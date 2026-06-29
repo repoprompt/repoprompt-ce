@@ -102,7 +102,7 @@ jobs:
               for process_id in process_ids:
                   try:
                       groups.add(os.getpgid(process_id))
-                  except ProcessLookupError:
+                  except (ProcessLookupError, PermissionError, OSError):
                       pass
               groups.discard(os.getpgrp())
               return groups
@@ -111,7 +111,7 @@ jobs:
               for group in groups:
                   try:
                       os.killpg(group, sent_signal)
-                  except ProcessLookupError:
+                  except (ProcessLookupError, PermissionError, OSError):
                       pass
 
           def live_process_groups(groups):
@@ -119,7 +119,7 @@ jobs:
               for group in groups:
                   try:
                       os.killpg(group, 0)
-                  except ProcessLookupError:
+                  except (ProcessLookupError, PermissionError, OSError):
                       continue
                   live.add(group)
               return live

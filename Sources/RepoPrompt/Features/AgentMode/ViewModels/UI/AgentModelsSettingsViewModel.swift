@@ -8,7 +8,7 @@
 //
 //  SEARCH-HELPER: Agent Models, Oracle Model, Built-in Chat Model,
 //  Context Builder Agent, Agent Role Defaults, Apply Recommended Setup,
-//  Planning Model, sync toggle, Context Builder drift
+//  Planning Model, sync toggle, workspace overrides
 //
 //  Related:
 //  - Page:          /RepoPrompt/Views/Settings/AgentModelsSettingsView.swift
@@ -23,51 +23,30 @@ import SwiftUI
 
 @MainActor
 final class AgentModelsSettingsViewModel: ObservableObject {
-    // MARK: - Types
-
-    /// Drift between the Context Builder configuration persisted globally
-    /// (used by MCP runs) and the legacy workspace-scoped fields (used by UI
-    /// runs today for backwards compatibility).
-    ///
-    /// The Agent Models page surfaces this as a small resolver when the two
-    /// disagree so a user doesn't have one value silently winning. Extension
-    /// B Phase 3 is expected to collapse Context Builder to a single picker;
-    /// until then, the resolver keeps the storage in sync.
-    struct ContextBuilderDrift: Equatable {
-        let globalAgentRaw: String?
-        let globalModelRaw: String?
-        let workspaceAgentRaw: String?
-        let workspaceModelRaw: String?
-        let globalDescription: String
-        let workspaceDescription: String
-    }
-
     // MARK: - Dependencies
 
-    let promptVM: PromptViewModel
-    let contextBuilderVM: ContextBuilderAgentViewModel
     let apiSettingsVM: APISettingsViewModel
-    let settingsStore: GlobalSettingsStore
+    private let settingsManager: any SettingsManaging
     private let notificationCenter: NotificationCenter
     private let engine: AutoRecommendationEngine
 
     // MARK: - Published state
 
+    @Published private(set) var workspaceID: UUID?
+    @Published private(set) var workspaceName: String?
+    @Published private(set) var inheritanceMode: AgentModelsInheritanceMode
+    @Published private(set) var profileSnapshot: AgentModelsSettingsProfile
     @Published private(set) var recommendations: RecommendationSet = .init()
-    @Published private(set) var contextBuilderDrift: ContextBuilderDrift? = nil
     @Published private(set) var isApplyingAll: Bool = false
     @Published var syncChatWithOracle: Bool {
         didSet {
-            guard oldValue != syncChatWithOracle else { return }
-            settingsStore.setSyncChatModelWithOracle(syncChatWithOracle, reason: "agent_models.sync_toggle")
-            // If turning sync on, mirror Oracle → Built-in Chat so the two agree going forward.
-            if syncChatWithOracle {
-                let planningRaw = promptVM.planningModelName
-                if !planningRaw.isEmpty, planningRaw != promptVM.preferredModel {
-                    promptVM.preferredModel = planningRaw
+            guard !isReloadingScopedState, oldValue != syncChatWithOracle else { return }
+            updateSelectedProfile(reason: "agent_models.sync_toggle") { profile in
+                profile.syncChatModelWithOracle = syncChatWithOracle
+                if syncChatWithOracle, profile.preferredComposeModelRaw != profile.planningModelRaw {
+                    profile.preferredComposeModelRaw = profile.planningModelRaw
                 }
             }
-            refresh()
         }
     }
 
@@ -81,44 +60,104 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// MCP list_agents filtering, hide non-role model IDs
     @Published var restrictMCPAgentDiscoveryToRoleLabels: Bool {
         didSet {
-            guard oldValue != restrictMCPAgentDiscoveryToRoleLabels else { return }
-            settingsStore.setRestrictMCPAgentDiscoveryToRoleLabels(restrictMCPAgentDiscoveryToRoleLabels)
+            guard !isReloadingScopedState, oldValue != restrictMCPAgentDiscoveryToRoleLabels else { return }
+            updateSelectedProfile(reason: "agent_models.hide_non_role_toggle") { profile in
+                profile.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
+            }
         }
     }
 
     // MARK: - Bookkeeping
 
     private var cancellables = Set<AnyCancellable>()
+    private var isReloadingScopedState = false
 
     // MARK: - Init
 
     init(
-        promptVM: PromptViewModel,
-        contextBuilderVM: ContextBuilderAgentViewModel,
         apiSettingsVM: APISettingsViewModel,
+        workspaceID: UUID? = nil,
+        workspaceName: String? = nil,
+        settingsManager: (any SettingsManaging)? = nil,
         settingsStore: GlobalSettingsStore? = nil,
         defaults: UserDefaults = .standard,
         notificationCenter: NotificationCenter = .default
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        self.promptVM = promptVM
-        self.contextBuilderVM = contextBuilderVM
+        let settingsManager = settingsManager ?? settingsStore
+        let initialInheritanceMode = Self.inheritanceMode(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID
+        )
+        let initialProfile = Self.profile(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID,
+            inheritanceMode: initialInheritanceMode
+        )
+
         self.apiSettingsVM = apiSettingsVM
-        self.settingsStore = settingsStore
+        self.workspaceID = workspaceID
+        self.workspaceName = workspaceName
+        inheritanceMode = initialInheritanceMode
+        profileSnapshot = initialProfile
+        self.settingsManager = settingsManager
         _ = defaults // Retained for initializer compatibility while storage lives in GlobalSettingsStore.
         self.notificationCenter = notificationCenter
         engine = AutoRecommendationEngine(
             settingsStore: settingsStore,
+            profileSettingsManager: settingsManager,
             apiSettingsViewModel: apiSettingsVM
         )
-        syncChatWithOracle = settingsStore.syncChatModelWithOracle()
-        restrictMCPAgentDiscoveryToRoleLabels = settingsStore.restrictMCPAgentDiscoveryToRoleLabels()
+        syncChatWithOracle = initialProfile.syncChatModelWithOracle
+        restrictMCPAgentDiscoveryToRoleLabels = initialProfile.restrictMCPAgentDiscoveryToRoleLabels
 
         observeNotifications()
         refresh()
     }
 
     // MARK: - Public Derived Values
+
+    var hasWorkspace: Bool {
+        workspaceID != nil
+    }
+
+    var workspaceDisplayName: String? {
+        let trimmed = workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    var editingScope: AgentModelsEditingScope {
+        guard let workspaceID, inheritanceMode == .useWorkspaceOverrides else { return .global }
+        return .workspace(workspaceID)
+    }
+
+    var isEditingWorkspaceSettings: Bool {
+        if case .workspace = editingScope { return true }
+        return false
+    }
+
+    var isEditingGlobalSettings: Bool {
+        !isEditingWorkspaceSettings
+    }
+
+    var effectiveScopeDescription: String {
+        isEditingWorkspaceSettings ? "Using workspace overrides" : "Using global settings"
+    }
+
+    var workspaceAgentModelsTitle: String {
+        if let workspaceDisplayName {
+            return "Agent Models for Workspace: \(workspaceDisplayName)"
+        }
+        return "Agent Models"
+    }
+
+    var noWorkspaceExplanation: String {
+        "No workspace is active, so Agent Models edits apply to global settings. Open a workspace to create workspace-specific overrides."
+    }
+
+    var showsRecommendationActions: Bool {
+        hasWorkspace
+    }
 
     var availability: AgentModelCatalog.AvailabilityContext {
         apiSettingsVM.agentModeAvailabilityContext
@@ -129,11 +168,43 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var currentOracleModelName: String {
-        promptVM.planningModel.displayName
+        displayName(forChatModelRaw: profileSnapshot.planningModelRaw, fallback: "Select an Oracle model")
     }
 
     var currentBuiltinChatModelName: String {
-        promptVM.preferredAIModel.displayName
+        let raw = profileSnapshot.syncChatModelWithOracle
+            ? profileSnapshot.planningModelRaw
+            : profileSnapshot.preferredComposeModelRaw
+        return displayName(
+            forChatModelRaw: raw,
+            fallback: "Select a Built-in Chat model"
+        )
+    }
+
+    var selectedContextBuilderSelection: AgentModelCatalog.NormalizedAgentSelection {
+        let selectedAgentRaw = profileSnapshot.contextBuilderAgentRaw
+        let selectedModelRaw = selectedAgentRaw.flatMap { profileSnapshot.contextBuilderModelsByAgent?[$0] }
+        return AgentModelCatalog.normalizeSelection(
+            agentRaw: selectedAgentRaw,
+            modelRaw: selectedModelRaw,
+            availability: availability
+        )
+    }
+
+    var selectedContextBuilderAgent: AgentProviderKind {
+        selectedContextBuilderSelection.agent
+    }
+
+    var selectedContextBuilderModelRaw: String {
+        selectedContextBuilderSelection.modelRaw
+    }
+
+    var selectedContextBuilderDisplayName: String {
+        AgentModelCatalog.displayName(
+            for: selectedContextBuilderModelRaw,
+            agentKind: selectedContextBuilderAgent,
+            availability: availability
+        )
     }
 
     var recommendedOracleModelName: String? {
@@ -160,43 +231,63 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var roleDefaultsResolutions: [MCPAgentRoleDefaultsService.RoleDefaultResolution] {
-        MCPAgentRoleDefaultsService.resolutions(
+        let profileStore = AgentModelsProfileRoleDefaultsStore(overrides: profileSnapshot.mcpAgentRoleOverrides)
+        return MCPAgentRoleDefaultsService.resolutions(
             availability: availability,
-            settingsStore: settingsStore
+            recommendedAvailability: availability.filteredForRecommendationProviders(settingsManager.globalRecommendationProviderFilter()),
+            settingsStore: profileStore
         )
     }
 
     var roleDefaultsHasOverrides: Bool {
-        roleDefaultsResolutions.contains(where: \.hasCustomOverride)
+        roleDefaultsResolutions.contains(where: \.hasStoredOverride)
     }
 
     var hasUnsatisfiedRecommendations: Bool {
-        recommendations.hasUnsatisfied || contextBuilderDrift != nil
+        recommendations.hasUnsatisfied
+    }
+
+    // MARK: - Scope
+
+    func updateWorkspaceContext(workspaceID: UUID?, workspaceName: String?) {
+        guard self.workspaceID != workspaceID || self.workspaceName != workspaceName else { return }
+        self.workspaceID = workspaceID
+        self.workspaceName = workspaceName
+        reloadScopedState()
+        refresh()
+    }
+
+    func setInheritanceMode(_ mode: AgentModelsInheritanceMode) {
+        guard let workspaceID else { return }
+        guard inheritanceMode != mode else { return }
+        settingsManager.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: mode)
+        reloadScopedState()
+        refresh()
+        postShouldRefresh(reason: "agent_models.inheritance_mode")
     }
 
     // MARK: - Refresh
 
     /// Recompute the recommendation set and drift state.
     func refresh() {
-        guard let workspaceID = promptVM.currentWorkspaceID else {
+        guard let workspaceID else {
             recommendations = RecommendationSet()
-            contextBuilderDrift = nil
             return
         }
-        let raw = engine.computeRecommendations(for: workspaceID)
+        let raw = engine.computeRecommendations(for: workspaceID, scope: editingScope)
         recommendations = engine.applyMutedFlags(raw, workspaceID: workspaceID)
-        contextBuilderDrift = computeContextBuilderDrift(workspaceID: workspaceID)
     }
 
     // MARK: - Destinations
 
     /// Destination for the Oracle model. Writes `planningModel` and, when the
-    /// sync toggle is on, mirrors to `preferredComposeModel`.
+    /// sync toggle is on, mirrors to `preferredComposeModel` in the selected
+    /// global/workspace Agent Models profile.
     var oracleModelDestination: ModelDestination {
         ModelDestination(
             id: "agentModels.oracle",
             getter: { [weak self] in
-                self?.promptVM.planningModelName ?? ""
+                self?.profileSnapshot.planningModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
                 self?.setOracleModel(raw: rawValue)
@@ -205,12 +296,13 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     /// Destination for the Built-in Chat model. Writes `preferredComposeModel`
-    /// and, when the sync toggle is on, mirrors to `planningModel`.
+    /// and, when the sync toggle is on, mirrors to `planningModel` in the
+    /// selected global/workspace Agent Models profile.
     var builtinChatModelDestination: ModelDestination {
         ModelDestination(
             id: "agentModels.builtinChat",
             getter: { [weak self] in
-                self?.promptVM.preferredModel ?? ""
+                self?.profileSnapshot.preferredComposeModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
                 self?.setBuiltinChatModel(raw: rawValue)
@@ -221,142 +313,165 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     // MARK: - Oracle / Built-in Chat setters
 
     func setOracleModel(raw: String) {
-        promptVM.planningModelName = raw
-        postShouldRefresh()
+        updateSelectedProfile(reason: "agent_models.oracle_model") { profile in
+            profile.planningModelRaw = raw
+            if profile.syncChatModelWithOracle {
+                profile.preferredComposeModelRaw = raw
+            }
+        }
     }
 
     func setBuiltinChatModel(raw: String) {
-        promptVM.preferredModel = raw
-        postShouldRefresh()
+        updateSelectedProfile(reason: "agent_models.builtin_chat_model") { profile in
+            profile.preferredComposeModelRaw = raw
+            if profile.syncChatModelWithOracle,
+               !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                profile.planningModelRaw = raw
+            }
+        }
+    }
+
+    // MARK: - Copy Actions
+
+    func copyGlobalSettingsToWorkspaceOverrides() {
+        guard let workspaceID else { return }
+        settingsManager.copyAgentModelsProfile(from: .global, to: .workspace(workspaceID))
+        reloadScopedState()
+        refresh()
+        postShouldRefresh(reason: "agent_models.copy_global_to_workspace")
+    }
+
+    func copyWorkspaceSettingsToGlobal() {
+        guard let workspaceID else { return }
+        settingsManager.copyAgentModelsProfile(from: .workspace(workspaceID), to: .global)
+        reloadScopedState()
+        refresh()
+        postShouldRefresh(reason: "agent_models.copy_workspace_to_global")
     }
 
     // MARK: - Row-level Apply
 
     func applyOracleRecommendation() {
-        guard let rec = recommendations.chatModel else { return }
-        let backend = rec.defaultBackend
-        guard let option = rec.option(for: backend), let model = option.modelString, !model.isEmpty else {
+        guard workspaceID != nil,
+              let rec = recommendations.chatModel,
+              let recommendedModelRaw = engine.recommendedChatModelRaw(rec, backend: rec.defaultBackend)
+        else {
             return
         }
-        setOracleModel(raw: model)
+
+        updateSelectedProfile(reason: "agent_models.apply_oracle_recommendation") { profile in
+            profile.planningModelRaw = recommendedModelRaw
+            profile.preferredComposeModelRaw = recommendedModelRaw
+        }
+        postRecommendationsDidApply(reason: "agent_models.apply_oracle_recommendation")
     }
 
     func applyContextBuilderRecommendation() {
         guard let rec = recommendations.contextBuilder,
-              let workspaceID = promptVM.currentWorkspaceID else { return }
-        engine.applyContextBuilderRecommendation(rec, workspaceID: workspaceID)
-        // Drift is automatically resolved by applyContextBuilderRecommendation
-        // because it writes both the global selection and the legacy workspace fields.
-        notificationCenter.post(
-            name: .recommendationsDidApply,
-            object: nil,
-            userInfo: ["workspaceID": workspaceID]
-        )
+              workspaceID != nil else { return }
+        let recommendedModelRaw = engine.recommendedContextBuilderModelRaw(rec)
+        updateSelectedProfile(
+            reason: "agent_models.apply_context_builder_recommendation",
+            contextBuilderWriteIntent: .userInitiated
+        ) { profile in
+            profile.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
+            profile = profile.replacingContextBuilderModel(recommendedModelRaw, for: rec.recommendedAgent.rawValue)
+        }
+        postRecommendationsDidApply(reason: "agent_models.apply_context_builder_recommendation")
     }
 
     func applyRoleDefault(_ resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution) {
-        MCPAgentRoleDefaultsService.clearOverride(
-            for: resolution.role,
-            settingsStore: settingsStore
-        )
-        postAgentRoleDefaultsChanged()
+        var overrides = profileSnapshot.mcpAgentRoleOverrides ?? [:]
+        overrides.removeValue(forKey: resolution.role.rawValue)
+        persistRoleDefaultOverrides(overrides.isEmpty ? nil : overrides)
     }
 
     func resetAllRoleDefaults() {
-        MCPAgentRoleDefaultsService.clearAllOverrides(settingsStore: settingsStore)
-        postAgentRoleDefaultsChanged()
+        persistRoleDefaultOverrides(nil)
     }
 
     func setRoleDefaultSelection(
         _ selection: AgentModelCatalog.NormalizedAgentSelection,
         for role: AgentModelCatalog.TaskLabelKind
     ) {
-        _ = MCPAgentRoleDefaultsService.setSelection(
-            selection,
-            for: role,
-            settingsStore: settingsStore
+        var overrides = profileSnapshot.mcpAgentRoleOverrides ?? [:]
+        let selectionID = AgentModelSelectionID(
+            agentRaw: selection.agent.rawValue,
+            modelRaw: selection.modelRaw
         )
-        postAgentRoleDefaultsChanged()
+        // Keep explicit role picks durable even when they currently match the recommendation;
+        // `applyRoleDefault` / reset actions are the explicit path back to recommendation-tracking.
+        overrides[role.rawValue] = selectionID.rawValue
+        persistRoleDefaultOverrides(overrides)
     }
 
     // MARK: - Bulk Apply
 
     func applyAllRecommendations(includePresetExposure: Bool = false) {
-        guard let workspaceID = promptVM.currentWorkspaceID else { return }
+        guard showsRecommendationActions else { return }
+        guard workspaceID != nil else { return }
         isApplyingAll = true
-        engine.applyModelRecommendations(
-            recommendations,
-            workspaceID: workspaceID,
-            includePresetExposure: includePresetExposure
-        )
-        // Resolve any CB drift by snapping the workspace legacy fields to the
-        // freshly applied global selection.
-        snapWorkspaceLegacyContextBuilderToGlobal(workspaceID: workspaceID)
-        refresh()
+
+        var profile = profileSnapshot
+        var didMutateProfile = false
+        if let chat = recommendations.chatModel,
+           let recommendedModelRaw = engine.recommendedChatModelRaw(chat, backend: chat.defaultBackend)
+        {
+            profile.planningModelRaw = recommendedModelRaw
+            profile.preferredComposeModelRaw = recommendedModelRaw
+            didMutateProfile = true
+        }
+        if let cb = recommendations.contextBuilder {
+            let recommendedModelRaw = engine.recommendedContextBuilderModelRaw(cb)
+            profile.contextBuilderAgentRaw = cb.recommendedAgent.rawValue
+            profile = profile.replacingContextBuilderModel(recommendedModelRaw, for: cb.recommendedAgent.rawValue)
+            didMutateProfile = true
+        }
+        if recommendations.mcpAgentDefaults != nil {
+            profile.mcpAgentRoleOverrides = nil
+            didMutateProfile = true
+        }
+        if didMutateProfile {
+            persistSelectedProfile(
+                profile,
+                reason: "agent_models.apply_all_recommendations",
+                contextBuilderWriteIntent: recommendations.contextBuilder == nil
+                    ? .preserveExistingOwnership
+                    : .userInitiated
+            )
+        }
+        if includePresetExposure, let presetExposure = recommendations.mcpPresetExposure {
+            engine.applyMCPPresetExposure(presetExposure)
+        }
+        if !didMutateProfile {
+            reloadScopedState()
+            refresh()
+        }
+        postRecommendationsDidApply(reason: "agent_models.apply_all_recommendations")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             self?.isApplyingAll = false
         }
     }
 
-    // MARK: - Context Builder Drift
-
-    /// Resolve drift by snapping the workspace legacy fields to match the global
-    /// Context Builder selection. MCP already uses global; UI runs will, too.
-    func resolveContextBuilderDriftUsingGlobal() {
-        guard let drift = contextBuilderDrift,
-              let workspaceID = promptVM.currentWorkspaceID else { return }
-        var settings = settingsStore.chatSettings(for: workspaceID)
-        settings.contextBuilderAgentRaw = drift.globalAgentRaw
-        settings.contextBuilderAgentModelRaw = drift.globalModelRaw
-        settings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(settings, commit: true)
-        promptVM.commitContextBuilderSettings()
-        refresh()
-    }
-
-    /// Resolve drift by promoting the workspace legacy Context Builder selection
-    /// to the global selection so MCP and UI runs agree.
-    func resolveContextBuilderDriftUsingWorkspace() {
-        guard let drift = contextBuilderDrift,
-              let agentRaw = drift.workspaceAgentRaw,
-              let workspaceID = promptVM.currentWorkspaceID else { return }
-        let modelRaw = drift.workspaceModelRaw ?? drift.globalModelRaw ?? ""
-        settingsStore.setGlobalContextBuilderAgentSelection(
-            agentRaw: agentRaw,
-            modelRaw: modelRaw,
-            markUserDefined: true
-        )
-        // Also mirror workspace-scoped fields so they're marked as user-defined.
-        var settings = settingsStore.chatSettings(for: workspaceID)
-        settings.contextBuilderAgentRaw = agentRaw
-        settings.contextBuilderAgentModelRaw = modelRaw
-        settings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(settings, commit: true)
-        promptVM.commitContextBuilderSettings()
-        refresh()
-    }
-
     // MARK: - Context Builder Menu
 
     func contextBuilderAgentModelMenuItems(windowID: Int) -> [StableMenuItem] {
-        var items = promptVM.availableAgentKinds.map { agent in
+        let selection = selectedContextBuilderSelection
+        var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
-                options: promptVM.contextBuilderModelOptions(for: agent),
-                selectedAgent: promptVM.contextBuilderAgent,
-                selectedModelRaw: promptVM.contextBuilderAgentModelRaw
+                options: AgentModelCatalog.options(for: agent, availability: availability),
+                selectedAgent: selection.agent,
+                selectedModelRaw: selection.modelRaw
             ) { [weak self] selectedAgent, selectedOption in
-                guard let self else { return }
-                promptVM.contextBuilderAgent = selectedAgent
-                promptVM.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
-                promptVM.commitContextBuilderSettings()
-                refresh()
+                self?.setContextBuilderSelection(agent: selectedAgent, modelRaw: selectedOption.rawValue)
             }
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
             to: &items,
             windowID: windowID,
-            availableAgents: promptVM.availableAgentKinds
+            availableAgents: AgentModelCatalog.selectableAgents(availability: availability)
         )
         return items
     }
@@ -386,6 +501,26 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     // MARK: - Private helpers
 
+    private static func inheritanceMode(
+        settingsManager: any SettingsManaging,
+        workspaceID: UUID?
+    ) -> AgentModelsInheritanceMode {
+        guard let workspaceID else { return .useGlobalSettings }
+        return settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode
+    }
+
+    private static func profile(
+        settingsManager: any SettingsManaging,
+        workspaceID: UUID?,
+        inheritanceMode: AgentModelsInheritanceMode
+    ) -> AgentModelsSettingsProfile {
+        guard let workspaceID, inheritanceMode == .useWorkspaceOverrides else {
+            return settingsManager.globalAgentModelsProfile()
+        }
+        return settingsManager.workspaceAgentModelsProfile(for: workspaceID)
+            ?? settingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID)
+    }
+
     private func observeNotifications() {
         notificationCenter.publisher(for: .recommendationsShouldRefresh)
             .receive(on: DispatchQueue.main)
@@ -394,22 +529,141 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
         notificationCenter.publisher(for: .recommendationsDidApply)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.refresh() }
+            .sink { [weak self] _ in
+                self?.reloadScopedState()
+                self?.refresh()
+            }
+            .store(in: &cancellables)
+
+        notificationCenter.publisher(for: .agentModelsSettingsDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.handleAgentModelsSettingsDidChange(notification)
+            }
             .store(in: &cancellables)
     }
 
-    private func postShouldRefresh() {
-        DispatchQueue.main.async { [weak self] in
-            self?.notificationCenter.post(name: .recommendationsShouldRefresh, object: nil)
+    private func handleAgentModelsSettingsDidChange(_ notification: Notification) {
+        let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+        let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+        if scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+           workspaceID != self.workspaceID
+        {
+            return
         }
+        reloadScopedState()
+        refresh()
+    }
+
+    private func reloadScopedState() {
+        let nextInheritanceMode = Self.inheritanceMode(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID
+        )
+        let nextProfile = Self.profile(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID,
+            inheritanceMode: nextInheritanceMode
+        )
+        isReloadingScopedState = true
+        inheritanceMode = nextInheritanceMode
+        profileSnapshot = nextProfile
+        syncChatWithOracle = nextProfile.syncChatModelWithOracle
+        restrictMCPAgentDiscoveryToRoleLabels = nextProfile.restrictMCPAgentDiscoveryToRoleLabels
+        isReloadingScopedState = false
+    }
+
+    private func updateSelectedProfile(
+        reason: String,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership,
+        _ mutation: (inout AgentModelsSettingsProfile) -> Void
+    ) {
+        var profile = profileSnapshot
+        mutation(&profile)
+        persistSelectedProfile(
+            profile,
+            reason: reason,
+            contextBuilderWriteIntent: contextBuilderWriteIntent
+        )
+    }
+
+    private func persistSelectedProfile(
+        _ profile: AgentModelsSettingsProfile,
+        reason: String,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership
+    ) {
+        switch editingScope {
+        case .global:
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: contextBuilderWriteIntent
+            )
+        case let .workspace(workspaceID):
+            settingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+        }
+        reloadScopedState()
+        refresh()
+        postShouldRefresh(reason: reason)
+    }
+
+    private func persistRoleDefaultOverrides(_ overrides: [String: String]?) {
+        updateSelectedProfile(reason: "agent_models.role_defaults") { profile in
+            profile.mcpAgentRoleOverrides = overrides
+        }
+        postAgentRoleDefaultsChanged()
+    }
+
+    private func setContextBuilderSelection(agent: AgentProviderKind, modelRaw: String) {
+        updateSelectedProfile(
+            reason: "agent_models.context_builder",
+            contextBuilderWriteIntent: .userInitiated
+        ) { profile in
+            profile.contextBuilderAgentRaw = agent.rawValue
+            profile = profile.replacingContextBuilderModel(modelRaw, for: agent.rawValue)
+        }
+    }
+
+    private func postShouldRefresh(reason: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            var userInfo: [String: Any] = ["reason": reason]
+            if let workspaceID {
+                userInfo["workspaceID"] = workspaceID
+            }
+            notificationCenter.post(
+                name: .recommendationsShouldRefresh,
+                object: nil,
+                userInfo: userInfo
+            )
+        }
+    }
+
+    private func postRecommendationsDidApply(reason: String) {
+        var userInfo: [String: Any] = [
+            "reason": reason,
+            AgentModelsSettingsNotification.scopeKey: isEditingWorkspaceSettings
+                ? AgentModelsSettingsNotification.Scope.workspace.rawValue
+                : AgentModelsSettingsNotification.Scope.global.rawValue
+        ]
+        if case let .workspace(workspaceID) = editingScope {
+            userInfo["workspaceID"] = workspaceID
+        }
+        if let workspaceID {
+            userInfo["sourceWorkspaceID"] = workspaceID
+        }
+        notificationCenter.post(
+            name: .recommendationsDidApply,
+            object: nil,
+            userInfo: userInfo
+        )
     }
 
     private func postAgentRoleDefaultsChanged() {
         var userInfo: [String: Any] = [
             "reason": "agentRoleDefaultsChanged",
-            "scope": "global"
+            "scope": isEditingWorkspaceSettings ? "workspace" : "global"
         ]
-        if let workspaceID = promptVM.currentWorkspaceID {
+        if let workspaceID {
             userInfo["workspaceID"] = workspaceID
         }
         notificationCenter.post(
@@ -420,65 +674,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         refresh()
     }
 
-    private func computeContextBuilderDrift(workspaceID: UUID) -> ContextBuilderDrift? {
-        let (globalAgentRaw, globalModelRaw) = settingsStore.globalContextBuilderAgentSelection()
-        let settings = settingsStore.chatSettings(for: workspaceID)
-        let workspaceAgentRaw = settings.contextBuilderAgentRaw
-        let workspaceModelRaw = settings.contextBuilderAgentModelRaw
-
-        // Drift is only meaningful when both scopes hold a value — otherwise
-        // the workspace is simply delegating to the global default.
-        guard let workspaceAgentRaw,
-              let globalAgentRaw
-        else {
-            return nil
+    private func displayName(forChatModelRaw raw: String?, fallback: String) -> String {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return fallback
         }
-        let modelsDiffer: Bool = {
-            let g = globalModelRaw ?? ""
-            let w = workspaceModelRaw ?? ""
-            return g.caseInsensitiveCompare(w) != .orderedSame
-        }()
-        let agentsDiffer = workspaceAgentRaw.caseInsensitiveCompare(globalAgentRaw) != .orderedSame
-        guard agentsDiffer || modelsDiffer else { return nil }
-
-        return ContextBuilderDrift(
-            globalAgentRaw: globalAgentRaw,
-            globalModelRaw: globalModelRaw,
-            workspaceAgentRaw: workspaceAgentRaw,
-            workspaceModelRaw: workspaceModelRaw,
-            globalDescription: describeSelection(agentRaw: globalAgentRaw, modelRaw: globalModelRaw),
-            workspaceDescription: describeSelection(agentRaw: workspaceAgentRaw, modelRaw: workspaceModelRaw)
-        )
-    }
-
-    private func snapWorkspaceLegacyContextBuilderToGlobal(workspaceID: UUID) {
-        let (globalAgentRaw, globalModelRaw) = settingsStore.globalContextBuilderAgentSelection()
-        guard let globalAgentRaw else { return }
-        var settings = settingsStore.chatSettings(for: workspaceID)
-        let needsUpdate =
-            settings.contextBuilderAgentRaw != globalAgentRaw ||
-            settings.contextBuilderAgentModelRaw != globalModelRaw
-        guard needsUpdate else { return }
-        settings.contextBuilderAgentRaw = globalAgentRaw
-        settings.contextBuilderAgentModelRaw = globalModelRaw
-        settings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(settings, commit: true)
-    }
-
-    private func describeSelection(agentRaw: String?, modelRaw: String?) -> String {
-        guard let agentRaw, let agent = AgentProviderKind(rawValue: agentRaw) else {
-            return "Not configured"
-        }
-        let modelDisplay: String = {
-            guard let raw = modelRaw, !raw.isEmpty else {
-                return AgentModel.defaultModel.displayName
-            }
-            return AgentModelCatalog.displayName(
-                for: raw,
-                agentKind: agent,
-                availability: availability
-            )
-        }()
-        return "\(agent.displayName) · \(modelDisplay)"
+        return AIModel.fromModelName(raw)?.displayName ?? raw
     }
 }

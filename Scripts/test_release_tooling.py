@@ -1311,6 +1311,19 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('gitleaks git --redact --log-opts="$range" .', workflow)
         self.assertIn("gitleaks dir --redact .", workflow)
 
+    def test_ci_test_timeout_cleanup_tolerates_unsignalable_process_groups(self) -> None:
+        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        app_test_harness = workflow.split("      - name: Run app tests", 1)[1].split(
+            "      - name: Run provider package tests",
+            1,
+        )[0]
+
+        self.assertEqual(
+            app_test_harness.count("except (ProcessLookupError, PermissionError, OSError):"),
+            3,
+        )
+        self.assertIn("if attempt == 1 and not output_seen.is_set():", app_test_harness)
+
     def test_publish_staged_validates_before_creating_dist(self) -> None:
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}", 1)[0]

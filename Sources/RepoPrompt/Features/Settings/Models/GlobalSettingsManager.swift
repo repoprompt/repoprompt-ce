@@ -39,6 +39,22 @@ extension Notification.Name {
     /// Posted after app-wide file-system/ignore preferences are changed through
     /// the settings surface. `userInfo["key"]` contains the app_settings key.
     static let appSettingsFileSystemPreferencesDidChange = Notification.Name("RepoPromptAppSettingsFileSystemPreferencesDidChange")
+
+    /// Posted after durable Agent Models settings change through the scoped resolver.
+    /// `userInfo[AgentModelsSettingsNotification.scopeKey]` contains `global` or
+    /// `workspace`; workspace changes also include
+    /// `userInfo[AgentModelsSettingsNotification.workspaceIDKey]`.
+    static let agentModelsSettingsDidChange = Notification.Name("RepoPromptAgentModelsSettingsDidChange")
+}
+
+enum AgentModelsSettingsNotification {
+    static let scopeKey = "scope"
+    static let workspaceIDKey = "workspaceID"
+
+    enum Scope: String {
+        case global
+        case workspace
+    }
 }
 
 // MARK: - Copy Global Settings (per workspace)
@@ -293,6 +309,7 @@ class GlobalSettingsStore: ObservableObject {
 
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
+    @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
     private var scalarPreferences = GlobalScalarPreferences()
@@ -408,6 +425,161 @@ class GlobalSettingsStore: ObservableObject {
         // Global Context Builder settings are now the single source of truth.
         if commit {
             save()
+        }
+    }
+
+    // MARK: - Scoped Agent Models Settings
+
+    func globalAgentModelsProfile() -> AgentModelsSettingsProfile {
+        AgentModelsSettingsProfile(
+            planningModelRaw: scalarPreferences.modelSelection?.planningModel,
+            preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
+            syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
+            contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
+            contextBuilderModelsByAgent: globalDefaults.discoverModelsByAgent,
+            mcpAgentRoleOverrides: globalDefaults.mcpAgentRoleOverrides,
+            restrictMCPAgentDiscoveryToRoleLabels: restrictMCPAgentDiscoveryToRoleLabels()
+        )
+    }
+
+    func setGlobalAgentModelsProfile(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent
+    ) {
+        let oldProfile = globalAgentModelsProfile()
+        let normalized = normalizedAgentModelsProfile(profile)
+        var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
+        modelSelection.planningModel = normalized.planningModelRaw
+        modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
+        modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
+        scalarPreferences.modelSelection = modelSelection
+
+        var agentMode = scalarPreferences.agentMode ?? GlobalScalarPreferences.AgentModeSettings()
+        agentMode.restrictMCPAgentDiscoveryToRoleLabels = normalized.restrictMCPAgentDiscoveryToRoleLabels
+        scalarPreferences.agentMode = agentMode
+
+        globalDefaults.discoverAgentRaw = normalized.contextBuilderAgentRaw
+        globalDefaults.discoverModelsByAgent = normalized.contextBuilderModelsByAgent
+        globalDefaults.mcpAgentRoleOverrides = normalized.mcpAgentRoleOverrides
+        switch contextBuilderWriteIntent {
+        case .preserveExistingOwnership:
+            break
+        case .userInitiated:
+            globalDefaults.didUserSetDiscoverAgentDefaults = true
+        case .automaticSeed:
+            if globalDefaults.didUserSetDiscoverAgentDefaults != true {
+                globalDefaults.didUserSetDiscoverAgentDefaults = false
+            }
+        }
+
+        recordAgentModelsProfileWriteDiagnostic(
+            scope: .global,
+            workspaceID: nil,
+            oldProfile: oldProfile,
+            newProfile: normalized
+        )
+
+        objectWillChange.send()
+        save()
+        postAgentModelsSettingsDidChange(scope: .global)
+    }
+
+    func workspaceAgentModelsSettings(for workspaceID: UUID) -> WorkspaceAgentModelsSettings {
+        agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings()
+    }
+
+    func setWorkspaceAgentModelsInheritanceMode(
+        workspaceID: UUID,
+        mode: AgentModelsInheritanceMode
+    ) {
+        var settings = agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings()
+        let oldProfile = settings.profile
+        settings.inheritanceMode = mode
+        if mode == .useWorkspaceOverrides, settings.profile == nil {
+            settings.profile = globalAgentModelsProfile()
+        }
+        agentModelsSettingsByWorkspaceID[workspaceID] = settings
+        if oldProfile != settings.profile, let newProfile = settings.profile {
+            recordAgentModelsProfileWriteDiagnostic(
+                scope: .workspace,
+                workspaceID: workspaceID,
+                oldProfile: oldProfile,
+                newProfile: newProfile
+            )
+        }
+        save()
+        postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+    }
+
+    func workspaceAgentModelsProfile(for workspaceID: UUID) -> AgentModelsSettingsProfile? {
+        agentModelsSettingsByWorkspaceID[workspaceID]?.profile
+    }
+
+    func setWorkspaceAgentModelsProfile(
+        workspaceID: UUID,
+        profile: AgentModelsSettingsProfile
+    ) {
+        let existing = agentModelsSettingsByWorkspaceID[workspaceID]
+        let oldProfile = existing?.profile
+        let normalized = normalizedAgentModelsProfile(profile)
+        let settings = WorkspaceAgentModelsSettings(
+            inheritanceMode: existing?.inheritanceMode ?? .useWorkspaceOverrides,
+            profile: normalized
+        )
+        agentModelsSettingsByWorkspaceID[workspaceID] = settings
+        recordAgentModelsProfileWriteDiagnostic(
+            scope: .workspace,
+            workspaceID: workspaceID,
+            oldProfile: oldProfile,
+            newProfile: normalized
+        )
+        save()
+        postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+    }
+
+    func effectiveAgentModelsProfile(workspaceID: UUID?) -> AgentModelsSettingsProfile {
+        guard let workspaceID else { return globalAgentModelsProfile() }
+        let settings = workspaceAgentModelsSettings(for: workspaceID)
+        guard settings.inheritanceMode == .useWorkspaceOverrides,
+              let profile = settings.profile
+        else {
+            return globalAgentModelsProfile()
+        }
+        return normalizedAgentModelsProfile(profile)
+    }
+
+    func setAgentModelsMCPAgentRoleOverrides(
+        _ overrides: [String: String]?,
+        scope: AgentModelsEditingScope
+    ) {
+        updateAgentModelsProfile(scope: scope) { profile in
+            profile.mcpAgentRoleOverrides = overrides
+        }
+    }
+
+    func copyAgentModelsProfile(
+        from source: AgentModelsEditingScope,
+        to destination: AgentModelsEditingScope
+    ) {
+        let profile = agentModelsProfile(for: source)
+        switch destination {
+        case .global:
+            setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .userInitiated)
+        case let .workspace(workspaceID):
+            let oldProfile = agentModelsSettingsByWorkspaceID[workspaceID]?.profile
+            let normalized = normalizedAgentModelsProfile(profile)
+            agentModelsSettingsByWorkspaceID[workspaceID] = WorkspaceAgentModelsSettings(
+                inheritanceMode: .useWorkspaceOverrides,
+                profile: normalized
+            )
+            recordAgentModelsProfileWriteDiagnostic(
+                scope: .workspace,
+                workspaceID: workspaceID,
+                oldProfile: oldProfile,
+                newProfile: normalized
+            )
+            save()
+            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
         }
     }
 
@@ -650,6 +822,7 @@ class GlobalSettingsStore: ObservableObject {
         line: UInt = #line,
         function: StaticString = #function
     ) {
+        let oldAgentModelsProfile = globalAgentModelsProfile()
         let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
         let oldPlanning = scalarPreferences.modelSelection?.planningModel
         let shouldMirror = honorSync && resolvedSyncChatModelWithOracleFromCurrentPreferences()
@@ -689,6 +862,9 @@ class GlobalSettingsStore: ObservableObject {
                 function: function
             )
         }
+        if globalAgentModelsProfile() != oldAgentModelsProfile {
+            postAgentModelsSettingsDidChange(scope: .global)
+        }
     }
 
     func planningModelRaw() -> String? {
@@ -704,6 +880,7 @@ class GlobalSettingsStore: ObservableObject {
         line: UInt = #line,
         function: StaticString = #function
     ) {
+        let oldAgentModelsProfile = globalAgentModelsProfile()
         let oldPlanning = scalarPreferences.modelSelection?.planningModel
         let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
         let shouldMirror = honorSync && resolvedSyncChatModelWithOracleFromCurrentPreferences()
@@ -735,6 +912,9 @@ class GlobalSettingsStore: ObservableObject {
                 function: function
             )
         }
+        if globalAgentModelsProfile() != oldAgentModelsProfile {
+            postAgentModelsSettingsDidChange(scope: .global)
+        }
     }
 
     func syncChatModelWithOracle() -> Bool {
@@ -750,6 +930,7 @@ class GlobalSettingsStore: ObservableObject {
         line: UInt = #line,
         function: StaticString = #function
     ) {
+        let oldAgentModelsProfile = globalAgentModelsProfile()
         let oldStoredValue = scalarPreferences.modelSelection?.syncChatModelWithOracle.map(String.init)
         let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
         let planning = scalarPreferences.modelSelection?.planningModel ?? ""
@@ -781,6 +962,9 @@ class GlobalSettingsStore: ObservableObject {
                 line: line,
                 function: function
             )
+        }
+        if globalAgentModelsProfile() != oldAgentModelsProfile {
+            postAgentModelsSettingsDidChange(scope: .global)
         }
     }
 
@@ -988,8 +1172,12 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     func setRestrictMCPAgentDiscoveryToRoleLabels(_ enabled: Bool, commit: Bool = true) {
+        let oldValue = restrictMCPAgentDiscoveryToRoleLabels()
         updateAgentModeScalar(commit: commit) { settings in
             settings.restrictMCPAgentDiscoveryToRoleLabels = enabled
+        }
+        if oldValue != enabled {
+            postAgentModelsSettingsDidChange(scope: .global)
         }
     }
 
@@ -1414,7 +1602,9 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
+        objectWillChange.send()
         save()
+        postAgentModelsSettingsDidChange(scope: .global)
     }
 
     /// Sets the global Context Builder agent and optionally updates/clears that agent's
@@ -1469,7 +1659,9 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
+        objectWillChange.send()
         save()
+        postAgentModelsSettingsDidChange(scope: .global)
     }
 
     /// Returns whether the user has explicitly set the global Context Builder agent defaults.
@@ -1502,7 +1694,10 @@ class GlobalSettingsStore: ObservableObject {
             setGlobalContextBuilderAgentSelection(agentRaw: agent, modelRaw: model, markUserDefined: true)
         } else if let agent = agentRaw {
             globalDefaults.discoverAgentRaw = agent
+            globalDefaults.didUserSetDiscoverAgentDefaults = true
+            objectWillChange.send()
             save()
+            postAgentModelsSettingsDidChange(scope: .global)
         }
     }
 
@@ -1517,9 +1712,14 @@ class GlobalSettingsStore: ObservableObject {
     /// Updates global MCP Agent Mode role-default overrides.
     /// Empty dictionaries are normalized to nil.
     func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool = true) {
-        globalDefaults.mcpAgentRoleOverrides = Self.normalizedMCPAgentRoleOverrides(overrides)
+        let oldOverrides = Self.normalizedMCPAgentRoleOverrides(globalDefaults.mcpAgentRoleOverrides)
+        let normalized = Self.normalizedMCPAgentRoleOverrides(overrides)
+        globalDefaults.mcpAgentRoleOverrides = normalized
         if commit {
             save()
+        }
+        if oldOverrides != normalized {
+            postAgentModelsSettingsDidChange(scope: .global)
         }
     }
 
@@ -1630,12 +1830,120 @@ class GlobalSettingsStore: ObservableObject {
         settings.didAutoApplyRecommendationsAt = nil
     }
 
+    private func agentModelsProfile(for scope: AgentModelsEditingScope) -> AgentModelsSettingsProfile {
+        switch scope {
+        case .global:
+            globalAgentModelsProfile()
+        case let .workspace(workspaceID):
+            workspaceAgentModelsProfile(for: workspaceID)
+                ?? effectiveAgentModelsProfile(workspaceID: workspaceID)
+        }
+    }
+
+    private func updateAgentModelsProfile(
+        scope: AgentModelsEditingScope,
+        _ mutation: (inout AgentModelsSettingsProfile) -> Void
+    ) {
+        switch scope {
+        case .global:
+            var profile = globalAgentModelsProfile()
+            mutation(&profile)
+            setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
+        case let .workspace(workspaceID):
+            var settings = agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings(
+                inheritanceMode: .useWorkspaceOverrides,
+                profile: globalAgentModelsProfile()
+            )
+            settings.inheritanceMode = .useWorkspaceOverrides
+            let oldProfile = settings.profile
+            var profile = settings.profile ?? globalAgentModelsProfile()
+            mutation(&profile)
+            let normalized = normalizedAgentModelsProfile(profile)
+            settings.profile = normalized
+            agentModelsSettingsByWorkspaceID[workspaceID] = settings
+            recordAgentModelsProfileWriteDiagnostic(
+                scope: .workspace,
+                workspaceID: workspaceID,
+                oldProfile: oldProfile,
+                newProfile: normalized
+            )
+            save()
+            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+        }
+    }
+
+    private func normalizedAgentModelsProfile(_ profile: AgentModelsSettingsProfile) -> AgentModelsSettingsProfile {
+        AgentModelsSettingsProfile(
+            planningModelRaw: profile.planningModelRaw,
+            preferredComposeModelRaw: profile.preferredComposeModelRaw,
+            syncChatModelWithOracle: profile.syncChatModelWithOracle,
+            contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
+            contextBuilderModelsByAgent: profile.contextBuilderModelsByAgent,
+            mcpAgentRoleOverrides: profile.mcpAgentRoleOverrides,
+            restrictMCPAgentDiscoveryToRoleLabels: profile.restrictMCPAgentDiscoveryToRoleLabels
+        )
+    }
+
+    private func recordAgentModelsProfileWriteDiagnostic(
+        scope: AgentModelsSettingsNotification.Scope,
+        workspaceID: UUID?,
+        oldProfile: AgentModelsSettingsProfile?,
+        newProfile: AgentModelsSettingsProfile,
+        fileID: StaticString = #fileID,
+        line: UInt = #line,
+        function: StaticString = #function
+    ) {
+        let workspaceSuffix = workspaceID.map { ".\($0.uuidString)" } ?? ""
+        recordSettingsWriteDiagnostic(
+            key: "agentModelsProfile.\(scope.rawValue)\(workspaceSuffix)",
+            oldValue: agentModelsProfileDiagnosticValue(oldProfile),
+            newValue: agentModelsProfileDiagnosticValue(newProfile),
+            commit: true,
+            reason: "agent_models.profile.\(scope.rawValue)",
+            fileID: fileID,
+            line: line,
+            function: function
+        )
+    }
+
+    private func agentModelsProfileDiagnosticValue(_ profile: AgentModelsSettingsProfile?) -> String? {
+        guard let profile else { return nil }
+        let contextBuilderModelRaw = profile.contextBuilderAgentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
+        return [
+            "planning=\(profile.planningModelRaw ?? "nil")",
+            "compose=\(profile.preferredComposeModelRaw ?? "nil")",
+            "sync=\(profile.syncChatModelWithOracle)",
+            "contextBuilder=\(profile.contextBuilderAgentRaw ?? "nil"):\(contextBuilderModelRaw ?? "nil")",
+            "roleOverrides=\(profile.mcpAgentRoleOverrides?.count ?? 0)",
+            "restrictRoleDiscovery=\(profile.restrictMCPAgentDiscoveryToRoleLabels)"
+        ].joined(separator: ";")
+    }
+
+    private func postAgentModelsSettingsDidChange(
+        scope: AgentModelsSettingsNotification.Scope,
+        workspaceID: UUID? = nil,
+        notificationCenter: NotificationCenter = .default
+    ) {
+        var userInfo: [String: Any] = [
+            AgentModelsSettingsNotification.scopeKey: scope.rawValue
+        ]
+        if let workspaceID {
+            userInfo[AgentModelsSettingsNotification.workspaceIDKey] = workspaceID
+        }
+        notificationCenter.post(
+            name: .agentModelsSettingsDidChange,
+            object: self,
+            userInfo: userInfo
+        )
+    }
+
     // MARK: - Persistence
 
     private func load() {
         let document = fileStore.loadOrCreateDefault()
         copySettings = document.copySettings
         chatSettings = document.chatSettings
+        agentModelsSettingsByWorkspaceID = document.agentModelsSettings
         globalDefaults = document.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
@@ -1648,6 +1956,7 @@ class GlobalSettingsStore: ObservableObject {
             objectWillChange.send()
             copySettings = document.copySettings
             chatSettings = document.chatSettings
+            agentModelsSettingsByWorkspaceID = document.agentModelsSettings
             globalDefaults = document.globalDefaults
             scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
@@ -1691,6 +2000,7 @@ class GlobalSettingsStore: ObservableObject {
         let document = GlobalSettingsDocument(
             copySettings: copySettings,
             chatSettings: chatSettings,
+            agentModelsSettings: agentModelsSettingsByWorkspaceID,
             globalDefaults: globalDefaults,
             scalarPreferences: scalarPreferences
         )

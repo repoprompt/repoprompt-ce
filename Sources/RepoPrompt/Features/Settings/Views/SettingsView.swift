@@ -401,10 +401,11 @@ struct SettingsView: View {
         case .agentModels:
             AgentModelsSettingsView(
                 promptVM: promptViewModel,
-                contextBuilderVM: windowState.contextBuilderAgentViewModel,
                 apiSettingsVM: apiSettingsViewModel,
                 windowID: windowState.windowID,
+                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 workspaceName: windowState.workspaceManager.activeWorkspace?.name,
+                settingsManager: windowState.settingsManager,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))

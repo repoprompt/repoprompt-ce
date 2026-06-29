@@ -4,16 +4,18 @@ import Foundation
 /// `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`.
 ///
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
-/// defaults. Schema v2 adds optional scalar preference groups. Scalar fields stay
-/// optional so missing JSON fields fall back through the typed GlobalSettingsStore
-/// accessors without losing current default behavior.
+/// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
+/// workspace-scoped Agent Models profiles. Scalar fields stay optional so missing
+/// JSON fields fall back through the typed GlobalSettingsStore accessors without
+/// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 4
 
     var schemaVersion: Int
     var updatedAt: Date
     var copySettingsByWorkspaceID: [String: CopyGlobalSettings]
     var chatSettingsByWorkspaceID: [String: ChatGlobalSettings]
+    var agentModelsSettingsByWorkspaceID: [String: WorkspaceAgentModelsSettings]?
     var globalDefaults: GlobalDefaults
     var scalarPreferences: GlobalScalarPreferences?
 
@@ -22,6 +24,7 @@ struct GlobalSettingsDocument: Codable {
         updatedAt: Date = Date(),
         copySettings: [UUID: CopyGlobalSettings] = [:],
         chatSettings: [UUID: ChatGlobalSettings] = [:],
+        agentModelsSettings: [UUID: WorkspaceAgentModelsSettings] = [:],
         globalDefaults: GlobalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
         scalarPreferences: GlobalScalarPreferences? = nil
     ) {
@@ -29,6 +32,9 @@ struct GlobalSettingsDocument: Codable {
         self.updatedAt = updatedAt
         copySettingsByWorkspaceID = Self.encodeUUIDKeyedDictionary(copySettings)
         chatSettingsByWorkspaceID = Self.encodeUUIDKeyedDictionary(chatSettings)
+        agentModelsSettingsByWorkspaceID = agentModelsSettings.isEmpty
+            ? nil
+            : Self.encodeUUIDKeyedDictionary(agentModelsSettings)
         self.globalDefaults = globalDefaults
         self.scalarPreferences = scalarPreferences
     }
@@ -41,9 +47,14 @@ struct GlobalSettingsDocument: Codable {
         Self.decodeUUIDKeyedDictionary(chatSettingsByWorkspaceID)
     }
 
+    var agentModelsSettings: [UUID: WorkspaceAgentModelsSettings] {
+        Self.decodeUUIDKeyedDictionary(agentModelsSettingsByWorkspaceID ?? [:])
+    }
+
     func replacing(
         copySettings: [UUID: CopyGlobalSettings],
         chatSettings: [UUID: ChatGlobalSettings],
+        agentModelsSettings: [UUID: WorkspaceAgentModelsSettings],
         globalDefaults: GlobalDefaults,
         scalarPreferences: GlobalScalarPreferences? = nil,
         updatedAt: Date = Date()
@@ -53,6 +64,7 @@ struct GlobalSettingsDocument: Codable {
             updatedAt: updatedAt,
             copySettings: copySettings,
             chatSettings: chatSettings,
+            agentModelsSettings: agentModelsSettings,
             globalDefaults: globalDefaults,
             scalarPreferences: scalarPreferences ?? self.scalarPreferences
         )
@@ -69,6 +81,145 @@ struct GlobalSettingsDocument: Codable {
             guard let uuid = UUID(uuidString: entry.key) else { return }
             result[uuid] = entry.value
         }
+    }
+}
+
+// MARK: - Scoped Agent Models Settings
+
+enum AgentModelsInheritanceMode: String, Codable, Equatable {
+    case useGlobalSettings
+    case useWorkspaceOverrides
+}
+
+enum AgentModelsEditingScope: Equatable {
+    case global
+    case workspace(UUID)
+}
+
+enum ContextBuilderSettingsWriteIntent {
+    case preserveExistingOwnership
+    case userInitiated
+    case automaticSeed
+}
+
+struct AgentModelsSettingsProfile: Codable, Equatable {
+    var planningModelRaw: String?
+    var preferredComposeModelRaw: String?
+    var syncChatModelWithOracle: Bool
+    var contextBuilderAgentRaw: String?
+    var contextBuilderModelsByAgent: [String: String]?
+    var mcpAgentRoleOverrides: [String: String]?
+    var restrictMCPAgentDiscoveryToRoleLabels: Bool
+
+    init(
+        planningModelRaw: String? = nil,
+        preferredComposeModelRaw: String? = nil,
+        syncChatModelWithOracle: Bool = false,
+        contextBuilderAgentRaw: String? = nil,
+        contextBuilderModelsByAgent: [String: String]? = nil,
+        mcpAgentRoleOverrides: [String: String]? = nil,
+        restrictMCPAgentDiscoveryToRoleLabels: Bool = false
+    ) {
+        self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
+        self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
+        self.syncChatModelWithOracle = syncChatModelWithOracle
+        self.contextBuilderAgentRaw = Self.normalizedAgentRaw(contextBuilderAgentRaw)
+        self.contextBuilderModelsByAgent = Self.normalizedContextBuilderModelsByAgent(contextBuilderModelsByAgent)
+        self.mcpAgentRoleOverrides = Self.normalizedStringMap(mcpAgentRoleOverrides)
+        self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case planningModelRaw
+        case preferredComposeModelRaw
+        case syncChatModelWithOracle
+        case contextBuilderAgentRaw
+        case contextBuilderModelsByAgent
+        case mcpAgentRoleOverrides
+        case restrictMCPAgentDiscoveryToRoleLabels
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            planningModelRaw: container.decodeIfPresent(String.self, forKey: .planningModelRaw),
+            preferredComposeModelRaw: container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw),
+            syncChatModelWithOracle: container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false,
+            contextBuilderAgentRaw: container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw),
+            contextBuilderModelsByAgent: container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent),
+            mcpAgentRoleOverrides: container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides),
+            restrictMCPAgentDiscoveryToRoleLabels: container.decodeIfPresent(Bool.self, forKey: .restrictMCPAgentDiscoveryToRoleLabels) ?? false
+        )
+    }
+
+    func replacingContextBuilderModel(_ modelRaw: String?, for agentRaw: String?) -> AgentModelsSettingsProfile {
+        let resolvedAgentRaw = Self.normalizedAgentRaw(agentRaw) ?? contextBuilderAgentRaw
+        guard let resolvedAgentRaw else { return self }
+
+        var next = self
+        var modelsByAgent = contextBuilderModelsByAgent ?? [:]
+        if let normalizedModelRaw = Self.trimmedNonEmpty(modelRaw) {
+            modelsByAgent[resolvedAgentRaw] = normalizedModelRaw
+        } else {
+            modelsByAgent[resolvedAgentRaw] = nil
+        }
+        next.contextBuilderModelsByAgent = modelsByAgent.isEmpty ? nil : modelsByAgent
+        return next
+    }
+
+    private static func normalizedChatModelRaw(_ raw: String?) -> String? {
+        trimmedNonEmpty(raw)
+    }
+
+    private static func normalizedAgentRaw(_ raw: String?) -> String? {
+        trimmedNonEmpty(raw)
+    }
+
+    private static func normalizedContextBuilderModelsByAgent(_ values: [String: String]?) -> [String: String]? {
+        normalizedStringMap(values)
+    }
+
+    private static func normalizedStringMap(_ values: [String: String]?) -> [String: String]? {
+        guard let values else { return nil }
+        let normalized = values.keys.sorted().reduce(into: [String: String]()) { result, rawKey in
+            guard let key = trimmedNonEmpty(rawKey),
+                  let value = trimmedNonEmpty(values[rawKey])
+            else {
+                return
+            }
+            result[key] = value
+        }
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func trimmedNonEmpty(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+}
+
+struct WorkspaceAgentModelsSettings: Codable, Equatable {
+    var inheritanceMode: AgentModelsInheritanceMode
+    var profile: AgentModelsSettingsProfile?
+
+    init(
+        inheritanceMode: AgentModelsInheritanceMode = .useGlobalSettings,
+        profile: AgentModelsSettingsProfile? = nil
+    ) {
+        self.inheritanceMode = inheritanceMode
+        self.profile = profile
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inheritanceMode, profile
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        inheritanceMode = try container.decodeIfPresent(AgentModelsInheritanceMode.self, forKey: .inheritanceMode)
+            ?? .useGlobalSettings
+        profile = try container.decodeIfPresent(AgentModelsSettingsProfile.self, forKey: .profile)
     }
 }
 

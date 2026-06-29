@@ -11,7 +11,7 @@ struct AgentManageMCPToolService {
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
-    let restrictDiscoveryToRoleLabels: @MainActor () -> Bool
+    let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
 
     init(
         toolName: String,
@@ -20,8 +20,8 @@ struct AgentManageMCPToolService {
         resolveSpawnSourceTabID: @escaping (_ metadata: RequestMetadata) async -> UUID?,
         resolveSpawnParentSessionID: @escaping (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?,
         bindCurrentRequestToTab: @escaping (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void,
-        restrictDiscoveryToRoleLabels: @escaping @MainActor () -> Bool = {
-            GlobalSettingsStore.shared.restrictMCPAgentDiscoveryToRoleLabels()
+        restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
+            GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
         }
     ) {
         self.toolName = toolName
@@ -83,8 +83,9 @@ struct AgentManageMCPToolService {
     private func executeListAgents(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let availability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+        let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
-        let restrictedDiscovery = restrictDiscoveryToRoleLabels()
+        let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
         let agents: [Value] = omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability).map { entry -> Value in
             // Flatten all models — each start target becomes its own entry.
@@ -129,11 +130,11 @@ struct AgentManageMCPToolService {
             }
             return .object(agentObj)
         }
-        // Build task labels with effective global role defaults. These remain
+        // Build task labels with effective workspace/global role defaults. These remain
         // visible even when restricted discovery hides the extra per-agent
         // catalog, because callers need to understand which concrete model each
         // role label resolves to.
-        let taskLabelEntries = MCPAgentRoleDefaultsService.resolutions(availability: availability).map { res -> Value in
+        let taskLabelEntries = MCPAgentRoleDefaultsService.resolutions(availability: availability, workspaceID: workspaceID).map { res -> Value in
             let recommendedID = AgentModelSelectionID(
                 agentRaw: res.recommended.agent.rawValue,
                 modelRaw: res.recommended.modelRaw
@@ -424,12 +425,13 @@ struct AgentManageMCPToolService {
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
         try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
-        // create_session always creates a new session — default to the global engineer role when model_id is omitted.
+        // create_session always creates a new session — default to the effective engineer role when model_id is omitted.
         // Validate selection before creating a target to avoid phantom sessions on bad model_id.
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: targetWindow.workspaceManager.activeWorkspace?.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
@@ -497,7 +499,8 @@ struct AgentManageMCPToolService {
         }
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
