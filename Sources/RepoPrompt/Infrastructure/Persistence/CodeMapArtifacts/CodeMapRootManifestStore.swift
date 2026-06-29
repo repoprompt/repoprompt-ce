@@ -769,6 +769,13 @@ actor CodeMapRootManifestStore {
         ) == snapshot else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
+        _ = try reconcileLocked(
+            layout: layout,
+            maximumEntries: nil,
+            protectingDigest: name,
+            incomingByteCount: 0,
+            replacedByteCount: 0
+        )
         if semanticUnchanged {
             return .unchanged(manifestGeneration: nextGeneration)
         }
