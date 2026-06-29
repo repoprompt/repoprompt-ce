@@ -584,6 +584,41 @@ extension AgentModeViewModel {
             applyEditsApprovalSubscriptionTask?.cancel()
         }
 
+        /// Cancels all ephemeral runtime tasks and clears transient state on this
+        /// session. Called by both `prepareSessionForWindowClose` and
+        /// `prepareWorkspaceSwitchSessionDiscard` before the VM performs
+        /// async teardown (provider dispose, coordinator shutdown, MCP cleanup).
+        ///
+        /// This method is purely synchronous and touches only TabSession-owned
+        /// state. VM-owned interactions (cancelPendingQuestion, approval,
+        /// instruction, applyEditsReview, MCP control, run cancellation) remain
+        /// on the VM and are called separately by each teardown path.
+        func cancelEphemeralRuntimeState() {
+            derivedTranscriptRefreshTask?.cancel()
+            derivedTranscriptRefreshTask = nil
+            pendingDerivedTranscriptRefreshReason = nil
+            pendingCommandRunningFlushTask?.cancel()
+            pendingCommandRunningFlushTask = nil
+            pendingCommandRunningByKey.removeAll()
+            claudeSteeringFlushTask?.cancel()
+            claudeSteeringFlushTask = nil
+            acpSteeringFlushTask?.cancel()
+            acpSteeringFlushTask = nil
+            clearClaudeReasoningStatus(clearDisplayedStatus: true)
+            assistantDeltaFlushTask?.cancel()
+            assistantDeltaFlushTask = nil
+            pendingAssistantDelta = ""
+            agentTask?.cancel()
+            agentTask = nil
+            codexEventTask?.cancel()
+            codexEventTask = nil
+            codexEventTaskRunID = nil
+            applyEditsApprovalSubscriptionTask?.cancel()
+            applyEditsApprovalSubscriptionTask = nil
+            applyEditsApprovalSubscriptionID = nil
+            pendingApplyEditsReview = nil
+        }
+
         @discardableResult
         func beginPersistentBindingTransition() -> UInt64 {
             bindingTransitionGeneration &+= 1

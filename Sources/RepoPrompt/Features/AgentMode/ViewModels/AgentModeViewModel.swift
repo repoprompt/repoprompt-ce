@@ -2794,23 +2794,15 @@ final class AgentModeViewModel: ObservableObject {
     private func prepareSessionForWindowClose(_ session: TabSession) async {
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
-        session.derivedTranscriptRefreshTask?.cancel()
-        session.derivedTranscriptRefreshTask = nil
-        session.pendingDerivedTranscriptRefreshReason = nil
-        session.pendingCommandRunningFlushTask?.cancel()
-        session.pendingCommandRunningFlushTask = nil
-        session.pendingCommandRunningByKey.removeAll()
+        session.cancelEphemeralRuntimeState()
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
-        cancelPendingApplyEditsReview(for: session, reason: "Cancelled because window is closing")
         await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
         if session.runState.isActive {
             await cancelAgentRun(tabID: session.tabID)
         }
-        session.agentTask?.cancel()
-        session.agentTask = nil
         await cleanupACPStateForDeletedSession(session)
         let provider = session.provider
         session.provider = nil
@@ -9644,34 +9636,15 @@ final class AgentModeViewModel: ObservableObject {
         )
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
-        session.derivedTranscriptRefreshTask?.cancel()
-        session.derivedTranscriptRefreshTask = nil
-        session.pendingDerivedTranscriptRefreshReason = nil
-        session.pendingCommandRunningFlushTask?.cancel()
-        session.pendingCommandRunningFlushTask = nil
-        session.pendingCommandRunningByKey.removeAll()
-        session.claudeSteeringFlushTask?.cancel()
-        session.claudeSteeringFlushTask = nil
-        session.acpSteeringFlushTask?.cancel()
-        session.acpSteeringFlushTask = nil
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+        session.cancelEphemeralRuntimeState()
         clearPendingAssistantDelta(session)
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
-        session.pendingApplyEditsReview = nil
         reconcileInteractiveRunState(session)
         cancelPendingInstruction(for: session)
-        session.agentTask?.cancel()
-        session.agentTask = nil
-        session.codexEventTask?.cancel()
-        session.codexEventTask = nil
-        session.codexEventTaskRunID = nil
         if let runID = session.runID {
             _ = mcpRunToolCanceller(runID, "workspace_switch")
         }
-        session.applyEditsApprovalSubscriptionTask?.cancel()
-        session.applyEditsApprovalSubscriptionTask = nil
-        session.applyEditsApprovalSubscriptionID = nil
         return target
     }
 
