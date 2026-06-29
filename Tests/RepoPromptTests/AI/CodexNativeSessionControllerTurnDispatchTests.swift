@@ -32,6 +32,26 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
         XCTAssertNil(controller.test_routingCurrentTurnID)
     }
 
+    func testTurnStartOmitsNilServiceTier() async throws {
+        let recorder = TurnRequestRecorder(result: [
+            "turn": ["id": "submission-1"]
+        ])
+        let controller = makeController(recorder: recorder)
+        controller.test_installThreadState(threadID: "thread-1")
+
+        _ = try await controller.startUserTurn(
+            text: "hello",
+            images: [],
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil
+        )
+
+        let request = try XCTUnwrap(recorder.requests().only)
+        XCTAssertEqual(request.method, "turn/start")
+        XCTAssertFalse(request.params.keys.contains("serviceTier"), "Nil service tier should be omitted, not sent as explicit default")
+    }
+
     func testTurnSteerUsesExactExpectedIDAndOmitsStartOnlySettings() async throws {
         let recorder = TurnRequestRecorder(result: [
             "turnId": "turn-1"

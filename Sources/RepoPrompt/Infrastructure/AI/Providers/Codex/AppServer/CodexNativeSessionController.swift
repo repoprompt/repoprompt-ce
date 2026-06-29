@@ -1093,7 +1093,7 @@ final class CodexNativeSessionController {
                 if let reasoningEffort {
                     params["effort"] = reasoningEffort
                 }
-                params["serviceTier"] = serviceTier ?? NSNull()
+                Self.addServiceTier(serviceTier, to: &params)
                 if let workspacePath {
                     params["cwd"] = workspacePath
                 }
@@ -1122,7 +1122,7 @@ final class CodexNativeSessionController {
                 if let reasoningEffort {
                     params["effort"] = reasoningEffort
                 }
-                params["serviceTier"] = serviceTier ?? NSNull()
+                Self.addServiceTier(serviceTier, to: &params)
                 if let workspacePath {
                     params["cwd"] = workspacePath
                 }
@@ -1324,7 +1324,7 @@ final class CodexNativeSessionController {
         if let reasoningEffort {
             params["effort"] = reasoningEffort
         }
-        params["serviceTier"] = serviceTier ?? NSNull()
+        Self.addServiceTier(serviceTier, to: &params)
         if let workspacePath {
             params["cwd"] = workspacePath
         }
@@ -7880,6 +7880,12 @@ final class CodexNativeSessionController {
             }
         }
         return nil
+    }
+
+    private static func addServiceTier(_ serviceTier: String?, to params: inout [String: Any]) {
+        guard let serviceTier = serviceTier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !serviceTier.isEmpty else { return }
+        params["serviceTier"] = serviceTier
     }
 
     static func appServerTurnSandboxPolicyPayload(
