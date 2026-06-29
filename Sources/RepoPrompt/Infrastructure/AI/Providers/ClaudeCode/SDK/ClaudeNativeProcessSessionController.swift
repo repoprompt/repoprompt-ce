@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final actor ClaudeNativeProcessSessionController {
@@ -231,6 +232,31 @@ final actor ClaudeNativeProcessSessionController {
 
     var hasActiveSession: Bool {
         process != nil
+    }
+
+    deinit {
+        performSynchronousDeinitCleanup()
+    }
+
+    /// Last-resort process cleanup for controller deallocation.
+    ///
+    /// Normal owners must call async `shutdown()`, which can reap the process and
+    /// clear expected PID registrations. `deinit` cannot await that path, so this
+    /// method only releases file-handle callbacks, closes stdin, and sends SIGTERM
+    /// to any still-owned child process.
+    private func performSynchronousDeinitCleanup() {
+        stdoutChunkChannel?.finish()
+        stderrChunkChannel?.finish()
+        stdoutConsumerTask?.cancel()
+        stderrConsumerTask?.cancel()
+
+        guard let process else { return }
+        process.stdout.readabilityHandler = nil
+        process.stderr.readabilityHandler = nil
+        process.stdin?.closeFile()
+        _ = Darwin.kill(process.pid, SIGTERM)
+        var status: Int32 = 0
+        _ = Darwin.waitpid(process.pid, &status, WNOHANG)
     }
 
     var hasTurnInFlight: Bool {
