@@ -14,6 +14,10 @@ import SwiftTreeSitter
 struct CodeMapGenerator {
     static let debug = false
 
+    /// Maximum continuation lines appended after the first JS/TS declaration line.
+    /// This changes extracted artifact content and is therefore part of pipeline identity.
+    static let jstsMaxAppendedContinuationLines = 80
+
     // MARK: - Debug Configuration
 
     /// Controls detailed logging for code map generation
@@ -273,33 +277,57 @@ struct CodeMapGenerator {
         }
     }
 
-    /// Generates a `FileAPI` from Tree-sitter captures.
-    ///
-    /// • Deduplicates import/export lines.
-    /// • Supports new buckets: `exports`, `interfaces`, `aliases`, `literalUnions`.
-    /// • Detects trivial literal-union type-aliases.
-    /// • Keeps previous heavyweight/lightweight extraction logic for other languages.
-    static func generateCodeMap(
+    private struct GenerationOutput {
+        let imports: [String]
+        let exports: [String]
+        let enums: [EnumInfo]
+        let aliases: [TypeAliasInfo]
+        let literalUnions: [String]
+        let macros: [String]
+        let referencedTypes: [String]
+        let globalFunctions: [FunctionInfo]
+        let globalVariables: [VariableInfo]
+        let classesByLine: [Int: ClassInfo]
+        let interfacesByLine: [Int: InterfaceInfo]
+    }
+
+    static func generateSyntaxArtifact(
         from namedRanges: [NamedRange],
         content: String,
-        fullPath: String,
+        language: LanguageType,
         perfOptions: CodeMapPerfOptions = .disabled,
         perfStats: CodeMapPerfStats? = nil
-    ) -> FileAPI? {
-        // ------------------------------------------------------------------
-        // 0)  Early setup & helpers
-        // ------------------------------------------------------------------
-        let normalizedURL = URL(fileURLWithPath: fullPath.trimmingCharacters(in: .whitespacesAndNewlines))
-            .standardizedFileURL
-        let fileExt = normalizedURL.pathExtension.lowercased()
-        let terminator: Character = (fileExt == "py") ? ":" : (fileExt == "rb") ? "\0" : "{"
+    ) -> CodeMapSyntaxArtifact? {
+        let output = extractCodeMap(
+            from: namedRanges,
+            content: content,
+            language: language,
+            terminator: declarationTerminator(for: language),
+            perfOptions: perfOptions,
+            perfStats: perfStats
+        )
+        return makeSyntaxArtifact(from: output)
+    }
 
-        guard let supportedLanguage = supportedLang(for: fileExt) else {
-            if debugLogging {
-                print("🔍 [CodeMapGenerator] Unsupported file extension: '\(fileExt)' for file: \(fullPath)")
-            }
-            return nil
+    private static func declarationTerminator(for language: LanguageType) -> Character {
+        switch language {
+        case .python: ":"
+        case .ruby: "\0"
+        default: "{"
         }
+    }
+
+    private static func extractCodeMap(
+        from namedRanges: [NamedRange],
+        content: String,
+        language supportedLanguage: LanguageType,
+        terminator: Character,
+        perfOptions: CodeMapPerfOptions,
+        perfStats: CodeMapPerfStats?
+    ) -> GenerationOutput {
+        // ------------------------------------------------------------------
+        // 0) Early setup & helpers
+        // ------------------------------------------------------------------
         let isLightweightLang = SyntaxManager.isLightweight(language: supportedLanguage)
 
         // BUG FIX #1: Split TS/TSX from JS for proper routing
@@ -309,8 +337,7 @@ struct CodeMapGenerator {
 
         if debugLogging {
             print("🔍 [CodeMapGenerator] Starting code map generation")
-            print("📄 File: \(fullPath)")
-            print("🏷️  Extension: '\(fileExt)' -> Language: \(supportedLanguage)")
+            print("🏷️  Explicit language: \(supportedLanguage)")
             print("⚡️ Lightweight mode: \(isLightweightLang)")
             print("🎯 Terminator: '\(terminator)'")
             print("📊 Total named ranges: \(namedRanges.count)")
@@ -1562,7 +1589,7 @@ struct CodeMapGenerator {
 
                 // Use rawLine for indent detection
                 let indent = rawLine.prefix { $0.isWhitespace }.count
-                if fileExt == "ts", indent > 0 { // interface / type-literal
+                if supportedLanguage == .ts, indent > 0 { // interface / type-literal
                     if debugLogging { print("   ⏭️  Skipped interface member") }
                     recordCaptureAttribution(.variable, since: attributionStart)
                     continue
@@ -1600,7 +1627,7 @@ struct CodeMapGenerator {
                 let trimmed = fullDecl.trimmingCharacters(in: .whitespacesAndNewlines)
 
                 // 🔧 Fix 2: Guard against type-alias lines that sneak in
-                if fileExt == "ts", trimmedLine.contains("="),
+                if supportedLanguage == .ts, trimmedLine.contains("="),
                    trimmedLine.hasSuffix(";"), !trimmedLine.contains(":")
                 {
                     if debugLogging { print("   ⏭️  Skipped type-alias masquerading as variable") }
@@ -1892,180 +1919,78 @@ struct CodeMapGenerator {
             }
         }
 
-        // ------------------------------------------------------------------
-        // 4)  Merge globals into "main class" where appropriate
-        //     🔧 Swift: Skip synthetic class creation to keep functions[] populated
-        // ------------------------------------------------------------------
-        if debugLogging {
-            print("\n🔗 [Phase 4] Merging globals into main class")
-        }
-
-        let mainClassName = normalizedURL.deletingPathExtension().lastPathComponent
-        var mainClassFound = false
-        for (_, cls) in classesByLine where cls.name == mainClassName {
-            mainClassFound = true
-        }
-
-        // 🔧 Swift fix: Skip synthetic class creation for Swift
-        let skipSyntheticClass = shouldSkipSyntheticMainClass(for: supportedLanguage)
-
-        if debugLogging {
-            print("🏷️  Main class name: '\(mainClassName)'")
-            print("🔍 Main class found in existing classes: \(mainClassFound)")
-            print("📊 Global functions to merge: \(globalFunctions.count)")
-            print("📊 Global variables to merge: \(globalVariables.count)")
-            print("⚙️  Skip synthetic class (Swift mode): \(skipSyntheticClass)")
-        }
-
-        // For Swift, don't merge globals into classes - keep them in functions[] and globalVars[]
-        if !skipSyntheticClass {
-            if mainClassFound {
-                for key in classesByLine.keys where classesByLine[key]?.name == mainClassName {
-                    classesByLine[key]?.methods.append(contentsOf: globalFunctions)
-                    classesByLine[key]?.properties.append(contentsOf: globalVariables.map {
-                        PropertyInfo(name: $0.name, typeName: $0.typeName)
-                    })
-                    if debugLogging {
-                        print("✅ Merged \(globalFunctions.count) global functions and \(globalVariables.count) global variables into existing class '\(mainClassName)'")
-                    }
-                }
-                // Clear globals since they're now in the class
-                globalFunctions.removeAll()
-                globalVariables.removeAll()
-            } else {
-                // 🔧 Fix 3: Don't create the synthetic class when nothing remains
-                let shouldCreateSynthetic =
-                    !mainClassFound &&
-                    (!globalFunctions.isEmpty || !globalVariables.isEmpty)
-
-                if shouldCreateSynthetic {
-                    classesByLine[-1] = ClassInfo(
-                        name: mainClassName,
-                        methods: globalFunctions,
-                        properties: globalVariables.map {
-                            PropertyInfo(name: $0.name, typeName: $0.typeName)
-                        }
-                    )
-                    if debugLogging {
-                        print("🆕 Created synthetic main class '\(mainClassName)' with \(globalFunctions.count) global functions and \(globalVariables.count) global variables")
-                    }
-                    // Clear globals since they're now in the synthetic class
-                    globalFunctions.removeAll()
-                    globalVariables.removeAll()
-                } else if debugLogging {
-                    print("⏭️  Skipped synthetic class creation - no global functions or variables remain")
-                }
-            }
-        } else {
-            if debugLogging {
-                print("⏭️  Swift mode: Keeping \(globalFunctions.count) functions and \(globalVariables.count) globals separate (not merging into classes)")
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // 5)  Finalise lists & referenced types
-        //      ✨  Strip out "hollow" classes (no members)
-        // ------------------------------------------------------------------
-        if debugLogging {
-            print("\n🏁 [Phase 5] Finalizing results")
-        }
-
-        let finalClasses = classesByLine
-            .keys
-            .sorted()
-            .compactMap { classesByLine[$0] }
-            .filter { !$0.methods.isEmpty || !$0.properties.isEmpty }
-
-        let finalInterfaces = interfaceBoundaries.keys
-            .sorted() // preserve source order
-            .compactMap { interfaceBoundaries[$0] }
-            .filter { !$0.methods.isEmpty || !$0.properties.isEmpty }
-
-        // 🔧 Swift fix: Always preserve functions and globals for Swift (don't hide them when classes exist)
-        let finalFuncs: [FunctionInfo]
-        let finalGlobals: [VariableInfo]
-        if skipSyntheticClass {
-            // Swift: keep functions and globals regardless of whether classes exist
-            finalFuncs = globalFunctions
-            finalGlobals = globalVariables
-        } else {
-            // Other languages: only show globals if no classes exist
-            finalFuncs = finalClasses.isEmpty ? globalFunctions : []
-            finalGlobals = finalClasses.isEmpty ? globalVariables : []
-        }
-
         let typeFinalizeToken = Signpost.begin("codemap.referenced_types")
         let typeFinalizeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        let finalRefs = referencedTypes.finalizeSorted()
+        let finalReferences = referencedTypes.finalizeSorted()
         if perfEnabled {
             activePerfStats?.referencedTypesFinalizeDuration += (CFAbsoluteTimeGetCurrent() - typeFinalizeStart)
         }
-        if debugLogging {
-            print("🔍 Referenced types (filtered): \(finalRefs.count) (from \(referencedTypes.rawInsertions) raw)")
-        }
         Signpost.end("codemap.referenced_types", typeFinalizeToken)
 
-        if debugLogging {
-            print("📊 Final counts:")
-            print("   • Imports: \(imports.count)")
-            print("   • Exports: \(exports.count)")
-            print("   • Classes: \(finalClasses.count)")
-            print("   • Interfaces: \(finalInterfaces.count)")
-            print("   • Type aliases: \(aliases.count)")
-            print("   • Literal unions: \(literalUnions.count)")
-            print("   • Functions: \(finalFuncs.count)")
-            print("   • Enums: \(enums.count)")
-            print("   • Global variables: \(finalGlobals.count)")
-            print("   • Macros: \(macros.count)")
-            print("   • Referenced types: \(finalRefs.count)")
-        }
+        return GenerationOutput(
+            imports: imports,
+            exports: exports,
+            enums: enums,
+            aliases: aliases,
+            literalUnions: literalUnions,
+            macros: macros,
+            referencedTypes: finalReferences,
+            globalFunctions: globalFunctions,
+            globalVariables: globalVariables,
+            classesByLine: classesByLine,
+            interfacesByLine: interfaceBoundaries
+        )
+    }
 
-        // ------------------------------------------------------------------
-        // 6)  Early‑exit if file has zero meaningful content
-        // ------------------------------------------------------------------
-        let hasClassContent = !finalClasses.isEmpty
-        let isEmpty = imports.isEmpty && exports.isEmpty && !hasClassContent &&
-            finalFuncs.isEmpty && finalGlobals.isEmpty &&
-            enums.isEmpty && macros.isEmpty && finalInterfaces.isEmpty &&
-            aliases.isEmpty && literalUnions.isEmpty
-
-        if isEmpty {
-            if debugLogging {
-                print("🚫 File has no meaningful content - returning nil")
-            }
+    private static func makeSyntaxArtifact(from output: GenerationOutput) -> CodeMapSyntaxArtifact? {
+        let classes = finalizedClasses(output.classesByLine)
+        let interfaces = finalizedInterfaces(output.interfacesByLine)
+        guard hasMeaningfulContent(
+            output: output,
+            classes: classes,
+            interfaces: interfaces,
+            functions: output.globalFunctions,
+            globalVars: output.globalVariables
+        ) else {
             return nil
         }
 
-        // ------------------------------------------------------------------
-        // 7)  Construct and return `FileAPI`
-        // ------------------------------------------------------------------
-        if debugLogging {
-            print("\n✅ [Phase 6] Creating FileAPI and returning result")
-        }
-
-        let fileAPIToken = Signpost.begin("codemap.fileapi_init")
-        let fileAPIStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        let api = FileAPI(
-            filePath: fullPath,
-            imports: imports,
-            exports: exports,
-            classes: finalClasses,
-            interfaces: finalInterfaces,
-            aliases: aliases,
-            literalUnions: literalUnions,
-            functions: finalFuncs,
-            enums: enums,
-            globalVars: finalGlobals,
-            macros: macros,
-            referencedTypes: finalRefs
+        return CodeMapSyntaxArtifact(
+            imports: output.imports,
+            exports: output.exports,
+            classes: classes,
+            interfaces: interfaces,
+            aliases: output.aliases,
+            literalUnions: output.literalUnions,
+            functions: output.globalFunctions,
+            enums: output.enums,
+            globalVars: output.globalVariables,
+            macros: output.macros,
+            referencedTypes: output.referencedTypes
         )
-        if perfEnabled {
-            activePerfStats?.fileAPIInitDuration += (CFAbsoluteTimeGetCurrent() - fileAPIStart)
-        }
-        Signpost.end("codemap.fileapi_init", fileAPIToken)
+    }
 
-        if debug { api.printAPI() }
-        return api
+    private static func finalizedClasses(_ classesByLine: [Int: ClassInfo]) -> [ClassInfo] {
+        classesByLine.keys.sorted().compactMap { classesByLine[$0] }
+            .filter { !$0.methods.isEmpty || !$0.properties.isEmpty }
+    }
+
+    private static func finalizedInterfaces(_ interfacesByLine: [Int: InterfaceInfo]) -> [InterfaceInfo] {
+        interfacesByLine.keys.sorted().compactMap { interfacesByLine[$0] }
+            .filter { !$0.methods.isEmpty || !$0.properties.isEmpty }
+    }
+
+    private static func hasMeaningfulContent(
+        output: GenerationOutput,
+        classes: [ClassInfo],
+        interfaces: [InterfaceInfo],
+        functions: [FunctionInfo],
+        globalVars: [VariableInfo]
+    ) -> Bool {
+        !output.imports.isEmpty || !output.exports.isEmpty || !classes.isEmpty ||
+            !functions.isEmpty || !globalVars.isEmpty || !output.enums.isEmpty ||
+            !output.macros.isEmpty || !interfaces.isEmpty || !output.aliases.isEmpty ||
+            !output.literalUnions.isEmpty
     }
 
     // MARK: - Optimized Helpers
@@ -2299,9 +2224,8 @@ struct CodeMapGenerator {
         let baseIndent = declaration.prefix(while: { $0.isWhitespace }).count
         var nextLocation = startRange.upperBound
         var linesAdded = 0
-        let maxLines = 80
 
-        while nextLocation < nsContent.length, linesAdded < maxLines {
+        while nextLocation < nsContent.length, linesAdded < jstsMaxAppendedContinuationLines {
             let trimmedDecl = declaration.trimmingCharacters(in: .whitespacesAndNewlines)
             switch context {
             case .functionLike:

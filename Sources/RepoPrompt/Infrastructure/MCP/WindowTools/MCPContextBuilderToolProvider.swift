@@ -422,7 +422,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
 
                 try workspaceContext?.validateAvailability()
                 let sel = resultTab.selection
-                let fileCount = sel.selectedPaths.count + sel.autoCodemapPaths.count
+                let fileCount = sel.selectedPaths.count
 
                 let selectionReply = try await dependencies.buildTabSelectionReply(
                     sel,

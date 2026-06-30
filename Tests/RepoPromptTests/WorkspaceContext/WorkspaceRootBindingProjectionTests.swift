@@ -123,14 +123,132 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
 
         let scope = try XCTUnwrap(ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection))
         let mapping = try XCTUnwrap(scope.rootMappings.first)
+        let logicalLabel = try XCTUnwrap(WorkspaceLogicalRootIdentity.labels(
+            for: [
+                WorkspaceLogicalRootIdentity.RootDescriptor(
+                    physicalRootID: physicalRoot.id,
+                    rootEpoch: WorkspaceCodemapRootEpoch(
+                        rootID: logicalRoot.id,
+                        rootLifetimeID: physicalRoot.id
+                    ),
+                    preferredName: logicalRoot.name
+                )
+            ]
+        )[physicalRoot.id])
         XCTAssertEqual(scope.kind, "session_bound_worktree")
-        XCTAssertEqual(mapping.logicalRootName, "Project")
-        XCTAssertEqual(mapping.logicalRootPath, "/repo/project")
+        XCTAssertEqual(mapping.logicalRootName, logicalLabel)
+        XCTAssertEqual(mapping.logicalRootPath, logicalLabel)
         XCTAssertEqual(mapping.effectiveRootName, "project-agent")
-        XCTAssertEqual(mapping.effectiveRootPath, "/tmp/worktrees/project-agent")
+        XCTAssertEqual(mapping.effectiveRootPath, "session-bound")
         XCTAssertEqual(mapping.worktreeID, "wt-1")
         XCTAssertEqual(mapping.branch, "feature/demo")
         XCTAssertEqual(mapping.label, "Demo Worktree")
+    }
+
+    func testDuplicateLogicalRootBasenamesProduceStableUniqueNonPhysicalLabels() throws {
+        let reusedRootID = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-0000-0000-0000-000000000001"))
+        let firstLifetimeID = try XCTUnwrap(UUID(uuidString: "BBBBBBBB-0000-0000-0000-000000000001"))
+        let secondLifetimeID = try XCTUnwrap(UUID(uuidString: "BBBBBBBB-0000-0000-0000-000000000002"))
+        let firstEpoch = WorkspaceCodemapRootEpoch(
+            rootID: reusedRootID,
+            rootLifetimeID: firstLifetimeID
+        )
+        let secondEpoch = WorkspaceCodemapRootEpoch(
+            rootID: reusedRootID,
+            rootLifetimeID: secondLifetimeID
+        )
+        let priorGeneratedLabel = WorkspaceLogicalRootIdentity.label(for: firstEpoch)
+        let firstLogical = WorkspaceRootRef(id: UUID(), name: "repo", fullPath: "/canonical/one/repo")
+        let secondLogical = WorkspaceRootRef(
+            id: UUID(),
+            name: priorGeneratedLabel,
+            fullPath: "/canonical/two/repo"
+        )
+        let firstPhysical = WorkspaceRootRef(id: UUID(), name: "secret-one", fullPath: "/private/worktrees/secret-one")
+        let secondPhysical = WorkspaceRootRef(
+            id: UUID(),
+            name: priorGeneratedLabel,
+            fullPath: "/private/worktrees/secret-two"
+        )
+        let repeatedEpochPhysical = WorkspaceRootRef(
+            id: UUID(),
+            name: "secret-three",
+            fullPath: "/private/worktrees/secret-three"
+        )
+        let descriptors = [
+            WorkspaceLogicalRootIdentity.RootDescriptor(
+                physicalRootID: firstPhysical.id,
+                rootEpoch: firstEpoch,
+                preferredName: "repo"
+            ),
+            WorkspaceLogicalRootIdentity.RootDescriptor(
+                physicalRootID: secondPhysical.id,
+                rootEpoch: secondEpoch,
+                preferredName: priorGeneratedLabel
+            ),
+            WorkspaceLogicalRootIdentity.RootDescriptor(
+                physicalRootID: repeatedEpochPhysical.id,
+                rootEpoch: firstEpoch,
+                preferredName: "repo"
+            )
+        ]
+
+        let first = WorkspaceLogicalRootIdentity.labels(for: descriptors)
+        let second = WorkspaceLogicalRootIdentity.labels(for: Array(descriptors.reversed()))
+
+        XCTAssertEqual(first, second)
+        let firstLabel = "root@aaaaaaaa-0000-0000-0000-000000000001+bbbbbbbb-0000-0000-0000-000000000001"
+        let secondLabel = "root@aaaaaaaa-0000-0000-0000-000000000001+bbbbbbbb-0000-0000-0000-000000000002"
+        XCTAssertEqual(first[firstPhysical.id], firstLabel)
+        XCTAssertEqual(first[repeatedEpochPhysical.id], firstLabel)
+        XCTAssertEqual(first[secondPhysical.id], secondLabel)
+        XCTAssertNotEqual(firstLabel, secondLabel)
+        XCTAssertEqual(priorGeneratedLabel, firstLabel)
+        let logicalPaths = try [firstPhysical.id, secondPhysical.id].map { physicalRootID in
+            try XCTUnwrap(try WorkspaceCodemapLogicalPresentationPath(
+                rootDisplayName: XCTUnwrap(first[physicalRootID]),
+                standardizedRelativePath: "Sources/App.swift"
+            )).displayPath
+        }.sorted()
+        XCTAssertEqual(
+            logicalPaths,
+            [
+                "\(firstLabel)/Sources/App.swift",
+                "\(secondLabel)/Sources/App.swift"
+            ]
+        )
+        XCTAssertFalse(first.values.contains { $0.contains("/canonical/") || $0.contains("/private/") })
+
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: secondLogical,
+                    physicalRoot: secondPhysical,
+                    binding: Self.binding(
+                        logicalRoot: secondLogical,
+                        physicalRoot: secondPhysical,
+                        worktreeID: "two"
+                    )
+                ),
+                .init(
+                    logicalRoot: firstLogical,
+                    physicalRoot: firstPhysical,
+                    binding: Self.binding(
+                        logicalRoot: firstLogical,
+                        physicalRoot: firstPhysical,
+                        worktreeID: "one"
+                    )
+                )
+            ]
+        )
+        let scope = try XCTUnwrap(ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection))
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(scope), encoding: .utf8))
+        XCTAssertEqual(Set(scope.rootMappings.map(\.logicalRootName)).count, 2)
+        XCTAssertFalse(encoded.contains(firstPhysical.standardizedFullPath))
+        XCTAssertFalse(encoded.contains(secondPhysical.standardizedFullPath))
+        XCTAssertFalse(encoded.contains(firstLogical.standardizedFullPath))
+        XCTAssertFalse(encoded.contains(secondLogical.standardizedFullPath))
     }
 
     func testFileTreeSnapshotIsDisplayedAsLogicalRoot() {
@@ -206,14 +324,17 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         )
         let logicalSelection = StoredSelection(
             selectedPaths: ["Sources/App.swift"],
-            autoCodemapPaths: ["Sources/Dependency.swift"],
+            manualCodemapPaths: ["Sources/Manual.swift"],
             slices: ["Sources/Sliced.swift": [LineRange(start: 3, end: 9)]],
             codemapAutoEnabled: false
         )
 
         let physicalSelection = projection.physicalizeSelection(logicalSelection)
         XCTAssertEqual(physicalSelection.selectedPaths, ["/tmp/worktrees/project-agent/Sources/App.swift"])
-        XCTAssertEqual(physicalSelection.autoCodemapPaths, ["/tmp/worktrees/project-agent/Sources/Dependency.swift"])
+        XCTAssertEqual(
+            physicalSelection.manualCodemapPaths,
+            ["/tmp/worktrees/project-agent/Sources/Manual.swift"]
+        )
         XCTAssertEqual(
             physicalSelection.slices["/tmp/worktrees/project-agent/Sources/Sliced.swift"],
             [LineRange(start: 3, end: 9)]
@@ -221,7 +342,10 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
 
         let persistedSelection = projection.logicalizeSelection(physicalSelection)
         XCTAssertEqual(persistedSelection.selectedPaths, ["/repo/project/Sources/App.swift"])
-        XCTAssertEqual(persistedSelection.autoCodemapPaths, ["/repo/project/Sources/Dependency.swift"])
+        XCTAssertEqual(
+            persistedSelection.manualCodemapPaths,
+            ["/repo/project/Sources/Manual.swift"]
+        )
         XCTAssertEqual(
             persistedSelection.slices["/repo/project/Sources/Sliced.swift"],
             [LineRange(start: 3, end: 9)]
@@ -302,13 +426,10 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         XCTAssertEqual(ownership.rootClaimCount, 0)
     }
 
-    func testMaterializerInitializesSessionWorktreeCodemapsIdempotently() async throws {
-        let logicalRootURL = try makeTemporaryRoot(name: "ProjectionCodemapLogical")
-        let physicalRootURL = try makeTemporaryRoot(name: "ProjectionCodemapPhysical")
-        try write(
-            "struct WorktreeInitializedType {\n    func initializedMethod() {}\n}\n",
-            to: physicalRootURL.appendingPathComponent("Sources/App.swift")
-        )
+    func testMaterializerCommitsOwnershipWithoutCodemapDemandOrBuild() async throws {
+        let logicalRootURL = try makeTemporaryRoot(name: "ProjectionCommitLogical")
+        let physicalRootURL = try makeTemporaryRoot(name: "ProjectionCommitPhysical")
+        try write("struct CommitOnlyType {}\n", to: physicalRootURL.appendingPathComponent("Sources/App.swift"))
         let store = WorkspaceFileContextStore()
         let loadedLogicalRoot = try await store.loadRoot(path: logicalRootURL.path)
         let logicalRoot = WorkspaceRootRef(
@@ -317,35 +438,27 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
             fullPath: loadedLogicalRoot.standardizedFullPath
         )
         let physicalRoot = WorkspaceRootRef(id: UUID(), name: logicalRoot.name, fullPath: physicalRootURL.path)
-        let binding = Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "codemap")
-
-        let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-            sessionID: UUID(),
-            bindings: [binding]
+        let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+        let sessionID = UUID()
+        let preparation = try await materializer.prepare(
+            sessionID: sessionID,
+            bindings: [Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "commit")]
         )
-        let firstProjection = try XCTUnwrap(materializedProjection)
-        let physicalRootID = try XCTUnwrap(firstProjection.physicalRootRefs.first?.id)
 
-        let firstRedundantInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
-        XCTAssertTrue(firstRedundantInitialization.isEmpty)
-        let snapshot = try await waitForCodemapSnapshot(
-            store: store,
-            rootID: physicalRootID,
-            relativePath: "Sources/App.swift"
-        )
-        XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("WorktreeInitializedType") == true)
+        let projection = try await materializer.commit(preparation)
+        let counts = await store.codemapPresentationOperationCountsForTesting()
 
-        _ = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-            sessionID: UUID(),
-            bindings: [binding]
-        )
-        let secondRedundantInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
-        XCTAssertTrue(secondRedundantInitialization.isEmpty)
+        XCTAssertNotNil(projection)
+        XCTAssertEqual(counts.artifactDemandRequests, 0)
+        XCTAssertEqual(counts.presentationFreezeRequests, 0)
+        await materializer.release(sessionID: sessionID)
+        await store.unloadRoot(id: loadedLogicalRoot.id)
     }
 
-    func testMaterializerRetriesCodemapInitializationAfterZeroFileIngress() async throws {
-        let logicalRootURL = try makeTemporaryRoot(name: "ProjectionRetryLogical")
-        let physicalRootURL = try makeTemporaryRoot(name: "ProjectionRetryPhysical")
+    func testMaterializationStartsZeroCodemapTasks() async throws {
+        let logicalRootURL = try makeTemporaryRoot(name: "ProjectionMaterializeLogical")
+        let physicalRootURL = try makeTemporaryRoot(name: "ProjectionMaterializePhysical")
+        try write("struct MaterializedWithoutCodemapType {}\n", to: physicalRootURL.appendingPathComponent("Sources/App.swift"))
         let store = WorkspaceFileContextStore()
         let loadedLogicalRoot = try await store.loadRoot(path: logicalRootURL.path)
         let logicalRoot = WorkspaceRootRef(
@@ -354,33 +467,21 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
             fullPath: loadedLogicalRoot.standardizedFullPath
         )
         let physicalRoot = WorkspaceRootRef(id: UUID(), name: logicalRoot.name, fullPath: physicalRootURL.path)
-        let binding = Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "retry")
+        let sessionID = UUID()
+        let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
 
-        let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-            sessionID: UUID(),
-            bindings: [binding]
+        let projection = await materializer.materialize(
+            sessionID: sessionID,
+            bindings: [Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "materialize")]
         )
-        let projection = try XCTUnwrap(materializedProjection)
-        let physicalRootID = try XCTUnwrap(projection.physicalRootRefs.first?.id)
-        let emptyRetry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
-        XCTAssertTrue(emptyRetry.isEmpty)
+        await Task.yield()
+        let counts = await store.codemapPresentationOperationCountsForTesting()
 
-        _ = try await store.createFile(
-            rootID: physicalRootID,
-            relativePath: "Sources/App.swift",
-            content: "struct RetryAfterIngressType {\n    func retryMethod() {}\n}\n"
-        )
-        let submittedRetry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
-        XCTAssertEqual(submittedRetry, [physicalRootID])
-        let redundantRetry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
-        XCTAssertTrue(redundantRetry.isEmpty)
-
-        let snapshot = try await waitForCodemapSnapshot(
-            store: store,
-            rootID: physicalRootID,
-            relativePath: "Sources/App.swift"
-        )
-        XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("RetryAfterIngressType") == true)
+        XCTAssertNotNil(projection)
+        XCTAssertEqual(counts.artifactDemandRequests, 0)
+        XCTAssertEqual(counts.presentationFreezeRequests, 0)
+        await materializer.release(sessionID: sessionID)
+        await store.unloadRoot(id: loadedLogicalRoot.id)
     }
 
     func testMaterializedSessionWorktreeScopeReportsAvailable() async throws {
@@ -407,24 +508,6 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         XCTAssertTrue(scopedRoots.contains {
             $0.standardizedFullPath == physicalRootURL.standardizedFileURL.path
         })
-    }
-
-    private func waitForCodemapSnapshot(
-        store: WorkspaceFileContextStore,
-        rootID: UUID,
-        relativePath: String,
-        timeout: Duration = .seconds(6)
-    ) async throws -> WorkspaceCodemapSnapshot {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if let snapshot = await store.codemapSnapshot(rootID: rootID, relativePath: relativePath) {
-                return snapshot
-            }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        XCTFail("Timed out waiting for codemap snapshot")
-        throw NSError(domain: "WorkspaceRootBindingProjectionTests", code: 1)
     }
 
     private static func binding(

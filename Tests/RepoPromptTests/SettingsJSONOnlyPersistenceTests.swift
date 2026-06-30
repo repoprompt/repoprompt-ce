@@ -10,42 +10,46 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertFalse(path.contains("/Application Support/RepoPrompt/Settings/globalSettings.json"), path)
     }
 
-    func testMissingGlobalSettingsCreatesCurrentDefaultsAndIgnoresLegacyDefaults() throws {
+    func testMissingGlobalSettingsCreatesCurrentDefaultsAndIgnoresObsoleteDefaults() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
         let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.set(false, forKey: "respectGitignore")
+        defaults.set(false, forKey: obsoleteGitignorePreferenceKey)
 
         let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
         let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
         let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
-        XCTAssertTrue(store.respectGitignore())
         XCTAssertTrue(store.respectRepoIgnore())
         XCTAssertTrue(store.respectCursorignore())
         XCTAssertTrue(store.skipSymlinks())
     }
 
-    func testExplicitJSONRespectGitignoreFalseIsPreserved() throws {
+    func testObsoleteGitignoreJSONKeyIsIgnoredAndNeverEmitted() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
         let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
         let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
-        try fileStore.save(GlobalSettingsDocument(
-            scalarPreferences: GlobalScalarPreferences(
-                fileSystem: .init(respectGitignore: false)
-            )
-        ))
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let json = """
+        {"schemaVersion":2,"updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{},"scalarPreferences":{"fileSystem":{"\(obsoleteGitignorePreferenceKey)":false,"respectRepoIgnore":false}}}
+        """
+        try Data(json.utf8).write(to: fileURL)
 
         let store = try GlobalSettingsStore(
             defaults: XCTUnwrap(UserDefaults(suiteName: "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)")),
             fileStore: fileStore
         )
 
-        XCTAssertFalse(store.respectGitignore())
+        XCTAssertFalse(store.respectRepoIgnore())
+        store.setShowEmptyFolders(true)
+
+        let persisted = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertFalse(persisted.contains(obsoleteGitignorePreferenceKey))
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.fileSystem?.showEmptyFolders, true)
     }
 
     func testWorktreeVisualIdentityDefaultsAreEmptyAndFallbackDoesNotPersist() throws {
@@ -336,5 +340,9 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             .appendingPathComponent("SettingsJSONOnlyPersistenceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private var obsoleteGitignorePreferenceKey: String {
+        ["respect", "Git", "ignore"].joined()
     }
 }

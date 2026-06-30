@@ -283,6 +283,47 @@ extension MCPServerViewModel {
         case explicitHint
     }
 
+    enum MCPTabContextSelectionMirrorPolicy {
+        struct Result: Equatable {
+            let selection: StoredSelection
+            let preservedManualMode: Bool
+        }
+
+        static func isExplicitAutoReset(_ selection: StoredSelection) -> Bool {
+            selection.codemapAutoEnabled
+                && selection.selectedPaths.isEmpty
+                && selection.manualCodemapPaths.isEmpty
+                && selection.slices.isEmpty
+        }
+
+        static func reconcileIncomingSnapshotSelection(
+            boundSelection: StoredSelection,
+            incomingSnapshotSelection: StoredSelection,
+            isRunScopedWorktreeContext: Bool
+        ) -> Result {
+            if isRunScopedWorktreeContext {
+                return Result(selection: boundSelection, preservedManualMode: false)
+            }
+
+            if boundSelection.codemapAutoEnabled == false,
+               incomingSnapshotSelection.codemapAutoEnabled,
+               !isExplicitAutoReset(incomingSnapshotSelection)
+            {
+                return Result(
+                    selection: StoredSelection(
+                        selectedPaths: incomingSnapshotSelection.selectedPaths,
+                        manualCodemapPaths: boundSelection.manualCodemapPaths,
+                        slices: incomingSnapshotSelection.slices,
+                        codemapAutoEnabled: false
+                    ),
+                    preservedManualMode: true
+                )
+            }
+
+            return Result(selection: incomingSnapshotSelection, preservedManualMode: false)
+        }
+    }
+
     struct TabContextHint: Equatable {
         let tabID: UUID
         let workspaceID: UUID?
@@ -716,19 +757,18 @@ extension MCPServerViewModel {
                         return
                     }
 
-                    // 3) Merge snapshot into bound context, but preserve manual codemap mode once set.
+                    // 3) Merge snapshot into bound context, but preserve frozen run-scoped
+                    // worktree selection. The visible compose-tab snapshot can lag or be
+                    // intentionally empty for hidden worktree runs; importing it would erase
+                    // the source selection used by run-scoped tools.
                     guard var bound = self.tabContextByConnectionID[connectionID] else { return }
-                    var incomingSelection = snapshot.selection
-
-                    // Preserve manual=false stickiness
-                    let wasManual = (bound.selection.codemapAutoEnabled == false)
-                    if wasManual && incomingSelection.codemapAutoEnabled == true {
-                        incomingSelection = StoredSelection(
-                            selectedPaths: incomingSelection.selectedPaths,
-                            autoCodemapPaths: incomingSelection.autoCodemapPaths,
-                            slices: incomingSelection.slices,
-                            codemapAutoEnabled: false
-                        )
+                    let mirrorResult = MCPTabContextSelectionMirrorPolicy.reconcileIncomingSnapshotSelection(
+                        boundSelection: bound.selection,
+                        incomingSnapshotSelection: snapshot.selection,
+                        isRunScopedWorktreeContext: bound.runID != nil && !bound.worktreeBindings.isEmpty
+                    )
+                    let incomingSelection = mirrorResult.selection
+                    if mirrorResult.preservedManualMode {
                         // DON'T call commitTabContext here - it creates an infinite loop!
                         // The bound context correction is enough; next operation will sync to UI.
                         tabContextLog("preserved manual mode on snapshot connectionID=\(connectionID) tab=\(context.tabID)")
@@ -1651,6 +1691,58 @@ extension MCPServerViewModel {
         let autoSelectedAliases: [String]
     }
 
+    private func selectionForPrimaryGitArtifactCommit(
+        latestSelection: StoredSelection,
+        contextSelection: StoredSelection
+    ) -> StoredSelection {
+        func appendUnique(
+            _ paths: [String],
+            to output: inout [String],
+            identities: inout Set<String>
+        ) {
+            for path in paths {
+                let identity = StoredSelectionPathNormalization.standardizedPath(path) ?? path
+                guard !identity.isEmpty, identities.insert(identity).inserted else { continue }
+                output.append(path)
+            }
+        }
+
+        var selectedPaths: [String] = []
+        var selectedIdentities = Set<String>()
+        appendUnique(contextSelection.selectedPaths, to: &selectedPaths, identities: &selectedIdentities)
+        appendUnique(latestSelection.selectedPaths, to: &selectedPaths, identities: &selectedIdentities)
+
+        var manualCodemapPaths: [String] = []
+        var manualCodemapIdentities = Set<String>()
+        appendUnique(
+            contextSelection.manualCodemapPaths,
+            to: &manualCodemapPaths,
+            identities: &manualCodemapIdentities
+        )
+        appendUnique(
+            latestSelection.manualCodemapPaths,
+            to: &manualCodemapPaths,
+            identities: &manualCodemapIdentities
+        )
+
+        var slices = contextSelection.slices
+        var sliceIdentities = Set(contextSelection.slices.keys.map {
+            StoredSelectionPathNormalization.standardizedPath($0) ?? $0
+        })
+        for (path, ranges) in latestSelection.slices {
+            let identity = StoredSelectionPathNormalization.standardizedPath(path) ?? path
+            guard !identity.isEmpty, sliceIdentities.insert(identity).inserted else { continue }
+            slices[path] = ranges
+        }
+
+        return StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: contextSelection.codemapAutoEnabled && latestSelection.codemapAutoEnabled
+        )
+    }
+
     enum MCPManageSelectionArtifactCommitResult: Equatable {
         case committed(selection: StoredSelection, selectionRevision: UInt64)
         case conflict(reason: String)
@@ -1790,13 +1882,24 @@ extension MCPServerViewModel {
         if !resolved.usesActiveTabCompatibility,
            let canonicalSelection = verification.canonicalSelection,
            canonicalSelection == verification.expectedSelection,
-           let connectionID = metadata.connectionID,
-           let latest = tabContextByConnectionID[connectionID],
-           latest.tabID == context.tabID,
-           latest.windowID == context.windowID,
-           latest.workspaceID == context.workspaceID,
-           latest.runID == context.runID,
-           latest.readFileAutoSelectionGeneration == context.readFileAutoSelectionGeneration
+           MCPTabContextSelectionMirrorPolicy.isExplicitAutoReset(canonicalSelection)
+        {
+            synchronizeBoundTabContextAfterVerifiedAutoReset(
+                resolvedContext: resolved,
+                persistedContext: context,
+                canonicalSelection: canonicalSelection,
+                metadata: metadata
+            )
+        } else if !resolved.usesActiveTabCompatibility,
+                  let canonicalSelection = verification.canonicalSelection,
+                  canonicalSelection == verification.expectedSelection,
+                  let connectionID = metadata.connectionID,
+                  let latest = tabContextByConnectionID[connectionID],
+                  latest.tabID == context.tabID,
+                  latest.windowID == context.windowID,
+                  latest.workspaceID == context.workspaceID,
+                  latest.runID == context.runID,
+                  latest.readFileAutoSelectionGeneration == context.readFileAutoSelectionGeneration
         {
             var refreshed = selectionOnlyCommitContext(from: context)
             refreshed.selection = canonicalSelection
@@ -1810,6 +1913,40 @@ extension MCPServerViewModel {
             tabContextByConnectionID[connectionID] = refreshed
         }
         return verification
+    }
+
+    @MainActor
+    private func synchronizeBoundTabContextAfterVerifiedAutoReset(
+        resolvedContext: ResolvedTabContextSnapshot,
+        persistedContext: TabContextSnapshot,
+        canonicalSelection: StoredSelection,
+        metadata: RequestMetadata
+    ) {
+        guard MCPTabContextSelectionMirrorPolicy.isExplicitAutoReset(canonicalSelection),
+              !resolvedContext.usesActiveTabCompatibility,
+              resolvedContext.source != nil,
+              let connectionID = metadata.connectionID,
+              var latest = tabContextByConnectionID[connectionID],
+              latest.tabID == persistedContext.tabID,
+              latest.windowID == persistedContext.windowID,
+              latest.runID == persistedContext.runID,
+              latest.readFileAutoSelectionGeneration == persistedContext.readFileAutoSelectionGeneration
+        else { return }
+        if let latestWorkspaceID = latest.workspaceID,
+           let persistedWorkspaceID = persistedContext.workspaceID,
+           latestWorkspaceID != persistedWorkspaceID
+        {
+            return
+        }
+
+        latest.selection = canonicalSelection
+        if let workspaceID = persistedContext.workspaceID {
+            latest.selectionRevision = workspaceManager?.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: persistedContext.tabID
+            ) ?? latest.selectionRevision
+        }
+        tabContextByConnectionID[connectionID] = latest
     }
 
     struct ReadFileAutoSelectionAuthoritativeResult: Equatable {
@@ -1859,7 +1996,9 @@ extension MCPServerViewModel {
         let logicalExpectedBaseSelection = lookupContext.logicalizeSelection(expectedBaseSelection)
         let expectedBaseForPreservation = StoredSelection(
             selectedPaths: StoredSelectionPathNormalization.standardizedPaths(logicalExpectedBaseSelection.selectedPaths),
-            autoCodemapPaths: StoredSelectionPathNormalization.standardizedPaths(logicalExpectedBaseSelection.autoCodemapPaths),
+            manualCodemapPaths: StoredSelectionPathNormalization.standardizedPaths(
+                logicalExpectedBaseSelection.manualCodemapPaths
+            ),
             slices: StoredSelectionPathNormalization.standardizedSlices(logicalExpectedBaseSelection.slices).mapValues {
                 SliceRangeMath.normalize($0)
             },
@@ -1867,7 +2006,9 @@ extension MCPServerViewModel {
         )
         let persistedSelection = StoredSelection(
             selectedPaths: StoredSelectionPathNormalization.standardizedPaths(logicalSelection.selectedPaths),
-            autoCodemapPaths: StoredSelectionPathNormalization.standardizedPaths(logicalSelection.autoCodemapPaths),
+            manualCodemapPaths: StoredSelectionPathNormalization.standardizedPaths(
+                logicalSelection.manualCodemapPaths
+            ),
             slices: StoredSelectionPathNormalization.standardizedSlices(logicalSelection.slices).mapValues {
                 SliceRangeMath.normalize($0)
             },
@@ -3012,7 +3153,8 @@ extension MCPServerViewModel {
     @MainActor
     func commitPrimaryGitArtifactsToCurrentTab(
         toolName: String,
-        candidates: [GitDiffPublishedArtifact]
+        candidates: [GitDiffPublishedArtifact],
+        sourceSelection: StoredSelection? = nil
     ) async throws -> PrimaryGitArtifactCommitResult {
         let (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
         guard let workspaceID = context.workspaceID,
@@ -3022,19 +3164,33 @@ extension MCPServerViewModel {
         }
 
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        let lookupContext = await lookupContext(for: context)
+        let contextSelection = sourceSelection ?? Self.logicalizeSelectionForPersistence(
+            context.selection,
+            lookupContext: lookupContext
+        )
         var mergeResult: WorkspaceGitDiffArtifactSelectionMergeResult?
         guard let transaction = await selectionCoordinator.transformSelection(
             for: identity,
             source: .mcpTabContext,
-            mirrorToUIIfActive: context.worktreeBindings.isEmpty
-        ) { latestSelection in
-            let merged = mergePrimaryGitDiffArtifactsIntoSelection(
-                existing: latestSelection,
-                candidates: candidates
-            )
-            mergeResult = merged
-            return merged.selection
-        }, let mergeResult else {
+            mirrorToUIIfActive: context.worktreeBindings.isEmpty,
+            { latestSelection in
+                let latestSelection = Self.logicalizeSelectionForPersistence(
+                    latestSelection,
+                    lookupContext: lookupContext
+                )
+                let commitBase = selectionForPrimaryGitArtifactCommit(
+                    latestSelection: latestSelection,
+                    contextSelection: contextSelection
+                )
+                let merged = mergePrimaryGitDiffArtifactsIntoSelection(
+                    existing: commitBase,
+                    candidates: candidates
+                )
+                mergeResult = merged
+                return merged.selection
+            }
+        ), let mergeResult else {
             throw MCPError.internalError("Canonical tab selection could not commit Git artifacts")
         }
 

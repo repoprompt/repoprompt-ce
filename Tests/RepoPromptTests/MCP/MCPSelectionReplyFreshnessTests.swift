@@ -4,6 +4,52 @@ import XCTest
 
 @MainActor
 final class MCPSelectionReplyFreshnessTests: XCTestCase {
+    func testFullIssuePathReturnsAbsoluteForExactlyOneAuthorizedRoot() {
+        let root = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/workspace/project")
+        let path = "/workspace/project/Sources/Missing.swift"
+
+        XCTAssertEqual(
+            MCPServerViewModel.SelectionReplyAssembler.logicalIssuePath(
+                path,
+                roots: [root],
+                rootDisplayNamesByRootID: [root.id: root.name],
+                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+                display: .full
+            ),
+            path
+        )
+    }
+
+    func testFullIssuePathRedactsOutOfScopeAndCrossRootStaleSelections() {
+        let authorizedRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/workspace/project")
+        let nestedRoot = WorkspaceRootRef(id: UUID(), name: "Nested", fullPath: "/workspace/project/Packages/Nested")
+        let labels = [authorizedRoot.id: authorizedRoot.name, nestedRoot.id: nestedRoot.name]
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let scenarios: [(path: String, roots: [WorkspaceRootRef], expected: String)] = [
+            ("/private/outside/Secret.swift", [authorizedRoot], "unmapped:Secret.swift"),
+            ("/workspace/other/Stale.swift", [authorizedRoot], "unmapped:Stale.swift"),
+            (
+                "/workspace/project/Packages/Nested/Ambiguous.swift",
+                [authorizedRoot, nestedRoot],
+                "unmapped:Ambiguous.swift"
+            )
+        ]
+
+        for scenario in scenarios {
+            XCTAssertEqual(
+                MCPServerViewModel.SelectionReplyAssembler.logicalIssuePath(
+                    scenario.path,
+                    roots: scenario.roots,
+                    rootDisplayNamesByRootID: labels,
+                    lookupContext: lookupContext,
+                    display: .full
+                ),
+                scenario.expected,
+                scenario.path
+            )
+        }
+    }
+
     func testMutationReplyRereadsLiveTabSelectionAfterProviderStabilization() async throws {
         let root = try makeTemporaryRoot(name: "MutationReply")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -162,7 +208,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         )
         let freshSelection = StoredSelection(
             selectedPaths: [fullFile.path],
-            autoCodemapPaths: [codemapFile.path],
             slices: [slicedFile.path: [LineRange(start: 1, end: 1)]],
             codemapAutoEnabled: false
         )
@@ -424,8 +469,129 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             lookupContext: providerResolvedLookupContext
         )
 
-        XCTAssertEqual(currentReply.files?.map(\.path), [logicalFile.path])
-        XCTAssertEqual(mutationReply.files?.map(\.path), [logicalFile.path])
+        let projectedDisplayPath = "\(workspaceRoot.lastPathComponent)/\(worktreeFile.lastPathComponent)"
+        XCTAssertEqual(currentReply.files?.map(\.path), [projectedDisplayPath])
+        XCTAssertEqual(mutationReply.files?.map(\.path), [projectedDisplayPath])
+    }
+
+    func testWorktreeProjectedFullSelectionPathsUseDisambiguatedLogicalRootLabels() async throws {
+        let firstLogicalRoot = try makeTemporaryRoot(name: "repo")
+        let secondLogicalRoot = try makeTemporaryRoot(name: "repo")
+        let firstWorktreeRoot = try makeTemporaryRoot(name: "worktree-one")
+        let secondWorktreeRoot = try makeTemporaryRoot(name: "worktree-two")
+        defer {
+            try? FileManager.default.removeItem(at: firstLogicalRoot.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondLogicalRoot.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: firstWorktreeRoot.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondWorktreeRoot.deletingLastPathComponent())
+        }
+        try write("struct FirstLogicalPlaceholder {}\n", to: firstLogicalRoot.appendingPathComponent("Placeholder.swift"))
+        try write("struct SecondLogicalPlaceholder {}\n", to: secondLogicalRoot.appendingPathComponent("Placeholder.swift"))
+        let firstRelativePath = "Sources/First.swift"
+        let secondRelativePath = "Sources/Second.swift"
+        try write("struct FirstWorktreeOnly {}\n", to: firstWorktreeRoot.appendingPathComponent(firstRelativePath))
+        try write("struct SecondWorktreeOnly {}\n", to: secondWorktreeRoot.appendingPathComponent(secondRelativePath))
+
+        let tabID = UUID()
+        let logicalSelection = StoredSelection(selectedPaths: [
+            firstLogicalRoot.appendingPathComponent(firstRelativePath).path,
+            secondLogicalRoot.appendingPathComponent(secondRelativePath).path
+        ])
+        let (window, workspaceID) = await makeWindow(
+            roots: [firstLogicalRoot, secondLogicalRoot],
+            tabID: tabID,
+            selection: logicalSelection
+        )
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let firstLogicalLoaded = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: firstLogicalRoot.path
+        )
+        let secondLogicalLoaded = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: secondLogicalRoot.path
+        )
+        let firstPhysicalLoaded = try await window.workspaceFileContextStore.loadRoot(
+            path: firstWorktreeRoot.path,
+            kind: .sessionWorktree
+        )
+        let secondPhysicalLoaded = try await window.workspaceFileContextStore.loadRoot(
+            path: secondWorktreeRoot.path,
+            kind: .sessionWorktree
+        )
+        let firstLogicalRef = WorkspaceRootRef(
+            id: firstLogicalLoaded.id,
+            name: firstLogicalLoaded.name,
+            fullPath: firstLogicalLoaded.standardizedFullPath
+        )
+        let secondLogicalRef = WorkspaceRootRef(
+            id: secondLogicalLoaded.id,
+            name: secondLogicalLoaded.name,
+            fullPath: secondLogicalLoaded.standardizedFullPath
+        )
+        let firstPhysicalRef = WorkspaceRootRef(
+            id: firstPhysicalLoaded.id,
+            name: firstPhysicalLoaded.name,
+            fullPath: firstPhysicalLoaded.standardizedFullPath
+        )
+        let secondPhysicalRef = WorkspaceRootRef(
+            id: secondPhysicalLoaded.id,
+            name: secondPhysicalLoaded.name,
+            fullPath: secondPhysicalLoaded.standardizedFullPath
+        )
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: firstLogicalRef,
+                    physicalRoot: firstPhysicalRef,
+                    binding: makeBinding(logicalRoot: firstLogicalRef, physicalRoot: firstPhysicalRef, suffix: "-first")
+                ),
+                .init(
+                    logicalRoot: secondLogicalRef,
+                    physicalRoot: secondPhysicalRef,
+                    binding: makeBinding(logicalRoot: secondLogicalRef, physicalRoot: secondPhysicalRef, suffix: "-second")
+                )
+            ],
+            visibleLogicalRoots: [firstLogicalRef, secondLogicalRef]
+        )
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: projection.lookupRootScope,
+            bindingProjection: projection
+        )
+        let labels = await lookupContext.logicalRootDisplayNamesByRootID(store: window.workspaceFileContextStore)
+        let firstLabel = try XCTUnwrap(labels[firstPhysicalLoaded.id])
+        let secondLabel = try XCTUnwrap(labels[secondPhysicalLoaded.id])
+        XCTAssertNotEqual(firstLabel, secondLabel)
+
+        let firstPhysicalFiles = await window.workspaceFileContextStore.files(inRoot: firstPhysicalLoaded.id)
+        let secondPhysicalFiles = await window.workspaceFileContextStore.files(inRoot: secondPhysicalLoaded.id)
+        let firstFile = try XCTUnwrap(
+            firstPhysicalFiles.first { $0.standardizedRelativePath == firstRelativePath }
+        )
+        let secondFile = try XCTUnwrap(
+            secondPhysicalFiles.first { $0.standardizedRelativePath == secondRelativePath }
+        )
+        let formatter = MCPServerViewModel.PathFormatter(
+            format: .full,
+            owner: window.mcpServer,
+            projection: projection,
+            rootScope: projection.lookupRootScope
+        )
+        let firstPath = await formatter.displayPath(for: firstFile)
+        let secondPath = await formatter.displayPath(for: secondFile)
+        let paths = [firstPath, secondPath]
+        XCTAssertEqual(Set(paths), [
+            "\(firstLabel)/\(firstRelativePath)",
+            "\(secondLabel)/\(secondRelativePath)"
+        ])
+        for path in paths {
+            XCTAssertFalse(path.hasPrefix(firstLogicalRoot.path), path)
+            XCTAssertFalse(path.hasPrefix(secondLogicalRoot.path), path)
+            XCTAssertFalse(path.hasPrefix(firstWorktreeRoot.path), path)
+            XCTAssertFalse(path.hasPrefix(secondWorktreeRoot.path), path)
+        }
     }
 
     #if DEBUG
@@ -1284,6 +1450,14 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         tabID: UUID,
         selection: StoredSelection
     ) async -> (window: WindowState, workspaceID: UUID) {
+        await makeWindow(roots: [root], tabID: tabID, selection: selection)
+    }
+
+    private func makeWindow(
+        roots: [URL],
+        tabID: UUID,
+        selection: StoredSelection
+    ) async -> (window: WindowState, workspaceID: UUID) {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
@@ -1292,7 +1466,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
 
         let workspace = WorkspaceModel(
             name: "Selection Reply \(UUID().uuidString.prefix(8))",
-            repoPaths: [root.path],
+            repoPaths: roots.map(\.path),
             ephemeralFlag: true,
             composeTabs: [ComposeTabState(id: tabID, name: "Agent", selection: selection)],
             activeComposeTabID: tabID
@@ -1329,15 +1503,16 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
 
     private func makeBinding(
         logicalRoot: WorkspaceRootRef,
-        physicalRoot: WorkspaceRootRef
+        physicalRoot: WorkspaceRootRef,
+        suffix: String = ""
     ) -> AgentSessionWorktreeBinding {
         AgentSessionWorktreeBinding(
-            id: "selection-reply-binding",
+            id: "selection-reply-binding\(suffix)",
             repositoryID: "selection-reply-repository",
             repoKey: "selection-reply-repo-key",
             logicalRootPath: logicalRoot.standardizedFullPath,
             logicalRootName: logicalRoot.name,
-            worktreeID: "selection-reply-worktree",
+            worktreeID: "selection-reply-worktree\(suffix)",
             worktreeRootPath: physicalRoot.standardizedFullPath,
             worktreeName: URL(fileURLWithPath: physicalRoot.standardizedFullPath).lastPathComponent,
             branch: "feature/selection-reply",

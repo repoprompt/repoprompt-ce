@@ -8,8 +8,24 @@ import Foundation
 extension FileSystemService {
     struct DirEntry {
         let name: String
+        let nameBytes: Data
         let isDir: Bool
         let isSym: Bool
+        let fileSystemMode: UInt16
+
+        init(
+            name: String,
+            nameBytes: Data? = nil,
+            isDir: Bool,
+            isSym: Bool,
+            fileSystemMode: UInt16 = 0
+        ) {
+            self.name = name
+            self.nameBytes = nameBytes ?? Data(name.utf8)
+            self.isDir = isDir
+            self.isSym = isSym
+            self.fileSystemMode = fileSystemMode
+        }
     }
 
     /// Result of scanning a directory including ignore file detection
@@ -117,6 +133,7 @@ extension FileSystemService {
 
     private struct DecodedDirentName {
         let name: String
+        let bytes: Data
         let length: Int
     }
 
@@ -154,9 +171,32 @@ extension FileSystemService {
 
             guard length > 0 else { return nil }
 
-            let name = String(decoding: buffer.prefix(length), as: UTF8.self)
-            return DecodedDirentName(name: name, length: length)
+            let bytes = Data(buffer.prefix(length))
+            let name = String(decoding: bytes, as: UTF8.self)
+            return DecodedDirentName(name: name, bytes: bytes, length: length)
         }
+    }
+
+    private static func descriptorRelativeMode(
+        dir: UnsafeMutablePointer<DIR>,
+        entry: dirent,
+        nameLength: Int
+    ) -> UInt16 {
+        let fd = dirfd(dir)
+        guard fd >= 0 else { return 0 }
+        var nameBuffer = [CChar](repeating: 0, count: nameLength + 1)
+        withUnsafeBytes(of: entry.d_name) { rawBuffer in
+            let buffer = rawBuffer.bindMemory(to: UInt8.self)
+            for index in 0 ..< min(nameLength, buffer.count) {
+                nameBuffer[index] = CChar(bitPattern: buffer[index])
+            }
+        }
+        var status = stat()
+        let result = nameBuffer.withUnsafeBufferPointer { buffer -> Int32 in
+            guard let base = buffer.baseAddress else { return -1 }
+            return fstatat(fd, base, &status, AT_SYMLINK_NOFOLLOW)
+        }
+        return result == 0 ? UInt16(truncatingIfNeeded: status.st_mode) : 0
     }
 
     private static func fileTypeFallback(
@@ -284,7 +324,17 @@ extension FileSystemService {
             }
 
             // Add the entry to the results
-            entries.append(DirEntry(name: fileName, isDir: isDir, isSym: isSym))
+            entries.append(DirEntry(
+                name: fileName,
+                nameBytes: decoded.bytes,
+                isDir: isDir,
+                isSym: isSym,
+                fileSystemMode: descriptorRelativeMode(
+                    dir: dir,
+                    entry: dirent,
+                    nameLength: decoded.length
+                )
+            ))
         }
 
         return DirectoryScanResult(
@@ -321,7 +371,7 @@ extension FileSystemService {
 
         for i in 0 ..< count {
             // Copy dirent into local var so the pointer remains valid for the entire iteration
-            var localDirent = namelist![Int(i)]!.pointee
+            let localDirent = namelist![Int(i)]!.pointee
 
             // Safely convert d_name -> Swift String
             guard let decoded = decodeDirentName(localDirent) else {
@@ -368,7 +418,12 @@ extension FileSystemService {
             }
 
             // Finally, record the entry
-            entries.append(DirEntry(name: rawName, isDir: isDir, isSym: isSym))
+            entries.append(DirEntry(
+                name: rawName,
+                nameBytes: decoded.bytes,
+                isDir: isDir,
+                isSym: isSym
+            ))
         }
 
         return entries

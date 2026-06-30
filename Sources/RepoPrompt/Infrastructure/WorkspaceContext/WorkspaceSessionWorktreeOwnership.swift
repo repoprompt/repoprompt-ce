@@ -53,11 +53,52 @@ enum WorkspaceAuthorizedSelectionCandidateResolution: Equatable {
     case staleAuthority(WorkspaceSessionRootAuthorizationMismatch)
 }
 
+struct WorkspaceRootSeedShadowScope: Hashable {
+    let token: WorkspaceSessionWorktreeOwnershipToken
+    let bindingFingerprint: String
+    let rootID: UUID
+    let lifetimeID: UUID
+    let standardizedPhysicalPath: String
+    let catalogGeneration: UInt64
+    let appliedIndexGeneration: UInt64
+}
+
+struct WorkspaceRootSeedShadowPreparation {
+    let scope: WorkspaceRootSeedShadowScope
+    let snapshot: WorkspaceRootReusableSnapshot
+    let planHandle: WorkspaceRootTargetSeedPlanHandle
+}
+
 struct WorkspaceSessionWorktreeOwnershipPreparation {
     let token: WorkspaceSessionWorktreeOwnershipToken
     let bindingFingerprint: String
     let roots: [WorkspaceSessionWorktreeOwnedRoot]
     let reusesInstalledOwnership: Bool
+    let materializationHintObservationsByPhysicalRootPath: [
+        String: WorkspaceRootMaterializationHintObservation
+    ]
+    let rootSeedShadowPreparations: [WorkspaceRootSeedShadowPreparation]
+    let pendingSeededRootPreparations: [WorkspacePendingSeededRootPreparation]
+
+    init(
+        token: WorkspaceSessionWorktreeOwnershipToken,
+        bindingFingerprint: String,
+        roots: [WorkspaceSessionWorktreeOwnedRoot],
+        reusesInstalledOwnership: Bool,
+        materializationHintObservationsByPhysicalRootPath: [
+            String: WorkspaceRootMaterializationHintObservation
+        ] = [:],
+        rootSeedShadowPreparations: [WorkspaceRootSeedShadowPreparation] = [],
+        pendingSeededRootPreparations: [WorkspacePendingSeededRootPreparation] = []
+    ) {
+        self.token = token
+        self.bindingFingerprint = bindingFingerprint
+        self.roots = roots
+        self.reusesInstalledOwnership = reusesInstalledOwnership
+        self.materializationHintObservationsByPhysicalRootPath = materializationHintObservationsByPhysicalRootPath
+        self.rootSeedShadowPreparations = rootSeedShadowPreparations
+        self.pendingSeededRootPreparations = pendingSeededRootPreparations
+    }
 }
 
 enum WorkspaceSessionWorktreeOwnershipError: LocalizedError, Equatable {

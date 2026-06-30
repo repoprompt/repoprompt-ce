@@ -396,9 +396,277 @@
         }
     }
 
+    struct WorkspaceFileSearchColdStartSnapshot: Equatable {
+        struct Materialization: Equatable {
+            let totalMicroseconds: UInt64
+            let prepareMicroseconds: UInt64
+            let commitMicroseconds: UInt64
+        }
+
+        struct RootCrawl: Equatable {
+            let count: Int
+            let totalMicroseconds: UInt64
+            let maximumMicroseconds: UInt64
+            let filesDiscovered: Int
+            let foldersDiscovered: Int
+        }
+
+        struct SchedulerWorkload: Equatable {
+            let requestCount: Int
+            let enqueueCount: Int
+            let grantCount: Int
+            let completionCount: Int
+            let cancellationCount: Int
+            let failureCount: Int
+            let totalWaitMicroseconds: UInt64
+            let maximumWaitMicroseconds: UInt64
+            let totalExecutionMicroseconds: UInt64
+        }
+
+        struct Codemap: Equatable {
+            let collectionPassCount: Int
+            let filesCollected: Int
+            let collectionMicroseconds: UInt64
+            let requestBuildPassCount: Int
+            let requestsBuilt: Int
+            let requestBuildMicroseconds: UInt64
+            let submissionPassCount: Int
+            let requestsSubmitted: Int
+            let submissionMicroseconds: UInt64
+            let scansStarted: Int
+            let scansCompleted: Int
+            let scansCancelled: Int
+            let scanMicroseconds: UInt64
+        }
+
+        let materialization: Materialization
+        let rootCrawl: RootCrawl
+        let schedulerByWorkload: [String: SchedulerWorkload]
+        let codemap: Codemap
+    }
+
+    final class WorkspaceFileSearchColdStartCollector: @unchecked Sendable {
+        private struct SchedulerState {
+            var requestCount = 0
+            var enqueueCount = 0
+            var grantCount = 0
+            var completionCount = 0
+            var cancellationCount = 0
+            var failureCount = 0
+            var totalWaitNanoseconds: UInt64 = 0
+            var maximumWaitNanoseconds: UInt64 = 0
+            var totalExecutionNanoseconds: UInt64 = 0
+        }
+
+        private struct State {
+            var materializationNanoseconds: UInt64 = 0
+            var prepareNanoseconds: UInt64 = 0
+            var commitNanoseconds: UInt64 = 0
+            var rootCrawlCount = 0
+            var rootCrawlNanoseconds: UInt64 = 0
+            var maximumRootCrawlNanoseconds: UInt64 = 0
+            var filesDiscovered = 0
+            var foldersDiscovered = 0
+            var schedulerByWorkload: [String: SchedulerState] = [:]
+            var codemapCollectionPassCount = 0
+            var codemapFilesCollected = 0
+            var codemapCollectionNanoseconds: UInt64 = 0
+            var codemapRequestBuildPassCount = 0
+            var codemapRequestsBuilt = 0
+            var codemapRequestBuildNanoseconds: UInt64 = 0
+            var activeCodemapRequestBuildStartNanoseconds: UInt64?
+            var codemapSubmissionPassCount = 0
+            var codemapRequestsSubmitted = 0
+            var codemapSubmissionNanoseconds: UInt64 = 0
+            var codemapScansStarted = 0
+            var codemapScansCompleted = 0
+            var codemapScansCancelled = 0
+            var codemapScanNanoseconds: UInt64 = 0
+        }
+
+        private let lock = NSLock()
+        private var state = State()
+
+        func recordMaterialization(
+            totalNanoseconds: UInt64,
+            prepareNanoseconds: UInt64,
+            commitNanoseconds: UInt64
+        ) {
+            withState {
+                $0.materializationNanoseconds &+= totalNanoseconds
+                $0.prepareNanoseconds &+= prepareNanoseconds
+                $0.commitNanoseconds &+= commitNanoseconds
+            }
+        }
+
+        func recordRootCrawl(nanoseconds: UInt64, files: Int, folders: Int) {
+            withState {
+                $0.rootCrawlCount += 1
+                $0.rootCrawlNanoseconds &+= nanoseconds
+                $0.maximumRootCrawlNanoseconds = max($0.maximumRootCrawlNanoseconds, nanoseconds)
+                $0.filesDiscovered += files
+                $0.foldersDiscovered += folders
+            }
+        }
+
+        func recordSchedulerRequest(workload: String) {
+            withSchedulerState(workload: workload) { $0.requestCount += 1 }
+        }
+
+        func recordSchedulerEnqueue(workload: String) {
+            withSchedulerState(workload: workload) { $0.enqueueCount += 1 }
+        }
+
+        func recordSchedulerGrant(workload: String, waitNanoseconds: UInt64) {
+            withSchedulerState(workload: workload) {
+                $0.grantCount += 1
+                $0.totalWaitNanoseconds &+= waitNanoseconds
+                $0.maximumWaitNanoseconds = max($0.maximumWaitNanoseconds, waitNanoseconds)
+            }
+        }
+
+        func recordSchedulerCompletion(
+            workload: String,
+            executionNanoseconds: UInt64,
+            cancelled: Bool,
+            failed: Bool
+        ) {
+            withSchedulerState(workload: workload) {
+                if cancelled {
+                    $0.cancellationCount += 1
+                } else if failed {
+                    $0.failureCount += 1
+                } else {
+                    $0.completionCount += 1
+                }
+                $0.totalExecutionNanoseconds &+= executionNanoseconds
+            }
+        }
+
+        func recordCodemapCollection(nanoseconds: UInt64, files: Int) {
+            withState {
+                $0.codemapCollectionPassCount += 1
+                $0.codemapFilesCollected += files
+                $0.codemapCollectionNanoseconds &+= nanoseconds
+            }
+        }
+
+        func beginCodemapRequestBuild(at startNanoseconds: UInt64) {
+            withState {
+                $0.codemapRequestBuildPassCount += 1
+                $0.activeCodemapRequestBuildStartNanoseconds = startNanoseconds
+            }
+        }
+
+        func recordCodemapRequestPrepared() {
+            withState { $0.codemapRequestsBuilt += 1 }
+        }
+
+        func finishCodemapRequestBuild(nanoseconds: UInt64) {
+            withState {
+                $0.codemapRequestBuildNanoseconds &+= nanoseconds
+                $0.activeCodemapRequestBuildStartNanoseconds = nil
+            }
+        }
+
+        func recordCodemapSubmission(nanoseconds: UInt64, requests: Int) {
+            withState {
+                $0.codemapSubmissionPassCount += 1
+                $0.codemapRequestsSubmitted += requests
+                $0.codemapSubmissionNanoseconds &+= nanoseconds
+            }
+        }
+
+        func recordCodemapScanStarted() {
+            withState { $0.codemapScansStarted += 1 }
+        }
+
+        func recordCodemapScanFinished(nanoseconds: UInt64, cancelled: Bool) {
+            withState {
+                if cancelled {
+                    $0.codemapScansCancelled += 1
+                } else {
+                    $0.codemapScansCompleted += 1
+                }
+                $0.codemapScanNanoseconds &+= nanoseconds
+            }
+        }
+
+        func snapshot() -> WorkspaceFileSearchColdStartSnapshot {
+            let captured = readState()
+            let requestBuildNanoseconds = captured.codemapRequestBuildNanoseconds &+ (
+                captured.activeCodemapRequestBuildStartNanoseconds.map {
+                    WorkspaceFileSearchDebugTiming.elapsed(
+                        since: $0,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    )
+                } ?? 0
+            )
+            return WorkspaceFileSearchColdStartSnapshot(
+                materialization: .init(
+                    totalMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.materializationNanoseconds),
+                    prepareMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.prepareNanoseconds),
+                    commitMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.commitNanoseconds)
+                ),
+                rootCrawl: .init(
+                    count: captured.rootCrawlCount,
+                    totalMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.rootCrawlNanoseconds),
+                    maximumMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.maximumRootCrawlNanoseconds),
+                    filesDiscovered: captured.filesDiscovered,
+                    foldersDiscovered: captured.foldersDiscovered
+                ),
+                schedulerByWorkload: captured.schedulerByWorkload.mapValues { workload in
+                    .init(
+                        requestCount: workload.requestCount,
+                        enqueueCount: workload.enqueueCount,
+                        grantCount: workload.grantCount,
+                        completionCount: workload.completionCount,
+                        cancellationCount: workload.cancellationCount,
+                        failureCount: workload.failureCount,
+                        totalWaitMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(workload.totalWaitNanoseconds),
+                        maximumWaitMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(workload.maximumWaitNanoseconds),
+                        totalExecutionMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(workload.totalExecutionNanoseconds)
+                    )
+                },
+                codemap: .init(
+                    collectionPassCount: captured.codemapCollectionPassCount,
+                    filesCollected: captured.codemapFilesCollected,
+                    collectionMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.codemapCollectionNanoseconds),
+                    requestBuildPassCount: captured.codemapRequestBuildPassCount,
+                    requestsBuilt: captured.codemapRequestsBuilt,
+                    requestBuildMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(requestBuildNanoseconds),
+                    submissionPassCount: captured.codemapSubmissionPassCount,
+                    requestsSubmitted: captured.codemapRequestsSubmitted,
+                    submissionMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.codemapSubmissionNanoseconds),
+                    scansStarted: captured.codemapScansStarted,
+                    scansCompleted: captured.codemapScansCompleted,
+                    scansCancelled: captured.codemapScansCancelled,
+                    scanMicroseconds: WorkspaceFileSearchDebugTiming.microseconds(captured.codemapScanNanoseconds)
+                )
+            )
+        }
+
+        private func withSchedulerState(workload: String, _ body: (inout SchedulerState) -> Void) {
+            withState { body(&$0.schedulerByWorkload[workload, default: SchedulerState()]) }
+        }
+
+        private func withState(_ body: (inout State) -> Void) {
+            lock.lock()
+            defer { lock.unlock() }
+            body(&state)
+        }
+
+        private func readState() -> State {
+            lock.lock()
+            defer { lock.unlock() }
+            return state
+        }
+    }
+
     enum WorkspaceFileSearchDebugContext {
         @TaskLocal static var collector: WorkspaceFileSearchPhaseCollector?
         @TaskLocal static var catalogBuildObserver: WorkspaceFileSearchCatalogBuildObserver?
+        @TaskLocal static var coldStartCollector: WorkspaceFileSearchColdStartCollector?
     }
 
     enum WorkspaceFileSearchDebugTiming {

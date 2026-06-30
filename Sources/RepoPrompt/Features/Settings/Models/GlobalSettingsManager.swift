@@ -255,7 +255,6 @@ struct GlobalDefaults: Codable {
 // MARK: - Scalar Settings Snapshots
 
 struct FileSystemSettingsSnapshot: Equatable {
-    var respectGitignore: Bool
     var respectRepoIgnore: Bool
     var respectCursorignore: Bool
     var globalIgnoreDefaults: String
@@ -814,16 +813,6 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
-    func respectGitignore() -> Bool {
-        scalarPreferences.fileSystem?.respectGitignore ?? true
-    }
-
-    func setRespectGitignore(_ enabled: Bool, commit: Bool = true) {
-        updateFileSystemScalar(commit: commit) { settings in
-            settings.respectGitignore = enabled
-        }
-    }
-
     func respectRepoIgnore() -> Bool {
         scalarPreferences.fileSystem?.respectRepoIgnore ?? true
     }
@@ -884,7 +873,6 @@ class GlobalSettingsStore: ObservableObject {
     func fileSystemSettingsSnapshot() -> FileSystemSettingsSnapshot {
         let settings = scalarPreferences.fileSystem
         return FileSystemSettingsSnapshot(
-            respectGitignore: settings?.respectGitignore ?? true,
             respectRepoIgnore: settings?.respectRepoIgnore ?? true,
             respectCursorignore: settings?.respectCursorignore ?? true,
             globalIgnoreDefaults: settings?.globalIgnoreDefaults ?? IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults,
@@ -980,6 +968,14 @@ class GlobalSettingsStore: ObservableObject {
 
         func setAgentModePerfDiagnosticsOSLogEnabled(_ enabled: Bool) {
             defaults.set(enabled, forKey: "emitAgentModePerfDiagnosticsToOSLog")
+        }
+
+        func worktreeStartupBenchmarkDiagnosticsEnabled() -> Bool {
+            defaults.bool(forKey: WorktreeStartupBenchmarkDiagnostics.enabledDefaultsKey)
+        }
+
+        func setWorktreeStartupBenchmarkDiagnosticsEnabled(_ enabled: Bool) {
+            defaults.set(enabled, forKey: WorktreeStartupBenchmarkDiagnostics.enabledDefaultsKey)
         }
     #endif
 

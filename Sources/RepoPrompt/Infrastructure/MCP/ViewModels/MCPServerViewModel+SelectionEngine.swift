@@ -28,18 +28,10 @@ struct WorkspaceGitDiffArtifactSelectionService {
             newlyAddedArtifacts.append(candidate)
         }
 
-        let candidateIdentities = Set(candidates.compactMap {
-            StoredSelectionPathNormalization.standardizedPath($0.absolutePath)
-        })
-        let autoCodemapPaths = existing.autoCodemapPaths.filter { path in
-            guard let identity = StoredSelectionPathNormalization.standardizedPath(path) else { return true }
-            return !candidateIdentities.contains(identity)
-        }
-
         return WorkspaceGitDiffArtifactSelectionMergeResult(
             selection: StoredSelection(
                 selectedPaths: selectedPaths,
-                autoCodemapPaths: autoCodemapPaths,
+                manualCodemapPaths: existing.manualCodemapPaths,
                 slices: existing.slices,
                 codemapAutoEnabled: existing.codemapAutoEnabled
             ),

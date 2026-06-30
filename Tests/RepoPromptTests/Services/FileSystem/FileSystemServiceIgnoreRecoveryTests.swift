@@ -20,7 +20,6 @@ final class FileSystemServiceIgnoreRecoveryTests: XCTestCase {
 
         let service = try await FileSystemService(
             path: root.path,
-            respectGitignore: false,
             respectRepoIgnore: true,
             respectCursorignore: true,
             skipSymlinks: true
@@ -46,7 +45,6 @@ final class FileSystemServiceIgnoreRecoveryTests: XCTestCase {
 
         let service = try await FileSystemService(
             path: root.path,
-            respectGitignore: false,
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true

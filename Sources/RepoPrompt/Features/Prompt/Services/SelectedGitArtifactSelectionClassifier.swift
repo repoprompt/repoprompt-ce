@@ -21,7 +21,6 @@ enum SelectedGitArtifactSelectionClassifier {
             .map(\.key)
             .sorted()
             .forEach(append)
-        selection.autoCodemapPaths.forEach(append)
         return candidates
     }
 

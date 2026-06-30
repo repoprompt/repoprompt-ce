@@ -595,9 +595,10 @@ public extension VCSService {
     }
 
     /// Create a Git worktree and keep best-effort `.worktreeinclude` copy details.
-    func createGitWorktreeWithResult(
+    internal func createGitWorktreeWithResult(
         request: GitWorktreeCreateRequest,
-        at repoURL: URL
+        at repoURL: URL,
+        initializationContext: GitWorktreeInitializationContext? = nil
     ) async throws -> GitWorktreeCreateResult {
         let resolved = await resolveRepo(from: repoURL)
         guard let resolved else {
@@ -607,7 +608,11 @@ public extension VCSService {
             throw VCSError.unsupportedOperation(operation: "create_worktree", backend: resolved.backendKind)
         }
 
-        let result = try await gitBackend().createWorktreeWithResult(request: request, at: resolved.rootURL)
+        let result = try await gitBackend().createWorktreeWithResult(
+            request: request,
+            at: resolved.rootURL,
+            initializationContext: initializationContext
+        )
         invalidateCache(for: resolved.rootURL)
         invalidateCache(for: request.path)
         return result

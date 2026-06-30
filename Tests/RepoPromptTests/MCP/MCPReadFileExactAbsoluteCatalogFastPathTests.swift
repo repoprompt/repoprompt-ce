@@ -325,15 +325,29 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         )
         let roots = await store.rootRefs(scope: scope)
         let service = WorkspaceReadableFileService(store: store)
+        let baselineLogicalStats = await store.scopedIngressBarrierStatsForTesting(rootID: logicalRecord.id)
+        let baselineWorktreeAStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeARecord.id)
+        let baselineWorktreeBStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeBRecord.id)
 
         try await service.awaitFreshnessForExplicitRequest(worktreeAFile.path, rootRefs: roots)
 
         let logicalStats = await store.scopedIngressBarrierStatsForTesting(rootID: logicalRecord.id)
         let worktreeAStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeARecord.id)
         let worktreeBStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeBRecord.id)
-        XCTAssertEqual(logicalStats.launchCount, 0)
-        XCTAssertEqual(worktreeAStats.launchCount, 1)
-        XCTAssertEqual(worktreeBStats.launchCount, 0)
+        XCTAssertEqual(scopedIngressBarrierWorkDelta(logicalStats, baselineLogicalStats), 0)
+        XCTAssertGreaterThan(scopedIngressBarrierWorkDelta(worktreeAStats, baselineWorktreeAStats), 0)
+        XCTAssertEqual(scopedIngressBarrierWorkDelta(worktreeBStats, baselineWorktreeBStats), 0)
+    }
+
+    private func scopedIngressBarrierWorkDelta(
+        _ after: WorkspaceFileContextStore.ScopedIngressBarrierStats,
+        _ before: WorkspaceFileContextStore.ScopedIngressBarrierStats
+    ) -> Int {
+        (after.launchCount - before.launchCount) +
+            (after.joinCount - before.joinCount) +
+            (after.successorCount - before.successorCount) +
+            (after.coalescedSuccessorCount - before.coalescedSuccessorCount) +
+            (after.noopCount - before.noopCount)
     }
 
     private func assertOrdered(

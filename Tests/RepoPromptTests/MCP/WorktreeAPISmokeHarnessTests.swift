@@ -114,6 +114,45 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
     }
 
+    func testManageWorktreeListExcludesStalePrunableWorktrees() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+
+        // Create a real linked worktree, then delete its checkout directory. Git keeps the admin
+        // record under .git/worktrees/<name> but now reports the worktree prunable ("gitdir file
+        // points to a non-existent location"). The tool must not list a stale worktree, otherwise
+        // a model could select it and bind a session to an empty/partial tree.
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/stale-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let createdWorktree = try Self.worktreeObject(createValue, key: "created_worktree")
+        let stalePath = try XCTUnwrap(createdWorktree["path"]?.stringValue)
+        let staleID = try XCTUnwrap(createdWorktree["worktree_id"]?.stringValue)
+        try FileManager.default.removeItem(at: URL(fileURLWithPath: stalePath))
+
+        let listValue = try await manageWorktree(["op": .string("list")])
+        let listObject = try XCTUnwrap(listValue.objectValue)
+        let listed = listObject["worktrees"]?.arrayValue ?? []
+        let listedIDs = listed.compactMap { $0.objectValue?["worktree_id"]?.stringValue }
+        let listedPaths = listed.compactMap { $0.objectValue?["path"]?.stringValue }
+
+        XCTAssertFalse(listedIDs.contains(staleID), "stale worktree id should be omitted: \(listedIDs)")
+        XCTAssertFalse(listedPaths.contains(stalePath), "stale worktree path should be omitted: \(listedPaths)")
+        XCTAssertFalse(listed.isEmpty, "the main worktree should still be listed")
+
+        let warning = listObject["warning"]?.stringValue ?? ""
+        XCTAssertTrue(
+            warning.lowercased().contains("prunable") || warning.lowercased().contains("stale"),
+            "expected an omitted-prunable warning, got: \(warning)"
+        )
+    }
+
     func testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections() async throws {
         let fixture = try Self.makeGitFixture()
         defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
@@ -260,7 +299,8 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         }
 
         let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
-        XCTAssertEqual(try Self.selectionPaths(setValue), [logicalPath])
+        let outputPath = "\(fixture.repo.lastPathComponent)/WorktreeOnly.swift"
+        XCTAssertEqual(try Self.selectionPaths(setValue), [outputPath])
         #if DEBUG
             let canonicalSelectionRevision = window.workspaceManager.selectionRevisionForMCP(
                 workspaceID: workspaceID,
@@ -324,7 +364,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 "path_display": .string("full")
             ])
         }
-        XCTAssertEqual(try Self.selectionPaths(getValue), [logicalPath])
+        XCTAssertEqual(try Self.selectionPaths(getValue), [outputPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         window.mcpServer.removeTabContext(
@@ -360,7 +400,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 "path_display": .string("full")
             ])
         }
-        XCTAssertEqual(try Self.selectionPaths(readSelection), [logicalPath])
+        XCTAssertEqual(try Self.selectionPaths(readSelection), [outputPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
@@ -400,7 +440,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 "path_display": .string("full")
             ])
         }
-        XCTAssertEqual(try Self.selectionPaths(finalSelection), [logicalPath])
+        XCTAssertEqual(try Self.selectionPaths(finalSelection), [outputPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
@@ -649,7 +689,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             worktreeID: worktreeID
         )
         let formattedTree = try Self.onlyText(ToolOutputFormatter.formatFileTree(value: treeValue))
-        XCTAssertTrue(formattedTree.contains(logicalRootPath), formattedTree)
+        XCTAssertFalse(formattedTree.contains(logicalRootPath), formattedTree)
         XCTAssertFalse(formattedTree.contains(effectiveRootPath), formattedTree)
         XCTAssertTrue(formattedTree.contains("session-bound worktree"), formattedTree)
 
@@ -661,7 +701,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             worktreeID: worktreeID
         )
         let formattedRead = try Self.onlyText(ToolOutputFormatter.formatReadFile(args: ["path": .string("Tracked.txt")], value: readValue))
-        XCTAssertTrue(formattedRead.contains(logicalRootPath), formattedRead)
+        XCTAssertFalse(formattedRead.contains(logicalRootPath), formattedRead)
         XCTAssertFalse(formattedRead.contains(effectiveRootPath), formattedRead)
         XCTAssertTrue(formattedRead.contains("session-bound worktree"), formattedRead)
 
@@ -673,7 +713,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             worktreeID: worktreeID
         )
         let formattedSearch = try Self.onlyText(ToolOutputFormatter.formatSearch(value: searchValue))
-        XCTAssertTrue(formattedSearch.contains(logicalRootPath), formattedSearch)
+        XCTAssertFalse(formattedSearch.contains(logicalRootPath), formattedSearch)
         XCTAssertFalse(formattedSearch.contains(effectiveRootPath), formattedSearch)
         XCTAssertTrue(formattedSearch.contains("session-bound worktree"), formattedSearch)
     }
@@ -896,8 +936,12 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let scope = try XCTUnwrap(object["worktree_scope"]?.objectValue)
         let mappings = try XCTUnwrap(scope["root_mappings"]?.arrayValue)
         let first = try XCTUnwrap(mappings.first?.objectValue)
-        XCTAssertEqual(first["logical_root_path"]?.stringValue, logicalRootPath)
-        XCTAssertEqual(first["effective_root_path"]?.stringValue, effectiveRootPath)
+        XCTAssertEqual(
+            first["logical_root_path"]?.stringValue,
+            URL(fileURLWithPath: logicalRootPath).lastPathComponent
+        )
+        XCTAssertEqual(first["effective_root_path"]?.stringValue, "session-bound")
+        XCTAssertNotEqual(first["logical_root_path"]?.stringValue, effectiveRootPath)
         XCTAssertEqual(first["worktree_id"]?.stringValue, worktreeID)
     }
 

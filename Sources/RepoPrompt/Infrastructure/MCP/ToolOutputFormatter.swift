@@ -71,7 +71,7 @@ enum ToolOutputFormatter {
             if let label = nonEmpty(mapping.label) {
                 details.append("label `\(label)`")
             }
-            lines.append("  - `\(mapping.logicalRootName)` `\(mapping.logicalRootPath)` → session-bound worktree (\(details.joined(separator: ", ")))")
+            lines.append("  - `\(mapping.logicalRootName)` → session-bound worktree (\(details.joined(separator: ", ")))")
         }
         return lines
     }
@@ -2372,6 +2372,12 @@ extension ToolOutputFormatter {
                 out.append("")
                 out.append("### Code Maps")
                 out.append("- **Files with codemap**: \(cs.fileCount)")
+                out.append(contentsOf: selectedCodeStructureDiagnosticLines(
+                    cs,
+                    summaryPrefix: "- **",
+                    summarySuffix: "**",
+                    bulletIndent: "  "
+                ))
                 // Keep output efficient: only emit full codemap content for small selections
                 let showContent = cs.fileCount <= 10 && !cs.content.isEmpty
                 if showContent {
@@ -2590,67 +2596,47 @@ extension ToolOutputFormatter {
     }
 
     static func formatCodeStructure(value: Value) -> [MCP.Tool.Content] {
-        if let dto = value.decode(ToolResultDTOs.SelectedCodeStructureDTO.self) {
-            let maxResultsOmitted = dto.omittedCount ?? 0
-            let tokenBudgetOmitted = dto.tokenBudgetOmittedCount ?? 0
-            let totalOmitted = dto.omittedTotal ?? (maxResultsOmitted + tokenBudgetOmitted)
-            let hasRenderableResult = dto.fileCount > 0 || totalOmitted > 0
-            let hasPendingRepair = dto.pendingPaths?.isEmpty == false
-            var out: [String] = []
-            out.append("## Code Structure \(statusIcon(success: hasRenderableResult, warning: hasPendingRepair))")
-            out.append("- **Files with codemap**: \(dto.fileCount)")
-            switch (maxResultsOmitted, tokenBudgetOmitted) {
-            case let (maxOmitted, 0) where maxOmitted > 0:
-                out.append("- **Codemaps omitted**: \(maxOmitted) (increase `max_results` to inspect more files)")
-            case let (0, budgetOmitted) where budgetOmitted > 0:
-                out.append("- **Codemaps omitted**: \(budgetOmitted) (response capped near 6k tokens; narrow `paths` or request specific files/directories)")
-            case let (maxOmitted, budgetOmitted) where maxOmitted > 0 && budgetOmitted > 0:
-                out.append("- **Codemaps omitted**: \(totalOmitted) (\(maxOmitted) beyond `max_results`, \(budgetOmitted) beyond the ~6k-token response cap)")
-                out.append("- **Guidance**: Increase `max_results` to consider more files, or narrow `paths` to change which files fit inside the response cap.")
-            default:
-                break
-            }
-            out.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .codeStructure))
-            if let pending = dto.pendingPaths, !pending.isEmpty {
-                out.append("- **Codemap generation pending**: \(pending.count) (retry with narrower `paths` if needed)")
-                out.append("")
-                out.append("### Files still awaiting codemap")
-                let grouped = groupPathsByRoot(pending)
-                for (root, paths) in grouped {
-                    out.append("- **\(root)**")
-                    for p in paths {
-                        out.append("  - `\(p)`")
-                    }
-                }
-            }
-            if let unmapped = dto.unmappedPaths, !unmapped.isEmpty {
-                out.append("- **Without codemap**: \(unmapped.count)")
-                out.append("")
-                out.append("### Files without codemap")
-                let grouped = groupPathsByRoot(unmapped)
-                for (root, paths) in grouped {
-                    out.append("- **\(root)**")
-                    for p in paths {
-                        out.append("  - `\(p)`")
-                    }
-                }
-            }
-            if !dto.content.isEmpty { out.append("")
-                out.append("```text\n\(dto.content)\n```")
-            }
-            return [.text(out.joined(separator: "\n"))]
+        guard let dto = value.decode(ToolResultDTOs.CodeStructureReplyDTO.self) else {
+            return formatGeneric(value: value)
         }
-        if let s = value.stringValue {
-            var out: [String] = []
-            let count = s.isEmpty ? 0 : 1
-            out.append("## Code Structure \(statusIcon(success: count > 0))")
-            out.append("- **Files**: \(count)")
-            if !s.isEmpty { out.append("")
-                out.append("```text\n\(s)\n```")
-            }
-            return [.text(out.joined(separator: "\n"))]
+        let icon = switch dto.status {
+        case "ready": "✅"
+        case "partial", "pending", "budget": "⚠️"
+        default: "❌"
         }
-        return formatGeneric(value: value)
+        var out: [String] = [
+            "## Code Structure \(icon)",
+            "- **Status**: `\(dto.status)`",
+            "- **Files**: \(dto.summary.returnedFiles) (\(dto.summary.returnedSeeds) seeds, \(dto.summary.returnedRelated) related)",
+            "- **Codemap content tokens**: \(dto.summary.codemapContentTokens)",
+            "- **Examined edges**: \(dto.summary.examinedEdges)"
+        ]
+        out.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .codeStructure))
+        if !dto.issues.isEmpty {
+            out.append("")
+            out.append("### Issues")
+            for issue in dto.issues {
+                var detail = "- `\(issue.code)` (\(issue.phase)): \(issue.message)"
+                if let path = issue.path { detail += " [`\(path)`]" }
+                if let attempted = issue.attempted, let limit = issue.limit {
+                    detail += " (attempted \(attempted), limit \(limit))"
+                }
+                if issue.retryable { detail += " — retryable" }
+                out.append(detail)
+            }
+        }
+        if !dto.files.isEmpty {
+            out.append("")
+            out.append("### Files")
+            for file in dto.files {
+                let directions = file.reachedBy.isEmpty
+                    ? ""
+                    : ", reached by \(file.reachedBy.joined(separator: ", "))"
+                out.append("#### `\(file.path)` — \(file.role), depth \(file.depth)\(directions), \(file.tokens) tokens")
+                out.append("```text\n\(file.content)\n```")
+            }
+        }
+        return [.text(out.joined(separator: "\n"))]
     }
 
     // (Removed) formatTokenStats – token stats are part of workspace_context
@@ -2880,9 +2866,10 @@ extension ToolOutputFormatter {
             }
 
             // Code maps summary (if present)
-            if let cs = dto.codeStructure, cs.fileCount > 0 {
+            if let cs = dto.codeStructure, cs.fileCount > 0 || hasSelectedCodeStructureDiagnostics(cs) {
                 out.append("")
                 out.append("Code Maps: \(cs.fileCount) files")
+                out.append(contentsOf: selectedCodeStructureDiagnosticLines(cs, bulletIndent: "  "))
             }
 
             // File content blocks (if requested)
@@ -2927,6 +2914,47 @@ extension ToolOutputFormatter {
             return [.text("## Selection\n\(s)")]
         }
         return formatGeneric(value: value)
+    }
+
+    private static func hasSelectedCodeStructureDiagnostics(_ codeStructure: ToolResultDTOs.SelectedCodeStructureDTO) -> Bool {
+        codeStructure.pendingPaths?.isEmpty == false
+            || codeStructure.unmappedPaths?.isEmpty == false
+            || (codeStructure.omittedCount ?? 0) > 0
+            || (codeStructure.omittedTotal ?? 0) > 0
+            || (codeStructure.tokenBudgetOmittedCount ?? 0) > 0
+            || codeStructure.tokenBudgetHit == true
+    }
+
+    private static func selectedCodeStructureDiagnosticLines(
+        _ codeStructure: ToolResultDTOs.SelectedCodeStructureDTO,
+        summaryPrefix: String = "",
+        summarySuffix: String = "",
+        bulletIndent: String
+    ) -> [String] {
+        var lines: [String] = []
+        if let pendingPaths = codeStructure.pendingPaths, !pendingPaths.isEmpty {
+            lines.append("\(summaryPrefix)Pending codemaps\(summarySuffix): \(pendingPaths.count)")
+            for path in pendingPaths {
+                lines.append("\(bulletIndent)- `\(path)`")
+            }
+        }
+        if let unmappedPaths = codeStructure.unmappedPaths, !unmappedPaths.isEmpty {
+            lines.append("\(summaryPrefix)Unmapped codemap paths\(summarySuffix): \(unmappedPaths.count)")
+            for path in unmappedPaths {
+                lines.append("\(bulletIndent)- `\(path)`")
+            }
+        }
+        let omittedCount = codeStructure.omittedTotal ?? codeStructure.omittedCount
+        if let omittedCount, omittedCount > 0 {
+            lines.append("\(summaryPrefix)Codemaps omitted\(summarySuffix): \(omittedCount)")
+        }
+        if let tokenBudgetOmittedCount = codeStructure.tokenBudgetOmittedCount, tokenBudgetOmittedCount > 0 {
+            lines.append("\(summaryPrefix)Token budget omitted\(summarySuffix): \(tokenBudgetOmittedCount)")
+        }
+        if codeStructure.tokenBudgetHit == true {
+            lines.append("\(summaryPrefix)Token budget hit\(summarySuffix)")
+        }
+        return lines
     }
 
     /// Formats token count with thousands separator (fast path avoids NumberFormatter allocation)

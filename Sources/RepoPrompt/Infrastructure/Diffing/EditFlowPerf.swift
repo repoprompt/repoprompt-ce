@@ -634,23 +634,6 @@ enum EditFlowPerf {
                 static let structuralMerge: StaticString = "EditFlow.ReadFile.AutoSelect.StructuralMerge"
                 static let autoCodemapRecomputeTotal: StaticString = "EditFlow.ReadFile.AutoSelect.AutoCodemapRecomputeTotal"
                 static let selectedFileLookup: StaticString = "EditFlow.ReadFile.AutoSelect.SelectedFileLookup"
-                static let codemapAPILoad: StaticString = "EditFlow.ReadFile.AutoSelect.CodemapAPILoad"
-
-                enum AllCodemapFileAPIs {
-                    static let actorBodyTotal: StaticString = "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.ActorBodyTotal"
-                    static let stateSnapshot: StaticString = "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.StateSnapshot"
-                    static let materialization: StaticString = "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.Materialization"
-                }
-
-                static let referencedPathResolution: StaticString = "EditFlow.ReadFile.AutoSelect.ReferencedPathResolution"
-                static let acceptedFileAPIFilter: StaticString = "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter"
-
-                enum AcceptedFileAPIFilter {
-                    static let pathGrouping: StaticString = "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter.PathGrouping"
-                    static let selectedRecordProjection: StaticString = "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter.SelectedRecordProjection"
-                }
-
-                static let autoReferencedAPIComputation: StaticString = "EditFlow.ReadFile.AutoSelect.AutoReferencedAPIComputation"
                 static let fullSliceClearing: StaticString = "EditFlow.ReadFile.AutoSelect.FullSliceClearing"
                 static let finalSelectionEquality: StaticString = "EditFlow.ReadFile.AutoSelect.FinalSelectionEquality"
                 static let persistence: StaticString = "EditFlow.ReadFile.AutoSelect.Persistence"

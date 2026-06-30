@@ -265,7 +265,9 @@ struct WorkspaceRootBindingProjection: Equatable {
         }
         return StoredSelection(
             selectedPaths: selection.selectedPaths.map { logicalDisplayPath(forPhysicalPath: $0, display: .full) },
-            autoCodemapPaths: selection.autoCodemapPaths.map { logicalDisplayPath(forPhysicalPath: $0, display: .full) },
+            manualCodemapPaths: selection.manualCodemapPaths.map {
+                logicalDisplayPath(forPhysicalPath: $0, display: .full)
+            },
             slices: slices,
             codemapAutoEnabled: selection.codemapAutoEnabled
         )
@@ -279,7 +281,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         }
         return StoredSelection(
             selectedPaths: selection.selectedPaths.map { translateInputPath($0) },
-            autoCodemapPaths: selection.autoCodemapPaths.map { translateInputPath($0) },
+            manualCodemapPaths: selection.manualCodemapPaths.map { translateInputPath($0) },
             slices: slices,
             codemapAutoEnabled: selection.codemapAutoEnabled
         )
@@ -346,6 +348,7 @@ struct WorkspaceRootBindingProjectionPreparation {
     let bindings: [AgentSessionWorktreeBinding]
     let visibleRoots: [WorkspaceRootRef]
     let ownership: WorkspaceSessionWorktreeOwnershipPreparation
+    let startupContext: WorktreeStartupContext?
 }
 
 struct WorkspaceRootBindingProjectionMaterializer {
@@ -353,38 +356,88 @@ struct WorkspaceRootBindingProjectionMaterializer {
 
     func prepare(
         sessionID: UUID,
-        bindings: [AgentSessionWorktreeBinding]
+        bindings: [AgentSessionWorktreeBinding],
+        startupContext: WorktreeStartupContext? = nil,
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         return try await prepare(
             sessionID: sessionID,
             bindings: bindings,
-            visibleRoots: visibleRoots
+            visibleRoots: visibleRoots,
+            startupContext: startupContext,
+            initializationHintsByBindingID: initializationHintsByBindingID
         )
     }
 
     private func prepare(
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding],
-        visibleRoots: [WorkspaceRootRef]
+        visibleRoots: [WorkspaceRootRef],
+        startupContext: WorktreeStartupContext?,
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
+        var initializationHintsByPhysicalRootPath: [String: WorkspaceRootMaterializationHint] = [:]
+        #if DEBUG
+            var receiptProjectionDecision = WorktreeStartupInstrumentation.ReceiptProjectionDecision()
+            receiptProjectionDecision.suppliedHintCount = initializationHintsByBindingID.count
+            receiptProjectionDecision.allHintKeysMatchedBindings = Set(initializationHintsByBindingID.keys)
+                .isSubset(of: Set(bindings.map(\.id)))
+        #endif
+        for binding in bindings {
+            guard let hint = initializationHintsByBindingID[binding.id] else { continue }
+            let physicalPath = StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
+            let validatedHint = hint.validated(
+                matching: binding,
+                sessionID: sessionID,
+                startupContext: startupContext
+            )
+            initializationHintsByPhysicalRootPath[physicalPath] = validatedHint
+            #if DEBUG
+                receiptProjectionDecision.matchedHintCount += 1
+                receiptProjectionDecision.validationFallback = receiptProjectionDecision.validationFallback
+                    ?? validatedHint.validationFallbackReason
+            #endif
+        }
+        #if DEBUG
+            if let startupContext {
+                WorktreeStartupInstrumentation.recordReceiptProjectionDecision(
+                    correlationID: startupContext.correlationID,
+                    decision: receiptProjectionDecision
+                )
+            }
+        #endif
         let ownership = try await store.prepareSessionWorktreeOwnership(
             ownerID: sessionID,
             bindingFingerprint: AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings),
-            physicalRootPaths: bindings.map(\.worktreeRootPath)
+            physicalRootPaths: bindings.map(\.worktreeRootPath),
+            startupContext: startupContext,
+            initializationHintsByPhysicalRootPath: initializationHintsByPhysicalRootPath
         )
         return WorkspaceRootBindingProjectionPreparation(
             sessionID: sessionID,
             bindings: bindings,
             visibleRoots: visibleRoots,
-            ownership: ownership
+            ownership: ownership,
+            startupContext: startupContext
         )
     }
 
     func commit(
         _ preparation: WorkspaceRootBindingProjectionPreparation
     ) async throws -> WorkspaceRootBindingProjection? {
-        let records = try await store.commitSessionWorktreeOwnership(preparation.ownership)
+        let records: [WorkspaceSessionWorktreeOwnedRoot]
+        do {
+            records = try await store.commitSessionWorktreeOwnership(preparation.ownership)
+        } catch {
+            #if DEBUG
+                await store.terminalizeReceiptConsumptionDecision(preparation.ownership)
+            #endif
+            throw error
+        }
+        if let startupContext = preparation.startupContext {
+            WorktreeStartupInstrumentation.record(.rootReady, context: startupContext)
+        }
         guard !preparation.bindings.isEmpty else { return nil }
 
         let recordsByPath = Dictionary(uniqueKeysWithValues: records.map {
@@ -422,13 +475,6 @@ struct WorkspaceRootBindingProjectionMaterializer {
         )
     }
 
-    func initializeCodemaps(for projection: WorkspaceRootBindingProjection?) async {
-        guard let projection else { return }
-        _ = await store.initializeCodemapsForSessionWorktreeRoots(
-            rootIDs: projection.physicalRootRefs.map(\.id)
-        )
-    }
-
     func abort(_ preparation: WorkspaceRootBindingProjectionPreparation) async {
         await store.abortSessionWorktreeOwnership(preparation.ownership)
     }
@@ -441,19 +487,74 @@ struct WorkspaceRootBindingProjectionMaterializer {
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding]
     ) async -> WorkspaceRootBindingProjection? {
+        await FileSystemService.withContentReadForegroundActivity(kind: .materialization) {
+            await materializeWithinForegroundActivity(
+                sessionID: sessionID,
+                bindings: bindings
+            )
+        }
+    }
+
+    private func materializeWithinForegroundActivity(
+        sessionID: UUID,
+        bindings: [AgentSessionWorktreeBinding]
+    ) async -> WorkspaceRootBindingProjection? {
+        #if DEBUG
+            let coldStartCollector = WorkspaceFileSearchDebugContext.coldStartCollector
+            let materializationStart = WorkspaceFileSearchDebugTiming.now()
+            var prepareNanoseconds: UInt64 = 0
+            var commitNanoseconds: UInt64 = 0
+        #endif
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         do {
+            #if DEBUG
+                let prepareStart = WorkspaceFileSearchDebugTiming.now()
+            #endif
             let preparation = try await prepare(
                 sessionID: sessionID,
                 bindings: bindings,
-                visibleRoots: visibleRoots
+                visibleRoots: visibleRoots,
+                startupContext: nil,
+                initializationHintsByBindingID: [:]
             )
+            #if DEBUG
+                prepareNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                    since: prepareStart,
+                    through: WorkspaceFileSearchDebugTiming.now()
+                )
+            #endif
             do {
+                #if DEBUG
+                    let commitStart = WorkspaceFileSearchDebugTiming.now()
+                #endif
                 let projection = try await commit(preparation)
-                await initializeCodemaps(for: projection)
+                #if DEBUG
+                    commitNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                        since: commitStart,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    )
+                    coldStartCollector?.recordMaterialization(
+                        totalNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: materializationStart,
+                            through: WorkspaceFileSearchDebugTiming.now()
+                        ),
+                        prepareNanoseconds: prepareNanoseconds,
+                        commitNanoseconds: commitNanoseconds
+                    )
+                #endif
                 return projection
             } catch {
                 await abort(preparation)
+                #if DEBUG
+                    coldStartCollector?.recordMaterialization(
+                        totalNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: materializationStart,
+                            through: WorkspaceFileSearchDebugTiming.now()
+                        ),
+                        prepareNanoseconds: prepareNanoseconds,
+                        commitNanoseconds: commitNanoseconds
+                    )
+                #endif
                 return failClosedProjection(
                     sessionID: sessionID,
                     bindings: bindings,
@@ -461,6 +562,16 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 )
             }
         } catch {
+            #if DEBUG
+                coldStartCollector?.recordMaterialization(
+                    totalNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: materializationStart,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    ),
+                    prepareNanoseconds: prepareNanoseconds,
+                    commitNanoseconds: commitNanoseconds
+                )
+            #endif
             return failClosedProjection(
                 sessionID: sessionID,
                 bindings: bindings,

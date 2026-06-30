@@ -3,45 +3,20 @@ import XCTest
 
 @MainActor
 final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
-    private var temporaryRoots = FileSystemTemporaryRoots()
+    func testExplicitCodemapOnlyIntentSelectsRequestedManualFileAndDisablesAuto() {
+        let fixture = makeFixture(fileName: "Present.swift")
+        XCTAssertTrue(fixture.viewModel.codemapAutoEnabled)
 
-    override func tearDownWithError() throws {
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
+        fixture.viewModel.setFileAsCodemap(fixture.file)
 
-    func testExplicitCodemapRemovalDisablesAutoForPresentAndEmptySelections() {
-        do {
-            let fixture = makeFixture(fileName: "Present.swift")
-            fixture.viewModel.setFileAsCodemap(fixture.file)
-            fixture.viewModel.codemapAutoEnabled = true
-
-            fixture.viewModel.removeCodemapFile(fixture.file)
-
-            XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
-            XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
-            XCTAssertFalse(fixture.viewModel.isAutoCodemapFile(fixture.file))
-        }
-
-        do {
-            let fixture = makeFixture(fileName: "Empty.swift")
-            XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
-            XCTAssertTrue(fixture.viewModel.codemapAutoEnabled)
-
-            fixture.viewModel.clearAutoCodemapFiles()
-
-            XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
-            XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
-        }
-
-        do {
-            let fixture = makeFixture(fileName: "Absent.swift")
-
-            fixture.viewModel.removeCodemapFile(fixture.file)
-
-            XCTAssertTrue(fixture.viewModel.codemapAutoEnabled)
-            XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
-        }
+        XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
+        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+        XCTAssertFalse(fixture.viewModel.isAutoCodemapFile(fixture.file))
+        XCTAssertTrue(fixture.viewModel.snapshotSelection().selectedPaths.isEmpty)
+        XCTAssertEqual(
+            fixture.viewModel.snapshotSelection().manualCodemapPaths,
+            [fixture.file.standardizedFullPath]
+        )
     }
 
     func testOrdinaryFileRemovalPreservesAutoAndFullClearRestoresIt() async {
@@ -58,9 +33,8 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
 
         do {
             let fixture = makeFixture(fileName: "Clear.swift")
-            fixture.viewModel.setFileAsCodemap(fixture.file)
+            fixture.viewModel.enterManualCodemapMode()
             XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
-            XCTAssertEqual(fixture.viewModel.autoCodemapFiles.map(\.id), [fixture.file.id])
 
             await fixture.viewModel.clearSelection()
 
@@ -70,89 +44,183 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         }
     }
 
-    func testVisibleAutoCodemapExcludesSessionRootsAndPreservesSlicesAndManualMode() async throws {
-        #if DEBUG
-            let visibleRootURL = try temporaryRoots.makeRoot(suiteName: "VisibleAutoCodemapRoot")
-            let hiddenRootURL = try temporaryRoots.makeRoot(suiteName: "HiddenAutoCodemapWorktree")
-            let selectedURL = visibleRootURL.appendingPathComponent("Selected.swift")
-            let visibleDependencyURL = visibleRootURL.appendingPathComponent("VisibleDependency.swift")
-            let hiddenDependencyURL = hiddenRootURL.appendingPathComponent("HiddenDependency.swift")
-            try "let selected = true\n".write(to: selectedURL, atomically: true, encoding: .utf8)
-            try "struct DependencyType {}\n".write(to: visibleDependencyURL, atomically: true, encoding: .utf8)
-            try "struct DependencyType {}\n".write(to: hiddenDependencyURL, atomically: true, encoding: .utf8)
+    func testSnapshotAndEncodingContainNoInferredPathState() throws {
+        let fixture = makeFixture(fileName: "Dependency.swift")
+        fixture.viewModel.selectFileForTesting(fixture.file)
 
-            let store = WorkspaceFileContextStore()
-            let visibleRoot = try await store.loadRoot(path: visibleRootURL.path)
-            let hiddenRoot = try await store.loadRoot(path: hiddenRootURL.path, kind: .sessionWorktree)
-            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
-            _ = try manager.attachRootShell(for: visibleRoot, workspaceID: UUID())
-            _ = try manager.attachRootShell(for: hiddenRoot, workspaceID: UUID())
+        let snapshot = fixture.viewModel.snapshotSelection()
+        XCTAssertEqual(snapshot.selectedPaths, [fixture.file.standardizedFullPath])
+        XCTAssertTrue(snapshot.codemapAutoEnabled)
 
-            let visibleRecords = await store.files(inRoot: visibleRoot.id)
-            let hiddenRecords = await store.files(inRoot: hiddenRoot.id)
-            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
-                rootID: visibleRoot.id,
-                rootPath: visibleRoot.standardizedFullPath,
-                generation: 1,
-                upsertedFiles: visibleRecords
-            ))
-            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
-                rootID: hiddenRoot.id,
-                rootPath: hiddenRoot.standardizedFullPath,
-                generation: 1,
-                upsertedFiles: hiddenRecords
-            ))
+        let encoded = try JSONEncoder().encode(snapshot)
+        let encodedText = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        XCTAssertFalse(encodedText.contains("autoCodemapPaths"))
 
-            let selected = try XCTUnwrap(manager.findFileByFullPath(selectedURL.path))
-            let visibleDependency = try XCTUnwrap(manager.findFileByFullPath(visibleDependencyURL.path))
-            let hiddenDependency = try XCTUnwrap(manager.findFileByFullPath(hiddenDependencyURL.path))
-            XCTAssertLessThan(hiddenDependency.standardizedFullPath, visibleDependency.standardizedFullPath)
-            let selectedAPI = makeFileAPI(
-                path: selectedURL.path,
-                symbolName: "selectedSymbol",
-                referencedTypes: ["DependencyType"]
+        fixture.viewModel.setAutoCodemapFilesForTesting([fixture.file])
+        XCTAssertEqual(fixture.viewModel.autoCodemapFiles.map(\.id), [fixture.file.id])
+        fixture.viewModel.enterManualCodemapMode()
+        XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
+        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+        XCTAssertTrue(fixture.viewModel.manualCodemapFiles.isEmpty)
+        XCTAssertTrue(fixture.viewModel.snapshotSelection().manualCodemapPaths.isEmpty)
+    }
+
+    func testGraphReadinessDoesNotMutateManualMode() {
+        let fixture = makeFixture(fileName: "Manual.swift")
+        fixture.viewModel.enterManualCodemapMode()
+
+        fixture.viewModel.handleAutomaticCodemapReadinessForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch(
+                rootID: fixture.file.rootIdentifier,
+                rootLifetimeID: UUID()
             )
-            let visibleAPI = makeFileAPI(
-                path: visibleDependencyURL.path,
-                symbolName: "visibleDependencySymbol",
-                className: "DependencyType"
-            )
-            let hiddenAPI = makeFileAPI(
-                path: hiddenDependencyURL.path,
-                symbolName: "hiddenDependencySymbol",
-                className: "DependencyType"
-            )
-            selected.setCodeMap(selectedAPI)
-            visibleDependency.setCodeMap(visibleAPI)
-            hiddenDependency.setCodeMap(hiddenAPI)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: selectedURL.path, modificationDate: Date(), fileAPI: selectedAPI),
-                WorkspaceObservedCodemapResult(fullPath: visibleDependencyURL.path, modificationDate: Date(), fileAPI: visibleAPI),
-                WorkspaceObservedCodemapResult(fullPath: hiddenDependencyURL.path, modificationDate: Date(), fileAPI: hiddenAPI)
+        )
+
+        XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
+        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+    }
+
+    func testNewSourceGenerationClearsExistingInferredMarkersSynchronously() {
+        let fixture = makeFixture(fileName: "Generation.swift")
+        fixture.viewModel.setAutoCodemapFilesForTesting([fixture.file])
+
+        fixture.viewModel.selectFileForTesting(fixture.file)
+
+        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+        XCTAssertTrue(fixture.viewModel.codemapAutoEnabled)
+    }
+
+    func testAutomaticPublicationTargetReconstructionPreservesExactReceiptOrder() throws {
+        let fixture = makeReconstructionFixture()
+        let firstTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.firstTarget,
+            relativePath: "First.swift"
+        )
+        let secondTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.secondTarget,
+            relativePath: "Second.swift"
+        )
+
+        let resolved = fixture.viewModel.reconstructAutomaticCodemapTargetsForTesting(
+            receiptTargets: [secondTarget, firstTarget],
+            revalidatedTargets: [secondTarget, firstTarget],
+            sourceIDs: [fixture.source.id],
+            filesByID: [
+                fixture.firstTarget.id: fixture.firstTarget,
+                fixture.secondTarget.id: fixture.secondTarget
+            ]
+        )
+
+        XCTAssertEqual(resolved?.map(\.id), [fixture.secondTarget.id, fixture.firstTarget.id])
+    }
+
+    func testAutomaticPublicationTargetReconstructionRejectsEveryMismatchAtomicallyAndRetries() throws {
+        let fixture = makeReconstructionFixture()
+        let firstTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.firstTarget,
+            relativePath: "First.swift"
+        )
+        let secondTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.secondTarget,
+            relativePath: "Second.swift"
+        )
+        let duplicateTargets = [firstTarget, firstTarget]
+        let wrongRootTarget = try makeTarget(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID()),
+            file: fixture.firstTarget,
+            relativePath: "First.swift"
+        )
+        let filesByID = [
+            fixture.firstTarget.id: fixture.firstTarget,
+            fixture.secondTarget.id: fixture.secondTarget
+        ]
+        let malformedCases: [(
+            receipt: [WorkspaceCodemapAutomaticSelectionTarget],
+            revalidated: [WorkspaceCodemapAutomaticSelectionTarget],
+            sourceIDs: [UUID],
+            filesByID: [UUID: FileViewModel]
+        )] = [
+            ([firstTarget, secondTarget], [firstTarget], [fixture.source.id], filesByID),
+            ([firstTarget, secondTarget], [secondTarget, firstTarget], [fixture.source.id], filesByID),
+            (duplicateTargets, duplicateTargets, [fixture.source.id], filesByID),
+            ([wrongRootTarget], [wrongRootTarget], [fixture.source.id], filesByID),
+            ([firstTarget], [firstTarget], [fixture.firstTarget.id], filesByID),
+            ([firstTarget, secondTarget], [firstTarget, secondTarget], [fixture.source.id], [
+                fixture.firstTarget.id: fixture.firstTarget
+            ])
+        ]
+
+        for malformed in malformedCases {
+            fixture.viewModel.setAutoCodemapFilesForTesting([
+                fixture.firstTarget,
+                fixture.secondTarget
             ])
 
-            manager.selectFileForTesting(selected)
-            let slice = LineRange(start: 1, end: 1)
-            manager.seedSelectionSlicesForTesting([slice], for: selected)
-            await manager.flushAutoCodemapSyncNowIfNeeded()
+            XCTAssertTrue(fixture.viewModel.rejectInvalidAutomaticCodemapTargetsForTesting(
+                receiptTargets: malformed.receipt,
+                revalidatedTargets: malformed.revalidated,
+                sourceIDs: malformed.sourceIDs,
+                filesByID: malformed.filesByID
+            ))
+            XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+            XCTAssertTrue(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+        }
+    }
 
-            let automatic = manager.snapshotSelection()
-            XCTAssertEqual(automatic.autoCodemapPaths, [visibleDependency.standardizedFullPath])
-            XCTAssertFalse(automatic.autoCodemapPaths.contains(hiddenDependency.standardizedFullPath))
-            XCTAssertEqual(automatic.slices[selected.standardizedFullPath], [slice])
-            XCTAssertTrue(automatic.codemapAutoEnabled)
+    func testMilestoneDProductionCallersContainNoEagerCodemapOrCacheActions() throws {
+        let repoRoot = try RepoRoot.url()
+        let relativePaths = [
+            "Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift",
+            "Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift",
+            "Sources/RepoPrompt/Features/Workspaces/WorkspaceCheckoutRefreshService.swift",
+            "Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift",
+            "Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+WorktreeMerge.swift",
+            "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentMCPStartWorktreeCoordinator.swift",
+            "Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceRootBindingProjection.swift"
+        ]
+        let forbidden = [
+            "initializeCodemapsForSessionWorktreeRoots",
+            "requestCodemapScans",
+            "repairMissingCodemapSnapshots",
+            "purgeStaleCodemapCaches",
+            "clearCodeMapCache",
+            "codeMapUpdatePublisher",
+            "codemapUpdates()"
+        ]
 
-            manager.setFileAsCodemap(visibleDependency)
-            let manualBeforeFlush = manager.snapshotSelection()
-            await manager.flushAutoCodemapSyncNowIfNeeded()
-            let manualAfterFlush = manager.snapshotSelection()
-            XCTAssertFalse(manualAfterFlush.codemapAutoEnabled)
-            XCTAssertEqual(manualAfterFlush.autoCodemapPaths, manualBeforeFlush.autoCodemapPaths)
-            XCTAssertEqual(manualAfterFlush.slices, manualBeforeFlush.slices)
+        for relativePath in relativePaths {
+            let source = try String(
+                contentsOf: repoRoot.appendingPathComponent(relativePath),
+                encoding: .utf8
+            )
+            for symbol in forbidden {
+                XCTAssertFalse(source.contains(symbol), "\(relativePath) still references \(symbol)")
+            }
+        }
+    }
 
-            await manager.unloadAllRootFolders()
-        #endif
+    func testPublicationRevalidationIsFinalAwaitBeforeSynchronousCommit() throws {
+        let repoRoot = try RepoRoot.url()
+        let sourceURL = repoRoot.appendingPathComponent(
+            "Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift"
+        )
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let revalidation = try XCTUnwrap(try source.range(
+            of: "guard automaticCodemapSelectionIsCurrent(",
+            range: XCTUnwrap(source.range(
+                of: "revalidateAutomaticCodemapSelectionForPublication("
+            )).upperBound ..< source.endIndex
+        ))
+        let commit = try XCTUnwrap(source.range(
+            of: "resetAutoCodemapFiles(resolvedTargets)",
+            range: revalidation.lowerBound ..< source.endIndex
+        ))
+        let synchronousCommitRegion = source[revalidation.lowerBound ..< commit.upperBound]
+        XCTAssertFalse(synchronousCommitRegion.contains("await"))
     }
 
     private func makeFixture(fileName: String) -> (
@@ -177,29 +245,54 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         return (WorkspaceFilesViewModel(), file)
     }
 
-    private func makeFileAPI(
-        path: String,
-        symbolName: String,
-        className: String? = nil,
-        referencedTypes: [String] = []
-    ) -> FileAPI {
-        FileAPI(
-            filePath: path,
-            imports: [],
-            classes: className.map { [ClassInfo(name: $0, methods: [], properties: [])] } ?? [],
-            functions: [
-                FunctionInfo(
-                    name: symbolName,
-                    parameters: [],
-                    returnType: nil,
-                    definitionLine: "func \(symbolName)()",
-                    lineNumber: 1
-                )
-            ],
-            enums: [],
-            globalVars: [],
-            macros: [],
-            referencedTypes: referencedTypes
+    private func makeReconstructionFixture() -> (
+        viewModel: WorkspaceFilesViewModel,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        source: FileViewModel,
+        firstTarget: FileViewModel,
+        secondTarget: FileViewModel
+    ) {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceFilesAutoCodemapModeTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let rootID = UUID()
+        return (
+            WorkspaceFilesViewModel(),
+            WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: UUID()),
+            makeFile(name: "Source.swift", rootURL: rootURL, rootID: rootID),
+            makeFile(name: "First.swift", rootURL: rootURL, rootID: rootID),
+            makeFile(name: "Second.swift", rootURL: rootURL, rootID: rootID)
+        )
+    }
+
+    private func makeFile(name: String, rootURL: URL, rootID: UUID) -> FileViewModel {
+        FileViewModel(
+            file: File(
+                name: name,
+                path: rootURL.appendingPathComponent(name).path,
+                modificationDate: Date(timeIntervalSince1970: 1000)
+            ),
+            rootPath: rootURL.path,
+            rootIdentifier: rootID,
+            rootFolderPath: rootURL.path,
+            fileSystemService: nil
+        )
+    }
+
+    private func makeTarget(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        file: FileViewModel,
+        relativePath: String
+    ) throws -> WorkspaceCodemapAutomaticSelectionTarget {
+        try WorkspaceCodemapAutomaticSelectionTarget(
+            rootEpoch: rootEpoch,
+            fileID: file.id,
+            catalogGeneration: 1,
+            requestGeneration: 1,
+            logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                rootDisplayName: "Root",
+                standardizedRelativePath: relativePath
+            ))
         )
     }
 }

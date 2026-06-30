@@ -22,11 +22,16 @@ final class ReviewGitRepositoryFixture {
 
     func makeRepository(
         named name: String,
-        files: [String: String] = ["Sources/Feature.swift": "let value = 1\n"]
+        files: [String: String] = ["Sources/Feature.swift": "let value = 1\n"],
+        objectFormat: GitObjectFormat? = nil
     ) throws -> URL {
         let root = sandbox.appendingPathComponent(name, isDirectory: true).standardizedFileURL
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        _ = try runGit(["init"], at: root)
+        var initArguments = ["init"]
+        if let objectFormat {
+            initArguments.append("--object-format=\(objectFormat.rawValue)")
+        }
+        _ = try runGit(initArguments, at: root)
         _ = try runGit(["config", "user.name", "RepoPrompt Test"], at: root)
         _ = try runGit(["config", "user.email", "repoprompt@example.test"], at: root)
         _ = try runGit(["config", "commit.gpgSign", "false"], at: root)
@@ -59,6 +64,15 @@ final class ReviewGitRepositoryFixture {
         try contents.write(to: file, atomically: true, encoding: .utf8)
     }
 
+    func write(_ data: Data, to relativePath: String, at root: URL) throws {
+        let file = root.appendingPathComponent(relativePath)
+        try FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: file, options: .atomic)
+    }
+
     func stage(_ relativePath: String, at root: URL) throws {
         _ = try runGit(["add", "--", relativePath], at: root)
     }
@@ -72,19 +86,48 @@ final class ReviewGitRepositoryFixture {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    func headBlobOID(for relativePath: String, at root: URL) throws -> String {
+        let oid = try runGit(["rev-parse", "--verify", "HEAD:\(relativePath)"], at: root)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard [40, 64].contains(oid.count), oid.allSatisfy(\.isHexDigit) else {
+            throw NSError(
+                domain: "ReviewGitRepositoryFixture.git",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Unexpected blob OID for \(relativePath): \(oid)"]
+            )
+        }
+        return oid
+    }
+
+    func isTracked(_ relativePath: String, at root: URL) throws -> Bool {
+        let output = try runGit(["ls-files", "--", relativePath], at: root)
+        return output.split(whereSeparator: \.isNewline).contains(Substring(relativePath))
+    }
+
+    func porcelainStatus(for relativePath: String, at root: URL) throws -> String {
+        try runGit(
+            ["status", "--porcelain=v1", "--untracked-files=all", "--", relativePath],
+            at: root
+        ).trimmingCharacters(in: .newlines)
+    }
+
+    @discardableResult
+    func createUntrackedFile(_ contents: String, at relativePath: String, root: URL) throws -> URL {
+        guard try !isTracked(relativePath, at: root) else {
+            throw NSError(
+                domain: "ReviewGitRepositoryFixture.git",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Expected untracked path: \(relativePath)"]
+            )
+        }
+        try write(contents, to: relativePath, at: root)
+        return root.appendingPathComponent(relativePath).standardizedFileURL
+    }
+
     @discardableResult
     func runGit(_ arguments: [String], at root: URL) throws -> String {
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-
-        let result = try TestProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
-            arguments: arguments,
-            currentDirectoryURL: root,
-            environment: environment
-        )
+        let result = try runGitResult(arguments, at: root)
         guard result.terminationStatus == 0 else {
             throw NSError(
                 domain: "ReviewGitRepositoryFixture.git",
@@ -96,5 +139,19 @@ final class ReviewGitRepositoryFixture {
             )
         }
         return result.outputText
+    }
+
+    func runGitResult(_ arguments: [String], at root: URL) throws -> TestProcessResult {
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+
+        return try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: root,
+            environment: environment
+        )
     }
 }

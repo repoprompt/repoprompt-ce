@@ -16,7 +16,6 @@ import XCTest
             let store = WorkspaceFileContextStore()
             let root = try await store.loadRoot(path: rootURL.path)
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
 
             let folderURL = rootURL.appendingPathComponent("Sources", isDirectory: true)
@@ -115,7 +114,6 @@ import XCTest
             let canonicalFolder = try XCTUnwrap(canonical.folders.first { $0.standardizedRelativePath == "Sources" })
 
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             manager.resetAppliedIndexProjectionLookupDiagnosticsForTesting()
 
@@ -165,7 +163,6 @@ import XCTest
             XCTAssertEqual(canonical.generation, 2)
 
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             let conflictingFolderID = UUID()
             let conflictingFileID = UUID()
@@ -236,7 +233,6 @@ import XCTest
             let canonicalFile = try XCTUnwrap(canonical.files.first { $0.standardizedRelativePath == "Seed.swift" })
 
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             manager.resetAppliedIndexProjectionLookupDiagnosticsForTesting()
 
@@ -269,7 +265,6 @@ import XCTest
             let keepRecord = try XCTUnwrap(initialCanonical.files.first { $0.standardizedRelativePath == "Keep.swift" })
 
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
                 rootID: root.id,
@@ -323,7 +318,6 @@ import XCTest
             let store = WorkspaceFileContextStore()
             let root = try await store.loadRoot(path: rootURL.path)
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
 
             let fileID = UUID()
@@ -394,7 +388,6 @@ import XCTest
             XCTAssertEqual(canonical.generation, 3)
 
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
 
             let ghostFolderID = UUID()
@@ -520,7 +513,6 @@ import XCTest
             let files = await store.files(inRoot: root.id)
             let file = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Hidden.swift" })
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
 
             await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
                 rootID: root.id,

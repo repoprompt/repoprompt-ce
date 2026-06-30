@@ -41,8 +41,11 @@
             IgnoreDebugMetricsRecorder.reset()
             XCTAssertEqual(IgnoreDebugMetricsRecorder.snapshot(), IgnoreDebugMetrics())
 
-            let rules = IgnoreRules()
-            rules.addIgnoreFile(content: "!logs/keep.log", priority: 0)
+            let rules = IgnoreRules(policy: .nonGitRoot)
+            rules.addCompiledLayer(
+                GitignoreCompiler.compile(content: "!logs/keep.log", directoryPath: ""),
+                authority: .secondary
+            )
             IgnoreDebugMetricsRecorder.reset()
 
             XCTAssertTrue(rules.requiresTraversal(for: "logs"))

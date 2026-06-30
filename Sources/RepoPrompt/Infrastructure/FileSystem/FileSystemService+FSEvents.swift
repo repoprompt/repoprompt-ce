@@ -33,6 +33,9 @@ extension FileSystemService {
 
     /// (Re)start the FSEvent stream if needed and drain the pre-crawl replay cut.
     public func startWatchingForChanges() async throws {
+        guard seedInitializationState == nil else {
+            throw FileSystemSeedReplayError.initializationAlreadyActive
+        }
         try startFSEventStream()
         if let stream = fseventStreamRef {
             FSEventStreamFlushSync(stream)
@@ -145,6 +148,47 @@ extension FileSystemService {
             isIgnoredPrefixCheck(relativePath: relativePath)
         }
         return isIgnored ? .ineligible(.ignored) : .eligible
+    }
+
+    func currentWorkspaceRootCatalogPolicyIdentity() -> WorkspaceRootCatalogPolicyIdentity {
+        catalogPolicyIdentity
+    }
+
+    func catalogProjectionEvidence(
+        forCommittedRegularPaths paths: WorkspaceRootByteExactPathSet
+    ) async -> WorkspaceRootCatalogProjectionEvidence? {
+        guard pendingIgnoreRulesRebuildCount == 0 else { return nil }
+        let startingRevision = ignoreRulesRevision
+        let startingIdentity = catalogPolicyIdentity
+        var dispositions: [WorkspaceRootByteExactPathKey: WorkspaceRootCommittedRegularProjectionDisposition] = [:]
+        dispositions.reserveCapacity(paths.count)
+
+        for pathKey in paths.sortedKeys {
+            let relativePath = pathKey.value
+            guard WorkspaceRootByteExactPathKey(StandardizedPath.relative(relativePath)) == pathKey else {
+                dispositions[pathKey] = .ineligible(.invalidRelativePath)
+                continue
+            }
+            let eligibility = await catalogRegularFileEligibility(relativePath: relativePath)
+            switch eligibility {
+            case .eligible:
+                dispositions[pathKey] = .searchableRegularFile
+            case .ineligible(.ignored):
+                dispositions[pathKey] = .policyIgnoredRegularFile
+            case let .ineligible(reason):
+                dispositions[pathKey] = .ineligible(reason)
+            }
+        }
+
+        guard pendingIgnoreRulesRebuildCount == 0,
+              startingRevision == ignoreRulesRevision,
+              startingIdentity == catalogPolicyIdentity
+        else { return nil }
+        return WorkspaceRootCatalogProjectionEvidence(
+            policyIdentity: startingIdentity,
+            dispositionsByRelativePath: dispositions,
+            ignoreRulesRevision: startingRevision
+        )
     }
 
     func registerExplicitlyManagedRegularFile(relativePath rawRelativePath: String) async -> CatalogRegularFileEligibility {
@@ -506,7 +550,17 @@ extension FileSystemService {
             }
         #endif
 
-        let filterResult = service.watcherEarlyFilter.filter(payload)
+        // A wrapped journal can never be proven safe by path filtering. Preserve
+        // the signal so strict seeded replay rejects it even when its path would
+        // otherwise be ignored by the immutable early-filter snapshot.
+        let hasWrappedJournal = payload.entries.contains { entry in
+            (entry.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)) != 0
+        }
+        let filterResult = if hasWrappedJournal {
+            FileSystemWatcherEarlyFilter.Result(payload: payload, filteredEntryCount: 0)
+        } else {
+            service.watcherEarlyFilter.filter(payload)
+        }
         guard let retainedPayload = filterResult.payload else { return }
 
         let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
@@ -1479,6 +1533,10 @@ extension FileSystemService {
                 }
             } catch {
                 print("Error during parallel folder scanning: \(error)")
+                if seedReplayRequiresFailClosedRecovery() {
+                    failCurrentSeedReplayForRecovery()
+                    return testMode ? [] : nil
+                }
                 // The serial fallback gets one immediate attempt. Targets that fail
                 // both paths remain explicitly dirty and retain the accepted watermark.
                 pendingQuietFolderScanTargets.subtract(Set(eligibleFolders))
@@ -1563,14 +1621,22 @@ extension FileSystemService {
             ignoreRulesRevision &+= 1
             pendingIgnoreChangeDirs.formUnion(changedIgnoreDirs)
             let dirs = changedIgnoreDirs // capture before escaping
+            pendingIgnoreRulesRebuildCount += 1
             #if DEBUG
                 if isTestMode {
                     await rebuildPerFolderIgnoreCache(changedDirs: dirs)
+                    pendingIgnoreRulesRebuildCount -= 1
                 } else {
-                    Task { await rebuildPerFolderIgnoreCache(changedDirs: dirs) }
+                    Task {
+                        await rebuildPerFolderIgnoreCache(changedDirs: dirs)
+                        pendingIgnoreRulesRebuildCount -= 1
+                    }
                 }
             #else
-                Task { await rebuildPerFolderIgnoreCache(changedDirs: dirs) }
+                Task {
+                    await rebuildPerFolderIgnoreCache(changedDirs: dirs)
+                    pendingIgnoreRulesRebuildCount -= 1
+                }
             #endif
         }
 

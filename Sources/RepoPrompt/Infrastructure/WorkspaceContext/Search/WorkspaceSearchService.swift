@@ -251,16 +251,25 @@ actor WorkspaceSearchService {
             }
         #endif
 
-        let results: [WorkspaceSearchCatalogEntry] = if trimmed.isEmpty {
-            Self.mergeRootEntries(rootPathIndexesAtSearchStart, limit: boundedLimit)
+        let results: [WorkspaceSearchCatalogEntry]
+        if trimmed.isEmpty {
+            for index in rootPathIndexesAtSearchStart {
+                index.recordEmptyQueryShadowParity(limit: boundedLimit)
+            }
+            results = Self.mergeRootEntries(rootPathIndexesAtSearchStart, limit: boundedLimit)
         } else {
-            await Task.detached {
-                Self.searchRootIndexes(
-                    rootPathIndexesAtSearchStart,
-                    query: trimmed,
-                    limit: boundedLimit
-                )
-            }.value
+            results = await withTaskGroup(of: [WorkspaceSearchCatalogEntry].self) { group in
+                group.addTask {
+                    await Self.searchRootIndexes(
+                        rootPathIndexesAtSearchStart,
+                        query: trimmed,
+                        limit: boundedLimit
+                    )
+                }
+                let value = await group.next() ?? []
+                group.cancelAll()
+                return value
+            }
         }
         return WorkspaceSearchQueryResult(
             query: query,
@@ -456,8 +465,13 @@ actor WorkspaceSearchService {
         _ rootPathIndexes: [WorkspaceSearchRootPathIndex],
         query: String,
         limit: Int
-    ) -> [WorkspaceSearchCatalogEntry] {
-        let candidateBatches = rootPathIndexes.map { $0.search(query, limit: limit) }
+    ) async -> [WorkspaceSearchCatalogEntry] {
+        var candidateBatches: [[WorkspaceSearchRootPathIndex.Candidate]] = []
+        candidateBatches.reserveCapacity(rootPathIndexes.count)
+        for index in rootPathIndexes {
+            if Task.isCancelled { return [] }
+            await candidateBatches.append(index.searchVerifyingShadow(query, limit: limit))
+        }
         var heap: [RankedCandidateCursor] = []
         heap.reserveCapacity(candidateBatches.count)
 
@@ -505,6 +519,7 @@ actor WorkspaceSearchService {
         var results: [WorkspaceSearchCatalogEntry] = []
         results.reserveCapacity(limit)
         while results.count < limit, let cursor = pop() {
+            if Task.isCancelled { return [] }
             let candidate = candidateBatches[cursor.rootIndex][cursor.candidateIndex]
             if seenIDs.insert(candidate.entry.id).inserted {
                 results.append(candidate.entry)

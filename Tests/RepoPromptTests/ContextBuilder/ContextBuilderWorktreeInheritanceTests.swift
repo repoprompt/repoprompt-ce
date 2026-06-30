@@ -168,7 +168,6 @@ import XCTest
                         Set([logicalFile.path, mapPath, patchPath])
                     )
                     XCTAssertTrue(publishedSelection.slices.isEmpty)
-                    XCTAssertTrue(publishedSelection.autoCodemapPaths.isEmpty)
                     XCTAssertFalse(publishedSelection.codemapAutoEnabled)
                     let publishedSelectionRevision = fixture.contextA.window.workspaceManager
                         .selectionRevisionForMCP(
@@ -264,7 +263,6 @@ import XCTest
                     let logicalRelativeFilePath = String(
                         logicalFile.standardizedFileURL.path.dropFirst(logicalRoot.standardizedFileURL.path.count)
                     ).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                    let expectedPublishedPaths = Set([logicalFile.path, mapAlias, patchAlias])
                     for (runIndex, responseType) in ["plan", "review"].enumerated() {
                         let response = try await outerEndpoint.callTool(
                             name: MCPWindowToolName.contextBuilder,
@@ -286,24 +284,26 @@ import XCTest
                         guard state.runs.indices.contains(runIndex) else { continue }
                         let run = state.runs[runIndex]
                         let runDiagnostics = "response_type=\(responseType) run_index=\(runIndex) \(run.selectionBeforeRead.diagnosticDescription)"
-                        XCTAssertEqual(
-                            Set(run.selectionBeforeRead.fullPaths),
-                            expectedPublishedPaths,
-                            runDiagnostics
-                        )
+                        XCTAssertEqual(run.selectionBeforeRead.fullPaths.count, 3, runDiagnostics)
+                        XCTAssertTrue(run.selectionBeforeRead.fullPaths.contains(mapAlias), runDiagnostics)
+                        XCTAssertTrue(run.selectionBeforeRead.fullPaths.contains(patchAlias), runDiagnostics)
                         XCTAssertTrue(run.selectionBeforeRead.slicePaths.isEmpty, runDiagnostics)
                         XCTAssertTrue(
-                            Set(run.selectionBeforeRead.invalidPaths).isDisjoint(with: expectedPublishedPaths),
+                            Set(run.selectionBeforeRead.invalidPaths).isDisjoint(
+                                with: Set(run.selectionBeforeRead.fullPaths)
+                            ),
                             runDiagnostics
                         )
                         let sourceObservation = try XCTUnwrap(
-                            run.selectionBeforeRead.files.first { $0.path == logicalFile.path },
+                            run.selectionBeforeRead.files.first {
+                                $0.pathWithinRoot == logicalRelativeFilePath
+                            },
                             runDiagnostics
                         )
                         XCTAssertEqual(sourceObservation.renderMode, "full", runDiagnostics)
                         XCTAssertEqual(
                             sourceObservation.rootPath,
-                            logicalRoot.standardizedFileURL.path,
+                            logicalRoot.lastPathComponent,
                             runDiagnostics
                         )
                         XCTAssertEqual(
@@ -342,9 +342,8 @@ import XCTest
                         XCTAssertTrue(run.tree.contains("BranchOnly.swift"), run.tree)
                         XCTAssertTrue(run.read.contains(worktreeSentinel), run.read)
                         XCTAssertTrue(run.search.contains(worktreeSentinel), run.search)
-                        if run.codeStructure.contains("Codemap generation pending") {
-                            XCTAssertTrue(run.codeStructure.contains("Files with codemap**: 0"), run.codeStructure)
-                            XCTAssertTrue(run.codeStructure.contains("### Files still awaiting codemap"), run.codeStructure)
+                        if run.codeStructure.contains("- **Status**: `pending`") {
+                            XCTAssertTrue(run.codeStructure.contains("`artifact_pending`"), run.codeStructure)
                             assertLogicalPath(logicalRelativeFilePath, in: run.codeStructure)
                             XCTAssertFalse(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
                         } else {
@@ -413,17 +412,16 @@ import XCTest
                         codeMapUsageOverride: .auto,
                         lookupContextOverride: lookupContext
                     )
-                    XCTAssertEqual(
-                        Set(expected.files?.compactMap(\.rootPath) ?? []),
-                        Set([logicalRoot.standardizedFileURL.path])
-                    )
+                    let expectedRootPaths = Set(expected.files?.compactMap(\.rootPath) ?? [])
+                    XCTAssertEqual(expectedRootPaths, Set([logicalRoot.lastPathComponent]))
                     let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(expected)
-                    XCTAssertTrue(formattedSelection.contains(logicalRoot.standardizedFileURL.path), formattedSelection)
+                    XCTAssertTrue(formattedSelection.contains(logicalFile.lastPathComponent), formattedSelection)
+                    XCTAssertFalse(formattedSelection.contains(logicalRoot.standardizedFileURL.path), formattedSelection)
                     XCTAssertFalse(formattedSelection.contains(worktreeRoot.standardizedFileURL.path), formattedSelection)
 
                     let slicedSelection = StoredSelection(
                         selectedPaths: [logicalFile.path],
-                        autoCodemapPaths: [],
+
                         slices: [logicalFile.path: [LineRange(start: 1, end: 1)]],
                         codemapAutoEnabled: false
                     )
@@ -434,12 +432,11 @@ import XCTest
                         codeMapUsageOverride: .none,
                         lookupContextOverride: lookupContext
                     )
-                    XCTAssertEqual(
-                        Set(slicedReply.fileSlices?.compactMap(\.rootPath) ?? []),
-                        Set([logicalRoot.standardizedFileURL.path])
-                    )
+                    let slicedRootPaths = Set(slicedReply.fileSlices?.compactMap(\.rootPath) ?? [])
+                    XCTAssertEqual(slicedRootPaths, Set([logicalRoot.lastPathComponent]))
                     let formattedSlices = ToolOutputFormatter.formatSelectionReplyToString(slicedReply)
-                    XCTAssertTrue(formattedSlices.contains(logicalRoot.standardizedFileURL.path), formattedSlices)
+                    XCTAssertTrue(formattedSlices.contains(logicalFile.lastPathComponent), formattedSlices)
+                    XCTAssertFalse(formattedSlices.contains(logicalRoot.standardizedFileURL.path), formattedSlices)
                     XCTAssertFalse(formattedSlices.contains(worktreeRoot.standardizedFileURL.path), formattedSlices)
 
                     XCTAssertEqual(state.accounting.count, 2)
@@ -1066,15 +1063,33 @@ import XCTest
                     _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: fixture.contextA.rootURL)
                     _ = try gitFixture.runGit(["add", "."], at: fixture.contextA.rootURL)
                     _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: fixture.contextA.rootURL)
+                    await store.replayObservedFileSystemDeltas(
+                        rootID: fixture.contextA.rootID,
+                        deltas: [.folderAdded(".git")]
+                    )
+                    let relativePath = "Sources/\(fixture.contextA.fileURL.lastPathComponent)"
+                    let warmedCodemap = try await waitForCodemapDemandReady(
+                        in: store,
+                        rootID: fixture.contextA.rootID,
+                        relativePath: relativePath
+                    )
+                    _ = await store.cancelCodemapArtifactDemand(warmedCodemap.ticket)
                     let canonicalSentinel = "CanonicalNonAgentContextBuilderType"
                     try write(
                         "struct \(canonicalSentinel) { func canonicalMethod() {} }\n",
                         to: fixture.contextA.fileURL
                     )
-                    let relativePath = "Sources/\(fixture.contextA.fileURL.lastPathComponent)"
+                    let modifiedDate = try await store.fileModificationDate(
+                        rootID: fixture.contextA.rootID,
+                        relativePath: relativePath
+                    )
                     await store.replayObservedFileSystemDeltas(
                         rootID: fixture.contextA.rootID,
-                        deltas: [.fileModified(relativePath, Date())]
+                        deltas: [.fileModified(relativePath, modifiedDate)]
+                    )
+                    _ = await store.awaitAppliedIngressForExplicitRequest(
+                        userPath: fixture.contextA.fileURL.path,
+                        fallbackScope: .visibleWorkspace
                     )
                     try await waitForCodemap(
                         in: store,
@@ -1294,6 +1309,89 @@ import XCTest
             }
         }
 
+        private func codemapWarmupUnavailableIsRetryable(
+            _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+        ) -> Bool {
+            switch reason {
+            case .gitTerminal(.releasedRootEpoch), .gitTransient, .busy,
+                 .staleCurrentness, .demandUnavailable(.transient):
+                true
+            case .rootNotLoaded, .fileNotCataloged, .unsupportedFileType,
+                 .gitTerminal, .demandUnavailable, .rejected, .routeConflict,
+                 .registrationFailed, .runtimeFailure, .cancelled:
+                false
+            }
+        }
+
+        private func codemapWarmupRetryDelay(
+            for reason: WorkspaceCodemapArtifactDemandUnavailableReason
+        ) -> Duration {
+            if case let .busy(milliseconds) = reason, let milliseconds {
+                return .milliseconds(max(25, min(milliseconds, 250)))
+            }
+            return .milliseconds(25)
+        }
+
+        private func waitForCodemapDemandReady(
+            in store: WorkspaceFileContextStore,
+            rootID: UUID,
+            relativePath: String,
+            timeout: Duration = .seconds(20)
+        ) async throws -> WorkspaceCodemapArtifactDemandReady {
+            func failure(_ message: String) -> NSError {
+                NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: message]
+                )
+            }
+
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var lastReason: WorkspaceCodemapArtifactDemandUnavailableReason?
+
+            requestLoop: while clock.now < deadline {
+                guard let file = await store.file(rootID: rootID, relativePath: relativePath) else {
+                    try await Task.sleep(for: .milliseconds(25))
+                    continue
+                }
+                let initial = await store.requestCodemapArtifact(forFileID: file.id)
+                switch initial {
+                case let .ready(ready):
+                    return ready
+                case let .unavailable(reason):
+                    lastReason = reason
+                    guard codemapWarmupUnavailableIsRetryable(reason) else {
+                        throw failure("Codemap warmup unavailable for \(relativePath): \(reason)")
+                    }
+                    try await Task.sleep(for: codemapWarmupRetryDelay(for: reason))
+                    continue
+                case let .pending(ticket):
+                    while clock.now < deadline {
+                        switch await store.codemapArtifactDemandStatus(ticket) {
+                        case let .ready(ready):
+                            return ready
+                        case .pending:
+                            try await Task.sleep(for: .milliseconds(25))
+                        case let .unavailable(reason):
+                            lastReason = reason
+                            guard codemapWarmupUnavailableIsRetryable(reason) else {
+                                throw failure("Codemap warmup settled unavailable for \(relativePath): \(reason)")
+                            }
+                            try await Task.sleep(for: codemapWarmupRetryDelay(for: reason))
+                            continue requestLoop
+                        }
+                    }
+                }
+            }
+            if let lastReason {
+                XCTFail("Timed out waiting for codemap warmup in \(relativePath); last reason: \(lastReason)")
+                throw failure("Timed out waiting for codemap warmup in \(relativePath); last reason: \(lastReason)")
+            }
+            XCTFail("Timed out waiting for codemap warmup in \(relativePath)")
+            throw failure("Timed out waiting for codemap warmup in \(relativePath)")
+        }
+
         private func waitForCodemap(
             in store: WorkspaceFileContextStore,
             rootID: UUID,
@@ -1301,19 +1399,59 @@ import XCTest
             containing expectedText: String,
             timeout: Duration = .seconds(6)
         ) async throws {
-            try await store.requestCodemapScan(rootID: rootID, relativePath: relativePath)
+            func failure(_ message: String) -> NSError {
+                NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: message]
+                )
+            }
+
+            func validateReady(_ ready: WorkspaceCodemapArtifactDemandReady, phase: String) throws -> Bool {
+                let outcome = try ready.handle.outcome()
+                guard case .ready = outcome else {
+                    throw failure("Codemap \(phase) outcome was \(outcome) for \(relativePath)")
+                }
+                guard let rendered = try ready.handle.renderedCodemap(displayPath: relativePath) else {
+                    throw failure("Codemap \(phase) had no rendered output for \(relativePath)")
+                }
+                guard rendered.text.contains(expectedText) else {
+                    throw failure(
+                        "Codemap \(phase) did not contain \(expectedText) for \(relativePath); rendered=\(rendered.text)"
+                    )
+                }
+                return true
+            }
+
+            let fileRecord = await store.file(rootID: rootID, relativePath: relativePath)
+            let file = try XCTUnwrap(fileRecord)
+            let initial = await store.requestCodemapArtifact(forFileID: file.id)
+            let ticket: WorkspaceCodemapArtifactDemandTicket
+            switch initial {
+            case let .pending(value):
+                ticket = value
+            case let .ready(ready):
+                _ = try validateReady(ready, phase: "initial")
+                return
+            case let .unavailable(reason):
+                throw failure("Codemap initial unavailable for \(relativePath): \(reason)")
+            }
+
             let clock = ContinuousClock()
             let deadline = clock.now.advanced(by: timeout)
             while clock.now < deadline {
-                if let snapshot = await store.codemapSnapshot(rootID: rootID, relativePath: relativePath),
-                   snapshot.fileAPI?.apiDescription.contains(expectedText) == true
-                {
+                switch await store.codemapArtifactDemandStatus(ticket) {
+                case let .ready(ready):
+                    _ = try validateReady(ready, phase: "settled")
                     return
+                case .pending:
+                    try await Task.sleep(for: .milliseconds(25))
+                case let .unavailable(reason):
+                    throw failure("Codemap settled unavailable for \(relativePath): \(reason)")
                 }
-                try await Task.sleep(for: .milliseconds(25))
             }
             XCTFail("Timed out waiting for codemap containing \(expectedText)")
-            throw NSError(domain: "ContextBuilderWorktreeInheritanceTests", code: 1)
+            throw failure("Timed out waiting for codemap containing \(expectedText) in \(relativePath)")
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
@@ -1367,8 +1505,10 @@ import XCTest
             let parts = logicalPath.split(separator: "/", maxSplits: 1).map(String.init)
             let root = parts.first ?? logicalPath
             let pathWithinRoot = parts.count > 1 ? parts[1] : logicalPath
-            XCTAssertTrue(output.contains("- **\(root)**"), output)
-            XCTAssertTrue(output.contains("  - `\(pathWithinRoot)`"), output)
+            let groupedPath = output.contains("- **\(root)**")
+                && output.contains("  - `\(pathWithinRoot)`")
+            let inlinePath = output.contains("[`\(logicalPath)`]")
+            XCTAssertTrue(groupedPath || inlinePath, output)
         }
 
         private func makeGitBinding(
@@ -1593,6 +1733,7 @@ import XCTest
             let codeStructure = try await toolResultText(endpoint.callTool(
                 name: MCPWindowToolName.getCodeStructure,
                 arguments: [
+                    "scope": "paths",
                     "paths": [logicalFilePath]
                 ],
                 timeoutSeconds: 30

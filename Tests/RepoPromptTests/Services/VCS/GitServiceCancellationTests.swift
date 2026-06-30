@@ -125,6 +125,120 @@ import XCTest
             XCTAssertEqual(kill(childPID, 0), -1)
             XCTAssertEqual(errno, ESRCH, "Escalated Git subprocess was not reaped.")
         }
+
+        func testCapabilityBoundBlobCancellationDrainsBeforeReleasingAdmission() async throws {
+            let fixture = try GitCancellationFixture()
+            defer { fixture.cleanup() }
+            let admission = GitProcessAdmissionController(globalLimit: 1, perRepositoryLimit: 1)
+            let baseline = await admission.snapshot()
+            let git = GitService(
+                gitExecutableURL: fixture.executableURL,
+                processAdmissionController: admission
+            )
+            let oid = GitBlobOID.blob(bytes: Data(), objectFormat: .sha1)
+            let command = Task {
+                try await git.gitBlobObjectBytes(
+                    in: fixture.layout,
+                    oid: oid,
+                    expectedByteCount: GitCancellationFixture.payloadByteCount
+                )
+            }
+            defer { command.cancel() }
+
+            let childPID = try await fixture.awaitReadyPID()
+            defer {
+                if kill(childPID, 0) == 0 {
+                    _ = kill(childPID, SIGKILL)
+                }
+            }
+            let completion = TestCompletionSignal()
+            Task {
+                _ = await command.result
+                completion.signal()
+            }
+
+            command.cancel()
+            try await fixture.awaitOutputGate()
+            let heldAdmission = await admission.snapshot()
+            XCTAssertEqual(heldAdmission.activeGlobal, baseline.activeGlobal + 1)
+            XCTAssertEqual(heldAdmission.activeLeaseCount, baseline.activeLeaseCount + 1)
+            let completedWhileGated = await completion.wait(timeout: .zero)
+            XCTAssertFalse(completedWhileGated)
+
+            try fixture.releaseChild()
+            let completed = await completion.wait(timeout: .seconds(15))
+            if !completed {
+                _ = kill(childPID, SIGKILL)
+                _ = await completion.wait(timeout: .seconds(5))
+                XCTFail("Cancelled capability-bound blob read did not complete after release.")
+                return
+            }
+            switch await command.result {
+            case .success:
+                XCTFail("Cancelled capability-bound blob read returned bytes.")
+            case let .failure(error):
+                XCTAssertTrue(error is CancellationError, "Unexpected cancellation result: \(error)")
+            }
+            let finalAdmission = await admission.snapshot()
+            XCTAssertEqual(finalAdmission, baseline)
+            errno = 0
+            XCTAssertEqual(kill(childPID, 0), -1)
+            XCTAssertEqual(errno, ESRCH, "Capability-bound blob subprocess was not reaped.")
+        }
+
+        func testCapabilityBoundBlobCancellationEscalatesAndReleasesAdmission() async throws {
+            let fixture = try GitCancellationFixture()
+            defer { fixture.cleanup() }
+            let admission = GitProcessAdmissionController(globalLimit: 1, perRepositoryLimit: 1)
+            let baseline = await admission.snapshot()
+            let git = GitService(
+                gitExecutableURL: fixture.executableURL,
+                processAdmissionController: admission,
+                processTerminationGrace: .milliseconds(250)
+            )
+            let oid = GitBlobOID.blob(bytes: Data(), objectFormat: .sha1)
+            let command = Task {
+                try await git.gitBlobObjectBytes(
+                    in: fixture.layout,
+                    oid: oid,
+                    expectedByteCount: GitCancellationFixture.payloadByteCount
+                )
+            }
+            defer { command.cancel() }
+
+            let childPID = try await fixture.awaitReadyPID()
+            defer {
+                if kill(childPID, 0) == 0 {
+                    _ = kill(childPID, SIGKILL)
+                }
+            }
+            let completion = TestCompletionSignal()
+            Task {
+                _ = await command.result
+                completion.signal()
+            }
+
+            command.cancel()
+            try await fixture.awaitOutputGate()
+            let completed = await completion.wait(timeout: .seconds(5))
+            if !completed {
+                _ = kill(childPID, SIGKILL)
+                _ = await completion.wait(timeout: .seconds(5))
+                XCTFail("Capability-bound blob read did not complete after SIGKILL escalation.")
+                return
+            }
+            switch await command.result {
+            case .success:
+                XCTFail("TERM-resistant capability-bound blob read returned bytes.")
+            case let .failure(error):
+                XCTAssertTrue(error is CancellationError, "Unexpected escalation result: \(error)")
+            }
+            let finalAdmission = await admission.snapshot()
+            XCTAssertEqual(finalAdmission, baseline)
+            errno = 0
+            XCTAssertEqual(kill(childPID, 0), -1)
+            XCTAssertEqual(errno, ESRCH, "SIGKILL-escalated blob subprocess was not reaped.")
+        }
     }
 
     private final class GitCancellationFixture {
@@ -134,6 +248,17 @@ import XCTest
         let repo: URL
         let executableURL: URL
         let expectedOutputByteCount: Int
+
+        var layout: GitRepositoryLayout {
+            let gitDirectory = repo.appendingPathComponent(".git", isDirectory: true)
+            return GitRepositoryLayout(
+                workTreeRoot: repo,
+                dotGitPath: gitDirectory,
+                gitDir: gitDirectory,
+                commonDir: gitDirectory,
+                isWorktree: false
+            )
+        }
 
         private let readyDescriptor: Int32
         private let outputGateDescriptor: Int32
@@ -154,7 +279,10 @@ import XCTest
                 }
             }
 
-            try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: repo.appendingPathComponent(".git/objects", isDirectory: true),
+                withIntermediateDirectories: true
+            )
             let pwd = try TestProcessRunner.run(
                 executableURL: URL(fileURLWithPath: "/bin/pwd"),
                 currentDirectoryURL: repo

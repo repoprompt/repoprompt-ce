@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPrompt
 import XCTest
 
@@ -15,7 +16,7 @@ final class AgentContextExportResolverTests: XCTestCase {
     func testDisplayFileCountUsesExplicitSelectionAndExcludesAutoCodemaps() {
         let selection = StoredSelection(
             selectedPaths: ["A.swift", "B.swift", "C.swift", "D.swift", "E.swift"],
-            autoCodemapPaths: ["G.swift", "H.swift"],
+
             slices: [
                 "E.swift": [LineRange(start: 1, end: 2)],
                 "F.swift": [LineRange(start: 3, end: 4)]
@@ -81,9 +82,8 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.sliceRangeCount, 1)
     }
 
-    func testSelectionSummaryExcludesEmptySlicesAndAutoCodemaps() {
+    func testSelectionSummaryExcludesEmptySlicesAndDoesNotInferCodemaps() {
         let selection = StoredSelection(
-            autoCodemapPaths: ["Sources/Dependency.swift"],
             slices: ["Sources/Empty.swift": []],
             codemapAutoEnabled: true
         )
@@ -130,9 +130,9 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.headlineText, "1 file · 1 sliced · 3 ranges")
     }
 
-    func testAutoCodemapExportResolutionBatchesPopoverPathLookups() async throws {
+    func testNonGitAutomaticExportPreservesSelectedRowsWithoutRuntimeOrLegacyFallback() async throws {
         #if DEBUG
-            let root = try makeTemporaryRoot(name: "AgentExportAutoCodemapBatch")
+            let root = try makeTemporaryRoot(name: "AgentExportNonGitAuto")
             let explicitFileCount = 7
             var selectedPaths: [String] = []
             var slices: [String: [LineRange]] = [:]
@@ -144,32 +144,24 @@ final class AgentContextExportResolverTests: XCTestCase {
                     slices[fileURL.path] = [LineRange(start: 1, end: 1)]
                 }
             }
-
-            let codemapCount = 44
-            var codemapPaths: [String] = []
-            var observed: [WorkspaceObservedCodemapResult] = []
-            for index in 0 ..< codemapCount {
-                let fileURL = root.appendingPathComponent("Dependency\(index).swift")
-                try write("struct Dependency\(index) {}", to: fileURL)
-                codemapPaths.append(fileURL.path)
-                observed.append(
-                    WorkspaceObservedCodemapResult(
-                        fullPath: fileURL.path,
-                        modificationDate: Date(),
-                        fileAPI: makeFileAPI(path: fileURL.path, symbol: "dependency\(index)")
-                    )
+            for index in 0 ..< 44 {
+                try write(
+                    "struct Dependency\(index) {}",
+                    to: root.appendingPathComponent("Dependency\(index).swift")
                 )
             }
 
-            let store = WorkspaceFileContextStore()
+            let runtimeAccessCount = AgentExportLockedCounter()
+            let store = WorkspaceFileContextStore(codemapRuntimeProvider: {
+                runtimeAccessCount.increment()
+                throw AgentExportTestError.unexpectedRuntimeAccess
+            })
             _ = try await store.loadRoot(path: root.path)
-            await store.applyObservedCodemapResults(observed)
             let source = AgentContextExportSource(
                 tabID: UUID(),
                 promptText: "Review",
                 selection: StoredSelection(
                     selectedPaths: selectedPaths,
-                    autoCodemapPaths: codemapPaths,
                     slices: slices,
                     codemapAutoEnabled: true
                 ),
@@ -201,7 +193,12 @@ final class AgentContextExportResolverTests: XCTestCase {
 
             XCTAssertEqual(model.rows.count(where: { $0.kind != .codemap }), explicitFileCount)
             XCTAssertEqual(model.rows.count(where: { $0.kind == .slices }), 4)
-            XCTAssertEqual(model.rows.count(where: { $0.kind == .codemap }), codemapCount)
+            XCTAssertEqual(model.rows.count(where: { $0.kind == .codemap }), 0)
+            guard case .unavailable = model.codemapCoverage else {
+                return XCTFail("Non-Git automatic export must report unavailable codemap coverage")
+            }
+            XCTAssertFalse(model.codemapIssues.isEmpty)
+            XCTAssertEqual(runtimeAccessCount.value, 0)
             XCTAssertEqual(
                 AgentContextExportResolver.displayFileCount(
                     resolvedModel: model,
@@ -235,6 +232,7 @@ final class AgentContextExportResolverTests: XCTestCase {
 
         let previewText = await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: fixture.store,
             purpose: .preview
         )
@@ -265,6 +263,177 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(clipboard.contains("let origin = \"base\""), clipboard)
     }
 
+    func testWorktreeSelectedCodemapUsesFrozenLogicalPresentationWithoutPhysicalLeak() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-logical",
+            files: ["App.swift": "struct LogicalBase {}\n"]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-physical-secret",
+            files: [
+                "App.swift": "struct WorktreeAgentExport { func worktreeExportCodemapSymbol() { let physicalBodySentinel = true } }\n"
+            ]
+        )
+        let store = try makeIsolatedCodemapStore(name: #function)
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let source = makeSource(
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["App.swift"], codemapAutoEnabled: false)
+        )
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            )
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .selected,
+            presentationCoordinator: coordinator
+        )
+
+        let row = try XCTUnwrap(model.rows.first)
+        let rendered = try XCTUnwrap(model.codemapPresentation.renderedEntriesByFileID[row.id.fileID])
+        XCTAssertEqual(row.kind, .codemap)
+        XCTAssertEqual(row.displayPath, "App.swift")
+        XCTAssertEqual(row.directoryDisplay, rendered.logicalPath.rootDisplayName)
+        XCTAssertEqual(rendered.rootEpoch.rootID, row.rootID)
+        XCTAssertFalse(rendered.logicalPath.rootDisplayName.isEmpty)
+        XCTAssertFalse(rendered.logicalPath.rootDisplayName.contains(worktreeRoot.path))
+        XCTAssertFalse(rendered.logicalPath.rootDisplayName.contains(worktreeRoot.lastPathComponent))
+        XCTAssertEqual(rendered.tokenCount, TokenCalculationService.estimateTokens(for: rendered.text))
+        XCTAssertFalse(rendered.text.contains(worktreeRoot.path), rendered.text)
+        XCTAssertFalse(rendered.text.contains(worktreeRoot.lastPathComponent), rendered.text)
+
+        let preview = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: store,
+            purpose: .preview
+        )
+        XCTAssertEqual(preview, rendered.text)
+
+        let clipboard = await AgentContextExportResolver.buildClipboardContent(
+            AgentContextClipboardRequest(
+                cfg: makeConfig(gitInclusion: .none, codeMapUsage: .selected),
+                source: source,
+                store: store,
+                lookupContext: model.lookupContext,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: true,
+                showCodeMapMarkers: true,
+                metaInstructions: [],
+                includeDatetimeInUserInstructions: false,
+                promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+                disabledPromptSections: [],
+                duplicateUserInstructionsAtTop: false,
+                reviewGitContext: .automaticOnly(),
+                completeGitDiffProvider: { "" }
+            )
+        )
+        XCTAssertTrue(clipboard.contains("worktreeExportCodemapSymbol"), clipboard)
+        XCTAssertFalse(clipboard.contains("physicalBodySentinel"), clipboard)
+        XCTAssertFalse(clipboard.contains(worktreeRoot.path), clipboard)
+    }
+
+    func testSelectedUnavailableCodemapPreservesFullRowAndReportsIncompleteCoverage() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportSelectedUnavailable")
+        try write("struct SelectedUnavailable {}\n", to: root.appendingPathComponent("Sources/App.swift"))
+        let runtimeAccessCount = AgentExportLockedCounter()
+        let store = WorkspaceFileContextStore(codemapRuntimeProvider: {
+            runtimeAccessCount.increment()
+            throw AgentExportTestError.unexpectedRuntimeAccess
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: ["Sources/App.swift"], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .selected
+        )
+
+        XCTAssertEqual(model.rows.map(\.kind), [.full])
+        guard case .unavailable = model.codemapCoverage else {
+            return XCTFail("Selected unavailable codemap must report incomplete coverage")
+        }
+        XCTAssertFalse(model.codemapIssues.isEmpty)
+        XCTAssertEqual(runtimeAccessCount.value, 0)
+    }
+
+    func testRevokedCodemapLifetimeOmitsStaleTargetBeforeModelPublication() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-revoked-logical",
+            files: ["Sources/Target.swift": "struct LogicalTarget {}\n"]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-revoked-worktree",
+            files: ["Sources/Target.swift": "struct RevokedTarget { func retainedUntilPublication() {} }\n"]
+        )
+        let store = try makeIsolatedCodemapStore(name: #function)
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let source = makeSource(
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot,
+            selection: StoredSelection(
+                selectedPaths: ["Sources/Target.swift"],
+                codemapAutoEnabled: false
+            )
+        )
+        let lookupContext = await AgentContextExportResolver.lookupContext(source: source, store: store)
+        let boundRoots = await store.rootRefs(scope: lookupContext.rootScope)
+        let physicalRootID = try XCTUnwrap(boundRoots.first {
+            $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
+        }?.id)
+        let revalidationCount = AgentExportLockedCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            ),
+            beforePublicationRevalidation: { _ in
+                revalidationCount.increment()
+                if revalidationCount.value == 1 {
+                    await store.unloadRoot(id: physicalRootID)
+                }
+            }
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .selected,
+            presentationCoordinator: coordinator
+        )
+
+        XCTAssertEqual(model.rows.map(\.kind), [.full])
+        XCTAssertTrue(model.codemapPresentation.orderedEntries.isEmpty)
+        guard case .unavailable = model.codemapCoverage else {
+            return XCTFail("Revoked complete export must publish typed incomplete coverage")
+        }
+        XCTAssertGreaterThanOrEqual(revalidationCount.value, 1)
+    }
+
     func testBoundExportFailsClosedWhenPhysicalWorktreeCannotBeLoaded() async throws {
         let logicalRoot = try makeTemporaryRoot(name: "AgentExportMissingLogical")
         try write("let origin = \"base\"\n", to: logicalRoot.appendingPathComponent("Sources/App.swift"))
@@ -286,19 +455,21 @@ final class AgentContextExportResolverTests: XCTestCase {
             filePathDisplay: .relative,
             codeMapUsage: .none
         )
-        let expectedPhysicalPath = unloadablePhysicalRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path
-
         XCTAssertEqual(model.lookupContext.bindingProjection?.physicalRootPaths, Set([unloadablePhysicalRoot.standardizedFileURL.path]))
         XCTAssertTrue(model.rows.isEmpty)
-        XCTAssertEqual(model.missingPaths, [expectedPhysicalPath])
+        XCTAssertEqual(model.missingPaths, ["Sources/App.swift"])
+        XCTAssertFalse(model.missingPaths.contains { $0.contains(unloadablePhysicalRoot.path) })
         XCTAssertFalse(model.rows.contains { $0.displayPath == "Sources/App.swift" })
     }
 
-    func testRemoveRowMutatesLogicalStoredSelectionByPhysicalizedPath() async throws {
+    func testRemoveRowResolvesLogicalSelectionKeysByFileIdentity() async throws {
         let fixture = try await makeBoundFixture()
         let original = StoredSelection(
-            selectedPaths: ["Sources/App.swift", "Sources/Keep.swift"],
-            autoCodemapPaths: [],
+            selectedPaths: [
+                "Sources/App.swift",
+                fixture.logicalRoot.appendingPathComponent("Sources/App.swift").path,
+                "Sources/Keep.swift"
+            ],
             slices: ["Sources/App.swift": [LineRange(start: 1, end: 1)]],
             codemapAutoEnabled: false
         )
@@ -311,10 +482,63 @@ final class AgentContextExportResolverTests: XCTestCase {
         )
         let row = try XCTUnwrap(model.rows.first { $0.displayPath == "Sources/App.swift" })
 
-        let updated = AgentContextExportResolver.removeRow(row, from: original, lookupContext: model.lookupContext)
+        let updated = await AgentContextExportResolver.removeRow(
+            row,
+            from: original,
+            lookupContext: model.lookupContext,
+            store: fixture.store
+        )
 
         XCTAssertEqual(updated.selectedPaths, ["Sources/Keep.swift"])
         XCTAssertTrue(updated.slices.isEmpty)
+    }
+
+    func testRemovingInferredAutomaticRowDisablesTransientSourceIntent() async throws {
+        let fixture = try await makeBoundFixture()
+        let lookupContext = await AgentContextExportResolver.lookupContext(
+            source: makeSource(
+                logicalRoot: fixture.logicalRoot,
+                worktreeRoot: fixture.worktreeRoot,
+                selection: StoredSelection(
+                    selectedPaths: ["Sources/Keep.swift"],
+                    codemapAutoEnabled: true
+                )
+            ),
+            store: fixture.store
+        )
+        let inferredFileID = UUID()
+        let inferredRow = AgentContextExportRow(
+            id: ResolvedPromptFileEntryID(
+                fileID: inferredFileID,
+                mode: .codemap,
+                lineRanges: nil
+            ),
+            kind: .codemap,
+            rootID: UUID(),
+            relativePath: "Sources/Inferred.swift",
+            displayPath: "Sources/Inferred.swift",
+            displayName: "Inferred.swift",
+            directoryDisplay: "Sources",
+            lineRanges: nil,
+            canRemove: true,
+            removesAutomaticSourceIntent: true
+        )
+        let selection = StoredSelection(
+            selectedPaths: ["Sources/Keep.swift"],
+            codemapAutoEnabled: true
+        )
+
+        let updated = await AgentContextExportResolver.removeRow(
+            inferredRow,
+            from: selection,
+            lookupContext: lookupContext,
+            store: fixture.store
+        )
+
+        XCTAssertEqual(updated.selectedPaths, selection.selectedPaths)
+        XCTAssertTrue(updated.slices.isEmpty)
+        XCTAssertFalse(updated.codemapAutoEnabled)
+        XCTAssertTrue(inferredRow.canRemove)
     }
 
     func testUnboundAgentExportDoesNotSeeSessionWorktreeRoots() async throws {
@@ -346,6 +570,47 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(lookupContext.rootScope, .visibleWorkspace)
         XCTAssertTrue(model.rows.isEmpty)
         XCTAssertEqual(model.missingPaths, ["Sources/Hidden.swift"])
+    }
+
+    func testDuplicateRootBasenamesProduceStableAgentPathsWithoutPhysicalLeaks() async throws {
+        let firstParent = try makeTemporaryRoot(name: "AgentDuplicateRootFirst")
+        let secondParent = try makeTemporaryRoot(name: "AgentDuplicateRootSecond")
+        let firstRoot = firstParent.appendingPathComponent("repo")
+        let secondRoot = secondParent.appendingPathComponent("repo")
+        let firstFile = firstRoot.appendingPathComponent("Sources/App.swift")
+        let secondFile = secondRoot.appendingPathComponent("Sources/App.swift")
+        try write("struct FirstDuplicateRoot {}\n", to: firstFile)
+        try write("struct SecondDuplicateRoot {}\n", to: secondFile)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: firstRoot.path)
+        _ = try await store.loadRoot(path: secondRoot.path)
+
+        func model(paths: [String]) async -> AgentContextExportModel {
+            await AgentContextExportResolver.resolveModel(
+                source: AgentContextExportSource(
+                    tabID: UUID(),
+                    promptText: "Review duplicate roots",
+                    selection: StoredSelection(selectedPaths: paths, codemapAutoEnabled: false),
+                    selectedMetaPromptIDs: [],
+                    tabName: "Duplicate roots",
+                    activeAgentSessionID: nil,
+                    worktreeBindings: []
+                ),
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .none
+            )
+        }
+
+        let first = await model(paths: [secondFile.path, firstFile.path])
+        let second = await model(paths: [firstFile.path, secondFile.path])
+        let paths = first.rows.map(\.displayPath)
+
+        XCTAssertEqual(paths, second.rows.map(\.displayPath))
+        XCTAssertEqual(Set(paths).count, 2)
+        XCTAssertTrue(paths.allSatisfy { $0.hasPrefix("root@") && $0.hasSuffix("/Sources/App.swift") })
+        XCTAssertFalse(paths.contains { $0.contains(firstParent.path) || $0.contains(secondParent.path) })
+        XCTAssertFalse(first.missingPaths.contains { $0.contains(firstParent.path) || $0.contains(secondParent.path) })
     }
 
     func testExportContextIdentityIncludesWorktreeBindingFingerprint() async throws {
@@ -411,7 +676,12 @@ final class AgentContextExportResolverTests: XCTestCase {
             codemapAutoEnabled: false
         )
 
-        let updated = AgentContextExportResolver.removeRow(row, from: latestSelection, lookupContext: model.lookupContext)
+        let updated = await AgentContextExportResolver.removeRow(
+            row,
+            from: latestSelection,
+            lookupContext: model.lookupContext,
+            store: fixture.store
+        )
 
         XCTAssertEqual(updated.selectedPaths, ["Sources/Keep.swift", "Sources/New.swift"])
     }
@@ -419,13 +689,13 @@ final class AgentContextExportResolverTests: XCTestCase {
     func testClearSelectionSnapshotPreservesNewlyAddedFiles() {
         let staleSnapshot = StoredSelection(
             selectedPaths: ["Sources/App.swift", "Sources/Keep.swift"],
-            autoCodemapPaths: ["Sources/AppCodemap.swift"],
+
             slices: ["Sources/App.swift": [LineRange(start: 1, end: 1)]],
             codemapAutoEnabled: false
         )
         let latestSelection = StoredSelection(
             selectedPaths: ["Sources/App.swift", "Sources/Keep.swift", "Sources/New.swift"],
-            autoCodemapPaths: ["Sources/AppCodemap.swift", "Sources/NewCodemap.swift"],
+
             slices: [
                 "Sources/App.swift": [LineRange(start: 1, end: 1)],
                 "Sources/New.swift": [LineRange(start: 2, end: 2)]
@@ -436,7 +706,6 @@ final class AgentContextExportResolverTests: XCTestCase {
         let updated = AgentContextExportResolver.removeSelectionSnapshot(staleSnapshot, from: latestSelection)
 
         XCTAssertEqual(updated.selectedPaths, ["Sources/New.swift"])
-        XCTAssertEqual(updated.autoCodemapPaths, ["Sources/NewCodemap.swift"])
         XCTAssertEqual(updated.slices, ["Sources/New.swift": [LineRange(start: 2, end: 2)]])
     }
 
@@ -686,11 +955,13 @@ final class AgentContextExportResolverTests: XCTestCase {
 
         let previewResult = await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: store,
             purpose: .preview
         )
         let copyResult = await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: store,
             purpose: .copy
         )
@@ -728,11 +999,13 @@ final class AgentContextExportResolverTests: XCTestCase {
 
         let previewResult = await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: store,
             purpose: .preview
         )
         let copyResult = await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: store,
             purpose: .copy
         )
@@ -804,38 +1077,53 @@ final class AgentContextExportResolverTests: XCTestCase {
         )
     }
 
-    private func makeFileAPI(path: String, symbol: String) -> FileAPI {
-        FileAPI(
-            filePath: path,
-            imports: [],
-            classes: [],
-            functions: [
-                FunctionInfo(
-                    name: symbol,
-                    parameters: [],
-                    returnType: nil,
-                    definitionLine: "func \(symbol)()",
-                    lineNumber: 1
-                )
-            ],
-            enums: [],
-            globalVars: [],
-            macros: [],
-            referencedTypes: []
-        )
-    }
-
-    private func makeConfig(gitInclusion: GitInclusion) -> PromptContextResolved {
+    private func makeConfig(
+        gitInclusion: GitInclusion,
+        codeMapUsage: CodeMapUsage = .none
+    ) -> PromptContextResolved {
         PromptContextResolved(
             includeFiles: true,
             includeUserPrompt: true,
             includeMetaPrompts: false,
             includeFileTree: true,
             fileTreeMode: .auto,
-            codeMapUsage: .none,
+            codeMapUsage: codeMapUsage,
             gitInclusion: gitInclusion,
             storedPromptIds: []
         )
+    }
+
+    private func makeIsolatedCodemapStore(name: String) throws -> WorkspaceFileContextStore {
+        let runtimeRoot = try makeTemporaryRoot(name: "\(name)-CodemapRuntime")
+        guard chmod(runtimeRoot.path, 0o700) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let resolvedPath = try runtimeRoot.path.withCString { pointer -> String in
+            guard let value = realpath(pointer, nil) else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            defer { free(value) }
+            return String(cString: value)
+        }
+        let registry = WorkspaceCodemapBindingIntegrationRegistry()
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: URL(fileURLWithPath: resolvedPath, isDirectory: true),
+            bindingIntegrationRegistry: registry,
+            bindingEngineFactory: { runtime in
+                WorkspaceCodemapBindingEngine(
+                    runtime: runtime,
+                    capabilityService: WorkspaceCodemapGitCapabilityService(
+                        namespaceSalt: Data(
+                            repeating: 0x41,
+                            count: GitBlobRepositoryNamespace.saltByteCount
+                        )
+                    ),
+                    sourceReader: registry.makeValidatedSourceReaderClient(),
+                    catalogClient: registry.makeBindingCatalogClient()
+                )
+            }
+        )
+        return WorkspaceFileContextStore(codemapRuntimeProvider: { runtime })
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
@@ -850,5 +1138,26 @@ final class AgentContextExportResolverTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+private enum AgentExportTestError: Error {
+    case unexpectedRuntimeAccess
+}
+
+private final class AgentExportLockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
     }
 }

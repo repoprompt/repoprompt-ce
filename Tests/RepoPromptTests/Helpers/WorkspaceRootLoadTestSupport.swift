@@ -9,7 +9,6 @@ enum WorkspaceRootLoadTestSupport {
         let settings = GlobalSettingsStore.shared.fileSystemSettingsSnapshot()
         return try await window.workspaceFileContextStore.loadRoot(
             path: path,
-            respectGitignore: settings.respectGitignore,
             respectRepoIgnore: settings.respectRepoIgnore,
             respectCursorignore: settings.respectCursorignore,
             skipSymlinks: settings.skipSymlinks,

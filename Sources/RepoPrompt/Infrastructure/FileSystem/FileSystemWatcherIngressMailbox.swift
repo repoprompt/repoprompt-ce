@@ -46,15 +46,18 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
     #if DEBUG
         struct Snapshot: Equatable {
             let acceptedHighWatermark: Watermark
+            let queuedAcceptedWatermarkRange: ClosedRange<Watermark>?
             let queuedPayloadCount: Int
             let queuedRawEntryCount: Int
             let hasOverflowRootRescan: Bool
+            let isAutomaticDrainPaused: Bool
         }
     #endif
 
     private let lock = NSLock()
     private let maxQueuedRawEntries: Int
     private var isAccepting = true
+    private var isAutomaticDrainPaused = false
     private var nextAcceptedSequence: UInt64 = 0
     private var acceptedHighWatermark = Watermark.zero
     private var queuedPayloads: [AcceptedPayload] = []
@@ -75,9 +78,29 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Stops callback acceptance from scheduling actor drain work. Explicit FIFO
+    /// takes remain available so a seeded initialization can replay a precise cut.
+    func pauseAutomaticDraining() {
+        lock.lock()
+        isAutomaticDrainPaused = true
+        lock.unlock()
+    }
+
+    /// Restores ordinary callback-driven draining and immediately schedules any
+    /// payloads that accumulated while the mailbox was paused.
+    func resumeAutomaticDraining(
+        scheduleDrain: @escaping @Sendable () async -> Void
+    ) {
+        lock.lock()
+        isAutomaticDrainPaused = false
+        scheduleDrainIfNeeded(scheduleDrain)
+        lock.unlock()
+    }
+
     func stopAcceptingAndDiscardPending() {
         lock.lock()
         isAccepting = false
+        isAutomaticDrainPaused = false
         queuedPayloads.removeAll(keepingCapacity: false)
         queuedPayloadHead = 0
         queuedRawEntryCount = 0
@@ -146,9 +169,13 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
             defer { lock.unlock() }
             return Snapshot(
                 acceptedHighWatermark: acceptedHighWatermark,
+                queuedAcceptedWatermarkRange: queuedPayloadHead < queuedPayloads.count
+                    ? queuedPayloads[queuedPayloadHead].lowestAcceptedWatermark ... queuedPayloads[queuedPayloads.count - 1].acceptedHighWatermark
+                    : nil,
                 queuedPayloadCount: queuedPayloads.count - queuedPayloadHead,
                 queuedRawEntryCount: queuedRawEntryCount,
-                hasOverflowRootRescan: hasOverflowRootRescan
+                hasOverflowRootRescan: hasOverflowRootRescan,
+                isAutomaticDrainPaused: isAutomaticDrainPaused
             )
         }
     #endif
@@ -217,7 +244,11 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
     }
 
     private func scheduleDrainIfNeeded(_ scheduleDrain: @escaping @Sendable () async -> Void) {
-        guard isAccepting, activeDrainToken == nil, queuedPayloadHead < queuedPayloads.count else { return }
+        guard isAccepting,
+              !isAutomaticDrainPaused,
+              activeDrainToken == nil,
+              queuedPayloadHead < queuedPayloads.count
+        else { return }
         nextDrainToken &+= 1
         let token = nextDrainToken
         activeDrainToken = token

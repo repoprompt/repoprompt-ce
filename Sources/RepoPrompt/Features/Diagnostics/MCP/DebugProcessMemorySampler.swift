@@ -6,6 +6,12 @@
         let timestampMS: Double
         let residentBytes: UInt64
         let physicalFootprintBytes: UInt64?
+        let userCPUTimeMS: Double
+        let systemCPUTimeMS: Double
+
+        var cpuUsage: DebugProcessCPUUsage {
+            DebugProcessCPUUsage(userMS: userCPUTimeMS, systemMS: systemCPUTimeMS)
+        }
 
         var residentMB: Double {
             Self.megabytes(residentBytes)
@@ -21,7 +27,10 @@
                 "resident_bytes": NSNumber(value: residentBytes),
                 "resident_mb": Self.round(residentMB),
                 "physical_footprint_bytes": physicalFootprintBytes.map { NSNumber(value: $0) } ?? NSNull(),
-                "physical_footprint_mb": physicalFootprintMB.map(Self.round) ?? NSNull()
+                "physical_footprint_mb": physicalFootprintMB.map(Self.round) ?? NSNull(),
+                "cumulative_user_cpu_ms": Self.round(userCPUTimeMS),
+                "cumulative_system_cpu_ms": Self.round(systemCPUTimeMS),
+                "cumulative_cpu_ms": Self.round(cpuUsage.totalMS)
             ]
         }
 
@@ -31,6 +40,47 @@
 
         static func round(_ value: Double) -> Double {
             (value * 10.0).rounded() / 10.0
+        }
+    }
+
+    struct DebugProcessCPUUsage: Equatable {
+        let userMS: Double
+        let systemMS: Double
+
+        var totalMS: Double {
+            userMS + systemMS
+        }
+
+        func delta(since baseline: DebugProcessCPUUsage) -> DebugProcessCPUUsage? {
+            let userDelta = userMS - baseline.userMS
+            let systemDelta = systemMS - baseline.systemMS
+            guard userDelta >= 0, systemDelta >= 0 else { return nil }
+            return DebugProcessCPUUsage(userMS: userDelta, systemMS: systemDelta)
+        }
+    }
+
+    struct DebugProcessCPUIntervalTracker {
+        private(set) var previousSnapshot: DebugProcessMemorySnapshot
+        private(set) var peakCoreUtilizationPercent: Double?
+
+        init(baseline: DebugProcessMemorySnapshot) {
+            previousSnapshot = baseline
+            peakCoreUtilizationPercent = nil
+        }
+
+        mutating func record(_ snapshot: DebugProcessMemorySnapshot) {
+            if let utilization = snapshot.coreUtilizationPercent(since: previousSnapshot) {
+                peakCoreUtilizationPercent = max(peakCoreUtilizationPercent ?? utilization, utilization)
+            }
+            previousSnapshot = snapshot
+        }
+    }
+
+    extension DebugProcessMemorySnapshot {
+        func coreUtilizationPercent(since baseline: DebugProcessMemorySnapshot) -> Double? {
+            let elapsedMS = timestampMS - baseline.timestampMS
+            guard elapsedMS > 0, let cpuDelta = cpuUsage.delta(since: baseline.cpuUsage) else { return nil }
+            return cpuDelta.totalMS / elapsedMS * 100.0
         }
     }
 
@@ -59,12 +109,28 @@
         private var sampleTask: Task<Void, Never>?
         private var lastCompletedSession: CompletedSession?
 
-        func start(label: String, intervalMS: Int, reset: Bool) async -> DebugMemorySamplerResponse {
-            if activeSession != nil {
-                guard reset else {
-                    return .error(code: "already_running", message: "A large workspace memory sampling session is already running. Pass `reset: true` to replace it.")
+        func start(
+            label: String,
+            intervalMS: Int,
+            reset: Bool,
+            benchmarkGate: Bool = false
+        ) async -> DebugMemorySamplerResponse {
+            let gateGeneration: UInt64?
+            if benchmarkGate {
+                do {
+                    gateGeneration = try WorktreeStartupBenchmarkGate.shared.requireEnabled { $0 }
+                } catch {
+                    return .error(code: "disabled", message: "Benchmark diagnostics are disabled.")
                 }
-                await resetActiveSession()
+            } else {
+                gateGeneration = nil
+            }
+            let effectiveLabel = label
+            if activeSession != nil {
+                return .error(
+                    code: "already_running",
+                    message: "A large workspace memory sampling session is already running; ownership cannot be taken over."
+                )
             }
 
             guard let baseline = Self.captureSnapshot() else {
@@ -73,7 +139,7 @@
 
             let session = ActiveSession(
                 id: UUID(),
-                label: label,
+                label: effectiveLabel,
                 intervalMS: intervalMS,
                 startedMS: baseline.timestampMS,
                 baseline: baseline,
@@ -83,7 +149,9 @@
                 samples: [baseline],
                 marks: [],
                 firstSwitchReturnedPeak: nil,
-                firstSwitchReturnedPeakPhysicalFootprint: nil
+                firstSwitchReturnedPeakPhysicalFootprint: nil,
+                cpuIntervalTracker: DebugProcessCPUIntervalTracker(baseline: baseline),
+                benchmarkGateGeneration: gateGeneration
             )
             activeSession = session
             lastCompletedSession = nil
@@ -97,6 +165,9 @@
         }
 
         func mark(_ name: String) async -> DebugMemorySamplerResponse {
+            guard revokeStaleBenchmarkSessionIfNeeded() else {
+                return .error(code: "disabled", message: "Benchmark diagnostics were revoked.")
+            }
             guard var session = activeSession else {
                 return .error(code: "no_active_session", message: "No large workspace memory sampling session is active.")
             }
@@ -123,19 +194,35 @@
             return .payload(result)
         }
 
-        func stop(settleSeconds: Double) async -> DebugMemorySamplerResponse {
+        func stop(sessionID: UUID, settleSeconds: Double) async -> DebugMemorySamplerResponse {
+            guard revokeStaleBenchmarkSessionIfNeeded() else {
+                return .error(code: "disabled", message: "Benchmark diagnostics were revoked.")
+            }
             guard var session = activeSession else {
-                if let lastCompletedSession {
+                if let lastCompletedSession, lastCompletedSession.id == sessionID {
                     return .payload(payload(for: lastCompletedSession, action: "stop", running: false, includeSamplesLimit: 50))
                 }
-                return .error(code: "no_active_session", message: "No large workspace memory sampling session is active.")
+                return .error(
+                    code: "no_matching_active_session",
+                    message: "No matching large workspace memory sampling session is active."
+                )
+            }
+            guard session.id == sessionID else {
+                return .error(
+                    code: "session_mismatch",
+                    message: "The requested memory sampling session does not own the active sampler."
+                )
             }
 
             if settleSeconds > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(settleSeconds * 1_000_000_000.0))
-                if let updated = activeSession, updated.id == session.id {
-                    session = updated
+                guard let updated = activeSession, updated.id == sessionID else {
+                    return .error(
+                        code: "session_no_longer_active",
+                        message: "The owned memory sampling session is no longer active."
+                    )
                 }
+                session = updated
             }
 
             if let finalSnapshot = Self.captureSnapshot() {
@@ -153,6 +240,9 @@
         }
 
         func snapshot(limit: Int) async -> DebugMemorySamplerResponse {
+            guard revokeStaleBenchmarkSessionIfNeeded() else {
+                return .error(code: "disabled", message: "Benchmark diagnostics were revoked.")
+            }
             if let activeSession {
                 return .payload(payload(for: activeSession, action: "snapshot", running: true, includeSamplesLimit: limit))
             }
@@ -163,6 +253,9 @@
         }
 
         func current(limit: Int) async -> DebugMemorySamplerResponse {
+            guard revokeStaleBenchmarkSessionIfNeeded() else {
+                return .error(code: "disabled", message: "Benchmark diagnostics were revoked.")
+            }
             guard let snapshot = Self.captureSnapshot() else {
                 return .error(code: "memory_snapshot_failed", message: "Unable to capture current process memory.")
             }
@@ -175,6 +268,7 @@
                 "phys_footprint_available": snapshot.physicalFootprintBytes != nil
             ]
             if let activeSession {
+                result["session_id"] = activeSession.id.uuidString
                 result["session"] = sessionPayload(for: activeSession, running: true)
                 result["metrics"] = metricsPayload(for: activeSession)
                 result["recent_samples"] = activeSession.samples.suffix(limit).map { $0.payload() }
@@ -185,7 +279,12 @@
         }
 
         func reset() async -> DebugMemorySamplerResponse {
-            await resetActiveSession()
+            guard activeSession == nil else {
+                return .error(
+                    code: "already_running",
+                    message: "An active memory sampling session cannot be reset or taken over."
+                )
+            }
             lastCompletedSession = nil
             return .payload([
                 "ok": true,
@@ -193,12 +292,6 @@
                 "action": "reset",
                 "running": false
             ])
-        }
-
-        private func resetActiveSession() async {
-            sampleTask?.cancel()
-            sampleTask = nil
-            activeSession = nil
         }
 
         private func runSamplingLoop(sessionID: UUID, intervalMS: Int) async {
@@ -212,13 +305,37 @@
 
         private func recordPeriodicSample(sessionID: UUID) {
             guard var session = activeSession, session.id == sessionID else { return }
+            if let generation = session.benchmarkGateGeneration,
+               !WorktreeStartupBenchmarkGate.shared.isCurrentEnabledGeneration(generation)
+            {
+                sampleTask?.cancel()
+                sampleTask = nil
+                activeSession = nil
+                lastCompletedSession = nil
+                return
+            }
             guard let snapshot = Self.captureSnapshot() else { return }
             record(snapshot: snapshot, in: &session)
             activeSession = session
         }
 
+        @discardableResult
+        private func revokeStaleBenchmarkSessionIfNeeded() -> Bool {
+            let generations = [activeSession?.benchmarkGateGeneration, lastCompletedSession?.benchmarkGateGeneration]
+                .compactMap(\.self)
+            guard generations.allSatisfy({ WorktreeStartupBenchmarkGate.shared.isCurrentEnabledGeneration($0) }) else {
+                sampleTask?.cancel()
+                sampleTask = nil
+                activeSession = nil
+                lastCompletedSession = nil
+                return false
+            }
+            return true
+        }
+
         private func record(snapshot: DebugProcessMemorySnapshot, in session: inout ActiveSession) {
             session.totalSampleCount += 1
+            session.cpuIntervalTracker.record(snapshot)
             session.final = snapshot
             if snapshot.residentBytes > session.peak.residentBytes {
                 session.peak = snapshot
@@ -244,6 +361,7 @@
                 "op": "large_workspace_memory",
                 "action": action,
                 "running": running,
+                "session_id": session.id.uuidString,
                 "session": sessionPayload(for: session, running: running),
                 "metrics": metricsPayload(for: session),
                 "baseline": session.baseline.payload(),
@@ -261,6 +379,7 @@
                 "op": "large_workspace_memory",
                 "action": action,
                 "running": running,
+                "session_id": session.id.uuidString,
                 "session": sessionPayload(for: session, running: running),
                 "metrics": metricsPayload(for: session),
                 "baseline": session.baseline.payload(),
@@ -311,7 +430,8 @@
                 firstSwitchReturnedPeakPhysicalFootprint: session.firstSwitchReturnedPeakPhysicalFootprint,
                 sampleCount: session.totalSampleCount,
                 durationSeconds: (session.final.timestampMS - session.startedMS) / 1000.0,
-                physFootprintAvailable: session.physicalFootprintAvailable
+                physFootprintAvailable: session.physicalFootprintAvailable,
+                peakIntervalCoreUtilizationPercent: session.cpuIntervalTracker.peakCoreUtilizationPercent
             )
         }
 
@@ -326,7 +446,8 @@
                 firstSwitchReturnedPeakPhysicalFootprint: session.firstSwitchReturnedPeakPhysicalFootprint,
                 sampleCount: session.totalSampleCount,
                 durationSeconds: (session.final.timestampMS - session.startedMS) / 1000.0,
-                physFootprintAvailable: session.physicalFootprintAvailable
+                physFootprintAvailable: session.physicalFootprintAvailable,
+                peakIntervalCoreUtilizationPercent: session.peakIntervalCoreUtilizationPercent
             )
         }
 
@@ -340,7 +461,8 @@
             firstSwitchReturnedPeakPhysicalFootprint: DebugProcessMemorySnapshot?,
             sampleCount: Int,
             durationSeconds: Double,
-            physFootprintAvailable: Bool
+            physFootprintAvailable: Bool,
+            peakIntervalCoreUtilizationPercent: Double?
         ) -> [String: Any] {
             var metrics: [String: Any] = [
                 "baseline_resident_mb": DebugProcessMemorySnapshot.round(baseline.residentMB),
@@ -352,6 +474,15 @@
                 "duration_seconds": DebugProcessMemorySnapshot.round(durationSeconds),
                 "phys_footprint_available": physFootprintAvailable
             ]
+
+            let sessionCPU = final.cpuUsage.delta(since: baseline.cpuUsage)
+            metrics["session_user_cpu_ms"] = sessionCPU.map { DebugProcessMemorySnapshot.round($0.userMS) } ?? NSNull()
+            metrics["session_system_cpu_ms"] = sessionCPU.map { DebugProcessMemorySnapshot.round($0.systemMS) } ?? NSNull()
+            metrics["session_cpu_ms"] = sessionCPU.map { DebugProcessMemorySnapshot.round($0.totalMS) } ?? NSNull()
+            metrics["average_core_utilization_percent"] = final.coreUtilizationPercent(since: baseline)
+                .map(DebugProcessMemorySnapshot.round) ?? NSNull()
+            metrics["peak_interval_core_utilization_percent"] = peakIntervalCoreUtilizationPercent
+                .map(DebugProcessMemorySnapshot.round) ?? NSNull()
 
             let firstSwitchReturnedSnapshot = marks.first { $0.name == "switch_returned" }?.snapshot
             if let firstSwitchReturnedSnapshot {
@@ -436,11 +567,27 @@
         private static func captureSnapshot() -> DebugProcessMemorySnapshot? {
             let nowMS = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000.0
             guard let residentBytes = captureResidentBytes() else { return nil }
+            guard let cpuUsage = captureCPUUsage() else { return nil }
             return DebugProcessMemorySnapshot(
                 timestampMS: nowMS,
                 residentBytes: residentBytes,
-                physicalFootprintBytes: capturePhysicalFootprintBytes()
+                physicalFootprintBytes: capturePhysicalFootprintBytes(),
+                userCPUTimeMS: cpuUsage.userMS,
+                systemCPUTimeMS: cpuUsage.systemMS
             )
+        }
+
+        private static func captureCPUUsage() -> DebugProcessCPUUsage? {
+            var usage = rusage()
+            guard getrusage(RUSAGE_SELF, &usage) == 0 else { return nil }
+            return DebugProcessCPUUsage(
+                userMS: milliseconds(usage.ru_utime),
+                systemMS: milliseconds(usage.ru_stime)
+            )
+        }
+
+        private static func milliseconds(_ value: timeval) -> Double {
+            Double(value.tv_sec) * 1000.0 + Double(value.tv_usec) / 1000.0
         }
 
         private static func captureResidentBytes() -> UInt64? {
@@ -485,6 +632,8 @@
             var marks: [DebugProcessMemoryMark]
             var firstSwitchReturnedPeak: DebugProcessMemorySnapshot?
             var firstSwitchReturnedPeakPhysicalFootprint: DebugProcessMemorySnapshot?
+            var cpuIntervalTracker: DebugProcessCPUIntervalTracker
+            let benchmarkGateGeneration: UInt64?
             var totalSampleCount: Int = 1
 
             var physicalFootprintAvailable: Bool {
@@ -505,8 +654,10 @@
             let marks: [DebugProcessMemoryMark]
             let firstSwitchReturnedPeak: DebugProcessMemorySnapshot?
             let firstSwitchReturnedPeakPhysicalFootprint: DebugProcessMemorySnapshot?
+            let peakIntervalCoreUtilizationPercent: Double?
             let totalSampleCount: Int
             let physicalFootprintAvailable: Bool
+            let benchmarkGateGeneration: UInt64?
 
             init(session: ActiveSession) {
                 id = session.id
@@ -521,8 +672,10 @@
                 marks = session.marks
                 firstSwitchReturnedPeak = session.firstSwitchReturnedPeak
                 firstSwitchReturnedPeakPhysicalFootprint = session.firstSwitchReturnedPeakPhysicalFootprint
+                peakIntervalCoreUtilizationPercent = session.cpuIntervalTracker.peakCoreUtilizationPercent
                 totalSampleCount = session.totalSampleCount
                 physicalFootprintAvailable = session.physicalFootprintAvailable
+                benchmarkGateGeneration = session.benchmarkGateGeneration
             }
         }
     }

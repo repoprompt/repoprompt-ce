@@ -213,7 +213,7 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
         }
         return StoredSelection(
             selectedPaths: paths,
-            autoCodemapPaths: Array(paths.prefix(max(0, count / 3))),
+
             slices: slices,
             codemapAutoEnabled: !includeSlices
         )

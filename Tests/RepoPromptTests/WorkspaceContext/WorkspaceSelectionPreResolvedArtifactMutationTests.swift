@@ -8,7 +8,7 @@ final class WorkspaceSelectionPreResolvedArtifactMutationTests: XCTestCase {
         let service = WorkspaceSelectionMutationService(store: WorkspaceFileContextStore())
         let base = StoredSelection(
             selectedPaths: [source],
-            autoCodemapPaths: [artifact, "/workspace/Sources/Dependency.swift"],
+
             slices: [
                 source: [LineRange(start: 1, end: 2)],
                 artifact: [LineRange(start: 1, end: 1)]
@@ -23,7 +23,6 @@ final class WorkspaceSelectionPreResolvedArtifactMutationTests: XCTestCase {
         )
 
         XCTAssertEqual(result.selectedPaths, [source, artifact])
-        XCTAssertEqual(result.autoCodemapPaths, ["/workspace/Sources/Dependency.swift"])
         XCTAssertEqual(result.slices, [source: [LineRange(start: 1, end: 2)]])
         XCTAssertFalse(result.codemapAutoEnabled)
     }
@@ -34,7 +33,7 @@ final class WorkspaceSelectionPreResolvedArtifactMutationTests: XCTestCase {
         let service = WorkspaceSelectionMutationService(store: WorkspaceFileContextStore())
         let base = StoredSelection(
             selectedPaths: [source, artifact],
-            autoCodemapPaths: [artifact, "/workspace/Sources/Dependency.swift"],
+
             slices: [
                 source: [LineRange(start: 1, end: 2)],
                 artifact: [LineRange(start: 1, end: 1)]
@@ -49,7 +48,6 @@ final class WorkspaceSelectionPreResolvedArtifactMutationTests: XCTestCase {
         )
 
         XCTAssertEqual(result.selectedPaths, [source])
-        XCTAssertEqual(result.autoCodemapPaths, ["/workspace/Sources/Dependency.swift"])
         XCTAssertEqual(result.slices, [source: [LineRange(start: 1, end: 2)]])
         XCTAssertTrue(result.codemapAutoEnabled)
     }

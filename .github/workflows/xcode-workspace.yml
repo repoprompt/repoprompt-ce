@@ -1,0 +1,45 @@
+name: Xcode Workspace Validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * 1'
+  push:
+    branches:
+      - main
+    paths:
+      - 'Package.swift'
+      - 'Package.resolved'
+      - 'Makefile'
+      - 'Scripts/generate_xcode_workspace.py'
+      - 'Scripts/xcode_developer_workflow.sh'
+      - 'Scripts/test_xcode_workspace_generator.py'
+      - '.github/workflows/xcode-workspace.yml'
+      - 'docs/architecture/xcode-workspace.md'
+  pull_request:
+    paths:
+      - 'Package.swift'
+      - 'Package.resolved'
+      - 'Makefile'
+      - 'Scripts/generate_xcode_workspace.py'
+      - 'Scripts/xcode_developer_workflow.sh'
+      - 'Scripts/test_xcode_workspace_generator.py'
+      - '.github/workflows/xcode-workspace.yml'
+      - 'docs/architecture/xcode-workspace.md'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Generated Xcode Workspace
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Test Xcode workspace generator
+        run: make xcode-generator-test
+
+      - name: Validate generated Xcode workspace
+        run: make xcode-validate

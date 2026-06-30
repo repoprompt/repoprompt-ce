@@ -133,7 +133,9 @@ struct AgentExportCard: View {
                 isLoading: isLoadingExportModel,
                 canMutate: selectionCoordinator != nil,
                 onRefresh: { refreshExportModel() },
-                onLoadContent: { row, purpose in await loadRowContent(row, purpose: purpose) },
+                onLoadContent: { row, purpose in
+                    await loadRowContent(row, model: currentExportModel, purpose: purpose)
+                },
                 onRemove: { row, model in remove(row, from: model) },
                 onClear: { model in clearSelection(for: model) }
             )
@@ -233,10 +235,13 @@ struct AgentExportCard: View {
 
     private func loadRowContent(
         _ row: AgentContextExportRow,
+        model: AgentContextExportModel?,
         purpose: AgentContextExportRow.ContentPurpose
     ) async -> String? {
-        await AgentContextExportResolver.loadRowContent(
+        guard let model else { return nil }
+        return await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: promptManager.workspaceFileContextStore,
             purpose: purpose
         )
@@ -283,10 +288,11 @@ struct AgentExportCard: View {
         guard row.canRemove else { return }
         Task {
             let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
-            let updated = AgentContextExportResolver.removeRow(
+            let updated = await AgentContextExportResolver.removeRow(
                 row,
                 from: latestSelection,
-                lookupContext: model.lookupContext
+                lookupContext: model.lookupContext,
+                store: promptManager.workspaceFileContextStore
             )
             await persistSelection(updated, source: model.source)
             await MainActor.run { refreshExportModel() }

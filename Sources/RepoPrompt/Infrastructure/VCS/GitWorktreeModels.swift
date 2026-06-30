@@ -227,6 +227,8 @@ public struct GitWorktreeCreateRequest: Sendable, Equatable {
 public struct GitWorktreeCreateResult: Sendable, Equatable {
     public let descriptor: GitWorktreeDescriptor
     public let includeCopyResult: GitWorktreeIncludeCopyResult?
+    let initializationReceipt: GitWorktreeCreationReceipt?
+    let initializationFallbackReason: WorkspaceRootSeedFallbackReason?
 
     public init(
         descriptor: GitWorktreeDescriptor,
@@ -234,23 +236,40 @@ public struct GitWorktreeCreateResult: Sendable, Equatable {
     ) {
         self.descriptor = descriptor
         self.includeCopyResult = includeCopyResult
+        initializationReceipt = nil
+        initializationFallbackReason = nil
+    }
+
+    init(
+        descriptor: GitWorktreeDescriptor,
+        includeCopyResult: GitWorktreeIncludeCopyResult?,
+        initializationReceipt: GitWorktreeCreationReceipt?,
+        initializationFallbackReason: WorkspaceRootSeedFallbackReason? = nil
+    ) {
+        self.descriptor = descriptor
+        self.includeCopyResult = includeCopyResult
+        self.initializationReceipt = initializationReceipt
+        self.initializationFallbackReason = initializationFallbackReason
     }
 }
 
 public struct GitWorktreeIncludeCopyResult: Sendable, Equatable {
     public let copiedCount: Int
     public let matchedCount: Int
+    public let copiedRelativePaths: [String]
     public let skippedSummaries: [String]
     public let errorSummaries: [String]
 
     public init(
         copiedCount: Int,
         matchedCount: Int,
+        copiedRelativePaths: [String] = [],
         skippedSummaries: [String] = [],
         errorSummaries: [String] = []
     ) {
         self.copiedCount = copiedCount
         self.matchedCount = matchedCount
+        self.copiedRelativePaths = copiedRelativePaths
         self.skippedSummaries = skippedSummaries
         self.errorSummaries = errorSummaries
     }
@@ -491,18 +510,46 @@ actor GitWorktreeMutationCoordinator {
 
     private var busyKeys: Set<String> = []
     private var waitersByKey: [String: [Waiter]] = [:]
+    #if DEBUG
+        private var queuedWaiterObservationContinuationsByKey: [
+            String: [CheckedContinuation<Void, Never>]
+        ] = [:]
+    #endif
 
     func withLock<T: Sendable>(
         key: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
+        #if DEBUG
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+            let waitStarted = DispatchTime.now().uptimeNanoseconds
+        #endif
         try await acquire(key: key)
+        #if DEBUG
+            let acquired = DispatchTime.now().uptimeNanoseconds
+        #endif
         do {
             try Task.checkCancellation()
             let value = try await operation()
+            #if DEBUG
+                let finished = DispatchTime.now().uptimeNanoseconds
+                WorktreeStartupInstrumentation.recordBenchmarkMutationLock(
+                    tag: benchmarkMetricTag,
+                    queueWaitMicroseconds: (acquired - waitStarted) / 1000,
+                    heldMicroseconds: (finished - acquired) / 1000
+                )
+            #endif
             release(key: key)
             return value
         } catch {
+            #if DEBUG
+                let finished = DispatchTime.now().uptimeNanoseconds
+                WorktreeStartupInstrumentation.recordBenchmarkMutationLock(
+                    tag: benchmarkMetricTag,
+                    queueWaitMicroseconds: (acquired - waitStarted) / 1000,
+                    heldMicroseconds: (finished - acquired) / 1000
+                )
+            #endif
             release(key: key)
             throw error
         }
@@ -518,6 +565,13 @@ actor GitWorktreeMutationCoordinator {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 waitersByKey[key, default: []].append(Waiter(id: waiterID, continuation: continuation))
+                #if DEBUG
+                    let observationContinuations = queuedWaiterObservationContinuationsByKey
+                        .removeValue(forKey: key) ?? []
+                    for observationContinuation in observationContinuations {
+                        observationContinuation.resume()
+                    }
+                #endif
             }
         } onCancel: {
             Task { await self.cancelWaiter(key: key, id: waiterID) }
@@ -545,4 +599,13 @@ actor GitWorktreeMutationCoordinator {
         waitersByKey[key] = waiters.isEmpty ? nil : waiters
         waiter.continuation.resume(throwing: CancellationError())
     }
+
+    #if DEBUG
+        func waitForQueuedWaiterForTesting(key: String) async {
+            if waitersByKey[key]?.isEmpty == false { return }
+            await withCheckedContinuation { continuation in
+                queuedWaiterObservationContinuationsByKey[key, default: []].append(continuation)
+            }
+        }
+    #endif
 }
