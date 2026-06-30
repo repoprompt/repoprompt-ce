@@ -6,6 +6,23 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPAskOracleWorktreeTests: XCTestCase {
+        func testOracleCleanupHelperInvokesAIQueriesServiceDelete() async {
+            let recorder = OracleCleanupRecorder()
+            let oracle = makeOracleViewModel(cleanupRecorder: recorder)
+            let handle = ProviderConversationCleanupHandle(
+                provider: "test-provider",
+                conversationID: "oracle-thread"
+            )
+
+            await oracle.cleanupOracleProviderConversation(handle, model: .claude4Sonnet)
+
+            let calls = recorder.calls()
+            XCTAssertEqual(calls.count, 1)
+            XCTAssertEqual(calls.first?.handle, handle)
+            XCTAssertEqual(calls.first?.model, .claude4Sonnet)
+            XCTAssertEqual(calls.first?.action, .delete)
+        }
+
         func testExplicitWindowProvenanceEndsBeforePostProviderHooks() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -3105,6 +3122,71 @@ import XCTest
             for waiter in waiters {
                 waiter.resume()
             }
+        }
+    }
+
+    @MainActor
+    private func makeOracleViewModel(cleanupRecorder: OracleCleanupRecorder) -> OracleViewModel {
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let aiQueriesService = AIQueriesService(
+            keyManager: keyManager,
+            cleanupProviderConversationOverride: { handle, model, action in
+                cleanupRecorder.record(handle: handle, model: model, action: action)
+                return .succeeded(message: "oracle cleanup")
+            }
+        )
+        let fileManager = WorkspaceFilesViewModel()
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: aiQueriesService,
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -298,
+            settingsManager: WindowSettingsManager(windowID: -298)
+        )
+        let workspaceManager = WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        return OracleViewModel(
+            aiQueriesService: aiQueriesService,
+            promptViewModel: prompt,
+            workspaceManager: workspaceManager,
+            chatData: ChatDataService()
+        )
+    }
+
+    private final class OracleCleanupRecorder: @unchecked Sendable {
+        struct Call {
+            let handle: ProviderConversationCleanupHandle
+            let model: AIModel
+            let action: ProviderConversationCleanupAction
+        }
+
+        private let lock = NSLock()
+        private var recordedCalls: [Call] = []
+
+        func record(
+            handle: ProviderConversationCleanupHandle,
+            model: AIModel,
+            action: ProviderConversationCleanupAction
+        ) {
+            lock.lock()
+            recordedCalls.append(.init(handle: handle, model: model, action: action))
+            lock.unlock()
+        }
+
+        func calls() -> [Call] {
+            lock.lock()
+            let calls = recordedCalls
+            lock.unlock()
+            return calls
         }
     }
 #endif

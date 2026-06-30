@@ -933,6 +933,21 @@ class GlobalSettingsStore: ObservableObject {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
+    func providerConversationCleanupAction() -> ProviderConversationCleanupAction {
+        guard let raw = scalarPreferences.agentMode?.providerConversationCleanupAction,
+              let action = ProviderConversationCleanupAction(rawValue: raw)
+        else {
+            return .archive
+        }
+        return action
+    }
+
+    func setProviderConversationCleanupAction(_ action: ProviderConversationCleanupAction, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.providerConversationCleanupAction = action.rawValue
+        }
+    }
+
     #if DEBUG
         func claudeRawEventLoggingEnabled() -> Bool {
             defaults.bool(forKey: "claudeRawEventLoggingEnabled")

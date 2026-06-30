@@ -317,6 +317,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var maxBackgroundAgentComposeTabs: Int?
         var showBuiltInWorkflowCleanupGuidance: Bool?
         var codexGoalSupportEnabled: Bool?
+        var providerConversationCleanupAction: String?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
 
         init(
@@ -328,6 +329,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             maxBackgroundAgentComposeTabs: Int? = nil,
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
+            providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil
         ) {
             self.proEditAgentMode = proEditAgentMode
@@ -338,6 +340,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.maxBackgroundAgentComposeTabs = maxBackgroundAgentComposeTabs
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
+            self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
         }
     }

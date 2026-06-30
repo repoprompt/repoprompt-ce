@@ -148,6 +148,7 @@ actor AgentSessionDataService {
         let agentReasoningEffort: String?
         let lastRunState: String?
         let providerSessionID: String?
+        let providerCleanupHandle: ProviderConversationCleanupHandle?
         let autoEditEnabled: Bool
         let codexConversationID: String?
         let codexRolloutPath: String?
@@ -1067,6 +1068,7 @@ actor AgentSessionDataService {
                 agentReasoningEffort: header.agentReasoningEffort,
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
                 providerSessionID: header.providerSessionID,
+                providerCleanupHandle: header.providerCleanupHandle,
                 autoEditEnabled: header.autoEditEnabled,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,

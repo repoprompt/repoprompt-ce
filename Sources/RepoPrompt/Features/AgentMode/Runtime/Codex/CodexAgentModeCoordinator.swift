@@ -1245,6 +1245,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         session.codexConversationID = agentSession.codexConversationID
         session.codexRolloutPath = agentSession.codexRolloutPath
+        session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.codexModel = agentSession.codexModel
         session.codexReasoningEffort = agentSession.codexReasoningEffort
         session.codexContextUsage = AgentContextUsage(
@@ -1265,6 +1266,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         agentSession.codexConversationID = session.codexConversationID
         agentSession.codexRolloutPath = session.codexRolloutPath
+        agentSession.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+            provider: session.selectedAgent.rawValue,
+            explicit: session.providerCleanupHandle,
+            providerSessionID: session.providerSessionID,
+            codexConversationID: session.codexConversationID,
+            codexRolloutPath: session.codexRolloutPath
+        )
         agentSession.codexModel = session.codexModel
         agentSession.codexReasoningEffort = session.codexReasoningEffort
         agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
@@ -2644,6 +2652,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         if isHeadlessAgent(oldAgent) || isHeadlessAgent(newAgent) {
             session.providerSessionID = nil
+            session.providerCleanupHandle = nil
         }
         if oldAgent == .codexExec, newAgent != .codexExec {
             cancelCodexThreadNameSync(for: session.tabID)
@@ -2670,6 +2679,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             resetCodexResumeTimeoutState(for: session)
             session.codexConversationID = nil
             session.codexRolloutPath = nil
+            session.providerCleanupHandle = nil
             session.codexContextUsage = nil
             viewModel?.clearContextUsageSnapshot(for: session)
             session.codexModel = nil
@@ -3074,6 +3084,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             cancelCodexTransportClosedFallback(for: session.tabID)
             session.codexConversationID = ref.conversationID
             session.codexRolloutPath = ref.rolloutPath
+            session.providerCleanupHandle = ProviderConversationCleanupHandle(
+                provider: AgentProviderKind.codexExec.rawValue,
+                conversationID: ref.conversationID,
+                rolloutPath: ref.rolloutPath
+            )
             session.codexModel = ref.model
             session.codexReasoningEffort = ref.reasoningEffort
             // Always clear the reconnect flag after a successful start/resume.
@@ -7977,6 +7992,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         resetCodexResumeTimeoutState(for: session)
         session.codexConversationID = nil
         session.codexRolloutPath = nil
+        session.providerCleanupHandle = nil
         session.codexContextUsage = nil
         viewModel?.clearContextUsageSnapshot(for: session)
         session.activeReasoningItemID = nil

@@ -21,7 +21,7 @@ final class AgentSessionWorktreeBindingPersistenceTests: XCTestCase {
         XCTAssertTrue(decoded.worktreeMergeOperations.isEmpty)
     }
 
-    func testAgentSessionRoundTripsWorktreeBindingsAsVersionSix() throws {
+    func testAgentSessionRoundTripsWorktreeBindingsAsCurrentVersion() throws {
         let binding = makeBinding()
         let session = try AgentSession(
             id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000102")),
@@ -38,7 +38,7 @@ final class AgentSessionWorktreeBindingPersistenceTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)
-        XCTAssertEqual(decoded.serializationVersion, 6)
+        XCTAssertEqual(decoded.serializationVersion, 7)
         XCTAssertEqual(decoded.worktreeBindings, [binding])
     }
 

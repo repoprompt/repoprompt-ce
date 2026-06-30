@@ -61,6 +61,47 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         XCTAssertTrue(store.codexGoalSupportEnabled())
     }
 
+    func testProviderConversationCleanupActionDefaultsArchiveAndPersistsDelete() throws {
+        let defaultStore = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+        XCTAssertEqual(defaultStore.providerConversationCleanupAction(), .archive)
+
+        let deleteStore = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(providerConversationCleanupAction: "delete"))
+        ))
+        XCTAssertEqual(deleteStore.providerConversationCleanupAction(), .delete)
+    }
+
+    func testProviderConversationCleanupHandleFallsBackToProviderSessionID() throws {
+        let result = AIStreamResult(
+            type: "message_stop",
+            text: nil,
+            providerSessionID: " claude-session-1 "
+        )
+
+        let handle = try XCTUnwrap(AIQueriesService.cleanupHandle(for: result, model: .claudeCodeSonnet))
+        XCTAssertEqual(handle.provider, "claudeCode")
+        XCTAssertEqual(handle.sessionID, "claude-session-1")
+        XCTAssertNil(handle.conversationID)
+    }
+
+    func testProviderConversationCleanupHandlePrefersExplicitHandle() throws {
+        let explicit = ProviderConversationCleanupHandle(
+            provider: "custom-provider",
+            conversationID: "conversation-1"
+        )
+        let result = AIStreamResult(
+            type: "message_stop",
+            text: nil,
+            providerSessionID: "session-ignored",
+            cleanupHandle: explicit
+        )
+
+        let handle = try XCTUnwrap(AIQueriesService.cleanupHandle(for: result, model: .claudeCodeSonnet))
+        XCTAssertEqual(handle, explicit)
+    }
+
     private func makeIsolatedDefaults() throws -> UserDefaults {
         let suiteName = "CodexGoalSupportDefaultTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

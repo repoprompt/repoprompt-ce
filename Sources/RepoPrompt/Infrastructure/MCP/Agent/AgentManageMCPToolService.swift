@@ -728,6 +728,7 @@ struct AgentManageMCPToolService {
             }
 
             do {
+                var providerCleanupOutcome: ProviderConversationCleanupOutcome?
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
                     let activeWorkspace = targetWindow.workspaceManager.activeWorkspace ?? workspace
                     guard activeWorkspace.composeTabs.contains(where: { $0.id == tabID }) else { return nil }
@@ -744,7 +745,7 @@ struct AgentManageMCPToolService {
                     #if DEBUG
                         let deleteOpenStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    await agentModeVM.deleteSession(tabID: openTabID)
+                    providerCleanupOutcome = await agentModeVM.deleteSession(tabID: openTabID)
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deleteOpen",
@@ -767,6 +768,9 @@ struct AgentManageMCPToolService {
                         debugOpenDeletedCount += 1
                     #endif
                 } else {
+                    if let persistedSession = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace) {
+                        providerCleanupOutcome = await agentModeVM.cleanupProviderConversationForPersistedAgentSession(persistedSession)
+                    }
                     #if DEBUG
                         let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
@@ -800,10 +804,20 @@ struct AgentManageMCPToolService {
                         ]
                     )
                 #endif
-                deletedSessions.append([
+                var deletedSession: [String: Value] = [
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name)
-                ])
+                ]
+                if let providerCleanupOutcome {
+                    var cleanupObject: [String: Value] = [
+                        "status": .string(providerCleanupOutcome.status)
+                    ]
+                    if let message = providerCleanupOutcome.message {
+                        cleanupObject["message"] = .string(message)
+                    }
+                    deletedSession["provider_cleanup"] = .object(cleanupObject)
+                }
+                deletedSessions.append(deletedSession)
             } catch {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),

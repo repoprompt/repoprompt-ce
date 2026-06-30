@@ -8,8 +8,17 @@ protocol HeadlessAgentProvider {
     ///   - runID: Optional runID for this execution (if nil, provider generates one)
     func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error>
 
+    /// Best-effort provider-side cleanup for a persisted/resumable conversation.
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
+
     /// Dispose of the provider and cancel any running operations.
     func dispose() async
+}
+
+extension HeadlessAgentProvider {
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+        .unsupported(message: "Provider has no local API for \(action.rawValue) cleanup of conversations.")
+    }
 }
 
 /// Lifecycle events for agent session state (not user-facing chat content).

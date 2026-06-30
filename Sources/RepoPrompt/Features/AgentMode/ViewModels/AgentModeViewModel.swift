@@ -68,6 +68,8 @@ final class AgentModeViewModel: ObservableObject {
     typealias MCPServerEnabler = () async -> Void
     typealias MCPRunRoutingCleaner = (_ runID: UUID, _ windowID: Int, _ reason: String) async -> Void
     typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
+    typealias ProviderConversationCleaner = ProviderConversationCleanupRegistry.Cleaner
+    typealias PersistedProviderConversationCleaner = ProviderConversationCleaner
     typealias CodexActiveToolQuery = (_ runID: UUID) -> Bool
     typealias CodexAgentRunWaitQuery = (_ runID: UUID) -> Bool
     typealias CodexAgentRunWaitDrain = @MainActor (_ runID: UUID, _ source: String) async -> Bool
@@ -567,6 +569,7 @@ final class AgentModeViewModel: ObservableObject {
     private let mcpServerEnabler: MCPServerEnabler
     private let mcpRunRoutingCleaner: MCPRunRoutingCleaner
     private let mcpRunToolCanceller: MCPRunToolCanceller
+    private var providerConversationCleanupRegistry: ProviderConversationCleanupRegistry
     let codexCoordinator: CodexAgentModeCoordinator
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
@@ -695,6 +698,12 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setCurrentTabIDOverride(_ tabID: UUID?) {
             test_currentTabIDOverride = tabID
+        }
+
+        func test_setPersistedProviderConversationCleaner(
+            _ cleaner: @escaping PersistedProviderConversationCleaner
+        ) {
+            providerConversationCleanupRegistry = ProviderConversationCleanupRegistry(codexCleaner: cleaner)
         }
 
         func test_setSidebarAutoArchiveDependencies(
@@ -1537,6 +1546,7 @@ final class AgentModeViewModel: ObservableObject {
         mcpRunToolCanceller = { [weak mcpServer] runID, reason in
             mcpServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
         }
+        providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
         usesProductionAgentDefaultsAndModelPolling = true
         codexCoordinator = CodexAgentModeCoordinator(
@@ -1655,6 +1665,7 @@ final class AgentModeViewModel: ObservableObject {
                 )
             },
             mcpRunToolCanceller: MCPRunToolCanceller? = nil,
+            providerConversationCleanupRegistry: ProviderConversationCleanupRegistry = ProviderConversationCleanupRegistry(),
             mcpServerEnabler: @escaping MCPServerEnabler = {},
             testMCPServer: MCPServerViewModel? = nil,
             testWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
@@ -1705,6 +1716,7 @@ final class AgentModeViewModel: ObservableObject {
                 ?? { [weak testMCPServer] runID, reason in
                     testMCPServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
                 }
+            self.providerConversationCleanupRegistry = providerConversationCleanupRegistry
             self.shouldManageCodexTooling = shouldManageCodexTooling
             usesProductionAgentDefaultsAndModelPolling = testUsesProductionAgentDefaultsAndModelPolling
             let legacyWatchdogThreshold = testCodexStallWatchdogInactivityThreshold
@@ -3993,6 +4005,7 @@ final class AgentModeViewModel: ObservableObject {
 
         session.runState = payload.normalizedRunState
         session.providerSessionID = agentSession.providerSessionID
+        session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
         session.pendingHandoff = PendingHandoffState(
             payload: agentSession.pendingHandoffPayload,
@@ -4240,6 +4253,7 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
         session.providerSessionID = nil
+        session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
         session.lastUserMessageAt = nil
         session.isDirty = false
@@ -5906,6 +5920,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         await claudeCoordinator.shutdownClaudeSessionIfNeeded(session)
         session.providerSessionID = nil
+        session.providerCleanupHandle = nil
         session.contextUsageSnapshot = nil
         session.activeNonCodexTurnTokenAccumulator = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
@@ -11102,6 +11117,13 @@ final class AgentModeViewModel: ObservableObject {
             agentReasoningEffort: session.selectedReasoningEffortRaw,
             lastRunState: session.runState.rawValue,
             providerSessionID: session.providerSessionID,
+            providerCleanupHandle: providerCleanupHandle(
+                provider: session.selectedAgent.rawValue,
+                explicit: session.providerCleanupHandle,
+                providerSessionID: session.providerSessionID,
+                codexConversationID: session.codexConversationID,
+                codexRolloutPath: session.codexRolloutPath
+            ),
             autoEditEnabled: session.autoEditEnabled,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             parentSessionID: session.parentSessionID,
@@ -14127,6 +14149,13 @@ final class AgentModeViewModel: ObservableObject {
                    session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
                 {
                     session.providerSessionID = sessionID
+                    session.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+                        provider: session.selectedAgent.rawValue,
+                        explicit: nil,
+                        providerSessionID: sessionID,
+                        codexConversationID: session.codexConversationID,
+                        codexRolloutPath: session.codexRolloutPath
+                    )
                     session.isDirty = true
                     self.scheduleSave(for: session.tabID)
                 }
@@ -15532,6 +15561,7 @@ final class AgentModeViewModel: ObservableObject {
         // restore the old conversation or affect a replacement controller.
         claudeCoordinator.prepareForConversationResetSync(session)
         session.providerSessionID = nil
+        session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
         session.pendingNonCodexUserInputTokenQueue.removeAll()
         session.activeNonCodexTurnTokenAccumulator = nil
@@ -15628,6 +15658,67 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     @discardableResult
+    func cleanupProviderConversationForDeletedAgentSession(_ session: TabSession) async -> ProviderConversationCleanupOutcome? {
+        let action = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        let handle = providerCleanupHandle(
+            provider: session.selectedAgent.rawValue,
+            explicit: session.providerCleanupHandle,
+            providerSessionID: session.providerSessionID,
+            codexConversationID: session.codexConversationID,
+            codexRolloutPath: session.codexRolloutPath
+        )
+        guard let handle else { return nil }
+
+        let outcome: ProviderConversationCleanupOutcome = if let controller = session.codexController {
+            await controller.cleanupConversation(handle, action: action)
+        } else if let controller = session.claudeController {
+            await controller.cleanupConversation(handle, action: action)
+        } else if let provider = session.provider {
+            await provider.cleanupConversation(handle, action: action)
+        } else {
+            .unsupported(message: "No live provider controller was available for conversation cleanup.")
+        }
+        logProviderConversationCleanupOutcome(outcome, action: action, handle: handle)
+        return outcome
+    }
+
+    @discardableResult
+    func cleanupProviderConversationForPersistedAgentSession(_ agentSession: AgentSession) async -> ProviderConversationCleanupOutcome? {
+        let action = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        let handle = agentSession.resolvedProviderCleanupHandle
+        guard let handle else { return nil }
+        let outcome = await providerConversationCleanupRegistry.cleanup(handle, action: action)
+        logProviderConversationCleanupOutcome(outcome, action: action, handle: handle)
+        return outcome
+    }
+
+    private func providerCleanupHandle(
+        provider: String,
+        explicit: ProviderConversationCleanupHandle?,
+        providerSessionID: String?,
+        codexConversationID: String?,
+        codexRolloutPath: String?
+    ) -> ProviderConversationCleanupHandle? {
+        ProviderConversationCleanupHandle.resolved(
+            provider: provider,
+            explicit: explicit,
+            providerSessionID: providerSessionID,
+            codexConversationID: codexConversationID,
+            codexRolloutPath: codexRolloutPath
+        )
+    }
+
+    private func logProviderConversationCleanupOutcome(
+        _ outcome: ProviderConversationCleanupOutcome,
+        action: ProviderConversationCleanupAction,
+        handle: ProviderConversationCleanupHandle
+    ) {
+        #if DEBUG
+            print("[AgentModeVM] provider conversation cleanup action=\(action.rawValue) provider=\(handle.provider) status=\(outcome.status) message=\(outcome.message ?? "")")
+        #endif
+    }
+
+    @discardableResult
     func finalizeDeletedAgentSessionReferences(
         sessionID: UUID,
         workspaceID: UUID?,
@@ -15718,6 +15809,7 @@ final class AgentModeViewModel: ObservableObject {
             session.pendingCommandRunningFlushTask = nil
             session.pendingCommandRunningByKey.removeAll()
             session.agentTask?.cancel()
+            await cleanupProviderConversationForDeletedAgentSession(session)
             if let provider = session.provider {
                 await provider.dispose()
             }
@@ -15768,7 +15860,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Delete a session completely (clear chat and close tab)
-    func deleteSession(tabID: UUID) async {
+    @discardableResult
+    func deleteSession(tabID: UUID) async -> ProviderConversationCleanupOutcome? {
         #if DEBUG
             let deleteSessionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
@@ -15778,6 +15871,7 @@ final class AgentModeViewModel: ObservableObject {
         if wasCurrentTab {
             lastProcessedTabID = nil
         }
+        var providerCleanupOutcome: ProviderConversationCleanupOutcome?
         if let session = liveSession {
             removePendingUIRefresh(for: tabID)
             cancelPersistedLoad(for: session)
@@ -15792,6 +15886,7 @@ final class AgentModeViewModel: ObservableObject {
             session.pendingCommandRunningFlushTask = nil
             session.pendingCommandRunningByKey.removeAll()
             session.agentTask?.cancel()
+            providerCleanupOutcome = await cleanupProviderConversationForDeletedAgentSession(session)
             if let provider = session.provider {
                 await provider.dispose()
             }
@@ -15840,6 +15935,7 @@ final class AgentModeViewModel: ObservableObject {
                 ]
             )
         #endif
+        return providerCleanupOutcome
     }
 
     /// Last activity timestamp for sorting tabs in the UI

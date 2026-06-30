@@ -803,6 +803,21 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.codexGoalSupportEnabled()) },
             write: { try $0.setCodexGoalSupportEnabled(requiredBool(from: $1)) }
         ),
+        stringEnumSetting(
+            key: "agent_mode.provider_conversation_cleanup_action",
+            group: "agent_mode",
+            label: "Provider Conversation Cleanup",
+            description: "Controls best-effort provider-side Agent Mode conversation cleanup when deleting supported sessions. Archive is safer and is the default; delete asks supported providers to remove the conversation.",
+            allowedValues: ProviderConversationCleanupAction.allCases.map(\.rawValue),
+            read: { .string($0.providerConversationCleanupAction().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let action = ProviderConversationCleanupAction(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid provider cleanup action '\(raw)'.")
+                }
+                store.setProviderConversationCleanupAction(action)
+            }
+        ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.

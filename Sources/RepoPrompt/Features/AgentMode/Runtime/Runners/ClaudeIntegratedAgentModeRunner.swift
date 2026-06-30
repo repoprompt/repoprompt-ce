@@ -210,6 +210,13 @@ final class ClaudeIntegratedAgentModeRunner {
                    newSessionID != session.providerSessionID
                 {
                     session.providerSessionID = newSessionID
+                    session.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+                        provider: session.selectedAgent.rawValue,
+                        explicit: nil,
+                        providerSessionID: newSessionID,
+                        codexConversationID: session.codexConversationID,
+                        codexRolloutPath: session.codexRolloutPath
+                    )
                     session.isDirty = true
                     hooks.scheduleSave(session.tabID)
                 }

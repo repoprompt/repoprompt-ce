@@ -107,8 +107,15 @@ protocol CodexSessionControlling: AnyObject {
         failure: CodexNativeSessionController.TurnFailure
     ) async
     func cancelCurrentTurn() async
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
+}
+
+extension CodexSessionControlling {
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+        .unsupported(message: "Codex runtime has no local API for \(action.rawValue) cleanup of conversations.")
+    }
 }
 
 final class CodexNativeSessionController {
@@ -735,6 +742,20 @@ final class CodexNativeSessionController {
             return try await requestExecutor(method, params, timeout)
         }
         return try await client.request(method: method, params: params, timeout: timeout)
+    }
+
+    func cleanupConversation(
+        _ handle: ProviderConversationCleanupHandle,
+        action: ProviderConversationCleanupAction
+    ) async -> ProviderConversationCleanupOutcome {
+        let cleanup = CodexConversationCleanupService(
+            requestExecutor: { [weak self] method, params, timeout in
+                guard let self else { throw CodexAppServerClient.ClientError.invalidResponse }
+                return try await performRequest(method: method, params: params, timeout: timeout)
+            },
+            timeout: options.requestTimeout
+        )
+        return await cleanup.cleanup(handle, action: action)
     }
 
     init(
