@@ -85,12 +85,14 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`large_workspace_memory` is only available in DEBUG builds.")
                 #endif
-            case "codemap_memory_counters":
-                #if DEBUG
-                    return await debugCodemapMemoryCountersPayload(op: op, arguments: arguments)
-                #else
-                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`codemap_memory_counters` is only available in DEBUG builds.")
-                #endif
+            #if DEBUG
+                case "worktree_startup_benchmark":
+                    return await debugWorktreeStartupBenchmarkPayload(
+                        op: op,
+                        connectionID: connectionID,
+                        arguments: arguments
+                    )
+            #endif
             case "agent_perf_metrics":
                 #if DEBUG
                     return await debugAgentPerfMetricsPayload(op: op, arguments: arguments)
@@ -381,6 +383,93 @@ import MCP
                 let escaped = String(describing: error).replacingOccurrences(of: "\"", with: "\\\"")
                 return "{\"ok\":false,\"error\":\"Unable to encode debug response: \(escaped)\"}"
             }
+        }
+
+        func debugLargeWorkspaceMemoryPayload(op: String, arguments: [String: Value]) async -> CallTool.Result {
+            #if DEBUG
+                let action = debugString(arguments, "action")?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() ?? "snapshot"
+                let sampler = DebugProcessMemorySampler.shared
+
+                let response: DebugProcessMemorySampler.DebugMemorySamplerResponse
+                switch action {
+                case "start":
+                    let intervalMS: Int
+                    switch debugBoundedInt(arguments, "interval_ms", defaultValue: 100, range: 50 ... 5000) {
+                    case let .value(parsed), let .defaulted(parsed):
+                        intervalMS = parsed
+                    case .invalid:
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "`interval_ms` must be an integer between 50 and 5000.")
+                    }
+                    let label = debugString(arguments, "label")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let reset = debugBool(arguments, "reset") ?? false
+                    response = await sampler.start(
+                        label: (label?.isEmpty == false ? label : nil) ?? "large-workspace-memory",
+                        intervalMS: intervalMS,
+                        reset: reset,
+                        benchmarkGate: debugBool(arguments, "benchmark_gate") ?? false
+                    )
+                case "mark":
+                    guard let mark = debugString(arguments, "mark")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                        !mark.isEmpty
+                    else {
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "`mark` must be a non-empty string for action `mark`.")
+                    }
+                    response = await sampler.mark(mark)
+                case "stop":
+                    guard let rawSessionID = debugString(arguments, "session_id")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                        let sessionID = UUID(uuidString: rawSessionID)
+                    else {
+                        return debugDiagnosticsError(
+                            op: op,
+                            code: "invalid_params",
+                            message: "`session_id` must be a UUID for action `stop`."
+                        )
+                    }
+                    let settleSeconds = debugDouble(arguments, "settle_seconds") ?? 0
+                    guard settleSeconds.isFinite, settleSeconds >= 0, settleSeconds <= 300 else {
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "`settle_seconds` must be a number between 0 and 300.")
+                    }
+                    response = await sampler.stop(sessionID: sessionID, settleSeconds: settleSeconds)
+                case "snapshot":
+                    let limit: Int
+                    switch debugBoundedInt(arguments, "limit", defaultValue: 50, range: 1 ... 1000) {
+                    case let .value(parsed), let .defaulted(parsed):
+                        limit = parsed
+                    case .invalid:
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "`limit` must be an integer between 1 and 1000.")
+                    }
+                    response = await sampler.snapshot(limit: limit)
+                case "current":
+                    let limit: Int
+                    switch debugBoundedInt(arguments, "limit", defaultValue: 50, range: 1 ... 1000) {
+                    case let .value(parsed), let .defaulted(parsed):
+                        limit = parsed
+                    case .invalid:
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "`limit` must be an integer between 1 and 1000.")
+                    }
+                    response = await sampler.current(limit: limit)
+                case "reset":
+                    response = await sampler.reset()
+                default:
+                    return debugDiagnosticsError(op: op, code: "invalid_params", message: "Unknown `large_workspace_memory` action: \(action).")
+                }
+
+                switch response {
+                case var .payload(payload):
+                    payload["op"] = op
+                    payload["action"] = action
+                    return debugDiagnosticsResult(payload)
+                case let .error(code, message):
+                    return debugDiagnosticsError(op: op, code: code, message: message)
+                }
+            #else
+                return debugDiagnosticsError(op: op, code: "unavailable", message: "`large_workspace_memory` is only available in DEBUG builds.")
+            #endif
         }
     }
 #endif

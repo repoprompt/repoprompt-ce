@@ -192,8 +192,8 @@ final class ToolAvailabilityStore: ObservableObject {
 
     private static let defaultsKey = "mcp.disabledTools"
 
-    nonisolated static func suppressedToolNames(codeMapsGloballyDisabled: Bool) -> Set<String> {
-        codeMapsGloballyDisabled ? ["get_code_structure"] : []
+    nonisolated static func suppressedToolNames(codeMapsGloballyDisabled _: Bool) -> Set<String> {
+        []
     }
 
     private func setGloballySuppressedTools(_ names: Set<String>) {

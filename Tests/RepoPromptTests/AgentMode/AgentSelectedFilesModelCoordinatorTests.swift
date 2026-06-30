@@ -388,20 +388,21 @@ private func makeModel(for request: AgentSelectedFilesModelRequest) -> AgentCont
     let row = AgentContextExportRow(
         id: ResolvedPromptFileEntryID(fileID: UUID(), mode: .fullFile, lineRanges: nil),
         kind: .full,
-        physicalPath: "/tmp/RepoPromptTests/Sources/\(fileName)",
         rootID: UUID(),
         relativePath: "Sources/\(fileName)",
         displayPath: "Sources/\(fileName)",
         displayName: fileName,
         directoryDisplay: "Sources",
         lineRanges: nil,
-        canRemove: true
+        canRemove: true,
+        directContentPath: "/tmp/RepoPromptTests/Sources/\(fileName)"
     )
     return AgentContextExportModel(
         source: request.source,
         lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
         rows: [row],
         missingPaths: [],
-        invalidPaths: []
+        invalidPaths: [],
+        codemapPresentation: .empty
     )
 }

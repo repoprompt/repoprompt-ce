@@ -80,7 +80,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         let logicalPath = fixture.logicalRoot.appendingPathComponent("Sources/App.swift").path
         let staleSelection = StoredSelection(
             selectedPaths: [physicalPath],
-            autoCodemapPaths: [physicalPath],
+
             slices: [physicalPath: [LineRange(start: 1, end: 1)]],
             codemapAutoEnabled: false
         )
@@ -92,7 +92,6 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         )
 
         XCTAssertEqual(updated.selectedPaths, [logicalPath])
-        XCTAssertTrue(updated.autoCodemapPaths.isEmpty)
         XCTAssertTrue(updated.slices.isEmpty)
         XCTAssertFalse(updated.selectedPaths.contains { $0.contains(fixture.worktreeRoot.path) })
     }

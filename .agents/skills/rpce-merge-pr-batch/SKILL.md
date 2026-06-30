@@ -82,7 +82,7 @@ Keep every session bound to the recorded window and context, and resolve all pen
 
 Follow the trusted-base contribution-check validation matrix and use daemon-coordinated lanes. At minimum run `git diff --check` and trusted-base repository guardrails. Use `make guardrails` only after verifying that its Makefile and invoked scripts are unchanged from `VALIDATED_BASE`; otherwise use trusted copies in the approved isolated environment or stop for maintainer review.
 
-Run the required focused test, build, provider, MCP, packaging, release, or smoke lanes for the changed boundary. If you edit Swift, run the repository formatter as required by `AGENTS.md`, inspect any formatter changes, then run the required style checks. Do not substitute stale evidence or uncoordinated commands while the daemon is available.
+Run the required focused test, build, provider, MCP, packaging, release, or smoke lanes for the changed boundary. Default `preflight.sh push` is only the immediate push safety gate; do not treat it as heavyweight validation evidence. Use focused trusted-base matrix commands, or `.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready` when a computed-outgoing-range path-selected local PR-ready lane is required. If you edit Swift, run the repository formatter as required by `AGENTS.md`, inspect any formatter changes, then run the required style checks. Do not substitute stale evidence or uncoordinated commands while the daemon is available.
 
 Do not stop, replace, launch, or relaunch the visible app during PR validation. A non-disruptive smoke lane is allowed when required by the validation matrix and an appropriate app is already running.
 
@@ -100,7 +100,7 @@ Rerun commit preflight after every staging change. After committing, require a c
 .agents/skills/rpce-contribution-check/scripts/preflight.sh push
 ```
 
-Push only the intended explicit remote refspec. After the final push, capture the PR's remote head SHA as `VALIDATED_HEAD` and require it to equal local `HEAD`.
+Push only the intended explicit remote refspec. A fresh `preflight.sh pr-ready` run on the same clean `HEAD` includes push safety plus computed-outgoing-range path-selected heavyweight lanes, but release, smoke, already-pushed PR-base comparison, and destructive-approval requirements remain separate. After the final push, capture the PR's remote head SHA as `VALIDATED_HEAD` and require it to equal local `HEAD`.
 
 ### 7. Require Fresh Hosted Checks
 

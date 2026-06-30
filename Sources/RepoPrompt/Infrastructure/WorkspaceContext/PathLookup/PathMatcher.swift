@@ -764,10 +764,11 @@ enum PathMatcher {
                 let currentExtraDepth = max(0, componentCount(currentRel) - pathDepth)
                 if candidateExtraDepth != currentExtraDepth { return candidateExtraDepth < currentExtraDepth }
 
-                let relOrder = candidateRel.localizedCaseInsensitiveCompare(currentRel)
-                if relOrder != .orderedSame { return relOrder == .orderedAscending }
+                if candidateRel != currentRel {
+                    return candidateRel.utf8.lexicographicallyPrecedes(currentRel.utf8)
+                }
 
-                return candidate.fullPath.localizedCaseInsensitiveCompare(current.fullPath) == .orderedAscending
+                return candidate.fullPath.utf8.lexicographicallyPrecedes(current.fullPath.utf8)
             }
 
             if PathMatcher.isLoggingEnabled {

@@ -58,8 +58,15 @@ struct PromptContextAccountingResult {
     let tokenCalculationSnapshot: TokenCalculationSnapshot
     let missingPaths: [String]
     let invalidPaths: [String]
-    let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
-    let codemapSnapshotsUsed: [UUID: WorkspaceCodemapSnapshot]
+    let codemapPresentation: WorkspaceCodemapOperationPresentation
+    let codemapFileIDsUsed: Set<UUID>
+}
+
+struct PromptContextEntryResolution {
+    let entries: [ResolvedPromptFileEntry]
+    let missingPaths: [String]
+    let invalidPaths: [String]
+    let codemapPresentation: WorkspaceCodemapOperationPresentation
 }
 
 enum PromptContextAccountingContentPolicy {
@@ -91,128 +98,126 @@ actor PromptContextAccountingService {
     func calculatePromptStats(
         request: PromptContextAccountingRequest,
         store: WorkspaceFileContextStore,
-        fileTreeSnapshotRequest: WorkspaceFileTreeSnapshotRequest
+        fileTreePresentationRequest: WorkspaceFileTreePresentationRequest
     ) async -> PromptContextAccountingResult {
-        let codemapSnapshotBundle = await store.codemapSnapshotBundle(rootScope: request.rootScope)
-        let snapshot = await store.makeFileTreeSelectionSnapshot(
-            selection: request.selection,
-            request: fileTreeSnapshotRequest,
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            profile: request.pathLocateProfile
-        )
-        return await calculatePromptStats(
-            request: request.withFileTree(.snapshot(snapshot)),
+        await calculatePromptStats(
+            request: request,
             store: store,
-            codemapSnapshotBundle: codemapSnapshotBundle
+            frozenPresentation: nil,
+            codemapDisplayPathResolver: nil,
+            codemapLogicalRootDisplayNamesByRootID: [:],
+            fileTreePresentationRequest: fileTreePresentationRequest
         )
     }
 
     func calculatePromptStats(
         request: PromptContextAccountingRequest,
         store: WorkspaceFileContextStore,
-        codemapSnapshotBundle frozenCodemaps: WorkspaceCodemapSnapshotBundle? = nil,
-        codemapDisplayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
+        codemapPresentation frozenPresentation: WorkspaceCodemapOperationPresentation? = nil,
+        codemapDisplayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil,
+        codemapLogicalRootDisplayNamesByRootID: [UUID: String] = [:]
     ) async -> PromptContextAccountingResult {
-        #if DEBUG
-            let calculateStartMS = PromptTokenRecountDiagnostics.start()
-            var calculateBeginFields = PromptTokenRecountDiagnostics.selectionFields(request.selection)
-            calculateBeginFields["codeMapUsage"] = "\(request.codeMapUsage)"
-            calculateBeginFields["rootScope"] = "\(request.rootScope)"
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.calculate.begin",
-                fields: calculateBeginFields
+        await calculatePromptStats(
+            request: request,
+            store: store,
+            frozenPresentation: frozenPresentation,
+            codemapDisplayPathResolver: codemapDisplayPathResolver,
+            codemapLogicalRootDisplayNamesByRootID: codemapLogicalRootDisplayNamesByRootID,
+            fileTreePresentationRequest: nil
+        )
+    }
+
+    func withPromptStats<Value>(
+        request: PromptContextAccountingRequest,
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext,
+        fileTreePresentationRequest: WorkspaceFileTreePresentationRequest? = nil,
+        codemapDisplayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil,
+        operation: (PromptContextAccountingResult) async throws -> Value
+    ) async throws -> Value {
+        let plan = await WorkspaceCodemapPresentationIntentResolver.plan(
+            codeMapUsage: request.codeMapUsage,
+            selection: request.selection,
+            store: store,
+            rootScope: request.rootScope,
+            profile: request.pathLocateProfile
+        )
+        let rootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
+        return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+            for: plan.intent,
+            rootScope: request.rootScope,
+            logicalRootDisplayNamesByRootID: rootDisplayNames
+        ) { presentation in
+            let result = await calculatePromptStats(
+                request: request,
+                store: store,
+                frozenPresentation: WorkspaceCodemapPresentationIntentResolver.merging(
+                    presentation,
+                    preflightIssues: plan.preflightIssues
+                ),
+                codemapDisplayPathResolver: codemapDisplayPathResolver,
+                codemapLogicalRootDisplayNamesByRootID: rootDisplayNames,
+                lookupContext: lookupContext,
+                fileTreePresentationRequest: fileTreePresentationRequest
             )
-            let codemapStartMS = PromptTokenRecountDiagnostics.start()
-        #endif
-        let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle = if let frozenCodemaps {
-            frozenCodemaps
-        } else {
-            await store.codemapSnapshotBundle(rootScope: request.rootScope)
+            try Task.checkCancellation()
+            return try await operation(result)
         }
-        let codemapSnapshots = codemapSnapshotBundle.snapshotsByFileID
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.codemapSnapshots.end",
-                fields: [
-                    "codemapSnapshots": "\(codemapSnapshots.count)",
-                    "duration": codemapStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-            let resolveStartMS = PromptTokenRecountDiagnostics.start()
-        #endif
+    }
+
+    private func calculatePromptStats(
+        request: PromptContextAccountingRequest,
+        store: WorkspaceFileContextStore,
+        frozenPresentation: WorkspaceCodemapOperationPresentation? = nil,
+        codemapDisplayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil,
+        codemapLogicalRootDisplayNamesByRootID: [UUID: String] = [:],
+        lookupContext: WorkspaceLookupContext? = nil,
+        fileTreePresentationRequest: WorkspaceFileTreePresentationRequest?
+    ) async -> PromptContextAccountingResult {
         let resolution = await resolveEntries(
             selection: request.selection,
             store: store,
             rootScope: request.rootScope,
             profile: request.pathLocateProfile,
             codeMapUsage: request.codeMapUsage,
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            contentPolicy: .loadContent
+            codemapPresentation: frozenPresentation,
+            contentPolicy: .loadContent,
+            codemapLogicalRootDisplayNamesByRootID: codemapLogicalRootDisplayNamesByRootID
         )
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.resolveEntries.end",
-                fields: [
-                    "entries": "\(resolution.entries.count)",
-                    "missingPaths": "\(resolution.missingPaths.count)",
-                    "invalidPaths": "\(resolution.invalidPaths.count)",
-                    "duration": resolveStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
+        let effectiveFileTree: TokenCalculationFileTreeInput
+        if let fileTreePresentationRequest {
+            let treeLookupContext = lookupContext ?? WorkspaceLookupContext(
+                rootScope: request.rootScope,
+                bindingProjection: nil
             )
-            let snapshotStartMS = PromptTokenRecountDiagnostics.start()
-        #endif
+            let presentation = await store.makeFileTreePresentation(
+                selection: request.selection,
+                request: fileTreePresentationRequest,
+                lookupContext: treeLookupContext,
+                codemapPresentation: resolution.codemapPresentation,
+                profile: request.pathLocateProfile
+            )
+            effectiveFileTree = .rendered(presentation.content)
+        } else {
+            effectiveFileTree = request.fileTree
+        }
         let snapshots = makePromptFileEntrySnapshots(
             from: resolution.entries,
-            codemapSnapshotBundle: codemapSnapshotBundle,
+            codemapPresentation: resolution.codemapPresentation,
             filePathDisplay: request.filePathDisplay,
             displayPathResolver: codemapDisplayPathResolver
         )
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.promptSnapshots.end",
-                fields: [
-                    "promptEntries": "\(snapshots.count)",
-                    "duration": snapshotStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
         let calculationSnapshot = TokenCalculationSnapshot(
             promptText: request.promptText,
             selectedInstructionsText: request.selectedInstructionsText,
             duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
             promptEntries: snapshots,
-            fileTree: request.fileTree
+            fileTree: effectiveFileTree
         )
-        #if DEBUG
-            let tokenServiceStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.tokenService.begin",
-                fields: ["promptEntries": "\(calculationSnapshot.promptEntries.count)"]
-            )
-        #endif
         let tokenResult = await tokenCalculationService.calculatePromptStats(snapshot: calculationSnapshot)
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.tokenService.end",
-                fields: [
-                    "totalTokens": "\(tokenResult.totalTokenCount)",
-                    "fileTokens": "\(tokenResult.totalTokenCountFilesOnly)",
-                    "duration": tokenServiceStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
-        let usedCodemaps = codemapSnapshots.filter { fileID, _ in
-            snapshots.contains { $0.fileID == fileID && $0.isCodemapRequested && $0.codeMapContent != nil }
-        }
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.calculate.end",
-                fields: [
-                    "usedCodemaps": "\(usedCodemaps.count)",
-                    "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
+        let usedCodemapFileIDs = Set(snapshots.compactMap { snapshot in
+            snapshot.isCodemapRequested && snapshot.codeMapContent != nil ? snapshot.fileID : nil
+        })
         return PromptContextAccountingResult(
             tokenResult: tokenResult,
             resolvedEntries: resolution.entries,
@@ -220,8 +225,8 @@ actor PromptContextAccountingService {
             tokenCalculationSnapshot: calculationSnapshot,
             missingPaths: resolution.missingPaths,
             invalidPaths: resolution.invalidPaths,
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            codemapSnapshotsUsed: usedCodemaps
+            codemapPresentation: resolution.codemapPresentation,
+            codemapFileIDsUsed: usedCodemapFileIDs
         )
     }
 
@@ -231,38 +236,15 @@ actor PromptContextAccountingService {
         rootScope: WorkspaceLookupRootScope = .allLoaded,
         profile: PathLocateProfile = .uiAssisted,
         codeMapUsage: CodeMapUsage = .auto,
-        codemapSnapshotBundle frozenCodemaps: WorkspaceCodemapSnapshotBundle? = nil,
-        contentPolicy: PromptContextAccountingContentPolicy = .loadContent
-    ) async -> (entries: [ResolvedPromptFileEntry], missingPaths: [String], invalidPaths: [String]) {
-        let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle = if let frozenCodemaps {
-            frozenCodemaps
-        } else {
-            await store.codemapSnapshotBundle(rootScope: rootScope)
-        }
-        return await resolveEntries(
-            selection: selection,
-            store: store,
-            rootScope: rootScope,
-            profile: profile,
-            codeMapUsage: codeMapUsage,
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            contentPolicy: contentPolicy
-        )
-    }
-
-    private func resolveEntries(
-        selection: StoredSelection,
-        store: WorkspaceFileContextStore,
-        rootScope: WorkspaceLookupRootScope,
-        profile: PathLocateProfile,
-        codeMapUsage: CodeMapUsage,
-        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
-        contentPolicy: PromptContextAccountingContentPolicy
-    ) async -> (entries: [ResolvedPromptFileEntry], missingPaths: [String], invalidPaths: [String]) {
+        codemapPresentation frozenPresentation: WorkspaceCodemapOperationPresentation? = nil,
+        contentPolicy: PromptContextAccountingContentPolicy = .loadContent,
+        codemapLogicalRootDisplayNamesByRootID: [UUID: String] = [:]
+    ) async -> PromptContextEntryResolution {
+        var codemapPresentation = frozenPresentation ?? .empty
         #if DEBUG
             let resolveStartMS = PromptTokenRecountDiagnostics.start()
             var resolveBeginFields = PromptTokenRecountDiagnostics.selectionFields(selection)
-            resolveBeginFields["codemapSnapshots"] = "\(codemapSnapshotBundle.count)"
+            resolveBeginFields["codemapEntries"] = "\(codemapPresentation.orderedEntries.count)"
             resolveBeginFields["codeMapUsage"] = "\(codeMapUsage)"
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.accounting.resolveEntries.begin",
@@ -274,6 +256,12 @@ actor PromptContextAccountingService {
         var invalidPaths: [String] = []
         var seenIDs = Set<ResolvedPromptFileEntryID>()
         var selectedFileIDs = Set<UUID>()
+        let orderedSlicePaths = selection.slices.keys.sorted {
+            let lhs = StoredSelectionPathNormalization.standardizedPath($0) ?? $0
+            let rhs = StoredSelectionPathNormalization.standardizedPath($1) ?? $1
+            if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
+            return $0.utf8.lexicographicallyPrecedes($1.utf8)
+        }
 
         #if DEBUG
             let selectedPathsStartMS = PromptTokenRecountDiagnostics.start()
@@ -309,7 +297,7 @@ actor PromptContextAccountingService {
         }
         let selectedPathLookupResults = await store.lookupPaths(selectedPathLookupRequests)
         guard !Task.isCancelled else {
-            return (entries, missingPaths, invalidPaths)
+            return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
         }
         #if DEBUG
             selectedPathsDebugState.finishLookupBatch()
@@ -345,7 +333,7 @@ actor PromptContextAccountingService {
         var selectedPathFallbackLookups = 0
         for (selectedPathIndex, path) in selection.selectedPaths.enumerated() {
             guard !Task.isCancelled else {
-                return (entries, missingPaths, invalidPaths)
+                return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
             }
             if let result = selectedPathLookupResults[path] {
                 selectedPathResultsByIndex[selectedPathIndex] = result
@@ -366,11 +354,114 @@ actor PromptContextAccountingService {
             }
         #endif
 
+        var operationSourceFileIDs: [UUID] = []
+        var seenOperationSourceFileIDs = Set<UUID>()
+        func appendOperationSource(_ file: WorkspaceFileRecord) {
+            if seenOperationSourceFileIDs.insert(file.id).inserted {
+                operationSourceFileIDs.append(file.id)
+            }
+        }
+        for selectedPathIndex in selectedPathResultsByIndex.keys.sorted() {
+            guard let result = selectedPathResultsByIndex[selectedPathIndex] else { continue }
+            if let file = result.file {
+                appendOperationSource(file)
+            } else if let folder = result.folder {
+                let prefix = folder.standardizedRelativePath
+                let files = await store.files(inRoot: folder.rootID)
+                for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
+                    appendOperationSource(file)
+                }
+            }
+        }
+        for path in orderedSlicePaths {
+            if let file = await store.lookupPath(path, profile: profile, rootScope: rootScope)?.file {
+                appendOperationSource(file)
+            }
+        }
+        var manualCodemapFileIDs: [UUID] = []
+        if codeMapUsage == .selected || (codeMapUsage == .auto && !selection.codemapAutoEnabled) {
+            let manualRequests = selection.manualCodemapPaths.map {
+                WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+            }
+            let manualResults = await store.lookupPaths(manualRequests)
+            var seenManualIDs = Set<UUID>()
+            for path in selection.manualCodemapPaths {
+                if let file = manualResults[path]?.file, seenManualIDs.insert(file.id).inserted {
+                    manualCodemapFileIDs.append(file.id)
+                }
+            }
+        }
+        var completeCodemapFileIDs: [UUID] = []
+        if codeMapUsage == .complete {
+            for root in await store.rootRefs(scope: rootScope) {
+                for file in await store.files(inRoot: root.id) {
+                    let fileExtension = (file.name as NSString).pathExtension.lowercased()
+                    if !fileExtension.isEmpty,
+                       SyntaxManager.supportsCodeMap(fileExtension: fileExtension)
+                    {
+                        completeCodemapFileIDs.append(file.id)
+                    }
+                }
+            }
+        }
+        if frozenPresentation == nil {
+            let intent: WorkspaceCodemapOperationPresentationIntent = switch codeMapUsage {
+            case .none:
+                .none
+            case .selected:
+                .exact(
+                    fileIDs: operationSourceFileIDs + manualCodemapFileIDs.filter {
+                        !operationSourceFileIDs.contains($0)
+                    },
+                    completeRootSet: false
+                )
+            case .auto:
+                selection.codemapAutoEnabled
+                    ? .automatic(sourceFileIDs: operationSourceFileIDs)
+                    : .exact(fileIDs: manualCodemapFileIDs, completeRootSet: false)
+            case .complete:
+                .exact(fileIDs: completeCodemapFileIDs, completeRootSet: true)
+            }
+            let preflightIssues: [WorkspaceCodemapOperationIssue] = []
+            do {
+                let presentation = try await WorkspaceCodemapPresentationCoordinator(store: store)
+                    .presentation(
+                        for: intent,
+                        rootScope: rootScope,
+                        logicalRootDisplayNamesByRootID: codemapLogicalRootDisplayNamesByRootID
+                    )
+                codemapPresentation = WorkspaceCodemapPresentationIntentResolver.merging(
+                    presentation,
+                    preflightIssues: preflightIssues
+                )
+            } catch {
+                let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
+                    .cancelled
+                } else {
+                    .coordinationUnavailable
+                }
+                codemapPresentation = WorkspaceCodemapOperationPresentation(
+                    orderedEntries: [],
+                    coverage: .unavailable([issue]),
+                    issues: [issue],
+                    publicationReceipt: nil
+                )
+                if issue == .cancelled {
+                    return PromptContextEntryResolution(
+                        entries: [],
+                        missingPaths: [],
+                        invalidPaths: [],
+                        codemapPresentation: codemapPresentation
+                    )
+                }
+            }
+        }
+
         var selectedFileReadRequests: [SelectedFileAccountingReadRequest] = []
         var selectedCodemapReadSkips = 0
         for (selectedPathIndex, path) in selection.selectedPaths.enumerated() {
             guard !Task.isCancelled else {
-                return (entries, missingPaths, invalidPaths)
+                return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
             }
             #if DEBUG
                 selectedPathsDebugState.beginPath(index: selectedPathIndex, path: path)
@@ -399,7 +490,7 @@ actor PromptContextAccountingService {
                 )
             #endif
             if let file = result.file {
-                let useSelectedCodemap = codeMapUsage == .selected && codemapSnapshotBundle.hasRenderableCodemap(for: file)
+                let useSelectedCodemap = codeMapUsage == .selected && codemapPresentation.renderedEntriesByFileID[file.id] != nil
                 if useSelectedCodemap {
                     selectedCodemapReadSkips += 1
                 } else {
@@ -520,7 +611,7 @@ actor PromptContextAccountingService {
             return results
         }
         guard !Task.isCancelled else {
-            return (entries, missingPaths, invalidPaths)
+            return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
         }
         #if DEBUG
             let readBatchErrors = selectedFileReadResults.values.reduce(into: 0) { count, result in
@@ -542,7 +633,7 @@ actor PromptContextAccountingService {
 
         for (selectedPathIndex, path) in selection.selectedPaths.enumerated() {
             guard !Task.isCancelled else {
-                return (entries, missingPaths, invalidPaths)
+                return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
             }
             guard let result = selectedPathResultsByIndex[selectedPathIndex] else {
                 #if DEBUG
@@ -564,7 +655,7 @@ actor PromptContextAccountingService {
                 #endif
                 selectedFileIDs.insert(file.id)
                 let ranges = sliceRanges(for: path, file: file, location: result.location, in: selection.slices)
-                let useSelectedCodemap = codeMapUsage == .selected && codemapSnapshotBundle.hasRenderableCodemap(for: file)
+                let useSelectedCodemap = codeMapUsage == .selected && codemapPresentation.renderedEntriesByFileID[file.id] != nil
                 let content = useSelectedCodemap ? nil : selectedFileReadResults[selectedPathIndex]?.content
                 let entry = ResolvedPromptFileEntry(
                     file: file,
@@ -602,10 +693,10 @@ actor PromptContextAccountingService {
                 #endif
                 for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
                     guard !Task.isCancelled else {
-                        return (entries, missingPaths, invalidPaths)
+                        return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
                     }
                     selectedFileIDs.insert(file.id)
-                    let useSelectedCodemap = codeMapUsage == .selected && codemapSnapshotBundle.hasRenderableCodemap(for: file)
+                    let useSelectedCodemap = codeMapUsage == .selected && codemapPresentation.renderedEntriesByFileID[file.id] != nil
                     let content: String?
                     if useSelectedCodemap {
                         content = nil
@@ -694,9 +785,10 @@ actor PromptContextAccountingService {
                 fields: ["sliceFiles": "\(selection.slices.count)"]
             )
         #endif
-        for (path, ranges) in selection.slices {
+        for path in orderedSlicePaths {
+            guard let ranges = selection.slices[path] else { continue }
             guard !Task.isCancelled else {
-                return (entries, missingPaths, invalidPaths)
+                return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
             }
             guard let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) else {
                 missingPaths.append(path)
@@ -734,61 +826,35 @@ actor PromptContextAccountingService {
                 ]
             )
         #endif
-        let codemapPaths: [String] = switch codeMapUsage {
-        case .none, .selected:
-            []
-        case .auto:
-            Array(selection.autoCodemapPaths)
-        case .complete:
-            codemapSnapshotBundle.orderedSnapshots.compactMap { snapshot in
-                guard !selectedFileIDs.contains(snapshot.fileID), snapshot.fileAPI != nil else { return nil }
-                return snapshot.fullPath
+        if codeMapUsage == .auto || codeMapUsage == .complete {
+            let rootsByID = await Dictionary(uniqueKeysWithValues: store.rootRefs(scope: rootScope).map { ($0.id, $0) })
+            for rendered in codemapPresentation.orderedEntries {
+                guard !Task.isCancelled else {
+                    return PromptContextEntryResolution(
+                        entries: entries,
+                        missingPaths: missingPaths,
+                        invalidPaths: invalidPaths,
+                        codemapPresentation: codemapPresentation
+                    )
+                }
+                guard !selectedFileIDs.contains(rendered.fileID),
+                      let file = await store.file(
+                          rootID: rendered.rootEpoch.rootID,
+                          relativePath: rendered.logicalPath.standardizedRelativePath
+                      ),
+                      file.id == rendered.fileID
+                else { continue }
+                let entry = ResolvedPromptFileEntry(
+                    file: file,
+                    isCodemap: true,
+                    mode: .codemap,
+                    loadedContent: nil,
+                    rootFolderPath: rootsByID[file.rootID]?.fullPath
+                )
+                append(entry, to: &entries, seenIDs: &seenIDs)
             }
         }
 
-        #if DEBUG
-            let codemapPathsStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.resolveEntries.codemapPaths.begin",
-                fields: ["codemapPaths": "\(codemapPaths.count)"]
-            )
-        #endif
-        let codemapPathLookupRequests = codemapPaths.map {
-            WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
-        }
-        let codemapPathLookupResults = await store.lookupPaths(codemapPathLookupRequests)
-        guard !Task.isCancelled else {
-            return (entries, missingPaths, invalidPaths)
-        }
-        for path in codemapPaths {
-            guard !Task.isCancelled else {
-                return (entries, missingPaths, invalidPaths)
-            }
-            guard let result = codemapPathLookupResults[path] else {
-                missingPaths.append(path)
-                continue
-            }
-            guard let file = result.file else {
-                invalidPaths.append(path)
-                continue
-            }
-            guard !selectedFileIDs.contains(file.id), codemapSnapshotBundle.hasRenderableCodemap(for: file) else { continue }
-            let entry = ResolvedPromptFileEntry(file: file, isCodemap: true, mode: .codemap, loadedContent: nil, rootFolderPath: result.location.rootPath)
-            append(entry, to: &entries, seenIDs: &seenIDs)
-        }
-
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.accounting.resolveEntries.codemapPaths.end",
-                fields: [
-                    "entries": "\(entries.count)",
-                    "selectedFileIDs": "\(selectedFileIDs.count)",
-                    "missingPaths": "\(missingPaths.count)",
-                    "invalidPaths": "\(invalidPaths.count)",
-                    "duration": codemapPathsStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
         let uniqueMissingPaths = Array(Set(missingPaths)).sorted()
         let uniqueInvalidPaths = Array(Set(invalidPaths)).sorted()
         #if DEBUG
@@ -803,22 +869,19 @@ actor PromptContextAccountingService {
                 ]
             )
         #endif
-        return (entries, uniqueMissingPaths, uniqueInvalidPaths)
+        return PromptContextEntryResolution(entries: entries, missingPaths: uniqueMissingPaths, invalidPaths: uniqueInvalidPaths, codemapPresentation: codemapPresentation)
     }
 
     func makePromptFileEntrySnapshots(
         from entries: [ResolvedPromptFileEntry],
-        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
-        filePathDisplay: FilePathDisplay = .relative,
-        displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
+        filePathDisplay _: FilePathDisplay = .relative,
+        displayPathResolver _: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) -> [PromptFileEntrySnapshot] {
-        let hasMultipleRoots = Set(entries.map(\.file.rootID)).count > 1
-        return entries.map { entry in
+        entries.map { entry in
             let codeMapContent: String?
             let availableCodeMapTokenCount: Int
-            let displayPath = displayPathResolver?(entry)
-                ?? Self.selectedPath(for: entry, filePathDisplay: filePathDisplay, hasMultipleRoots: hasMultipleRoots)
-            if let rendered = codemapSnapshotBundle.renderedCodemap(for: entry.file, displayPath: displayPath) {
+            if let rendered = codemapPresentation.renderedEntriesByFileID[entry.file.id] {
                 availableCodeMapTokenCount = rendered.tokenCount
                 codeMapContent = entry.isCodemap ? rendered.text : nil
             } else {
@@ -837,17 +900,6 @@ actor PromptContextAccountingService {
                 availableCodeMapTokenCount: availableCodeMapTokenCount
             )
         }
-    }
-
-    private nonisolated static func selectedPath(for entry: ResolvedPromptFileEntry, filePathDisplay: FilePathDisplay, hasMultipleRoots: Bool) -> String {
-        if filePathDisplay == .relative {
-            if hasMultipleRoots, let rootFolderPath = entry.rootFolderPath, !rootFolderPath.isEmpty {
-                let rootFolderName = (StandardizedPath.absolute(rootFolderPath) as NSString).lastPathComponent
-                return rootFolderName.isEmpty ? entry.file.relativePath : "\(rootFolderName)/\(entry.file.relativePath)"
-            }
-            return entry.file.relativePath
-        }
-        return entry.file.fullPath
     }
 
     private nonisolated func sliceRanges(for path: String, file: WorkspaceFileRecord, location: WorkspacePathLocation, in slices: [String: [LineRange]]) -> [LineRange]? {

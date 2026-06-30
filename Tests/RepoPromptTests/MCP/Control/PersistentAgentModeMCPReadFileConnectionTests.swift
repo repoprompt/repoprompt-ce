@@ -172,6 +172,17 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #endif
     }
 
+    func testThreeRootSessionScopeReplacesCanonicalGitRootAndPreservesIndependentNonGitRoot() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true, gitBacked: true) { fixture in
+                try await fixture.installWorktreeBinding()
+                try await runCheckpoint(fixture: fixture, scenario: .threeRootFileToolScope)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testReadAutoSelectionDeclinesWhenBoundTabClosesDuringPersistenceSuspension() async throws {
         #if DEBUG
             try await withFixture { fixture in
@@ -224,6 +235,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case worktreeCoverageCertificatePersistenceBoundary
             case worktreeCoverageCertificateFailClosed
             case worktreeSearchPhysicalCoverage
+            case threeRootFileToolScope
             case hiddenWorktreeReadSliceRebase
 
             var requiresSerialReadPrelude: Bool {
@@ -231,7 +243,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion,
                      .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
-                     .worktreeSearchPhysicalCoverage, .hiddenWorktreeReadSliceRebase:
+                     .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase:
                     false
                 default:
                     true
@@ -242,9 +254,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         func withFixture(
             agentOwned: Bool = false,
             inactiveAgentTab: Bool = false,
+            gitBacked: Bool = false,
             _ operation: (Fixture) async throws -> Void
         ) async throws {
-            let fixture = try await Fixture.make(agentOwned: agentOwned, inactiveAgentTab: inactiveAgentTab)
+            let fixture = try await Fixture.make(
+                agentOwned: agentOwned,
+                inactiveAgentTab: inactiveAgentTab,
+                gitBacked: gitBacked
+            )
             do {
                 try await operation(fixture)
                 await fixture.cleanup()
@@ -422,6 +439,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertWorktreeCoverageCertificateFailClosed(fixture: fixture)
             case .worktreeSearchPhysicalCoverage:
                 try await assertWorktreeSearchPhysicalCoverage(fixture: fixture)
+            case .threeRootFileToolScope:
+                try await assertThreeRootFileToolScope(fixture: fixture)
             case .hiddenWorktreeReadSliceRebase:
                 try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
             }
@@ -820,6 +839,71 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertNil(preservedFull.slices[matchingLogicalPath])
         }
 
+        func assertThreeRootFileToolScope(fixture: Fixture) async throws {
+            let searchCases: [(id: Int, pattern: String, expectedMatches: Int, filterPath: String?)] = try [
+                (10, Fixture.canonicalOnlyMarker, 0, nil),
+                (11, Fixture.worktreeOnlyMarker, 1, nil),
+                (12, Fixture.nonGitVisibleMarker, 1, nil),
+                (13, Fixture.nonGitVisibleMarker, 1, fixture.auxiliaryRootPath)
+            ]
+            for testCase in searchCases {
+                var arguments: [String: Any] = [
+                    "pattern": testCase.pattern,
+                    "mode": "content",
+                    "regex": false
+                ]
+                if let filterPath = testCase.filterPath {
+                    arguments["filter"] = ["paths": [filterPath]]
+                }
+                let response = try await fixture.socketClient.request(
+                    id: testCase.id,
+                    method: "tools/call",
+                    params: ["name": MCPWindowToolName.search, "arguments": arguments]
+                )
+                let text = try Self.readFileText(from: response, id: testCase.id)
+                XCTAssertTrue(text.contains("- **Total matches**: \(testCase.expectedMatches)"), text)
+                XCTAssertFalse(try text.contains(fixture.worktreeRootPath), text)
+            }
+
+            let nonGitFile = try fixture.auxiliarySwiftFileURL
+            let readResponse = try await fixture.socketClient.request(
+                id: 14,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": nonGitFile.path]
+                ]
+            )
+            let readText = try Self.readFileText(from: readResponse, id: 14)
+            XCTAssertTrue(readText.contains(Fixture.nonGitVisibleMarker), readText)
+
+            MCPToolWorkCountDiagnostics.resetForTesting()
+            let structureResponse = try await fixture.socketClient.request(
+                id: 15,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.getCodeStructure,
+                    "arguments": [
+                        "scope": "paths",
+                        "paths": [nonGitFile.path]
+                    ]
+                ]
+            )
+            let structureText = try Self.readFileText(from: structureResponse, id: 15)
+            XCTAssertTrue(structureText.contains("- **Status**: `unavailable`"), structureText)
+            XCTAssertTrue(structureText.contains("`git_root_unavailable`"), structureText)
+            let work = MCPToolWorkCountDiagnostics.debugSnapshots().git
+            XCTAssertEqual(work.count, 1)
+            XCTAssertEqual(work.first?.operation, MCPWindowToolName.getCodeStructure)
+            let gitCommands = work.first?.commands ?? []
+            XCTAssertEqual(work.first?.commandCount, 3, gitCommands.joined(separator: "\n"))
+            XCTAssertTrue(
+                gitCommands.contains { $0.contains("rev-parse --show-toplevel") },
+                gitCommands.joined(separator: "\n")
+            )
+            XCTAssertEqual(work.first?.outcome, "success")
+        }
+
         func assertWorktreeCoverageCertificateRepeats(fixture: Fixture) async throws {
             try await clearSelection(fixture: fixture, id: 3)
 
@@ -927,7 +1011,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     fixture.liveFileURL.path,
                     fixture.worktreeOnlyLogicalURL.path
                 ],
-                autoCodemapPaths: selectionAdvancedAfterIngressSnapshot.selection.autoCodemapPaths,
+
                 slices: [
                     fixture.liveFileURL.path: [LineRange(start: 1, end: 20)],
                     fixture.worktreeOnlyLogicalURL.path: [LineRange(start: 30, end: 40)]
@@ -2600,6 +2684,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         static let worktreeOnlyRelativePath = "Tests/RepoPromptTests/MCP/WorktreeOnlySelection.swift"
         static let largeWorktreeRelativePath = "Tests/RepoPromptTests/MCP/SessionWorktree6500.swift"
         static let searchCreatedRelativePath = "Tests/RepoPromptTests/MCP/SearchCreated.swift"
+        static let canonicalOnlyMarker = "RPCE_CANONICAL_ONLY"
+        static let worktreeOnlyMarker = "RPCE_WORKTREE_ONLY"
+        static let nonGitVisibleMarker = "RPCE_NONGIT_VISIBLE"
         static func liveContents() throws -> (logical: String, worktree: String) {
             let targetURL = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
@@ -2628,6 +2715,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let spec: MCPBootstrapLeaseSpec
         let lease: MCPBootstrapLease
         let agentOwned: Bool
+        let gitBacked: Bool
         private var worktreeRootURL: URL?
         private var worktreeRootID: UUID?
         private var retiredWorktreeRootURLs: [URL] = []
@@ -2654,7 +2742,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             connectionManager: BootstrapSocketConnectionManager,
             spec: MCPBootstrapLeaseSpec,
             lease: MCPBootstrapLease,
-            agentOwned: Bool
+            agentOwned: Bool,
+            gitBacked: Bool
         ) {
             self.rootURL = rootURL
             self.fileURL = fileURL
@@ -2670,13 +2759,19 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             self.spec = spec
             self.lease = lease
             self.agentOwned = agentOwned
+            self.gitBacked = gitBacked
         }
 
-        static func make(agentOwned: Bool = false, inactiveAgentTab: Bool = false) async throws -> Fixture {
+        static func make(
+            agentOwned: Bool = false,
+            inactiveAgentTab: Bool = false,
+            gitBacked: Bool = false
+        ) async throws -> Fixture {
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             let fileURL = rootURL.appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
+            let canonicalOnlyFileURL = rootURL.appendingPathComponent("Sources/CanonicalOnly.swift")
             let liveFileURL = rootURL.appendingPathComponent(liveRelativePath)
             let liveContents = try liveContents()
             do {
@@ -2689,7 +2784,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     withIntermediateDirectories: true
                 )
                 try sentinelContent.write(to: fileURL, atomically: true, encoding: .utf8)
+                try "let \(canonicalOnlyMarker) = true\n".write(
+                    to: canonicalOnlyFileURL,
+                    atomically: true,
+                    encoding: .utf8
+                )
                 try liveContents.logical.write(to: liveFileURL, atomically: true, encoding: .utf8)
+                if gitBacked {
+                    _ = try GitWorktreeTestSupport.runGit(["init"], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(["config", "user.name", "RepoPrompt Test"], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(
+                        ["config", "user.email", "repoprompt@example.test"],
+                        cwd: rootURL
+                    )
+                    _ = try GitWorktreeTestSupport.runGit(["config", "commit.gpgSign", "false"], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(["add", "."], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(["commit", "-m", "fixture"], cwd: rootURL)
+                }
             } catch {
                 try? FileManager.default.removeItem(at: rootURL)
                 throw error
@@ -2888,7 +2999,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     connectionManager: resolvedConnectionManager,
                     spec: spec,
                     lease: resolvedLease,
-                    agentOwned: agentOwned
+                    agentOwned: agentOwned,
+                    gitBacked: gitBacked
                 )
             } catch {
                 await connectionManager?.stop()
@@ -2952,6 +3064,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 atomically: true,
                 encoding: .utf8
             )
+            try "struct \(Self.nonGitVisibleMarker) {}\n".write(
+                to: auxiliaryRootURL.appendingPathComponent("Plain.swift"),
+                atomically: true,
+                encoding: .utf8
+            )
             let auxiliaryRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: auxiliaryRootURL.path)
             auxiliaryRootID = auxiliaryRoot.id
 
@@ -2959,6 +3076,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests-Worktree", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             self.worktreeRootURL = worktreeRootURL
+            if gitBacked {
+                _ = try GitWorktreeTestSupport.runGit(
+                    ["worktree", "add", "--detach", worktreeRootURL.path, "HEAD"],
+                    cwd: rootURL
+                )
+                try FileManager.default.removeItem(
+                    at: worktreeRootURL.appendingPathComponent("Sources/CanonicalOnly.swift")
+                )
+            }
             let worktreeFileURL = worktreeRootURL.appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
             let worktreeLiveFileURL = worktreeRootURL.appendingPathComponent(Self.liveRelativePath)
             let worktreeOnlyFileURL = worktreeRootURL.appendingPathComponent(Self.worktreeOnlyRelativePath)
@@ -2982,7 +3108,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let liveContents = try Self.liveContents()
             try Self.sentinelContent.write(to: worktreeFileURL, atomically: true, encoding: .utf8)
             try liveContents.worktree.write(to: worktreeLiveFileURL, atomically: true, encoding: .utf8)
-            try "let worktreeOnlySelection = true\n".write(
+            try "let \(Self.worktreeOnlyMarker) = true\n".write(
                 to: worktreeOnlyFileURL,
                 atomically: true,
                 encoding: .utf8
@@ -3035,6 +3161,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         var installedWorktreeRootID: UUID {
             get throws {
                 try XCTUnwrap(worktreeRootID)
+            }
+        }
+
+        var auxiliaryRootPath: String {
+            get throws {
+                try XCTUnwrap(auxiliaryRootURL).path
+            }
+        }
+
+        var auxiliarySwiftFileURL: URL {
+            get throws {
+                try XCTUnwrap(auxiliaryRootURL).appendingPathComponent("Plain.swift")
             }
         }
 

@@ -108,6 +108,25 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
     }
 
     private func executeManageSelection(args: [String: Value]) async throws -> ToolResultDTOs.SelectionReply {
+        #if DEBUG
+            let metadata = await dependencies.captureRequestMetadata()
+            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
+                WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
+                    agentSessionID: $0
+                )
+            }
+            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(tag) {
+                try await executeManageSelectionWithRetry(args: args)
+            }
+        #else
+            return try await executeManageSelectionWithRetry(args: args)
+        #endif
+    }
+
+    private func executeManageSelectionWithRetry(
+        args: [String: Value]
+    ) async throws -> ToolResultDTOs.SelectionReply {
         do {
             return try await executeManageSelectionAttempt(args: args)
         } catch is ArtifactCommitConflict {
@@ -219,7 +238,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         switch op {
         case "get":
             let ctx = resolvedContext.snapshot
-            selectionLog("[Virtual] manage_selection op=get tab=\(ctx.tabID) selected=\(ctx.selection.selectedPaths.count) codemap=\(ctx.selection.autoCodemapPaths.count) slices=\(ctx.selection.slices.count)")
+            selectionLog("[Virtual] manage_selection op=get tab=\(ctx.tabID) selected=\(ctx.selection.selectedPaths.count) manualCodemaps=\(ctx.selection.manualCodemapPaths.count) slices=\(ctx.selection.slices.count)")
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction, transition: .completed)
             try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction)
@@ -245,11 +264,9 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 artifactResolution.absolutePaths,
                 .add
             )
-            let previewSelectionFinal: StoredSelection = if mode == "codemap_only" {
-                StoredSelection(selectedPaths: selectionWithArtifacts.selectedPaths, autoCodemapPaths: selectionWithArtifacts.autoCodemapPaths, slices: selectionWithArtifacts.slices, codemapAutoEnabled: false)
-            } else {
-                selectionWithArtifacts
-            }
+            let previewSelectionFinal = mode == "codemap_only"
+                ? buildResult.selection
+                : selectionWithArtifacts
             var combinedInvalid = buildResult.invalidPaths
             for msg in buildResult.codemapUnavailable where !combinedInvalid.contains(msg) {
                 combinedInvalid.append(msg)
@@ -555,11 +572,13 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         case "clear":
             let baseContext = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=clear mode=\(mode) tab=\(baseContext.tabID)")
-            let clearedSelection = if mode == "codemap_only" {
-                StoredSelection(selectedPaths: baseContext.selection.selectedPaths, autoCodemapPaths: [], slices: baseContext.selection.slices, codemapAutoEnabled: false)
-            } else {
-                StoredSelection()
-            }
+            let clearedSelection = mode == "codemap_only"
+                ? StoredSelection(
+                    selectedPaths: baseContext.selection.selectedPaths,
+                    slices: baseContext.selection.slices,
+                    codemapAutoEnabled: false
+                )
+                : StoredSelection()
             return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: baseContext, selection: clearedSelection, includeBlocks: includeBlocks, display: display, extraInvalid: extraInvalid, view: view)
         default:
             throw MCPError.invalidParams("Unsupported op '\(op)' for manage_selection when tab context is active")
@@ -673,6 +692,6 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
     }
 
     private static func selectionSummary(_ selection: StoredSelection) -> String {
-        "selected=\(selection.selectedPaths.count), codemap=\(selection.autoCodemapPaths.count), slices=\(selection.slices.count), auto=\(selection.codemapAutoEnabled)"
+        "selected=\(selection.selectedPaths.count), manualCodemaps=\(selection.manualCodemapPaths.count), slices=\(selection.slices.count), auto=\(selection.codemapAutoEnabled)"
     }
 }

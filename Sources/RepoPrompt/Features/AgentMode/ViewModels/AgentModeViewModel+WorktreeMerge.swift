@@ -814,10 +814,6 @@ extension AgentModeViewModel {
                 userPath: target.path,
                 fallbackScope: .allLoaded
             )
-            let roots = await store.rootRefs(scope: .allLoaded)
-            for root in roots where samePath(root.standardizedFullPath, target.path) {
-                try? await store.requestCodemapScans(inRoot: root.id)
-            }
         }
         updateWorktreeMergeSummariesInIndex(for: session)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)

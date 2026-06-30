@@ -11,7 +11,7 @@ import SwiftUI
 /// for progressive-disclosure-friendly browsing.
 ///
 /// SEARCH-HELPER: Advanced Settings, File System, AI Behavior, Code Maps,
-/// URL Opener, URL scheme, deep links, gitignore, symlinks, saved prompts,
+/// URL Opener, URL scheme, deep links, symlinks, saved prompts,
 /// datetime instructions
 ///
 /// Related:
@@ -34,13 +34,6 @@ struct AdvancedSettingsView: View {
 
     private var canonicalURLPrefix: String {
         "\(AppDeepLinkURLScheme.canonical)://"
-    }
-
-    private var respectGitignoreBinding: Binding<Bool> {
-        Binding(
-            get: { globalSettings.respectGitignore() },
-            set: { setFileSystemPreference($0, key: "file_system.respect_gitignore", store: { globalSettings.setRespectGitignore($0) }) }
-        )
     }
 
     private var respectRepoIgnoreBinding: Binding<Bool> {
@@ -161,12 +154,6 @@ struct AdvancedSettingsView: View {
                 title: "Workspace Folder Scanning",
                 description: "Changes refresh open folders and are shared with app_settings MCP writes."
             ) {
-                SettingToggle(
-                    title: "Respect .gitignore rules",
-                    description: "Honor .gitignore files while scanning workspace folders.",
-                    isOn: respectGitignoreBinding
-                )
-
                 SettingToggle(
                     title: "Respect .repo_ignore rules",
                     description: "Honor RepoPrompt-specific .repo_ignore files. Edit local .repo_ignore content through the Ignore Patterns editor or file editing tools.",

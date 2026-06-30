@@ -57,7 +57,7 @@ enum AgentSelectedFilesDiagnostics {
             let sliceRanges = nonEmptySlices.values.reduce(0) { $0 + $1.count }
             return [
                 "selectedPaths": String(selection.selectedPaths.count),
-                "autoCodemapPaths": String(selection.autoCodemapPaths.count),
+                "manualCodemapPaths": String(selection.manualCodemapPaths.count),
                 "sliceFiles": String(nonEmptySlices.count),
                 "sliceRanges": String(sliceRanges),
                 "codemapAutoEnabled": String(selection.codemapAutoEnabled)

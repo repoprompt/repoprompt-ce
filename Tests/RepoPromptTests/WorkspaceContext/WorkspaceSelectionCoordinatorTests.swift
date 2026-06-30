@@ -15,7 +15,7 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"], codemapAutoEnabled: true)
         let pending = StoredSelection(
             selectedPaths: ["/tmp/pending.swift"],
-            autoCodemapPaths: ["/tmp/dependency.swift"],
+
             slices: ["/tmp/pending.swift": [LineRange(start: 1, end: 3)]],
             codemapAutoEnabled: false
         )
@@ -44,7 +44,7 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
         let next = StoredSelection(
             selectedPaths: ["/tmp/next.swift"],
-            autoCodemapPaths: ["/tmp/next_dependency.swift"],
+
             slices: ["/tmp/next.swift": [LineRange(start: 4, end: 8)]],
             codemapAutoEnabled: false
         )
@@ -354,23 +354,18 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
     func testDeferredMCPMirrorRefreshesFenceBeforeQueuedCatalogSnapshotPublishes() async {
         let first = StoredSelection(
             selectedPaths: ["/tmp/Full.swift"],
-            autoCodemapPaths: ["/tmp/DependencyA.swift", "/tmp/DependencyB.swift"],
+
             codemapAutoEnabled: true
         )
         let latest = StoredSelection(
             selectedPaths: ["/tmp/Full.swift", "/tmp/Sliced.swift"],
-            autoCodemapPaths: [
-                "/tmp/DependencyA.swift",
-                "/tmp/DependencyB.swift",
-                "/tmp/DependencyC.swift",
-                "/tmp/DependencyD.swift"
-            ],
+
             slices: ["/tmp/Sliced.swift": [LineRange(start: 4, end: 7)]],
             codemapAutoEnabled: true
         )
         let completeCatalog = StoredSelection(
             selectedPaths: ["/tmp/Full.swift", "/tmp/Sliced.swift"],
-            autoCodemapPaths: (0 ..< 300).map { "/tmp/Catalog/\($0).swift" },
+
             codemapAutoEnabled: true
         )
         let harness = CoordinatorHarness(initialSelection: StoredSelection())
@@ -403,9 +398,6 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(harness.manager.mirroredSelection, latest)
         XCTAssertEqual(harness.manager.publishedSelections, [first, latest])
-        XCTAssertTrue(harness.manager.publishedSelections.allSatisfy {
-            $0.selectedPaths.count + $0.autoCodemapPaths.count <= 6
-        })
         XCTAssertFalse(harness.manager.publishedSelections.contains(completeCatalog))
     }
 
@@ -632,7 +624,7 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         let inactiveInitial = StoredSelection(selectedPaths: ["/tmp/inactive-old.swift"])
         let next = StoredSelection(
             selectedPaths: ["/tmp/inactive-new.swift"],
-            autoCodemapPaths: ["/tmp/inactive-dependency.swift"],
+
             codemapAutoEnabled: false
         )
         let harness = CoordinatorHarness(initialSelection: initial)
@@ -657,6 +649,40 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(changes.last, .init(tabID: inactiveTabID, selection: next, source: .mcpTabContext))
     }
 
+    func testMCPSelectionClearRestoresAutoModeAndNextFullAddPreservesAutoFlag() async {
+        let initial = StoredSelection(
+            manualCodemapPaths: ["/tmp/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+        let harness = CoordinatorHarness(initialSelection: initial)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let cleared = await coordinator.persistActiveSelection(
+            StoredSelection(),
+            source: .mcpTabContext
+        )
+
+        XCTAssertEqual(cleared, StoredSelection())
+        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, StoredSelection())
+        XCTAssertEqual(harness.manager.mirrorStartedSelections, [StoredSelection()])
+        XCTAssertEqual(harness.manager.mirrorCompletedSelections, [StoredSelection()])
+        XCTAssertEqual(harness.manager.mirroredSelection, StoredSelection())
+
+        let current = harness.manager.composeTab(with: harness.tabID)?.selection
+        let nextFullAdd = StoredSelection(
+            selectedPaths: ["/tmp/Full.swift"],
+            codemapAutoEnabled: current?.codemapAutoEnabled ?? false
+        )
+        let persistedFullAdd = await coordinator.persistActiveSelection(
+            nextFullAdd,
+            source: .mcpTabContext
+        )
+
+        XCTAssertEqual(persistedFullAdd.selectedPaths, ["/tmp/Full.swift"])
+        XCTAssertTrue(persistedFullAdd.codemapAutoEnabled)
+        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, persistedFullAdd)
+    }
+
     func testAtomicArtifactTransformMergesIntoLatestCanonicalSelection() async throws {
         let sourcePath = "/tmp/source.swift"
         let concurrentPath = "/tmp/concurrent.swift"
@@ -664,7 +690,7 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         let patchPath = "/tmp/workspace/_git_data/repos/repo/snapshot/diff/all.patch"
         let initial = StoredSelection(
             selectedPaths: [sourcePath],
-            autoCodemapPaths: [mapPath, "/tmp/dependency.swift"],
+
             slices: [sourcePath: [LineRange(start: 2, end: 6)]],
             codemapAutoEnabled: false
         )
@@ -673,7 +699,7 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
 
         let concurrent = StoredSelection(
             selectedPaths: [sourcePath, concurrentPath],
-            autoCodemapPaths: initial.autoCodemapPaths,
+
             slices: initial.slices,
             codemapAutoEnabled: initial.codemapAutoEnabled
         )
@@ -714,7 +740,6 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(transaction.before, concurrent)
         XCTAssertEqual(transaction.after.selectedPaths, [sourcePath, concurrentPath, mapPath, patchPath])
         XCTAssertEqual(transaction.after.slices, initial.slices)
-        XCTAssertEqual(transaction.after.autoCodemapPaths, ["/tmp/dependency.swift"])
         XCTAssertFalse(transaction.after.codemapAutoEnabled)
         XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, transaction.after)
     }

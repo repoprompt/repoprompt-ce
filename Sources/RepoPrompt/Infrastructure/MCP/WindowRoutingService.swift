@@ -681,7 +681,9 @@ final class WindowRoutingService: Service {
         let sel = tab.selection
         let sampleK = 3
         var allPaths = Set<String>()
-        allPaths.reserveCapacity(sel.selectedPaths.count + sel.slices.count + sel.autoCodemapPaths.count)
+        allPaths.reserveCapacity(
+            sel.selectedPaths.count + sel.manualCodemapPaths.count + sel.slices.count
+        )
 
         var samplePaths: [String] = []
         samplePaths.reserveCapacity(sampleK)
@@ -702,10 +704,10 @@ final class WindowRoutingService: Service {
         for path in sel.selectedPaths where allPaths.insert(path).inserted {
             considerForSample(path)
         }
-        for path in sel.slices.keys where allPaths.insert(path).inserted {
+        for path in sel.manualCodemapPaths where allPaths.insert(path).inserted {
             considerForSample(path)
         }
-        for path in sel.autoCodemapPaths where allPaths.insert(path).inserted {
+        for path in sel.slices.keys where allPaths.insert(path).inserted {
             considerForSample(path)
         }
 

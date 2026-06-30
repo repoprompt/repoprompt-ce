@@ -206,15 +206,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
     /// Views should use this instead of directly accessing previewContent for SVG-aware rendering.
     @Published private(set) var previewSnapshot: FilePreviewSnapshot?
 
-    /// Indicates whether a CodeMap load is in progress (for UI feedback)
-    @Published private(set) var isCodeMapLoading: Bool = false
-
     /// Notifies listeners whenever this file’s check state changes:
     /// (file, isChecked)
     var onCheckStateChanged: ((FileViewModel, Bool) -> Void)?
-
-    /// Keeps track of ongoing CodeMap loading so we can cancel or await it.
-    private var codeMapLoadingTask: Task<FileAPI?, Never>?
 
     // MARK: - Single-flight gate (atomic start-or-join)
 
@@ -297,12 +291,8 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
     /// The last time we successfully loaded content (UI-facing).
     @Published private(set) var lastLoadedDate: Date?
 
-    /// Cached token count for more efficient token calculations
-    @Published private(set) var cachedTokenCount: Int? = nil
-
     /// Cached line counts for quick UI access
     @Published private(set) var contentLineCount: Int? = nil
-    @Published private(set) var codemapLineCount: Int? = nil
 
     /// Cached syntax tokens for highlighting (loaded on demand)
     private var cachedNamedRanges: [NamedRange]?
@@ -334,8 +324,6 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
     let chunkSize = 50000
     let hierarchyLevel: Int
-    private(set) var fileAPI: FileAPI?
-    @Published private(set) var hasAcceptedCodeMap: Bool
 
     // MARK: - Preview limits
 
@@ -573,7 +561,6 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         loadingState = .notLoaded
         cachedContent = nil
         cachedNamedRanges = nil
-        hasAcceptedCodeMap = false
         self.hierarchyLevel = hierarchyLevel
         self.fileSystemService = fileSystemService
         if let contentProvider {
@@ -631,7 +618,6 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         loadingState = .notLoaded
         cachedContent = nil
         cachedNamedRanges = nil
-        hasAcceptedCodeMap = false
         self.hierarchyLevel = hierarchyLevel
         self.fileSystemService = fileSystemService
         if let contentProvider {
@@ -688,8 +674,6 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
         // Invalidate UI-visible caches (but keep cachedContent as a fallback)
         cachedNamedRanges = nil
-        cachedTokenCount = nil
-        clearCodeMapState()
         lastLoadedDate = nil
         loadingState = .notLoaded
         error = nil
@@ -699,53 +683,12 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
         // Cancel ongoing work
         await contentLoadGate.cancel()
-        codeMapLoadingTask?.cancel()
-        codeMapLoadingTask = nil
-        isCodeMapLoading = false
 
         // One-hop atomic snapshot update (bump version & clear freshness)
         await stateCache.recordExternalModification(newDate)
 
         // Reposition in parent if sorted by modification date.
         parentFolder?.childDidUpdateModificationDate(self)
-    }
-
-    func acceptsCodeMap(_ codeMap: FileAPI) -> Bool {
-        StandardizedPath.absolute(codeMap.filePath) == standardizedFullPath
-    }
-
-    @MainActor
-    func setCodeMap(_ newCodeMap: FileAPI?) {
-        guard let newCodeMap else {
-            clearCodeMapState()
-            return
-        }
-
-        let isAccepted = acceptsCodeMap(newCodeMap)
-        guard isAccepted else {
-            clearCodeMapState()
-            return
-        }
-
-        if hasAcceptedCodeMap,
-           let existingAPI = fileAPI,
-           StandardizedPath.absolute(existingAPI.filePath) == StandardizedPath.absolute(newCodeMap.filePath),
-           existingAPI.apiDescription == newCodeMap.apiDescription,
-           codemapLineCount != nil
-        {
-            return
-        }
-
-        fileAPI = newCodeMap
-        hasAcceptedCodeMap = true
-        // Count lines using line-ending-aware utility (handles LF/CRLF/CR uniformly)
-        codemapLineCount = String.splitContentPreservingAllLineEndings(newCodeMap.apiDescription).count
-    }
-
-    private func clearCodeMapState() {
-        fileAPI = nil
-        hasAcceptedCodeMap = false
-        codemapLineCount = nil
     }
 
     /// Set whether this file is currently checked; calls the optional callback.
@@ -973,7 +916,6 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         modificationDate: Date
     ) async -> String {
         let resolvedContent = content ?? "[Binary file]"
-        let tokenCount = TokenCalculationService.estimateTokens(for: resolvedContent)
         let byteCount = resolvedContent.utf8.count
 
         // Precompute preview artifacts off MainActor to avoid UI hitches.
@@ -998,7 +940,6 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
             resolvedContent,
             modificationDate,
             tokens: nil,
-            tokenCount: tokenCount,
             previewArtifacts: previewArtifacts
         )
         return resolvedContent
@@ -1009,12 +950,10 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         _ newContent: String,
         _ modificationDate: Date,
         tokens: [NamedRange]?,
-        tokenCount: Int,
         previewArtifacts: PreviewArtifacts
     ) async {
         cachedContent = newContent
         cachedNamedRanges = tokens // will be nil on load; re-tokenize on demand
-        cachedTokenCount = tokenCount
         loadingState = .loaded
         lastLoadedDate = modificationDate
         // Keep the UI-facing timestamp in sync with disk mtime so future setModificationDate(newDate)
@@ -1108,7 +1047,6 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         } else {
             // Evict memory-only caches
             cachedNamedRanges = nil
-            cachedTokenCount = nil
             previewContent = nil
             previewNamedRanges = nil
             previewSnapshot = nil

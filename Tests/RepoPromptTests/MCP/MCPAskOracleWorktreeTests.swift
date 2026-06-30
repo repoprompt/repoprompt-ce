@@ -455,6 +455,110 @@ import XCTest
             }
         }
 
+        func testGitDiffSelectedArtifactsAutoSelectPatchForBoundLinkedWorktreeWithoutSessionRootCatalog() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let gitFixture = try ReviewGitRepositoryFixture(name: "OracleSelectedArtifactNoCatalog")
+                defer { gitFixture.cleanup() }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let logicalRoot = try gitFixture.makeRepository(
+                        named: "logical",
+                        files: ["Sources/Feature.swift": "let value = \"initial\"\n"]
+                    )
+                    let worktreeRoot = try gitFixture.makeLinkedWorktree(
+                        from: logicalRoot,
+                        named: "worktree",
+                        branch: "feature/artifact-no-catalog"
+                    )
+                    let logicalFile = logicalRoot.appendingPathComponent("Sources/Feature.swift")
+                    let worktreeFile = worktreeRoot.appendingPathComponent("Sources/Feature.swift")
+                    try write("let value = \"canonical_artifact_leak\"\n", to: logicalFile)
+                    try write("let value = \"linked_artifact_source\"\n", to: worktreeFile)
+                    _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(
+                        path: logicalRoot.path,
+                        kind: .primaryWorkspace
+                    )
+                    let layout = try XCTUnwrap(
+                        GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: worktreeRoot)
+                    )
+                    let repositoryIdentity = GitWorktreeIdentity.repositoryIdentity(
+                        commonGitDir: layout.commonDir,
+                        mainWorktreeRoot: layout.knownMainWorktreeRoot
+                    )
+                    let worktreeID = GitWorktreeIdentity.worktreeID(
+                        repositoryID: repositoryIdentity.repositoryID,
+                        gitDir: layout.gitDir,
+                        isMain: false,
+                        path: layout.workTreeRoot
+                    )
+                    let binding = AgentSessionWorktreeBinding(
+                        id: "binding-artifact-no-catalog",
+                        repositoryID: repositoryIdentity.repositoryID,
+                        repoKey: GitRepoDescriptor(rootURL: logicalRoot).repoKey,
+                        logicalRootPath: logicalRoot.path,
+                        logicalRootName: "ArtifactNoCatalogRepo",
+                        worktreeID: worktreeID,
+                        worktreeRootPath: worktreeRoot.path,
+                        worktreeName: "worktree",
+                        branch: "feature/artifact-no-catalog",
+                        source: "test"
+                    )
+
+                    let sourceSelection = StoredSelection(
+                        selectedPaths: [logicalFile.path],
+                        codemapAutoEnabled: false
+                    )
+                    let context = makeFrozenContext(
+                        fixture: fixture,
+                        selection: sourceSelection,
+                        bindings: [binding]
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
+
+                    let gitResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.git,
+                        arguments: [
+                            "op": "diff",
+                            "repo_root": logicalRoot.path,
+                            "scope": "selected",
+                            "detail": "patches",
+                            "artifacts": true,
+                            "mode": "deep"
+                        ],
+                        timeoutSeconds: 30
+                    )
+                    XCTAssertFalse(gitResponse.rawJSON.contains("\"isError\":true"), gitResponse.rawJSON)
+                    let gitText = try toolResultText(gitResponse)
+                    let publishedSelection = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                    ).selection
+                    XCTAssertTrue(publishedSelection.selectedPaths.contains(logicalFile.path))
+                    _ = try requireSelectedPath(
+                        suffix: "/MAP.txt",
+                        in: publishedSelection,
+                        context: "selected linked-worktree artifact publication without session root catalog",
+                        toolOutput: gitText
+                    )
+                    let patchPath = try requireSelectedPath(
+                        suffix: "/diff/all.patch",
+                        in: publishedSelection,
+                        context: "selected linked-worktree artifact publication without session root catalog",
+                        toolOutput: gitText
+                    )
+                    let patchText = try String(contentsOfFile: patchPath, encoding: .utf8)
+                    XCTAssertTrue(patchText.contains("linked_artifact_source"), patchText)
+                    XCTAssertFalse(patchText.contains("canonical_artifact_leak"), patchText)
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAskOracleReviewUsesAuthorizedSelectedArtifactAndKeepsMapAsContext() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -539,11 +643,17 @@ import XCTest
                     let publishedSelection = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
                     ).selection
-                    let mapPath = try XCTUnwrap(
-                        publishedSelection.selectedPaths.first { $0.hasSuffix("/MAP.txt") }
+                    let mapPath = try requireSelectedPath(
+                        suffix: "/MAP.txt",
+                        in: publishedSelection,
+                        context: "selected-artifact publication",
+                        toolOutput: gitText
                     )
-                    let patchPath = try XCTUnwrap(
-                        publishedSelection.selectedPaths.first { $0.hasSuffix("/diff/all.patch") }
+                    let patchPath = try requireSelectedPath(
+                        suffix: "/diff/all.patch",
+                        in: publishedSelection,
+                        context: "selected-artifact publication",
+                        toolOutput: gitText
                     )
                     XCTAssertTrue(publishedSelection.selectedPaths.contains(logicalFile.path))
                     let patchText = try String(contentsOfFile: patchPath, encoding: .utf8)
@@ -833,7 +943,7 @@ import XCTest
                     let endpoint = try fixture.endpointA()
                     try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
 
-                    _ = try await endpoint.callTool(
+                    let gitResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.git,
                         arguments: [
                             "op": "diff",
@@ -845,15 +955,22 @@ import XCTest
                         ],
                         timeoutSeconds: 30
                     )
+                    let gitText = try toolResultText(gitResponse)
 
                     let publishedSelection = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
                     ).selection
-                    let mapPath = try XCTUnwrap(
-                        publishedSelection.selectedPaths.first { $0.hasSuffix("/MAP.txt") }
+                    let mapPath = try requireSelectedPath(
+                        suffix: "/MAP.txt",
+                        in: publishedSelection,
+                        context: "canonical-artifact publication",
+                        toolOutput: gitText
                     )
-                    let patchPath = try XCTUnwrap(
-                        publishedSelection.selectedPaths.first { $0.hasSuffix("/diff/all.patch") }
+                    let patchPath = try requireSelectedPath(
+                        suffix: "/diff/all.patch",
+                        in: publishedSelection,
+                        context: "canonical-artifact publication",
+                        toolOutput: gitText
                     )
                     XCTAssertTrue(publishedSelection.selectedPaths.contains(sourceFile.path))
                     let patchText = try String(contentsOfFile: patchPath, encoding: .utf8)
@@ -1163,6 +1280,163 @@ import XCTest
             }
         }
 
+        func testAgentRunOracleReviewSourceCaptureAllowsEquivalentSelectionRevisionDriftButRejectsIdentityChange() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    contextASearchFileCount: 3
+                )
+                addTeardownBlock {
+                    await fixture.cleanup()
+                }
+                let window = fixture.contextA.window
+                defer {
+                    window.mcpServer.setRequestMetadataOverrideForTesting(nil)
+                }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let sourceTabID = UUID()
+                    guard let workspaceIndex = window.workspaceManager.workspaces.firstIndex(where: {
+                        $0.id == fixture.contextA.workspaceID
+                    }) else {
+                        return XCTFail("Expected active fixture workspace")
+                    }
+                    window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                        ComposeTabState(
+                            id: sourceTabID,
+                            name: "Oracle revision drift source",
+                            selection: StoredSelection(),
+                            promptText: "Frozen launch source"
+                        )
+                    )
+                    let sourceIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: sourceTabID
+                    )
+                    let searchPaths = Array(fixture.contextA.searchFileURLs.prefix(3).map(\.path))
+                    XCTAssertEqual(searchPaths.count, 3)
+                    let sourcePaths = Array(searchPaths.prefix(2))
+                    let manualCodemapPath = searchPaths[2]
+                    let sourceSelection = StoredSelection(
+                        selectedPaths: sourcePaths,
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        sourceSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    let sourceRevision = window.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: sourceTabID
+                    )
+                    let committedSource = try XCTUnwrap(
+                        window.workspaceManager.composeTab(with: sourceTabID)
+                    )
+                    XCTAssertEqual(Set(committedSource.selection.selectedPaths), Set(sourcePaths))
+                    let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                        route: .explicitTabContext,
+                        windowID: window.windowID,
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: sourceTabID,
+                        selectionRevision: sourceRevision,
+                        promptText: committedSource.promptText,
+                        selection: committedSource.selection,
+                        sourceAgentSessionID: nil,
+                        routedRunID: nil
+                    )
+
+                    let equivalentSelection = StoredSelection(
+                        selectedPaths: Array(sourcePaths.reversed()),
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        equivalentSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    XCTAssertNotEqual(
+                        window.workspaceManager.selectionRevisionForMCP(
+                            workspaceID: fixture.contextA.workspaceID,
+                            tabID: sourceTabID
+                        ),
+                        sourceRevision
+                    )
+                    let equivalentCapture = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                        snapshot: snapshot,
+                        targetWindow: window
+                    )
+                    let liveAfterEquivalentCapture = window.workspaceManager.composeTab(
+                        with: sourceTabID
+                    )?.selection
+                    guard case let .captured(captured) = equivalentCapture else {
+                        return XCTFail(
+                            "Expected equivalent selection identity drift to preserve captured source, " +
+                                "got \(equivalentCapture); " +
+                                "liveSelection=\(String(describing: liveAfterEquivalentCapture))"
+                        )
+                    }
+                    XCTAssertEqual(captured.sourceSelectionRevision, sourceRevision)
+                    XCTAssertEqual(captured.selection, committedSource.selection)
+                    XCTAssertEqual(
+                        captured.exactSelectedIdentities,
+                        AgentRunOracleReviewSelectionIdentity.normalizedSelectedArtifactIdentities(
+                            snapshot.selection
+                        )
+                    )
+
+                    let manualCodemapChangedSelection = StoredSelection(
+                        selectedPaths: sourcePaths,
+                        manualCodemapPaths: [manualCodemapPath],
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        manualCodemapChangedSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    let manualCodemapChangedCapture = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                        snapshot: snapshot,
+                        targetWindow: window
+                    )
+                    guard case let .unavailable(manualCodemapUnavailable) = manualCodemapChangedCapture else {
+                        return XCTFail("Expected manual codemap identity drift to fail closed")
+                    }
+                    guard case .sourceCaptureFailed = manualCodemapUnavailable.reason else {
+                        return XCTFail(
+                            "Expected manual codemap source capture failure, got \(manualCodemapUnavailable.reason)"
+                        )
+                    }
+
+                    let changedSelection = StoredSelection(
+                        selectedPaths: [sourcePaths[0]],
+                        codemapAutoEnabled: false
+                    )
+                    _ = await window.selectionCoordinator.persistSelection(
+                        changedSelection,
+                        for: sourceIdentity,
+                        source: .runtimeMutation,
+                        mirrorToUIIfActive: false
+                    )
+                    let changedCapture = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                        snapshot: snapshot,
+                        targetWindow: window
+                    )
+                    guard case let .unavailable(unavailable) = changedCapture else {
+                        return XCTFail("Expected real selection identity drift to fail closed")
+                    }
+                    guard case let .sourceCaptureFailed(message) = unavailable.reason else {
+                        return XCTFail("Expected source capture failure, got \(unavailable.reason)")
+                    }
+                    XCTAssertTrue(message.contains("selection") || message.contains("tab changed"))
+                }
+            }
+        }
+
         func testAgentRunExplicitContextCapturesInactiveSourceInsteadOfActiveTab() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -1301,6 +1575,35 @@ import XCTest
                 let previousCustomProviderValidity = apiSettings.isCustomProviderValid
                 let previousClaudeCodeConnected = apiSettings.isClaudeCodeConnected
                 let previousPlanningModel = fixture.contextA.window.promptManager.planningModelName
+                var syntheticSessionIDsToCleanup: [UUID] = []
+                var syntheticRunIDsToCleanup: [UUID] = []
+                var syntheticConnectionsToCleanup: [SyntheticMCPConnectionCleanup] = []
+                var delegatedConversationSessionIDToDeactivate: UUID?
+
+                func trackSyntheticSession(_ sessionID: UUID) {
+                    guard !syntheticSessionIDsToCleanup.contains(sessionID) else { return }
+                    syntheticSessionIDsToCleanup.append(sessionID)
+                }
+
+                func trackSyntheticRun(_ runID: UUID) {
+                    guard !syntheticRunIDsToCleanup.contains(runID) else { return }
+                    syntheticRunIDsToCleanup.append(runID)
+                }
+
+                func trackSyntheticConnection(
+                    connectionID: UUID,
+                    clientName: String,
+                    runID: UUID?
+                ) {
+                    guard !syntheticConnectionsToCleanup.contains(where: {
+                        $0.connectionID == connectionID
+                    }) else { return }
+                    syntheticConnectionsToCleanup.append(SyntheticMCPConnectionCleanup(
+                        connectionID: connectionID,
+                        clientName: clientName,
+                        runID: runID
+                    ))
+                }
 
                 defer {
                     fixture.contextA.window.promptManager
@@ -1482,6 +1785,10 @@ import XCTest
                         }
                     }
 
+                    if let activeAgentSessionID = frozenContext.activeAgentSessionID {
+                        trackSyntheticSession(activeAgentSessionID)
+                    }
+
                     let endpoint = try fixture.endpointA()
                     try await configureAgentModeEndpoint(
                         endpoint,
@@ -1489,7 +1796,7 @@ import XCTest
                         fixture: fixture
                     )
 
-                    _ = try await endpoint.callTool(
+                    let gitResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.git,
                         arguments: [
                             "op": "diff",
@@ -1501,19 +1808,29 @@ import XCTest
                         ],
                         timeoutSeconds: 30
                     )
+                    let gitText = try toolResultText(gitResponse)
 
                     let publishedSelection = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.composeTab(
                             with: fixture.contextA.tabID
                         )
                     ).selection
-                    let mapPath = try XCTUnwrap(
-                        publishedSelection.selectedPaths.first { $0.hasSuffix("/MAP.txt") }
+                    let diagnosticContext = "oracle transport publication "
+                        + "repositoryKind=\(repositoryKind.rawValue) "
+                        + "delegateToChildRun=\(delegateToChildRun) "
+                        + "childInheritWorktreeBindings=\(childInheritWorktreeBindings) "
+                        + "childCreateWorktree=\(childCreateWorktree)"
+                    let mapPath = try requireSelectedPath(
+                        suffix: "/MAP.txt",
+                        in: publishedSelection,
+                        context: diagnosticContext,
+                        toolOutput: gitText
                     )
-                    let patchPath = try XCTUnwrap(
-                        publishedSelection.selectedPaths.first {
-                            $0.hasSuffix("/diff/all.patch")
-                        }
+                    let patchPath = try requireSelectedPath(
+                        suffix: "/diff/all.patch",
+                        in: publishedSelection,
+                        context: diagnosticContext,
+                        toolOutput: gitText
                     )
                     let patchText = try String(contentsOfFile: patchPath, encoding: .utf8)
                     let mapAlias = try XCTUnwrap(
@@ -1571,9 +1888,11 @@ import XCTest
                                 .unbound
                             )
                         } else {
+                            let sourceClientName = "public-agent-run-nested"
                             let sourceSessionID = UUID()
                             let sourceRunID = UUID()
                             sourceRunIDToCleanup = sourceRunID
+                            trackSyntheticSession(sourceSessionID)
                             var sourceTab = try XCTUnwrap(
                                 window.workspaceManager.composeTab(with: fixture.contextA.tabID)
                             )
@@ -1588,10 +1907,16 @@ import XCTest
                             sourceSession.runID = sourceRunID
                             try window.mcpServer.bindTabForConnection(
                                 connectionID: startConnectionID,
-                                clientName: "public-agent-run-nested",
+                                clientName: sourceClientName,
                                 tabID: fixture.contextA.tabID,
                                 workspaceID: fixture.contextA.workspaceID,
                                 windowID: window.windowID,
+                                runID: sourceRunID
+                            )
+                            trackSyntheticRun(sourceRunID)
+                            trackSyntheticConnection(
+                                connectionID: startConnectionID,
+                                clientName: sourceClientName,
                                 runID: sourceRunID
                             )
                             await ServerNetworkManager.shared.debugSeedRunPolicyState(
@@ -1608,7 +1933,7 @@ import XCTest
                             )
                             window.mcpServer.setRequestMetadataOverrideForTesting(.init(
                                 connectionID: startConnectionID,
-                                clientName: "public-agent-run-nested",
+                                clientName: sourceClientName,
                                 windowID: window.windowID,
                                 runPurpose: .agentModeRun
                             ))
@@ -1656,6 +1981,9 @@ import XCTest
                             startSession["context_id"]?.stringValue.flatMap(UUID.init(uuidString:))
                         )
                         let resolvedTargetRunID = try XCTUnwrap(targetRunID)
+                        trackSyntheticSession(targetSessionID)
+                        trackSyntheticRun(resolvedTargetRunID)
+                        delegatedConversationSessionIDToDeactivate = targetSessionID
                         let delegated = try XCTUnwrap(
                             try agentModeViewModel.mcpDelegatedAgentRunOracleReviewContext(
                                 tabID: targetTabID,
@@ -1711,8 +2039,13 @@ import XCTest
                             explicitlyBound: false
                         )
                         if let sourceRunIDToCleanup {
-                            await ServerNetworkManager.shared.cleanupRunRoutingState(
-                                for: sourceRunIDToCleanup
+                            await cleanupSyntheticMCPRoutingForOracleTest(
+                                window: window,
+                                sessionIDs: [],
+                                runIDs: [sourceRunIDToCleanup],
+                                connections: syntheticConnectionsToCleanup.filter {
+                                    $0.runID == sourceRunIDToCleanup
+                                }
                             )
                         }
                         if bindings.isEmpty {
@@ -1722,14 +2055,20 @@ import XCTest
                                 fixture: fixture
                             )
                         } else {
+                            let childOracleClientName = "linked-public-child-oracle"
                             let connectionID = UUID()
                             directOracleConnectionID = connectionID
                             try window.mcpServer.bindTabForConnection(
                                 connectionID: connectionID,
-                                clientName: "linked-public-child-oracle",
+                                clientName: childOracleClientName,
                                 tabID: targetTabID,
                                 workspaceID: fixture.contextA.workspaceID,
                                 windowID: window.windowID,
+                                runID: resolvedTargetRunID
+                            )
+                            trackSyntheticConnection(
+                                connectionID: connectionID,
+                                clientName: childOracleClientName,
                                 runID: resolvedTargetRunID
                             )
                             await ServerNetworkManager.shared.setRunPurpose(
@@ -1744,7 +2083,7 @@ import XCTest
                             )
                             window.mcpServer.setRequestMetadataOverrideForTesting(.init(
                                 connectionID: connectionID,
-                                clientName: "linked-public-child-oracle",
+                                clientName: childOracleClientName,
                                 windowID: window.windowID,
                                 runPurpose: .agentModeRun
                             ))
@@ -2048,8 +2387,29 @@ import XCTest
                         )
                     }
 
+                    await cleanupSyntheticMCPRoutingForOracleTest(
+                        window: fixture.contextA.window,
+                        sessionIDs: syntheticSessionIDsToCleanup,
+                        runIDs: syntheticRunIDsToCleanup,
+                        connections: syntheticConnectionsToCleanup
+                    )
                     await fixture.cleanup()
                 } catch {
+                    if delegateToChildRun,
+                       let delegatedConversationSessionIDToDeactivate
+                    {
+                        await fixture.contextA.window.agentModeViewModel
+                            .mcpDeactivateControlContext(
+                                sessionID: delegatedConversationSessionIDToDeactivate,
+                                cleanupSessionStore: true
+                            )
+                    }
+                    await cleanupSyntheticMCPRoutingForOracleTest(
+                        window: fixture.contextA.window,
+                        sessionIDs: syntheticSessionIDsToCleanup,
+                        runIDs: syntheticRunIDsToCleanup,
+                        connections: syntheticConnectionsToCleanup
+                    )
                     await fixture.cleanup()
                     throw error
                 }
@@ -2366,6 +2726,101 @@ import XCTest
             )
         }
 
+        private func requireSelectedPath(
+            suffix: String,
+            in selection: StoredSelection,
+            context: String,
+            toolOutput: String? = nil,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) throws -> String {
+            try XCTUnwrap(
+                selection.selectedPaths.first { $0.hasSuffix(suffix) },
+                missingSelectedPathDiagnostic(
+                    suffix: suffix,
+                    selection: selection,
+                    context: context,
+                    toolOutput: toolOutput
+                ),
+                file: file,
+                line: line
+            )
+        }
+
+        private func missingSelectedPathDiagnostic(
+            suffix: String,
+            selection: StoredSelection,
+            context: String,
+            toolOutput: String?
+        ) -> String {
+            var message = "Missing selected path suffix \(suffix) during \(context)."
+            message += "\nSelected paths:\n"
+            message += selection.selectedPaths.sorted().joined(separator: "\n")
+            if let toolOutput, !toolOutput.isEmpty {
+                message += "\nGit tool output:\n"
+                message += truncatedDiagnostic(toolOutput)
+            }
+            return message
+        }
+
+        private func truncatedDiagnostic(_ text: String, limit: Int = 6000) -> String {
+            guard text.count > limit else { return text }
+            return String(text.prefix(limit))
+                + "\n… truncated \(text.count - limit) additional characters"
+        }
+
+        private func cleanupSyntheticMCPRoutingForOracleTest(
+            window: WindowState,
+            sessionIDs: [UUID],
+            runIDs: [UUID],
+            connections: [SyntheticMCPConnectionCleanup]
+        ) async {
+            var seenConnections = Set<UUID>()
+            let uniqueConnections = connections.filter { cleanup in
+                seenConnections.insert(cleanup.connectionID).inserted
+            }
+            for connection in uniqueConnections {
+                window.mcpServer.removeTabContext(
+                    forConnectionID: connection.connectionID,
+                    clientName: connection.clientName,
+                    windowID: window.windowID,
+                    runID: connection.runID
+                )
+            }
+
+            var seenSessionIDs = Set<UUID>()
+            let uniqueSessionIDs = sessionIDs.filter { seenSessionIDs.insert($0).inserted }
+            let materializer = WorkspaceRootBindingProjectionMaterializer(
+                store: window.workspaceFileContextStore
+            )
+            for sessionID in uniqueSessionIDs {
+                await materializer.release(sessionID: sessionID)
+            }
+
+            var seenRunIDs = Set<UUID>()
+            let uniqueRunIDs = runIDs.filter { seenRunIDs.insert($0).inserted }
+            for runID in uniqueRunIDs {
+                await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
+                await ServerNetworkManager.shared.cleanupRunRoutingState(
+                    for: runID,
+                    windowID: window.windowID
+                )
+                await AgentRunCoordinator.shared.cleanupRouting(runID: runID)
+            }
+
+            for connection in uniqueConnections {
+                await ServerNetworkManager.shared.debugRemoveConnection(connection.connectionID)
+                await ServerNetworkManager.shared.clearClientConnectionPolicy(
+                    for: connection.clientName,
+                    windowID: window.windowID,
+                    runID: connection.runID
+                )
+                await ServerNetworkManager.shared.debugClearPersistedRoutingState(
+                    for: connection.clientName
+                )
+            }
+        }
+
         private func toolResultText(_ response: PersistentMCPTestRPCResponse) throws -> String {
             let data = try XCTUnwrap(response.rawJSON.data(using: .utf8))
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -2452,6 +2907,12 @@ import XCTest
         case canonical
         case linkedWorktree
         case visibleLinkedWorktree
+    }
+
+    private struct SyntheticMCPConnectionCleanup {
+        let connectionID: UUID
+        let clientName: String
+        let runID: UUID?
     }
 
     @MainActor

@@ -242,7 +242,10 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
                 isLoading: modelCoordinator.isLoading,
                 placeholderFileCount: selectionCount,
                 canMutate: selectionCoordinator != nil,
-                onLoadContent: { row, purpose in await loadRowContent(row, purpose: purpose) },
+                onLoadContent: { row, purpose in
+                    guard let model = modelCoordinator.model else { return nil }
+                    return await loadRowContent(row, model: model, purpose: purpose)
+                },
                 onRemove: { row, model in remove(row, from: model) },
                 onClear: { model in clearSelection(for: model) }
             )
@@ -389,10 +392,12 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
 
     private func loadRowContent(
         _ row: AgentContextExportRow,
+        model: AgentContextExportModel,
         purpose: AgentContextExportRow.ContentPurpose
     ) async -> String? {
         await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: promptManager.workspaceFileContextStore,
             purpose: purpose
         )
@@ -402,10 +407,11 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
         guard row.canRemove else { return }
         Task {
             let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
-            let updated = AgentContextExportResolver.removeRow(
+            let updated = await AgentContextExportResolver.removeRow(
                 row,
                 from: latestSelection,
-                lookupContext: model.lookupContext
+                lookupContext: model.lookupContext,
+                store: promptManager.workspaceFileContextStore
             )
             await persistSelection(updated, source: model.source)
             await MainActor.run { refreshExportModel(force: true) }
@@ -466,7 +472,10 @@ struct AgentSelectedFilesInlineManager: View {
             isLoading: modelCoordinator.isLoading,
             placeholderFileCount: summary.totalExplicitFileCount,
             canMutate: selectionCoordinator != nil,
-            onLoadContent: { row, purpose in await loadRowContent(row, purpose: purpose) },
+            onLoadContent: { row, purpose in
+                guard let model = modelCoordinator.model else { return nil }
+                return await loadRowContent(row, model: model, purpose: purpose)
+            },
             onRemove: { row, model in remove(row, from: model) },
             onClear: { model in clearSelection(for: model) }
         )
@@ -586,10 +595,12 @@ struct AgentSelectedFilesInlineManager: View {
 
     private func loadRowContent(
         _ row: AgentContextExportRow,
+        model: AgentContextExportModel,
         purpose: AgentContextExportRow.ContentPurpose
     ) async -> String? {
         await AgentContextExportResolver.loadRowContent(
             for: row,
+            model: model,
             store: promptManager.workspaceFileContextStore,
             purpose: purpose
         )
@@ -599,10 +610,11 @@ struct AgentSelectedFilesInlineManager: View {
         guard row.canRemove else { return }
         Task {
             let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
-            let updated = AgentContextExportResolver.removeRow(
+            let updated = await AgentContextExportResolver.removeRow(
                 row,
                 from: latestSelection,
-                lookupContext: model.lookupContext
+                lookupContext: model.lookupContext,
+                store: promptManager.workspaceFileContextStore
             )
             await persistSelection(updated, source: model.source)
             await MainActor.run { refreshExportModel(force: true) }

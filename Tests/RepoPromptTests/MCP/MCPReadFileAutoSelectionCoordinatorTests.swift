@@ -92,7 +92,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
     func testAuthoritativeSelectionPreservationRequiresFullCanonicalSuperset() {
         let expected = StoredSelection(
             selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
-            autoCodemapPaths: ["/workspace/C.swift"],
+            manualCodemapPaths: ["/workspace/C.swift"],
             slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
             codemapAutoEnabled: true
         )
@@ -102,7 +102,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 "additive wider slice",
                 StoredSelection(
                     selectedPaths: ["/workspace/A.swift", "/workspace/B.swift", "/workspace/D.swift"],
-                    autoCodemapPaths: ["/workspace/C.swift", "/workspace/E.swift"],
+                    manualCodemapPaths: ["/workspace/C.swift", "/workspace/E.swift"],
                     slices: ["/workspace/B.swift": [LineRange(start: 5, end: 25)]],
                     codemapAutoEnabled: true
                 ),
@@ -112,7 +112,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 "full selection supersedes expected slice",
                 StoredSelection(
                     selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
-                    autoCodemapPaths: ["/workspace/C.swift"],
+                    manualCodemapPaths: ["/workspace/C.swift"],
                     codemapAutoEnabled: true
                 ),
                 true
@@ -121,7 +121,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 "unrelated selected path dropped",
                 StoredSelection(
                     selectedPaths: ["/workspace/B.swift"],
-                    autoCodemapPaths: ["/workspace/C.swift"],
+                    manualCodemapPaths: ["/workspace/C.swift"],
                     slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
                     codemapAutoEnabled: true
                 ),
@@ -131,7 +131,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 "expected full file demoted to slice",
                 StoredSelection(
                     selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
-                    autoCodemapPaths: ["/workspace/C.swift"],
+                    manualCodemapPaths: ["/workspace/C.swift"],
                     slices: [
                         "/workspace/A.swift": [LineRange(start: 1, end: 2)],
                         "/workspace/B.swift": [LineRange(start: 10, end: 20)]
@@ -141,7 +141,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 false
             ),
             (
-                "auto codemap path dropped",
+                "manual codemap path dropped",
                 StoredSelection(
                     selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
                     slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
@@ -153,7 +153,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 "slice narrowed",
                 StoredSelection(
                     selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
-                    autoCodemapPaths: ["/workspace/C.swift"],
+                    manualCodemapPaths: ["/workspace/C.swift"],
                     slices: ["/workspace/B.swift": [LineRange(start: 11, end: 20)]],
                     codemapAutoEnabled: true
                 ),
@@ -163,7 +163,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 "codemap mode changed",
                 StoredSelection(
                     selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
-                    autoCodemapPaths: ["/workspace/C.swift"],
+                    manualCodemapPaths: ["/workspace/C.swift"],
                     slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
                     codemapAutoEnabled: false
                 ),
@@ -249,10 +249,10 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         let firstGate = CoordinatorAsyncGate()
         let recorder = CoordinatorRecorder()
         let coordinator = makeCoordinator(recorder: recorder) { _, batch in
-            if await recorder.canonicalBatches().isEmpty {
+            let invocation = await recorder.recordCanonicalAndCount(batch)
+            if invocation == 1 {
                 await firstGate.markStartedAndWaitForRelease()
             }
-            await recorder.recordCanonical(batch)
             return .unchanged
         }
         let key = contextKey()
@@ -266,7 +266,9 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.enqueue(intent: .slices(entries: [
             WorkspaceSelectionSliceInput(path: "/tmp/B.swift", ranges: [LineRange(start: 4, end: 6), LineRange(start: 6, end: 8)])
         ]), for: key))
-        XCTAssertEqual(coordinator.debugSnapshot().pendingCanonicalBatchCount, 1)
+        let blockedSnapshot = coordinator.debugSnapshot()
+        XCTAssertEqual(blockedSnapshot.pendingCanonicalBatchCount, 1)
+        XCTAssertEqual(blockedSnapshot.canonicalWorkerCount, 1)
 
         await firstGate.release()
         await coordinator.drain(.canonicalSelection, for: key)

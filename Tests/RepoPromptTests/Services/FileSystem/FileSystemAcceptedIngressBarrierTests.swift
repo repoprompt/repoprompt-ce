@@ -83,8 +83,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         )
         let service = try await makeService(
             root: root,
-            maxPendingWatcherIngressEntries: 2,
-            respectGitignore: true
+            maxPendingWatcherIngressEntries: 2
         )
 
         for eventID in 1 ... 10 {
@@ -115,7 +114,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
             atomically: true,
             encoding: .utf8
         )
-        let service = try await makeService(root: root, respectGitignore: true)
+        let service = try await makeService(root: root)
         let firstVisiblePath = root.appendingPathComponent("Sources/First.swift").path
         let secondVisiblePath = root.appendingPathComponent("Sources/Second.swift").path
 
@@ -148,7 +147,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressEarlyIgnoreChange")
         let ignoreURL = root.appendingPathComponent(".gitignore")
         try ".build/\n".write(to: ignoreURL, atomically: true, encoding: .utf8)
-        let service = try await makeService(root: root, respectGitignore: true)
+        let service = try await makeService(root: root)
         let ignoredPath = root.appendingPathComponent(".build/generated.o").path
 
         let initiallyIgnored = await service.acceptWatcherPayloadForTesting([
@@ -325,6 +324,260 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
+    func testPausedMailboxAcceptsMonotonicRangeWithoutSchedulingUntilResume() async throws {
+        let mailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: 10)
+        let drainCount = AsyncCounter()
+        mailbox.pauseAutomaticDraining()
+
+        let first = mailbox.accept(callbackPayload(path: "/outside/first.swift", eventID: 50), lifecycleCorrelation: nil) {
+            _ = await drainCount.incrementAndValue()
+        }
+        let second = mailbox.accept(callbackPayload(path: "/outside/second.swift", eventID: 51), lifecycleCorrelation: nil) {
+            _ = await drainCount.incrementAndValue()
+        }
+        await Task.yield()
+
+        XCTAssertEqual(first?.rawValue, 1)
+        XCTAssertEqual(second?.rawValue, 2)
+        let pausedDrainCount = await drainCount.value()
+        XCTAssertEqual(pausedDrainCount, 0)
+        let paused = mailbox.snapshotForTesting()
+        XCTAssertTrue(paused.isAutomaticDrainPaused)
+        XCTAssertEqual(paused.queuedAcceptedWatermarkRange, try XCTUnwrap(first) ... second!)
+
+        mailbox.resumeAutomaticDraining {
+            _ = await drainCount.incrementAndValue()
+            while mailbox.takeNextAcceptedPayload() != nil {}
+        }
+        for _ in 0 ..< 100 {
+            if await drainCount.value() > 0 { break }
+            await Task.yield()
+        }
+        let resumedDrainCount = await drainCount.value()
+        XCTAssertEqual(resumedDrainCount, 1)
+        XCTAssertFalse(mailbox.snapshotForTesting().isAutomaticDrainPaused)
+    }
+
+    func testSeedReplayProcessesOnlyCapturedCutAndResumeDrainsPostCutPayload() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemSeedReplayCut")
+        let fileURL = root.appendingPathComponent("Known.swift")
+        try "before".write(to: fileURL, atomically: true, encoding: .utf8)
+        let service = try await makeService(root: root)
+        let publications = LockedPublications()
+        let publisher = await service.publisherForChanges()
+        let cancellable = publisher.sink { publications.append($0) }
+        let initializationID = FileSystemSeedInitializationID()
+        let journalCut = FileSystemSeedReplayJournalCut(fseventID: max(1, FSEventsGetCurrentEventId()))
+        let capture = try await service.startWatchingForSeedPreparation(
+            since: journalCut,
+            initializationID: initializationID
+        )
+        let preparation = try await service.prepareSeededInventoryForTesting(
+            relativeFilePaths: ["Known.swift"],
+            relativeFolderPaths: [],
+            initializationID: initializationID
+        )
+        try await service.installSeededInventory(preparation)
+
+        let firstValue = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: fileURL.path, flags: modifiedFileFlags, eventId: journalCut.fseventID + 1)
+        ])
+        let first = try XCTUnwrap(firstValue)
+        let replayCut = try await service.captureSeedReplayAcceptedWatermark(initializationID: initializationID)
+        let secondValue = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: fileURL.path, flags: modifiedFileFlags, eventId: journalCut.fseventID + 2)
+        ])
+        let second = try XCTUnwrap(secondValue)
+
+        XCTAssertEqual(capture.journalCut, journalCut)
+        XCTAssertEqual(replayCut, first)
+        XCTAssertGreaterThan(second, replayCut)
+        let paused = await service.watcherIngressMailboxSnapshotForTesting()
+        XCTAssertTrue(paused.isAutomaticDrainPaused)
+
+        let result = try await service.flushSeedReplay(
+            through: replayCut,
+            initializationID: initializationID
+        )
+        XCTAssertEqual(result.requestedAcceptedWatermark, first)
+        XCTAssertEqual(result.publishedAcceptedWatermark, first)
+        // The real stream may synchronously accept a HistoryDone payload before
+        // the injected change. Strict replay must count and fence that payload,
+        // while only the file event contributes a changed path.
+        XCTAssertEqual(result.acceptedPayloadCount, Int(first.rawValue))
+        XCTAssertGreaterThanOrEqual(result.acceptedEventCount, result.acceptedPayloadCount)
+        let changedPathReader = try result.changedRelativePaths.makeReader()
+        XCTAssertEqual(try changedPathReader.next(), "Known.swift")
+        XCTAssertNil(try changedPathReader.next())
+        let inventoryReader = try result.inventorySnapshot.makeReader()
+        var inventory: [FileSystemSeededInventoryRecord] = []
+        while let record = try inventoryReader.next() {
+            inventory.append(record)
+        }
+        XCTAssertEqual(
+            inventory,
+            [FileSystemSeededInventoryRecord(relativePath: "Known.swift", isDirectory: false)]
+        )
+        XCTAssertEqual(publications.snapshot().count, 1)
+        let queued = await service.watcherIngressMailboxSnapshotForTesting()
+        let queuedRange = try XCTUnwrap(queued.queuedAcceptedWatermarkRange)
+        XCTAssertGreaterThan(queuedRange.lowerBound, replayCut)
+        XCTAssertEqual(queuedRange.upperBound, second)
+        XCTAssertTrue(queued.isAutomaticDrainPaused)
+
+        let didComplete = await service.completeSeededPublication(initializationID: initializationID)
+        XCTAssertTrue(didComplete)
+        _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: second)
+        let resumed = await service.watcherIngressMailboxSnapshotForTesting()
+        XCTAssertFalse(resumed.isAutomaticDrainPaused)
+        XCTAssertNil(resumed.queuedAcceptedWatermarkRange)
+        XCTAssertEqual(publications.snapshot().last?.watcherAcceptedWatermark, second)
+        await service.stopWatchingForChanges()
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testSeedReplayRejectsCollapsedMailboxRangeBeforePublication() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemSeedReplayOverflow")
+        let service = try await makeService(root: root, maxPendingWatcherIngressEntries: 2)
+        let publications = LockedPublications()
+        let publisher = await service.publisherForChanges()
+        let cancellable = publisher.sink { publications.append($0) }
+        let initializationID = FileSystemSeedInitializationID()
+        _ = try await service.startWatchingForSeedPreparation(
+            since: FileSystemSeedReplayJournalCut(fseventID: max(1, FSEventsGetCurrentEventId())),
+            initializationID: initializationID
+        )
+        let preparation = try await service.prepareSeededInventoryForTesting(
+            relativeFilePaths: [],
+            relativeFolderPaths: [],
+            initializationID: initializationID
+        )
+        try await service.installSeededInventory(preparation)
+
+        var cut = FileSystemWatcherIngressMailbox.Watermark.zero
+        for eventID in 60 ... 62 {
+            let accepted = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/outside/overflow-\(eventID).swift", flags: createdFileFlags, eventId: FSEventStreamEventId(eventID))
+            ])
+            cut = try XCTUnwrap(accepted)
+        }
+        do {
+            _ = try await service.flushSeedReplay(through: cut, initializationID: initializationID)
+            XCTFail("Expected strict replay to reject the lossy mailbox sentinel")
+        } catch let error as FileSystemSeedReplayError {
+            XCTAssertEqual(error, .mailboxOverflow)
+        }
+        XCTAssertTrue(publications.snapshot().isEmpty)
+        await service.abortSeededPreparation(initializationID: initializationID)
+        let cleaned = await service.watcherIngressMailboxSnapshotForTesting()
+        XCTAssertFalse(cleaned.isAutomaticDrainPaused)
+        XCTAssertEqual(cleaned.queuedPayloadCount, 0)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testSeedReplayTeardownCannotSynthesizeSuccessfulBarrier() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemSeedReplayTeardown")
+        let service = try await makeService(root: root)
+        let publications = LockedPublications()
+        let publisher = await service.publisherForChanges()
+        let cancellable = publisher.sink { publications.append($0) }
+        let initializationID = FileSystemSeedInitializationID()
+        _ = try await service.startWatchingForSeedPreparation(
+            since: FileSystemSeedReplayJournalCut(fseventID: max(1, FSEventsGetCurrentEventId())),
+            initializationID: initializationID
+        )
+        let preparation = try await service.prepareSeededInventoryForTesting(
+            relativeFilePaths: [],
+            relativeFolderPaths: [],
+            initializationID: initializationID
+        )
+        try await service.installSeededInventory(preparation)
+        let accepted = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: "/outside/abandoned.swift", flags: createdFileFlags, eventId: 70)
+        ])
+        let cut = try XCTUnwrap(accepted)
+        await service.abortSeededPreparation(initializationID: initializationID)
+
+        do {
+            _ = try await service.flushSeedReplay(through: cut, initializationID: initializationID)
+            XCTFail("Expected teardown to invalidate strict replay")
+        } catch let error as FileSystemSeedReplayError {
+            XCTAssertEqual(error, .initializationNotCurrent)
+        }
+        XCTAssertTrue(publications.snapshot().isEmpty)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testSyntheticHundredThousandPathReplayUsesBoundedSpillWorkingSet() throws {
+        let inventory = FileSystemVisitedInventory()
+        let manifest = try FileSystemSeededInventoryManifest.makeForTesting(records: [])
+        inventory.installSeeded(manifest: manifest)
+
+        let recordCount = 100_000
+        let retainedGenerationCount = 40000
+        var retainedSnapshot: FileSystemSeededInventorySnapshot?
+        for index in 0 ..< recordCount {
+            inventory.applySeededChangeForTesting(
+                relativePath: String(format: "Replay/%06d.swift", index),
+                isDirectory: false
+            )
+            if index + 1 == retainedGenerationCount {
+                retainedSnapshot = try inventory.seededSnapshot()
+            }
+        }
+
+        let snapshot = try inventory.seededSnapshot()
+        let statistics = inventory.seededReplayStorageStatisticsForTesting
+        XCTAssertEqual(statistics.changedPathCount, recordCount)
+        XCTAssertLessThanOrEqual(
+            statistics.peakMutablePathBytes,
+            FileSystemSeededInventoryChangeOverlay.maximumMutablePathBytes
+        )
+        XCTAssertLessThanOrEqual(
+            statistics.peakOpenSegmentCount,
+            FileSystemSeededInventoryChangeOverlay.maximumSegmentCount + 1
+        )
+        let mergePathByteBound =
+            (FileSystemSeededInventoryChangeOverlay.maximumSegmentCount + 1) * 256 * 1024
+                + (FileSystemSeededInventoryChangeOverlay.maximumSegmentCount + 2)
+                * FileSystemSeededInventoryChangeOverlay.maximumRecordPathBytes
+        XCTAssertLessThanOrEqual(statistics.peakMergeResidentPathBytes, mergePathByteBound)
+        XCTAssertEqual(statistics.currentSegmentCount, 1)
+
+        let oldReader = try XCTUnwrap(retainedSnapshot).makeReader()
+        var oldObservedCount = 0
+        while let record = try oldReader.next() {
+            XCTAssertEqual(record.relativePath, String(format: "Replay/%06d.swift", oldObservedCount))
+            oldObservedCount += 1
+        }
+        XCTAssertEqual(oldObservedCount, retainedGenerationCount)
+
+        let reader = try snapshot.makeReader()
+        var observedCount = 0
+        while let record = try reader.next() {
+            XCTAssertEqual(record.relativePath, String(format: "Replay/%06d.swift", observedCount))
+            XCTAssertFalse(record.isDirectory)
+            observedCount += 1
+        }
+        XCTAssertEqual(observedCount, recordCount)
+    }
+
+    func testSeedWatcherRejectsZeroJournalCut() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemSeedReplayInvalidCut")
+        let service = try await makeService(root: root)
+        do {
+            _ = try await service.startWatchingForSeedPreparation(
+                since: FileSystemSeedReplayJournalCut(fseventID: 0),
+                initializationID: FileSystemSeedInitializationID()
+            )
+            XCTFail("Expected zero journal cut to be rejected")
+        } catch let error as FileSystemSeedReplayError {
+            XCTAssertEqual(error, .invalidJournalCut)
+        }
+        let isWatching = await service.isWatchingForChangesForTesting()
+        XCTAssertFalse(isWatching)
+    }
+
     private var createdFileFlags: FSEventStreamEventFlags {
         FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile)
     }
@@ -341,12 +594,10 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
 
     private func makeService(
         root: URL,
-        maxPendingWatcherIngressEntries: Int? = nil,
-        respectGitignore: Bool = false
+        maxPendingWatcherIngressEntries: Int? = nil
     ) async throws -> FileSystemService {
         try await FileSystemService(
             path: root.path,
-            respectGitignore: respectGitignore,
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true,

@@ -228,6 +228,9 @@ struct AgentRunMCPToolService {
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
         var testAgentModeViewModel: AgentModeViewModel?
+        var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
+        var testBeforeProviderDispatch: (() async -> Void)?
+        var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?
     #endif
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
@@ -242,6 +245,11 @@ struct AgentRunMCPToolService {
 
     func execute(args: [String: Value]) async throws -> Value {
         let op = normalizedString(args["op"])?.lowercased() ?? "wait"
+        #if DEBUG
+            if op != "start", args["_worktree_startup_benchmark_token"] != nil {
+                throw MCPError.invalidParams("The worktree startup benchmark token is only supported with agent_run op=start.")
+            }
+        #endif
         if op != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
@@ -267,6 +275,12 @@ struct AgentRunMCPToolService {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
+        var worktreeStartupCorrelationID = UUID()
+        var worktreeStartupFlags = WorktreeStartupFeatureFlags.current()
+        var worktreeStartupServingControl = WorktreeStartupServingControl.automatic
+        #if DEBUG
+            var worktreeStartupBenchmarkToken: UUID?
+        #endif
         // start always creates a new session — reject explicit session_id
         if normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
@@ -347,23 +361,225 @@ struct AgentRunMCPToolService {
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
         )
 
+        #if DEBUG
+            if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
+                guard let token = UUID(uuidString: rawToken) else {
+                    throw MCPError.invalidParams("Invalid worktree startup benchmark token.")
+                }
+                do {
+                    guard case .create = worktreeStartRequest.mode,
+                          worktreeStartRequest.path == nil,
+                          !worktreeStartRequest.allowExternalPath
+                    else {
+                        throw DebugWorktreeStartupBenchmarkError.startIdentityMismatch
+                    }
+                    let preflight = try WorktreeStartupBenchmarkDiagnostics.shared.preflight(token: token)
+                    let scope = preflight.expectedStart.rootIdentity.scope
+                    let actualContextID = metadata.tabContextHint?.tabID
+                        ?? targetWindow.promptManager.activeComposeTabID
+                    guard scope.windowID == targetWindow.windowID,
+                          scope.workspaceID == workspace.id,
+                          scope.contextID == actualContextID
+                    else { throw DebugWorktreeStartupBenchmarkError.invalidScope }
+                    worktreeStartupBenchmarkToken = token
+                    worktreeStartupCorrelationID = preflight.correlationID
+                    worktreeStartupFlags = preflight.flags
+                    worktreeStartupServingControl = preflight.servingControl
+                } catch let error as DebugWorktreeStartupBenchmarkError {
+                    throw MCPError.invalidParams("Worktree startup benchmark token rejected (\(error.code)).")
+                }
+            }
+        #endif
+
         let sessionName = normalizedString(args["session_name"])
+        let effectiveParentWorktreeInheritance = worktreeStartRequest.inheritParentWorktreeBindings
+            && !worktreeStartRequest.hasExplicitWorktreeArgs
+        let usesRoutedParentSource = parentSourceTabID != nil
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
             sessionID: nil,
             createIfNeeded: true,
             sessionName: sessionName,
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: worktreeStartRequest.inheritParentWorktreeBindings
+            inheritWorktreeBindings: usesRoutedParentSource
+                ? false
+                : effectiveParentWorktreeInheritance
         )
-        do {
-            try await startWorktreeCoordinator.prepare(
-                request: worktreeStartRequest,
-                target: target,
-                targetWindow: targetWindow
-            )
-        } catch {
+        guard let targetSessionID = target.sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
+            throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
+        }
+        #if DEBUG
+            if worktreeStartupBenchmarkToken != nil {
+                do {
+                    let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+                    try diagnostics.registerRecoverableStartTarget(
+                        correlationID: worktreeStartupCorrelationID,
+                        agentSessionID: targetSessionID,
+                        targetTabID: target.tabID,
+                        targetOrigin: target.origin
+                    )
+                    try diagnostics.requireRecoverableStartNotAborted(
+                        correlationID: worktreeStartupCorrelationID
+                    )
+                } catch {
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .discardRequested,
+                        errorCategory: "target_registration"
+                    )
+                    await agentModeVM.mcpDiscardSessionTarget(target)
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .discardCompleted,
+                        providerRunActive: false
+                    )
+                    throw error
+                }
+            }
+        #endif
+        let worktreeStartupContext = WorktreeStartupContext(
+            agentSessionID: targetSessionID,
+            correlationID: worktreeStartupCorrelationID,
+            flags: worktreeStartupFlags,
+            servingControl: worktreeStartupServingControl
+        )
+        WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
+        var expectedRoutedWorktreeBindings: [AgentSessionWorktreeBinding]?
+        var expectedExplicitTabWorktreeSource: (
+            tabID: UUID,
+            sessionID: UUID,
+            bindings: [AgentSessionWorktreeBinding]
+        )?
+        do {
+            if effectiveParentWorktreeInheritance,
+               let parentSourceTabID,
+               let spawnParentSessionID
+            {
+                expectedRoutedWorktreeBindings = try agentModeVM.mcpReconcileRoutedSpawnWorktreeBindings(
+                    sourceTabID: parentSourceTabID,
+                    expectedParentSessionID: spawnParentSessionID,
+                    target: target
+                )
+            } else if effectiveParentWorktreeInheritance,
+                      parentSourceTabID == nil,
+                      spawnParentSessionID == nil,
+                      oracleLaunchSource.snapshot.route == .explicitTabContext,
+                      let sourceAgentSessionID = oracleLaunchSource.snapshot.sourceAgentSessionID
+            {
+                guard case let .captured(capturedSource) = oracleLaunchSource.source else {
+                    throw MCPError.invalidParams(
+                        "agent_run.start cannot inherit the explicit-tab worktree because its frozen launch source is unavailable."
+                    )
+                }
+                guard capturedSource.sourceTabID == oracleLaunchSource.snapshot.tabID,
+                      capturedSource.sourceAgentSessionID == sourceAgentSessionID
+                else {
+                    throw MCPError.invalidParams(
+                        "agent_run.start cannot inherit the explicit-tab worktree because its frozen launch source identity does not match the launch snapshot."
+                    )
+                }
+                let capturedBindings = capturedSource.sourceWorktreeBindings
+                try agentModeVM.mcpReconcileExplicitTabSpawnWorktreeBindings(
+                    sourceTabID: oracleLaunchSource.snapshot.tabID,
+                    expectedSourceSessionID: sourceAgentSessionID,
+                    expectedBindings: capturedBindings,
+                    target: target
+                )
+                expectedExplicitTabWorktreeSource = (
+                    oracleLaunchSource.snapshot.tabID,
+                    sourceAgentSessionID,
+                    capturedBindings
+                )
+            }
+            #if DEBUG
+                if let worktreeStartupBenchmarkToken {
+                    try await WorktreeStartupBenchmarkDiagnostics.$currentPendingStart.withValue(
+                        DebugWorktreeStartupBenchmarkPendingStart(
+                            token: worktreeStartupBenchmarkToken,
+                            startAttemptID: UUID()
+                        )
+                    ) {
+                        try await startWorktreeCoordinator.prepare(
+                            request: worktreeStartRequest,
+                            target: target,
+                            targetWindow: targetWindow,
+                            startupContext: worktreeStartupContext
+                        )
+                    }
+                } else {
+                    try await startWorktreeCoordinator.prepare(
+                        request: worktreeStartRequest,
+                        target: target,
+                        targetWindow: targetWindow,
+                        startupContext: worktreeStartupContext
+                    )
+                }
+            #else
+                try await startWorktreeCoordinator.prepare(
+                    request: worktreeStartRequest,
+                    target: target,
+                    targetWindow: targetWindow,
+                    startupContext: worktreeStartupContext
+                )
+            #endif
+            if let expectedRoutedWorktreeBindings,
+               let spawnParentSessionID
+            {
+                try agentModeVM.mcpRequireRoutedSpawnWorktreeBindings(
+                    expectedRoutedWorktreeBindings,
+                    expectedParentSessionID: spawnParentSessionID,
+                    target: target
+                )
+            }
+            #if DEBUG
+                if expectedExplicitTabWorktreeSource != nil {
+                    testBeforeExplicitTabWorktreeValidation?()
+                }
+            #endif
+            if let expectedExplicitTabWorktreeSource {
+                try agentModeVM.mcpRequireExplicitTabSpawnWorktreeBindings(
+                    sourceTabID: expectedExplicitTabWorktreeSource.tabID,
+                    expectedSourceSessionID: expectedExplicitTabWorktreeSource.sessionID,
+                    expectedBindings: expectedExplicitTabWorktreeSource.bindings,
+                    target: target
+                )
+            }
+        } catch {
+            WorktreeStartupInstrumentation.record(
+                .failed,
+                context: worktreeStartupContext,
+                fallback: error is CancellationError ? .cancellation : nil
+            )
+            #if DEBUG
+                if worktreeStartupBenchmarkToken != nil {
+                    let category = error is CancellationError
+                        ? "cancellation"
+                        : (error as? DebugWorktreeStartupBenchmarkError) == .startAborted
+                        ? "abort_requested"
+                        : "worktree_preparation"
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .failed,
+                        providerRunActive: false,
+                        errorCategory: category
+                    )
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .discardRequested
+                    )
+                }
+            #endif
+            await agentModeVM.mcpDiscardSessionTarget(target)
+            #if DEBUG
+                if worktreeStartupBenchmarkToken != nil {
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .discardCompleted,
+                        providerRunActive: false
+                    )
+                }
+            #endif
             throw error
         }
         #if DEBUG
@@ -380,6 +596,15 @@ struct AgentRunMCPToolService {
         #endif
         let outcome: AgentExternalMCPRunStarter.StartOutcome
         do {
+            WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
+            #if DEBUG
+                if worktreeStartupBenchmarkToken != nil {
+                    await testBeforeProviderDispatch?()
+                    try WorktreeStartupBenchmarkDiagnostics.shared.beginRecoverableProviderDispatch(
+                        correlationID: worktreeStartupCorrelationID
+                    )
+                }
+            #endif
             outcome = try await startRun(
                 target,
                 message,
@@ -394,15 +619,61 @@ struct AgentRunMCPToolService {
                 spawnParentSessionID,
                 oracleLaunchSource.source
             )
+            #if DEBUG
+                if worktreeStartupBenchmarkToken != nil {
+                    await testAfterProviderStartBeforeBookkeeping?()
+                    if WorktreeStartupBenchmarkDiagnostics.shared.recoverableStartAbortRequested(
+                        correlationID: worktreeStartupCorrelationID
+                    ) == true {
+                        await agentModeVM.cancelAgentRun(
+                            tabID: target.tabID,
+                            completion: .terminalPublished
+                        )
+                        throw DebugWorktreeStartupBenchmarkError.startAborted
+                    }
+                }
+            #endif
         } catch {
             let decoratedError = startWorktreeCoordinator.providerStartError(
                 error,
                 targetSessionID: target.sessionID,
                 agentModeVM: agentModeVM
             )
+            #if DEBUG
+                if worktreeStartupBenchmarkToken != nil {
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .failed,
+                        providerRunActive: false,
+                        errorCategory: error is CancellationError ? "cancellation" : "provider_start"
+                    )
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .discardRequested
+                    )
+                }
+            #endif
             await agentModeVM.mcpDiscardSessionTarget(target)
+            #if DEBUG
+                if worktreeStartupBenchmarkToken != nil {
+                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                        correlationID: worktreeStartupCorrelationID,
+                        phase: .discardCompleted,
+                        providerRunActive: false
+                    )
+                }
+            #endif
             throw decoratedError
         }
+        #if DEBUG
+            if worktreeStartupBenchmarkToken != nil {
+                try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                    correlationID: worktreeStartupCorrelationID,
+                    phase: .responsePrepared,
+                    providerRunActive: outcome.snapshot.status == .running
+                )
+            }
+        #endif
         if detach || outcome.snapshot.status != .running || timeoutSeconds <= 0 {
             return decoratedRunValue(snapshot: outcome.snapshot, workflow: workflow, delivery: outcome.delivery)
         }

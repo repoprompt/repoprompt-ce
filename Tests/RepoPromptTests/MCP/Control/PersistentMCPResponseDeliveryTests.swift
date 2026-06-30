@@ -935,9 +935,13 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         _ = Darwin.shutdown(firstAppFD, SHUT_RDWR)
         Self.closeIfOpen(firstSockets[1])
         firstSockets[1] = -1
+        guard try Self.waitUntilSocketPeerClosed(firstBridgeFD, timeout: 5) else {
+            XCTFail("Expected app socket close to be visible before writing the post-close client request")
+            return
+        }
         try Self.writeAll(toolRequest, to: hostFD)
 
-        let firstBridgeCompleted = await firstResult.waitUntilStored(timeout: .seconds(2))
+        let firstBridgeCompleted = await firstResult.waitUntilStored(timeout: .seconds(5))
         XCTAssertTrue(firstBridgeCompleted)
         guard case let .failure(firstError) = firstResult.load(),
               let socketError = firstError as? SocketProxyError
@@ -2046,6 +2050,38 @@ private extension PersistentMCPResponseDeliveryTests {
         ) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+    }
+
+    static func waitUntilSocketPeerClosed(_ fd: Int32, timeout: TimeInterval) throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
+            let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
+            if pollResult < 0 {
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            if pollResult == 0 { continue }
+
+            let revents = Int32(pfd.revents)
+            if revents & POLLNVAL != 0 {
+                throw POSIXError(.EBADF)
+            }
+            if revents & (POLLHUP | POLLERR) != 0 {
+                return true
+            }
+            if revents & POLLIN != 0 {
+                var byte: UInt8 = 0
+                let peeked = Darwin.recv(fd, &byte, 1, MSG_PEEK)
+                if peeked == 0 { return true }
+                if peeked < 0 {
+                    if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+        }
+        return false
     }
 
     static func fillPipeToCapacity(_ fd: Int32) throws {

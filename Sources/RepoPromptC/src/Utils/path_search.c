@@ -4,6 +4,8 @@
 #include <ctype.h>
 #include <regex.h>
 #include <stdio.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include "wildmatch.h"
 
 // Debug logging macros
@@ -45,6 +47,10 @@ path_search_index_t* path_search_create(const char** paths, size_t count) {
     // Copy original paths
     for (size_t i = 0; i < count; i++) {
         index->original_paths[i] = strdup(paths[i]);
+        size_t path_length = strlen(paths[i]);
+        if (path_length > index->maximum_path_length) {
+            index->maximum_path_length = path_length;
+        }
     }
     
     // Copy and sort forward paths
@@ -507,6 +513,293 @@ search_result_t* path_search_find(
     free(candidates);
     pattern_parts_destroy(parts);
     
+    return result;
+}
+
+struct path_search_cancellation {
+    atomic_bool cancelled;
+};
+
+path_search_cancellation_t* path_search_cancellation_create(void) {
+    path_search_cancellation_t* cancellation = calloc(1, sizeof(path_search_cancellation_t));
+    if (cancellation) atomic_init(&cancellation->cancelled, false);
+    return cancellation;
+}
+
+void path_search_cancellation_cancel(path_search_cancellation_t* cancellation) {
+    if (cancellation) atomic_store_explicit(&cancellation->cancelled, true, memory_order_release);
+}
+
+void path_search_cancellation_destroy(path_search_cancellation_t* cancellation) {
+    free(cancellation);
+}
+
+static bool projected_cancelled(const path_search_cancellation_t* cancellation) {
+    return cancellation
+        && atomic_load_explicit(&cancellation->cancelled, memory_order_acquire);
+}
+
+typedef struct projected_key_cursor {
+    const char* segments[4];
+    size_t lengths[4];
+    size_t segment;
+    size_t offset;
+} projected_key_cursor_t;
+
+static bool projected_key_next(projected_key_cursor_t* cursor, unsigned char* byte) {
+    while (cursor->segment < 4 && cursor->offset >= cursor->lengths[cursor->segment]) {
+        cursor->segment++;
+        cursor->offset = 0;
+    }
+    if (cursor->segment >= 4) return false;
+    *byte = (unsigned char)cursor->segments[cursor->segment][cursor->offset++];
+    return true;
+}
+
+static int projected_index_compare(
+    const path_search_index_t* index,
+    const char* absolute_prefix,
+    size_t lhs,
+    size_t rhs,
+    path_search_work_stats_t* stats
+) {
+    if (stats) stats->heap_comparison_count++;
+    const char* lhs_path = index->original_paths[lhs];
+    const char* rhs_path = index->original_paths[rhs];
+    const char separator[] = "\n";
+    size_t absolute_length = strlen(absolute_prefix);
+    projected_key_cursor_t lhs_cursor = {
+        .segments = {lhs_path, separator, absolute_prefix, lhs_path},
+        .lengths = {strlen(lhs_path), 1, absolute_length, strlen(lhs_path)}
+    };
+    projected_key_cursor_t rhs_cursor = {
+        .segments = {rhs_path, separator, absolute_prefix, rhs_path},
+        .lengths = {strlen(rhs_path), 1, absolute_length, strlen(rhs_path)}
+    };
+    while (true) {
+        unsigned char lhs_byte = 0;
+        unsigned char rhs_byte = 0;
+        bool has_lhs = projected_key_next(&lhs_cursor, &lhs_byte);
+        bool has_rhs = projected_key_next(&rhs_cursor, &rhs_byte);
+        if (!has_lhs || !has_rhs) {
+            if (has_lhs != has_rhs) return has_lhs ? 1 : -1;
+            if (lhs < rhs) return -1;
+            if (lhs > rhs) return 1;
+            return 0;
+        }
+        if (lhs_byte < rhs_byte) return -1;
+        if (lhs_byte > rhs_byte) return 1;
+    }
+}
+
+static void projected_heap_sift_up(
+    size_t* heap,
+    size_t position,
+    const path_search_index_t* index,
+    const char* absolute_prefix,
+    path_search_work_stats_t* stats
+) {
+    while (position > 0) {
+        size_t parent = (position - 1) / 2;
+        if (projected_index_compare(index, absolute_prefix, heap[parent], heap[position], stats) >= 0) break;
+        size_t swap = heap[parent];
+        heap[parent] = heap[position];
+        heap[position] = swap;
+        position = parent;
+    }
+}
+
+static void projected_heap_sift_down(
+    size_t* heap,
+    size_t count,
+    size_t position,
+    const path_search_index_t* index,
+    const char* absolute_prefix,
+    path_search_work_stats_t* stats
+) {
+    while (true) {
+        size_t left = position * 2 + 1;
+        if (left >= count) break;
+        size_t right = left + 1;
+        size_t worst = left;
+        if (right < count
+            && projected_index_compare(index, absolute_prefix, heap[left], heap[right], stats) < 0) {
+            worst = right;
+        }
+        if (projected_index_compare(index, absolute_prefix, heap[position], heap[worst], stats) >= 0) break;
+        size_t swap = heap[position];
+        heap[position] = heap[worst];
+        heap[worst] = swap;
+        position = worst;
+    }
+}
+
+static bool projected_space_and_matches(const char* key, char* const* terms, size_t term_count) {
+    for (size_t index = 0; index < term_count; index++) {
+        if (strcasestr(key, terms[index]) == NULL) return false;
+    }
+    return true;
+}
+
+search_result_t* path_search_projected_find(
+    const path_search_index_t* relative_index,
+    const char* pattern,
+    const char* display_prefix,
+    const char* absolute_prefix,
+    size_t limit
+) {
+    return path_search_projected_find_cancellable(
+        relative_index,
+        pattern,
+        display_prefix,
+        absolute_prefix,
+        limit,
+        NULL,
+        NULL
+    );
+}
+
+search_result_t* path_search_projected_find_cancellable(
+    const path_search_index_t* relative_index,
+    const char* pattern,
+    const char* display_prefix,
+    const char* absolute_prefix,
+    size_t limit,
+    const path_search_cancellation_t* cancellation,
+    path_search_work_stats_t* stats
+) {
+    if (!relative_index || !pattern || !display_prefix || !absolute_prefix) return NULL;
+    if (stats) memset(stats, 0, sizeof(*stats));
+
+    pattern_parts_t* parts = pattern_decompose(pattern);
+    if (!parts) return NULL;
+    bool is_space_and = strncmp(parts->regex_pattern, "SPACE_AND:", 10) == 0;
+    char* pattern_copy = NULL;
+    char* terms[20] = {0};
+    size_t term_count = 0;
+    if (is_space_and) {
+        pattern_copy = strdup(parts->regex_pattern + 10);
+        if (!pattern_copy) {
+            pattern_parts_destroy(parts);
+            return NULL;
+        }
+        char* state = NULL;
+        char* term = strtok_r(pattern_copy, " ", &state);
+        while (term && term_count < 20) {
+            if (*term != '\0') terms[term_count++] = term;
+            term = strtok_r(NULL, " ", &state);
+        }
+    }
+    regex_t regex;
+    bool has_regex = false;
+    if (!is_space_and) {
+        has_regex = regcomp(&regex, parts->regex_pattern, REG_EXTENDED | REG_ICASE) == 0;
+    }
+
+    search_result_t* result = calloc(1, sizeof(search_result_t));
+    if (!result) {
+        free(pattern_copy);
+        if (has_regex) regfree(&regex);
+        pattern_parts_destroy(parts);
+        return NULL;
+    }
+    result->capacity = limit < relative_index->count ? limit : relative_index->count;
+    size_t* heap = result->capacity > 0
+        ? calloc(result->capacity, sizeof(size_t))
+        : NULL;
+    if (result->capacity > 0) {
+        result->indices = calloc(result->capacity, sizeof(size_t));
+        result->scores = calloc(result->capacity, sizeof(int32_t));
+        if (!result->indices || !result->scores || !heap) {
+            free(heap);
+            search_result_destroy(result);
+            free(pattern_copy);
+            if (has_regex) regfree(&regex);
+            pattern_parts_destroy(parts);
+            return NULL;
+        }
+    }
+
+    size_t display_length = strlen(display_prefix);
+    size_t absolute_length = strlen(absolute_prefix);
+    if (relative_index->maximum_path_length > (SIZE_MAX - display_length - absolute_length - 2) / 2) {
+        free(heap);
+        search_result_destroy(result);
+        free(pattern_copy);
+        if (has_regex) regfree(&regex);
+        pattern_parts_destroy(parts);
+        return NULL;
+    }
+    size_t scratch_bytes = display_length + absolute_length
+        + relative_index->maximum_path_length * 2 + 2;
+    char* scratch = malloc(scratch_bytes);
+    if (!scratch && scratch_bytes > 0) {
+        free(heap);
+        search_result_destroy(result);
+        free(pattern_copy);
+        if (has_regex) regfree(&regex);
+        pattern_parts_destroy(parts);
+        return NULL;
+    }
+    if (stats) stats->scratch_bytes = scratch_bytes;
+    size_t heap_count = 0;
+    for (size_t index = 0; index < relative_index->count; index++) {
+        if ((index & 63) == 0 && projected_cancelled(cancellation)) {
+            if (stats) stats->cancelled = true;
+            break;
+        }
+        const char* relative_path = relative_index->original_paths[index];
+        if (!relative_path) continue;
+        if (stats) stats->examined_count++;
+        size_t relative_length = strlen(relative_path);
+        size_t key_length = display_length + relative_length + 1 + absolute_length + relative_length;
+        memcpy(scratch, display_prefix, display_length);
+        memcpy(scratch + display_length, relative_path, relative_length);
+        scratch[display_length + relative_length] = '\n';
+        memcpy(scratch + display_length + relative_length + 1, absolute_prefix, absolute_length);
+        memcpy(
+            scratch + display_length + relative_length + 1 + absolute_length,
+            relative_path,
+            relative_length
+        );
+        scratch[key_length] = '\0';
+
+        bool matched = is_space_and
+            ? projected_space_and_matches(scratch, terms, term_count)
+            : (has_regex && regexec(&regex, scratch, 0, NULL, 0) == 0);
+        if (matched) {
+            if (stats) stats->matched_count++;
+            if (heap_count < result->capacity) {
+                heap[heap_count] = index;
+                projected_heap_sift_up(heap, heap_count, relative_index, absolute_prefix, stats);
+                heap_count++;
+                if (stats && heap_count > stats->heap_peak_count) stats->heap_peak_count = heap_count;
+            } else if (heap_count > 0
+                       && projected_index_compare(relative_index, absolute_prefix, index, heap[0], stats) < 0) {
+                heap[0] = index;
+                projected_heap_sift_down(heap, heap_count, 0, relative_index, absolute_prefix, stats);
+            }
+        }
+    }
+    if (projected_cancelled(cancellation)) {
+        if (stats) stats->cancelled = true;
+        heap_count = 0;
+    }
+    result->count = heap_count;
+    for (size_t output = heap_count; output > 0; output--) {
+        result->indices[output - 1] = heap[0];
+        result->scores[output - 1] = 1;
+        heap_count--;
+        if (heap_count > 0) {
+            heap[0] = heap[heap_count];
+            projected_heap_sift_down(heap, heap_count, 0, relative_index, absolute_prefix, stats);
+        }
+    }
+    free(scratch);
+    free(heap);
+    free(pattern_copy);
+    if (has_regex) regfree(&regex);
+    pattern_parts_destroy(parts);
     return result;
 }
 

@@ -765,7 +765,7 @@ final class TabContextRoutingTests: XCTestCase {
         let sessionID = UUID()
         let physicalSelection = StoredSelection(
             selectedPaths: [worktreeRoot.appendingPathComponent("Sources/App.swift").path],
-            autoCodemapPaths: [worktreeRoot.appendingPathComponent("Sources/Dependency.swift").path],
+
             codemapAutoEnabled: false
         )
         let context = MCPServerViewModel.TabContextSnapshot(
@@ -802,10 +802,6 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertEqual(
             persistedInactiveSelection.selectedPaths,
             [logicalRoot.appendingPathComponent("Sources/App.swift").path]
-        )
-        XCTAssertEqual(
-            persistedInactiveSelection.autoCodemapPaths,
-            [logicalRoot.appendingPathComponent("Sources/Dependency.swift").path]
         )
         XCTAssertEqual(window.workspaceManager.composeTab(with: activeTabID)?.selection, activeSelectionBeforePersistence)
         XCTAssertEqual(
@@ -1149,7 +1145,7 @@ final class TabContextRoutingTests: XCTestCase {
         let staleSelection = StoredSelection(selectedPaths: ["/tmp/old-agent.swift"])
         let requestedSelection = StoredSelection(
             selectedPaths: ["/tmp/new-agent.swift"],
-            autoCodemapPaths: ["/tmp/new-dependency.swift"],
+
             codemapAutoEnabled: false
         )
         let manager = FakeMCPSelectionManager(
@@ -1202,6 +1198,140 @@ final class TabContextRoutingTests: XCTestCase {
             XCTAssertTrue(message.contains(tabID.uuidString), message)
             XCTAssertTrue(message.contains("Retry manage_selection for the same context_id"), message)
         }
+    }
+
+    func testTabContextMirroringAcceptsExplicitClearAutoResetFromManualMode() {
+        let boundSelection = StoredSelection(
+            manualCodemapPaths: ["/tmp/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+
+        let result = MCPServerViewModel.MCPTabContextSelectionMirrorPolicy
+            .reconcileIncomingSnapshotSelection(
+                boundSelection: boundSelection,
+                incomingSnapshotSelection: StoredSelection(),
+                isRunScopedWorktreeContext: false
+            )
+
+        XCTAssertEqual(result.selection, StoredSelection())
+        XCTAssertTrue(result.selection.codemapAutoEnabled)
+        XCTAssertTrue(result.selection.manualCodemapPaths.isEmpty)
+        XCTAssertFalse(result.preservedManualMode)
+    }
+
+    func testTabContextMirroringStillPreservesManualModeForOrdinaryAutoSnapshot() {
+        let boundSelection = StoredSelection(
+            manualCodemapPaths: ["/tmp/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+        let incomingSelection = StoredSelection(
+            selectedPaths: ["/tmp/Full.swift"],
+            slices: ["/tmp/Sliced.swift": [LineRange(start: 1, end: 3)]],
+            codemapAutoEnabled: true
+        )
+
+        let result = MCPServerViewModel.MCPTabContextSelectionMirrorPolicy
+            .reconcileIncomingSnapshotSelection(
+                boundSelection: boundSelection,
+                incomingSnapshotSelection: incomingSelection,
+                isRunScopedWorktreeContext: false
+            )
+
+        XCTAssertEqual(result.selection.selectedPaths, incomingSelection.selectedPaths)
+        XCTAssertEqual(result.selection.slices, incomingSelection.slices)
+        XCTAssertEqual(result.selection.manualCodemapPaths, boundSelection.manualCodemapPaths)
+        XCTAssertFalse(result.selection.codemapAutoEnabled)
+        XCTAssertTrue(result.preservedManualMode)
+    }
+
+    func testTabContextMirroringKeepsRunScopedWorktreeSelectionFrozen() {
+        let boundSelection = StoredSelection(
+            selectedPaths: ["/tmp/RunScoped.swift"],
+            manualCodemapPaths: ["/tmp/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+
+        let result = MCPServerViewModel.MCPTabContextSelectionMirrorPolicy
+            .reconcileIncomingSnapshotSelection(
+                boundSelection: boundSelection,
+                incomingSnapshotSelection: StoredSelection(),
+                isRunScopedWorktreeContext: true
+            )
+
+        XCTAssertEqual(result.selection, boundSelection)
+        XCTAssertFalse(result.preservedManualMode)
+    }
+
+    @MainActor
+    func testVerifiedClearAutoResetSynchronizesSameBoundContextBeforeNextMutation() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let connectionID = UUID()
+        let manualSelection = StoredSelection(
+            manualCodemapPaths: ["/tmp/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+        await installSelectionWorkspace(
+            in: window,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: manualSelection,
+            name: "Verified Clear Auto Reset"
+        )
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "clear-auto-reset-test",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        var resetContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+        XCTAssertFalse(resetContext.selection.codemapAutoEnabled)
+        resetContext.selection = StoredSelection()
+        let resolved = MCPServerViewModel.ResolvedTabContextSnapshot(
+            snapshot: resetContext,
+            usesActiveTabCompatibility: false,
+            source: .explicitBinding
+        )
+
+        let verification = await window.mcpServer.persistResolvedTabContextSnapshot(
+            resolved,
+            metadata: MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "clear-auto-reset-test",
+                windowID: window.windowID
+            ),
+            mutated: true
+        )
+
+        XCTAssertEqual(verification?.canonicalSelection, StoredSelection())
+        XCTAssertTrue(verification?.isVerified == true)
+        let boundAfterClear = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+        XCTAssertEqual(boundAfterClear.selection, StoredSelection())
+        XCTAssertTrue(boundAfterClear.selection.codemapAutoEnabled)
+        XCTAssertTrue(boundAfterClear.selection.manualCodemapPaths.isEmpty)
+
+        let nextSameConnectionSnapshot = try window.mcpServer.resolveTabContextSnapshot(
+            from: MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "clear-auto-reset-test",
+                windowID: window.windowID
+            ),
+            toolName: "manage_selection",
+            policy: .allowActiveTabCompatibility
+        )
+        let nextFullAddSelection = StoredSelection(
+            selectedPaths: ["/tmp/Full.swift"],
+            codemapAutoEnabled: nextSameConnectionSnapshot.snapshot.selection.codemapAutoEnabled
+        )
+        XCTAssertTrue(nextFullAddSelection.codemapAutoEnabled)
     }
 
     @MainActor
@@ -1601,7 +1731,7 @@ final class TabContextRoutingTests: XCTestCase {
         )
         let physicalSelection = StoredSelection(
             selectedPaths: ["/tmp/worktrees/project-agent/Sources/App.swift"],
-            autoCodemapPaths: ["/tmp/worktrees/project-agent/Sources/Dependency.swift"],
+
             slices: ["/tmp/worktrees/project-agent/Sources/Sliced.swift": [LineRange(start: 1, end: 4)]],
             codemapAutoEnabled: false
         )
@@ -1612,7 +1742,6 @@ final class TabContextRoutingTests: XCTestCase {
         )
 
         XCTAssertEqual(persisted.selectedPaths, ["/repo/project/Sources/App.swift"])
-        XCTAssertEqual(persisted.autoCodemapPaths, ["/repo/project/Sources/Dependency.swift"])
         XCTAssertEqual(
             persisted.slices["/repo/project/Sources/Sliced.swift"],
             [LineRange(start: 1, end: 4)]

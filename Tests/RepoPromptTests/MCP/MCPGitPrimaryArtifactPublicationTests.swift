@@ -3,6 +3,59 @@ import XCTest
 
 @MainActor
 final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
+    func testSelectedPublicationPathsTranslateBoundLogicalSelectionWhenPhysicalizationIsNoOp() {
+        let binding = AgentSessionWorktreeBinding(
+            id: "binding-selected-publication",
+            repositoryID: "repo-selected-publication",
+            repoKey: "repo-key",
+            logicalRootPath: "/logical",
+            logicalRootName: "logical",
+            worktreeID: "worktree-selected-publication",
+            worktreeRootPath: "/linked",
+            worktreeName: "linked",
+            branch: "feature/selected-publication",
+            source: "test"
+        )
+        let logicalSelection = StoredSelection(
+            selectedPaths: [
+                "/logical/Sources/F.swift",
+                "/logical/Sources/F.swift",
+                "/logical2/Sources/Other.swift"
+            ],
+            manualCodemapPaths: ["/logical/Sources/CodemapOnly.swift"],
+            slices: [
+                "/logical/Sources/F.swift": [LineRange(start: 1, end: 1)],
+                "/logical/Sources/G.swift": [LineRange(start: 2, end: 2)],
+                "/workspace/_git_data/repos/repo/snapshot/diff/all.patch": [LineRange(start: 1, end: 1)]
+            ],
+            codemapAutoEnabled: false
+        )
+        let physicalSelection = StoredSelection(
+            selectedPaths: [
+                "/logical/Sources/F.swift",
+                "/linked/Sources/F.swift",
+                "/logical2/Sources/Other.swift"
+            ],
+            slices: [
+                "/linked/Sources/G.swift": [LineRange(start: 2, end: 2)]
+            ],
+            codemapAutoEnabled: false
+        )
+
+        XCTAssertEqual(
+            MCPGitToolProvider.selectedGitDiffPathsForPublication(
+                logicalSelection: logicalSelection,
+                physicalSelection: physicalSelection,
+                worktreeBindings: [binding]
+            ),
+            [
+                "/linked/Sources/F.swift",
+                "/logical2/Sources/Other.swift",
+                "/linked/Sources/G.swift"
+            ]
+        )
+    }
+
     func testCanonicalAndLinkedWorktreeSnapshotsIngressWithoutWatcherAndPreserveSelection() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: "MCPGitPrimaryArtifactPublication")
         defer { fixture.cleanup() }
@@ -74,7 +127,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
         let sourcePath = canonical.appendingPathComponent("Sources/Feature.swift").path
         let initial = StoredSelection(
             selectedPaths: [sourcePath],
-            autoCodemapPaths: [canonicalSet.map.absolutePath, "/tmp/dependency.swift"],
+
             slices: [sourcePath: [LineRange(start: 1, end: 1)]],
             codemapAutoEnabled: false
         )
@@ -91,7 +144,6 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             readyCandidates.map(\.absolutePath)
         )
         XCTAssertEqual(merge.selection.slices, initial.slices)
-        XCTAssertEqual(merge.selection.autoCodemapPaths, ["/tmp/dependency.swift"])
         XCTAssertFalse(merge.selection.codemapAutoEnabled)
         XCTAssertEqual(
             merge.newlyAddedArtifacts.compactMap(\.clientAlias),

@@ -1260,7 +1260,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
 
         let selection = StoredSelection(
             selectedPaths: [selected.path],
-            autoCodemapPaths: [dependency.path],
+
             codemapAutoEnabled: false
         )
         let tab = ComposeTabState(selection: selection)
@@ -1286,7 +1286,6 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     ) {
         let actual = composition.workspaceFilesViewModel.snapshotSelection()
         XCTAssertEqual(actual.selectedPaths, fixture.selection.selectedPaths, file: file, line: line)
-        XCTAssertEqual(actual.autoCodemapPaths, fixture.selection.autoCodemapPaths, file: file, line: line)
         XCTAssertEqual(actual.codemapAutoEnabled, fixture.selection.codemapAutoEnabled, file: file, line: line)
     }
 

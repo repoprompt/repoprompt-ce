@@ -512,12 +512,6 @@
             try withIsolatedCaptureCase("testReadFileAutoSelectionQueueRecorderCapturesSanitizedStagesAndLifecycle") {
                 try scenarioReadFileAutoSelectionQueueRecorderCapturesSanitizedStagesAndLifecycle()
             }
-            try withIsolatedCaptureCase("testAcceptedFileAPIFilterInnerAttributionRecorderCapturesEmptyDimensions") {
-                try scenarioAcceptedFileAPIFilterInnerAttributionRecorderCapturesEmptyDimensions()
-            }
-            try withIsolatedCaptureCase("testAllCodemapFileAPIsActorBodyAttributionRecorderCapturesEmptyDimensions") {
-                try scenarioAllCodemapFileAPIsActorBodyAttributionRecorderCapturesEmptyDimensions()
-            }
         }
 
         func testStaleCaptureStateCannotContaminateSubsequentIntervalOrLifecycleCapture() throws {
@@ -1169,29 +1163,40 @@
             try FileSystemTestSupport.write("second", to: secondURL)
             let store = window.workspaceFileContextStore
             let record = try await store.loadRoot(path: root.path)
-            let watcherStartGate = MCPDiagnosticsGate()
-            await store.setWatcherServiceStateWillReconcileHandler { observedRootID, shouldWatch in
-                guard observedRootID == record.id, shouldWatch else { return }
-                await watcherStartGate.markStartedAndWaitForRelease()
-            }
-            let watcherStartTask = Task {
-                try await store.startWatchingRoot(id: record.id)
-            }
-            await watcherStartGate.waitUntilStarted()
+            let rootID = record.id
+            let rootName = record.name
+            let rootPath = record.fullPath
+            let attachedPublisherIngress = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootID)
+            XCTAssertTrue(attachedPublisherIngress)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: rootID)
 
             let flushGate = MCPDiagnosticsGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == record.id else { return }
                 await flushGate.markStartedAndWaitForRelease()
             }
-            let activeBarrier = Task {
-                await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            let activeBarrier = Task.detached {
+                await store.awaitAppliedIngress(rootRefs: [WorkspaceRootRef(id: rootID, name: rootName, fullPath: rootPath)])
             }
             var pendingBarrier: Task<[WorkspaceIngressBarrierSample], Never>?
             var coalescedBarrier: Task<[WorkspaceIngressBarrierSample], Never>?
 
             do {
-                await flushGate.waitUntilStarted()
+                do {
+                    try await waitForDiagnosticsGateStart(flushGate, label: "scoped ingress flush")
+                } catch {
+                    let loadedRoots = await store.roots()
+                    let rootDescriptions = loadedRoots.map { root in
+                        "\(root.id.uuidString):\(root.kind):\(root.standardizedFullPath)"
+                    }
+                    let stats = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
+                    let flightCount = await store.scopedIngressBarrierFlightCountForTesting()
+                    let authority = await store.publishedSeededAuthoritySnapshotForTesting(rootID: record.id)
+                    XCTFail(
+                        "Scoped ingress flush did not start; roots=\(rootDescriptions) stats=\(stats) flightCount=\(flightCount) authority=\(String(describing: authority))"
+                    )
+                    throw error
+                }
                 let createdFileFlags = FSEventStreamEventFlags(
                     kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
                 )
@@ -1201,8 +1206,8 @@
                     scheduleDrain: false
                 )
                 _ = try XCTUnwrap(firstAccepted, "Expected first watcher watermark")
-                pendingBarrier = Task {
-                    await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                pendingBarrier = Task.detached {
+                    await store.awaitAppliedIngress(rootRefs: [WorkspaceRootRef(id: rootID, name: rootName, fullPath: rootPath)])
                 }
                 for _ in 0 ..< 1000 {
                     if await store.scopedIngressBarrierStatsForTesting(rootID: record.id).successorCount == 1 { break }
@@ -1224,8 +1229,8 @@
                 )
                 let acceptedServicePublicationSequence = await store.appliedIngressSnapshotForTesting(rootID: record.id)
                     .acceptedServicePublicationSequence
-                coalescedBarrier = Task {
-                    await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                coalescedBarrier = Task.detached {
+                    await store.awaitAppliedIngress(rootRefs: [WorkspaceRootRef(id: rootID, name: rootName, fullPath: rootPath)])
                 }
                 for _ in 0 ..< 1000 {
                     if await store.scopedIngressBarrierStatsForTesting(rootID: record.id).coalescedSuccessorCount == 1 {
@@ -1243,16 +1248,15 @@
                         "root_limit": .int(1)
                     ]
                 )
-                await cleanupRuntimePendingBarrierTest(
+                let cleanupDrainedFlights = await cleanupRuntimePendingBarrierTest(
                     store: store,
                     rootID: record.id,
-                    watcherStartGate: watcherStartGate,
                     flushGate: flushGate,
-                    watcherStartTask: watcherStartTask,
                     activeBarrier: activeBarrier,
                     pendingBarrier: pendingBarrier,
                     coalescedBarrier: coalescedBarrier
                 )
+                XCTAssertTrue(cleanupDrainedFlights, "Scoped ingress barrier flights should drain before test teardown")
 
                 let payload = try debugDiagnosticsPayload(result, caseLabel: caseLabel)
                 let runtime = try XCTUnwrap(payload["runtime"] as? [String: Any], caseLabel)
@@ -1279,12 +1283,10 @@
                 )
                 XCTAssertNotNil((pending["age_ms"] as? NSNumber)?.uint64Value)
             } catch {
-                await cleanupRuntimePendingBarrierTest(
+                _ = await cleanupRuntimePendingBarrierTest(
                     store: store,
                     rootID: record.id,
-                    watcherStartGate: watcherStartGate,
                     flushGate: flushGate,
-                    watcherStartTask: watcherStartTask,
                     activeBarrier: activeBarrier,
                     pendingBarrier: pendingBarrier,
                     coalescedBarrier: coalescedBarrier
@@ -1566,51 +1568,6 @@
             XCTAssertTrue(snapshot.lifecycleEvents.allSatisfy { !$0.sanitizedDimensions.contains("/") })
         }
 
-        private func scenarioAcceptedFileAPIFilterInnerAttributionRecorderCapturesEmptyDimensions() throws {
-            _ = startedCapture(label: "accepted-file-api-filter-inner", maxSamples: 100)
-            let stages: [(StaticString, String)] = [
-                (EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.pathGrouping, "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter.PathGrouping"),
-                (EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.selectedRecordProjection, "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter.SelectedRecordProjection")
-            ]
-            for (stage, _) in stages {
-                EditFlowPerf.measure(stage) {}
-            }
-
-            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
-            XCTAssertFalse(snapshot.active)
-            XCTAssertFalse(EditFlowPerf.isDebugCaptureActive)
-            XCTAssertEqual(snapshot.retainedSampleCount, stages.count)
-            XCTAssertEqual(snapshot.droppedSampleCount, 0)
-            for (_, stageName) in stages {
-                let row = try XCTUnwrap(snapshot.stages.first { $0.stageName == stageName })
-                XCTAssertEqual(row.sampleCount, 1)
-                XCTAssertEqual(row.sanitizedDimensions, "")
-            }
-        }
-
-        private func scenarioAllCodemapFileAPIsActorBodyAttributionRecorderCapturesEmptyDimensions() throws {
-            _ = startedCapture(label: "all-codemap-file-apis-actor-body", maxSamples: 100)
-            let stages: [(StaticString, String)] = [
-                (EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal, "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.ActorBodyTotal"),
-                (EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot, "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.StateSnapshot"),
-                (EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.Materialization")
-            ]
-            for (stage, _) in stages {
-                EditFlowPerf.measure(stage) {}
-            }
-
-            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
-            XCTAssertFalse(snapshot.active)
-            XCTAssertFalse(EditFlowPerf.isDebugCaptureActive)
-            XCTAssertEqual(snapshot.retainedSampleCount, stages.count)
-            XCTAssertEqual(snapshot.droppedSampleCount, 0)
-            for (_, stageName) in stages {
-                let row = try XCTUnwrap(snapshot.stages.first { $0.stageName == stageName })
-                XCTAssertEqual(row.sampleCount, 1)
-                XCTAssertEqual(row.sanitizedDimensions, "")
-            }
-        }
-
         func testCaptureRejectsConcurrentStartAndFinishDisablesCapture() {
             switch EditFlowPerf.beginDebugCapture(label: "first", maxSamples: 100) {
             case .started:
@@ -1851,7 +1808,6 @@
             let root = try temporaryRoots.makeRoot(suiteName: "FileSystemPublicationCorrelation")
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: false,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true
@@ -1913,25 +1869,63 @@
         private func cleanupRuntimePendingBarrierTest(
             store: WorkspaceFileContextStore,
             rootID: UUID,
-            watcherStartGate: MCPDiagnosticsGate,
             flushGate: MCPDiagnosticsGate,
-            watcherStartTask: Task<Void, Error>,
             activeBarrier: Task<[WorkspaceIngressBarrierSample], Never>,
             pendingBarrier: Task<[WorkspaceIngressBarrierSample], Never>?,
             coalescedBarrier: Task<[WorkspaceIngressBarrierSample], Never>?
-        ) async {
+        ) async -> Bool {
             await flushGate.release()
-            activeBarrier.cancel()
-            pendingBarrier?.cancel()
-            coalescedBarrier?.cancel()
-            _ = await activeBarrier.value
-            _ = await pendingBarrier?.value
-            _ = await coalescedBarrier?.value
+
+            var drainedFlights = await waitForScopedIngressBarrierFlightsToDrain(store: store)
+            if !drainedFlights {
+                activeBarrier.cancel()
+                pendingBarrier?.cancel()
+                coalescedBarrier?.cancel()
+                _ = await activeBarrier.value
+                _ = await pendingBarrier?.value
+                _ = await coalescedBarrier?.value
+                drainedFlights = await waitForScopedIngressBarrierFlightsToDrain(store: store)
+            } else {
+                _ = await activeBarrier.value
+                _ = await pendingBarrier?.value
+                _ = await coalescedBarrier?.value
+            }
+
             await store.setScopedIngressBarrierWillFlushHandler(nil)
-            await store.setWatcherServiceStateWillReconcileHandler(nil)
-            await watcherStartGate.release()
-            _ = try? await watcherStartTask.value
             await store.stopWatchingRoot(id: rootID)
+            let drainedAfterStop = await waitForScopedIngressBarrierFlightsToDrain(store: store)
+            return drainedFlights && drainedAfterStop
+        }
+
+        private func waitForDiagnosticsGateStart(
+            _ gate: MCPDiagnosticsGate,
+            label: String,
+            attempts: Int = 200
+        ) async throws {
+            for _ in 0 ..< attempts {
+                if await gate.hasStarted() { return }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            throw MCPDiagnosticsTimeoutError(label: label)
+        }
+
+        private func waitForScopedIngressBarrierFlightsToDrain(
+            store: WorkspaceFileContextStore,
+            attempts: Int = 200
+        ) async -> Bool {
+            for _ in 0 ..< attempts {
+                if await store.scopedIngressBarrierFlightCountForTesting() == 0 { return true }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            return await store.scopedIngressBarrierFlightCountForTesting() == 0
+        }
+
+        private struct MCPDiagnosticsTimeoutError: Error, CustomStringConvertible {
+            let label: String
+
+            var description: String {
+                "Timed out waiting for diagnostics gate to start: \(label)"
+            }
         }
 
         private actor MCPDiagnosticsGate {
@@ -1956,6 +1950,10 @@
                 await withCheckedContinuation { continuation in
                     startWaiters.append(continuation)
                 }
+            }
+
+            func hasStarted() -> Bool {
+                started
             }
 
             func release() {

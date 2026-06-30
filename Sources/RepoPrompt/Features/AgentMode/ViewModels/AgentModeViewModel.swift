@@ -5254,6 +5254,137 @@ final class AgentModeViewModel: ObservableObject {
         return ensureSessionBoundToTab(sourceSession)
     }
 
+    func mcpReconcileRoutedSpawnWorktreeBindings(
+        sourceTabID: UUID,
+        expectedParentSessionID: UUID,
+        target: MCPSessionTarget
+    ) throws -> [AgentSessionWorktreeBinding] {
+        guard let sourceSession = sessions[sourceTabID],
+              sourceSession.activeAgentSessionID == expectedParentSessionID
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the routed source Agent session for worktree inheritance."
+            )
+        }
+        let expectedBindings = sourceSession.worktreeBindings
+        if !expectedBindings.isEmpty {
+            guard sourceSession.mcpControlContext?.sessionID == expectedParentSessionID else {
+                throw MCPError.invalidParams(
+                    "agent_run.start could not validate the routed source Agent session for worktree inheritance."
+                )
+            }
+        }
+        guard sourceSession.hasLoadedPersistedState else {
+            throw MCPError.invalidParams(
+                "agent_run.start cannot inherit worktree bindings before the routed source Agent session is hydrated."
+            )
+        }
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == expectedParentSessionID
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the routed child Agent session for worktree inheritance."
+            )
+        }
+
+        if targetSession.worktreeBindings.isEmpty {
+            _ = commitWorktreeBindings(expectedBindings, to: targetSession)
+        } else if targetSession.worktreeBindings != expectedBindings {
+            throw MCPError.invalidParams(
+                "agent_run.start child worktree bindings conflict with the routed source session."
+            )
+        }
+        return expectedBindings
+    }
+
+    func mcpRequireRoutedSpawnWorktreeBindings(
+        _ expectedBindings: [AgentSessionWorktreeBinding],
+        expectedParentSessionID: UUID,
+        target: MCPSessionTarget
+    ) throws {
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == expectedParentSessionID,
+              targetSession.worktreeBindings == expectedBindings
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start child worktree bindings changed before provider startup."
+            )
+        }
+    }
+
+    func mcpReconcileExplicitTabSpawnWorktreeBindings(
+        sourceTabID: UUID,
+        expectedSourceSessionID: UUID,
+        expectedBindings: [AgentSessionWorktreeBinding],
+        target: MCPSessionTarget
+    ) throws {
+        guard let sourceSession = sessions[sourceTabID],
+              sourceSession.activeAgentSessionID == expectedSourceSessionID
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the explicit-tab source Agent session for worktree inheritance."
+            )
+        }
+        guard sourceSession.hasLoadedPersistedState else {
+            throw MCPError.invalidParams(
+                "agent_run.start cannot inherit worktree bindings before the explicit-tab source Agent session is hydrated."
+            )
+        }
+        guard sourceSession.worktreeBindings == expectedBindings else {
+            throw MCPError.invalidParams(
+                "agent_run.start explicit-tab source worktree bindings changed after launch capture."
+            )
+        }
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == nil
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the top-level target Agent session for explicit-tab worktree inheritance."
+            )
+        }
+
+        if targetSession.worktreeBindings.isEmpty {
+            _ = commitWorktreeBindings(expectedBindings, to: targetSession)
+        } else if targetSession.worktreeBindings != expectedBindings {
+            throw MCPError.invalidParams(
+                "agent_run.start target worktree bindings conflict with the explicit-tab source session."
+            )
+        }
+    }
+
+    func mcpRequireExplicitTabSpawnWorktreeBindings(
+        sourceTabID: UUID,
+        expectedSourceSessionID: UUID,
+        expectedBindings: [AgentSessionWorktreeBinding],
+        target: MCPSessionTarget
+    ) throws {
+        guard let sourceSession = sessions[sourceTabID],
+              sourceSession.activeAgentSessionID == expectedSourceSessionID,
+              sourceSession.hasLoadedPersistedState,
+              sourceSession.worktreeBindings == expectedBindings
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start explicit-tab source Agent session or worktree bindings changed before provider startup."
+            )
+        }
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == nil,
+              targetSession.worktreeBindings == expectedBindings
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start top-level target worktree bindings changed before provider startup."
+            )
+        }
+    }
+
     func applySpawnParentSessionID(
         _ parentSessionID: UUID?,
         to session: TabSession,
@@ -5519,7 +5650,9 @@ final class AgentModeViewModel: ObservableObject {
     func transitionWorktreeBindings(
         _ desiredBindings: [AgentSessionWorktreeBinding],
         forSessionID sessionID: UUID,
-        intent: WorktreeBindingTransitionIntent
+        intent: WorktreeBindingTransitionIntent,
+        startupContext: WorktreeStartupContext? = nil,
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
@@ -5529,6 +5662,9 @@ final class AgentModeViewModel: ObservableObject {
         }
         session.worktreeBindingTransitionInProgress = true
         defer { session.worktreeBindingTransitionInProgress = false }
+        if let startupContext {
+            WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext)
+        }
         let previousBindings = session.worktreeBindings
         let previousDestination = executionDestinationIdentity(in: previousBindings)
         let nextDestination = executionDestinationIdentity(in: desiredBindings)
@@ -5555,7 +5691,12 @@ final class AgentModeViewModel: ObservableObject {
         let preparation: WorkspaceRootBindingProjectionPreparation?
         if let materializer {
             do {
-                preparation = try await materializer.prepare(sessionID: sessionID, bindings: desiredBindings)
+                preparation = try await materializer.prepare(
+                    sessionID: sessionID,
+                    bindings: desiredBindings,
+                    startupContext: startupContext,
+                    initializationHintsByBindingID: initializationHintsByBindingID
+                )
             } catch {
                 throw ExecutionLocationTransitionError.unavailable(error.localizedDescription)
             }
@@ -5612,17 +5753,11 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
 
-            let projection: WorkspaceRootBindingProjection?
             if let materializer, let preparation {
-                projection = try await materializer.commit(preparation)
+                _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
-            } else {
-                projection = nil
             }
             _ = commitWorktreeBindings(desiredBindings, to: session)
-            if let materializer {
-                await materializer.initializeCodemaps(for: projection)
-            }
             return session.worktreeBindings
         } catch {
             if !ownershipCommitted, let materializer, let preparation {
@@ -6358,6 +6493,10 @@ final class AgentModeViewModel: ObservableObject {
             break
         }
         if let sessionID = target.sessionID {
+            // Release logical worktree ownership before tearing down session/tab state. This is
+            // intentionally idempotent: a concurrent transition or repeated discard observes the
+            // generation invalidation and cannot republish stale ownership.
+            await releaseSessionWorktreeOwnership(sessionID: sessionID)
             mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
             await mcpDeactivateControlContext(
                 sessionID: sessionID,
@@ -12865,7 +13004,7 @@ final class AgentModeViewModel: ObservableObject {
         let workspaceBlocks = PromptPackagingService.generateFileBlocksDetailed(
             files: workspaceEntries,
             filePathDisplay: .relative,
-            codemapSnapshotBundle: .empty,
+            codemapPresentation: .empty,
             displayPathResolver: { entry in
                 if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
                     forPhysicalPath: entry.file.standardizedFullPath
@@ -13049,7 +13188,6 @@ final class AgentModeViewModel: ObservableObject {
         guard !promotedPaths.isEmpty else { return logicalSelection == selection ? selection : logicalSelection }
 
         let existingPaths = StoredSelectionPathNormalization.standardizedPaths(logicalSelection.selectedPaths)
-        let existingAutoCodemapPaths = StoredSelectionPathNormalization.standardizedPaths(logicalSelection.autoCodemapPaths)
         let existingSlices = StoredSelectionPathNormalization.standardizedSlices(logicalSelection.slices)
         let promotedKeys = Set(promotedPaths.map { physicalizedSelectionKey($0, lookupContext: lookupContext) })
 
@@ -13059,22 +13197,21 @@ final class AgentModeViewModel: ObservableObject {
             mergedPaths.append(path)
         }
 
-        let filteredAutoCodemapPaths = existingAutoCodemapPaths.filter {
-            !promotedKeys.contains(physicalizedSelectionKey($0, lookupContext: lookupContext))
-        }
         let filteredSlices = existingSlices.filter {
             !promotedKeys.contains(physicalizedSelectionKey($0.key, lookupContext: lookupContext))
         }
 
         let normalizedSelection = StoredSelection(
             selectedPaths: existingPaths,
-            autoCodemapPaths: existingAutoCodemapPaths,
+            manualCodemapPaths: logicalSelection.manualCodemapPaths,
             slices: existingSlices,
             codemapAutoEnabled: selection.codemapAutoEnabled
         )
         let updatedSelection = StoredSelection(
             selectedPaths: mergedPaths,
-            autoCodemapPaths: filteredAutoCodemapPaths,
+            manualCodemapPaths: logicalSelection.manualCodemapPaths.filter {
+                !promotedKeys.contains(physicalizedSelectionKey($0, lookupContext: lookupContext))
+            },
             slices: filteredSlices,
             codemapAutoEnabled: selection.codemapAutoEnabled
         )
@@ -15874,7 +16011,10 @@ final class AgentModeViewModel: ObservableObject {
     /// Build the file-contents block used by handoff payload export for the current active tab.
     /// This intentionally snapshots only the current tab selection, matching the in-app handoff path.
     @MainActor
-    func buildCurrentTabHandoffFileContentsBlock(tokenCap: Int = 60000) async -> String {
+    func buildCurrentTabHandoffFileContentsBlock(
+        tokenCap: Int = 60000,
+        overTokenCapSummaryWillBegin: (() async -> Void)? = nil
+    ) async -> String {
         guard let workspaceManager,
               let sourceTabID = currentTabID else { return "" }
         workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true)
@@ -15883,7 +16023,8 @@ final class AgentModeViewModel: ObservableObject {
         return await buildForkFileContentsBlock(
             selection: sourceSelection,
             tokenCap: tokenCap,
-            lookupContext: lookupContext
+            lookupContext: lookupContext,
+            overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
         )
     }
 
@@ -16099,23 +16240,27 @@ final class AgentModeViewModel: ObservableObject {
     private func buildForkFileContentsBlock(
         selection: StoredSelection,
         tokenCap: Int,
-        lookupContext: WorkspaceLookupContext
+        lookupContext: WorkspaceLookupContext,
+        overTokenCapSummaryWillBegin: (() async -> Void)? = nil
     ) async -> String {
         guard let promptManager else { return "" }
+        let tokenCounter = promptManager.tokenCountingViewModel
+        tokenCounter.suspendAutomaticRecounts()
+        defer { tokenCounter.resumeAutomaticRecounts() }
 
         return await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
             tokenCap: tokenCap,
             store: promptManager.workspaceFileContextStore,
             lookupContext: lookupContext,
-            overTokenCapSummaryProvider: { [weak self] selection, lookupContext, codemapSnapshotBundle in
+            overTokenCapSummaryProvider: { [weak self] selection, lookupContext, presentation in
                 guard let self, let mcp = mcpServer else { return nil }
-                let reply = await mcp.buildTabSelectionReply(
+                let reply = await mcp.buildBorrowedTabSelectionReply(
+                    codemapPresentation: presentation,
                     from: selection,
                     includeBlocks: false,
                     display: .relative,
-                    lookupContextOverride: lookupContext,
-                    codemapSnapshotBundle: codemapSnapshotBundle
+                    lookupContext: lookupContext
                 )
                 let summary = ToolOutputFormatter.formatSelectionReplyToString(reply)
                 return """
@@ -16123,7 +16268,8 @@ final class AgentModeViewModel: ObservableObject {
                 \(summary)
                 </selection_summary>
                 """
-            }
+            },
+            overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
         )
     }
 }

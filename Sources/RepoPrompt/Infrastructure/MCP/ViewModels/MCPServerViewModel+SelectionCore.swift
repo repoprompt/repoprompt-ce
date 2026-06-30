@@ -55,9 +55,15 @@ extension MCPServerViewModel {
 
     /// Returns selection-aware workspace records for the resolved tab context snapshot.
     @MainActor
-    func selectedRecordsForCurrentTabContext() async throws -> [WorkspaceFileRecord] {
+    func selectedRecordsForCurrentTabContext(
+        metadataOverride: RequestMetadata? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
+    ) async throws -> [WorkspaceFileRecord] {
         do {
-            let collections = try await selectionCollectionsForCurrentTabContext()
+            let collections = try await selectionCollectionsForCurrentTabContext(
+                metadataOverride: metadataOverride,
+                lookupContextOverride: lookupContextOverride
+            )
             return collections.selected.map(\.entry.file)
         } catch let error as StabilizedSelectionReadSnapshotError {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -76,14 +82,27 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func selectionCollections(for context: TabContextSnapshot, codeMapUsageOverride: CodeMapUsage? = nil) async -> SelectionReplyAssembler.SelectionCollections {
+    func selectionCollections(
+        for context: TabContextSnapshot,
+        codeMapUsageOverride: CodeMapUsage? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
+    ) async -> SelectionReplyAssembler.SelectionCollections {
         let requestedUsage = codeMapUsageOverride ?? promptVM.codeMapUsage
-        let lookupContext = await lookupContext(for: context)
+        let lookupContext: WorkspaceLookupContext = if let lookupContextOverride {
+            lookupContextOverride
+        } else {
+            await self.lookupContext(for: context)
+        }
         let source = StoredSelectionSource(
             stored: lookupContext.physicalizeSelection(context.selection),
             codeMapUsage: effectiveMCPCodeMapUsage(requestedUsage)
         )
-        return await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
+        return await SelectionReplyAssembler.collect(
+            from: source,
+            owner: self,
+            rootScope: lookupContext.rootScope,
+            lookupContext: lookupContext
+        )
     }
 
     @MainActor
@@ -101,8 +120,15 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func selectionCollectionsForCurrentTabContext() async throws -> SelectionReplyAssembler.SelectionCollections {
-        let metadata = await captureRequestMetadata()
+    func selectionCollectionsForCurrentTabContext(
+        metadataOverride: RequestMetadata? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
+    ) async throws -> SelectionReplyAssembler.SelectionCollections {
+        let metadata: RequestMetadata = if let metadataOverride {
+            metadataOverride
+        } else {
+            await captureRequestMetadata()
+        }
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
             toolName: "selection",
@@ -110,7 +136,39 @@ extension MCPServerViewModel {
             startMirroring: false
         )
         let stabilized = try stabilizedSelectionReadSnapshot(resolved)
-        return await selectionCollections(for: stabilized.snapshot)
+        return await selectionCollections(
+            for: stabilized.snapshot,
+            lookupContextOverride: lookupContextOverride
+        )
+    }
+
+    @MainActor
+    func physicalSelectionForCurrentTabContext(
+        metadataOverride: RequestMetadata? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
+    ) async throws -> StoredSelection {
+        do {
+            let metadata: RequestMetadata = if let metadataOverride {
+                metadataOverride
+            } else {
+                await captureRequestMetadata()
+            }
+            let resolved = try resolveTabContextSnapshot(
+                from: metadata,
+                toolName: "selection",
+                policy: .allowLegacyImplicitRouting,
+                startMirroring: false
+            )
+            let stabilized = try stabilizedSelectionReadSnapshot(resolved)
+            let lookupContext: WorkspaceLookupContext = if let lookupContextOverride {
+                lookupContextOverride
+            } else {
+                await self.lookupContext(for: stabilized.snapshot)
+            }
+            return lookupContext.physicalizeSelection(stabilized.snapshot.selection)
+        } catch let error as StabilizedSelectionReadSnapshotError {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
     }
 
     struct PathFormatter {
@@ -122,6 +180,7 @@ extension MCPServerViewModel {
         let format: FilePathDisplay
         unowned let owner: MCPServerViewModel
         let projection: WorkspaceRootBindingProjection?
+        let rootScope: WorkspaceLookupRootScope
         let displayPathOverrides: [String: String]
         let rootMetadataOverrides: [String: RootMetadata]
 
@@ -129,12 +188,14 @@ extension MCPServerViewModel {
             format: FilePathDisplay,
             owner: MCPServerViewModel,
             projection: WorkspaceRootBindingProjection? = nil,
+            rootScope: WorkspaceLookupRootScope = .allLoaded,
             displayPathOverrides: [String: String] = [:],
             rootMetadataOverrides: [String: RootMetadata] = [:]
         ) {
             self.format = format
             self.owner = owner
             self.projection = projection
+            self.rootScope = rootScope
             self.displayPathOverrides = displayPathOverrides
             self.rootMetadataOverrides = rootMetadataOverrides
         }
@@ -143,19 +204,28 @@ extension MCPServerViewModel {
             if let override = displayPathOverrides[file.standardizedFullPath] {
                 return override
             }
-            if let projection,
-               let projected = projection.projectedLogicalDisplayPath(forPhysicalPath: file.standardizedFullPath, display: format)
+            let store = await MainActor.run { owner.promptVM.workspaceFileContextStore }
+            let roots = await store.rootRefs(scope: rootScope)
+            let lookupContext = WorkspaceLookupContext(
+                rootScope: rootScope,
+                bindingProjection: projection
+            )
+            let labels = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
+            if format == .full,
+               let metadata = projection?.projectedLogicalRootMetadata(forPhysicalPath: file.standardizedFullPath)
             {
-                return projected
+                let rootName = labels[file.rootID]
+                    ?? URL(fileURLWithPath: metadata.rootPath).lastPathComponent
+                return metadata.pathWithinRoot.isEmpty
+                    ? rootName
+                    : "\(rootName)/\(metadata.pathWithinRoot)"
             }
-            switch format {
-            case .full:
-                return file.fullPath
-            case .relative:
-                let roots = await owner.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
-                guard let root = roots.first(where: { $0.id == file.rootID }) else { return file.relativePath }
-                return ClientPathFormatter.displayPath(root: root, relativePath: file.standardizedRelativePath, visibleRoots: roots)
-            }
+            return lookupContext.logicalDisplayPath(
+                for: file,
+                roots: roots,
+                rootDisplayNamesByRootID: labels,
+                display: format
+            ) ?? file.standardizedRelativePath
         }
     }
 
@@ -183,10 +253,9 @@ extension MCPServerViewModel {
 
         func codemapTokens(
             for file: WorkspaceFileRecord,
-            displayPath: String,
-            codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
+            codemapPresentation: WorkspaceCodemapOperationPresentation
         ) -> Int {
-            codemapSnapshotBundle.renderedCodemap(for: file, displayPath: displayPath)?.tokenCount ?? 0
+            codemapPresentation.renderedEntriesByFileID[file.id]?.tokenCount ?? 0
         }
     }
 
@@ -208,7 +277,7 @@ extension MCPServerViewModel {
             let codemapAutoEnabled: Bool
             let codeMapUsage: CodeMapUsage
             let invalid: [String]
-            let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
+            let codemapPresentation: WorkspaceCodemapOperationPresentation
 
             static func empty(codeMapUsage: CodeMapUsage) -> SelectionCollections {
                 SelectionCollections(
@@ -217,7 +286,7 @@ extension MCPServerViewModel {
                     codemapAutoEnabled: false,
                     codeMapUsage: codeMapUsage,
                     invalid: [],
-                    codemapSnapshotBundle: .empty
+                    codemapPresentation: .empty
                 )
             }
         }
@@ -238,35 +307,120 @@ extension MCPServerViewModel {
             from source: SelectionSource,
             owner: MCPServerViewModel,
             rootScope: WorkspaceLookupRootScope = .allLoaded,
-            codemapSnapshotBundle frozenCodemaps: WorkspaceCodemapSnapshotBundle? = nil,
-            contentPolicy: PromptContextAccountingContentPolicy = .loadContent
+            contentPolicy: PromptContextAccountingContentPolicy = .loadContent,
+            lookupContext: WorkspaceLookupContext? = nil,
+            codemapPresentation: WorkspaceCodemapOperationPresentation? = nil,
+            issuePathDisplay: FilePathDisplay = .relative
         ) async -> SelectionCollections {
+            do {
+                return try await withCollections(
+                    from: source,
+                    owner: owner,
+                    rootScope: rootScope,
+                    contentPolicy: contentPolicy,
+                    lookupContext: lookupContext,
+                    codemapPresentation: codemapPresentation,
+                    issuePathDisplay: issuePathDisplay
+                ) { $0 }
+            } catch {
+                return await .empty(codeMapUsage: source.currentCodeMapUsage())
+            }
+        }
+
+        static func withCollections<Value>(
+            from source: SelectionSource,
+            owner: MCPServerViewModel,
+            rootScope: WorkspaceLookupRootScope = .allLoaded,
+            contentPolicy: PromptContextAccountingContentPolicy = .loadContent,
+            lookupContext: WorkspaceLookupContext? = nil,
+            codemapPresentation: WorkspaceCodemapOperationPresentation? = nil,
+            issuePathDisplay: FilePathDisplay = .relative,
+            operation: (SelectionCollections) async throws -> Value
+        ) async throws -> Value {
             let selection = await source.resolvedSelection()
             let usage = await source.currentCodeMapUsage()
             let store = await MainActor.run { owner.promptVM.workspaceFileContextStore }
-            let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle = if let frozenCodemaps {
-                frozenCodemaps
-            } else {
-                await store.codemapSnapshotBundle(rootScope: rootScope)
+            let effectiveLookupContext = lookupContext ?? WorkspaceLookupContext(
+                rootScope: rootScope,
+                bindingProjection: nil
+            )
+            let rootDisplayNames = await effectiveLookupContext.logicalRootDisplayNamesByRootID(
+                store: store
+            )
+            func resolveCollections(
+                presentation: WorkspaceCodemapOperationPresentation
+            ) async throws -> Value {
+                let accounting = PromptContextAccountingService()
+                let resolution = await accounting.resolveEntries(
+                    selection: selection,
+                    store: store,
+                    rootScope: rootScope,
+                    profile: .uiAssisted,
+                    codeMapUsage: usage,
+                    codemapPresentation: presentation,
+                    contentPolicy: contentPolicy,
+                    codemapLogicalRootDisplayNamesByRootID: rootDisplayNames
+                )
+                let roots = await store.rootRefs(scope: rootScope)
+                let invalid = (resolution.missingPaths + resolution.invalidPaths).map { path in
+                    logicalIssuePath(
+                        path,
+                        roots: roots,
+                        rootDisplayNamesByRootID: rootDisplayNames,
+                        lookupContext: effectiveLookupContext,
+                        display: issuePathDisplay
+                    )
+                }.sorted(by: utf8Precedes)
+                let collections = makeCollections(
+                    resolution: resolution,
+                    selection: selection,
+                    usage: usage,
+                    invalid: invalid
+                )
+                try Task.checkCancellation()
+                return try await operation(collections)
             }
-            let accounting = PromptContextAccountingService()
-            let resolution = await accounting.resolveEntries(
+            if let codemapPresentation {
+                return try await resolveCollections(presentation: codemapPresentation)
+            }
+            let plan = await WorkspaceCodemapPresentationIntentResolver.plan(
+                codeMapUsage: usage,
                 selection: selection,
                 store: store,
                 rootScope: rootScope,
-                profile: .uiAssisted,
-                codeMapUsage: usage,
-                codemapSnapshotBundle: codemapSnapshotBundle,
-                contentPolicy: contentPolicy
+                profile: .uiAssisted
             )
+            return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+                for: plan.intent,
+                rootScope: rootScope,
+                logicalRootDisplayNamesByRootID: rootDisplayNames
+            ) { presentation in
+                try await resolveCollections(
+                    presentation: WorkspaceCodemapPresentationIntentResolver.merging(
+                        presentation,
+                        preflightIssues: plan.preflightIssues
+                    )
+                )
+            }
+        }
 
+        private static func makeCollections(
+            resolution: PromptContextEntryResolution,
+            selection: StoredSelection,
+            usage: CodeMapUsage,
+            invalid: [String]
+        ) -> SelectionCollections {
             let selected = resolution.entries.compactMap { entry -> SelectedEntry? in
                 entry.isCodemap ? nil : SelectedEntry(entry: entry)
             }
+            let manualCodemapPaths = Set(
+                StoredSelectionPathNormalization.standardizedPaths(selection.manualCodemapPaths)
+            )
             let codemap = resolution.entries.compactMap { entry -> CodemapEntry? in
                 guard entry.isCodemap else { return nil }
                 let origin: CodemapOrigin = switch usage {
-                case .selected: .selectedMode
+                case .selected:
+                    manualCodemapPaths.contains(entry.file.standardizedFullPath) ? .manual : .selectedMode
                 case .complete: .auto
                 case .auto: selection.codemapAutoEnabled ? .auto : .manual
                 case .none: .manual
@@ -278,25 +432,68 @@ extension MCPServerViewModel {
                 codemap: codemap,
                 codemapAutoEnabled: selection.codemapAutoEnabled,
                 codeMapUsage: usage,
-                invalid: resolution.missingPaths + resolution.invalidPaths,
-                codemapSnapshotBundle: codemapSnapshotBundle
+                invalid: invalid,
+                codemapPresentation: resolution.codemapPresentation
             )
+        }
+
+        static func logicalIssuePath(
+            _ path: String,
+            roots: [WorkspaceRootRef],
+            rootDisplayNamesByRootID: [UUID: String],
+            lookupContext: WorkspaceLookupContext,
+            display: FilePathDisplay
+        ) -> String {
+            guard path.hasPrefix("/") else { return path }
+            let absolute = StandardizedPath.absolute(path)
+            let authorizingRoots = roots.filter {
+                absolute == $0.standardizedFullPath || absolute.hasPrefix($0.standardizedFullPath + "/")
+            }
+            guard authorizingRoots.count == 1, let authorizedRoot = authorizingRoots.first else {
+                return "unmapped:\(URL(fileURLWithPath: path).lastPathComponent)"
+            }
+            if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                forPhysicalPath: absolute,
+                display: display
+            ) {
+                return projected
+            }
+            if display == .full {
+                return absolute
+            }
+            if let label = rootDisplayNamesByRootID[authorizedRoot.id] {
+                let relative = String(absolute.dropFirst(authorizedRoot.standardizedFullPath.count))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                return relative.isEmpty ? label : "\(label)/\(relative)"
+            }
+            return "unmapped:\(URL(fileURLWithPath: path).lastPathComponent)"
+        }
+
+        private static func utf8Precedes(_ lhs: String, _ rhs: String) -> Bool {
+            lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
         }
 
         private static func pathMetadata(
             for file: WorkspaceFileRecord,
-            entry: ResolvedPromptFileEntry? = nil,
+            entry _: ResolvedPromptFileEntry? = nil,
             formatter: PathFormatter
-        ) -> (rootPath: String, pathWithinRoot: String) {
+        ) async -> (rootPath: String, pathWithinRoot: String) {
             if let override = formatter.rootMetadataOverrides[file.standardizedFullPath] {
-                return (override.rootPath, override.pathWithinRoot)
+                let safeRootPath = override.rootPath.hasPrefix("/")
+                    ? URL(fileURLWithPath: override.rootPath).lastPathComponent
+                    : override.rootPath
+                return (safeRootPath, override.pathWithinRoot)
             }
-            if let projected = formatter.projection?.projectedLogicalRootMetadata(forPhysicalPath: file.standardizedFullPath) {
-                return projected
-            }
-            let rootPath = entry?.rootFolderPath.map { StandardizedPath.absolute($0) }
-                ?? (file.standardizedFullPath as NSString).deletingLastPathComponent
-            return (rootPath, file.standardizedRelativePath)
+            let store = await MainActor.run { formatter.owner.promptVM.workspaceFileContextStore }
+            let lookupContext = WorkspaceLookupContext(
+                rootScope: formatter.rootScope,
+                bindingProjection: formatter.projection
+            )
+            let labels = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
+            return (
+                labels[file.rootID] ?? "workspace",
+                file.standardizedRelativePath
+            )
         }
 
         /// Computes how a file would render under a given codemap usage mode
@@ -397,7 +594,7 @@ extension MCPServerViewModel {
             for entry in collections.selected {
                 let file = entry.file
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry, formatter: formatter)
+                let metadata = await pathMetadata(for: file, entry: entry.entry, formatter: formatter)
                 let ranges = entry.ranges ?? []
                 let hasSlices = !ranges.isEmpty
                 let entryResult = entryResultsByFileID?[file.id]
@@ -431,16 +628,11 @@ extension MCPServerViewModel {
                 // Compute copy preset projection if copy usage differs from auto
                 var copyPreset: ToolResultDTOs.SelectedFileInfo.CopyPresetProjection? = nil
                 if let copyUsage, copyUsage != .auto {
-                    let hasCodemap = collections.codemapSnapshotBundle.hasRenderableCodemap(for: file)
-                    let codemapTokenCount = if hasCodemap {
-                        tokens.codemapTokens(
-                            for: file,
-                            displayPath: displayPath,
-                            codemapSnapshotBundle: collections.codemapSnapshotBundle
-                        )
-                    } else {
-                        0
-                    }
+                    let codemapTokenCount = tokens.codemapTokens(
+                        for: file,
+                        codemapPresentation: collections.codemapPresentation
+                    )
+                    let hasCodemap = codemapTokenCount > 0
                     copyPreset = computeCopyPresetProjection(
                         autoRenderMode: autoRenderMode,
                         autoTokens: tokenCount,
@@ -485,11 +677,10 @@ extension MCPServerViewModel {
             for entry in collections.codemap {
                 let file = entry.file
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry, formatter: formatter)
+                let metadata = await pathMetadata(for: file, entry: entry.entry, formatter: formatter)
                 let rawCodemapTokens = tokens.codemapTokens(
                     for: file,
-                    displayPath: displayPath,
-                    codemapSnapshotBundle: collections.codemapSnapshotBundle
+                    codemapPresentation: collections.codemapPresentation
                 )
                 let tokenCount = if rawCodemapTokens == 0, collections.codeMapUsage == .selected {
                     tokens.fullTokens(for: entry.entry)
@@ -660,7 +851,7 @@ extension MCPServerViewModel {
                 let generated = generateBlocks(
                     selected: collections.selected,
                     codemap: collections.codemap,
-                    codemapSnapshotBundle: collections.codemapSnapshotBundle,
+                    codemapPresentation: collections.codemapPresentation,
                     display: display,
                     projection: pathProjection,
                     displayPathOverrides: displayPathOverrides
@@ -674,9 +865,18 @@ extension MCPServerViewModel {
             }
 
             // MCP replies never await an immediate recount. Use the latest published
-            // active-tab snapshot when no tab-scoped override was prepared.
-            let fallbackPublished = await MainActor.run {
-                tokens?.owner.promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(for: nil)
+            // active-tab snapshot only when no tab-scoped override was prepared, and do not
+            // schedule a refresh from reply formatting itself.
+            let needsFallbackPublished = tokenStatsOverride == nil || tokenAccountingOverride == nil
+            let fallbackPublished: TokenCountingViewModel.PublishedTokenSnapshot? = if needsFallbackPublished {
+                await MainActor.run {
+                    tokens?.owner.promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
+                        for: nil,
+                        scheduleRefreshIfNeeded: false
+                    )
+                }
+            } else {
+                nil
             }
             let tokenStats: ToolResultDTOs.TokenStats? = tokenStatsOverride
                 ?? fallbackPublished.map(MCPServerViewModel.publishedTokenStats)
@@ -721,7 +921,7 @@ extension MCPServerViewModel {
             return PromptPackagingService.generateFileContents(
                 selected.map(\.entry),
                 filePathDisplay: display,
-                codemapSnapshotBundle: .empty,
+                codemapPresentation: .empty,
                 displayPathResolver: { entry in
                     projection?.projectedLogicalDisplayPath(forPhysicalPath: entry.file.standardizedFullPath, display: display)
                 }
@@ -731,13 +931,13 @@ extension MCPServerViewModel {
         static func generateBlocks(
             selected: [SelectedEntry],
             codemap: [CodemapEntry],
-            codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
+            codemapPresentation: WorkspaceCodemapOperationPresentation,
             display: FilePathDisplay,
             projection: WorkspaceRootBindingProjection? = nil,
             displayPathOverrides: [String: String] = [:]
         ) -> [String] {
             let renderableCodemaps = codemap.compactMap { item -> ResolvedPromptFileEntry? in
-                if item.origin == .selectedMode || codemapSnapshotBundle.hasRenderableCodemap(for: item.file) {
+                if item.origin == .selectedMode || codemapPresentation.renderedEntriesByFileID[item.file.id] != nil {
                     return item.entry
                 }
                 return nil
@@ -747,7 +947,7 @@ extension MCPServerViewModel {
             let (codemapBlocks, contentBlocks) = PromptPackagingService.generatePartitionedFileBlocks(
                 entries,
                 filePathDisplay: display,
-                codemapSnapshotBundle: codemapSnapshotBundle,
+                codemapPresentation: codemapPresentation,
                 displayPathResolver: { entry in
                     displayPathOverrides[entry.file.standardizedFullPath]
                         ?? projection?.projectedLogicalDisplayPath(
@@ -774,7 +974,7 @@ extension MCPServerViewModel {
                 guard !ranges.isEmpty else { continue }
 
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry, formatter: formatter)
+                let metadata = await pathMetadata(for: file, entry: entry.entry, formatter: formatter)
                 let dtoRanges = ranges.map { ToolResultDTOs.LineRangeDTO(range: $0) }
                 slices.append(.init(
                     path: displayPath,
@@ -835,16 +1035,37 @@ extension MCPServerViewModel {
         unowned let owner: MCPServerViewModel
         let lookupContext: WorkspaceLookupContext
 
-        func build(for files: [WorkspaceFileRecord]) async throws -> ToolResultDTOs.SelectedCodeStructureDTO? {
+        func build(
+            for files: [WorkspaceFileRecord],
+            presentation: WorkspaceCodemapOperationPresentation
+        ) async -> ToolResultDTOs.SelectedCodeStructureDTO? {
             guard !files.isEmpty else { return nil }
             let disabled = await MainActor.run { owner.promptVM.codeMapsGloballyDisabled }
             guard !disabled else { return nil }
 
-            return try await owner.buildCodeStructureDTO(
-                fromRecords: files,
-                maxResults: 25,
-                includeUnmappedPaths: true,
-                lookupContext: lookupContext
+            let fileIDs = Set(files.map(\.id))
+            let rendered = presentation.orderedEntries.filter { fileIDs.contains($0.fileID) }
+            let included = Array(rendered.prefix(25))
+            let renderedIDs = Set(rendered.map(\.fileID))
+            var unmapped: [String] = []
+            for file in files where !renderedIDs.contains(file.id) {
+                if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                    forPhysicalPath: file.standardizedFullPath,
+                    display: .relative
+                ) {
+                    unmapped.append(projected)
+                } else {
+                    unmapped.append(file.standardizedRelativePath)
+                }
+            }
+            return ToolResultDTOs.SelectedCodeStructureDTO(
+                fileCount: included.count,
+                content: included.map(\.text).joined(separator: "\n\n"),
+                unmappedPaths: unmapped.isEmpty ? nil : unmapped.sorted(),
+                omittedCount: rendered.count > included.count ? rendered.count - included.count : nil,
+                worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(
+                    from: lookupContext.bindingProjection
+                )
             )
         }
     }

@@ -54,6 +54,36 @@ struct AgentRunOracleReviewLaunchSnapshot: Equatable {
     let selection: StoredSelection
     let sourceAgentSessionID: UUID?
     let routedRunID: UUID?
+
+    var normalizedSourceSelectionIdentities: [String] {
+        AgentRunOracleReviewSelectionIdentity.normalizedSourceSelectionIdentities(selection)
+    }
+}
+
+/// Canonical selected-file identity comparison for delegated Agent-run Oracle review packaging.
+///
+/// Selection revisions can advance because active UI state is mirrored or re-committed while the
+/// frozen review capability is built. Delegated review source validation therefore compares these
+/// normalized identities before treating revision-only churn as a real source change.
+enum AgentRunOracleReviewSelectionIdentity {
+    static func normalizedSourceSelectionIdentities(_ selection: StoredSelection) -> [String] {
+        normalizedIdentities(
+            selection.selectedPaths
+                + selection.manualCodemapPaths
+                + Array(selection.slices.keys)
+        )
+    }
+
+    static func normalizedSelectedArtifactIdentities(_ selection: StoredSelection) -> [String] {
+        normalizedIdentities(
+            selection.selectedPaths
+                + Array(selection.slices.keys)
+        )
+    }
+
+    private static func normalizedIdentities(_ candidates: [String]) -> [String] {
+        Array(Set(candidates.compactMap(StoredSelectionPathNormalization.standardizedPath))).sorted()
+    }
 }
 
 /// Fully frozen launch source ready for the existing pending/delegated carrier lifecycle.
@@ -106,14 +136,7 @@ enum AgentRunOracleReviewSource: Equatable {
             self.sourceAgentSessionID = sourceAgentSessionID
             self.sourceAgentRunID = sourceAgentRunID
             self.sourceWorktreeBindings = sourceWorktreeBindings
-            exactSelectedIdentities = Self.normalizedSelectionIdentities(selection)
-        }
-
-        private static func normalizedSelectionIdentities(_ selection: StoredSelection) -> [String] {
-            let candidates = selection.selectedPaths
-                + selection.autoCodemapPaths
-                + Array(selection.slices.keys)
-            return Array(Set(candidates.compactMap(StoredSelectionPathNormalization.standardizedPath))).sorted()
+            exactSelectedIdentities = AgentRunOracleReviewSelectionIdentity.normalizedSelectedArtifactIdentities(selection)
         }
     }
 

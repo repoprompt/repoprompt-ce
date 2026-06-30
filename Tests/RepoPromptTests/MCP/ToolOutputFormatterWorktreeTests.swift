@@ -243,23 +243,45 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         }
     }
 
-    func testCodeStructureOutputShowsPendingLogicalPathsAndWorktreeScope() throws {
-        let dto = ToolResultDTOs.SelectedCodeStructureDTO(
-            fileCount: 0,
-            content: "",
-            pendingPaths: ["Project/Sources/App.swift"],
+    func testCodeStructureOutputShowsTypedPendingIssueAndWorktreeScope() throws {
+        let dto = ToolResultDTOs.CodeStructureReplyDTO(
+            status: "pending",
+            files: [],
+            summary: .init(
+                requestedSeeds: 1,
+                resolvedSeeds: 0,
+                returnedSeeds: 0,
+                returnedRelated: 0,
+                returnedFiles: 0,
+                codemapContentTokens: 0,
+                examinedEdges: 0
+            ),
+            issues: [
+                .init(
+                    code: "artifact_pending",
+                    phase: "seed_demand",
+                    path: "Project/Sources/App.swift",
+                    retryable: true,
+                    retryAfterMilliseconds: 50,
+                    attempted: nil,
+                    limit: nil,
+                    message: "Codemap generation is still pending."
+                )
+            ],
+            retry: .init(retryable: true, retryAfterMilliseconds: 50),
             worktreeScope: Self.scope()
         )
 
         let text = try Self.onlyText(ToolOutputFormatter.formatCodeStructure(value: Self.value(dto)))
 
         XCTAssertTrue(text.contains("## Code Structure ⚠️"), text)
-        XCTAssertTrue(text.contains("Codemap generation pending**: 1"), text)
-        XCTAssertTrue(text.contains("- **Project**"), text)
-        XCTAssertTrue(text.contains("`Sources/App.swift`"), text)
+        XCTAssertTrue(text.contains("**Status**: `pending`"), text)
+        XCTAssertTrue(text.contains("`artifact_pending`"), text)
+        XCTAssertTrue(text.contains("`Project/Sources/App.swift`"), text)
         XCTAssertTrue(text.contains("codemap scans use"), text)
         XCTAssertTrue(text.contains("Displayed paths use logical/canonical roots"), text)
-        XCTAssertTrue(text.contains("/repo/project"), text)
+        XCTAssertTrue(text.contains("`Project` → session-bound worktree"), text)
+        XCTAssertFalse(text.contains("/repo/project"), text)
         XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
         XCTAssertTrue(text.contains("wt_123"), text)
         XCTAssertTrue(text.contains("branch `feature/demo`"), text)
@@ -290,13 +312,69 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         let text = try Self.onlyText(ToolOutputFormatter.formatPromptState(value: Self.value(dto)))
 
         XCTAssertTrue(text.contains("Displayed paths use logical/canonical roots"), text)
-        XCTAssertTrue(text.contains("/repo/project"), text)
+        XCTAssertTrue(text.contains("`Project` → session-bound worktree"), text)
+        XCTAssertFalse(text.contains("/repo/project"), text)
         XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
         XCTAssertTrue(text.contains("wt_123"), text)
         XCTAssertTrue(text.contains("branch `feature/demo`"), text)
         XCTAssertTrue(text.contains("label `Demo Worktree`"), text)
         XCTAssertEqual(Self.occurrences(of: "session-bound worktree", in: text), 2, text)
         XCTAssertTrue(text.contains("### Selected File Tree"), text)
+    }
+
+    func testWorkspaceContextCodeMapsShowsPendingAndUnmappedWhenZeroFiles() throws {
+        let scope = Self.scope()
+        let dto = ToolResultDTOs.PromptContextDTO(
+            prompt: "",
+            selection: nil,
+            fileBlocks: nil,
+            codeStructure: .init(
+                fileCount: 0,
+                content: "",
+                unmappedPaths: ["Project/README.md"],
+                pendingPaths: ["Project/Sources/Pending.swift"]
+            ),
+            fileTree: nil,
+            tokenStats: nil,
+            userTokenStats: nil,
+            tokenStatsNote: nil,
+            copyPreset: nil,
+            copyPresets: nil,
+            worktreeScope: scope
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatPromptState(value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("### Code Maps"), text)
+        XCTAssertTrue(text.contains("- **Files with codemap**: 0"), text)
+        XCTAssertTrue(text.contains("- **Pending codemaps**: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/Sources/Pending.swift`"), text)
+        XCTAssertTrue(text.contains("- **Unmapped codemap paths**: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/README.md`"), text)
+        XCTAssertFalse(text.contains("/repo/project"), text)
+        XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
+    }
+
+    func testManageSelectionCodeMapsShowsPendingAndUnmappedWhenZeroFiles() throws {
+        let dto = ToolResultDTOs.SelectionReply(
+            files: [],
+            totalTokens: 0,
+            status: "ok",
+            codeStructure: .init(
+                fileCount: 0,
+                content: "",
+                unmappedPaths: ["Project/README.md"],
+                pendingPaths: ["Project/Sources/Pending.swift"]
+            )
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageSelection(args: [:], value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("Code Maps: 0 files"), text)
+        XCTAssertTrue(text.contains("Pending codemaps: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/Sources/Pending.swift`"), text)
+        XCTAssertTrue(text.contains("Unmapped codemap paths: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/README.md`"), text)
     }
 
     func testAgentRunOutputShowsWorktreeSummaryAndUnavailableState() throws {
@@ -367,9 +445,9 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             rootMappings: [
                 .init(
                     logicalRootName: "Project",
-                    logicalRootPath: "/repo/project",
+                    logicalRootPath: "Project",
                     effectiveRootName: "project-agent",
-                    effectiveRootPath: "/tmp/worktrees/project-agent",
+                    effectiveRootPath: "session-bound",
                     worktreeID: "wt_123",
                     worktreeName: "project-agent",
                     branch: "feature/demo",
@@ -382,7 +460,8 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
     private static func assertScopeBlock(in text: String) {
         XCTAssertTrue(text.contains("session-bound worktree"), text)
         XCTAssertTrue(text.contains("Displayed paths use logical/canonical roots"), text)
-        XCTAssertTrue(text.contains("/repo/project"), text)
+        XCTAssertTrue(text.contains("`Project`"), text)
+        XCTAssertFalse(text.contains("/repo/project"), text)
         XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
         XCTAssertTrue(text.contains("wt_123"), text)
         XCTAssertTrue(text.contains("branch `feature/demo`"), text)

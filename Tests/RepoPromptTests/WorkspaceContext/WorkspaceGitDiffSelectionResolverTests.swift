@@ -12,7 +12,7 @@ final class WorkspaceGitDiffSelectionResolverTests: XCTestCase {
     func testCandidatesIncludeSelectedPathsAndNonEmptySlicesOnce() {
         let selection = StoredSelection(
             selectedPaths: ["Sources/App.swift", "Sources/App.swift", "Sources/Other.swift"],
-            autoCodemapPaths: ["Sources/CodemapOnly.swift"],
+
             slices: [
                 "Sources/App.swift": [LineRange(start: 1, end: 2)],
                 "Sources/Sliced.swift": [LineRange(start: 3, end: 4)],
@@ -222,7 +222,7 @@ final class WorkspaceGitDiffSelectionResolverTests: XCTestCase {
         let patchPath = patchFile.standardizedFileURL.path
         let existing = StoredSelection(
             selectedPaths: [visiblePath],
-            autoCodemapPaths: [mapPath, "/tmp/dependency.swift"],
+
             slices: [visiblePath: [LineRange(start: 2, end: 4)]],
             codemapAutoEnabled: false
         )
@@ -250,7 +250,6 @@ final class WorkspaceGitDiffSelectionResolverTests: XCTestCase {
 
         XCTAssertEqual(result.selection.selectedPaths, [visiblePath, mapPath, patchPath])
         XCTAssertEqual(result.selection.slices, existing.slices)
-        XCTAssertEqual(result.selection.autoCodemapPaths, ["/tmp/dependency.swift"])
         XCTAssertFalse(result.selection.codemapAutoEnabled)
         XCTAssertEqual(result.newlyAddedArtifacts, candidates)
     }

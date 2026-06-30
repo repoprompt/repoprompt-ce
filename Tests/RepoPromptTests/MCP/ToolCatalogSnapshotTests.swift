@@ -303,6 +303,10 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             XCTAssertNotNil(agentRunProperties[field], "agent_run schema should advertise property \(field)")
             XCTAssertNotNil(agentExploreProperties[field], "agent_explore schema should advertise property \(field)")
         }
+        #if DEBUG
+            XCTAssertNotNil(agentRunProperties["_worktree_startup_benchmark_token"])
+            XCTAssertNil(agentExploreProperties["_worktree_startup_benchmark_token"])
+        #endif
 
         let exploreOpEnum = agentExploreProperties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
         XCTAssertEqual(exploreOpEnum, ["start", "poll", "wait", "cancel"])
@@ -365,6 +369,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         ) async throws {
             let fixture = try BootstrapSocketNamespaceFixture.make()
             let manager = ServerNetworkManager.shared
+            await manager.debugResumeAllLifecycleFenceCheckpoints()
+            await manager.stop()
             let productionSocketURL = MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL
             let defaultSocketURL = await manager.debugResolvedBootstrapSocketURL()
             XCTAssertEqual(defaultSocketURL, productionSocketURL)
@@ -466,7 +472,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     private static let expectedSignatures: [String] = [
         "0|manage_selection|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b2facb46e2b8f9d4cfb00551bdfa19454b7f3eecd81bac510f4fed12f99452c3|schema=4b7a043e8e48130ee84cc6bbf7b9fd597b495aef238d44f17df6600088a2bb6f",
         "1|file_actions|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=81230c22d826458cae079855b133d59da34c4a66ae4a68252727e564931335b8|schema=d4ed12eee8ed779610016aa46a6f3686ed7635436517c0de0a16efc8b0d0d1fe",
-        "2|get_code_structure|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=616a8669bc14e69afaad4cfec4e4da2b1f5dcb7142030fb615857175b2146cb4|schema=f9bbf57f060e5cf70b8104a4b800100459376fb4438bfa80ef8f388aedf7c913",
+        "2|get_code_structure|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=9d2524b6470775d4f6455c7c4db134054a2f50fe2d5be59aaddacb963ec44e47|schema=63876c20e878abd0465cf824d6fa1876c7fe3388c54d3f0cb087622f644f0cd4",
         "3|get_file_tree|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=9bf648121646b463554d58373f61c2dcede04640482994e0cf1533d21ae77093|schema=91972027e030989cf242fed03377bdc5056c6317cc77d351d3fa5348dd1767a0",
         "4|read_file|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=f5ccd98a8fc0956c4ebcff540ffc8c0eaf0aaeb654b2f8edc0495c059fcf2807|schema=d023edb446167481751886bebeac7dc8896e2b3f57c12b18591761f846618bb1",
         "5|file_search|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=f2c9e16ca780c4e94f795b6c9489658856052e6d159aa467a64c906ee48a3fe4|schema=08904f5e241c06414ff476b80b81338a5798961a69d93227d7ed098694546b99",
@@ -482,7 +488,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=7b3c869b0c959c1c162dfadfd4ea578b05ed0834b2e930d177a8c38f96c31a4b",
-        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=52ef9e56d0aa35f1523bb6700ce9ced3512749401b4ea409d0de8cf3d007855b|schema=e2b5bce34fa512aca293fffec7eaa46a9639feb4e840546c12d3554b8a2d514b",
+        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=f2549cee7d02060a9f04ef33b46de9d3bd6e206c37214559f7ab586d21f0e1b8|schema=1d86e85b1dd38bc0438d8d002230bcadbe80c21ae621d0a2dab9e4c9d0af5f65",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=03e16bee789cb9343f6b1b16cb4d472aedd3d811a43f6f95ad8ea5e8f69dc28d|schema=f5bc6b05cf0683ef3acb7a82ee4a14b75fadf26f32c56b0314be1424688a2ba5",
         "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",

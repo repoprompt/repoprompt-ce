@@ -139,7 +139,9 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertFalse(window.isClosing)
         XCTAssertFalse(window.apiSettingsViewModel.test_hasPreparedForWindowClose)
         window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
-        window.contextBuilderAgentViewModel.test_startCodexModelsSubscriptionIfNeeded()
+        guard await waitForSubscriberCount(1, pollingService: pollingService) else { return }
+        window.contextBuilderAgentViewModel.selectedAgent = .codexExec
+        XCTAssertTrue(window.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask)
         guard await waitForSubscriberCount(2, pollingService: pollingService) else { return }
         let attachedSubscriberCount = await pollingService.test_subscriberCount()
         XCTAssertEqual(attachedSubscriberCount, 2)

@@ -165,8 +165,27 @@ public enum CatalogRegularFileEligibility: Sendable, Equatable {
 
 struct FSItemDTO {
     let relativePath: String
+    let relativePathBytes: Data
     let isDirectory: Bool
     let hierarchy: Int
+    let isSymbolicLink: Bool
+    let fileSystemMode: UInt16
+
+    init(
+        relativePath: String,
+        relativePathBytes: Data? = nil,
+        isDirectory: Bool,
+        hierarchy: Int,
+        isSymbolicLink: Bool = false,
+        fileSystemMode: UInt16 = 0
+    ) {
+        self.relativePath = relativePath
+        self.relativePathBytes = relativePathBytes ?? Data(relativePath.utf8)
+        self.isDirectory = isDirectory
+        self.hierarchy = hierarchy
+        self.isSymbolicLink = isSymbolicLink
+        self.fileSystemMode = fileSystemMode
+    }
 }
 
 struct FSPreparedChunk {

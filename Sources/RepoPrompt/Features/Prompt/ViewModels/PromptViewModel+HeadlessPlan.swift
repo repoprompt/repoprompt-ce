@@ -79,47 +79,6 @@ extension PromptViewModel {
             gitInclusion: effectiveGitScope,
             storedPromptIds: []
         )
-        let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
-        let preAssembly = if let authorization = snapshot.finalReviewAuthorization {
-            try await preAssembleStrictPromptContext(
-                cfg: headlessConfig,
-                selection: snapshot.selection,
-                lookupContext: lookupContext,
-                sourceTabID: snapshot.tabID,
-                reviewGitContext: snapshot.reviewGitContext,
-                finalReviewAuthorization: authorization
-            )
-        } else {
-            await preAssemblePromptContext(
-                cfg: headlessConfig,
-                selection: snapshot.selection,
-                lookupContext: lookupContext,
-                reviewGitContext: snapshot.reviewGitContext
-            )
-        }
-        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
-
-        // 2. Generate file contents. Preserve legacy formatting unless an authoritative
-        // Agent Mode lookup context requires physical paths to be projected logically.
-        let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
-            { entry in preAssembly.displayPath(for: entry) }
-        } else {
-            nil
-        }
-        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
-            codeEntries,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            displayPathResolver: displayPathResolver
-        )
-        let fileBlocks = partitionedBlocks.contentBlocks
-
-        // 3. Combine the frozen file tree with only the canonical codemap partition.
-        let fileTree = PromptPackagingService.combinedFileMapContent(
-            fileTreeContent: preAssembly.fileTreeContent,
-            codemapBlocks: partitionedBlocks.codemapBlocks
-        ) ?? ""
-
         // 4. System prompt based on mode
         let systemPrompt: String = {
             switch mode {
@@ -145,20 +104,44 @@ extension PromptViewModel {
         // 5. Single-user conversation
         let conversation = [ConversationEntry(role: .user, content: snapshot.promptText)]
 
-        let gitDiff = preAssembly.gitDiff
-
-        // 6. Assemble AIMessage (no warning, no meta prompts)
-        return PromptPackagingService.buildAIMessage(
-            systemPrompt: systemPrompt,
-            metaInstructions: [],
-            fileTree: fileTree,
-            fileContents: fileBlocks,
-            gitDiff: gitDiff,
-            conversation: conversation,
-            temperature: setModelTemperature ? modelTemperature : nil,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
-        )
+        return try await withPreassembledPromptContext(
+            cfg: headlessConfig,
+            selection: snapshot.selection,
+            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
+            reviewGitContext: snapshot.reviewGitContext,
+            sourceTabID: snapshot.tabID,
+            finalReviewAuthorization: snapshot.finalReviewAuthorization
+        ) { preAssembly in
+            let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
+                preAssembly.entries
+            )
+            let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
+                { entry in preAssembly.displayPath(for: entry) }
+            } else {
+                nil
+            }
+            let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
+                codeEntries,
+                filePathDisplay: self.filePathDisplayOption,
+                codemapPresentation: preAssembly.codemapPresentation,
+                displayPathResolver: displayPathResolver
+            )
+            let fileTree = PromptPackagingService.combinedFileMapContent(
+                fileTreeContent: preAssembly.fileTreeContent,
+                codemapBlocks: partitionedBlocks.codemapBlocks
+            ) ?? ""
+            return PromptPackagingService.buildAIMessage(
+                systemPrompt: systemPrompt,
+                metaInstructions: [],
+                fileTree: fileTree,
+                fileContents: partitionedBlocks.contentBlocks,
+                gitDiff: preAssembly.gitDiff,
+                conversation: conversation,
+                temperature: self.setModelTemperature ? self.modelTemperature : nil,
+                promptSectionsOrder: self.promptSectionsOrder,
+                disabledPromptSections: self.disabledPromptSections,
+                duplicateUserInstructionsAtTop: self.duplicateUserInstructionsAtTop
+            )
+        }
     }
 }
