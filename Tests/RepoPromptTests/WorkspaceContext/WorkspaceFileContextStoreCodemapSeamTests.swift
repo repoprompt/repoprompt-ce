@@ -4802,37 +4802,97 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             await fixture.shutdown()
             repositoryFixture.cleanup()
         }
-        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let store = fixture.makeStore(
+            codemapProjectionPreloadLaunchPolicy: .disabled,
+            selectionGraphFactory: graphProbe.factory
+        )
+
+        func requireReadyDemand(
+            _ ticket: WorkspaceCodemapArtifactDemandTicket,
+            phase: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws -> WorkspaceCodemapArtifactDemandReady {
+            let result = try await settledResult(store: store, ticket: ticket)
+            guard case let .ready(ready) = result else {
+                XCTFail("Expected \(phase) ready, got \(result).", file: file, line: line)
+                throw CodemapStoreTestError.expectedReady
+            }
+            return ready
+        }
+
+        func withReadyProjectionDemand<Value>(
+            sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+            phase: String,
+            file: StaticString = #filePath,
+            line: UInt = #line,
+            body: (WorkspaceCodemapProjectionDemandTicket) async throws -> Value
+        ) async throws -> Value {
+            let projectionTicket = try await requireReadyProjectionDemand(
+                store: store,
+                sourceTickets: sourceTickets,
+                phase: phase,
+                file: file,
+                line: line
+            )
+            do {
+                let value = try await body(projectionTicket)
+                await assertProjectionDemandReleased(
+                    store: store,
+                    projectionTicket,
+                    phase: phase,
+                    file: file,
+                    line: line
+                )
+                return value
+            } catch {
+                _ = await store.releaseCodemapProjectionDemand(projectionTicket)
+                throw error
+            }
+        }
+
         let loaded = try await store.loadRoot(path: root.path)
         let files = await store.files(inRoot: loaded.id)
         let affected = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Affected.swift" })
         let unrelated = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Unrelated.swift" })
         let affectedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: affected.id))
-        let affectedReady = try await readyResult(settledResult(store: store, ticket: affectedTicket))
+        let affectedReady = try await requireReadyDemand(
+            affectedTicket,
+            phase: "initial affected demand"
+        )
         let unrelatedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: unrelated.id))
-        let unrelatedReady = try await readyResult(settledResult(store: store, ticket: unrelatedTicket))
-        _ = try await generationMatchedCompleteSeal(
-            catalogClient: fixture.registry.makeBindingCatalogClient(),
-            graphProbe: graphProbe,
-            ticket: unrelatedTicket
+        let unrelatedReady = try await requireReadyDemand(
+            unrelatedTicket,
+            phase: "initial unrelated demand"
         )
-        let unrelatedPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
-            rootDisplayName: "Workspace",
-            standardizedRelativePath: unrelated.standardizedRelativePath
-        ))
-        let unrelatedPresentation = try await frozenPresentationBundle(
-            store.freezeCodemapPresentation([
-                WorkspaceCodemapPresentationRequest(ticket: unrelatedTicket, logicalPath: unrelatedPath)
-            ])
-        )
-        _ = try await readyGraphQuery(
-            store: store,
-            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
-                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: affectedTicket),
-                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
-            ])
-        )
-        let graph = try XCTUnwrap(graphProbe.graph(rootEpoch: affectedTicket.rootEpoch))
+        let (unrelatedPresentation, graph) = try await withReadyProjectionDemand(
+            sourceTickets: [affectedTicket, unrelatedTicket],
+            phase: "initial affected/unrelated projection demand"
+        ) { _ in
+            _ = try await generationMatchedCompleteSeal(
+                catalogClient: fixture.registry.makeBindingCatalogClient(),
+                graphProbe: graphProbe,
+                ticket: unrelatedTicket
+            )
+            let unrelatedPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                rootDisplayName: "Workspace",
+                standardizedRelativePath: unrelated.standardizedRelativePath
+            ))
+            let unrelatedPresentation = try await frozenPresentationBundle(
+                store.freezeCodemapPresentation([
+                    WorkspaceCodemapPresentationRequest(ticket: unrelatedTicket, logicalPath: unrelatedPath)
+                ])
+            )
+            _ = try await readyGraphQuery(
+                store: store,
+                query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                    WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: affectedTicket),
+                    WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
+                ])
+            )
+            let graph = try XCTUnwrap(graphProbe.graph(rootEpoch: affectedTicket.rootEpoch))
+            return (unrelatedPresentation, graph)
+        }
 
         try Self.write(
             "struct Affected { let changed = true }\n",
@@ -4851,7 +4911,10 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         )
         let successorTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: affected.id))
         XCTAssertGreaterThan(successorTicket.pathGeneration, affectedTicket.pathGeneration)
-        let successorReady = try await readyResult(settledResult(store: store, ticket: successorTicket))
+        let successorReady = try await requireReadyDemand(
+            successorTicket,
+            phase: "successor affected demand after modification"
+        )
         let successorPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
             rootDisplayName: "Workspace",
             standardizedRelativePath: affected.standardizedRelativePath
@@ -4861,19 +4924,24 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
                 WorkspaceCodemapPresentationRequest(ticket: successorTicket, logicalPath: successorPath)
             ])
         )
-        _ = try await generationMatchedCompleteSeal(
-            catalogClient: fixture.registry.makeBindingCatalogClient(),
-            graphProbe: graphProbe,
-            ticket: successorTicket
-        )
-        let successorGraph = try await readyGraphQuery(
-            store: store,
-            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
-                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: successorTicket),
-                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
-            ])
-        )
-        XCTAssertEqual(successorGraph.roots.first?.rootEpoch, successorTicket.rootEpoch)
+        try await withReadyProjectionDemand(
+            sourceTickets: [successorTicket, unrelatedTicket],
+            phase: "successor affected/unrelated projection demand after modification"
+        ) { _ in
+            _ = try await generationMatchedCompleteSeal(
+                catalogClient: fixture.registry.makeBindingCatalogClient(),
+                graphProbe: graphProbe,
+                ticket: successorTicket
+            )
+            let successorGraph = try await readyGraphQuery(
+                store: store,
+                query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                    WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: successorTicket),
+                    WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
+                ])
+            )
+            XCTAssertEqual(successorGraph.roots.first?.rootEpoch, successorTicket.rootEpoch)
+        }
         try FileManager.default.removeItem(at: root.appendingPathComponent(unrelated.standardizedRelativePath))
         await store.replayObservedFileSystemDeltas(
             rootID: loaded.id,
@@ -4885,22 +4953,27 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         _ = try await renderedPresentationEntries(
             store.renderCodemapPresentation(successorPresentation)
         )
-        _ = try await generationMatchedCompleteSeal(
-            catalogClient: fixture.registry.makeBindingCatalogClient(),
-            graphProbe: graphProbe,
-            ticket: successorTicket
-        )
-        let postDeleteSuccessorGraph = try await readyGraphQuery(
-            store: store,
-            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
-                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: successorTicket)
-            ])
-        )
-        let postDeleteRoot = try XCTUnwrap(postDeleteSuccessorGraph.roots.first)
-        XCTAssertEqual(postDeleteRoot.rootEpoch, successorTicket.rootEpoch)
-        XCTAssertTrue(postDeleteRoot.result.sourceCoverage.contains {
-            $0.source.fileID == affected.id && $0.state == .covered
-        })
+        try await withReadyProjectionDemand(
+            sourceTickets: [successorTicket],
+            phase: "post-delete successor projection demand"
+        ) { _ in
+            _ = try await generationMatchedCompleteSeal(
+                catalogClient: fixture.registry.makeBindingCatalogClient(),
+                graphProbe: graphProbe,
+                ticket: successorTicket
+            )
+            let postDeleteSuccessorGraph = try await readyGraphQuery(
+                store: store,
+                query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                    WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: successorTicket)
+                ])
+            )
+            let postDeleteRoot = try XCTUnwrap(postDeleteSuccessorGraph.roots.first)
+            XCTAssertEqual(postDeleteRoot.rootEpoch, successorTicket.rootEpoch)
+            XCTAssertTrue(postDeleteRoot.result.sourceCoverage.contains {
+                $0.source.fileID == affected.id && $0.state == .covered
+            })
+        }
 
         await store.replayPublisherFileSystemPublicationForTesting(
             rootID: loaded.id,
@@ -8802,6 +8875,153 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         throw CodemapStoreTestError.timedOut
     }
 
+    private func projectionDemandDeadlineUptimeNanoseconds(
+        retentionDuration: Duration
+    ) -> UInt64 {
+        let components = retentionDuration.components
+        guard components.seconds >= 0, components.attoseconds >= 0 else {
+            return DispatchTime.now().uptimeNanoseconds
+        }
+        let seconds = UInt64(components.seconds)
+        let attoseconds = UInt64(components.attoseconds)
+        let (secondNanoseconds, secondsOverflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        let (combinedNanoseconds, combinedOverflow) = secondNanoseconds.addingReportingOverflow(
+            attoseconds / 1_000_000_000
+        )
+        let remainingNanoseconds = secondsOverflow || combinedOverflow
+            ? UInt64.max
+            : combinedNanoseconds
+        let now = DispatchTime.now().uptimeNanoseconds
+        let (deadline, overflow) = now.addingReportingOverflow(remainingNanoseconds)
+        return overflow ? UInt64.max : deadline
+    }
+
+    private func boundedProjectionRetryMilliseconds(_ retry: UInt64) -> Int {
+        min(1000, max(25, Int(exactly: retry) ?? 1000))
+    }
+
+    private func projectionDemandSourceTicketDiagnostics(
+        _ sourceTickets: [WorkspaceCodemapArtifactDemandTicket]
+    ) -> String {
+        sourceTickets.map { ticket in
+            "fileID=\(ticket.fileID) rootEpoch=\(ticket.rootEpoch) " +
+                "catalogGeneration=\(ticket.catalogGeneration) " +
+                "ingressGeneration=\(ticket.ingressGeneration)"
+        }.joined(separator: "; ")
+    }
+
+    private func requireReadyProjectionDemand(
+        store: WorkspaceFileContextStore,
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        phase: String,
+        readinessTimeout: Duration = .seconds(15),
+        retentionDuration: Duration = .seconds(45),
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> WorkspaceCodemapProjectionDemandTicket {
+        guard !sourceTickets.isEmpty else {
+            XCTFail(
+                "Expected \(phase) source tickets for projection demand.",
+                file: file,
+                line: line
+            )
+            throw CodemapStoreTestError.expectedReadyProjectionDemand(phase)
+        }
+        let sourceDiagnostics = projectionDemandSourceTicketDiagnostics(sourceTickets)
+        let acquisition = await store.acquireCodemapProjectionDemand(
+            sourceTickets: sourceTickets,
+            deadlineUptimeNanoseconds: projectionDemandDeadlineUptimeNanoseconds(
+                retentionDuration: retentionDuration
+            )
+        )
+        let projectionTicket: WorkspaceCodemapProjectionDemandTicket
+        var latestStatus: WorkspaceCodemapProjectionDemandStatus
+        switch acquisition {
+        case let .acquired(ticket, status):
+            projectionTicket = ticket
+            latestStatus = status
+        case let .busy(reason, retryAfterMilliseconds):
+            XCTFail(
+                "Expected \(phase) projection demand acquired, got busy \(reason) " +
+                    "retry=\(retryAfterMilliseconds); sourceTickets=\(sourceDiagnostics).",
+                file: file,
+                line: line
+            )
+            throw CodemapStoreTestError.expectedReadyProjectionDemand(phase)
+        case let .unavailable(reason, retryAfterMilliseconds):
+            XCTFail(
+                "Expected \(phase) projection demand acquired, got unavailable \(reason) " +
+                    "retry=\(String(describing: retryAfterMilliseconds)); " +
+                    "sourceTickets=\(sourceDiagnostics).",
+                file: file,
+                line: line
+            )
+            throw CodemapStoreTestError.expectedReadyProjectionDemand(phase)
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: readinessTimeout)
+        while clock.now < deadline {
+            switch latestStatus {
+            case .ready:
+                return projectionTicket
+            case let .waitingForSetup(retryAfterMilliseconds),
+                 let .queued(_, retryAfterMilliseconds),
+                 let .joined(_, retryAfterMilliseconds),
+                 let .waitingForBatchBoundary(_, retryAfterMilliseconds),
+                 let .activeBatch(_, retryAfterMilliseconds),
+                 let .suspendedBusy(_, retryAfterMilliseconds):
+                try await Task.sleep(for: .milliseconds(
+                    boundedProjectionRetryMilliseconds(retryAfterMilliseconds)
+                ))
+                latestStatus = await store.codemapProjectionDemandStatus(projectionTicket)
+            case .stale, .cancelled, .expired:
+                _ = await store.releaseCodemapProjectionDemand(projectionTicket)
+                XCTFail(
+                    "Expected \(phase) projection demand ready, got \(latestStatus); " +
+                        "sourceTickets=\(sourceDiagnostics).",
+                    file: file,
+                    line: line
+                )
+                throw CodemapStoreTestError.expectedReadyProjectionDemand(phase)
+            case let .unavailable(reason, retryAfterMilliseconds):
+                _ = await store.releaseCodemapProjectionDemand(projectionTicket)
+                XCTFail(
+                    "Expected \(phase) projection demand ready, got unavailable \(reason) " +
+                        "retry=\(String(describing: retryAfterMilliseconds)); " +
+                        "sourceTickets=\(sourceDiagnostics).",
+                    file: file,
+                    line: line
+                )
+                throw CodemapStoreTestError.expectedReadyProjectionDemand(phase)
+            }
+        }
+        _ = await store.releaseCodemapProjectionDemand(projectionTicket)
+        XCTFail(
+            "Expected \(phase) projection demand ready, latest \(latestStatus); " +
+                "sourceTickets=\(sourceDiagnostics).",
+            file: file,
+            line: line
+        )
+        throw CodemapStoreTestError.timedOut
+    }
+
+    private func assertProjectionDemandReleased(
+        store: WorkspaceFileContextStore,
+        _ ticket: WorkspaceCodemapProjectionDemandTicket,
+        phase: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let released = await store.releaseCodemapProjectionDemand(ticket)
+        XCTAssertTrue(
+            released,
+            "Expected \(phase) projection demand release to succeed.",
+            file: file,
+            line: line
+        )
+    }
+
     private func generationMatchedCompleteSeal(
         catalogClient: WorkspaceCodemapBindingCatalogClient,
         graphProbe: CodemapSelectionGraphProbe,
@@ -9022,6 +9242,7 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
 
 private enum CodemapStoreTestError: Error {
     case expectedGenerationMatchedSeal(String)
+    case expectedReadyProjectionDemand(String)
     case expectedFrozenPresentationBundle
     case manualProjectionAuthorityRequired
     case expectedPending

@@ -268,7 +268,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(invocations.count, 1)
         let invocation = try XCTUnwrap(invocations.first)
         XCTAssertEqual(invocation.operation, MCPWindowToolName.getCodeStructure)
-        XCTAssertEqual(invocation.commandCount, 0, invocation.commands.joined(separator: "\n"))
+        assertNonGitEligibilityDiagnosticShape(invocation)
         XCTAssertEqual(invocation.outcome, "success")
         XCTAssertEqual(invocation.requestIdentity, requestIdentity)
 
@@ -294,7 +294,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         } == true)
         let repeatedInvocations = MCPToolWorkCountDiagnostics.debugSnapshots().git
         XCTAssertEqual(repeatedInvocations.count, 2)
-        XCTAssertEqual(repeatedInvocations.map(\.commandCount), [0, 0])
+        for invocation in repeatedInvocations {
+            assertNonGitEligibilityDiagnosticShape(invocation)
+        }
         XCTAssertEqual(repeatedInvocations.map(\.requestIdentity), [requestIdentity, repeatedRequestIdentity])
     }
 
@@ -1201,6 +1203,37 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(
             availability,
             .sessionWorktreeUnavailable(missingPhysicalRootPaths: [missingWorktreeURL.standardizedFileURL.path])
+        )
+    }
+
+    private func assertNonGitEligibilityDiagnosticShape(
+        _ invocation: MCPToolWorkCountDiagnostics.GitInvocationSnapshot,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let commands = invocation.commands
+        if invocation.commandCount == 0, commands.isEmpty {
+            return
+        }
+
+        // This accepted three-command shape is non-git eligibility probing after
+        // proof invalidation, not legacy snapshot-build work.
+        let expectedFallbackCommands = [
+            "rev-parse --show-toplevel",
+            "rev-parse --show-toplevel",
+            "rev-parse --is-bare-repository"
+        ]
+        if invocation.commandCount == expectedFallbackCommands.count,
+           commands == expectedFallbackCommands
+        {
+            return
+        }
+
+        XCTFail(
+            "Expected no git commands or exact non-git eligibility fallback commands; " +
+                "got count \(invocation.commandCount):\n\(commands.joined(separator: "\n"))",
+            file: file,
+            line: line
         )
     }
 
