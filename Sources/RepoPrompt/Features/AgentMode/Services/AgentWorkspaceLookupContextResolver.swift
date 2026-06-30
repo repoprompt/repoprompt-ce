@@ -88,25 +88,40 @@ enum AgentWorkspaceLookupContextResolver {
     }
 
     private final class ProjectionCache {
+        private let limit = 16
         private let lock = NSLock()
         private var contexts: [CacheKey: WorkspaceLookupContext] = [:]
+        private var order: [CacheKey] = []
 
         func context(for key: CacheKey) -> WorkspaceLookupContext? {
             lock.lock()
             defer { lock.unlock() }
-            return contexts[key]
+            guard let context = contexts[key] else { return nil }
+            touch(key)
+            return context
         }
 
         func store(_ context: WorkspaceLookupContext, for key: CacheKey) {
             lock.lock()
             contexts[key] = context
+            touch(key)
+            while order.count > limit, let oldest = order.first {
+                order.removeFirst()
+                contexts.removeValue(forKey: oldest)
+            }
             lock.unlock()
         }
 
         func removeValue(for key: CacheKey) {
             lock.lock()
             contexts.removeValue(forKey: key)
+            order.removeAll { $0 == key }
             lock.unlock()
+        }
+
+        private func touch(_ key: CacheKey) {
+            order.removeAll { $0 == key }
+            order.append(key)
         }
     }
 

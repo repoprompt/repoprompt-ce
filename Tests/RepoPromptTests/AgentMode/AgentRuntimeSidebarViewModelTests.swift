@@ -116,6 +116,30 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertNil(store.runtimeVM.snapshot.selectionTokens)
     }
 
+    func testLiveSlicedSelectionSuppressesSameCountToolSelectionTokens() throws {
+        let store = AgentRuntimeMetricsUIStore()
+        let manageSelectionItem = try makeManageSelectionItem(fileCount: 1)
+        let liveSummary = AgentContextExportResolver.selectionSummary(
+            for: StoredSelection(
+                selectedPaths: ["Sources/File0.swift"],
+                slices: ["Sources/File0.swift": [LineRange(start: 4, end: 8)]],
+                codemapAutoEnabled: false
+            )
+        )
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(latestManageSelectionItem: manageSelectionItem),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            liveSelectionSummary: liveSummary,
+            selectedAgent: .codexExec,
+            selectedModelRaw: "gpt-5.1-codex"
+        )
+
+        XCTAssertEqual(store.runtimeVM.snapshot.selectionFileCount, 1)
+        XCTAssertEqual(store.runtimeVM.snapshot.selectionSummary, liveSummary)
+        XCTAssertNil(store.runtimeVM.snapshot.selectionTokens)
+    }
+
     func testClaudeFableSelectionFallsBackToOneMillionTokenContextWindow() {
         let store = AgentRuntimeMetricsUIStore()
         store.update(

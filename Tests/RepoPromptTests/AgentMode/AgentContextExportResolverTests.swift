@@ -273,6 +273,41 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(clipboard.contains("let origin = \"base\""), clipboard)
     }
 
+    func testMetadataOnlyWorktreeExportDoesNotDirectReadSymlinkEscapingRoot() async throws {
+        let fixture = try await makeBoundFixture()
+        let externalRoot = try makeTemporaryRoot(name: "AgentExportExternal")
+        let externalFile = externalRoot.appendingPathComponent("Secret.swift")
+        let symlink = fixture.worktreeRoot.appendingPathComponent("Sources/Linked.swift")
+        try write("let secret = true\n", to: externalFile)
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: externalFile
+        )
+        let source = makeSource(
+            logicalRoot: fixture.logicalRoot,
+            worktreeRoot: fixture.worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/Linked.swift"], codemapAutoEnabled: false)
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: fixture.store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertFalse(model.lookupContext.bindingProjection?.isFullyMaterialized == false)
+        XCTAssertTrue(model.rows.allSatisfy { $0.directContentPath == nil })
+        if let row = model.rows.first {
+            let previewText = await AgentContextExportResolver.loadRowContent(
+                for: row,
+                store: fixture.store,
+                purpose: .preview
+            )
+            XCTAssertNotEqual(previewText, "let secret = true\n")
+        }
+    }
+
     func testEmptyBoundExportSkipsWorktreeProjection() async throws {
         let fixture = try await makeBoundFixture()
         let source = makeSource(

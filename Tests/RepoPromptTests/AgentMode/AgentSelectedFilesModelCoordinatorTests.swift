@@ -112,6 +112,84 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testCachedIdentityCancelsDifferentInFlightResolve() async {
+        let resolver = GatedModelResolver()
+        let coordinator = AgentSelectedFilesModelCoordinator { request in
+            await resolver.resolve(request)
+        }
+        let requestA = makeRequest(name: "A.swift")
+        let requestB = makeRequest(name: "B.swift")
+        let requestC = makeRequest(name: "C.swift")
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestB), .started)
+        let didStartB = await resolver.waitUntilStartCount("B.swift", count: 1)
+        XCTAssertTrue(didStartB)
+        await resolver.releaseNext("B.swift")
+        let didLoadB = await waitUntilModel(promptText: "B.swift", in: coordinator)
+        XCTAssertTrue(didLoadB)
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestC), .started)
+        let didStartC = await resolver.waitUntilStartCount("C.swift", count: 1)
+        XCTAssertTrue(didStartC)
+        await resolver.releaseNext("C.swift")
+        let didLoadC = await waitUntilModel(promptText: "C.swift", in: coordinator)
+        XCTAssertTrue(didLoadC)
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestA, preserveDisplayedModel: true), .started)
+        let didStartA = await resolver.waitUntilStartCount("A.swift", count: 1)
+        XCTAssertTrue(didStartA)
+        XCTAssertEqual(coordinator.model?.source.promptText, "C.swift")
+        XCTAssertTrue(coordinator.isLoading)
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestB), .skippedLoaded)
+        XCTAssertEqual(coordinator.model?.source.promptText, "B.swift")
+        XCTAssertFalse(coordinator.isLoading)
+        XCTAssertEqual(coordinator.debugStats.cancellations, 1)
+
+        await resolver.releaseNext("A.swift")
+        await drainCancelledTask()
+
+        XCTAssertEqual(coordinator.model?.source.promptText, "B.swift")
+        XCTAssertFalse(coordinator.isLoading)
+        XCTAssertEqual(coordinator.debugStats.resolverCompletions, 2)
+    }
+
+    @MainActor
+    func testLoadedIdentityCancelsDifferentInFlightResolveWhenPreservingDisplayedModel() async {
+        let resolver = GatedModelResolver()
+        let coordinator = AgentSelectedFilesModelCoordinator { request in
+            await resolver.resolve(request)
+        }
+        let requestA = makeRequest(name: "A.swift")
+        let requestB = makeRequest(name: "B.swift")
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestB), .started)
+        let didStartB = await resolver.waitUntilStartCount("B.swift", count: 1)
+        XCTAssertTrue(didStartB)
+        await resolver.releaseNext("B.swift")
+        let didLoadB = await waitUntilModel(promptText: "B.swift", in: coordinator)
+        XCTAssertTrue(didLoadB)
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestA, preserveDisplayedModel: true), .started)
+        let didStartA = await resolver.waitUntilStartCount("A.swift", count: 1)
+        XCTAssertTrue(didStartA)
+        XCTAssertEqual(coordinator.model?.source.promptText, "B.swift")
+        XCTAssertTrue(coordinator.isLoading)
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestB), .skippedLoaded)
+        XCTAssertEqual(coordinator.model?.source.promptText, "B.swift")
+        XCTAssertFalse(coordinator.isLoading)
+        XCTAssertEqual(coordinator.debugStats.cancellations, 1)
+
+        await resolver.releaseNext("A.swift")
+        await drainCancelledTask()
+
+        XCTAssertEqual(coordinator.model?.source.promptText, "B.swift")
+        XCTAssertFalse(coordinator.isLoading)
+        XCTAssertEqual(coordinator.debugStats.resolverCompletions, 1)
+    }
+
+    @MainActor
     func testInvalidateWithoutRefreshClearsLoadedRowsAndStartsNoResolverWork() async {
         let resolver = ImmediateModelResolver()
         let coordinator = AgentSelectedFilesModelCoordinator { request in

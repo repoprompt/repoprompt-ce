@@ -627,6 +627,7 @@ enum AgentContextExportResolver {
         let selectedPaths = source.selection.selectedPaths
         for path in selectedPaths {
             let translatedPath = lookupContext.translateInputPath(path)
+            var requiresStoreFallback = false
             guard let row = metadataOnlyRow(
                 originalPath: path,
                 translatedPath: translatedPath,
@@ -634,9 +635,10 @@ enum AgentContextExportResolver {
                 projection: projection,
                 filePathDisplay: filePathDisplay,
                 missingPaths: &missingPaths,
-                invalidPaths: &invalidPaths
+                invalidPaths: &invalidPaths,
+                requiresStoreFallback: &requiresStoreFallback
             ) else {
-                if metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
+                if requiresStoreFallback || metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
                     return nil
                 }
                 continue
@@ -647,6 +649,7 @@ enum AgentContextExportResolver {
 
         for (path, ranges) in source.selection.slices where !ranges.isEmpty && !selectedPaths.contains(where: { normalizedSelectionKey($0) == normalizedSelectionKey(path) }) {
             let translatedPath = lookupContext.translateInputPath(path)
+            var requiresStoreFallback = false
             guard let row = metadataOnlyRow(
                 originalPath: path,
                 translatedPath: translatedPath,
@@ -654,9 +657,10 @@ enum AgentContextExportResolver {
                 projection: projection,
                 filePathDisplay: filePathDisplay,
                 missingPaths: &missingPaths,
-                invalidPaths: &invalidPaths
+                invalidPaths: &invalidPaths,
+                requiresStoreFallback: &requiresStoreFallback
             ) else {
-                if metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
+                if requiresStoreFallback || metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
                     return nil
                 }
                 continue
@@ -750,7 +754,8 @@ enum AgentContextExportResolver {
         projection: WorkspaceRootBindingProjection,
         filePathDisplay: FilePathDisplay,
         missingPaths: inout [String],
-        invalidPaths: inout [String]
+        invalidPaths: inout [String],
+        requiresStoreFallback: inout Bool
     ) -> AgentContextExportRow? {
         let trimmed = translatedPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -769,6 +774,10 @@ enum AgentContextExportResolver {
             return nil
         }
         guard !isDirectory.boolValue else { return nil }
+        guard safeDirectContentPath(physicalPath, boundRoot: boundRoot) != nil else {
+            requiresStoreFallback = true
+            return nil
+        }
 
         let relativePath = StandardizedPath.relative(
             String(physicalPath.dropFirst(boundRoot.physicalRoot.standardizedFullPath.count))
@@ -797,6 +806,19 @@ enum AgentContextExportResolver {
             canRemove: true,
             directContentPath: physicalPath
         )
+    }
+
+    private static func safeDirectContentPath(
+        _ physicalPath: String,
+        boundRoot: WorkspaceRootBindingProjection.BoundRoot
+    ) -> String? {
+        let rootPath = boundRoot.physicalRoot.standardizedFullPath
+        let resolvedRoot = StandardizedPath.absolute((rootPath as NSString).resolvingSymlinksInPath)
+        let resolvedPath = StandardizedPath.absolute((physicalPath as NSString).resolvingSymlinksInPath)
+        guard resolvedPath == resolvedRoot || resolvedPath.hasPrefix("\(resolvedRoot)/") else {
+            return nil
+        }
+        return physicalPath
     }
 
     private static func metadataOnlyPathRequiresStoreFallback(
@@ -833,7 +855,9 @@ enum AgentContextExportResolver {
     }
 
     private static func stableUUID(namespace: String, rawValue: String) -> UUID {
-        let digest = Array(SHA256.hash(data: Data("\(namespace)|\(rawValue)".utf8)))
+        var digest = Array(SHA256.hash(data: Data("\(namespace)|\(rawValue)".utf8)))
+        digest[6] = (digest[6] & 0x0F) | 0x50
+        digest[8] = (digest[8] & 0x3F) | 0x80
         let bytes: uuid_t = (
             digest[0], digest[1], digest[2], digest[3],
             digest[4], digest[5], digest[6], digest[7],

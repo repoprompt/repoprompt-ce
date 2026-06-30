@@ -116,12 +116,15 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         AgentSelectedFilesDiagnostics.event("coordinator.refresh.request", fields: refreshFields, includeStack: true)
 
         if !force, loadedIdentity == request.identity, model != nil {
+            cancelActiveRefresh(reason: "skipLoaded", fields: refreshFields)
+            state = AgentSelectedFilesModelState(model: state.model, rowSplit: state.rowSplit, isLoading: false)
             debugStats.skippedLoaded += 1
             AgentSelectedFilesDiagnostics.event("coordinator.refresh.skipLoaded", fields: refreshFields)
             return .skippedLoaded
         }
 
         if !force, let cachedModel = cachedModels[request.identity] {
+            cancelActiveRefresh(reason: "skipCached", fields: refreshFields)
             debugStats.skippedLoaded += 1
             touchCachedModel(request.identity)
             state = AgentSelectedFilesModelState(
@@ -140,11 +143,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             return .skippedLoading
         }
 
-        if refreshTask != nil {
-            debugStats.cancellations += 1
-            AgentSelectedFilesDiagnostics.event("coordinator.refresh.cancelExisting", fields: refreshFields, includeStack: true)
-            refreshTask?.cancel()
-        }
+        cancelActiveRefresh(reason: "startReplacement", fields: refreshFields)
 
         let shouldClearLoadedModel = loadedIdentity != request.identity
         let shouldClearDisplayedModel = shouldClearLoadedModel && !preserveDisplayedModel
@@ -254,6 +253,23 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
 
     func resetDebugStats() {
         debugStats = AgentSelectedFilesModelDebugStats()
+    }
+
+    private func cancelActiveRefresh(reason: String, fields: [String: String]) {
+        guard refreshTask != nil || refreshID != nil || loadingIdentity != nil else { return }
+        var cancelFields = fields
+        cancelFields["reason"] = reason
+        cancelFields["cancelledLoadingIdentityPresent"] = String(loadingIdentity != nil)
+        if refreshTask != nil {
+            debugStats.cancellations += 1
+            AgentSelectedFilesDiagnostics.event("coordinator.refresh.cancelExisting", fields: cancelFields, includeStack: true)
+            refreshTask?.cancel()
+        } else {
+            AgentSelectedFilesDiagnostics.event("coordinator.refresh.clearOrphanedGeneration", fields: cancelFields, includeStack: true)
+        }
+        refreshTask = nil
+        refreshID = nil
+        loadingIdentity = nil
     }
 
     private func cacheModel(_ model: AgentContextExportModel, for identity: AgentSelectedFilesModelIdentity) {

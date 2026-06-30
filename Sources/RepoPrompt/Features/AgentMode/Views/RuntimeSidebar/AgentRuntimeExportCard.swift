@@ -341,7 +341,7 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
     }
 
     private func refreshExportModel(force: Bool = false, preserveDisplayedModel: Bool = false) {
-        let request = makeModelRequest(flushPendingUI: false)
+        let request = makeModelRequest(flushPendingUI: true)
         var fields = AgentSelectedFilesDiagnostics.requestFields(request)
         fields["component"] = "trigger"
         fields["force"] = String(force)
@@ -549,7 +549,7 @@ struct AgentSelectedFilesInlineManager: View {
     }
 
     private func refreshExportModel(force: Bool = false, preserveDisplayedModel: Bool = false) {
-        let request = makeModelRequest(flushPendingUI: false)
+        let request = makeModelRequest(flushPendingUI: true)
         var fields = AgentSelectedFilesDiagnostics.requestFields(request)
         fields["component"] = "inline"
         fields["force"] = String(force)
@@ -683,7 +683,7 @@ private struct AgentSelectedFilesPopover: View {
                             ForEach(activeRows) { row in
                                 AgentSelectedFileRow(
                                     row: row,
-                                    canRemove: canMutate && row.canRemove,
+                                    canRemove: !isLoading && canMutate && row.canRemove,
                                     previewCoordinator: previewCoordinator,
                                     onLoadContent: onLoadContent,
                                     onRemove: { row in
@@ -753,7 +753,7 @@ private struct AgentSelectedFilesPopover: View {
                 .font(fontPreset.captionFont.weight(.medium))
         }
         .buttonStyle(CustomButtonStyle(verticalPadding: 3, horizontalPadding: 8))
-        .disabled(split.rows.isEmpty || !canMutate || model == nil)
+        .disabled(isLoading || split.rows.isEmpty || !canMutate || model == nil)
         .hoverTooltip(canMutate ? "Clear selection" : "Unavailable")
         .accessibilityHint(canMutate ? "Clear selection" : "Selection unavailable")
     }
@@ -791,7 +791,7 @@ private struct AgentSelectedFilesPopover: View {
     }
 
     private func displayFileCount(split: AgentSelectedFilesRowSplit) -> Int {
-        if placeholderFileCount > 0 {
+        if isLoading, model == nil, placeholderFileCount > 0 {
             return placeholderFileCount
         }
         return split.fileRows.count
