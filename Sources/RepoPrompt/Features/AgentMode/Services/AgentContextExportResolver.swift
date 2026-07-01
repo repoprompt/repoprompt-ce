@@ -632,7 +632,10 @@ enum AgentContextExportResolver {
             case .preview where lineRanges?.isEmpty != false:
                 guard let file = FileHandle(forReadingAtPath: path) else { return nil }
                 defer { try? file.close() }
-                guard let data = try? file.read(upToCount: AgentContextPreviewContentPolicy.maximumBytes + 1) ?? Data() else {
+                let data: Data
+                do {
+                    data = try file.read(upToCount: AgentContextPreviewContentPolicy.maximumBytes + 1) ?? Data()
+                } catch {
                     return nil
                 }
                 let truncated = data.count > AgentContextPreviewContentPolicy.maximumBytes

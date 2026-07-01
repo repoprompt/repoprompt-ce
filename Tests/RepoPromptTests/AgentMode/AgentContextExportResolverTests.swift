@@ -1120,6 +1120,46 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(previewResult?.contains("Preview truncated") ?? true)
     }
 
+    func testEmptyDirectFilePreviewReturnsEmptyContent() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportPreviewEmpty")
+        try write("", to: root.appendingPathComponent("Sources/Empty.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: ["Sources/Empty.swift"], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+        let row = try XCTUnwrap(model.rows.first)
+
+        let previewResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: store,
+            purpose: .preview
+        )
+        let copyResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: store,
+            purpose: .copy
+        )
+
+        XCTAssertEqual(previewResult, "")
+        XCTAssertEqual(copyResult, "")
+    }
+
     private func makeBoundFixture() async throws -> (logicalRoot: URL, worktreeRoot: URL, store: WorkspaceFileContextStore) {
         let logicalRoot = try makeTemporaryRoot(name: "AgentExportLogical")
         let worktreeRoot = try makeTemporaryRoot(name: "AgentExportWorktree")
