@@ -535,16 +535,14 @@ extension MCPServerViewModel {
             entryResultsByFileID: preparedAccounting.entryResultsByFileID
         )
 
-        let tokenStatsOverride: ToolResultDTOs.TokenStats = if let published = preparedAccounting.activePublishedSnapshot {
-            Self.publishedTokenStats(published)
-        } else {
-            Self.makeTokenStats(
-                filesTokens: filesReply.totalTokens,
-                filesContentTokens: (filesReply.summary?.fullTokens ?? 0) + (filesReply.summary?.sliceTokens ?? 0),
-                codemapsTokens: filesReply.summary?.codemapTokens,
-                breakdown: preparedAccounting.breakdown
-            )
-        }
+        let filesContentTokens = (filesReply.summary?.fullTokens ?? 0) + (filesReply.summary?.sliceTokens ?? 0)
+        let codemapsTokens = filesReply.summary?.codemapTokens ?? 0
+        let tokenStatsOverride = Self.makeTokenStats(
+            filesTokens: filesReply.totalTokens,
+            filesContentTokens: filesContentTokens > 0 ? filesContentTokens : nil,
+            codemapsTokens: codemapsTokens > 0 ? codemapsTokens : nil,
+            breakdown: preparedAccounting.breakdown
+        )
 
         var reply = await SelectionReplyAssembler.makeSelectionReply(
             filesReply: filesReply,
@@ -563,7 +561,12 @@ extension MCPServerViewModel {
 
         // Inject minimal codeStructure.unmappedPaths to report pending codemaps
         if reply.codeStructure == nil {
-            if let minimal = await buildUnmappedOnlyCodeStructure(collections: collections, display: display, projection: lookupContext.bindingProjection) {
+            if let minimal = await buildUnmappedOnlyCodeStructure(
+                collections: collections,
+                display: display,
+                projection: lookupContext.bindingProjection,
+                rootScope: lookupContext.rootScope
+            ) {
                 reply = ToolResultDTOs.SelectionReply(
                     files: reply.files,
                     totalTokens: reply.totalTokens,
@@ -582,7 +585,8 @@ extension MCPServerViewModel {
                     userChatTokens: reply.userChatTokens,
                     normalizedCodeMapUsage: reply.normalizedCodeMapUsage,
                     tokenStats: reply.tokenStats,
-                    tokenAccounting: reply.tokenAccounting
+                    tokenAccounting: reply.tokenAccounting,
+                    copyPresetProjection: reply.copyPresetProjection
                 )
             }
         }
@@ -645,6 +649,7 @@ extension MCPServerViewModel {
         return SelectionReplyAssembler.SelectionCollections(
             selected: artifactEntries + collections.selected,
             codemap: collections.codemap,
+            requestedCodemapFiles: collections.requestedCodemapFiles,
             codemapAutoEnabled: collections.codemapAutoEnabled,
             codeMapUsage: collections.codeMapUsage,
             invalid: collections.invalid,
@@ -739,40 +744,43 @@ extension MCPServerViewModel {
 
     // MARK: - Unmapped Paths Helper
 
-    /// Builds a minimal code structure DTO containing only unmappedPaths
-    /// (files without codemaps). Used to report pending codemaps in selection replies
-    /// without generating full codemap content.
+    /// Builds a minimal code structure DTO containing only codemap diagnostics
+    /// (files whose codemap presentation is pending or permanently unavailable).
+    /// Used to report codemap readiness in selection replies without generating full
+    /// codemap content.
     @MainActor
     func buildUnmappedOnlyCodeStructure(
         collections: SelectionReplyAssembler.SelectionCollections,
         display: FilePathDisplay,
-        projection: WorkspaceRootBindingProjection? = nil
+        projection: WorkspaceRootBindingProjection? = nil,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> ToolResultDTOs.SelectedCodeStructureDTO? {
         guard !promptVM.codeMapsGloballyDisabled else { return nil }
-        // Combine selected + codemap files
-        let files = collections.selected.map(\.file) + collections.codemap.map(\.file)
+        guard collections.codeMapUsage != .none else { return nil }
+
+        let files = SelectionReplyAssembler.codemapDiagnosticFiles(for: collections)
         guard !files.isEmpty else { return nil }
 
-        var unmapped: [String] = []
-        var seen = Set<String>()
-        for file in files where collections.codemapPresentation.renderedEntriesByFileID[file.id] == nil {
-            let p = await PathFormatter(
-                format: display,
-                owner: self,
-                projection: projection
-            ).displayPath(for: file)
-            if seen.insert(p).inserted {
-                unmapped.append(p)
-            }
+        let formatter = PathFormatter(
+            format: display,
+            owner: self,
+            projection: projection,
+            rootScope: rootScope
+        )
+        let diagnostics = await SelectionReplyAssembler.missingCodemapDiagnostics(
+            for: files,
+            presentation: collections.codemapPresentation
+        ) { file in
+            await formatter.displayPath(for: file)
         }
 
-        guard !unmapped.isEmpty else { return nil }
+        guard !diagnostics.isEmpty else { return nil }
 
-        // Minimal DTO: report unmappedPaths only; keep content empty and counts neutral
         return ToolResultDTOs.SelectedCodeStructureDTO(
             fileCount: 0,
             content: "",
-            unmappedPaths: unmapped,
+            unmappedPaths: diagnostics.unmappedPaths.isEmpty ? nil : diagnostics.unmappedPaths,
+            pendingPaths: diagnostics.pendingPaths.isEmpty ? nil : diagnostics.pendingPaths,
             omittedCount: nil,
             worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection)
         )

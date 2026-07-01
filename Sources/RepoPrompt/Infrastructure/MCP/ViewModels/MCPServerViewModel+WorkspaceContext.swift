@@ -158,16 +158,12 @@ extension MCPServerViewModel {
             let codemapsTokens = selectionReply?.summary?.codemapTokens ?? 0
 
             if let prepared = preparedTokenAccounting {
-                if let published = prepared.activePublishedSnapshot {
-                    tokenStatsDTO = Self.publishedTokenStats(published)
-                } else {
-                    tokenStatsDTO = Self.makeTokenStats(
-                        filesTokens: fileTokens,
-                        filesContentTokens: filesContentTokens > 0 ? filesContentTokens : nil,
-                        codemapsTokens: codemapsTokens > 0 ? codemapsTokens : nil,
-                        breakdown: prepared.breakdown
-                    )
-                }
+                tokenStatsDTO = Self.makeTokenStats(
+                    filesTokens: fileTokens,
+                    filesContentTokens: filesContentTokens > 0 ? filesContentTokens : nil,
+                    codemapsTokens: codemapsTokens > 0 ? codemapsTokens : nil,
+                    breakdown: prepared.breakdown
+                )
 
                 if let userFileTokens = selectionReply?.userCopyTokens, userFileTokens != fileTokens {
                     let userContentTokens = selectionReply?.userCopyContentTokens ?? 0

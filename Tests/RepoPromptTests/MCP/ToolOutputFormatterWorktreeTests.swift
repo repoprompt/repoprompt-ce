@@ -377,6 +377,118 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("  - `Project/README.md`"), text)
     }
 
+    func testManageSelectionIncompleteZeroTokensShowsPendingAccounting() throws {
+        let dto = ToolResultDTOs.SelectionReply(
+            files: [
+                .init(
+                    path: "Project/Sources/Pending.swift",
+                    tokens: 0,
+                    renderMode: "full",
+                    ranges: nil,
+                    isAuto: false,
+                    codemapOrigin: nil,
+                    copyPreset: nil,
+                    rootPath: "Project",
+                    pathWithinRoot: "Sources/Pending.swift"
+                )
+            ],
+            totalTokens: 0,
+            status: "ok",
+            codeStructure: .init(
+                fileCount: 0,
+                content: "",
+                pendingPaths: ["Project/Sources/Pending.swift"]
+            ),
+            summary: .init(
+                fullCount: 1,
+                sliceCount: 0,
+                codemapCount: 0,
+                fullTokens: 0,
+                sliceTokens: 0,
+                codemapTokens: 0
+            ),
+            tokenStats: .init(total: 0, files: 0),
+            tokenAccounting: .init(
+                status: "incomplete",
+                source: "active_tab_published",
+                refreshPending: true,
+                incompleteComponents: ["files", "codemap_presentation"]
+            )
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageSelection(args: [:], value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("**Token accounting pending**"), text)
+        XCTAssertFalse(text.contains("**0 total tokens**"), text)
+        XCTAssertTrue(
+            text.contains("Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files, codemap_presentation"),
+            text
+        )
+        XCTAssertTrue(text.contains("Files: pending (1 file)"), text)
+        XCTAssertTrue(text.contains("Pending codemaps: 1"), text)
+        XCTAssertFalse(text.contains("Unmapped codemap paths: 1"), text)
+
+        let embedded = ToolOutputFormatter.formatSelectionReplyToString(dto)
+        XCTAssertTrue(embedded.contains("- Total tokens: pending (Auto view)"), embedded)
+        XCTAssertFalse(embedded.contains("- Total tokens: 0 (Auto view)"), embedded)
+        XCTAssertTrue(
+            embedded.contains("- Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files, codemap_presentation"),
+            embedded
+        )
+    }
+
+    func testManageSelectionNonzeroPartialTokensStillShowsAccountingLine() throws {
+        let dto = ToolResultDTOs.SelectionReply(
+            files: [
+                .init(
+                    path: "Project/Sources/Partial.swift",
+                    tokens: 12,
+                    renderMode: "full",
+                    ranges: nil,
+                    isAuto: false,
+                    codemapOrigin: nil,
+                    copyPreset: nil,
+                    rootPath: "Project",
+                    pathWithinRoot: "Sources/Partial.swift"
+                )
+            ],
+            totalTokens: 12,
+            status: "ok",
+            summary: .init(
+                fullCount: 1,
+                sliceCount: 0,
+                codemapCount: 0,
+                fullTokens: 12,
+                sliceTokens: 0,
+                codemapTokens: 0
+            ),
+            tokenStats: .init(total: 42, files: 12, prompt: 30),
+            tokenAccounting: .init(
+                status: "incomplete",
+                source: "active_tab_published",
+                refreshPending: true,
+                incompleteComponents: ["files"]
+            )
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageSelection(args: [:], value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("**42 total tokens**"), text)
+        XCTAssertFalse(text.contains("**Token accounting pending**"), text)
+        XCTAssertTrue(
+            text.contains("Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files"),
+            text
+        )
+        XCTAssertTrue(text.contains("Files: 12"), text)
+
+        let embedded = ToolOutputFormatter.formatSelectionReplyToString(dto)
+        XCTAssertTrue(embedded.contains("- Total tokens: 12 (Auto view)"), embedded)
+        XCTAssertTrue(
+            embedded.contains("- Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files"),
+            embedded
+        )
+    }
+
     func testAgentRunOutputShowsWorktreeSummaryAndUnavailableState() throws {
         let cases = [
             (
