@@ -564,3 +564,22 @@ Primary metric eligible: no
 | 2 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeTwoRootContextBuilderImplicitGitPublishesSelectedRepository` | 20 | 5.050 | 33.873 | 56.204 | 0 |
 | 3 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps` | 20 | 4.925 | 25.008 | 25.293 | 0 |
 | 4 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeContextBuilderFailsClosedBeforeProviderCreationWhenWorktreeIsUnavailable` | 20 | 0.449 | 0.548 | 0.759 | 0 |
+
+### Baseline failure summary: 2026-07-01T21:28:41+00:00 — root — reliability-gate-20260701-root-after-contextbuilder-clean
+
+Command: `python3 Scripts/test_suite_optimizer.py baseline --target root --samples 5 --label reliability-gate-20260701-root-after-contextbuilder-clean --inventory prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json --scoreboard prompt-exports/optimize-test-suite-runs.md --output prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-contextbuilder-clean.json --source-change-guard metadata`
+Artifact: `prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-contextbuilder-clean.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: complete
+Source-change guard: `metadata`
+Primary metric eligible: no — zero valid samples; no normal timing baseline summary emitted.
+Optimizer exit: no normal optimizer exit; wrapper stopped with SIGKILL/effective 137 after preserving hung-sample evidence. First conductor ticket canceled with exit 130; a second sample started during shutdown and was canceled as cleanup with exit 130.
+
+| Sample | Valid | State | Exit | Log | Invalid reason / signature |
+|---:|---|---|---:|---|---|
+| 1 | no | canceled | 130 | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/614bf6c0-e3d0-4e86-bf42-c7a96470acba.log` | Root XCTest stale-output hang for ~54 min at `RepoPromptTests.AgentWorktreeMergeAttentionTests/testActiveConflictOperationReturnsNilWhenOnlyTerminalOrReviewStatesArePresent`; not ContextBuilder-related. |
+| 2 | no | canceled | 130 | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3f735856-82e5-43eb-bf68-7f18b8661f06.log` | Cleanup cancellation after optimizer advanced during shutdown at `RepoPromptTests.CodeMapArtifactStoreTests/testPendingScanAdmissionAndReadRetainOneDescriptorAcrossAtomicReplacement`; not treated as independent failure signal. |
+
+Result: 0 valid + 2 invalid attempted of 5 requested. Median, observed p95, relative MAD, and noise are unavailable because there were no valid samples.
+ContextBuilder repeat check: no known ContextBuilder failure signatures repeated in this root re-baseline attempt.
+Phase 4 decision: cannot resume from this gate; preserve evidence and classify the remaining root cluster as the `AgentWorktreeMergeAttentionTests` stale-output/hang observed in sample 1.
