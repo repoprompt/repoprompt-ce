@@ -60,13 +60,6 @@ struct GeneralSettingsView: View {
         )
     }
 
-    private var warnBeforeCmdQBinding: Binding<Bool> {
-        Binding(
-            get: { globalSettings.warnBeforeCmdQ() },
-            set: { globalSettings.setWarnBeforeCmdQ($0) }
-        )
-    }
-
     /// Close action for dismissing the settings view
     var closeAction: (() -> Void)?
 
@@ -198,20 +191,6 @@ struct GeneralSettingsView: View {
                             isOn: showTooltipsBinding
                         )
                     }
-                }
-
-                Divider()
-
-                // Quit Section
-                SettingSection(
-                    title: "Quit",
-                    description: "Prevent accidental quits"
-                ) {
-                    SettingToggle(
-                        title: "Warn before quitting with ⌘Q",
-                        description: "When on, hold ⌘Q to quit (a quick tap is ignored). Quit from the menu, Dock, or system still quits immediately.",
-                        isOn: warnBeforeCmdQBinding
-                    )
                 }
 
                 Divider()
