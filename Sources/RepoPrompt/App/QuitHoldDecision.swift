@@ -11,9 +11,10 @@ import Foundation
 //
 // Quit timing: the threshold ARMS the quit; the actual quit intent is produced
 // only when the user releases ⌘Q (keyUp or Command flag release) AFTER the
-// threshold. Releasing before the threshold cancels. This release-after-
-// threshold contract is required because terminating while the key is still
-// held starves AppKit's shutdown path (see QuitHoldController class doc).
+// threshold. Releasing before the threshold cancels. An `.externalCancel`
+// (owner window closed, app resigned active, etc.) resets from `.holding` or
+// `.armed` to `.idle` with a `.dismiss` intent so the controller can tear down
+// the overlay immediately and a later ⌘Q can't quit from stale state.
 //
 // Semantics are pinned by `docs/spec/hold-to-quit.md` (scenarios S-001, S-002,
 // S-003, S-010) and mirrored by `QuitHoldDecisionTests`.
@@ -29,6 +30,10 @@ public enum QuitHoldEvent {
     case flagsChanged(commandDown: Bool)
     /// The hold timer elapsed (threshold reached).
     case timerElapsed
+    /// An external condition aborted the gesture (owner window closed, app
+    /// resigned active, …). Resets an in-flight hold; no-op if idle/already
+    /// quitting.
+    case externalCancel
 }
 
 /// Observable side effects the controller should perform in response to an event.
@@ -40,11 +45,15 @@ public enum QuitHoldIntent: Equatable {
     /// Threshold reached while still holding: keep the overlay and update it to
     /// a "release to quit" message. Do NOT terminate yet.
     case arm
-    /// Dismiss the overlay (linger/fade), cancel the timer, and keep running.
+    /// Release before the threshold: dismiss the overlay (linger/fade), cancel
+    /// the timer, and keep running.
     case cancel
     /// Release after the threshold: dismiss the overlay and quit through the
     /// normal shutdown path.
     case quit
+    /// External cancellation: dismiss the overlay immediately (no linger) and
+    /// reset to idle.
+    case dismiss
 }
 
 public struct QuitHoldDecision {
@@ -76,7 +85,7 @@ public struct QuitHoldDecision {
                 return .beginHold(threshold: Self.threshold)
             case .keyDown(toggleOn: false):
                 return .ignore
-            case .keyUp, .flagsChanged(commandDown: _), .timerElapsed:
+            case .keyUp, .flagsChanged(commandDown: _), .timerElapsed, .externalCancel:
                 return .ignore
             }
 
@@ -90,6 +99,10 @@ public struct QuitHoldDecision {
                 // Released before the threshold: cancel.
                 state = .idle
                 return .cancel
+            case .externalCancel:
+                // Aborted externally: reset to idle, dismiss immediately.
+                state = .idle
+                return .dismiss
             case .keyDown(toggleOn: _), .flagsChanged(commandDown: true):
                 return .ignore
             }
@@ -100,6 +113,11 @@ public struct QuitHoldDecision {
                 // Released after the threshold: quit.
                 state = .quitting
                 return .quit
+            case .externalCancel:
+                // Aborted externally: reset to idle, dismiss immediately. Without
+                // this, a later ⌘Q tap could quit from stale `.armed` state.
+                state = .idle
+                return .dismiss
             case .keyDown(toggleOn: _), .flagsChanged(commandDown: true), .timerElapsed:
                 return .ignore
             }

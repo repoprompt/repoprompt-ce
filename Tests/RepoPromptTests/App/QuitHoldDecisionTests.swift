@@ -122,6 +122,60 @@ final class QuitHoldDecisionTests: XCTestCase {
         }
     }
 
+    // MARK: - External cancellation (owner window closed / app resigned active)
+
+    /// External cancel while holding dismisses and returns to idle.
+    func testExternalCancelWhileHoldingDismissesAndReturnsToIdle() {
+        var decision = QuitHoldDecision()
+        _ = decision.handle(.keyDown(toggleOn: true))
+        let intent = decision.handle(.externalCancel)
+        XCTAssertEqual(intent, .dismiss)
+        XCTAssertEqual(decision.state, .idle)
+    }
+
+    /// External cancel while armed resets to idle — a later ⌘Q tap must NOT
+    /// quit from stale `.armed` state (regression: owner window closes mid-hold).
+    func testExternalCancelWhileArmedDismissesAndReturnsToIdle() {
+        var decision = QuitHoldDecision()
+        _ = decision.handle(.keyDown(toggleOn: true))
+        _ = decision.handle(.timerElapsed)
+        let intent = decision.handle(.externalCancel)
+        XCTAssertEqual(intent, .dismiss)
+        XCTAssertEqual(decision.state, .idle)
+    }
+
+    /// After an external cancel from `.armed`, a subsequent quick ⌘Q tap does
+    /// not quit — it begins a fresh hold and cancels on release, never quits.
+    func testTapAfterExternalCancelFromArmedDoesNotQuit() {
+        var decision = QuitHoldDecision()
+        _ = decision.handle(.keyDown(toggleOn: true))
+        _ = decision.handle(.timerElapsed)
+        _ = decision.handle(.externalCancel)
+        let down = decision.handle(.keyDown(toggleOn: true))
+        XCTAssertEqual(down, .beginHold(threshold: QuitHoldDecision.threshold))
+        XCTAssertEqual(decision.state, .holding)
+        let up = decision.handle(.keyUp)
+        XCTAssertEqual(up, .cancel)
+        XCTAssertEqual(decision.state, .idle)
+    }
+
+    /// External cancel is a no-op when idle.
+    func testExternalCancelWhileIdleIsIgnored() {
+        var decision = QuitHoldDecision()
+        XCTAssertEqual(decision.handle(.externalCancel), .ignore)
+        XCTAssertEqual(decision.state, .idle)
+    }
+
+    /// External cancel does not escape the terminal quitting state.
+    func testExternalCancelWhileQuittingIsIgnored() {
+        var decision = QuitHoldDecision()
+        _ = decision.handle(.keyDown(toggleOn: true))
+        _ = decision.handle(.timerElapsed)
+        _ = decision.handle(.keyUp)
+        XCTAssertEqual(decision.handle(.externalCancel), .ignore)
+        XCTAssertEqual(decision.state, .quitting)
+    }
+
     // MARK: - Helpers
 
     /// A decision driven to the armed state (toggle-on keyDown + timer elapsed).

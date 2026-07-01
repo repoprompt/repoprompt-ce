@@ -56,13 +56,19 @@ enum QuitHoldEventFilter {
 //
 // **Quit timing (release-after-threshold):** reaching the 1.0s threshold while
 // still holding ⌘Q only ARMS the quit (the overlay switches to "Release ⌘Q to
-// Quit"). The actual `NSApp.terminate(nil)` is fired on ⌘Q `keyUp` / Command
-// release AFTER the threshold, deferred one run-loop turn so the run loop is
-// idle when terminate runs. Terminating while the key is still held wedges the
-// shutdown: AppKit's `.terminateLater` wait plus sustained key-repeat delivery
-// starves the Swift main-actor executor, so the shutdown `Task` never runs and
-// `reply(true)` is never called. Quitting on release avoids that entirely and
+// Quit"). The actual `NSApp.terminate(nil)` is fired SYNCHRONOUSLY on ⌘Q
+// `keyUp` / Command release AFTER the threshold, from within this monitor's
+// event handler (i.e., during AppKit's `sendEvent`). It must NOT be deferred
+// to a `DispatchQueue` callback: AppKit's `.terminateLater` wait then starves
+// the Swift main-actor executor, the shutdown `Task` never runs, and
+// `reply(true)` is never called (the app wedges). Calling terminate during
+// `sendEvent` — like the menu and Apple-Event quit paths — drains cleanly and
 // leaves the existing async shutdown path unchanged.
+//
+// **External cancellation:** if the owner window closes or the app resigns
+// active mid-hold, an `.externalCancel` event resets the decision to `idle`
+// and dismisses the overlay immediately (no linger), so a later ⌘Q can't arm
+// or quit from stale `.holding`/`.armed` state.
 //
 // Per the spec's event-swallowing policy, the controller swallows a `keyDown`
 // based only on the toggle + exact-modifier match — *regardless* of the
@@ -81,6 +87,9 @@ final class QuitHoldController {
     private var holdWorkItem: DispatchWorkItem?
     private var overlayPanel: QuitHoldPanel?
     private var ownerWillCloseObserver: NSObjectProtocol?
+    /// App-lifetime observer that aborts an in-flight hold when the app loses
+    /// focus (the local key monitor won't see the keyUp then).
+    private var resignActiveObserver: NSObjectProtocol?
     /// Scheduled "dwell then fade" removal of the overlay after an early
     /// release; cancelled by `hideOverlay()` so a new hold or a confirmed quit
     /// still use the immediate-dismiss path.
@@ -97,6 +106,9 @@ final class QuitHoldController {
         if let monitor {
             NSEvent.removeMonitor(monitor)
         }
+        if let resignActiveObserver {
+            NotificationCenter.default.removeObserver(resignActiveObserver)
+        }
     }
 
     // MARK: - Lifecycle
@@ -110,6 +122,18 @@ final class QuitHoldController {
             MainActor.assumeIsolated {
                 guard let self else { return event }
                 return self.handle(event)
+            }
+        }
+        resignActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // Runs on `.main`; abort any in-flight hold so state can't get
+            // stuck when the keyUp is never delivered (app no longer frontmost).
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.apply(self.decision.handle(.externalCancel))
             }
         }
     }
@@ -162,6 +186,15 @@ final class QuitHoldController {
             cancelHold()
         case .quit:
             fireTermination()
+        case .dismiss:
+            // External cancellation (owner window closed / app resigned active):
+            // state was already reset to idle by the decision; tear down the
+            // overlay immediately — no linger.
+            holdWorkItem?.cancel()
+            holdWorkItem = nil
+            lingerWorkItem?.cancel()
+            lingerWorkItem = nil
+            hideOverlay()
         case .ignore:
             break
         }
@@ -180,9 +213,9 @@ final class QuitHoldController {
         DispatchQueue.main.asyncAfter(deadline: .now() + threshold, execute: work)
     }
 
-    /// Release after the threshold: dismiss the overlay and route through the
-    /// normal shutdown path one run-loop turn later (run loop idle → the
-    /// shutdown Task drains cleanly).
+    /// Release after the threshold: dismiss the overlay and call
+    /// `NSApp.terminate(nil)` SYNCHRONOUSLY (during `sendEvent` — see class
+    /// doc) so the normal shutdown path drains cleanly.
     private func fireTermination() {
         holdWorkItem?.cancel()
         holdWorkItem = nil
@@ -221,8 +254,13 @@ final class QuitHoldController {
                 object: owner,
                 queue: .main
             ) { [weak self] _ in
-                // Runs on `.main`, so bridge into the main actor.
-                MainActor.assumeIsolated { self?.cancelHold() }
+                // Runs on `.main`; the owner window is closing, so abort the
+                // hold (reset state + dismiss overlay) — don't leave the gate
+                // in a stale .holding/.armed state.
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.apply(self.decision.handle(.externalCancel))
+                }
             }
         }
 
