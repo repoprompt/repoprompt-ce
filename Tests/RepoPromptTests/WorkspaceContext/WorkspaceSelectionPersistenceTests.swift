@@ -186,6 +186,56 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
         XCTAssertEqual(result.workspace.repoPaths, workspace.repoPaths)
     }
 
+    func testMalformedComposeTabSelectionDoesNotDropTabState() throws {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let activeChatSessionID = UUID()
+        let activeAgentSessionID = UUID()
+        let workspaceJSON = """
+        {
+          "id": "\(workspaceID.uuidString)",
+          "schemaVersion": 1,
+          "name": "Selection Decode Recovery",
+          "repoPaths": ["/tmp/root"],
+          "composeTabs": [
+            {
+              "id": "\(tabID.uuidString)",
+              "name": "Investigation",
+              "isPinned": true,
+              "activeChatSessionID": "\(activeChatSessionID.uuidString)",
+              "activeAgentSessionID": "\(activeAgentSessionID.uuidString)",
+              "selection": {
+                "selectedPaths": 42,
+                "manualCodemapPaths": ["/tmp/root/Manual.swift"],
+                "slices": {},
+                "codemapAutoEnabled": false
+              },
+              "expandedFolders": ["/tmp/root/Sources"],
+              "promptText": "preserve this prompt",
+              "selectedMetaPromptIDs": []
+            }
+          ],
+          "activeComposeTabID": "\(tabID.uuidString)",
+          "stashedTabs": []
+        }
+        """
+
+        let data = try XCTUnwrap(workspaceJSON.data(using: .utf8))
+        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: data)
+
+        XCTAssertEqual(decoded.composeTabs.count, 1)
+        let tab = try XCTUnwrap(decoded.composeTabs.first)
+        XCTAssertEqual(tab.id, tabID)
+        XCTAssertEqual(tab.name, "Investigation")
+        XCTAssertTrue(tab.isPinned)
+        XCTAssertEqual(tab.activeChatSessionID, activeChatSessionID)
+        XCTAssertEqual(tab.activeAgentSessionID, activeAgentSessionID)
+        XCTAssertEqual(tab.expandedFolders, ["/tmp/root/Sources"])
+        XCTAssertEqual(tab.promptText, "preserve this prompt")
+        XCTAssertEqual(tab.selection, StoredSelection())
+        XCTAssertEqual(decoded.activeComposeTabID, tabID)
+    }
+
     private static func workspace(
         id: UUID,
         tabID: UUID,

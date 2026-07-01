@@ -165,14 +165,11 @@ struct StoredSelection: Codable, Equatable, Hashable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let codemapAutoEnabled = try container.decodeIfPresent(Bool.self, forKey: .codemapAutoEnabled) ?? true
-        let decodedManualCodemapPaths = try container.decodeIfPresent([String].self, forKey: .manualCodemapPaths)
-        let legacyAutoCodemapPaths = try container.decodeIfPresent([String].self, forKey: .autoCodemapPaths) ?? []
         try self.init(
             selectedPaths: container.decodeIfPresent([String].self, forKey: .selectedPaths) ?? [],
-            manualCodemapPaths: decodedManualCodemapPaths ?? (codemapAutoEnabled ? [] : legacyAutoCodemapPaths),
+            manualCodemapPaths: container.decodeIfPresent([String].self, forKey: .manualCodemapPaths) ?? [],
             slices: container.decodeIfPresent([String: [LineRange]].self, forKey: .slices) ?? [:],
-            codemapAutoEnabled: codemapAutoEnabled
+            codemapAutoEnabled: container.decodeIfPresent(Bool.self, forKey: .codemapAutoEnabled) ?? true
         )
     }
 
@@ -180,7 +177,7 @@ struct StoredSelection: Codable, Equatable, Hashable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(selectedPaths, forKey: .selectedPaths)
         try container.encode(manualCodemapPaths, forKey: .manualCodemapPaths)
-        try container.encode(codemapAutoEnabled ? [] : manualCodemapPaths, forKey: .autoCodemapPaths)
+        try container.encode([String](), forKey: .autoCodemapPaths)
         try container.encode(slices, forKey: .slices)
         try container.encode(codemapAutoEnabled, forKey: .codemapAutoEnabled)
     }
@@ -305,7 +302,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         activeChatSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeChatSessionID)
         activeAgentSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeAgentSessionID)
-        selection = try c.decodeIfPresent(StoredSelection.self, forKey: .selection) ?? .init()
+        selection = (try? c.decodeIfPresent(StoredSelection.self, forKey: .selection)) ?? .init()
         expandedFolders = try c.decodeIfPresent([String].self, forKey: .expandedFolders) ?? []
         promptText = try c.decodeIfPresent(String.self, forKey: .promptText) ?? ""
         selectedMetaPromptIDs = try c.decodeIfPresent([UUID].self, forKey: .selectedMetaPromptIDs) ?? []
