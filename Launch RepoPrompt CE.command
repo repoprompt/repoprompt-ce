@@ -4,6 +4,7 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONDUCTOR="$ROOT_DIR/conductor"
 APP_ARGS=("$@")
+LAUNCHER_ADHOC_SIGNING=0
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "RepoPrompt CE's safe coordinated launcher requires Python 3."
@@ -21,23 +22,39 @@ elif [[ ! -x "$CONDUCTOR" ]]; then
     exit 1
 fi
 
+configure_debug_signing() {
+    if [[ -n "${SIGN_IDENTITY:-}" || "${ALLOW_ADHOC_SIGNING:-0}" == "1" || "${ALLOW_ADHOC_SIGNING:-0}" == "true" ]]; then
+        return 0
+    fi
+
+    local apple_development_identity
+    apple_development_identity="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/"Apple Development: / { print $2; exit }' || true)"
+    if [[ -n "$apple_development_identity" ]]; then
+        return 0
+    fi
+
+    export ALLOW_ADHOC_SIGNING=1
+    LAUNCHER_ADHOC_SIGNING=1
+}
+
 launch_app() {
     echo
     echo "Building and relaunching RepoPrompt CE..."
     echo "This run becomes the active launch; any older build or launch jobs still in flight are canceled."
+    if (( LAUNCHER_ADHOC_SIGNING )); then
+        echo "No Apple Development signing identity was found, so this launcher is using explicit ad-hoc debug signing."
+        echo "Debug secure storage will be in-memory; saved API keys and secure permission changes will not persist across app launches."
+    fi
     echo
+    local launch_log
+    launch_log="$(mktemp -t repoprompt-ce-launch)"
+    local relaunch_rc=0
     if (( ${#APP_ARGS[@]} > 0 )); then
-        if "$CONDUCTOR" app relaunch -- "${APP_ARGS[@]}"; then
-            echo
-            echo "RepoPrompt CE has been relaunched."
-        else
-            echo
-            echo "RepoPrompt CE was not relaunched."
-            echo "Check the result above to see whether the build failed or this run was canceled/replaced."
-            echo "If the build failed, fix the errors (or let in-flight edits settle), then press r to retry."
-            echo "Press s to check the current app and job state."
-        fi
-    elif "$CONDUCTOR" app relaunch; then
+        "$CONDUCTOR" app relaunch -- "${APP_ARGS[@]}" 2>&1 | tee "$launch_log" || relaunch_rc=${PIPESTATUS[0]}
+    else
+        "$CONDUCTOR" app relaunch 2>&1 | tee "$launch_log" || relaunch_rc=${PIPESTATUS[0]}
+    fi
+    if (( relaunch_rc == 0 )); then
         echo
         echo "RepoPrompt CE has been relaunched."
     else
@@ -46,7 +63,21 @@ launch_app() {
         echo "Check the result above to see whether the build failed or this run was canceled/replaced."
         echo "If the build failed, fix the errors (or let in-flight edits settle), then press r to retry."
         echo "Press s to check the current app and job state."
+        if grep -q "Debug ad-hoc signing is disabled by default" "$launch_log"; then
+            echo
+            echo "Debug signing was refused even though this launcher tried to configure it automatically."
+            echo "Run the same debug app from Terminal with explicit ad-hoc signing:"
+            echo
+            echo "  ALLOW_ADHOC_SIGNING=1 ./conductor app relaunch"
+            echo
+            echo "Ad-hoc debug builds use in-memory secure storage, so saved API keys and secure"
+            echo "permission changes do not persist across launches. For persistent debug"
+            echo "Keychain storage, pass a stable Apple Development identity explicitly:"
+            echo
+            echo "  SIGN_IDENTITY=\"Apple Development: Your Name (TEAMID)\" ./conductor app relaunch"
+        fi
     fi
+    rm -f "$launch_log"
 }
 
 show_status() {
@@ -112,6 +143,7 @@ echo "Project: $ROOT_DIR"
 echo "Mode:    coordinated (builds and launches run through the dev daemon)"
 
 cd "$ROOT_DIR" || exit 1
+configure_debug_signing
 launch_app
 
 while true; do

@@ -177,6 +177,97 @@ class LifecycleSurfaceTests(unittest.TestCase):
         self.assertIn("No uncoordinated fallback is provided", result.stdout)
         self.assertNotIn("Building and relaunching", result.stdout)
 
+    def test_finder_launcher_uses_ad_hoc_signing_when_no_identity_exists(self) -> None:
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(dirname)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "Launch RepoPrompt CE.command"
+            launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "dirname").symlink_to(dirname)
+            python = bin_dir / "python3"
+            python.write_text("binary", encoding="utf-8")
+            python.chmod(0o755)
+            conductor_log = root / "conductor-env.log"
+            conductor = root / "conductor"
+            conductor.write_text(
+                "#!/bin/bash\n"
+                "printf 'ALLOW_ADHOC_SIGNING=%s\\n' \"${ALLOW_ADHOC_SIGNING:-}\" >> conductor-env.log\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            conductor.chmod(0o755)
+            security = bin_dir / "security"
+            security.write_text("#!/bin/bash\nprintf '     0 valid identities found\\n'\n", encoding="utf-8")
+            security.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = str(bin_dir)
+            env.pop("SIGN_IDENTITY", None)
+            env.pop("ALLOW_ADHOC_SIGNING", None)
+
+            result = subprocess.run(
+                ["/bin/bash", str(launcher)],
+                env=env,
+                input="q",
+                text=True,
+                capture_output=True,
+                timeout=2,
+            )
+            conductor_log_text = conductor_log.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("using explicit ad-hoc debug signing", result.stdout)
+        self.assertIn("Debug secure storage will be in-memory", result.stdout)
+        self.assertIn("ALLOW_ADHOC_SIGNING=1", conductor_log_text)
+
+    def test_finder_launcher_shows_fallback_message_when_signing_still_refused(self) -> None:
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(dirname)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "Launch RepoPrompt CE.command"
+            launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "dirname").symlink_to(dirname)
+            python = bin_dir / "python3"
+            python.write_text("binary", encoding="utf-8")
+            python.chmod(0o755)
+            conductor = root / "conductor"
+            conductor.write_text(
+                "#!/bin/bash\n"
+                "echo 'ERROR: Debug ad-hoc signing is disabled by default. Set ALLOW_ADHOC_SIGNING=1 to build an ad-hoc package, or set SIGN_IDENTITY for stable signing.'\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            conductor.chmod(0o755)
+            security = bin_dir / "security"
+            security.write_text("#!/bin/bash\nprintf '     0 valid identities found\\n'\n", encoding="utf-8")
+            security.chmod(0o755)
+            env = os.environ.copy()
+            # Include system paths so tee, mktemp, grep, and rm are available
+            # for the launcher's reactive fallback log capture and grep.
+            env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+            env.pop("SIGN_IDENTITY", None)
+            env.pop("ALLOW_ADHOC_SIGNING", None)
+
+            result = subprocess.run(
+                ["/bin/bash", str(launcher)],
+                env=env,
+                input="q",
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("RepoPrompt CE was not relaunched", result.stdout)
+        self.assertIn("Debug signing was refused even though this launcher tried to configure it automatically", result.stdout)
+        self.assertIn("ALLOW_ADHOC_SIGNING=1 ./conductor app relaunch", result.stdout)
+        self.assertIn('SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./conductor app relaunch', result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
