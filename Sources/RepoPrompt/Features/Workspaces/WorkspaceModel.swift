@@ -165,11 +165,14 @@ struct StoredSelection: Codable, Equatable, Hashable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let codemapAutoEnabled = try container.decodeIfPresent(Bool.self, forKey: .codemapAutoEnabled) ?? true
+        let decodedManualCodemapPaths = try container.decodeIfPresent([String].self, forKey: .manualCodemapPaths)
+        let legacyAutoCodemapPaths = try container.decodeIfPresent([String].self, forKey: .autoCodemapPaths) ?? []
         try self.init(
             selectedPaths: container.decodeIfPresent([String].self, forKey: .selectedPaths) ?? [],
-            manualCodemapPaths: container.decodeIfPresent([String].self, forKey: .manualCodemapPaths) ?? [],
+            manualCodemapPaths: decodedManualCodemapPaths ?? (codemapAutoEnabled ? [] : legacyAutoCodemapPaths),
             slices: container.decodeIfPresent([String: [LineRange]].self, forKey: .slices) ?? [:],
-            codemapAutoEnabled: container.decodeIfPresent(Bool.self, forKey: .codemapAutoEnabled) ?? true
+            codemapAutoEnabled: codemapAutoEnabled
         )
     }
 
@@ -177,6 +180,7 @@ struct StoredSelection: Codable, Equatable, Hashable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(selectedPaths, forKey: .selectedPaths)
         try container.encode(manualCodemapPaths, forKey: .manualCodemapPaths)
+        try container.encode(codemapAutoEnabled ? [] : manualCodemapPaths, forKey: .autoCodemapPaths)
         try container.encode(slices, forKey: .slices)
         try container.encode(codemapAutoEnabled, forKey: .codemapAutoEnabled)
     }
@@ -184,6 +188,7 @@ struct StoredSelection: Codable, Equatable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case selectedPaths
         case manualCodemapPaths
+        case autoCodemapPaths
         case slices
         case codemapAutoEnabled
     }

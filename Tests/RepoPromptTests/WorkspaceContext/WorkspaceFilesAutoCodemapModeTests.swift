@@ -53,8 +53,10 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         XCTAssertTrue(snapshot.codemapAutoEnabled)
 
         let encoded = try JSONEncoder().encode(snapshot)
-        let encodedText = try XCTUnwrap(String(data: encoded, encoding: .utf8))
-        XCTAssertFalse(encodedText.contains("autoCodemapPaths"))
+        let encodedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        XCTAssertEqual(encodedObject["autoCodemapPaths"] as? [String], [])
 
         fixture.viewModel.setAutoCodemapFilesForTesting([fixture.file])
         XCTAssertEqual(fixture.viewModel.autoCodemapFiles.map(\.id), [fixture.file.id])
