@@ -164,6 +164,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var useTransparency: Bool?
         var collapseLatestFileChanges: Bool?
         var showTooltips: Bool?
+        var warnBeforeCmdQ: Bool?
         var experimentalAttributedTextEditor: Bool?
         var fileMentionPickerStyle: String?
         var enableKeyboardShortcuts: Bool?
@@ -175,6 +176,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             useTransparency: Bool? = nil,
             collapseLatestFileChanges: Bool? = nil,
             showTooltips: Bool? = nil,
+            warnBeforeCmdQ: Bool? = nil,
             experimentalAttributedTextEditor: Bool? = nil,
             fileMentionPickerStyle: String? = nil,
             enableKeyboardShortcuts: Bool? = nil,
@@ -185,6 +187,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.useTransparency = useTransparency
             self.collapseLatestFileChanges = collapseLatestFileChanges
             self.showTooltips = showTooltips
+            self.warnBeforeCmdQ = warnBeforeCmdQ
             self.experimentalAttributedTextEditor = experimentalAttributedTextEditor
             self.fileMentionPickerStyle = fileMentionPickerStyle
             self.enableKeyboardShortcuts = enableKeyboardShortcuts

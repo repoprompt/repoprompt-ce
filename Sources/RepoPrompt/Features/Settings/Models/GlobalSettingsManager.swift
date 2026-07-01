@@ -27,6 +27,9 @@ enum SettingKeys {
     /// Whether hover tooltips are shown globally.
     static let showTooltips = "showTooltips"
 
+    /// Whether to require holding ⌘Q before quitting (default on).
+    static let warnBeforeCmdQ = "warnBeforeCmdQ"
+
     /// Whether the MCP Oracle UI exposes the Model Presets affordance.
     /// Referenced by ChatSettingsView, MCPSettingsView, and the inline MCP toggle.
     static let mcpShowModelPresets = "mcpShowModelPresets"
@@ -449,6 +452,16 @@ class GlobalSettingsStore: ObservableObject {
     func setShowTooltips(_ enabled: Bool, commit: Bool = true) {
         updateUIScalar(commit: commit) { settings in
             settings.showTooltips = enabled
+        }
+    }
+
+    func warnBeforeCmdQ() -> Bool {
+        scalarPreferences.ui?.warnBeforeCmdQ ?? true
+    }
+
+    func setWarnBeforeCmdQ(_ enabled: Bool, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.warnBeforeCmdQ = enabled
         }
     }
 
