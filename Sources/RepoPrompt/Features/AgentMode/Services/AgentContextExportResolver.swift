@@ -375,12 +375,6 @@ enum AgentContextExportResolver {
         )
 
         let roots = await store.rootRefs(scope: lookupContext.rootScope)
-        var filesByID: [UUID: WorkspaceFileRecord] = [:]
-        for root in roots {
-            for file in await store.files(inRoot: root.id) {
-                filesByID[file.id] = file
-            }
-        }
         let presentationPlan = await WorkspaceCodemapPresentationIntentResolver.plan(
             codeMapUsage: codeMapUsage,
             selection: physicalSelection,
@@ -400,12 +394,19 @@ enum AgentContextExportResolver {
                     presentation,
                     preflightIssues: presentationPlan.preflightIssues
                 )
+                let codemapFilesByID = await codemapFileRecordsByID(
+                    for: presentation,
+                    resolution: resolution,
+                    roots: roots,
+                    store: store,
+                    codeMapUsage: codeMapUsage
+                )
                 return makeModel(
                     source: source,
                     lookupContext: lookupContext,
                     resolution: resolution,
                     roots: roots,
-                    filesByID: filesByID,
+                    codemapFilesByID: codemapFilesByID,
                     filePathDisplay: filePathDisplay,
                     codeMapUsage: codeMapUsage,
                     codemapPresentation: presentation,
@@ -422,12 +423,19 @@ enum AgentContextExportResolver {
                 unavailablePresentation(issue),
                 preflightIssues: presentationPlan.preflightIssues
             )
+            let codemapFilesByID = await codemapFileRecordsByID(
+                for: presentation,
+                resolution: resolution,
+                roots: roots,
+                store: store,
+                codeMapUsage: codeMapUsage
+            )
             return makeModel(
                 source: source,
                 lookupContext: lookupContext,
                 resolution: resolution,
                 roots: roots,
-                filesByID: filesByID,
+                codemapFilesByID: codemapFilesByID,
                 filePathDisplay: filePathDisplay,
                 codeMapUsage: codeMapUsage,
                 codemapPresentation: presentation,
@@ -810,7 +818,7 @@ enum AgentContextExportResolver {
         lookupContext: WorkspaceLookupContext,
         resolution: RowResolution,
         roots: [WorkspaceRootRef],
-        filesByID: [UUID: WorkspaceFileRecord],
+        codemapFilesByID: [UUID: WorkspaceFileRecord],
         filePathDisplay: FilePathDisplay,
         codeMapUsage: CodeMapUsage,
         codemapPresentation: WorkspaceCodemapOperationPresentation,
@@ -836,12 +844,13 @@ enum AgentContextExportResolver {
             }
         } else if codeMapUsage == .auto || codeMapUsage == .complete {
             var seenIDs = Set(rowEntries.map(\.entry.id))
+            let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
             for rendered in codemapPresentation.orderedEntries {
                 guard !resolution.selectedFileIDs.contains(rendered.fileID),
-                      let file = filesByID[rendered.fileID],
+                      let file = codemapFilesByID[rendered.fileID],
                       file.rootID == rendered.rootEpoch.rootID
                 else { continue }
-                let rootPath = roots.first(where: { $0.id == file.rootID })?.standardizedFullPath
+                let rootPath = rootsByID[file.rootID]?.standardizedFullPath
                 append(
                     ResolvedPromptFileEntry(
                         file: file,
@@ -887,6 +896,46 @@ enum AgentContextExportResolver {
             ),
             codemapPresentation: codemapPresentation
         )
+    }
+
+    private static func codemapFileRecordsByID(
+        for presentation: WorkspaceCodemapOperationPresentation,
+        resolution: RowResolution,
+        roots: [WorkspaceRootRef],
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage
+    ) async -> [UUID: WorkspaceFileRecord] {
+        guard codeMapUsage == .auto || codeMapUsage == .complete else { return [:] }
+
+        var wantedIDsByRootID: [UUID: Set<UUID>] = [:]
+        for rendered in presentation.orderedEntries where !resolution.selectedFileIDs.contains(rendered.fileID) {
+            wantedIDsByRootID[rendered.rootEpoch.rootID, default: []].insert(rendered.fileID)
+        }
+        guard !wantedIDsByRootID.isEmpty else { return [:] }
+
+        let allowedRootIDs = Set(roots.map(\.id))
+        let wantedFileCount = wantedIDsByRootID.values.reduce(0) { $0 + $1.count }
+        var filesByID: [UUID: WorkspaceFileRecord] = [:]
+        var skippedOutOfScopeCount = 0
+        for (rootID, wantedIDs) in wantedIDsByRootID {
+            guard allowedRootIDs.contains(rootID) else {
+                skippedOutOfScopeCount += wantedIDs.count
+                continue
+            }
+            for fileID in wantedIDs {
+                guard let file = await store.file(id: fileID), file.rootID == rootID else { continue }
+                filesByID[fileID] = file
+            }
+        }
+        AgentSelectedFilesDiagnostics.event(
+            "resolver.codemapFileRecords",
+            fields: [
+                "wantedFiles": String(wantedFileCount),
+                "resolvedFiles": String(filesByID.count),
+                "skippedOutOfScope": String(skippedOutOfScopeCount)
+            ]
+        )
+        return filesByID
     }
 
     static func unavailablePresentation(

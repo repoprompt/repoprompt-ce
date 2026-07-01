@@ -2270,6 +2270,7 @@ actor WorkspaceFileContextStore {
         private var codemapGraphWorkerStartCountForTesting = 0
         private var codemapProjectionRecoveryObserverStartCountForTesting = 0
         private var codemapProjectionRecoveryObserverRearmCountForTesting = 0
+        private var filesInRootRequestCountForTesting = 0
         private var codemapGraphPublicationWillFlushHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch, Int) async -> Void)?
         private var codemapProjectionRecoveryObserverWillWaitHandlerForTesting:
@@ -5620,11 +5621,19 @@ actor WorkspaceFileContextStore {
     }
 
     func files(inRoot rootID: UUID) -> [WorkspaceFileRecord] {
+        #if DEBUG
+            filesInRootRequestCountForTesting += 1
+        #endif
         guard let state = rootStatesByID[rootID] else { return [] }
         return state.fileIDsByRelativePath.values
             .filter(isDiscoverableFileID)
             .compactMap { filesByID[$0] }
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+    }
+
+    func file(id fileID: UUID) -> WorkspaceFileRecord? {
+        guard isDiscoverableFileID(fileID) else { return nil }
+        return filesByID[fileID]
     }
 
     private struct LoadedRootReusableSnapshotCurrentness {
@@ -15318,6 +15327,14 @@ actor WorkspaceFileContextStore {
                 projectionRecoveryObserversStarted: codemapProjectionRecoveryObserverStartCountForTesting,
                 projectionRecoveryObserverRearms: codemapProjectionRecoveryObserverRearmCountForTesting
             )
+        }
+
+        func resetFilesInRootRequestCountForTesting() {
+            filesInRootRequestCountForTesting = 0
+        }
+
+        func fileEnumerationRequestCountForTesting() -> Int {
+            filesInRootRequestCountForTesting
         }
 
         func codemapArtifactDemandRetainCountForTesting(

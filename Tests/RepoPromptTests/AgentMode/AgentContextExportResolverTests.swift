@@ -218,6 +218,44 @@ final class AgentContextExportResolverTests: XCTestCase {
         #endif
     }
 
+    func testSelectedFilesModelWithoutCodemapsDoesNotEnumerateWholeRoots() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AgentExportNoBroadEnumeration")
+            let selectedURL = root.appendingPathComponent("Sources/Feature/Selected.swift")
+            try write("struct Selected {}", to: selectedURL)
+            for index in 0 ..< 80 {
+                try write(
+                    "struct Bystander\(index) {}",
+                    to: root.appendingPathComponent("Sources/Generated/Level\(index % 8)/Nested\(index)/Bystander\(index).swift")
+                )
+            }
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            await store.resetFilesInRootRequestCountForTesting()
+            let source = AgentContextExportSource(
+                tabID: UUID(),
+                promptText: "Review",
+                selection: StoredSelection(selectedPaths: [selectedURL.path], codemapAutoEnabled: false),
+                selectedMetaPromptIDs: [],
+                tabName: "Agent Tab",
+                activeAgentSessionID: nil,
+                worktreeBindings: []
+            )
+
+            let model = await AgentContextExportResolver.resolveModel(
+                source: source,
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .none
+            )
+
+            XCTAssertEqual(model.rows.map(\.displayPath), ["Sources/Feature/Selected.swift"])
+            let filesInRootRequestCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(filesInRootRequestCount, 0)
+        #endif
+    }
+
     func testWorktreeExportUsesPhysicalContentWhileDisplayingLogicalPath() async throws {
         let fixture = try await makeBoundFixture()
         let source = makeSource(

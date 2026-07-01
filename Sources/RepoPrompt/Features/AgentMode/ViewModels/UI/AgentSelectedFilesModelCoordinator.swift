@@ -167,6 +167,42 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
 
         refreshTask = Task { [weak self, resolver] in
             let resolveStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+            if Self.shouldResolveFileRowsFirst(request) {
+                let fileRowsRequest = Self.fileRowsOnlyRequest(from: request)
+                let fileRowsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+                let fileRowsModel = await resolver(fileRowsRequest)
+                guard !Task.isCancelled else {
+                    AgentSelectedFilesDiagnostics.event(
+                        "coordinator.resolve.cancelledAfterFileRows",
+                        fields: refreshFields.merging(AgentSelectedFilesDiagnostics.elapsedFields(since: fileRowsStartMS)) { _, new in new }
+                    )
+                    return
+                }
+                let shouldContinue = await MainActor.run { [weak self] in
+                    guard let self else { return false }
+                    guard self.refreshID == refreshID, loadingIdentity == request.identity else {
+                        debugStats.staleResultsIgnored += 1
+                        AgentSelectedFilesDiagnostics.event(
+                            "coordinator.resolve.fileRowsStaleIgnored",
+                            fields: refreshFields.merging(AgentSelectedFilesDiagnostics.elapsedFields(since: fileRowsStartMS)) { _, new in new },
+                            includeStack: true
+                        )
+                        return false
+                    }
+                    var fileRowsFields = refreshFields.merging(AgentSelectedFilesDiagnostics.elapsedFields(since: fileRowsStartMS)) { _, new in new }
+                    fileRowsFields["rowCount"] = String(fileRowsModel.rows.count)
+                    fileRowsFields["missingPaths"] = String(fileRowsModel.missingPaths.count)
+                    fileRowsFields["invalidPaths"] = String(fileRowsModel.invalidPaths.count)
+                    AgentSelectedFilesDiagnostics.event("coordinator.resolve.fileRowsReady", fields: fileRowsFields)
+                    state = AgentSelectedFilesModelState(
+                        model: fileRowsModel,
+                        rowSplit: AgentSelectedFilesRowSplit(rows: fileRowsModel.rows),
+                        isLoading: true
+                    )
+                    return true
+                }
+                guard shouldContinue else { return }
+            }
             let resolvedModel = await resolver(request)
             guard !Task.isCancelled else {
                 AgentSelectedFilesDiagnostics.event(
@@ -284,6 +320,37 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
     private func touchCachedModel(_ identity: AgentSelectedFilesModelIdentity) {
         cachedModelOrder.removeAll { $0 == identity }
         cachedModelOrder.append(identity)
+    }
+
+    private static func shouldResolveFileRowsFirst(_ request: AgentSelectedFilesModelRequest) -> Bool {
+        guard hasExplicitFileRows(request.source.selection) else { return false }
+        switch request.codeMapUsage {
+        case .auto:
+            return request.source.selection.codemapAutoEnabled || !request.source.selection.manualCodemapPaths.isEmpty
+        case .complete:
+            return true
+        case .none, .selected:
+            return false
+        }
+    }
+
+    private static func hasExplicitFileRows(_ selection: StoredSelection) -> Bool {
+        if !selection.selectedPaths.isEmpty { return true }
+        return selection.slices.contains { !$0.value.isEmpty }
+    }
+
+    private static func fileRowsOnlyRequest(from request: AgentSelectedFilesModelRequest) -> AgentSelectedFilesModelRequest {
+        AgentSelectedFilesModelRequest(
+            identity: AgentSelectedFilesModelIdentity(
+                exportContextIdentity: request.identity.exportContextIdentity,
+                filePathDisplay: request.identity.filePathDisplay,
+                codeMapUsage: .none
+            ),
+            source: request.source,
+            store: request.store,
+            filePathDisplay: request.filePathDisplay,
+            codeMapUsage: .none
+        )
     }
 
     private static func resolveModel(_ request: AgentSelectedFilesModelRequest) async -> AgentContextExportModel {

@@ -1,6 +1,11 @@
 import Combine
 import SwiftUI
 
+private enum AgentSelectedFilesPopoverTab {
+    case files
+    case codemaps
+}
+
 struct AgentExportCard: View {
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject var tokenCounter: TokenCountingViewModel
@@ -208,6 +213,7 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
 
     @StateObject private var modelCoordinator = AgentSelectedFilesModelCoordinator()
     @State private var showSelectedFilesPopover = false
+    @State private var activePopoverTab: AgentSelectedFilesPopoverTab = .files
 
     private var selectionSummary: AgentContextSelectionSummary {
         if let summaryOverride {
@@ -241,6 +247,7 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
                 rowSplit: modelCoordinator.rowSplit,
                 isLoading: modelCoordinator.isLoading,
                 placeholderFileCount: selectionCount,
+                activeTab: $activePopoverTab,
                 canMutate: selectionCoordinator != nil,
                 onLoadContent: { row, purpose in
                     guard let model = modelCoordinator.model else { return nil }
@@ -256,6 +263,10 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
                 maxHeight: 440
             )
         }
+        .onChange(of: activePopoverTab) { _, _ in
+            guard showSelectedFilesPopover else { return }
+            refreshExportModel(preserveDisplayedModel: true)
+        }
         .onChange(of: showSelectedFilesPopover) { _, isPresented in
             AgentSelectedFilesDiagnostics.event(
                 "trigger.popover.visibilityChanged",
@@ -263,6 +274,7 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
                 includeStack: true
             )
             if isPresented {
+                activePopoverTab = .files
                 refreshExportModel()
             } else {
                 modelCoordinator.cancelLoading(keepLoadedModel: true)
@@ -324,23 +336,33 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
         let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let source = makeExportSource(flushPendingUI: flushPendingUI)
         let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
+        let codeMapUsage = effectiveCodeMapUsage(for: activePopoverTab, configuredUsage: cfg.codeMapUsage)
         var fields = AgentSelectedFilesDiagnostics.sourceFields(source)
         fields["component"] = "trigger"
         fields["flushPendingUI"] = String(flushPendingUI)
-        fields["codeMapUsage"] = String(describing: cfg.codeMapUsage)
+        fields["activeTab"] = String(describing: activePopoverTab)
+        fields["configuredCodeMapUsage"] = String(describing: cfg.codeMapUsage)
+        fields["codeMapUsage"] = String(describing: codeMapUsage)
         fields.merge(AgentSelectedFilesDiagnostics.elapsedFields(since: startMS)) { _, new in new }
         AgentSelectedFilesDiagnostics.event("view.makeModelRequest", fields: fields)
         return AgentSelectedFilesModelRequest(
             identity: AgentSelectedFilesModelIdentity(
                 exportContextIdentity: source.exportContextIdentity,
                 filePathDisplay: promptManager.filePathDisplayOption,
-                codeMapUsage: cfg.codeMapUsage
+                codeMapUsage: codeMapUsage
             ),
             source: source,
             store: promptManager.workspaceFileContextStore,
             filePathDisplay: promptManager.filePathDisplayOption,
-            codeMapUsage: cfg.codeMapUsage
+            codeMapUsage: codeMapUsage
         )
+    }
+
+    private func effectiveCodeMapUsage(
+        for activeTab: AgentSelectedFilesPopoverTab,
+        configuredUsage: CodeMapUsage
+    ) -> CodeMapUsage {
+        activeTab == .codemaps ? configuredUsage : .none
     }
 
     private func refreshExportModel(force: Bool = false, preserveDisplayedModel: Bool = false) {
@@ -460,6 +482,7 @@ struct AgentSelectedFilesInlineManager: View {
     let summary: AgentContextSelectionSummary
 
     @StateObject private var modelCoordinator = AgentSelectedFilesModelCoordinator()
+    @State private var activePopoverTab: AgentSelectedFilesPopoverTab = .files
 
     private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
         selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
@@ -471,6 +494,7 @@ struct AgentSelectedFilesInlineManager: View {
             rowSplit: modelCoordinator.rowSplit,
             isLoading: modelCoordinator.isLoading,
             placeholderFileCount: summary.totalExplicitFileCount,
+            activeTab: $activePopoverTab,
             canMutate: selectionCoordinator != nil,
             onLoadContent: { row, purpose in
                 guard let model = modelCoordinator.model else { return nil }
@@ -482,6 +506,9 @@ struct AgentSelectedFilesInlineManager: View {
         .onAppear {
             AgentSelectedFilesDiagnostics.event("inline.onAppear", includeStack: true)
             refreshExportModel()
+        }
+        .onChange(of: activePopoverTab) { _, _ in
+            refreshExportModel(preserveDisplayedModel: true)
         }
         .onDisappear {
             AgentSelectedFilesDiagnostics.event("inline.onDisappear", includeStack: true)
@@ -538,23 +565,33 @@ struct AgentSelectedFilesInlineManager: View {
         let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let source = makeExportSource(flushPendingUI: flushPendingUI)
         let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
+        let codeMapUsage = effectiveCodeMapUsage(for: activePopoverTab, configuredUsage: cfg.codeMapUsage)
         var fields = AgentSelectedFilesDiagnostics.sourceFields(source)
         fields["component"] = "inline"
         fields["flushPendingUI"] = String(flushPendingUI)
-        fields["codeMapUsage"] = String(describing: cfg.codeMapUsage)
+        fields["activeTab"] = String(describing: activePopoverTab)
+        fields["configuredCodeMapUsage"] = String(describing: cfg.codeMapUsage)
+        fields["codeMapUsage"] = String(describing: codeMapUsage)
         fields.merge(AgentSelectedFilesDiagnostics.elapsedFields(since: startMS)) { _, new in new }
         AgentSelectedFilesDiagnostics.event("view.makeModelRequest", fields: fields)
         return AgentSelectedFilesModelRequest(
             identity: AgentSelectedFilesModelIdentity(
                 exportContextIdentity: source.exportContextIdentity,
                 filePathDisplay: promptManager.filePathDisplayOption,
-                codeMapUsage: cfg.codeMapUsage
+                codeMapUsage: codeMapUsage
             ),
             source: source,
             store: promptManager.workspaceFileContextStore,
             filePathDisplay: promptManager.filePathDisplayOption,
-            codeMapUsage: cfg.codeMapUsage
+            codeMapUsage: codeMapUsage
         )
+    }
+
+    private func effectiveCodeMapUsage(
+        for activeTab: AgentSelectedFilesPopoverTab,
+        configuredUsage: CodeMapUsage
+    ) -> CodeMapUsage {
+        activeTab == .codemaps ? configuredUsage : .none
     }
 
     private func refreshExportModel(force: Bool = false, preserveDisplayedModel: Bool = false) {
@@ -659,6 +696,7 @@ private struct AgentSelectedFilesPopover: View {
     let rowSplit: AgentSelectedFilesRowSplit
     let isLoading: Bool
     let placeholderFileCount: Int
+    @Binding var activeTab: AgentSelectedFilesPopoverTab
     let canMutate: Bool
     let onLoadContent: (AgentContextExportRow, AgentContextExportRow.ContentPurpose) async -> String?
     let onRemove: (AgentContextExportRow, AgentContextExportModel) -> Void
@@ -666,12 +704,6 @@ private struct AgentSelectedFilesPopover: View {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @StateObject private var previewCoordinator = AgentSelectedFilePreviewLoadCoordinator()
-    @State private var activeTab: Tab = .files
-
-    private enum Tab {
-        case files
-        case codemaps
-    }
 
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -695,7 +727,7 @@ private struct AgentSelectedFilesPopover: View {
                             ForEach(activeRows) { row in
                                 AgentSelectedFileRow(
                                     row: row,
-                                    canRemove: !isLoading && canMutate && row.canRemove,
+                                    canRemove: canMutate && row.canRemove,
                                     previewCoordinator: previewCoordinator,
                                     onLoadContent: onLoadContent,
                                     onRemove: { row in
@@ -731,7 +763,7 @@ private struct AgentSelectedFilesPopover: View {
         }
     }
 
-    private func rows(for tab: Tab) -> [AgentContextExportRow] {
+    private func rows(for tab: AgentSelectedFilesPopoverTab) -> [AgentContextExportRow] {
         switch tab {
         case .files: rowSplit.fileRows
         case .codemaps: rowSplit.codemapRows
@@ -765,7 +797,7 @@ private struct AgentSelectedFilesPopover: View {
                 .font(fontPreset.captionFont.weight(.medium))
         }
         .buttonStyle(CustomButtonStyle(verticalPadding: 3, horizontalPadding: 8))
-        .disabled(isLoading || split.rows.isEmpty || !canMutate || model == nil)
+        .disabled(split.rows.isEmpty || !canMutate || model == nil)
         .hoverTooltip(canMutate ? "Clear selection" : "Unavailable")
         .accessibilityHint(canMutate ? "Clear selection" : "Selection unavailable")
     }
@@ -774,7 +806,7 @@ private struct AgentSelectedFilesPopover: View {
         icon: String,
         label: String,
         count: Int,
-        tab: Tab,
+        tab: AgentSelectedFilesPopoverTab,
         action: @escaping () -> Void
     ) -> some View {
         let isActive = activeTab == tab

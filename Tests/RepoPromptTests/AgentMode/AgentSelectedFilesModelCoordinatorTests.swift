@@ -52,6 +52,35 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testAutoCodemapRequestPublishesFileRowsBeforeFullModelCompletes() async {
+        let resolver = ProgressiveCodemapModelResolver()
+        let coordinator = AgentSelectedFilesModelCoordinator { request in
+            await resolver.resolve(request)
+        }
+        let request = makeRequest(name: "A.swift", codeMapUsage: .auto, codemapAutoEnabled: true)
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(request), .started)
+        let didDisplayFileRows = await waitUntilDisplayedModel(promptText: "A.swift", in: coordinator)
+        let didStartFullCodemapModel = await resolver.waitUntilStartCount(.auto, count: 1)
+
+        XCTAssertTrue(didDisplayFileRows)
+        XCTAssertTrue(didStartFullCodemapModel)
+        XCTAssertTrue(coordinator.isLoading)
+        XCTAssertEqual(coordinator.rowSplit.fileRows.count, 1)
+        XCTAssertEqual(coordinator.rowSplit.codemapRows.count, 0)
+        let startedUsages = await resolver.startedUsages()
+        XCTAssertEqual(startedUsages, [.none, .auto])
+
+        await resolver.releaseNext(.auto)
+        let didLoadFullModel = await waitUntilModel(promptText: "A.swift", in: coordinator)
+
+        XCTAssertTrue(didLoadFullModel)
+        XCTAssertFalse(coordinator.isLoading)
+        XCTAssertEqual(coordinator.debugStats.resolverStarts, 1)
+        XCTAssertEqual(coordinator.debugStats.resolverCompletions, 1)
+    }
+
+    @MainActor
     func testIdentityChangeCancelsOldLoadAndAcceptsNewestResultOnly() async {
         let resolver = GatedModelResolver()
         let coordinator = AgentSelectedFilesModelCoordinator { request in
@@ -305,11 +334,28 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         return coordinator.model?.source.promptText == promptText && !coordinator.isLoading
     }
 
-    private func makeRequest(name: String) -> AgentSelectedFilesModelRequest {
+    @MainActor
+    private func waitUntilDisplayedModel(
+        promptText: String,
+        in coordinator: AgentSelectedFilesModelCoordinator
+    ) async -> Bool {
+        for _ in 0 ..< 500 {
+            if coordinator.model?.source.promptText == promptText { return true }
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return coordinator.model?.source.promptText == promptText
+    }
+
+    private func makeRequest(
+        name: String,
+        codeMapUsage: CodeMapUsage = .none,
+        codemapAutoEnabled: Bool = false
+    ) -> AgentSelectedFilesModelRequest {
         let source = AgentContextExportSource(
             tabID: UUID(),
             promptText: name,
-            selection: StoredSelection(selectedPaths: ["Sources/\(name)"], codemapAutoEnabled: false),
+            selection: StoredSelection(selectedPaths: ["Sources/\(name)"], codemapAutoEnabled: codemapAutoEnabled),
             selectedMetaPromptIDs: [],
             tabName: "Test",
             activeAgentSessionID: nil,
@@ -319,12 +365,12 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
             identity: AgentSelectedFilesModelIdentity(
                 exportContextIdentity: source.exportContextIdentity,
                 filePathDisplay: .relative,
-                codeMapUsage: .none
+                codeMapUsage: codeMapUsage
             ),
             source: source,
             store: WorkspaceFileContextStore(),
             filePathDisplay: .relative,
-            codeMapUsage: .none
+            codeMapUsage: codeMapUsage
         )
     }
 
@@ -380,6 +426,45 @@ private actor GatedModelResolver {
 
     func startCount() -> Int {
         starts
+    }
+}
+
+private actor ProgressiveCodemapModelResolver {
+    private var usages: [CodeMapUsage] = []
+    private var startedCounts: [String: Int] = [:]
+    private var continuations: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func resolve(_ request: AgentSelectedFilesModelRequest) async -> AgentContextExportModel {
+        usages.append(request.codeMapUsage)
+        let key = request.codeMapUsage.rawValue
+        startedCounts[key, default: 0] += 1
+        if request.codeMapUsage == .auto || request.codeMapUsage == .complete {
+            await withCheckedContinuation { continuation in
+                continuations[key, default: []].append(continuation)
+            }
+        }
+        return makeModel(for: request)
+    }
+
+    func waitUntilStartCount(_ usage: CodeMapUsage, count: Int) async -> Bool {
+        let key = usage.rawValue
+        for _ in 0 ..< 500 {
+            if startedCounts[key, default: 0] >= count { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return startedCounts[key, default: 0] >= count
+    }
+
+    func releaseNext(_ usage: CodeMapUsage) {
+        let key = usage.rawValue
+        guard var queued = continuations[key], !queued.isEmpty else { return }
+        let continuation = queued.removeFirst()
+        continuations[key] = queued
+        continuation.resume()
+    }
+
+    func startedUsages() -> [CodeMapUsage] {
+        usages
     }
 }
 
