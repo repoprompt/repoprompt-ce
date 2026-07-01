@@ -689,9 +689,7 @@ enum AgentContextExportResolver {
         guard source.hasWorktreeBindings,
               source.worktreeBindings.count >= 1,
               metadataOnlyBindingsAreSafe(source.worktreeBindings),
-              codeMapUsage != .selected,
-              codeMapUsage != .complete,
-              source.selection.manualCodemapPaths.isEmpty,
+              codeMapUsage == .none,
               let sessionID = source.activeAgentSessionID
         else { return nil }
 

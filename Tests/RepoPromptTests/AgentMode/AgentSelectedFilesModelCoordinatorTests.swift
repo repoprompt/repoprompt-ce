@@ -66,6 +66,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertTrue(didDisplayFileRows)
         XCTAssertTrue(didStartFullCodemapModel)
         XCTAssertTrue(coordinator.isLoading)
+        XCTAssertFalse(coordinator.canMutateDisplayedModel)
         XCTAssertEqual(coordinator.rowSplit.fileRows.count, 1)
         XCTAssertEqual(coordinator.rowSplit.codemapRows.count, 0)
         let startedUsages = await resolver.startedUsages()
@@ -76,6 +77,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(didLoadFullModel)
         XCTAssertFalse(coordinator.isLoading)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
         XCTAssertEqual(coordinator.debugStats.resolverStarts, 1)
         XCTAssertEqual(coordinator.debugStats.resolverCompletions, 1)
     }
@@ -169,10 +171,12 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertTrue(didStartA)
         XCTAssertEqual(coordinator.model?.source.promptText, "C.swift")
         XCTAssertTrue(coordinator.isLoading)
+        XCTAssertFalse(coordinator.canMutateDisplayedModel)
 
         XCTAssertEqual(coordinator.refreshIfNeeded(requestB), .skippedLoaded)
         XCTAssertEqual(coordinator.model?.source.promptText, "B.swift")
         XCTAssertFalse(coordinator.isLoading)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
         XCTAssertEqual(coordinator.debugStats.cancellations, 1)
 
         await resolver.releaseNext("A.swift")
@@ -180,7 +184,38 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(coordinator.model?.source.promptText, "B.swift")
         XCTAssertFalse(coordinator.isLoading)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
         XCTAssertEqual(coordinator.debugStats.resolverCompletions, 2)
+    }
+
+    @MainActor
+    func testPreservedDisplayedModelCannotMutateWhileNewIdentityLoads() async {
+        let resolver = GatedModelResolver()
+        let coordinator = AgentSelectedFilesModelCoordinator { request in
+            await resolver.resolve(request)
+        }
+        let requestA = makeRequest(name: "A.swift")
+        let requestB = makeRequest(name: "B.swift")
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestA), .started)
+        let didStartA = await resolver.waitUntilStartCount("A.swift", count: 1)
+        XCTAssertTrue(didStartA)
+        await resolver.releaseNext("A.swift")
+        let didLoadA = await waitUntilModel(promptText: "A.swift", in: coordinator)
+        XCTAssertTrue(didLoadA)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(requestB, preserveDisplayedModel: true), .started)
+        let didStartB = await resolver.waitUntilStartCount("B.swift", count: 1)
+        XCTAssertTrue(didStartB)
+        XCTAssertEqual(coordinator.model?.source.promptText, "A.swift")
+        XCTAssertTrue(coordinator.isLoading)
+        XCTAssertFalse(coordinator.canMutateDisplayedModel)
+
+        await resolver.releaseNext("B.swift")
+        let didLoadB = await waitUntilModel(promptText: "B.swift", in: coordinator)
+        XCTAssertTrue(didLoadB)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
     }
 
     @MainActor

@@ -310,6 +310,26 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(clipboard.contains("let origin = \"base\""), clipboard)
     }
 
+    func testBoundWorktreeAutoCodemapDoesNotUseMetadataOnlyFastPathWhenAutoCodemapEnabled() async throws {
+        let fixture = try await makeBoundFixture()
+        _ = try await fixture.store.loadRoot(path: fixture.worktreeRoot.path)
+        let source = makeSource(
+            logicalRoot: fixture.logicalRoot,
+            worktreeRoot: fixture.worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/App.swift"], codemapAutoEnabled: true)
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: fixture.store,
+            filePathDisplay: .relative,
+            codeMapUsage: .auto
+        )
+
+        XCTAssertEqual(model.rows.first?.displayPath, "Sources/App.swift")
+        XCTAssertTrue(model.rows.allSatisfy { $0.directContentPath == nil })
+    }
+
     func testMetadataOnlyWorktreeExportDoesNotDirectReadSymlinkEscapingRoot() async throws {
         let fixture = try await makeBoundFixture()
         let externalRoot = try makeTemporaryRoot(name: "AgentExportExternal")

@@ -246,6 +246,7 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
                 model: modelCoordinator.model,
                 rowSplit: modelCoordinator.rowSplit,
                 isLoading: modelCoordinator.isLoading,
+                canMutateDisplayedModel: modelCoordinator.canMutateDisplayedModel,
                 placeholderFileCount: selectionCount,
                 activeTab: $activePopoverTab,
                 canMutate: selectionCoordinator != nil,
@@ -493,6 +494,7 @@ struct AgentSelectedFilesInlineManager: View {
             model: modelCoordinator.model,
             rowSplit: modelCoordinator.rowSplit,
             isLoading: modelCoordinator.isLoading,
+            canMutateDisplayedModel: modelCoordinator.canMutateDisplayedModel,
             placeholderFileCount: summary.totalExplicitFileCount,
             activeTab: $activePopoverTab,
             canMutate: selectionCoordinator != nil,
@@ -695,6 +697,7 @@ private struct AgentSelectedFilesPopover: View {
     let model: AgentContextExportModel?
     let rowSplit: AgentSelectedFilesRowSplit
     let isLoading: Bool
+    let canMutateDisplayedModel: Bool
     let placeholderFileCount: Int
     @Binding var activeTab: AgentSelectedFilesPopoverTab
     let canMutate: Bool
@@ -719,7 +722,9 @@ private struct AgentSelectedFilesPopover: View {
                 emptyState(title: "No files selected")
             } else {
                 let activeRows = rows(for: activeTab)
-                if activeRows.isEmpty {
+                if isLoading, activeTab == .codemaps, rowSplit.codemapRows.isEmpty {
+                    loadingSkeletonRows(count: 2)
+                } else if activeRows.isEmpty {
                     emptyState(title: activeTab == .files ? "No files in Agent context" : "No codemaps in Agent context")
                 } else {
                     ScrollView(.vertical, showsIndicators: true) {
@@ -727,7 +732,7 @@ private struct AgentSelectedFilesPopover: View {
                             ForEach(activeRows) { row in
                                 AgentSelectedFileRow(
                                     row: row,
-                                    canRemove: canMutate && row.canRemove,
+                                    canRemove: canMutateDisplayedRows && row.canRemove,
                                     previewCoordinator: previewCoordinator,
                                     onLoadContent: onLoadContent,
                                     onRemove: { row in
@@ -797,9 +802,13 @@ private struct AgentSelectedFilesPopover: View {
                 .font(fontPreset.captionFont.weight(.medium))
         }
         .buttonStyle(CustomButtonStyle(verticalPadding: 3, horizontalPadding: 8))
-        .disabled(split.rows.isEmpty || !canMutate || model == nil)
+        .disabled(split.rows.isEmpty || !canMutateDisplayedRows)
         .hoverTooltip(canMutate ? "Clear selection" : "Unavailable")
         .accessibilityHint(canMutate ? "Clear selection" : "Selection unavailable")
+    }
+
+    private var canMutateDisplayedRows: Bool {
+        canMutate && canMutateDisplayedModel && model != nil
     }
 
     private func tabButton(

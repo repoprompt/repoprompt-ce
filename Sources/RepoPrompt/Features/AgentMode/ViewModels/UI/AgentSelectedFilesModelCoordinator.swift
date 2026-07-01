@@ -59,8 +59,14 @@ struct AgentSelectedFilesModelState: Equatable {
     var model: AgentContextExportModel?
     var rowSplit: AgentSelectedFilesRowSplit
     var isLoading: Bool
+    var canMutateDisplayedModel: Bool
 
-    static let empty = AgentSelectedFilesModelState(model: nil, rowSplit: .empty, isLoading: false)
+    static let empty = AgentSelectedFilesModelState(
+        model: nil,
+        rowSplit: .empty,
+        isLoading: false,
+        canMutateDisplayedModel: false
+    )
 }
 
 @MainActor
@@ -80,6 +86,10 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
 
     var isLoading: Bool {
         state.isLoading
+    }
+
+    var canMutateDisplayedModel: Bool {
+        state.canMutateDisplayedModel
     }
 
     private let resolver: ResolveModel
@@ -117,7 +127,12 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
 
         if !force, loadedIdentity == request.identity, model != nil {
             cancelActiveRefresh(reason: "skipLoaded", fields: refreshFields)
-            state = AgentSelectedFilesModelState(model: state.model, rowSplit: state.rowSplit, isLoading: false)
+            state = AgentSelectedFilesModelState(
+                model: state.model,
+                rowSplit: state.rowSplit,
+                isLoading: false,
+                canMutateDisplayedModel: true
+            )
             debugStats.skippedLoaded += 1
             AgentSelectedFilesDiagnostics.event("coordinator.refresh.skipLoaded", fields: refreshFields)
             return .skippedLoaded
@@ -130,7 +145,8 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             state = AgentSelectedFilesModelState(
                 model: cachedModel,
                 rowSplit: AgentSelectedFilesRowSplit(rows: cachedModel.rows),
-                isLoading: false
+                isLoading: false,
+                canMutateDisplayedModel: true
             )
             loadedIdentity = request.identity
             AgentSelectedFilesDiagnostics.event("coordinator.refresh.skipCached", fields: refreshFields)
@@ -157,7 +173,8 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         state = AgentSelectedFilesModelState(
             model: shouldClearDisplayedModel ? nil : state.model,
             rowSplit: shouldClearDisplayedModel ? .empty : state.rowSplit,
-            isLoading: true
+            isLoading: true,
+            canMutateDisplayedModel: false
         )
         debugStats.resolverStarts += 1
         refreshFields["shouldClearLoadedModel"] = String(shouldClearLoadedModel)
@@ -197,7 +214,8 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                     state = AgentSelectedFilesModelState(
                         model: fileRowsModel,
                         rowSplit: AgentSelectedFilesRowSplit(rows: fileRowsModel.rows),
-                        isLoading: true
+                        isLoading: true,
+                        canMutateDisplayedModel: false
                     )
                     return true
                 }
@@ -231,7 +249,8 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                 state = AgentSelectedFilesModelState(
                     model: resolvedModel,
                     rowSplit: AgentSelectedFilesRowSplit(rows: resolvedModel.rows),
-                    isLoading: false
+                    isLoading: false,
+                    canMutateDisplayedModel: true
                 )
                 cacheModel(resolvedModel, for: request.identity)
                 loadedIdentity = request.identity
@@ -263,7 +282,12 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         refreshID = nil
         loadingIdentity = nil
         state = keepLoadedModel
-            ? AgentSelectedFilesModelState(model: state.model, rowSplit: state.rowSplit, isLoading: false)
+            ? AgentSelectedFilesModelState(
+                model: state.model,
+                rowSplit: state.rowSplit,
+                isLoading: false,
+                canMutateDisplayedModel: loadedIdentity != nil && state.model != nil
+            )
             : .empty
         if !keepLoadedModel {
             loadedIdentity = nil
