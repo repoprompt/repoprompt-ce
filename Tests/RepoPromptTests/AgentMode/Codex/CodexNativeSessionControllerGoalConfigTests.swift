@@ -194,6 +194,70 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertNil(params["path"])
     }
 
+    func testStartAndResumeOmitNilServiceTier() async throws {
+        let (startController, startRecordURL) = try await makeController(options: makeOptions())
+        _ = try await startController.startOrResume(
+            existing: nil,
+            baseInstructions: "Agent",
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil
+        )
+        await startController.shutdown()
+        let startParams = try recordedParams(for: "thread/start", at: startRecordURL)
+        XCTAssertFalse(startParams.keys.contains("serviceTier"), "Nil service tier should be omitted, not sent as explicit default")
+
+        let (resumeController, resumeRecordURL) = try await makeController(options: makeOptions())
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: "existing-thread",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil
+        )
+        _ = try await resumeController.startOrResume(
+            existing: existing,
+            baseInstructions: "Agent",
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil
+        )
+        await resumeController.shutdown()
+        let resumeParams = try recordedParams(for: "thread/resume", at: resumeRecordURL)
+        XCTAssertFalse(resumeParams.keys.contains("serviceTier"), "Nil service tier should be omitted, not sent as explicit default")
+    }
+
+    func testStartAndResumeSendExplicitServiceTier() async throws {
+        let (startController, startRecordURL) = try await makeController(options: makeOptions())
+        _ = try await startController.startOrResume(
+            existing: nil,
+            baseInstructions: "Agent",
+            model: "gpt-5.4",
+            reasoningEffort: "high",
+            serviceTier: " fast "
+        )
+        await startController.shutdown()
+        let startParams = try recordedParams(for: "thread/start", at: startRecordURL)
+        XCTAssertEqual(startParams["serviceTier"] as? String, "fast")
+
+        let (resumeController, resumeRecordURL) = try await makeController(options: makeOptions())
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: "existing-thread",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil
+        )
+        _ = try await resumeController.startOrResume(
+            existing: existing,
+            baseInstructions: "Agent",
+            model: "gpt-5.4",
+            reasoningEffort: "high",
+            serviceTier: " fast "
+        )
+        await resumeController.shutdown()
+        let resumeParams = try recordedParams(for: "thread/resume", at: resumeRecordURL)
+        XCTAssertEqual(resumeParams["serviceTier"] as? String, "fast")
+    }
+
     func testPathOnlyResumeFailsLocallyBeforeWritingRequest() async throws {
         let (controller, recordURL) = try await makeController(options: makeOptions())
         let existing = CodexNativeSessionController.SessionRef(
