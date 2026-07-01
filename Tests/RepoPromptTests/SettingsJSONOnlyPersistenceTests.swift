@@ -335,6 +335,64 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(reloaded.showDatesInMessageTimestamps())
     }
 
+    func testWarnBeforeCmdQDefaultsOnWithoutPersisting() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(ui: .init(showTooltips: false))
+        ))
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        let before = try String(contentsOf: fileURL, encoding: .utf8)
+
+        // Fresh install with no stored preference reads the default (on).
+        XCTAssertTrue(store.warnBeforeCmdQ())
+        XCTAssertNil(try fileStore.load().scalarPreferences?.ui?.warnBeforeCmdQ)
+        // Reading the default must not mutate the persisted document.
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), before)
+    }
+
+    func testWarnBeforeCmdQRoundTripsFalseAndTrue() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        store.setWarnBeforeCmdQ(false)
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.warnBeforeCmdQ, false)
+        XCTAssertFalse(store.warnBeforeCmdQ())
+
+        store.setWarnBeforeCmdQ(true)
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.warnBeforeCmdQ, true)
+        XCTAssertTrue(store.warnBeforeCmdQ())
+
+        // Setting survives a store reload (persists across launches).
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertTrue(reloaded.warnBeforeCmdQ())
+    }
+
+    func testWarnBeforeCmdQCodableRoundTripsAndLegacyDecodesToNil() throws {
+        // New optional value round-trips through synthesized Codable.
+        let encoded = try JSONEncoder().encode(GlobalScalarPreferences.UISettings(warnBeforeCmdQ: false))
+        let decoded = try JSONDecoder().decode(GlobalScalarPreferences.UISettings.self, from: encoded)
+        XCTAssertEqual(decoded.warnBeforeCmdQ, false)
+
+        // Legacy JSON without the key decodes without error and yields nil,
+        // which the accessor maps to the default (on) — backward compatible.
+        let legacyJSON = #"{"showTooltips":true}"#
+        let legacy = try JSONDecoder().decode(GlobalScalarPreferences.UISettings.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(legacy.showTooltips, true)
+        XCTAssertNil(legacy.warnBeforeCmdQ)
+    }
+
     private func makeTempDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("SettingsJSONOnlyPersistenceTests-\(UUID().uuidString)", isDirectory: true)
