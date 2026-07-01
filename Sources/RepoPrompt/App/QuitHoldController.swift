@@ -6,7 +6,6 @@
 //
 
 import AppKit
-import SwiftUI
 
 // MARK: - Pure event filter
 
@@ -54,6 +53,10 @@ enum QuitHoldEventFilter {
 // status / programmatic quits never generate a keyboard `keyDown` for ⌘Q, so
 // they call `terminate(_:)` directly and bypass this gate entirely.
 //
+// The controller owns gesture orchestration only — the overlay panel, its
+// linger/fade dismissal, and the owner-window-close observer live in
+// `QuitHoldOverlay`.
+//
 // **Quit timing (release-after-threshold):** reaching the 1.0s threshold while
 // still holding ⌘Q only ARMS the quit (the overlay switches to "Release ⌘Q to
 // Quit"). The actual `NSApp.terminate(nil)` is fired SYNCHRONOUSLY on ⌘Q
@@ -90,20 +93,11 @@ final class QuitHoldController {
     }
 
     private var holdWorkItem: DispatchWorkItem?
-    private var overlayPanel: QuitHoldPanel?
-    private var ownerWillCloseObserver: NSObjectProtocol?
     /// App-lifetime observer that aborts an in-flight hold when the app loses
     /// focus (the local key monitor won't see the keyUp then).
     private var resignActiveObserver: NSObjectProtocol?
-    /// Scheduled "dwell then fade" removal of the overlay after an early
-    /// release; cancelled by `hideOverlay()` so a new hold or a confirmed quit
-    /// still use the immediate-dismiss path.
-    private var lingerWorkItem: DispatchWorkItem?
-    /// Chrome-style overlay dismissal on early release: the message stays
-    /// readable for `cancelLingerSeconds`, then fades over `cancelFadeSeconds`
-    /// (~2s total) instead of vanishing instantly.
-    private static let cancelLingerSeconds: TimeInterval = 1.7
-    private static let cancelFadeSeconds: TimeInterval = 0.3
+
+    private let overlay = QuitHoldOverlay()
 
     private let warnBeforeCmdQ: @MainActor () -> Bool
 
@@ -180,8 +174,9 @@ final class QuitHoldController {
 
     /// External condition (owner window closed / app resigned active): feed
     /// an `.externalCancel` so the decision resets to idle and the overlay is
-    /// dismissed immediately (no linger). The owner-close and resign-active
-    /// observers call this; tests call it directly as the lifecycle seam.
+    /// dismissed immediately (no linger). The resign-active observer and the
+    /// overlay's owner-close observer call this; tests call it directly as the
+    /// lifecycle seam.
     func handleExternalCancellation() {
         apply(decision.handle(.externalCancel))
     }
@@ -190,12 +185,14 @@ final class QuitHoldController {
     private func apply(_ intent: QuitHoldIntent) {
         switch intent {
         case let .beginHold(threshold):
-            showOverlay(message: "Hold ⌘Q to Quit")
+            overlay.show(message: "Hold ⌘Q to Quit") { [weak self] in
+                self?.handleExternalCancellation()
+            }
             scheduleHoldTimer(threshold: threshold)
         case .arm:
             // Threshold reached while still holding: arm the quit and prompt
             // release. Do NOT terminate here (see class doc).
-            updateOverlayMessage("Release ⌘Q to Quit")
+            overlay.update("Release ⌘Q to Quit")
         case .cancel:
             cancelHold()
         case .quit:
@@ -204,11 +201,8 @@ final class QuitHoldController {
             // External cancellation (owner window closed / app resigned active):
             // state was already reset to idle by the decision; tear down the
             // overlay immediately — no linger.
-            holdWorkItem?.cancel()
-            holdWorkItem = nil
-            lingerWorkItem?.cancel()
-            lingerWorkItem = nil
-            hideOverlay()
+            cancelHoldTimer()
+            overlay.hide()
         case .ignore:
             break
         }
@@ -227,15 +221,19 @@ final class QuitHoldController {
         DispatchQueue.main.asyncAfter(deadline: .now() + threshold, execute: work)
     }
 
+    /// Sole owner of `holdWorkItem` teardown; `overlay.hide()` owns the overlay
+    /// + linger teardown. Cancels and nils the in-flight hold timer.
+    private func cancelHoldTimer() {
+        holdWorkItem?.cancel()
+        holdWorkItem = nil
+    }
+
     /// Release after the threshold: dismiss the overlay and call
     /// `NSApp.terminate(nil)` SYNCHRONOUSLY (during `sendEvent` — see class
     /// doc) so the normal shutdown path drains cleanly.
     private func fireTermination() {
-        holdWorkItem?.cancel()
-        holdWorkItem = nil
-        lingerWorkItem?.cancel()
-        lingerWorkItem = nil
-        hideOverlay()
+        cancelHoldTimer()
+        overlay.hide()
         // Call terminate SYNCHRONOUSLY here. This runs inside the local NSEvent
         // monitor closure, which AppKit invokes during sendEvent — the same
         // dispatch context the menu/Apple-Event quit paths use, and the only
@@ -246,155 +244,9 @@ final class QuitHoldController {
     }
 
     private func cancelHold() {
-        holdWorkItem?.cancel()
-        holdWorkItem = nil
+        cancelHoldTimer()
         // Chrome-style: keep the overlay readable for a beat on early release,
         // then fade it out instead of dismissing it instantly.
-        startCancelLinger()
-    }
-
-    // MARK: - Overlay
-
-    private func showOverlay(message: String) {
-        hideOverlay()
-
-        let panel = QuitHoldPanel()
-        overlayPanel = panel
-        configure(panel, message: message)
-
-        if let owner = NSApp.keyWindow, owner.isVisible {
-            ownerWillCloseObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.willCloseNotification,
-                object: owner,
-                queue: .main
-            ) { [weak self] _ in
-                // Runs on `.main`; the owner window is closing, so abort the
-                // hold (reset state + dismiss overlay) — don't leave the gate
-                // in a stale .holding/.armed state.
-                MainActor.assumeIsolated { self?.handleExternalCancellation() }
-            }
-        }
-
-        panel.orderFrontRegardless()
-    }
-
-    /// Swaps the overlay's message (e.g. "Hold…" → "Release…") without
-    /// dismissing it. No-op if no overlay is showing.
-    private func updateOverlayMessage(_ message: String) {
-        guard let panel = overlayPanel else { return }
-        configure(panel, message: message)
-    }
-
-    private func configure(_ panel: QuitHoldPanel, message: String) {
-        let hosting = NSHostingView(rootView: QuitHoldOverlayView(text: message))
-        panel.contentView = hosting
-        // Size the panel to the SwiftUI content's natural size (no fixed frame).
-        let fit = hosting.fittingSize
-        panel.setContentSize(NSSize(width: ceil(fit.width), height: ceil(fit.height)))
-        positionOverlay(panel)
-    }
-
-    private func hideOverlay() {
-        lingerWorkItem?.cancel()
-        lingerWorkItem = nil
-        if let observer = ownerWillCloseObserver {
-            NotificationCenter.default.removeObserver(observer)
-            ownerWillCloseObserver = nil
-        }
-        overlayPanel?.orderOut(nil)
-        overlayPanel = nil
-    }
-
-    /// On early release, lingers the overlay at full opacity so the message is
-    /// readable, then fades and removes it. No-op if no overlay is showing.
-    private func startCancelLinger() {
-        guard let panel = overlayPanel else { return }
-        lingerWorkItem?.cancel()
-        let dwell = DispatchWorkItem { [weak self] in
-            // DispatchQueue.main.asyncAfter runs this on the main thread.
-            MainActor.assumeIsolated { self?.beginFadeOut(of: panel) }
-        }
-        lingerWorkItem = dwell
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.cancelLingerSeconds, execute: dwell)
-    }
-
-    private func beginFadeOut(of panel: QuitHoldPanel) {
-        lingerWorkItem = nil
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.cancelFadeSeconds
-            panel.animator().alphaValue = 0
-        } completionHandler: { [weak self] in
-            // Runs on the main thread. Only remove this panel if it is still
-            // current — a new hold started during the fade replaces it.
-            MainActor.assumeIsolated {
-                if self?.overlayPanel === panel {
-                    self?.hideOverlay()
-                }
-            }
-        }
-    }
-
-    private func positionOverlay(_ panel: NSPanel) {
-        let size = panel.frame.size
-        let anchor: NSRect = {
-            if let keyWindow = NSApp.keyWindow, keyWindow.isVisible {
-                return keyWindow.frame
-            }
-            return NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: size.width, height: size.height)
-        }()
-        panel.setFrameOrigin(NSPoint(
-            x: anchor.midX - size.width / 2,
-            y: anchor.midY - size.height / 2
-        ))
-    }
-}
-
-// MARK: - Overlay panel + SwiftUI view
-
-/// Non-activating panel that can never become key/main, so it cannot steal
-/// keyboard focus from the active window (S-008).
-private final class QuitHoldPanel: NSPanel {
-    init() {
-        super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 236, height: 96),
-            styleMask: [.nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        isOpaque = false
-        backgroundColor = .clear
-        hasShadow = true
-        isMovable = false
-        isFloatingPanel = true
-        level = .floating
-        hidesOnDeactivate = false
-        ignoresMouseEvents = true
-        collectionBehavior = [.canJoinAllSpaces, .stationary]
-        isReleasedWhenClosed = false
-    }
-
-    override var canBecomeKey: Bool {
-        false
-    }
-
-    override var canBecomeMain: Bool {
-        false
-    }
-}
-
-/// "Hold ⌘Q to Quit" / "Release ⌘Q to Quit" card — text only (like Chrome).
-private struct QuitHoldOverlayView: View {
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.system(size: 34, weight: .semibold))
-            .padding(.horizontal, 28)
-            .padding(.vertical, 18)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.primary.opacity(0.1), lineWidth: 0.5)
-            )
+        overlay.cancelWithLinger()
     }
 }
