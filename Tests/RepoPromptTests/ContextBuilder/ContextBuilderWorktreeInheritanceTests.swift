@@ -780,6 +780,16 @@ import XCTest
                                 )
                             }
                         )
+                    try await waitForFrozenWorktreeBindingReady(
+                        in: fixture.contextA.window.mcpServer,
+                        store: fixture.contextA.window.workspaceFileContextStore,
+                        connectionID: outerEndpoint.connectionID,
+                        expectedSessionID: sessionID,
+                        expectedBindings: [binding],
+                        logicalPath: logicalBranchOnly.path,
+                        expectedPhysicalPath: worktreeBranchOnly.standardizedFileURL.path,
+                        phase: "post-fence Context Builder review"
+                    )
                     let postFenceRace = try await outerEndpoint.callTool(
                         name: MCPWindowToolName.contextBuilder,
                         arguments: [
@@ -1458,6 +1468,112 @@ import XCTest
                 GitRepoRootAuthorization.canonicalPath($0.standardizedFileURL.path)
             })
             return expected.isSubset(of: resolved)
+        }
+
+        private func waitForFrozenWorktreeBindingReady(
+            in mcpServer: MCPServerViewModel,
+            store: WorkspaceFileContextStore,
+            connectionID: UUID,
+            expectedSessionID: UUID,
+            expectedBindings: [AgentSessionWorktreeBinding],
+            logicalPath: String,
+            expectedPhysicalPath: String,
+            phase: String,
+            timeout: Duration = contextBuilderWorktreeCodemapDemandWarmupTimeout
+        ) async throws {
+            func failure(_ message: String) -> NSError {
+                NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: message]
+                )
+            }
+
+            let expectedFingerprint = AgentWorkspaceLookupContextSource
+                .worktreeBindingFingerprint(expectedBindings)
+            let expectedPhysicalPath = StandardizedPath.absolute(
+                (expectedPhysicalPath as NSString).expandingTildeInPath
+            )
+            let logicalPath = StandardizedPath.absolute(
+                (logicalPath as NSString).expandingTildeInPath
+            )
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var attempts = 0
+            var lastDiagnostic = "not inspected"
+
+            while true {
+                attempts += 1
+                if let frozen = mcpServer.tabContextByConnectionID[connectionID] {
+                    if frozen.activeAgentSessionID != expectedSessionID {
+                        lastDiagnostic = "frozen activeAgentSessionID=\(String(describing: frozen.activeAgentSessionID)) expected=\(expectedSessionID)"
+                    } else if case let .hydrated(bindings) = frozen.worktreeBindingState {
+                        let currentFingerprint = AgentWorkspaceLookupContextSource
+                            .worktreeBindingFingerprint(bindings)
+                        if currentFingerprint != expectedFingerprint {
+                            lastDiagnostic = "frozen binding fingerprint=\(currentFingerprint) expected=\(expectedFingerprint)"
+                        } else {
+                            do {
+                                let lookupContext = try await AgentWorkspaceLookupContextResolver
+                                    .requiredLookupContext(
+                                        source: AgentWorkspaceLookupContextSource(
+                                            activeAgentSessionID: expectedSessionID,
+                                            worktreeBindingState: frozen.worktreeBindingState
+                                        ),
+                                        store: store
+                                    )
+                                if let projection = lookupContext.bindingProjection {
+                                    let projectionFingerprint = AgentWorkspaceLookupContextSource
+                                        .worktreeBindingFingerprint(
+                                            projection.boundRootsForMetadata.map(\.binding)
+                                        )
+                                    let translatedPath = StandardizedPath.absolute(
+                                        (lookupContext.translateInputPath(logicalPath) as NSString)
+                                            .expandingTildeInPath
+                                    )
+                                    let availability = await store.rootScopeAvailability(lookupContext.rootScope)
+                                    let lifetimeSnapshot = await store
+                                        .sessionBoundRootScopeValidationSnapshot(
+                                            lookupContext.rootScope,
+                                            expectedPhysicalRoots: projection.physicalRootRefs
+                                        )
+                                    if projection.sessionID != expectedSessionID {
+                                        lastDiagnostic = "projection sessionID=\(projection.sessionID) expected=\(expectedSessionID)"
+                                    } else if !projection.isFullyMaterialized {
+                                        lastDiagnostic = "projection is not fully materialized; physicalRoots=\(projection.physicalRootRefs.map(\.standardizedFullPath))"
+                                    } else if projectionFingerprint != expectedFingerprint {
+                                        lastDiagnostic = "projection binding fingerprint=\(projectionFingerprint) expected=\(expectedFingerprint)"
+                                    } else if translatedPath != expectedPhysicalPath {
+                                        lastDiagnostic = "translated path=\(translatedPath) expected=\(expectedPhysicalPath)"
+                                    } else if availability != .available {
+                                        lastDiagnostic = "root scope unavailable: \(availability)"
+                                    } else if lifetimeSnapshot?.isGenerationCurrent() != true {
+                                        lastDiagnostic = "session root lifetime snapshot missing or stale"
+                                    } else {
+                                        return
+                                    }
+                                } else {
+                                    lastDiagnostic = "lookup context has no binding projection"
+                                }
+                            } catch {
+                                lastDiagnostic = "required lookup context failed: \(error)"
+                            }
+                        }
+                    } else {
+                        lastDiagnostic = "frozen worktree binding state=\(frozen.worktreeBindingState)"
+                    }
+                } else {
+                    lastDiagnostic = "missing frozen context for connectionID=\(connectionID)"
+                }
+
+                guard clock.now < deadline else { break }
+                await Task.yield()
+                try await Task.sleep(for: .milliseconds(100))
+            }
+
+            let message = "Timed out waiting for frozen worktree binding readiness before \(phase) after \(attempts) attempts; connectionID=\(connectionID) sessionID=\(expectedSessionID) expectedBindingFingerprint=\(expectedFingerprint) expectedPhysicalPath=\(expectedPhysicalPath); last=\(lastDiagnostic)"
+            XCTFail(message)
+            throw failure(message)
         }
 
         private func codemapWarmupUnavailableIsRetryable(
