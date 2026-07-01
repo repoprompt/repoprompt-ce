@@ -57,16 +57,34 @@ enum QuitHoldEventFilter {
 // linger/fade dismissal, and the owner-window-close observer live in
 // `QuitHoldOverlay`.
 //
-// **Quit timing (release-after-threshold):** reaching the 1.0s threshold while
-// still holding ⌘Q only ARMS the quit (the overlay switches to "Release ⌘Q to
-// Quit"). The actual `NSApp.terminate(nil)` is fired SYNCHRONOUSLY on ⌘Q
-// `keyUp` / Command release AFTER the threshold, from within this monitor's
-// event handler (i.e., during AppKit's `sendEvent`). It must NOT be deferred
-// to a `DispatchQueue` callback: AppKit's `.terminateLater` wait then starves
-// the Swift main-actor executor, the shutdown `Task` never runs, and
-// `reply(true)` is never called (the app wedges). Calling terminate during
-// `sendEvent` — like the menu and Apple-Event quit paths — drains cleanly and
-// leaves the existing async shutdown path unchanged.
+// ## ⚠️ LOAD-BEARING — read before "optimizing" this controller
+//
+// Two constraints below are non-obvious and hard-won. Either one, if
+// "simplified", silently breaks quit (the app wedges, or quits the wrong
+// thing). Full diagnosis + the dead ends that were tried:
+// `docs/investigations/hold-to-quit-shutdown-wedge-2026-07-01.md`.
+//
+// 1. `NSApp.terminate(nil)` is called SYNCHRONOUSLY from within this monitor's
+//    event handler (during AppKit's `sendEvent`) — see `fireTermination`. It
+//    must NOT be deferred to a `DispatchQueue`/`Task` callback (sync or
+//    `asyncAfter`): AppKit's `.terminateLater` wait then starves the Swift
+//    main-actor executor, the shutdown `Task { @MainActor }` never runs, and
+//    `reply(true)` is never called → the app wedges mid-shutdown (Quit menu
+//    disabled, process alive). Initiating terminate during `sendEvent` — like
+//    the menu and Apple-Event quit paths — is the only context in which the
+//    shutdown Task reliably drains. Do NOT "fix" a deferred call by pumping the
+//    run loop or making the shutdown synchronous; both create worse bugs.
+//
+// 2. Quit fires on ⌘Q RELEASE (`keyUp`), NOT at the threshold while the key is
+//    still held. Quitting while ⌘Q is held propagates the held key to the next
+//    focused app — that app's ⌘Q then fires too (confirmed by experiment; the
+//    at-threshold-while-holding variant was reverted for exactly this reason).
+//    Chrome also quits on keyUp (its window-close-at-threshold is only visual
+//    feedback; the actual quit waits for release). So the threshold only ARMS
+//    (overlay → "Release ⌘Q to Quit"); the release fires `terminate`.
+//    (We deliberately do NOT close windows at the threshold like Chrome: RPCE
+//    persists the window session on terminate, so closing windows early would
+//    risk restoring to an empty session and would buy nothing.)
 //
 // **External cancellation:** if the owner window closes or the app resigns
 // active mid-hold, an `.externalCancel` event resets the decision to `idle`

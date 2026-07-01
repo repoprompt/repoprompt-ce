@@ -110,7 +110,10 @@ public struct QuitHoldDecision {
         case .armed:
             switch event {
             case .keyUp, .flagsChanged(commandDown: false):
-                // Released after the threshold: quit.
+                // Released after the threshold: quit. Quit MUST wait for
+                // release rather than firing at the threshold while the key is
+                // held — quitting mid-hold propagates the held ⌘Q to the next
+                // focused app. See QuitHoldController's load-bearing notes.
                 state = .quitting
                 return .quit
             case .externalCancel:
