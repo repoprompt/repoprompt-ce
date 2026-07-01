@@ -9,6 +9,12 @@ import Foundation
 // `QuitHoldController` (App layer) owns the real `NSEvent` local monitor, the
 // hold timer, and the overlay, and feeds events into this value type.
 //
+// Quit timing: the threshold ARMS the quit; the actual quit intent is produced
+// only when the user releases ⌘Q (keyUp or Command flag release) AFTER the
+// threshold. Releasing before the threshold cancels. This release-after-
+// threshold contract is required because terminating while the key is still
+// held starves AppKit's shutdown path (see QuitHoldController class doc).
+//
 // Semantics are pinned by `docs/spec/hold-to-quit.md` (scenarios S-001, S-002,
 // S-003, S-010) and mirrored by `QuitHoldDecisionTests`.
 
@@ -21,7 +27,7 @@ public enum QuitHoldEvent {
     case keyUp
     /// A modifier-flag change. `commandDown` carries whether Command is held.
     case flagsChanged(commandDown: Bool)
-    /// The hold timer elapsed.
+    /// The hold timer elapsed (threshold reached).
     case timerElapsed
 }
 
@@ -31,9 +37,13 @@ public enum QuitHoldIntent: Equatable {
     case ignore
     /// Show the hold overlay and start the hold timer at `threshold`.
     case beginHold(threshold: TimeInterval)
-    /// Dismiss the overlay, cancel the timer, and keep the app running.
+    /// Threshold reached while still holding: keep the overlay and update it to
+    /// a "release to quit" message. Do NOT terminate yet.
+    case arm
+    /// Dismiss the overlay (linger/fade), cancel the timer, and keep running.
     case cancel
-    /// Dismiss the overlay and quit through the normal shutdown path.
+    /// Release after the threshold: dismiss the overlay and quit through the
+    /// normal shutdown path.
     case quit
 }
 
@@ -45,6 +55,8 @@ public struct QuitHoldDecision {
     public enum State: Equatable {
         case idle
         case holding
+        /// Threshold reached; waiting for ⌘Q / Command release to terminate.
+        case armed
         case quitting
     }
 
@@ -67,17 +79,31 @@ public struct QuitHoldDecision {
             case .keyUp, .flagsChanged(commandDown: _), .timerElapsed:
                 return .ignore
             }
+
         case .holding:
             switch event {
             case .timerElapsed:
-                state = .quitting
-                return .quit
+                // Threshold reached while still holding: arm, don't terminate.
+                state = .armed
+                return .arm
             case .keyUp, .flagsChanged(commandDown: false):
+                // Released before the threshold: cancel.
                 state = .idle
                 return .cancel
             case .keyDown(toggleOn: _), .flagsChanged(commandDown: true):
                 return .ignore
             }
+
+        case .armed:
+            switch event {
+            case .keyUp, .flagsChanged(commandDown: false):
+                // Released after the threshold: quit.
+                state = .quitting
+                return .quit
+            case .keyDown(toggleOn: _), .flagsChanged(commandDown: true), .timerElapsed:
+                return .ignore
+            }
+
         case .quitting:
             return .ignore
         }
