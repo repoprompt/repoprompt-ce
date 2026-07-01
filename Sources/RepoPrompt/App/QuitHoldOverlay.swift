@@ -41,7 +41,7 @@ final class QuitHoldOverlay {
     /// the controller wires it to its external-cancellation path. The observer
     /// is added here and removed in `hide()` (identical lifecycle to the inline
     /// form previously in QuitHoldController.showOverlay).
-    func show(message: String, onOwnerClose: @escaping () -> Void) {
+    func show(message: String, onOwnerClose: @escaping @Sendable @MainActor () -> Void) {
         hide()
 
         let panel = QuitHoldPanel()
