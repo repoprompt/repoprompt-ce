@@ -70,6 +70,39 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertTrue(fableGroup.options.contains { $0.displayName == "XHigh" })
     }
 
+    func testClaudeCodePickerExposesSonnet5WithAllOfficialEffortVariants() throws {
+        let models = AIModel.modelsForProvider(.claudeCode)
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-sonnet-5")))
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-sonnet-5:max")))
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-sonnet-5:xhigh")))
+        XCTAssertEqual(
+            AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-sonnet-5:xhigh"),
+            .claudeCodeModel(specifier: "claude-sonnet-5:xhigh")
+        )
+
+        let menu = AIModel.claudeCodeMenu(for: models)
+        let sonnet5Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-sonnet-5" })
+        XCTAssertEqual(sonnet5Group.displayName, "Sonnet 5")
+        XCTAssertEqual(sonnet5Group.options.compactMap(\.model.claudeCodeRuntimeSpecifierRaw), [
+            "claude-sonnet-5:low",
+            "claude-sonnet-5:medium",
+            "claude-sonnet-5:high",
+            "claude-sonnet-5:max",
+            "claude-sonnet-5:xhigh"
+        ])
+        XCTAssertEqual(sonnet5Group.options.map(\.displayName), ["Low", "Medium", "High", "Max", "XHigh"])
+    }
+
+    func testClaudeCodeProviderResolvesSonnet5EffortSpecifierForCLI() throws {
+        let maxSelection = try ClaudeCodeProvider.resolveCLIModelSelection(for: .claudeCodeModel(specifier: "claude-sonnet-5:max"))
+        XCTAssertEqual(maxSelection.modelArgument, "claude-sonnet-5")
+        XCTAssertEqual(maxSelection.effortLevel, .max)
+
+        let xhighSelection = try ClaudeCodeProvider.resolveCLIModelSelection(for: .claudeCodeModel(specifier: "claude-sonnet-5:xhigh"))
+        XCTAssertEqual(xhighSelection.modelArgument, "claude-sonnet-5")
+        XCTAssertEqual(xhighSelection.effortLevel, .xhigh)
+    }
+
     func testAIModelCodexMenuGroupsUseStableSemanticOrdering() {
         let groups = AIModel.codexMenuGroups(for: [
             .codexCustom(name: "gpt-5.2-high"),
