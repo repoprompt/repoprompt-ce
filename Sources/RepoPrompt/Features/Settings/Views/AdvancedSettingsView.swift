@@ -32,6 +32,13 @@ struct AdvancedSettingsView: View {
         )
     }
 
+    private var warnBeforeCmdQBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.warnBeforeCmdQ() },
+            set: { globalSettings.setWarnBeforeCmdQ($0) }
+        )
+    }
+
     private var canonicalURLPrefix: String {
         "\(AppDeepLinkURLScheme.canonical)://"
     }
@@ -109,6 +116,11 @@ struct AdvancedSettingsView: View {
                     .padding(.horizontal, -16)
 
                 keyboardShortcutsSection
+
+                Divider()
+                    .padding(.horizontal, -16)
+
+                quitSection
 
                 Divider()
                     .padding(.horizontal, -16)
@@ -263,6 +275,19 @@ struct AdvancedSettingsView: View {
             }
             .buttonStyle(CustomButtonStyle())
             .hoverTooltip("Opens the Keyboard Shortcuts settings tab for this window.")
+        }
+    }
+
+    private var quitSection: some View {
+        SettingSection(
+            title: "Quit",
+            description: "Prevent accidental quits that kill in-flight agent sessions."
+        ) {
+            SettingToggle(
+                title: "Warn before quitting with ⌘Q",
+                description: "When on, hold ⌘Q to quit (a quick tap is ignored). Quit from the menu, Dock, or system still quits immediately.",
+                isOn: warnBeforeCmdQBinding
+            )
         }
     }
 
