@@ -6,6 +6,7 @@ neon	0.6.0	https://github.com/ChimeHQ/Neon.git	neon/
 networkimage	6.0.1	https://github.com/gonzalezreal/NetworkImage	networkimage/
 ontology	0.6.0	https://github.com/loopwork-ai/ontology.git	ontology/
 rearrange	1.8.1	https://github.com/ChimeHQ/Rearrange	rearrange/
+sentry-cocoa	9.17.1	https://github.com/getsentry/sentry-cocoa	sentry-cocoa/
 swift-algorithms	1.2.1	https://github.com/apple/swift-algorithms.git	swift-algorithms/
 swift-asn1	1.7.0	https://github.com/apple/swift-asn1.git	swift-asn1/
 swift-async-algorithms	1.1.3	https://github.com/apple/swift-async-algorithms.git	swift-async-algorithms/

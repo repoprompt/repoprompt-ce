@@ -35,7 +35,13 @@ jq -r '
 ' Package.resolved | sort > "$TMP_DIR/resolved.tsv"
 cut -f1-3 "$INVENTORY" | sort > "$TMP_DIR/inventory.tsv"
 
-diff -u "$TMP_DIR/resolved.tsv" "$TMP_DIR/inventory.tsv" ||
+# SwiftPM does not keep the env-gated Sentry package in Package.resolved once
+# REPOPROMPT_ENABLE_SENTRY is restored to its default-off state, but official
+# release builds still link it via Package.swift's exact dependency. Keep its
+# copied notice under guardrail coverage without treating it as lockfile drift.
+grep -v $'^sentry-cocoa\t' "$TMP_DIR/inventory.tsv" > "$TMP_DIR/inventory-for-lockfile.tsv"
+
+diff -u "$TMP_DIR/resolved.tsv" "$TMP_DIR/inventory-for-lockfile.tsv" ||
     fail "SwiftPM notice inventory does not match Package.resolved"
 
 while IFS=$'\t' read -r identity _resolved _location bundle; do
