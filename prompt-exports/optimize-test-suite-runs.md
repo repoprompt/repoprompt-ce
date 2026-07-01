@@ -747,3 +747,123 @@ Primary metric eligible: yes
 | 18 | `RepoPromptTests.AgentRunWorktreeStartTests` | `testAgentExploreBatchCreatePreparesDistinctWorktreesBeforeProviderStart` | 1 | 4.997 | 4.997 | 4.997 | 0 |
 | 19 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | `testReceiptCreationFailurePointsAreCorrelationScopedOneShotAndFailClosed` | 1 | 4.830 | 4.830 | 4.830 | 0 |
 | 20 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | `testSubdirectoryReceiptPlansOnlyCorrespondingPhysicalRoot` | 1 | 4.688 | 4.688 | 4.688 | 0 |
+### Focused: 2026-07-01T22:50:58+00:00 — root — reliability-gate-20260701-focused-durable-catalog-cas
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.DurableArtifactCrashAndCatalogTests/testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-20260701-focused-durable-catalog-cas.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.DurableArtifactCrashAndCatalogTests/testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 17.732 | 0.006 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1113c8b8-361e-4394-9f25-71913a09bfae.log` |  |
+| 2 | yes | 0.957 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/40cbf748-d171-407b-ae02-02709963478e.log` |  |
+| 3 | yes | 1.003 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/90fa21ec-1436-45e8-925d-14f46ee1a81b.log` |  |
+| 4 | yes | 0.959 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9cd431a0-1f3a-4909-90b4-509c11c3882b.log` |  |
+| 5 | yes | 0.945 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1a2c5886-378c-4853-8f3c-d7636ffac4a4.log` |  |
+| 6 | yes | 0.963 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/fd412694-b49b-4fc5-8705-e3d76105a2e3.log` |  |
+| 7 | yes | 0.948 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/62515e39-c154-4fe1-a882-70683592aacf.log` |  |
+| 8 | yes | 0.968 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8f77774d-c5c2-443b-a04e-35bf2b873d00.log` |  |
+| 9 | yes | 0.925 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/87222cfc-9340-4612-818b-031ae67d71e9.log` |  |
+| 10 | yes | 0.951 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/eb52e9ba-1315-4ef5-bdc2-26a24c9e106d.log` |  |
+| 11 | yes | 1.007 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/05418285-d715-4277-9de0-dd4836549afe.log` |  |
+| 12 | yes | 0.994 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a0f8b3bf-360b-4550-b1d4-83be29d73f6f.log` |  |
+| 13 | yes | 0.979 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8d36200b-634a-4c10-ae0a-7311b1a33453.log` |  |
+| 14 | yes | 0.983 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0f7169e6-5b20-4950-bb2c-c52ec2b5dc71.log` |  |
+| 15 | yes | 0.936 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2f7831f9-16e6-4b82-93c3-9642e321f71c.log` |  |
+| 16 | yes | 0.942 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/119be2ce-b4eb-4332-90c8-05e28061f3bb.log` |  |
+| 17 | yes | 0.936 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/05ca15fe-efd9-4a44-8455-99b576130efc.log` |  |
+| 18 | yes | 0.962 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/20c2ff50-b9ac-4c7a-88cb-519fe1ada557.log` |  |
+| 19 | yes | 0.974 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/4f125ba9-51c4-4c42-a38d-0c470cc43f2a.log` |  |
+| 20 | yes | 0.989 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d67f7293-f6aa-44e3-bbfd-aa3f68b4fc79.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-01T22:50:58+00:00/f3393c0b1229 | reliability-gate-20260701-focused-durable-catalog-cas | root | filtered: `RepoPromptTests.DurableArtifactCrashAndCatalogTests/testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner` | 20 valid + 0 invalid | 2825 | 7 | 2832 | 0.962 | 1.007 | 0.0199 | stable | `prompt-exports/test-suite-focused-root-reliability-gate-20260701-focused-durable-catalog-cas.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.DurableArtifactCrashAndCatalogTests` | 1 | 0.199 | 0.218 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.DurableArtifactCrashAndCatalogTests` | `testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner` | 20 | 0.199 | 0.216 | 0.218 | 0 |
+
+### Baseline: 2026-07-01T23:31:04+00:00 — root — reliability-gate-20260701-root-after-durable-catalog-cas-clean
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --json`
+Artifact: `prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-durable-catalog-cas-clean.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: complete
+Source-change guard: `metadata`
+Primary metric eligible: yes
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 743.895 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/588dcdb8-05be-4e54-bda0-f2530771bc73.log` |  |
+| 2 | no | 733.701 | 0.001 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9f40cefc-e476-4a89-8329-3b586e714d40.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 3 | no | 710.140 | 0.001 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c71b3b0b-a179-4348-bf14-17d7dc824473.log` | conductor process exit 1; terminal state failed; test exit 1 |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-01T23:31:04+00:00/f3393c0b1229 | reliability-gate-20260701-root-after-durable-catalog-cas-clean | root | complete | 1 valid + 2 invalid | 2825 | 7 | 2832 | 743.895 | 743.895 | 0.0000 | stable | `prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-durable-catalog-cas-clean.json` | source guard `metadata`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests` | 65 | 55.917 | 2.753 | 0 |
+| 2 | `RepoPromptTests.WorkspaceCodemapBindingEngineTests` | 65 | 55.204 | 6.682 | 0 |
+| 3 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | 34 | 50.860 | 5.248 | 0 |
+| 4 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | 3 | 48.668 | 35.287 | 0 |
+| 5 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | 33 | 32.761 | 5.601 | 0 |
+| 6 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | 16 | 24.108 | 11.401 | 0 |
+| 7 | `RepoPromptTests.WorkspacePendingSeededRootTests` | 12 | 23.465 | 4.737 | 0 |
+| 8 | `RepoPromptTests.GitLoadedRootAuthorityEvidenceTests` | 47 | 22.798 | 17.248 | 1 |
+| 9 | `RepoPromptTests.AgentRunWorktreeStartTests` | 34 | 22.580 | 3.849 | 0 |
+| 10 | `RepoPromptTests.MCPAskOracleWorktreeTests` | 21 | 21.917 | 2.813 | 0 |
+| 11 | `RepoPromptTests.MCPCodeStructureWorktreeTests` | 17 | 21.337 | 3.332 | 0 |
+| 12 | `RepoPromptTests.WorkspaceCodemapLiveOverlayTests` | 37 | 19.159 | 1.444 | 0 |
+| 13 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | 5 | 18.627 | 11.289 | 0 |
+| 14 | `RepoPromptTests.CodeMapRootManifestStoreTests` | 28 | 13.693 | 3.965 | 0 |
+| 15 | `RepoPromptTests.PersistentAgentModeMCPReadFileConnectionTests` | 16 | 11.568 | 3.001 | 0 |
+| 16 | `RepoPromptTests.AgentProviderContextBuilderTests` | 7 | 11.560 | 11.028 | 0 |
+| 17 | `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests` | 17 | 10.696 | 1.310 | 0 |
+| 18 | `RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests` | 3 | 10.672 | 10.668 | 0 |
+| 19 | `RepoPromptTests.ACPAgentSessionControllerModeConfigTests` | 27 | 10.458 | 1.042 | 0 |
+| 20 | `RepoPromptTests.WorkspaceCodemapSelectionGraphTests` | 19 | 10.215 | 1.103 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeEmptyInitialSelectionDefersAndRoutesWithoutExplicitContext` | 1 | 35.287 | 35.287 | 35.287 | 0 |
+| 2 | `RepoPromptTests.GitLoadedRootAuthorityEvidenceTests` | `testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBounded` | 1 | 17.248 | 17.248 | 17.248 | 0 |
+| 3 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior` | 1 | 13.078 | 13.078 | 13.078 | 0 |
+| 4 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | `testFinalPackagingRetriesAfterRevocationAndDoesNotPublishFirstAssembly` | 1 | 11.401 | 11.401 | 11.401 | 0 |
+| 5 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | `testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections` | 1 | 11.289 | 11.289 | 11.289 | 0 |
+| 6 | `RepoPromptTests.AgentProviderContextBuilderTests` | `testAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze` | 1 | 11.028 | 11.028 | 11.028 | 0 |
+| 7 | `RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests` | `testManifestScaleStreamsOneHundredThousandByDefaultAndOneMillionOptIn` | 1 | 10.668 | 10.668 | 10.668 | 0 |
+| 8 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | `testFinalPackagingCancellationThrowsWithoutPublishingPayload` | 1 | 9.483 | 9.483 | 9.483 | 0 |
+| 9 | `RepoPromptTests.WorkspaceCodemapLocalGitClassificationTests` | `testGitLayoutWatcherChangeReprobesAndAdmitsConvertedRepository` | 1 | 7.652 | 7.652 | 7.652 | 0 |
+| 10 | `RepoPromptTests.WorkspaceRootNamespaceManifestTests` | `testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes` | 1 | 7.328 | 7.328 | 7.328 | 0 |
+| 11 | `RepoPromptTests.FileSystemAcceptedIngressBarrierTests` | `testSyntheticHundredThousandPathReplayUsesBoundedSpillWorkingSet` | 1 | 7.318 | 7.318 | 7.318 | 0 |
+| 12 | `RepoPromptTests.SelectionSlicePersistenceAndRebaseTests` | `testCanonicalStoreWatcherEditsPreserveLargeBeginningMiddleEndSlices` | 1 | 7.233 | 7.233 | 7.233 | 0 |
+| 13 | `RepoPromptTests.WorkspaceCodemapBindingEngineTests` | `testWarmManifestRejectsExplicitNonCleanCandidateStatesWithoutSourceRead` | 1 | 6.682 | 6.682 | 6.682 | 0 |
+| 14 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | `testLoadedRootAdmissionCurrentnessClassifiesCatalogStaleness` | 1 | 5.601 | 5.601 | 5.601 | 0 |
+| 15 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | `testAutomaticSelectionIgnoresUnsupportedEnterpriseInventoryForCompleteness` | 1 | 5.248 | 5.248 | 5.248 | 0 |
+| 16 | `RepoPromptTests.CLIProcessRunnerLifecycleTests` | `testStreamingProcessTerminationCallbackRunsAfterRunnerCancellation` | 1 | 5.060 | 5.060 | 5.060 | 0 |
+| 17 | `RepoPromptTests.ProcessLauncherDescriptorInheritanceTests` | `testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive` | 1 | 5.012 | 5.012 | 5.012 | 0 |
+| 18 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | `testReceiptCreationFailurePointsAreCorrelationScopedOneShotAndFailClosed` | 1 | 4.861 | 4.861 | 4.861 | 0 |
+| 19 | `RepoPromptTests.WorkspacePendingSeededRootTests` | `testTwoRootSeededPublicationPermitPublishesBothAtomicallyWithoutDeadlock` | 1 | 4.737 | 4.737 | 4.737 | 0 |
+| 20 | `RepoPromptTests.PersistentMCPDistinctConnectionConcurrencyTests` | `testDistinctConnectionsOverlapWithoutCrossRoutingReadOrSearchResults` | 1 | 4.375 | 4.375 | 4.375 | 0 |
+
+Reliability-gate decision note (2026-07-01T23:31Z): focused DurableArtifact CAS method was exonerated by `prompt-exports/test-suite-focused-root-reliability-gate-20260701-focused-durable-catalog-cas.json` (20 valid / 0 invalid, source guard `content`, method/contract/scenario delta 0). The required 3-sample complete root baseline was attempted via `prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-durable-catalog-cas-clean.json` and is not clean (1 valid / 2 invalid, source guard `metadata`). First invalid root sample: sample 2 log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9f40cefc-e476-4a89-8329-3b586e714d40.log`, `RepoPromptTests.MCPCodeStructureWorktreeTests/testInheritedWorktreeSequentialStructureThenTreePublishesLogicalMarkerWithoutPhysicalLeakage`, `MCPCodeStructureWorktreeTests.swift:211`, `XCTAssertEqual failed: ("2") is not equal to ("1") - Graph-worker drain counters should advance together: [0, 0, 1]`. Sample 3 also failed in `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c71b3b0b-a179-4348-bf14-17d7dc824473.log`, `RepoPromptTests.DurableArtifactCrashAndCatalogTests/testSubprocessCrashReplacingCatalogLeavesOldOrNewCompletePointer`, `DurableArtifactTestSupport.swift:78`, `unexpectedPublication(RepoPrompt.DurableArtifactPublicationResult.busy)`. Curated ledger was not regenerated or edited; no XCTest IDs changed; method delta 0, contract delta 0, scenario delta 0. Phase 4 remains blocked; next target should be the first invalid root sample (`MCPCodeStructureWorktreeTests/testInheritedWorktreeSequentialStructureThenTreePublishesLogicalMarkerWithoutPhysicalLeakage`), not slow-suite optimization.
+
+Tooling progress-output gaps observed during this dispatch: `Scripts/test_suite_optimizer.py baseline` emitted no live sample-start/sample-end lines during the long complete-root run; it did not print conductor ticket/log path as each sample began; it did not stream invalid reasons when sample 2 failed, so classification required polling conductor state/logs separately; the focused probe printed final JSON but the wrapper stayed open due inherited descriptors, making it look still-running; the complete-root wrapper also printed `root_baseline_exit=0` only after all samples finished. A future tooling improvement should emit per-sample start/end, conductor ticket/log path, exit/state, invalid reasons, and final artifact path incrementally.
