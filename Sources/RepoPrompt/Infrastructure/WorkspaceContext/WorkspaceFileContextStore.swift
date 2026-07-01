@@ -8794,13 +8794,34 @@ actor WorkspaceFileContextStore {
                 startFolder: nil
             )
         }
-        let startFolder = await (lookupSelectionPath(trimmedStartPath, profile: profile, rootScope: request.rootScope))?.folder
+        let startFolder = await resolveFileTreeStartFolder(
+            trimmedStartPath,
+            request: request,
+            profile: profile
+        )
         return makeFileTreeSelectionSnapshot(
             request,
             selectedStoreFileIDs: selectedStoreFileIDs,
             renderableCodemapFileIDs: renderableCodemapFileIDs,
             startFolder: startFolder
         )
+    }
+
+    private func resolveFileTreeStartFolder(
+        _ trimmedStartPath: String,
+        request: WorkspaceFileTreeSnapshotRequest,
+        profile: PathLocateProfile
+    ) async -> WorkspaceFolderRecord? {
+        let roots = rootRefs(scope: request.rootScope)
+        let resolution = await resolveFolderInput(
+            trimmedStartPath,
+            rootScope: request.rootScope,
+            profile: profile,
+            rootRefs: roots,
+            validateIssue: true,
+            allowGeneralLookupFallback: false
+        )
+        return resolution.folder
     }
 
     private func makeFileTreeSelectionSnapshot(
