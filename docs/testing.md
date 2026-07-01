@@ -178,6 +178,8 @@ python3 Scripts/test_suite_optimizer.py baseline \
 
 `--source-change-guard metadata` records path, size, and mtime metadata before and after each sample instead of hashing every source byte. It reduces measurement-tool overhead and cache perturbation but does not itself count as a suite-speed improvement; use the default content guard when strict byte-level immutability matters more than campaign overhead.
 
+During `baseline`, `Scripts/test_suite_optimizer.py` emits `test_suite_optimizer.progress {...}` lines to stderr at each sample start and end. These lines are live progress only; stdout remains the final JSON payload, and the written artifact plus scoreboard remain the authoritative timing evidence.
+
 Focused before/after evidence uses the same artifact path and append-only scoreboard, but is not the primary root metric unless followed by a complete root baseline:
 
 ```bash

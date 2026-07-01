@@ -16,7 +16,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 LEDGER_COLUMNS = [
     "method_id",
@@ -61,6 +61,8 @@ XCTEST_CASE_RE = re.compile(
 MEASUREMENT_SOURCE_SUFFIXES = {".swift", ".c", ".h"}
 SOURCE_GUARD_CONTENT = "content"
 SOURCE_GUARD_METADATA = "metadata"
+PROGRESS_PREFIX = "test_suite_optimizer.progress "
+ProgressSink = Callable[[dict[str, Any]], None]
 
 
 class OptimizerError(RuntimeError):
@@ -101,6 +103,7 @@ class ConductorRun:
     stderr: str
     result: dict[str, Any]
     log_text: str
+    ticket: str | None = None
 
 
 @dataclasses.dataclass
@@ -129,6 +132,17 @@ class Sample:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def progress_line(event: dict[str, Any]) -> str:
+    return PROGRESS_PREFIX + json.dumps(event, sort_keys=True, separators=(",", ":"))
+
+
+def emit_progress_event(event: dict[str, Any]) -> None:
+    try:
+        print(progress_line(event), file=sys.stderr, flush=True)
+    except (BrokenPipeError, OSError):
+        return
 
 
 def parse_test_list(text: str, target: str) -> list[ListedTest]:
@@ -226,6 +240,17 @@ def parse_conductor_json(stdout: str) -> dict[str, Any]:
     return payload
 
 
+def conductor_ticket_from_payload(payload: dict[str, Any], result: dict[str, Any]) -> str | None:
+    for source in (result, payload):
+        value = source.get("ticket")
+        if value is None:
+            continue
+        ticket = str(value)
+        if ticket:
+            return ticket
+    return None
+
+
 def conductor_command(
     repo_root: Path,
     target: str,
@@ -263,6 +288,7 @@ def run_conductor(
         stderr=completed.stderr,
         result=result,
         log_text=log_text,
+        ticket=conductor_ticket_from_payload(payload, result),
     )
 
 
@@ -896,6 +922,7 @@ def baseline(
     inventory_path: Path | None = None,
     source_change_guard: str = SOURCE_GUARD_CONTENT,
     filter_value: str | None = None,
+    progress_sink: ProgressSink | None = emit_progress_event,
 ) -> dict[str, Any]:
     if samples_requested <= 0:
         raise OptimizerError("--samples must be greater than zero")
@@ -903,19 +930,57 @@ def baseline(
     command = conductor_command(repo_root, target, filter_value=filter_value)
     scope = "filtered" if filter_value else "complete"
     for index in range(1, samples_requested + 1):
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "baseline_sample_start",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "scope": scope,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "command": command,
+                    "ticket": None,
+                    "log_path": None,
+                }
+            )
         before = measurement_source_guard_fingerprint(repo_root, source_change_guard)
         run = run_conductor(repo_root, target, list_mode=False, filter_value=filter_value)
         after = measurement_source_guard_fingerprint(repo_root, source_change_guard)
-        samples.append(
-            sample_from_run(
-                index,
-                target,
-                run,
-                source_changed=before != after,
-                source_guard_kind=source_change_guard,
-                require_timings=filter_value is not None,
-            )
+        sample = sample_from_run(
+            index,
+            target,
+            run,
+            source_changed=before != after,
+            source_guard_kind=source_change_guard,
+            require_timings=filter_value is not None,
         )
+        samples.append(sample)
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "baseline_sample_end",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "scope": scope,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "ticket": run.ticket,
+                    "log_path": sample.log_path or None,
+                    "process_exit_code": sample.process_exit_code,
+                    "state": sample.state,
+                    "exit_code": sample.exit_code,
+                    "execution_seconds": sample.execution_seconds,
+                    "measurement_invalid": sample.measurement_invalid,
+                    "source_changed": sample.source_changed,
+                    "valid": sample.valid,
+                    "invalid_reasons": sample.invalid_reasons,
+                }
+            )
     valid_samples = [sample for sample in samples if sample.valid]
     payload = {
         "timestamp": utc_now(),

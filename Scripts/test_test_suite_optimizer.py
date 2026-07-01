@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -294,6 +297,150 @@ class SourceAndLedgerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(optimizer.OptimizerError, "duplicate method_id"):
                 optimizer.read_ledger_ids(path)
+
+
+class ProgressOutputTests(unittest.TestCase):
+    def test_emit_progress_event_uses_stderr_compact_json_and_ignores_pipe_errors(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            optimizer.emit_progress_event({"z": 1, "event": "unit", "a": None})
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            f'{optimizer.PROGRESS_PREFIX}{{"a":null,"event":"unit","z":1}}\n',
+        )
+
+        class BrokenStderr:
+            def write(self, text: str) -> int:
+                raise BrokenPipeError()
+
+            def flush(self) -> None:
+                raise OSError()
+
+        with contextlib.redirect_stderr(BrokenStderr()):
+            optimizer.emit_progress_event({"event": "unit"})
+
+    def test_conductor_ticket_helper_uses_current_ticket_only(self) -> None:
+        self.assertEqual(
+            optimizer.conductor_ticket_from_payload({"ticket": "top"}, {"ticket": "result"}),
+            "result",
+        )
+        self.assertEqual(optimizer.conductor_ticket_from_payload({"ticket": "top"}, {}), "top")
+        self.assertEqual(optimizer.conductor_ticket_from_payload({}, {"ticket": 123}), "123")
+        self.assertIsNone(optimizer.conductor_ticket_from_payload({"ticket": ""}, {}))
+        self.assertIsNone(
+            optimizer.conductor_ticket_from_payload({}, {"supersededByTicket": "old-ticket"})
+        )
+
+
+class BaselineProgressTests(unittest.TestCase):
+    def make_run(self, index: int, *, exit_code: int = 0) -> optimizer.ConductorRun:
+        result = {
+            "state": "completed",
+            "exitCode": exit_code,
+            "queueWaitSeconds": 0.25,
+            "executionSeconds": 10.0 + index,
+            "timedOut": False,
+            "measurementInvalid": False,
+            "logPath": f"/tmp/test-suite-optimizer-sample-{index}.log",
+        }
+        return optimizer.ConductorRun(
+            command=["/repo/conductor", "test", "--json"],
+            process_exit_code=0,
+            stdout=json.dumps({"result": result}),
+            stderr="",
+            result=result,
+            log_text="Test Case 'RepoPromptTests.ExampleTests.testOne' passed after 1.000 seconds.\n",
+            ticket=f"ticket-{index}",
+        )
+
+    def test_baseline_progress_events_are_ordered_and_include_invalid_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filter_value = "RepoPromptTests.ExampleTests"
+            expected_command = optimizer.conductor_command(root, "root", filter_value=filter_value)
+            events: list[dict[str, object]] = []
+            operations: list[tuple[str, object]] = []
+            run_count = 0
+            runs = [self.make_run(1, exit_code=1), self.make_run(2)]
+
+            def progress_sink(event: dict[str, object]) -> None:
+                operations.append(("progress", event["event"]))
+                events.append(dict(event))
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+            ) -> optimizer.ConductorRun:
+                nonlocal run_count
+                run_count += 1
+                self.assertFalse(list_mode)
+                self.assertEqual((target, filter_value), ("root", "RepoPromptTests.ExampleTests"))
+                operations.append(("run", run_count))
+                return runs.pop(0)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "a" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-01T00:00:00+00:00"),
+            ):
+                payload = optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=2,
+                    label="progress-test",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    source_change_guard=optimizer.SOURCE_GUARD_METADATA,
+                    filter_value=filter_value,
+                    progress_sink=progress_sink,
+                )
+
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "baseline_sample_start",
+                "baseline_sample_end",
+                "baseline_sample_start",
+                "baseline_sample_end",
+            ],
+        )
+        self.assertEqual(operations[0], ("progress", "baseline_sample_start"))
+        self.assertEqual(operations[1], ("run", 1))
+        self.assertEqual(payload["summary"]["valid_samples"], 1)
+        self.assertEqual(payload["summary"]["invalid_samples"], 1)
+
+        start = events[0]
+        self.assertEqual(start["command"], expected_command)
+        self.assertEqual(start["target"], "root")
+        self.assertEqual(start["scope"], "filtered")
+        self.assertEqual(start["filter"], filter_value)
+        self.assertEqual(start["source_guard"], optimizer.SOURCE_GUARD_METADATA)
+        self.assertEqual(start["sample_index"], 1)
+        self.assertEqual(start["sample_count"], 2)
+        self.assertIsNone(start["ticket"])
+        self.assertIsNone(start["log_path"])
+
+        invalid_end = events[1]
+        self.assertEqual(invalid_end["ticket"], "ticket-1")
+        self.assertEqual(invalid_end["log_path"], "/tmp/test-suite-optimizer-sample-1.log")
+        self.assertEqual(invalid_end["process_exit_code"], 0)
+        self.assertEqual(invalid_end["state"], "completed")
+        self.assertEqual(invalid_end["exit_code"], 1)
+        self.assertEqual(invalid_end["execution_seconds"], 11.0)
+        self.assertEqual(invalid_end["measurement_invalid"], False)
+        self.assertEqual(invalid_end["source_changed"], False)
+        self.assertEqual(invalid_end["valid"], False)
+        self.assertEqual(invalid_end["invalid_reasons"], ["test exit 1"])
+        self.assertEqual(events[3]["valid"], True)
+        self.assertEqual(events[3]["invalid_reasons"], [])
 
 
 class CombinedBaselineTests(unittest.TestCase):
