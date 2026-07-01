@@ -73,6 +73,15 @@ final class QuitHoldController {
     private var holdWorkItem: DispatchWorkItem?
     private var overlayPanel: QuitHoldPanel?
     private var ownerWillCloseObserver: NSObjectProtocol?
+    /// Scheduled "dwell then fade" removal of the overlay after an early
+    /// release; cancelled by `hideOverlay()` so a new hold or a confirmed quit
+    /// still use the immediate-dismiss path.
+    private var lingerWorkItem: DispatchWorkItem?
+    /// Chrome-style overlay dismissal on early release: the message stays
+    /// readable for `cancelLingerSeconds`, then fades over `cancelFadeSeconds`
+    /// (~2s total) instead of vanishing instantly.
+    private static let cancelLingerSeconds: TimeInterval = 1.7
+    private static let cancelFadeSeconds: TimeInterval = 0.3
 
     init() {}
 
@@ -174,7 +183,9 @@ final class QuitHoldController {
     private func cancelHold() {
         holdWorkItem?.cancel()
         holdWorkItem = nil
-        hideOverlay()
+        // Chrome-style: keep the overlay readable for a beat on early release,
+        // then fade it out instead of dismissing it instantly.
+        startCancelLinger()
     }
 
     // MARK: - Overlay
@@ -206,12 +217,43 @@ final class QuitHoldController {
     }
 
     private func hideOverlay() {
+        lingerWorkItem?.cancel()
+        lingerWorkItem = nil
         if let observer = ownerWillCloseObserver {
             NotificationCenter.default.removeObserver(observer)
             ownerWillCloseObserver = nil
         }
         overlayPanel?.orderOut(nil)
         overlayPanel = nil
+    }
+
+    /// On early release, lingers the overlay at full opacity so the message is
+    /// readable, then fades and removes it. No-op if no overlay is showing.
+    private func startCancelLinger() {
+        guard let panel = overlayPanel else { return }
+        lingerWorkItem?.cancel()
+        let dwell = DispatchWorkItem { [weak self] in
+            // DispatchQueue.main.asyncAfter runs this on the main thread.
+            MainActor.assumeIsolated { self?.beginFadeOut(of: panel) }
+        }
+        lingerWorkItem = dwell
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.cancelLingerSeconds, execute: dwell)
+    }
+
+    private func beginFadeOut(of panel: QuitHoldPanel) {
+        lingerWorkItem = nil
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.cancelFadeSeconds
+            panel.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            // Runs on the main thread. Only remove this panel if it is still
+            // current — a new hold started during the fade replaces it.
+            MainActor.assumeIsolated {
+                if self?.overlayPanel === panel {
+                    self?.hideOverlay()
+                }
+            }
+        }
     }
 
     private func positionOverlay(_ panel: NSPanel) {
