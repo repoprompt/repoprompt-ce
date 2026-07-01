@@ -44,24 +44,32 @@ enum QuitHoldEventFilter {
 
 // MARK: - Controller
 
-/// App-lifecycle controller that gates the **keyboard** ⌘Q quit gesture.
-///
-/// It installs a raw `NSEvent` **local** monitor on `.keyDown` / `.keyUp` /
-/// `.flagsChanged`. On a keyboard ⌘Q `keyDown` with the toggle on it swallows
-/// the event (returns `nil`) so the default "Quit RepoPrompt ⌘Q" menu key
-/// equivalent never fires; it then runs a pure `QuitHoldDecision` state machine,
-/// shows a non-focus-stealing overlay, and starts a hold timer. Menu / Dock /
-/// status / programmatic quits never generate a keyboard `keyDown` for ⌘Q, so
-/// they call `terminate(_:)` directly and bypass this gate entirely. On a
-/// confirmed hold the controller calls `NSApp.terminate(nil)`, reusing the
-/// existing async shutdown path unchanged (it does **not** touch
-/// `applicationShouldTerminate`).
-///
-/// Per the spec's event-swallowing policy, the controller swallows a `keyDown`
-/// based only on the toggle + exact-modifier match — *regardless* of the
-/// `QuitHoldDecision` intent — so a repeated ⌘Q `keyDown` during a hold
-/// (intent `.ignore`) is still swallowed (S-010). `keyUp` and `flagsChanged`
-/// are never swallowed.
+// App-lifecycle controller that gates the **keyboard** ⌘Q quit gesture.
+//
+// It installs a raw `NSEvent` **local** monitor on `.keyDown` / `.keyUp` /
+// `.flagsChanged`. On a keyboard ⌘Q `keyDown` with the toggle on it swallows
+// the event (returns `nil`) so the default "Quit RepoPrompt ⌘Q" menu key
+// equivalent never fires; it then runs a pure `QuitHoldDecision` state machine,
+// shows a non-focus-stealing overlay, and starts a hold timer. Menu / Dock /
+// status / programmatic quits never generate a keyboard `keyDown` for ⌘Q, so
+// they call `terminate(_:)` directly and bypass this gate entirely.
+//
+// **Quit timing (release-after-threshold):** reaching the 1.0s threshold while
+// still holding ⌘Q only ARMS the quit (the overlay switches to "Release ⌘Q to
+// Quit"). The actual `NSApp.terminate(nil)` is fired on ⌘Q `keyUp` / Command
+// release AFTER the threshold, deferred one run-loop turn so the run loop is
+// idle when terminate runs. Terminating while the key is still held wedges the
+// shutdown: AppKit's `.terminateLater` wait plus sustained key-repeat delivery
+// starves the Swift main-actor executor, so the shutdown `Task` never runs and
+// `reply(true)` is never called. Quitting on release avoids that entirely and
+// leaves the existing async shutdown path unchanged.
+//
+// Per the spec's event-swallowing policy, the controller swallows a `keyDown`
+// based only on the toggle + exact-modifier match — *regardless* of the
+// `QuitHoldDecision` intent — so a repeated ⌘Q `keyDown` during a hold
+// (intent `.ignore`) is still swallowed (S-010). `keyUp` and `flagsChanged`
+// are never swallowed.
+
 @MainActor
 final class QuitHoldController {
     /// The local `NSEvent` monitor token. `nonisolated(unsafe)` so `deinit` can
@@ -120,23 +128,19 @@ final class QuitHoldController {
                 toggleOn: toggleOn
             )
             guard swallow else { return event }
-            let intent = decision.handle(.keyDown(toggleOn: true))
-            handleKeyDownIntent(intent)
+            apply(decision.handle(.keyDown(toggleOn: true)))
             return nil
 
         case .keyUp:
-            // Only Q's keyUp breaks the hold (spec "held semantics"); any other
-            // keyUp passes through untouched and does not cancel (S-002).
+            // Only Q's keyUp is a release signal (spec "held semantics"); any
+            // other keyUp passes through untouched (S-002).
             if event.keyCode == QuitHoldEventFilter.quitKeyCode {
-                let intent = decision.handle(.keyUp)
-                if intent == .cancel { cancelHold() }
+                apply(decision.handle(.keyUp))
             }
             return event
 
         case .flagsChanged:
-            let commandDown = event.modifierFlags.contains(.command)
-            let intent = decision.handle(.flagsChanged(commandDown: commandDown))
-            if intent == .cancel { cancelHold() }
+            apply(decision.handle(.flagsChanged(commandDown: event.modifierFlags.contains(.command))))
             return event
 
         default:
@@ -144,28 +148,21 @@ final class QuitHoldController {
         }
     }
 
-    private func handleKeyDownIntent(_ intent: QuitHoldIntent) {
+    /// Translates a decision intent into side effects.
+    private func apply(_ intent: QuitHoldIntent) {
         switch intent {
         case let .beginHold(threshold):
-            showOverlay()
+            showOverlay(message: "Hold ⌘Q to Quit")
             scheduleHoldTimer(threshold: threshold)
-        case .ignore, .cancel, .quit:
-            break
-        }
-    }
-
-    /// The hold timer elapsed: if the decision commits to quit, dismiss the
-    /// overlay and route through the normal shutdown path.
-    private func handleTimerElapsed() {
-        let intent = decision.handle(.timerElapsed)
-        switch intent {
-        case .quit:
-            holdWorkItem = nil
-            hideOverlay()
-            NSApp.terminate(nil)
+        case .arm:
+            // Threshold reached while still holding: arm the quit and prompt
+            // release. Do NOT terminate here (see class doc).
+            updateOverlayMessage("Release ⌘Q to Quit")
         case .cancel:
             cancelHold()
-        case .ignore, .beginHold:
+        case .quit:
+            fireTermination()
+        case .ignore:
             break
         }
     }
@@ -174,10 +171,31 @@ final class QuitHoldController {
         holdWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             // DispatchQueue.main.asyncAfter runs this on the main thread.
-            MainActor.assumeIsolated { self?.handleTimerElapsed() }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.apply(self.decision.handle(.timerElapsed))
+            }
         }
         holdWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + threshold, execute: work)
+    }
+
+    /// Release after the threshold: dismiss the overlay and route through the
+    /// normal shutdown path one run-loop turn later (run loop idle → the
+    /// shutdown Task drains cleanly).
+    private func fireTermination() {
+        holdWorkItem?.cancel()
+        holdWorkItem = nil
+        lingerWorkItem?.cancel()
+        lingerWorkItem = nil
+        hideOverlay()
+        // Call terminate SYNCHRONOUSLY here. This runs inside the local NSEvent
+        // monitor closure, which AppKit invokes during sendEvent — the same
+        // dispatch context the menu/Apple-Event quit paths use, and the only
+        // context in which terminateLater's shutdown Task reliably drains.
+        // Deferring to a DispatchQueue callback left the app wedged in
+        // terminateLater (the Task body never serviced).
+        NSApp.terminate(nil)
     }
 
     private func cancelHold() {
@@ -190,17 +208,12 @@ final class QuitHoldController {
 
     // MARK: - Overlay
 
-    private func showOverlay() {
+    private func showOverlay(message: String) {
         hideOverlay()
 
         let panel = QuitHoldPanel()
-        let hosting = NSHostingView(rootView: QuitHoldOverlayView())
-        panel.contentView = hosting
-        // Size the panel to the SwiftUI content's natural size (no fixed frame).
-        let fit = hosting.fittingSize
-        panel.setContentSize(NSSize(width: ceil(fit.width), height: ceil(fit.height)))
-        positionOverlay(panel)
         overlayPanel = panel
+        configure(panel, message: message)
 
         if let owner = NSApp.keyWindow, owner.isVisible {
             ownerWillCloseObserver = NotificationCenter.default.addObserver(
@@ -214,6 +227,22 @@ final class QuitHoldController {
         }
 
         panel.orderFrontRegardless()
+    }
+
+    /// Swaps the overlay's message (e.g. "Hold…" → "Release…") without
+    /// dismissing it. No-op if no overlay is showing.
+    private func updateOverlayMessage(_ message: String) {
+        guard let panel = overlayPanel else { return }
+        configure(panel, message: message)
+    }
+
+    private func configure(_ panel: QuitHoldPanel, message: String) {
+        let hosting = NSHostingView(rootView: QuitHoldOverlayView(text: message))
+        panel.contentView = hosting
+        // Size the panel to the SwiftUI content's natural size (no fixed frame).
+        let fit = hosting.fittingSize
+        panel.setContentSize(NSSize(width: ceil(fit.width), height: ceil(fit.height)))
+        positionOverlay(panel)
     }
 
     private func hideOverlay() {
@@ -304,10 +333,12 @@ private final class QuitHoldPanel: NSPanel {
     }
 }
 
-/// "Hold ⌘Q to Quit" card — text only, no progress bar or timer (like Chrome).
+/// "Hold ⌘Q to Quit" / "Release ⌘Q to Quit" card — text only (like Chrome).
 private struct QuitHoldOverlayView: View {
+    let text: String
+
     var body: some View {
-        Text("Hold ⌘Q to Quit")
+        Text(text)
             .font(.system(size: 34, weight: .semibold))
             .padding(.horizontal, 28)
             .padding(.vertical, 18)
