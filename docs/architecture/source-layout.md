@@ -16,6 +16,7 @@ Sources/
     Features/
       AgentMode/                 # Agent Mode UI, models, view models, onboarding, recommendations, and shared agent runtime ownership
         Runtime/Providers/       # provider/runtime enum and provider factory shared by Context Builder, Agent Mode, MCP, and recommendations
+        History/                 # cross-workspace session history scanner, MCP tool service (history.list_sessions / search / time)
       Chat/                      # chat/oracle models, services, diff state, view models, and views
       CodeMap/                   # code-map extraction feature code and FileAPI model
       ContextBuilder/            # Context Builder product UI/runtime, view models, settings, prompts, budget defaults, and response-type mapping

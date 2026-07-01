@@ -1,0 +1,96 @@
+{
+  "id" : "11111111-1111-4111-8111-111111111111",
+  "serializationVersion" : 6,
+  "name" : "Raw Tool Execution Session",
+  "savedAt" : 721742925,
+  "items" : [],
+  "transcript" : {
+    "version" : 3,
+    "nextSequenceIndex" : 3,
+    "turns" : [
+      {
+        "id" : "22222222-2222-4222-8222-222222222222",
+        "responseSpans" : [
+          {
+            "id" : "33333333-3333-4333-8333-333333333333",
+            "lifecycle" : "completed",
+            "startedAt" : 721742800,
+            "completedAt" : 721742920,
+            "activities" : [
+              {
+                "id" : "44444444-4444-4444-8444-444444444444",
+                "timestamp" : 721742805,
+                "sequenceIndex" : 0,
+                "role" : "assistant",
+                "itemKind" : "assistant",
+                "text" : "Raw persisted logging investigation started.",
+                "attachments" : [],
+                "taggedFileAttachments" : [],
+                "isStreaming" : false,
+                "isSubstantiveAssistant" : true,
+                "sealsAssistantBoundary" : false
+              },
+              {
+                "id" : "55555555-5555-4555-8555-555555555555",
+                "timestamp" : 721742810,
+                "sequenceIndex" : 1,
+                "role" : "toolExecution",
+                "itemKind" : "toolResult",
+                "text" : "apply_edits • success • src/logging/log.ts, src/api/register.ts",
+                "attachments" : [],
+                "taggedFileAttachments" : [],
+                "isStreaming" : false,
+                "toolExecution" : {
+                  "stableExecutionID" : "raw-exec-1",
+                  "toolName" : "apply_edits",
+                  "argsJSON" : "{\"path\":\"src/logging/log.ts\"}",
+                  "status" : "success",
+                  "summaryOnly" : false,
+                  "summaryText" : "apply_edits • success • src/logging/log.ts, src/api/register.ts",
+                  "keyPaths" : ["src/logging/log.ts", "src/api/register.ts"]
+                },
+                "isSubstantiveAssistant" : false,
+                "sealsAssistantBoundary" : false
+              },
+              {
+                "id" : "66666666-6666-4666-8666-666666666666",
+                "timestamp" : 721742815,
+                "sequenceIndex" : 2,
+                "role" : "toolExecution",
+                "itemKind" : "toolResult",
+                "text" : "read_file • success",
+                "attachments" : [],
+                "taggedFileAttachments" : [],
+                "isStreaming" : false,
+                "toolExecution" : {
+                  "stableExecutionID" : "raw-exec-2",
+                  "toolName" : "read_file",
+                  "argsJSON" : "{\"path\":\"src/logging/log.ts\"}",
+                  "status" : "success",
+                  "summaryOnly" : false,
+                  "summaryText" : "read_file • success",
+                  "keyPaths" : []
+                },
+                "isSubstantiveAssistant" : false,
+                "sealsAssistantBoundary" : false
+              }
+            ]
+          }
+        ],
+        "retentionTier" : "full",
+        "startedAt" : 721742800,
+        "completedAt" : 721742920
+      }
+    ]
+  },
+  "itemCount" : 1,
+  "lastUserMessageAt" : 721742800,
+  "agentKind" : "claudeCodeGLM",
+  "agentModel" : "sonnet",
+  "lastRunState" : "completed",
+  "autoEditEnabled" : true,
+  "providerTokenUsageByTurn" : [],
+  "isMCPOriginated" : false,
+  "worktreeBindings" : [],
+  "worktreeMergeOperations" : []
+}

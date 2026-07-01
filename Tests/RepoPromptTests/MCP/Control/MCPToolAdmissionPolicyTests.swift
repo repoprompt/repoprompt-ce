@@ -6,17 +6,21 @@ import XCTest
 final class MCPToolAdmissionPolicyTests: XCTestCase {
     func testClassificationExhaustivelyCoversCanonicalCatalogWithoutDefault() {
         let canonicalTools = MCPToolExecutionContractCatalog.orderedAdvertisedToolNames
-        XCTAssertEqual(canonicalTools.count, 26)
+        XCTAssertEqual(canonicalTools.count, 27)
         XCTAssertEqual(Set(MCPToolAdmissionPolicy.classifications.keys), Set(canonicalTools))
         XCTAssertEqual(MCPToolAdmissionPolicy.classifications.count, canonicalTools.count)
         XCTAssertNil(MCPToolAdmissionPolicy.classification(forCanonicalToolName: "future_unreviewed_tool"))
         XCTAssertNil(ServerNetworkManager.callLane(forCanonicalToolName: "future_unreviewed_tool"))
 
+        // history is read-only (list_sessions/search/time) but `search` can load up to
+        // maxSessionsScanned transcripts, so it rides the small-read lane whose per-window
+        // cap (2) bounds concurrent heavy reads more tightly than file_search.
         assertClass(.smallRead, tools: [
             MCPWindowToolName.getCodeStructure,
             MCPWindowToolName.getFileTree,
             MCPWindowToolName.readFile,
-            MCPWindowToolName.oracleChatLog
+            MCPWindowToolName.oracleChatLog,
+            MCPWindowToolName.history
         ])
         assertClass(.gitRead, tools: [MCPWindowToolName.git])
         assertClass(.fileSearch, tools: [MCPWindowToolName.search])
