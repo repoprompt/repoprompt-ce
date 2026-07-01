@@ -194,11 +194,11 @@ final class QuitHoldController {
         hideOverlay()
 
         let panel = QuitHoldPanel()
-        let startDate = Date()
-        let endDate = startDate.addingTimeInterval(QuitHoldDecision.threshold)
-        panel.contentView = NSHostingView(
-            rootView: QuitHoldOverlayView(startDate: startDate, endDate: endDate)
-        )
+        let hosting = NSHostingView(rootView: QuitHoldOverlayView())
+        panel.contentView = hosting
+        // Size the panel to the SwiftUI content's natural size (no fixed frame).
+        let fit = hosting.fittingSize
+        panel.setContentSize(NSSize(width: ceil(fit.width), height: ceil(fit.height)))
         positionOverlay(panel)
         overlayPanel = panel
 
@@ -304,23 +304,17 @@ private final class QuitHoldPanel: NSPanel {
     }
 }
 
-/// "Hold ⌘Q to Quit" card with a determinate progress bar over the threshold.
+/// "Hold ⌘Q to Quit" card — text only, no progress bar or timer (like Chrome).
 private struct QuitHoldOverlayView: View {
-    let startDate: Date
-    let endDate: Date
-
     var body: some View {
-        VStack(spacing: 10) {
-            Text("Hold ⌘Q to Quit")
-                .font(.headline)
-            ProgressView(timerInterval: startDate ... endDate, countsDown: false)
-        }
-        .padding(16)
-        .frame(width: 220)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.primary.opacity(0.1), lineWidth: 0.5)
-        )
+        Text("Hold ⌘Q to Quit")
+            .font(.system(size: 34, weight: .semibold))
+            .padding(.horizontal, 28)
+            .padding(.vertical, 18)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.1), lineWidth: 0.5)
+            )
     }
 }
