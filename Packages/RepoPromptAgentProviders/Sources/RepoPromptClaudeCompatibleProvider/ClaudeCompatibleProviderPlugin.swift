@@ -239,6 +239,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let opus47Raw = "claude-opus-4-7"
     private static let opus46Raw = "claude-opus-4-6"
     private static let opus45Raw = "claude-opus-4-5"
+    private static let sonnet5Raw = "claude-sonnet-5"
     private static let sonnet46Raw = "claude-sonnet-4-6"
     private static let sonnet45Raw = "claude-sonnet-4-5"
     private static let haiku45Raw = "claude-haiku-4-5"
@@ -285,6 +286,12 @@ public enum ClaudeCompatibleModelCatalog {
             displayName: "Sonnet Latest",
             description: "Balanced speed and capability. Good for general coding, analysis, and everyday work.",
             supportsXHigh: false
+        ),
+        StaticModel(
+            rawValue: sonnet5Raw,
+            displayName: "Sonnet 5",
+            description: "Pinned Claude Sonnet 5. Balanced speed and capability with 1M context for everyday engineering.",
+            supportsXHigh: true
         ),
         StaticModel(
             rawValue: sonnet46Raw,
