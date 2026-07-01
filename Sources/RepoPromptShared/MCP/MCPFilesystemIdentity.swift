@@ -183,8 +183,13 @@ public struct MCPFilesystemIdentity: Equatable, Sendable {
             .appendingPathComponent(routingStateFileName, isDirectory: false)
     }
 
+    public func userSpaceCLIRootURL(fileManager: FileManager = .default) -> URL {
+        fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("RepoPrompt", isDirectory: true)
+    }
+
     public func userSpaceCLIURL(fileManager: FileManager = .default) -> URL {
-        applicationSupportRootURL(fileManager: fileManager)
+        userSpaceCLIRootURL(fileManager: fileManager)
             .appendingPathComponent(userSpaceCLIFileName, isDirectory: false)
     }
 }

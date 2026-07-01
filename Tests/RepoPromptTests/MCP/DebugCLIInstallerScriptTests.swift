@@ -84,7 +84,7 @@ final class DebugCLIInstallerScriptTests: XCTestCase {
             home = root.appendingPathComponent("home", isDirectory: true)
             appBundle = root.appendingPathComponent("RepoPrompt.app", isDirectory: true)
             bundledCLI = appBundle.appendingPathComponent("Contents/MacOS/repoprompt-mcp")
-            userLink = home.appendingPathComponent("Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug")
+            userLink = home.appendingPathComponent("RepoPrompt/repoprompt_ce_cli_debug")
             pathLink = root.appendingPathComponent("bin/rpce-cli-debug")
             script = try RepoRoot.url().appendingPathComponent("Scripts/install_debug_cli.sh")
 

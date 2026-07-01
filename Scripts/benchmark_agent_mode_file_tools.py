@@ -803,7 +803,7 @@ def worktree_metadata(root: Path, candidate: Path) -> dict[str, Any]:
 
 def resolve_cli(argument: str | None) -> Path:
     candidates = [argument, os.environ.get("REPOPROMPT_DEBUG_CLI_INSTALL_PATH"), shutil.which("rpce-cli-debug"),
-                  str(Path.home() / "Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug")]
+                  str(Path.home() / "RepoPrompt/repoprompt_ce_cli_debug")]
     for candidate in candidates:
         if candidate:
             path = Path(candidate).expanduser()

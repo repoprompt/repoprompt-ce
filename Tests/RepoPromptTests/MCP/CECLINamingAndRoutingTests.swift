@@ -25,9 +25,12 @@ final class CECLINamingAndRoutingTests: XCTestCase {
         }
     }
 
-    func testUserSpaceSymlinkPathUsesApplicationSupport() {
+    func testUserSpaceSymlinkPathUsesStableNoSpaceDirectory() {
         let path = CLISymlinkManagerUserSpace.userSymlinkPath
-        XCTAssertTrue(path.contains("Library/Application Support/RepoPrompt CE"), path)
+        let expectedDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("RepoPrompt", isDirectory: true)
+        XCTAssertEqual(URL(fileURLWithPath: path).deletingLastPathComponent(), expectedDirectory, path)
+        XCTAssertFalse(path.contains(" "), path)
         #if DEBUG
             XCTAssertTrue(path.hasSuffix("repoprompt_ce_cli_debug"), path)
         #else

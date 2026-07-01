@@ -104,14 +104,14 @@ The installer links:
 
 ```text
 /usr/local/bin/rpce-cli-debug
-  -> ~/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug
+  -> ~/RepoPrompt/repoprompt_ce_cli_debug
   -> ~/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app/Contents/MacOS/repoprompt-mcp
 ```
 
 If `/usr/local/bin` needs administrator privileges, run the install target from an interactive terminal so `sudo` can prompt, or install the CLI from Settings → MCP → CLI Tools. Without the PATH link, use the direct fallback:
 
 ```bash
-"$HOME/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug" -e 'windows'
+"$HOME/RepoPrompt/repoprompt_ce_cli_debug" -e 'windows'
 ```
 
 Live CE MCP smoke flow:
