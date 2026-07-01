@@ -145,6 +145,37 @@ struct WorkspacePreset: Codable, Identifiable, Equatable {
     }
 }
 
+struct LossyDecodableArray<Element: Decodable>: Decodable {
+    private struct ElementWrapper: Decodable {
+        let value: Element?
+
+        init(from decoder: Decoder) throws {
+            value = try? Element(from: decoder)
+        }
+    }
+
+    let elements: [Element]
+    let droppedCount: Int
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var decoded: [Element] = []
+        var dropped = 0
+
+        while !container.isAtEnd {
+            let wrapper = try container.decode(ElementWrapper.self)
+            if let value = wrapper.value {
+                decoded.append(value)
+            } else {
+                dropped += 1
+            }
+        }
+
+        elements = decoded
+        droppedCount = dropped
+    }
+}
+
 struct StoredSelection: Codable, Equatable, Hashable {
     let selectedPaths: [String]
     let manualCodemapPaths: [String]
@@ -165,11 +196,21 @@ struct StoredSelection: Codable, Equatable, Hashable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(
-            selectedPaths: container.decodeIfPresent([String].self, forKey: .selectedPaths) ?? [],
-            manualCodemapPaths: container.decodeIfPresent([String].self, forKey: .manualCodemapPaths) ?? [],
-            slices: container.decodeIfPresent([String: [LineRange]].self, forKey: .slices) ?? [:],
-            codemapAutoEnabled: container.decodeIfPresent(Bool.self, forKey: .codemapAutoEnabled) ?? true
+        let manualKeyWasPresent = container.contains(.manualCodemapPaths)
+        let selectedPaths = try container.decodeIfPresent([String].self, forKey: .selectedPaths) ?? []
+        let manualPaths = try container.decodeIfPresent([String].self, forKey: .manualCodemapPaths) ?? []
+        let legacyAutoPaths = (try? container.decodeIfPresent([String].self, forKey: .autoCodemapPaths)) ?? []
+        let slices = try container.decodeIfPresent([String: [LineRange]].self, forKey: .slices) ?? [:]
+        let codemapAutoEnabled = try container.decodeIfPresent(Bool.self, forKey: .codemapAutoEnabled) ?? true
+        self.init(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: Self.compatibilityCodemapPaths(
+                manualPaths: manualPaths,
+                legacyAutoPaths: legacyAutoPaths,
+                manualKeyWasPresent: manualKeyWasPresent
+            ),
+            slices: slices,
+            codemapAutoEnabled: codemapAutoEnabled
         )
     }
 
@@ -177,7 +218,7 @@ struct StoredSelection: Codable, Equatable, Hashable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(selectedPaths, forKey: .selectedPaths)
         try container.encode(manualCodemapPaths, forKey: .manualCodemapPaths)
-        try container.encode([String](), forKey: .autoCodemapPaths)
+        try container.encode(manualCodemapPaths, forKey: .autoCodemapPaths)
         try container.encode(slices, forKey: .slices)
         try container.encode(codemapAutoEnabled, forKey: .codemapAutoEnabled)
     }
@@ -188,6 +229,24 @@ struct StoredSelection: Codable, Equatable, Hashable {
         case autoCodemapPaths
         case slices
         case codemapAutoEnabled
+    }
+
+    private static func compatibilityCodemapPaths(
+        manualPaths: [String],
+        legacyAutoPaths: [String],
+        manualKeyWasPresent: Bool
+    ) -> [String] {
+        dedupedCodemapPaths(manualKeyWasPresent ? manualPaths : legacyAutoPaths)
+    }
+
+    private static func dedupedCodemapPaths(_ paths: [String]) -> [String] {
+        var seen = Set<String>()
+        var deduped: [String] = []
+        for path in paths {
+            guard seen.insert(path).inserted else { continue }
+            deduped.append(path)
+        }
+        return deduped
     }
 }
 
@@ -302,7 +361,11 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         activeChatSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeChatSessionID)
         activeAgentSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeAgentSessionID)
-        selection = (try? c.decodeIfPresent(StoredSelection.self, forKey: .selection)) ?? .init()
+        if c.contains(.selection) {
+            selection = try c.decodeIfPresent(StoredSelection.self, forKey: .selection) ?? .init()
+        } else {
+            selection = .init()
+        }
         expandedFolders = try c.decodeIfPresent([String].self, forKey: .expandedFolders) ?? []
         promptText = try c.decodeIfPresent(String.self, forKey: .promptText) ?? ""
         selectedMetaPromptIDs = try c.decodeIfPresent([UUID].self, forKey: .selectedMetaPromptIDs) ?? []
@@ -389,6 +452,10 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
     /// compose-tab invariant normalization once. Excluded from CodingKeys/Equatable.
     var normalizationRequiresSave: Bool
 
+    /// Transient decode-time signal indicating one or more compose/stash entries
+    /// were skipped to preserve the rest of the workspace. Excluded from CodingKeys/Equatable.
+    var lossyDecodeRecovered: Bool
+
     private static let decodeLogger = Logger(subsystem: "com.repoprompt.workspace", category: "decode")
     private static var composeTabsDecodeWarningEmitted = false
 
@@ -447,6 +514,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         self.activeComposeTabID = activeComposeTabID
         self.stashedTabs = stashedTabs
         normalizationRequiresSave = false
+        lossyDecodeRecovered = false
         normalizeComposeTabInvariants()
         normalizationRequiresSave = false
     }
@@ -474,16 +542,37 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         copyPresetId = (try? c.decode(UUID.self, forKey: .copyPresetId))
         copyCustomizations = (try? c.decode(CopyCustomizations.self, forKey: .copyCustomizations))
         chatPresetId = (try? c.decode(UUID.self, forKey: .chatPresetId))
+        let lossyComposeTabs: LossyDecodableArray<ComposeTabState>?
+        var composeTabsRecoveredFromMalformedValue = false
         do {
-            composeTabs = try c.decodeIfPresent([ComposeTabState].self, forKey: .composeTabs) ?? []
+            lossyComposeTabs = try c.decodeIfPresent(LossyDecodableArray<ComposeTabState>.self, forKey: .composeTabs)
+            composeTabs = lossyComposeTabs?.elements ?? []
         } catch {
             Self.logComposeTabsDecodeFailure(error: error, workspaceID: id)
+            lossyComposeTabs = nil
             composeTabs = []
+            composeTabsRecoveredFromMalformedValue = true
         }
         activeComposeTabID = (try? c.decode(UUID.self, forKey: .activeComposeTabID))
-        stashedTabs = (try? c.decode([StashedTab].self, forKey: .stashedTabs)) ?? []
+        let lossyStashedTabs: LossyDecodableArray<StashedTab>?
+        var stashedTabsRecoveredFromMalformedValue = false
+        do {
+            lossyStashedTabs = try c.decodeIfPresent(LossyDecodableArray<StashedTab>.self, forKey: .stashedTabs)
+            stashedTabs = lossyStashedTabs?.elements ?? []
+        } catch {
+            lossyStashedTabs = nil
+            stashedTabs = []
+            stashedTabsRecoveredFromMalformedValue = true
+        }
         normalizationRequiresSave = false
-        normalizeComposeTabInvariants()
+        lossyDecodeRecovered = composeTabsRecoveredFromMalformedValue
+            || stashedTabsRecoveredFromMalformedValue
+            || (lossyComposeTabs?.droppedCount ?? 0) > 0
+            || (lossyStashedTabs?.droppedCount ?? 0) > 0
+        let normalized = normalizeComposeTabInvariants()
+        if lossyDecodeRecovered, normalized {
+            normalizationRequiresSave = false
+        }
     }
 
     func encode(to encoder: Encoder) throws {

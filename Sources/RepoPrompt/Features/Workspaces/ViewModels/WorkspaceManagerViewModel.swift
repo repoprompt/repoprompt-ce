@@ -71,9 +71,10 @@ struct WorkspaceFileLoadResult {
     let workspace: WorkspaceModel
     let cacheHit: Bool
     let composeTabsNormalized: Bool
+    let lossyDecodeRecovered: Bool
 
     var normalizationRequiresSave: Bool {
-        composeTabsNormalized
+        composeTabsNormalized && !lossyDecodeRecovered
     }
 
     let normalizationSaveTask: Task<Void, Never>?
@@ -89,9 +90,10 @@ private struct WorkspaceFileCachedLoadResult {
     let workspace: WorkspaceModel
     let cacheHit: Bool
     let composeTabsNormalized: Bool
+    let lossyDecodeRecovered: Bool
 
     var normalizationRequiresSave: Bool {
-        composeTabsNormalized
+        composeTabsNormalized && !lossyDecodeRecovered
     }
 
     let cacheKey: WorkspaceFileDecodeCacheKey
@@ -115,6 +117,7 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
                 workspace: cached,
                 cacheHit: true,
                 composeTabsNormalized: cached.normalizationRequiresSave,
+                lossyDecodeRecovered: cached.lossyDecodeRecovered,
                 cacheKey: keyBeforeRead
             )
         }
@@ -123,10 +126,11 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         let standardizedURL = URL(fileURLWithPath: keyBeforeRead.standardizedPath)
         let data = try Data(contentsOf: standardizedURL)
         var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: data)
+        let lossyDecodeRecovered = workspace.lossyDecodeRecovered
         let decodedRequiresSave = workspace.normalizationRequiresSave
         let normalized = workspace.normalizeComposeTabInvariants()
         let normalizationRequiresSave = decodedRequiresSave || normalized || workspace.normalizationRequiresSave
-        workspace.normalizationRequiresSave = normalizationRequiresSave
+        workspace.normalizationRequiresSave = lossyDecodeRecovered ? false : normalizationRequiresSave
 
         if let keyAfterRead = try? metadataKey(for: fileURL),
            keyAfterRead == keyBeforeRead
@@ -140,6 +144,7 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
             workspace: workspace,
             cacheHit: false,
             composeTabsNormalized: normalizationRequiresSave,
+            lossyDecodeRecovered: lossyDecodeRecovered,
             cacheKey: keyBeforeRead
         )
     }
@@ -274,6 +279,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private var stateVersionByWorkspaceID: [UUID: Int] = [:]
     private var lastSavedVersionByWorkspaceID: [UUID: Int] = [:]
+    private var lossyLoadedWorkspaceIDs = Set<UUID>()
 
     @MainActor
     private static var nextWorkspaceSelectionRevision: UInt64 = 1
@@ -309,6 +315,13 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func bumpStateVersion(for id: UUID?) {
         guard let id else { return }
         stateVersionByWorkspaceID[id, default: 0] &+= 1 // wraparound-safe
+    }
+
+    private func markLossyLoadedWorkspacesClean(_ workspaces: [WorkspaceModel]) {
+        for workspace in workspaces where workspace.lossyDecodeRecovered {
+            lossyLoadedWorkspaceIDs.insert(workspace.id)
+            lastSavedVersionByWorkspaceID[workspace.id] = stateVersionByWorkspaceID[workspace.id, default: 0]
+        }
     }
 
     private static func allocateWorkspaceSelectionRevision() -> UInt64 {
@@ -1466,6 +1479,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         #endif
         workspaces = loaded
+        markLossyLoadedWorkspacesClean(loaded)
         recordRepoPathBaselines(for: loaded)
 
         startPollTimer()
@@ -1613,15 +1627,51 @@ class WorkspaceManagerViewModel: ObservableObject {
         Self.loadWorkspaceIndex(from: workspaceIndexFileURL)
     }
 
-    private nonisolated static func loadWorkspaceIndex(from indexURL: URL) -> [WorkspaceIndexEntry] {
-        guard FileManager.default.fileExists(atPath: indexURL.path) else { return [] }
+    nonisolated static func loadWorkspaceIndex(from indexURL: URL) -> [WorkspaceIndexEntry] {
+        guard FileManager.default.fileExists(atPath: indexURL.path) else {
+            return recoverWorkspaceIndexEntries(fromBaseRoot: indexURL.deletingLastPathComponent())
+        }
 
         do {
             let data = try Data(contentsOf: indexURL)
             return try JSONDecoder().decode([WorkspaceIndexEntry].self, from: data)
         } catch {
             print("Failed to load workspaceIndex.json: \(error)")
-            return []
+            return recoverWorkspaceIndexEntries(fromBaseRoot: indexURL.deletingLastPathComponent())
+        }
+    }
+
+    nonisolated static func recoverWorkspaceIndexEntries(fromBaseRoot baseRoot: URL) -> [WorkspaceIndexEntry] {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: baseRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var entries: [WorkspaceIndexEntry] = []
+        var seenIDs = Set<UUID>()
+        for directory in contents.sorted(by: { $0.path < $1.path }) {
+            let values = try? directory.resourceValues(forKeys: [.isDirectoryKey])
+            guard values?.isDirectory == true else { continue }
+            let workspaceURL = directory.appendingPathComponent("workspace.json")
+            guard FileManager.default.fileExists(atPath: workspaceURL.path),
+                  let workspace = try? loadWorkspaceFromFile(at: workspaceURL),
+                  seenIDs.insert(workspace.id).inserted
+            else { continue }
+            entries.append(WorkspaceIndexEntry(
+                id: workspace.id,
+                name: workspace.name,
+                customStoragePath: workspace.customStoragePath,
+                isSystemWorkspace: workspace.isSystemWorkspace,
+                isHiddenInMenus: workspace.isHiddenInMenus
+            ))
+        }
+        return entries.sorted { lhs, rhs in
+            let nameOrder = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+            if nameOrder != .orderedSame {
+                return nameOrder == .orderedAscending
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
         }
     }
 
@@ -1684,6 +1734,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 guard reloadWorkspacesToken == token else { return }
 
                 workspaces = loaded
+                markLossyLoadedWorkspacesClean(loaded)
                 recordRepoPathBaselines(for: loaded)
                 if let currentActiveID,
                    loaded.contains(where: { $0.id == currentActiveID })
@@ -6896,6 +6947,26 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - Save/Load Single Workspace
 
+    @discardableResult
+    nonisolated static func backupExistingWorkspaceJSONBeforeLossySave(at url: URL, now: Date = Date()) throws -> URL? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return nil }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let timestamp = formatter.string(from: now).replacingOccurrences(of: ":", with: "-")
+        let directory = url.deletingLastPathComponent()
+        let baseName = url.lastPathComponent + ".pre-lossy-restore-" + timestamp
+        var candidate = directory.appendingPathComponent(baseName)
+        var suffix = 1
+        while fm.fileExists(atPath: candidate.path) {
+            candidate = directory.appendingPathComponent(baseName + "-" + String(suffix))
+            suffix += 1
+        }
+        try fm.copyItem(at: url, to: candidate)
+        return candidate
+    }
+
     private func saveWorkspaceAsync(source: WorkspaceSaveSource = .saveWorkspaceAsync) async {
         guard let active = activeWorkspace,
               let idx = workspaces.firstIndex(where: { $0.id == active.id })
@@ -6910,6 +6981,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let customStoragePath = current.customStoragePath
         let workspaceDirName = directoryName(for: current)
         let lastSyncedRepoPaths = lastSyncedRepoPathsByWorkspaceID[current.id]
+        let shouldBackupBeforeLossySave = lossyLoadedWorkspaceIDs.contains(current.id)
         await WorkspaceDiskWriter.shared.flush(url: workspaceFileURL(for: current))
 
         do {
@@ -6993,9 +7065,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             recordRepoPathBaseline(for: merged)
 
+            if shouldBackupBeforeLossySave {
+                _ = try Self.backupExistingWorkspaceJSONBeforeLossySave(at: url)
+            }
             let metadata = workspaceSaveMetadata(for: merged, source: source)
             WorkspaceFileDecodeCache.shared.invalidate(url: url)
             await WorkspaceDiskWriter.shared.enqueueWorkspace(data: data, url: url, metadata: metadata)
+            if shouldBackupBeforeLossySave {
+                lossyLoadedWorkspaceIDs.remove(current.id)
+            }
 
             if indexFieldsChanged {
                 await rebuildAndSaveIndexAsync()
@@ -7066,19 +7144,37 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         let metadata = workspaceSaveMetadata(for: workspaceToSave, source: source)
+        let shouldBackupBeforeLossySave = lossyLoadedWorkspaceIDs.contains(workspace.id)
         WorkspaceSaveTracer.event("workspaceSave.direct.enqueue", metadata: metadata, url: targetURL)
-        let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, baseRoot: currentBaseRoot, metadata: metadata)
+        let finalURL = try await saveWorkspaceToFileAsync(
+            workspaceToSave,
+            baseRoot: currentBaseRoot,
+            metadata: metadata,
+            backupBeforeLossySave: shouldBackupBeforeLossySave
+        )
         recordRepoPathBaseline(for: workspaceToSave)
+        if shouldBackupBeforeLossySave {
+            lossyLoadedWorkspaceIDs.remove(workspace.id)
+        }
         return finalURL
     }
 
-    nonisolated func saveWorkspaceToFileAsync(_ workspace: WorkspaceModel, baseRoot: URL, metadata: WorkspaceSavePayloadMetadata? = nil) async throws -> URL {
+    nonisolated func saveWorkspaceToFileAsync(
+        _ workspace: WorkspaceModel,
+        baseRoot: URL,
+        metadata: WorkspaceSavePayloadMetadata? = nil,
+        backupBeforeLossySave: Bool = false
+    ) async throws -> URL {
         // Encode JSON
         let encoded = try JSONEncoder().encode(workspace)
 
         // Prepare file path
         let folder = try ensureWorkspaceDirectoryExists(for: workspace, baseRoot: baseRoot)
         let finalURL = folder.appendingPathComponent("workspace.json")
+
+        if backupBeforeLossySave {
+            _ = try Self.backupExistingWorkspaceJSONBeforeLossySave(at: finalURL)
+        }
 
         // Enqueue write to shared disk writer for serialization
         WorkspaceFileDecodeCache.shared.invalidate(url: finalURL)
@@ -7098,12 +7194,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         let folder = try ensureWorkspaceDirectoryExists(for: workspace)
         let finalURL = folder.appendingPathComponent("workspace.json")
         let metadata = workspaceSaveMetadata(for: workspace, source: source)
+        let shouldBackupBeforeLossySave = lossyLoadedWorkspaceIDs.contains(workspace.id)
+        if shouldBackupBeforeLossySave {
+            _ = try Self.backupExistingWorkspaceJSONBeforeLossySave(at: finalURL)
+        }
 
         // Write synchronously for direct save paths.
         WorkspaceFileDecodeCache.shared.invalidate(url: finalURL)
         WorkspaceSaveTracer.event("workspaceSave.syncWrite.begin", metadata: metadata, url: finalURL)
         do {
             try encoded.write(to: finalURL, options: .atomic)
+            if shouldBackupBeforeLossySave {
+                lossyLoadedWorkspaceIDs.remove(workspace.id)
+            }
             WorkspaceSaveTracer.event("workspaceSave.syncWrite.success", metadata: metadata, url: finalURL)
         } catch {
             WorkspaceSaveTracer.event("workspaceSave.syncWrite.failure", metadata: metadata, url: finalURL, extra: ["error": error.localizedDescription])
@@ -7153,6 +7256,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspace: cachedResult.workspace,
             cacheHit: cachedResult.cacheHit,
             composeTabsNormalized: cachedResult.composeTabsNormalized,
+            lossyDecodeRecovered: cachedResult.lossyDecodeRecovered,
             normalizationSaveTask: normalizationSaveTask
         )
     }
@@ -8308,6 +8412,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // 5) Replace your in-memory array with newly loaded (or appended) ones
         //    or you can union them if you want to keep older existing ones.
         workspaces = newlyLoadedWorkspaces
+        markLossyLoadedWorkspacesClean(workspaces)
 
         // Rebuild and save the index to reflect the newly loaded sets
         await rebuildAndSaveIndexAsync()

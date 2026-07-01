@@ -13,6 +13,59 @@ import SwiftUI
 struct WindowSessionSnapshot: Codable {
     var version: Int
     var windows: [WindowSessionEntry]
+
+    /// Transient decode-time signal. Excluded from encoding.
+    var lossyDecodeRecovered: Bool
+
+    /// Number of window elements present in the decoded payload before lossy filtering.
+    /// Nil when the windows payload itself is malformed. Excluded from encoding.
+    var decodedWindowElementCount: Int?
+
+    /// Number of malformed/future-incompatible window elements dropped during lossy decode.
+    /// Excluded from encoding.
+    var droppedWindowElementCount: Int
+
+    init(version: Int, windows: [WindowSessionEntry]) {
+        self.version = version
+        self.windows = windows
+        lossyDecodeRecovered = false
+        decodedWindowElementCount = windows.count
+        droppedWindowElementCount = 0
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        do {
+            if let lossyWindows = try c.decodeIfPresent(LossyDecodableArray<WindowSessionEntry>.self, forKey: .windows) {
+                windows = lossyWindows.elements
+                decodedWindowElementCount = lossyWindows.elements.count + lossyWindows.droppedCount
+                droppedWindowElementCount = lossyWindows.droppedCount
+                lossyDecodeRecovered = lossyWindows.droppedCount > 0
+            } else {
+                windows = []
+                decodedWindowElementCount = 0
+                droppedWindowElementCount = 0
+                lossyDecodeRecovered = false
+            }
+        } catch {
+            windows = []
+            decodedWindowElementCount = nil
+            droppedWindowElementCount = 0
+            lossyDecodeRecovered = true
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(version, forKey: .version)
+        try c.encode(windows, forKey: .windows)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case windows
+    }
 }
 
 struct WindowSessionEntry: Codable {
@@ -35,6 +88,100 @@ struct WindowSessionCaptureCandidate {
 struct WindowInitialRefreshDeferral: Equatable {
     let id: UUID
     let waiterID: UUID
+}
+
+struct WindowSessionPersistenceSignature: Hashable {
+    let windowKind: String
+    let workspaceID: UUID?
+    let workspaceName: String?
+    let isSystemWorkspace: Bool
+    let isEphemeral: Bool
+    let primaryRepoPath: String?
+    let workspaceInstanceNumber: Int?
+
+    init(entry: WindowSessionEntry) {
+        windowKind = entry.windowKind.rawValue
+        workspaceID = entry.workspaceID
+        workspaceName = entry.workspaceName
+        isSystemWorkspace = entry.isSystemWorkspace
+        isEphemeral = entry.isEphemeral
+        primaryRepoPath = entry.primaryRepoPath
+        workspaceInstanceNumber = entry.workspaceInstanceNumber
+    }
+}
+
+enum WindowSessionPersistenceDecision: Equatable {
+    case persist
+    case deferUntilRestoreCompletes
+    case blockDestructiveReduction
+    case blockDestructiveReplacement
+    case blockAfterLossyRestore
+}
+
+enum WindowSessionPersistenceGuard {
+    static func decision(
+        capturedSignatures: [WindowSessionPersistenceSignature],
+        restoredBaselineCount: Int?,
+        restoredBaselineSignatures: [WindowSessionPersistenceSignature]?,
+        allowedReductionBudget: Int,
+        restoreIncomplete: Bool,
+        restoredSessionWasLossy: Bool
+    ) -> WindowSessionPersistenceDecision {
+        if restoreIncomplete {
+            return .deferUntilRestoreCompletes
+        }
+        if restoredSessionWasLossy, allowedReductionBudget == 0 {
+            return .blockAfterLossyRestore
+        }
+        guard let restoredBaselineCount else { return .persist }
+        if capturedSignatures.count + allowedReductionBudget < restoredBaselineCount {
+            return .blockDestructiveReduction
+        }
+        if allowedReductionBudget == 0,
+           let restoredBaselineSignatures,
+           capturedSignatures.count == restoredBaselineSignatures.count,
+           signatureCounts(capturedSignatures) != signatureCounts(restoredBaselineSignatures)
+        {
+            return .blockDestructiveReplacement
+        }
+        return .persist
+    }
+
+    static func baselineCountForLoadedRestoreSession(
+        restorableEntryCount: Int,
+        droppedWindowElementCount: Int
+    ) -> Int? {
+        let baselineCount = restorableEntryCount + droppedWindowElementCount
+        return baselineCount > 0 ? baselineCount : nil
+    }
+
+    static func baselineCountAfterPersist(
+        currentBaselineCount: Int?,
+        capturedWindowCount: Int
+    ) -> Int? {
+        guard currentBaselineCount != nil else { return nil }
+        return capturedWindowCount
+    }
+
+    static func baselineSignaturesAfterPersist(
+        currentBaselineSignatures _: [WindowSessionPersistenceSignature]?,
+        capturedSignatures _: [WindowSessionPersistenceSignature]
+    ) -> [WindowSessionPersistenceSignature]? {
+        // Signature replacement protection is a one-shot restore safety net.
+        // Once the first safe post-restore snapshot is allowed through, normal same-count
+        // workspace switches should not be blocked by the original restore signature set.
+        nil
+    }
+
+    private static func signatureCounts(
+        _ signatures: [WindowSessionPersistenceSignature]
+    ) -> [WindowSessionPersistenceSignature: Int] {
+        var counts: [WindowSessionPersistenceSignature: Int] = [:]
+        for signature in signatures {
+            counts[signature, default: 0] += 1
+        }
+        return counts
+    }
 }
 
 enum WindowSessionSnapshotBuilder {
@@ -230,9 +377,13 @@ class WindowStatesManager: ObservableObject {
         fileURL: WindowSessionStore.sessionFileURL()
     )
     private var explicitlyClosingWindowIDs: Set<Int> = []
+    private var allowedWindowSessionReductionBudget = 0
     private var restoreQueue: [WindowSessionEntry] = []
     private var hasLoadedRestoreSession = false
     private var isRestoreSessionLoadPending = false
+    private var restoredWindowPersistenceBaselineCount: Int?
+    private var restoredWindowPersistenceBaselineSignatures: [WindowSessionPersistenceSignature]?
+    private var restoredWindowSessionWasLossy = false
 
     func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {
         guard !pendingInitialRefreshDeferrals.isEmpty else { return nil }
@@ -306,6 +457,12 @@ class WindowStatesManager: ObservableObject {
                 self.preseedInstanceNumberState(from: snapshot)
 
                 self.restoreQueue = entries
+                self.restoredWindowPersistenceBaselineCount = WindowSessionPersistenceGuard.baselineCountForLoadedRestoreSession(
+                    restorableEntryCount: entries.count,
+                    droppedWindowElementCount: snapshot?.droppedWindowElementCount ?? 0
+                )
+                self.restoredWindowPersistenceBaselineSignatures = !entries.isEmpty ? entries.map(WindowSessionPersistenceSignature.init(entry:)) : nil
+                self.restoredWindowSessionWasLossy = snapshot?.lossyDecodeRecovered ?? false
                 self.isRestoreSessionLoadPending = false
                 if !entries.isEmpty {
                     self.applyRestoreEntriesIfPossible()
@@ -639,6 +796,7 @@ class WindowStatesManager: ObservableObject {
         guard !isTerminating else { return }
         guard allWindows.contains(where: { $0.windowID == windowID }) else { return }
         guard explicitlyClosingWindowIDs.insert(windowID).inserted else { return }
+        allowedWindowSessionReductionBudget += 1
 
         Task { @MainActor in
             await self.persistWindowSessionImmediately(reason: "explicitClose:\(windowID)")
@@ -648,13 +806,53 @@ class WindowStatesManager: ObservableObject {
     func persistWindowSession(reason: String = "unspecified") {
         guard !AppLaunchConfiguration.current.suppressesWindowPersistence else { return }
         let snapshot = captureCurrentSession()
+        guard shouldPersistWindowSessionSnapshot(snapshot, reason: reason) else { return }
         Task { await windowSessionWriter.scheduleWrite(snapshot) }
     }
 
     func persistWindowSessionImmediately(reason: String = "unspecified") async {
         guard !AppLaunchConfiguration.current.suppressesWindowPersistence else { return }
         let snapshot = captureCurrentSession()
+        guard shouldPersistWindowSessionSnapshot(snapshot, reason: reason) else { return }
         await windowSessionWriter.writeImmediately(snapshot)
+    }
+
+    private func shouldPersistWindowSessionSnapshot(_ snapshot: WindowSessionSnapshot, reason: String) -> Bool {
+        let capturedSignatures = snapshot.windows.map(WindowSessionPersistenceSignature.init(entry:))
+        let shouldWaitForRestoreLoad = !AppLaunchConfiguration.current.suppressesWindowRestore && autoRestoreWorkspacesEnabled
+        let decision = WindowSessionPersistenceGuard.decision(
+            capturedSignatures: capturedSignatures,
+            restoredBaselineCount: restoredWindowPersistenceBaselineCount,
+            restoredBaselineSignatures: restoredWindowPersistenceBaselineSignatures,
+            allowedReductionBudget: allowedWindowSessionReductionBudget,
+            restoreIncomplete: (shouldWaitForRestoreLoad && !hasLoadedRestoreSession) || isRestoreSessionLoadPending || !restoreQueue.isEmpty,
+            restoredSessionWasLossy: restoredWindowSessionWasLossy
+        )
+        switch decision {
+        case .persist:
+            let previousBaselineCount = restoredWindowPersistenceBaselineCount
+            if let previousBaselineCount {
+                let persistedReduction = max(0, previousBaselineCount - snapshot.windows.count)
+                allowedWindowSessionReductionBudget = max(0, allowedWindowSessionReductionBudget - persistedReduction)
+            }
+            restoredWindowPersistenceBaselineCount = WindowSessionPersistenceGuard.baselineCountAfterPersist(
+                currentBaselineCount: restoredWindowPersistenceBaselineCount,
+                capturedWindowCount: snapshot.windows.count
+            )
+            restoredWindowPersistenceBaselineSignatures = WindowSessionPersistenceGuard.baselineSignaturesAfterPersist(
+                currentBaselineSignatures: restoredWindowPersistenceBaselineSignatures,
+                capturedSignatures: capturedSignatures
+            )
+            restoredWindowSessionWasLossy = false
+            return true
+        case .deferUntilRestoreCompletes, .blockDestructiveReduction, .blockDestructiveReplacement, .blockAfterLossyRestore:
+            // Preserve the last complete session rather than overwrite it with a partial restore snapshot.
+            // TODO: Revisit with an explicit restore-complete/abandon signal if restore can be known terminal.
+            #if DEBUG
+                WorkspaceRestorePerfLog.log("restore.sessionPersistence skipped reason=\(reason) decision=\(decision) capturedWindows=\(snapshot.windows.count) baseline=\(restoredWindowPersistenceBaselineCount ?? -1) pendingRestore=\(isRestoreSessionLoadPending) queuedRestore=\(restoreQueue.count)")
+            #endif
+            return false
+        }
     }
 
     private func captureCurrentSession() -> WindowSessionSnapshot {

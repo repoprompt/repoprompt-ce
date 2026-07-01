@@ -109,7 +109,7 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         XCTAssertTrue(removed.mutated)
     }
 
-    func testStoredSelectionIgnoresLegacyInferredPathsAndWritesCompatibilityAlias() throws {
+    func testStoredSelectionUsesManualCodemapPathsAndReencodesLegacyCompatibilityAlias() throws {
         let legacyJSON = try XCTUnwrap(
             """
             {
@@ -135,10 +135,13 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
             encodedObject["manualCodemapPaths"] as? [String],
             ["/workspace/Manual.swift"]
         )
-        XCTAssertEqual(encodedObject["autoCodemapPaths"] as? [String], [])
+        XCTAssertEqual(
+            encodedObject["autoCodemapPaths"] as? [String],
+            ["/workspace/Manual.swift"]
+        )
     }
 
-    func testStoredSelectionEncodingRemainsReadableByLegacyDecoder() throws {
+    func testStoredSelectionEncodingProvidesManualPathsToLegacyDecoder() throws {
         let currentManual = StoredSelection(
             selectedPaths: ["/workspace/Source.swift"],
             manualCodemapPaths: ["/workspace/Manual.swift"],
@@ -147,7 +150,7 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
 
         let manualEncoded = try JSONEncoder().encode(currentManual)
         let legacyManual = try JSONDecoder().decode(LegacyStoredSelection.self, from: manualEncoded)
-        XCTAssertTrue(legacyManual.autoCodemapPaths.isEmpty)
+        XCTAssertEqual(legacyManual.autoCodemapPaths, ["/workspace/Manual.swift"])
     }
 
     func testSelectionProductionPathContainsNoLegacyRelationshipCalls() throws {

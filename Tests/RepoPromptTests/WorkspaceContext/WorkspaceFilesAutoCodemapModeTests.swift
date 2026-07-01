@@ -44,7 +44,7 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         }
     }
 
-    func testSnapshotAndEncodingContainNoInferredPathState() throws {
+    func testSnapshotAndEncodingContainNoInferredPathStateBeyondLegacyCompatibilityKey() throws {
         let fixture = makeFixture(fileName: "Dependency.swift")
         fixture.viewModel.selectFileForTesting(fixture.file)
 
@@ -56,7 +56,7 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         let encodedObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         )
-        XCTAssertEqual(encodedObject["autoCodemapPaths"] as? [String], [])
+        XCTAssertEqual(encodedObject["autoCodemapPaths"] as? [String], snapshot.manualCodemapPaths)
 
         fixture.viewModel.setAutoCodemapFilesForTesting([fixture.file])
         XCTAssertEqual(fixture.viewModel.autoCodemapFiles.map(\.id), [fixture.file.id])
