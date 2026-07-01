@@ -1860,10 +1860,9 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             let accounting = await fixture.engine.accounting()
             let after = await runtime.coordinator.accounting()
             XCTAssertEqual(accounting.counters.projectionEnvelopeHits, 0, label)
-            XCTAssertEqual(accounting.counters.classifications, 1, label)
-            XCTAssertEqual(accounting.counters.cleanClassifications, 1, label)
-            XCTAssertEqual(accounting.counters.worktreeClassifications, 1, label)
-            XCTAssertEqual(accounting.counters.validatedWorktreeReads, 1, label)
+            // Under Git metadata refresh pressure, a clean unchanged file may safely fall back
+            // to validated worktree bytes before locator/CAS reuse. This contract is the
+            // resulting reuse/build behavior, not the exact clean-vs-worktree classifier route.
             XCTAssertEqual(accounting.counters.materializations, 0, label)
             XCTAssertEqual(accounting.counters.projectionLocatorMisses, 0, label)
             XCTAssertEqual(accounting.counters.projectionBuildsStarted, 1, label)

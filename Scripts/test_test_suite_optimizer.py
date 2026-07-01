@@ -48,6 +48,28 @@ class TestListParsingTests(unittest.TestCase):
 
 
 class TimingTests(unittest.TestCase):
+    def make_sample(
+        self,
+        index: int,
+        timings: list[optimizer.TestCaseTiming],
+    ) -> optimizer.Sample:
+        return optimizer.Sample(
+            index=index,
+            target="root",
+            command=[],
+            process_exit_code=0,
+            state="completed",
+            exit_code=0,
+            queue_wait_seconds=0.0,
+            execution_seconds=1.0,
+            timed_out=False,
+            measurement_invalid=False,
+            diagnostic_paths=[],
+            log_path=f"/{index}.log",
+            invalid_reasons=[],
+            timings=timings,
+        )
+
     def test_parse_xctest_timings_supports_objc_and_dotted_formats(self) -> None:
         text = "\n".join(
             [
@@ -92,34 +114,87 @@ class TimingTests(unittest.TestCase):
         self.assertIn("measurement source changed during execution", reasons)
         self.assertIn("missing conductor execution timing", reasons)
 
-    def test_suite_ranking_uses_median_aggregate_seconds(self) -> None:
-        def sample(index: int, a: float, b: float) -> optimizer.Sample:
-            return optimizer.Sample(
-                index=index,
-                target="root",
-                command=[],
-                process_exit_code=0,
-                state="completed",
-                exit_code=0,
-                queue_wait_seconds=0.0,
-                execution_seconds=1.0,
-                timed_out=False,
-                measurement_invalid=False,
-                diagnostic_paths=[],
-                log_path=f"/{index}.log",
-                invalid_reasons=[],
-                timings=[
-                    optimizer.TestCaseTiming("RepoPromptTests.A", "testOne", "passed", a),
-                    optimizer.TestCaseTiming("RepoPromptTests.B", "testTwo", "passed", b),
-                ],
-            )
+    def test_filtered_sample_without_timings_is_invalid(self) -> None:
+        run = optimizer.ConductorRun(
+            command=["/repo/conductor", "test", "--filter", "RepoPromptTests.Empty", "--json"],
+            process_exit_code=0,
+            stdout="{}",
+            stderr="",
+            result={
+                "state": "completed",
+                "exitCode": 0,
+                "queueWaitSeconds": 0.0,
+                "executionSeconds": 1.0,
+                "timedOut": False,
+                "measurementInvalid": False,
+                "logPath": "/tmp/empty.log",
+            },
+            log_text="",
+        )
 
-        ranking = optimizer.suite_ranking([sample(1, 1.0, 4.0), sample(2, 5.0, 4.0)])
+        sample = optimizer.sample_from_run(
+            1,
+            "root",
+            run,
+            source_changed=False,
+            source_guard_kind=optimizer.SOURCE_GUARD_METADATA,
+            require_timings=True,
+        )
+
+        self.assertFalse(sample.valid)
+        self.assertEqual(sample.source_guard_kind, optimizer.SOURCE_GUARD_METADATA)
+        self.assertIn("filtered baseline produced no parsed XCTest timings", sample.invalid_reasons)
+
+    def test_suite_ranking_uses_median_aggregate_seconds(self) -> None:
+        ranking = optimizer.suite_ranking([
+            self.make_sample(
+                1,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testOne", "passed", 1.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testTwo", "passed", 4.0),
+                ],
+            ),
+            self.make_sample(
+                2,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testOne", "passed", 5.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testTwo", "passed", 4.0),
+                ],
+            ),
+        ])
 
         self.assertEqual(ranking[0]["suite"], "RepoPromptTests.B")
         self.assertEqual(ranking[0]["median_aggregate_seconds"], 4.0)
         self.assertEqual(ranking[1]["median_aggregate_seconds"], 3.0)
         self.assertEqual(ranking[1]["max_method_seconds"], 5.0)
+
+    def test_test_ranking_uses_median_p95_and_stable_ties(self) -> None:
+        samples = [
+            self.make_sample(
+                1,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testSlow", "passed", 5.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testSlow", "passed", 5.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testFast", "passed", 1.0),
+                ],
+            ),
+            self.make_sample(
+                2,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testSlow", "skipped", 7.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testSlow", "passed", 7.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testFast", "passed", 2.0),
+                ],
+            ),
+        ]
+
+        ranking = optimizer.test_ranking(samples)
+
+        self.assertEqual((ranking[0]["suite"], ranking[0]["method"]), ("RepoPromptTests.A", "testSlow"))
+        self.assertEqual((ranking[1]["suite"], ranking[1]["method"]), ("RepoPromptTests.B", "testSlow"))
+        self.assertEqual(ranking[0]["median_seconds"], 6.0)
+        self.assertEqual(ranking[0]["observed_p95_seconds"], 7.0)
+        self.assertEqual(ranking[1]["failure_or_skip_count"], 1)
 
 
 class SourceAndLedgerTests(unittest.TestCase):
@@ -131,6 +206,49 @@ class SourceAndLedgerTests(unittest.TestCase):
             "    func testOne() {}\n}\n",
             encoding="utf-8",
         )
+
+    def test_conductor_command_adds_filter_before_json(self) -> None:
+        command = optimizer.conductor_command(
+            Path("/repo"),
+            "root",
+            filter_value="RepoPromptTests.ExampleTests/testOne",
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/repo/conductor",
+                "test",
+                "--filter",
+                "RepoPromptTests.ExampleTests/testOne",
+                "--json",
+            ],
+        )
+        with self.assertRaisesRegex(optimizer.OptimizerError, "--filter cannot be used with list mode"):
+            optimizer.conductor_command(Path("/repo"), "provider", list_mode=True, filter_value="Suite")
+
+    def test_metadata_source_guard_changes_on_add_modify_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_repo(root)
+            tests = root / "Tests" / "RepoPromptTests" / "MCP"
+            initial = optimizer.measurement_source_metadata_fingerprint(root)
+
+            new_file = tests / "AnotherTests.swift"
+            new_file.write_text("final class AnotherTests {}\n", encoding="utf-8")
+            after_add = optimizer.measurement_source_metadata_fingerprint(root)
+
+            new_file.write_text("final class AnotherTests { func testTwo() {} }\n", encoding="utf-8")
+            after_modify = optimizer.measurement_source_metadata_fingerprint(root)
+
+            new_file.unlink()
+            after_delete = optimizer.measurement_source_metadata_fingerprint(root)
+
+        self.assertNotEqual(initial, after_add)
+        self.assertNotEqual(after_add, after_modify)
+        self.assertEqual(initial, after_delete)
+        with self.assertRaisesRegex(optimizer.OptimizerError, "unsupported source change guard"):
+            optimizer.measurement_source_guard_fingerprint(root, "unknown")
 
     def test_source_mapping_and_ledger_scaffold_are_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,9 +337,62 @@ class CombinedBaselineTests(unittest.TestCase):
         self.assertEqual(combined["summary"]["attempts"], 3)
         self.assertEqual(combined["summary"]["valid_samples"], 2)
         self.assertFalse(combined["summary"]["reliable"])
+        self.assertEqual(combined["scope"], "complete")
+        self.assertIsNone(combined["filter"])
+        self.assertEqual(combined["source_guard"]["kind"], optimizer.SOURCE_GUARD_CONTENT)
         self.assertEqual(combined["summary"]["median_seconds"], 12.0)
         self.assertEqual(combined["summary"]["observed_p95_seconds"], 14.0)
         self.assertEqual(combined["slowest_suites"][0]["median_aggregate_seconds"], 3.0)
+        self.assertEqual(combined["slowest_tests"][0]["median_seconds"], 3.0)
+
+    def test_combine_baselines_rejects_mixed_scope_filter_or_guard(self) -> None:
+        def artifact(
+            root: Path,
+            name: str,
+            *,
+            scope: str = "complete",
+            filter_value: str | None = None,
+            guard: str = optimizer.SOURCE_GUARD_CONTENT,
+        ) -> Path:
+            path = root / f"{name}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "target": "root",
+                        "scope": scope,
+                        "filter": filter_value,
+                        "source_guard": {"kind": guard},
+                        "samples": [
+                            {
+                                "command": ["/repo/conductor", "test", "--json"],
+                                "process_exit_code": 0,
+                                "state": "completed",
+                                "exit_code": 0,
+                                "execution_seconds": 10.0,
+                                "valid": True,
+                                "log_path": str(root / "missing.log"),
+                                "invalid_reasons": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            complete = artifact(root, "complete")
+            focused = artifact(root, "focused", scope="filtered", filter_value="RepoPromptTests.A")
+            focused_other = artifact(root, "focused-other", scope="filtered", filter_value="RepoPromptTests.B")
+            metadata = artifact(root, "metadata", guard=optimizer.SOURCE_GUARD_METADATA)
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one scope"):
+                optimizer.combine_baselines([complete, focused])
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one filter"):
+                optimizer.combine_baselines([focused, focused_other])
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one source change guard"):
+                optimizer.combine_baselines([complete, metadata])
 
     def test_compare_baselines_reports_fractional_deltas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,6 +415,12 @@ class AppendOnlyArtifactTests(unittest.TestCase):
             "timestamp": timestamp,
             "target": "provider",
             "label": "warm-baseline",
+            "artifact": "/tmp/provider-baseline.json",
+            "inventory": "/tmp/inventory.json",
+            "scope": "complete",
+            "filter": None,
+            "primary_metric_eligible": False,
+            "source_guard": {"kind": optimizer.SOURCE_GUARD_METADATA},
             "command": ["./conductor", "provider-test", "--json"],
             "git": {"commit": "a" * 40, "working_tree": ""},
             "samples": [
@@ -268,6 +445,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
                 "noise_classification": "stable",
             },
             "slowest_suites": [],
+            "slowest_tests": [],
         }
 
     def test_scoreboard_appends_without_rewriting_prior_rows(self) -> None:
@@ -281,6 +459,8 @@ class AppendOnlyArtifactTests(unittest.TestCase):
         self.assertTrue(second.startswith(first))
         self.assertIn("/one.log", second)
         self.assertIn("/two.log", second)
+        self.assertIn("Source-change guard: `metadata`", second)
+        self.assertIn("Primary metric eligible: no", second)
 
     def test_json_artifacts_refuse_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
