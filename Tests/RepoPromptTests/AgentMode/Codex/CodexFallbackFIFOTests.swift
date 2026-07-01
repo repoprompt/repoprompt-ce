@@ -820,7 +820,11 @@ final class CodexFallbackFIFOTests: XCTestCase {
             runAttemptID: session.activeRunAttemptID!
         )
         session.codexRoutingObservedTurnID = "turn"
-        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
         return (viewModel, session)
     }
 
@@ -861,7 +865,11 @@ final class CodexFallbackFIFOTests: XCTestCase {
             runAttemptID: session.activeRunAttemptID!
         )
         session.codexRoutingObservedTurnID = "turn"
-        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
         return (viewModel, session, sessionID)
     }
 

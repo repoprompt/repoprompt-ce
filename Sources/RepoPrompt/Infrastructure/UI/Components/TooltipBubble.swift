@@ -16,14 +16,14 @@ import SwiftUI
 
 /// ──────────────────────────────────
 struct TooltipBubble: View {
-    let text: String
+    let content: TooltipContent
     let preset: FontScalePreset // NEW
     private var maxWidth: CGFloat {
         320 * preset.scaleFactor
     }
 
     var body: some View {
-        Text(text)
+        Text(content.attributedText ?? AttributedString(content.text))
             .font(preset.captionFont) // was .caption
             .multilineTextAlignment(.leading)
             .padding(8 * preset.scaleFactor) // scale padding
@@ -46,12 +46,27 @@ struct TooltipBubble: View {
 /// ──────────────────────────────────
 enum TooltipPlacement { case top, bottom, left, right, topLeft, topRight, bottomLeft, bottomRight }
 
+struct TooltipContent {
+    let text: String
+    let attributedText: AttributedString?
+
+    init(_ text: String) {
+        self.text = text
+        attributedText = nil
+    }
+
+    init(attributedText: AttributedString, plainText: String) {
+        text = plainText
+        self.attributedText = attributedText
+    }
+}
+
 // ──────────────────────────────────
 // MARK: - Modifier
 
 /// ──────────────────────────────────
 private struct HoverTooltipModifier: ViewModifier {
-    let text: String?
+    let tooltipContent: TooltipContent?
     let placement: TooltipPlacement
     private let showDelay: TimeInterval = 0.3 // 300 ms
 
@@ -112,7 +127,7 @@ private struct HoverTooltipModifier: ViewModifier {
                 }
             )
             .onHover { inside in
-                guard let text else { return }
+                guard let tooltipContent else { return }
                 if inside, showTooltips {
                     // Key fix: scrolling doesn't relayout this view, so force an anchor re-measure now.
                     // This updates rt.anchorInfo.rect to the correct on-screen position before showing.
@@ -121,7 +136,7 @@ private struct HoverTooltipModifier: ViewModifier {
                     cancelPendingWork()
 
                     // Avoid retain cycle: runtime -> pendingWork -> closure -> runtime
-                    rt.pendingWork = rt.pendingWorkGate.schedule(after: showDelay) { [placement, preset, weak rt] in
+                    rt.pendingWork = rt.pendingWorkGate.schedule(after: showDelay) { [tooltipContent, placement, preset, weak rt] in
                         guard let rt else { return }
                         guard let hostWindow = rt.anchorInfo.window else { return }
                         defer { rt.pendingWork = nil }
@@ -130,7 +145,7 @@ private struct HoverTooltipModifier: ViewModifier {
 
                         let controller = TooltipOverlayController()
                         controller.show(
-                            text: text,
+                            content: tooltipContent,
                             anchorRect: rt.anchorInfo.rect,
                             owner: hostWindow,
                             placement: placement,
@@ -242,6 +257,15 @@ extension View {
         _ text: String?,
         _ placement: TooltipPlacement = .top
     ) -> some View {
-        modifier(HoverTooltipModifier(text: text, placement: placement))
+        modifier(HoverTooltipModifier(tooltipContent: text.map(TooltipContent.init), placement: placement))
+    }
+
+    /// Adds a pure-SwiftUI hover tooltip with attributed text for small emphasis.
+    func hoverTooltip(
+        _ attributedText: AttributedString?,
+        plainText: String,
+        _ placement: TooltipPlacement = .top
+    ) -> some View {
+        modifier(HoverTooltipModifier(tooltipContent: attributedText.map { TooltipContent(attributedText: $0, plainText: plainText) }, placement: placement))
     }
 }

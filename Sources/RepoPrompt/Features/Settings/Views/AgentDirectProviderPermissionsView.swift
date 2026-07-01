@@ -150,18 +150,8 @@ struct AgentDirectProviderPermissionsView: View {
                     title: "Tools & Runtime Options",
                     isExpanded: toolsDisclosedProviderIDs.contains(providerID),
                     onToggle: { toggleToolsDisclosure(providerID) },
-                    onSetCodexBashToolEnabled: { viewModel.setCodexBashToolEnabled($0) },
-                    onSetCodexSearchToolEnabled: { viewModel.setCodexSearchToolEnabled($0) },
-                    onSetCodexGoalSupportEnabled: { viewModel.setCodexGoalSupportEnabled($0) },
-                    onSetCodexMCPServerEnabled: { normalizedName, enabled in
-                        viewModel.setCodexMCPServerEnabled(
-                            normalizedName: normalizedName,
-                            enabled: enabled
-                        )
-                    },
-                    onSetClaudeBashToolEnabled: { viewModel.setClaudeBashToolEnabled($0) },
-                    onSetClaudeMCPStrictModeEnabled: { viewModel.setClaudeMCPStrictModeEnabled($0) },
-                    onSetClaudeToolSearchEnabled: { viewModel.setClaudeToolSearchEnabled($0) }
+                    onApplyCodexToolSettingMutation: { viewModel.applyCodexToolSettingMutation($0) },
+                    onApplyClaudeToolSettingMutation: { viewModel.applyClaudeToolSettingMutation($0) }
                 )
             }
         } else {

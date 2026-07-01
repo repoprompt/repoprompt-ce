@@ -762,7 +762,10 @@ final class CodexCLIProvider: AIProvider {
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
-            authTokensRefreshHandler: nil
+            authTokensRefreshHandler: nil,
+            goalSupportEnabledProvider: { false },
+            reasoningSummariesEnabledProvider: { false },
+            computerUseEnabledProvider: { false }
         )
 
         return CodexNativeSessionController(

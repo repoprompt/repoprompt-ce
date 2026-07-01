@@ -933,6 +933,18 @@ class GlobalSettingsStore: ObservableObject {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
+    func codexReasoningSummariesEnabled() -> Bool {
+        CodexReasoningSummaries.isEnabled(persistedValue: scalarPreferences.agentMode?.codexReasoningSummariesEnabled)
+    }
+
+    func setCodexReasoningSummariesEnabled(_ enabled: Bool, commit: Bool = true) {
+        let oldValue = codexReasoningSummariesEnabled()
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexReasoningSummariesEnabled = enabled
+        }
+        CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
+    }
+
     #if DEBUG
         func claudeRawEventLoggingEnabled() -> Bool {
             defaults.bool(forKey: "claudeRawEventLoggingEnabled")

@@ -57,6 +57,100 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    func testAgentModeDefaultCarriesReasoningSummaryOptInToStartAndResume() async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            forceExperimentalSteering: false,
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            goalSupportEnabledProvider: { true },
+            reasoningSummariesEnabledProvider: { true }
+        )
+
+        try await assertStartAndResumeGoalConfig(
+            options: options,
+            expectedGoalSupportEnabled: true,
+            expectedReasoningSummary: "auto"
+        )
+    }
+
+    func testDefaultConfigOverridesOmitThreadReasoningSummaryWhenUnspecified() {
+        let config = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            forceExperimentalSteering: false
+        )
+
+        XCTAssertNil(config["model_reasoning_summary"])
+    }
+
+    func testDefaultAppServerClientLaunchOmitsProcessReasoningSummaryOverride() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
+        let client = CodexAppServerClient()
+        await client.updateConfig(
+            CodexAppServerClient.Config(
+                commandName: executableURL.path,
+                additionalPathHints: [],
+                requestTimeout: 5,
+                workingDirectory: directory.path
+            )
+        )
+
+        try await client.startIfNeeded()
+        await client.stop()
+
+        let arguments = try recordedProcessArguments(at: recordURL)
+        XCTAssertTrue(arguments.contains("app-server"))
+        XCTAssertFalse(arguments.contains { $0.hasPrefix("model_reasoning_summary=") })
+    }
+
+    func testExplicitAppServerClientLaunchSerializesProcessReasoningSummaryAuto() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
+        let client = CodexAppServerClient()
+        await client.updateConfig(
+            CodexAppServerClient.Config(
+                commandName: executableURL.path,
+                additionalPathHints: [],
+                requestTimeout: 5,
+                workingDirectory: directory.path,
+                processModelReasoningSummary: .auto
+            )
+        )
+
+        try await client.startIfNeeded()
+        await client.stop()
+
+        let arguments = try recordedProcessArguments(at: recordURL)
+        XCTAssertTrue(arguments.contains("app-server"))
+        XCTAssertTrue(arguments.contains("model_reasoning_summary=auto"))
+    }
+
+    func testNativeSessionControllerDefaultOptionsOmitProcessReasoningSummaryOverride() async throws {
+        let options = CodexNativeSessionController.Options(
+            requestTimeout: 5,
+            configOverridesProvider: { [:] },
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            authTokensRefreshHandler: nil
+        )
+        let (controller, recordURL) = try await makeController(options: options)
+
+        _ = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        await controller.shutdown()
+
+        try assertProcessLaunchOmitsReasoningSummaryOverride(at: recordURL, label: "default options process")
+    }
+
     func testInitializedNotificationOmitsParams() async throws {
         let (controller, recordURL) = try await makeController(options: makeOptions())
         _ = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
@@ -188,7 +282,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
     private func assertStartAndResumeGoalConfig(
         options: CodexNativeSessionController.Options,
-        expectedGoalSupportEnabled: Bool
+        expectedGoalSupportEnabled: Bool,
+        expectedReasoningSummary: String = "none"
     ) async throws {
         let (startController, startRecordURL) = try await makeController(options: options)
         _ = try await startController.startOrResume(existing: nil, baseInstructions: "Agent")
@@ -197,8 +292,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         try assertGoalFeatureAndComputerUseConfig(
             in: recordedParams(for: "thread/start", at: startRecordURL),
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
+            expectedReasoningSummary: expectedReasoningSummary,
             label: "thread/start"
         )
+        try assertProcessLaunchOmitsReasoningSummaryOverride(at: startRecordURL, label: "thread/start process")
 
         let (resumeController, resumeRecordURL) = try await makeController(options: options)
         let existing = CodexNativeSessionController.SessionRef(
@@ -213,8 +310,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         try assertGoalFeatureAndComputerUseConfig(
             in: recordedParams(for: "thread/resume", at: resumeRecordURL),
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
+            expectedReasoningSummary: expectedReasoningSummary,
             label: "thread/resume"
         )
+        try assertProcessLaunchOmitsReasoningSummaryOverride(at: resumeRecordURL, label: "thread/resume process")
     }
 
     private func makeOptions() -> CodexNativeSessionController.Options {
@@ -267,6 +366,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         record_path = \(String(reflecting: recordURL.path))
 
+        with open(record_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"method": "__process_args", "argv": sys.argv[1:]}) + "\\n")
+
         def respond(request_id, result):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
 
@@ -299,6 +401,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         return try XCTUnwrap(request["params"] as? [String: Any])
     }
 
+    private func recordedProcessArguments(at recordURL: URL) throws -> [String] {
+        let request = try recordedRequest(for: "__process_args", at: recordURL)
+        return try XCTUnwrap(request["argv"] as? [String])
+    }
+
     private func recordedRequest(for method: String, at recordURL: URL) throws -> [String: Any] {
         let data = try Data(contentsOf: recordURL)
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -316,10 +423,17 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     private func assertGoalFeatureAndComputerUseConfig(
         in params: [String: Any],
         expectedGoalSupportEnabled: Bool,
+        expectedReasoningSummary: String,
         label: String
     ) throws {
         let config = try XCTUnwrap(params["config"] as? [String: Any], label)
         XCTAssertEqual(config["features.goals"] as? Bool, expectedGoalSupportEnabled, label)
         XCTAssertEqual(config["features.computer_use"] as? Bool, false, label)
+        XCTAssertEqual(config["model_reasoning_summary"] as? String, expectedReasoningSummary, label)
+    }
+
+    private func assertProcessLaunchOmitsReasoningSummaryOverride(at recordURL: URL, label: String) throws {
+        let arguments = try recordedProcessArguments(at: recordURL)
+        XCTAssertFalse(arguments.contains { $0.hasPrefix("model_reasoning_summary=") }, label)
     }
 }

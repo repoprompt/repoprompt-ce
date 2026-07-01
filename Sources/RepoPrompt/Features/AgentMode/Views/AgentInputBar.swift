@@ -29,15 +29,9 @@ struct AgentComposerActions {
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
-    let setCodexBashToolEnabled: (_ enabled: Bool) -> Void
-    let setCodexSearchToolEnabled: (_ enabled: Bool) -> Void
-    let setCodexGoalSupportEnabled: (_ enabled: Bool) -> Void
-    let setCodexMCPServerEnabled: (_ normalizedName: String, _ enabled: Bool) -> Void
-    let setClaudeBashToolEnabled: (_ enabled: Bool) -> Void
-    let setClaudeMCPStrictModeEnabled: (_ enabled: Bool) -> Void
-    let setClaudeToolSearchEnabled: (_ enabled: Bool) -> Void
+    let applyCodexToolSettingMutation: (_ mutation: CodexToolSettingMutation) -> Void
+    let applyClaudeToolSettingMutation: (_ mutation: ClaudeToolSettingMutation) -> Void
     let setClaudeEffortLevel: (_ level: ClaudeCodeEffortLevel) -> Void
-    let setClaudeAgentModePromptDelivery: (_ delivery: ClaudeAgentToolPreferences.AgentModePromptDelivery) -> Void
     let openCLIProvidersSettings: () -> Void
 }
 
@@ -145,15 +139,13 @@ struct AgentInputBar: View {
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
-            setCodexBashToolEnabled: { enabled in agentModeVM.setCodexBashToolEnabled(enabled) },
-            setCodexSearchToolEnabled: { enabled in agentModeVM.setCodexSearchToolEnabled(enabled) },
-            setCodexGoalSupportEnabled: { enabled in agentModeVM.setCodexGoalSupportEnabled(enabled) },
-            setCodexMCPServerEnabled: { normalizedName, enabled in agentModeVM.setCodexMCPServerEnabled(normalizedName: normalizedName, enabled: enabled) },
-            setClaudeBashToolEnabled: { enabled in agentModeVM.setClaudeBashToolEnabled(enabled) },
-            setClaudeMCPStrictModeEnabled: { enabled in agentModeVM.setClaudeMCPStrictModeEnabled(enabled) },
-            setClaudeToolSearchEnabled: { enabled in agentModeVM.setClaudeToolSearchEnabled(enabled) },
+            applyCodexToolSettingMutation: { mutation in
+                agentModeVM.applyCodexToolSettingMutation(mutation)
+            },
+            applyClaudeToolSettingMutation: { mutation in
+                agentModeVM.applyClaudeToolSettingMutation(mutation)
+            },
             setClaudeEffortLevel: { level in agentModeVM.setClaudeEffortLevel(level) },
-            setClaudeAgentModePromptDelivery: { delivery in agentModeVM.setClaudeAgentModePromptDelivery(delivery) },
             openCLIProvidersSettings: {
                 NotificationCenter.default.post(
                     name: .showCLIProvidersTab,
@@ -1239,24 +1231,32 @@ struct AgentComposerView: View, Equatable {
                     Toggle("Bash", isOn: Binding(
                         get: { codexTools.bashToolEnabled },
                         set: { newValue in
-                            actions.setCodexBashToolEnabled(newValue)
+                            actions.applyCodexToolSettingMutation(.bashTool(enabled: newValue))
                         }
                     ))
 
                     Toggle("Search", isOn: Binding(
                         get: { codexTools.searchToolEnabled },
                         set: { newValue in
-                            actions.setCodexSearchToolEnabled(newValue)
+                            actions.applyCodexToolSettingMutation(.searchTool(enabled: newValue))
                         }
                     ))
 
                     Toggle("Goals", isOn: Binding(
                         get: { codexTools.goalSupportEnabled },
                         set: { newValue in
-                            actions.setCodexGoalSupportEnabled(newValue)
+                            actions.applyCodexToolSettingMutation(.goalSupport(enabled: newValue))
                         }
                     ))
                     .hoverTooltip("Codex /goal support is enabled by default. Turn this off to stop RepoPrompt from enabling features.goals for Codex app-server launch and thread config.")
+
+                    Toggle("Reasoning Summaries", isOn: Binding(
+                        get: { codexTools.reasoningSummariesEnabled },
+                        set: { newValue in
+                            actions.applyCodexToolSettingMutation(.reasoningSummaries(enabled: newValue))
+                        }
+                    ))
+                    .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
                 } header: {
                     Text("Tools")
                 }
@@ -1274,7 +1274,9 @@ struct AgentComposerView: View, Equatable {
                                         codexTools.mcpServerStatesByNormalizedName[normalizedServerToggleKey(entry.normalizedName)] ?? isRepoPromptServer
                                     },
                                     set: { newValue in
-                                        actions.setCodexMCPServerEnabled(entry.normalizedName, newValue)
+                                        actions.applyCodexToolSettingMutation(
+                                            .mcpServer(normalizedName: entry.normalizedName, enabled: newValue)
+                                        )
                                     }
                                 )
                             ) {
@@ -1320,7 +1322,7 @@ struct AgentComposerView: View, Equatable {
                     Toggle("Bash", isOn: Binding(
                         get: { claudeTools.bashToolEnabled },
                         set: { newValue in
-                            actions.setClaudeBashToolEnabled(newValue)
+                            actions.applyClaudeToolSettingMutation(.bashTool(enabled: newValue))
                         }
                     ))
                 } header: {
@@ -1331,7 +1333,7 @@ struct AgentComposerView: View, Equatable {
                     Toggle("RepoPrompt Only", isOn: Binding(
                         get: { claudeTools.mcpStrictModeEnabled },
                         set: { newValue in
-                            actions.setClaudeMCPStrictModeEnabled(newValue)
+                            actions.applyClaudeToolSettingMutation(.mcpStrictMode(enabled: newValue))
                         }
                     ))
                 } header: {
@@ -1350,7 +1352,7 @@ struct AgentComposerView: View, Equatable {
                     Toggle("Lazy Tool Loading", isOn: Binding(
                         get: { claudeTools.toolSearchEnabled },
                         set: { newValue in
-                            actions.setClaudeToolSearchEnabled(newValue)
+                            actions.applyClaudeToolSettingMutation(.toolSearch(enabled: newValue))
                         }
                     ))
                 } header: {
@@ -1369,7 +1371,9 @@ struct AgentComposerView: View, Equatable {
                     Picker(selection: Binding(
                         get: { claudeTools.agentModePromptDelivery },
                         set: { newValue in
-                            actions.setClaudeAgentModePromptDelivery(newValue)
+                            actions.applyClaudeToolSettingMutation(
+                                .agentModePromptDelivery(delivery: newValue)
+                            )
                         }
                     )) {
                         ForEach(ClaudeAgentToolPreferences.AgentModePromptDelivery.allCases, id: \.rawValue) { delivery in

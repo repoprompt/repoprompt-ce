@@ -19,6 +19,20 @@ struct AgentStatusPillsRow: View {
         #endif
         HStack(spacing: 12) {
             HStack(spacing: 6) {
+                if let executionLocation = snapshot.executionLocation {
+                    AgentExecutionLocationPill(
+                        props: executionLocation,
+                        loadExistingWorktrees: { try await agentModeVM.availableExecutionWorktrees(for: executionLocation.tabID) },
+                        selectLocation: { choice, confirmation in
+                            await agentModeVM.selectExecutionLocation(
+                                choice,
+                                for: executionLocation.tabID,
+                                confirmedChange: confirmation
+                            )
+                        }
+                    )
+                }
+
                 AgentWorkflowPill(
                     statusPillsUI: statusPillsUI,
                     windowID: windowID,
@@ -32,20 +46,6 @@ struct AgentStatusPillsRow: View {
 
                 if let stagedSlashCommand = snapshot.stagedSlashCommand {
                     AgentStagedSlashCommandPill(staged: stagedSlashCommand)
-                }
-
-                if let executionLocation = snapshot.executionLocation {
-                    AgentExecutionLocationPill(
-                        props: executionLocation,
-                        loadExistingWorktrees: { try await agentModeVM.availableExecutionWorktrees(for: executionLocation.tabID) },
-                        selectLocation: { choice, confirmation in
-                            await agentModeVM.selectExecutionLocation(
-                                choice,
-                                for: executionLocation.tabID,
-                                confirmedChange: confirmation
-                            )
-                        }
-                    )
                 }
             }
 

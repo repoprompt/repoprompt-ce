@@ -13,23 +13,23 @@ final class TooltipOverlayController {
     // MARK: – Public API
 
     func show(
-        text: String,
+        content: TooltipContent,
         anchorRect: NSRect,
         owner: NSWindow,
         placement: TooltipPlacement,
         preset: FontScalePreset
     ) {
         prepareWindowIfNeeded(owner: owner, preset: preset)
-        let bubbleSize = bubbleSize(for: text, preset: preset)
+        let bubbleSize = bubbleSize(for: content.text, preset: preset)
         guard let win else { return }
 
-        cachedText = text
+        cachedText = content.text
         cachedPlacement = placement
         cachedPreset = preset
 
         // Update SwiftUI rootView
         if let hosting = win.contentView as? NSHostingView<AnyView> {
-            hosting.rootView = AnyView(TooltipBubble(text: text, preset: preset))
+            hosting.rootView = AnyView(TooltipBubble(content: content, preset: preset))
         }
 
         // Resize & position

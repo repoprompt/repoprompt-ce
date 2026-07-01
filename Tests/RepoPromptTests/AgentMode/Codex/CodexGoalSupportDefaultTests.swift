@@ -36,6 +36,27 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         XCTAssertTrue(CodexGoalSupport.isEnabled(defaults: defaults))
     }
 
+    func testMissingUserDefaultsReasoningSummariesKeyDefaultsDisabled() throws {
+        let defaults = try makeIsolatedDefaults()
+
+        XCTAssertNil(defaults.object(forKey: CodexReasoningSummaries.defaultsKey))
+        XCTAssertFalse(CodexReasoningSummaries.isEnabled(defaults: defaults))
+    }
+
+    func testExplicitUserDefaultsReasoningSummariesTrueEnablesSummaries() throws {
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: CodexReasoningSummaries.defaultsKey)
+
+        XCTAssertTrue(CodexReasoningSummaries.isEnabled(defaults: defaults))
+    }
+
+    func testExplicitUserDefaultsReasoningSummariesFalseDisablesSummaries() throws {
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(false, forKey: CodexReasoningSummaries.defaultsKey)
+
+        XCTAssertFalse(CodexReasoningSummaries.isEnabled(defaults: defaults))
+    }
+
     func testMissingGlobalSettingsGoalScalarDefaultsEnabled() throws {
         let store = try makeStore(document: GlobalSettingsDocument(
             scalarPreferences: GlobalScalarPreferences(agentMode: .init())
@@ -59,6 +80,30 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         ))
 
         XCTAssertTrue(store.codexGoalSupportEnabled())
+    }
+
+    func testMissingGlobalSettingsReasoningSummariesScalarDefaultsDisabled() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+
+        XCTAssertFalse(store.codexReasoningSummariesEnabled())
+    }
+
+    func testExplicitGlobalSettingsReasoningSummariesTrueEnablesSummaries() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(codexReasoningSummariesEnabled: true))
+        ))
+
+        XCTAssertTrue(store.codexReasoningSummariesEnabled())
+    }
+
+    func testExplicitGlobalSettingsReasoningSummariesFalseDisablesSummaries() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(codexReasoningSummariesEnabled: false))
+        ))
+
+        XCTAssertFalse(store.codexReasoningSummariesEnabled())
     }
 
     private func makeIsolatedDefaults() throws -> UserDefaults {

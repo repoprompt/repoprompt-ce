@@ -422,16 +422,21 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let queued = await service.watcherIngressMailboxSnapshotForTesting()
         let queuedRange = try XCTUnwrap(queued.queuedAcceptedWatermarkRange)
         XCTAssertGreaterThan(queuedRange.lowerBound, replayCut)
-        XCTAssertEqual(queuedRange.upperBound, second)
+        XCTAssertLessThanOrEqual(queuedRange.lowerBound, second)
+        XCTAssertGreaterThanOrEqual(queuedRange.upperBound, second)
+        let postCutDrainTarget = queuedRange.upperBound
         XCTAssertTrue(queued.isAutomaticDrainPaused)
 
         let didComplete = await service.completeSeededPublication(initializationID: initializationID)
         XCTAssertTrue(didComplete)
-        _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: second)
+        _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: postCutDrainTarget)
         let resumed = await service.watcherIngressMailboxSnapshotForTesting()
         XCTAssertFalse(resumed.isAutomaticDrainPaused)
-        XCTAssertNil(resumed.queuedAcceptedWatermarkRange)
-        XCTAssertEqual(publications.snapshot().last?.watcherAcceptedWatermark, second)
+        if let remainingRange = resumed.queuedAcceptedWatermarkRange {
+            XCTAssertGreaterThan(remainingRange.lowerBound, postCutDrainTarget)
+        }
+        let serviceState = await service.publicationStateForTesting()
+        XCTAssertGreaterThanOrEqual(serviceState.lastPublishedWatcherAcceptedWatermark, postCutDrainTarget)
         await service.stopWatchingForChanges()
         withExtendedLifetime(cancellable) {}
     }

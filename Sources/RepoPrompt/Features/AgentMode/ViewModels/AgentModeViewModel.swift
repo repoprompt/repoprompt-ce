@@ -1486,6 +1486,7 @@ final class AgentModeViewModel: ObservableObject {
                 shellToolEnabled: permissionProfile.codexBashToolEnabled(),
                 suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
+                reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
             return CodexNativeSessionController(

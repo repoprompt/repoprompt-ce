@@ -154,48 +154,77 @@ final class AgentProviderPreferenceSnapshotStore {
         return id.providerID
     }
 
-    func setCodexBashToolEnabled(_ enabled: Bool) {
-        CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+    @discardableResult
+    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) -> AgentProviderBindingID {
+        switch mutation {
+        case let .bashTool(enabled):
+            CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+        case let .searchTool(enabled):
+            CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
+        case let .goalSupport(enabled):
+            CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
+        case let .reasoningSummaries(enabled):
+            CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
+        case let .mcpServer(normalizedName, enabled):
+            CodexAgentToolPreferences.setMCPServerEnabled(
+                normalizedName: normalizedName,
+                isEnabled: enabled,
+                defaults: defaults,
+                secureStore: securePermissions
+            )
+        }
         bumpRevision(for: .codex)
+        return .codex
+    }
+
+    func setCodexBashToolEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.bashTool(enabled: enabled))
     }
 
     func setCodexSearchToolEnabled(_ enabled: Bool) {
-        CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
-        bumpRevision(for: .codex)
+        applyCodexToolSettingMutation(.searchTool(enabled: enabled))
     }
 
     func setCodexGoalSupportEnabled(_ enabled: Bool) {
-        if defaults === UserDefaults.standard {
-            GlobalSettingsStore.shared.setCodexGoalSupportEnabled(enabled)
-        } else {
-            CodexGoalSupport.setEnabled(enabled, defaults: defaults)
-        }
-        bumpRevision(for: .codex)
+        applyCodexToolSettingMutation(.goalSupport(enabled: enabled))
+    }
+
+    func setCodexReasoningSummariesEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.reasoningSummaries(enabled: enabled))
     }
 
     func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
-        CodexAgentToolPreferences.setMCPServerEnabled(
-            normalizedName: normalizedName,
-            isEnabled: enabled,
-            defaults: defaults,
-            secureStore: securePermissions
+        applyCodexToolSettingMutation(
+            .mcpServer(normalizedName: normalizedName, enabled: enabled)
         )
-        bumpRevision(for: .codex)
+    }
+
+    @discardableResult
+    func applyClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation) -> AgentProviderBindingID {
+        switch mutation {
+        case let .bashTool(enabled):
+            ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+        case let .mcpStrictMode(enabled):
+            ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+        case let .toolSearch(enabled):
+            ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
+        case let .agentModePromptDelivery(delivery):
+            ClaudeAgentToolPreferences.setAgentModePromptDelivery(delivery, defaults: defaults)
+        }
+        bumpRevision(for: .claude)
+        return .claude
     }
 
     func setClaudeBashToolEnabled(_ enabled: Bool) {
-        ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        bumpRevision(for: .claude)
+        applyClaudeToolSettingMutation(.bashTool(enabled: enabled))
     }
 
     func setClaudeMCPStrictModeEnabled(_ enabled: Bool) {
-        ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        bumpRevision(for: .claude)
+        applyClaudeToolSettingMutation(.mcpStrictMode(enabled: enabled))
     }
 
     func setClaudeToolSearchEnabled(_ enabled: Bool) {
-        ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
-        bumpRevision(for: .claude)
+        applyClaudeToolSettingMutation(.toolSearch(enabled: enabled))
     }
 
     func setClaudeEffortLevel(_ level: ClaudeCodeEffortLevel) {
@@ -222,8 +251,7 @@ final class AgentProviderPreferenceSnapshotStore {
     }
 
     func setClaudeAgentModePromptDelivery(_ delivery: ClaudeAgentToolPreferences.AgentModePromptDelivery) {
-        ClaudeAgentToolPreferences.setAgentModePromptDelivery(delivery, defaults: defaults)
-        bumpRevision(for: .claude)
+        applyClaudeToolSettingMutation(.agentModePromptDelivery(delivery: delivery))
     }
 
     func bumpRevision(for providerID: AgentProviderBindingID) {
@@ -342,6 +370,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 bashToolEnabled: CodexAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions),
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
                 goalSupportEnabled: codexGoalSupportEnabled(),
+                reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -356,6 +385,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 bashToolEnabled: true,
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
                 goalSupportEnabled: codexGoalSupportEnabled(),
+                reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -396,10 +426,11 @@ final class AgentProviderPreferenceSnapshotStore {
     }
 
     private func codexGoalSupportEnabled() -> Bool {
-        if defaults === UserDefaults.standard {
-            return GlobalSettingsStore.shared.codexGoalSupportEnabled()
-        }
-        return CodexGoalSupport.isEnabled(defaults: defaults)
+        CodexAgentModeBooleanPreference.goalSupport.isEnabled(defaults: defaults)
+    }
+
+    private func codexReasoningSummariesEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.reasoningSummaries.isEnabled(defaults: defaults)
     }
 
     private func claudeEffortLevel(

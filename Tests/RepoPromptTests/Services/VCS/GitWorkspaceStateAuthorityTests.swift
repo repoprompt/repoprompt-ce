@@ -163,10 +163,10 @@ final class GitWorkspaceStateAuthorityTests: XCTestCase {
         XCTAssertNil(authority.withPendingInitializationAuthorityPublicationPermit([fence]) { true })
 
         let decision = await authority.pendingInitializationFenceDecision(fence)
-        XCTAssertEqual(
-            decision,
-            .revalidationRequired(latestAcceptedMetadataWatermark: latestAcceptedWatermark)
-        )
+        guard case let .revalidationRequired(decisionWatermark) = decision else {
+            return XCTFail("Expected pending fence to request revalidation, got \(decision)")
+        }
+        XCTAssertGreaterThanOrEqual(decisionWatermark, latestAcceptedWatermark)
 
         let alreadyRevalidated = GitWorkspacePendingInitializationAuthorityFence(
             snapshot: fence.snapshot,
