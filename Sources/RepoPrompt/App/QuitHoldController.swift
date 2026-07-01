@@ -84,6 +84,11 @@ final class QuitHoldController {
     private nonisolated(unsafe) var monitor: Any?
 
     private var decision = QuitHoldDecision()
+    /// Current gesture phase (inspection/test seam).
+    var holdState: QuitHoldDecision.State {
+        decision.state
+    }
+
     private var holdWorkItem: DispatchWorkItem?
     private var overlayPanel: QuitHoldPanel?
     private var ownerWillCloseObserver: NSObjectProtocol?
@@ -100,7 +105,11 @@ final class QuitHoldController {
     private static let cancelLingerSeconds: TimeInterval = 1.7
     private static let cancelFadeSeconds: TimeInterval = 0.3
 
-    init() {}
+    private let warnBeforeCmdQ: @MainActor () -> Bool
+
+    init(warnBeforeCmdQ: @escaping @MainActor () -> Bool = { GlobalSettingsStore.shared.warnBeforeCmdQ() }) {
+        self.warnBeforeCmdQ = warnBeforeCmdQ
+    }
 
     deinit {
         if let monitor {
@@ -131,21 +140,18 @@ final class QuitHoldController {
         ) { [weak self] _ in
             // Runs on `.main`; abort any in-flight hold so state can't get
             // stuck when the keyUp is never delivered (app no longer frontmost).
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.apply(self.decision.handle(.externalCancel))
-            }
+            MainActor.assumeIsolated { self?.handleExternalCancellation() }
         }
     }
 
     // MARK: - Event handling
 
-    private func handle(_ event: NSEvent) -> NSEvent? {
+    func handle(_ event: NSEvent) -> NSEvent? {
         switch event.type {
         case .keyDown:
             // Swallow policy is independent of the decision intent: swallow iff
             // exact-modifier ⌘Q + toggle on (S-003 / S-010).
-            let toggleOn = GlobalSettingsStore.shared.warnBeforeCmdQ()
+            let toggleOn = warnBeforeCmdQ()
             let swallow = QuitHoldEventFilter.shouldSwallowKeyDown(
                 modifierFlags: event.modifierFlags,
                 keyCode: event.keyCode,
@@ -170,6 +176,14 @@ final class QuitHoldController {
         default:
             return event
         }
+    }
+
+    /// External condition (owner window closed / app resigned active): feed
+    /// an `.externalCancel` so the decision resets to idle and the overlay is
+    /// dismissed immediately (no linger). The owner-close and resign-active
+    /// observers call this; tests call it directly as the lifecycle seam.
+    func handleExternalCancellation() {
+        apply(decision.handle(.externalCancel))
     }
 
     /// Translates a decision intent into side effects.
@@ -257,10 +271,7 @@ final class QuitHoldController {
                 // Runs on `.main`; the owner window is closing, so abort the
                 // hold (reset state + dismiss overlay) — don't leave the gate
                 // in a stale .holding/.armed state.
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    self.apply(self.decision.handle(.externalCancel))
-                }
+                MainActor.assumeIsolated { self?.handleExternalCancellation() }
             }
         }
 
