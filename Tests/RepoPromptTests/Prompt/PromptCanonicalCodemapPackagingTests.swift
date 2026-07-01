@@ -4,54 +4,31 @@ import XCTest
 
 @MainActor
 final class PromptCanonicalCodemapPackagingTests: XCTestCase {
-    private var temporaryRoots = FileSystemTemporaryRoots()
-
-    override func tearDownWithError() throws {
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
-    func testRegularChatPackagingRendersOnlyCanonicalCodemapsExactlyOnce() async throws {
+    func testRegularChatPackagingOmitsIncompleteAutomaticCodemapWithoutLegacyFallback() async throws {
         let previousCodeMapsDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
         GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(false, commit: false)
         defer {
             GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(previousCodeMapsDisabled, commit: false)
         }
 
-        let root = try temporaryRoots.makeRoot(suiteName: "RegularCanonicalCodemap")
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let root = try repositoryFixture.makeRepository(
+            named: "regular-canonical",
+            files: [
+                "Selected.swift": "protocol SelectedContext { func selectedFullContentSentinel() -> TargetType }\n",
+                "Target.swift": "struct TargetType { func targetFullContentSentinel() {} }\n"
+            ]
+        )
         let selectedURL = root.appendingPathComponent("Selected.swift")
-        let targetURL = root.appendingPathComponent("Target.swift")
-        try FileSystemTestSupport.write(
-            "let selectedFullContentSentinel = TargetType()\n",
-            to: selectedURL
-        )
-        try FileSystemTestSupport.write(
-            "struct TargetType { func targetFullContentSentinel() {} }\n",
-            to: targetURL
-        )
 
-        let store = WorkspaceFileContextStore()
+        let store = WorkspaceFileContextStore(
+            codemapGitEligibilityProbe: .init { _ in
+                .transientUnavailable(.repositoryChanging)
+            },
+            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+        )
         _ = try await store.loadRoot(path: root.path)
-        await store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: selectedURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(
-                    path: selectedURL.path,
-                    symbolName: "selectedCodemapSymbol",
-                    referencedTypes: ["TargetType"]
-                )
-            ),
-            WorkspaceObservedCodemapResult(
-                fullPath: targetURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(
-                    path: targetURL.path,
-                    symbolName: "targetCodemapSymbol",
-                    className: "TargetType"
-                )
-            )
-        ])
         let prompt = makePrompt(store: store, windowID: -9801)
         let config = makeAutoConfig()
         let conversation = [ConversationEntry(role: .user, content: "Inspect the canonical context.")]
@@ -62,12 +39,12 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             overrideMode: .chat,
             selectionOverride: StoredSelection(
                 selectedPaths: [selectedURL.path],
-                autoCodemapPaths: [],
+
                 codemapAutoEnabled: false
             ),
             lookupContextOverride: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
         )
-        XCTAssertFalse(withoutCanonicalCodemap.fileTree.contains("targetCodemapSymbol"))
+        XCTAssertFalse(withoutCanonicalCodemap.fileTree.contains("targetFullContentSentinel"))
         XCTAssertFalse(withoutCanonicalCodemap.fileTree.contains("<Referenced APIs>"))
 
         let canonicalMessage = await prompt.packagePrompt(
@@ -76,43 +53,42 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             overrideMode: .chat,
             selectionOverride: StoredSelection(
                 selectedPaths: [selectedURL.path],
-                autoCodemapPaths: [targetURL.path],
+
                 codemapAutoEnabled: true
             ),
             lookupContextOverride: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
         )
         let packagedContents = canonicalMessage.fileBlocks.joined(separator: "\n")
 
-        XCTAssertEqual(occurrences(of: "targetCodemapSymbol", in: canonicalMessage.fileTree), 1)
+        XCTAssertEqual(occurrences(of: "targetFullContentSentinel", in: canonicalMessage.fileTree), 0)
         XCTAssertFalse(canonicalMessage.fileTree.contains("<Referenced APIs>"))
-        XCTAssertFalse(packagedContents.contains("targetCodemapSymbol"), packagedContents)
+        XCTAssertFalse(packagedContents.contains("targetFullContentSentinel"), packagedContents)
         XCTAssertEqual(occurrences(of: "selectedFullContentSentinel", in: packagedContents), 1)
         XCTAssertFalse(packagedContents.contains("targetFullContentSentinel"), packagedContents)
     }
 
-    func testCopyPackagingReadsCanonicalCodemapsFromActiveComposeTabExactlyOnce() async throws {
+    func testCopyPackagingOmitsIncompleteAutomaticCodemapWithoutLegacyFallback() async throws {
         let previousCodeMapsDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
         GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(false, commit: false)
         defer {
             GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(previousCodeMapsDisabled, commit: false)
         }
 
-        let root = try temporaryRoots.makeRoot(suiteName: "CopyCanonicalCodemap")
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let root = try repositoryFixture.makeRepository(
+            named: "copy-canonical",
+            files: [
+                "Selected.swift": "protocol SelectedCopyContext { func selectedCopyContentSentinel() -> TargetType }\n",
+                "Target.swift": "struct TargetType { func targetCopyAPI() { let targetCopyBodySentinel = true } }\n"
+            ]
+        )
         let selectedURL = root.appendingPathComponent("Selected.swift")
-        let targetURL = root.appendingPathComponent("Target.swift")
-        try FileSystemTestSupport.write(
-            "let selectedCopyContentSentinel = TargetType()\n",
-            to: selectedURL
-        )
-        try FileSystemTestSupport.write(
-            "struct TargetType { func targetCopyAPI() { let targetCopyBodySentinel = true } }\n",
-            to: targetURL
-        )
 
         let tabID = UUID()
         let emptyCanonicalSelection = StoredSelection(
             selectedPaths: [selectedURL.path],
-            autoCodemapPaths: [],
+
             codemapAutoEnabled: false
         )
         let (window, _) = await makeWindow(
@@ -125,26 +101,6 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             in: window,
             path: root.path
         )
-        await window.workspaceFileContextStore.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: selectedURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(
-                    path: selectedURL.path,
-                    symbolName: "selectedCopyCodemapSymbol",
-                    referencedTypes: ["TargetType"]
-                )
-            ),
-            WorkspaceObservedCodemapResult(
-                fullPath: targetURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(
-                    path: targetURL.path,
-                    symbolName: "targetCopyAPI",
-                    className: "TargetType"
-                )
-            )
-        ])
 
         _ = await window.selectionCoordinator.persistActiveSelection(
             emptyCanonicalSelection,
@@ -163,7 +119,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
 
         let canonicalSelection = StoredSelection(
             selectedPaths: [selectedURL.path],
-            autoCodemapPaths: [targetURL.path],
+
             codemapAutoEnabled: true
         )
         _ = await window.selectionCoordinator.persistActiveSelection(
@@ -177,68 +133,62 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
         let capturedSelection = window.selectionCoordinator.activeSelectionSnapshot(
             flushPendingUI: true
         ).selection
-        XCTAssertEqual(capturedSelection.autoCodemapPaths, [targetURL.standardizedFileURL.path])
         let preAssembly = await window.promptManager.preAssemblePromptContext(
             cfg: makeAutoConfig(),
             selection: capturedSelection,
             lookupContext: window.promptManager.allLoadedWorkspaceLookupContext()
         )
-        XCTAssertEqual(preAssembly.entries.filter(\.isCodemap).map(\.file.standardizedFullPath), [targetURL.standardizedFileURL.path])
+        XCTAssertTrue(preAssembly.entries.filter(\.isCodemap).isEmpty)
+        switch preAssembly.codemapPresentation.coverage {
+        case .complete, .partial:
+            XCTFail("Cold automatic codemap coverage must remain honestly incomplete")
+        case .pending, .unavailable:
+            break
+        }
         let canonicalClipboard = await window.promptManager.buildClipboard(
             for: makeAutoConfig(),
             promptTextOverride: ""
         )
 
-        XCTAssertEqual(occurrences(of: "targetCopyAPI", in: canonicalClipboard), 1, canonicalClipboard)
+        XCTAssertEqual(occurrences(of: "targetCopyAPI", in: canonicalClipboard), 0, canonicalClipboard)
         XCTAssertEqual(occurrences(of: "selectedCopyContentSentinel", in: canonicalClipboard), 1)
         XCTAssertFalse(canonicalClipboard.contains("targetCopyBodySentinel"), canonicalClipboard)
         XCTAssertFalse(canonicalClipboard.contains("<Referenced APIs>"), canonicalClipboard)
     }
 
-    func testFrozenHeadlessPackagingPreservesSlicesAndWorktreeProjectionWithCanonicalCodemap() async throws {
+    func testHeadlessPackagingPreservesSlicesWhenAutomaticCodemapIsIncomplete() async throws {
         let previousCodeMapsDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
         GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(false, commit: false)
         defer {
             GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(previousCodeMapsDisabled, commit: false)
         }
 
-        let logicalRoot = try temporaryRoots.makeRoot(suiteName: "HeadlessCanonicalLogical")
-        let worktreeRoot = try temporaryRoots.makeRoot(suiteName: "HeadlessCanonicalWorktree")
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "headless-logical",
+            files: [
+                "Sources/Selected.swift": "let canonicalFullContentSentinel = true\n",
+                "Sources/Target.swift": "struct CanonicalTarget {}\n"
+            ]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "headless-worktree",
+            files: [
+                "Sources/Selected.swift": "let excludedBeforeSlice = true\nfunc selectedWorktreeSlice() -> TargetType { TargetType() }\nlet excludedAfterSlice = true\n",
+                "Sources/Target.swift": "struct TargetType { func targetFullContentSentinel() {} }\n"
+            ]
+        )
         let logicalSelectedURL = logicalRoot.appendingPathComponent("Sources/Selected.swift")
-        let logicalTargetURL = logicalRoot.appendingPathComponent("Sources/Target.swift")
-        let worktreeSelectedURL = worktreeRoot.appendingPathComponent("Sources/Selected.swift")
-        let worktreeTargetURL = worktreeRoot.appendingPathComponent("Sources/Target.swift")
-        try FileSystemTestSupport.write(
-            "let canonicalFullContentSentinel = true\n",
-            to: logicalSelectedURL
-        )
-        try FileSystemTestSupport.write(
-            "struct CanonicalTarget {}\n",
-            to: logicalTargetURL
-        )
-        try FileSystemTestSupport.write(
-            "let excludedBeforeSlice = true\nlet selectedWorktreeSlice = TargetType()\nlet excludedAfterSlice = true\n",
-            to: worktreeSelectedURL
-        )
-        try FileSystemTestSupport.write(
-            "struct TargetType { func targetFullContentSentinel() {} }\n",
-            to: worktreeTargetURL
-        )
 
-        let store = WorkspaceFileContextStore()
+        let store = WorkspaceFileContextStore(
+            codemapGitEligibilityProbe: .init { _ in
+                .transientUnavailable(.repositoryChanging)
+            },
+            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+        )
         let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
         let worktreeRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
-        await store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: worktreeTargetURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(
-                    path: worktreeTargetURL.path,
-                    symbolName: "worktreeTargetCodemapSymbol",
-                    className: "TargetType"
-                )
-            )
-        ])
 
         let logicalRootRef = WorkspaceRootRef(
             id: logicalRecord.id,
@@ -281,7 +231,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
                 promptText: "Inspect the frozen worktree context.",
                 selection: StoredSelection(
                     selectedPaths: [logicalSelectedURL.path],
-                    autoCodemapPaths: [logicalTargetURL.path],
+
                     slices: [logicalSelectedURL.path: [LineRange(start: 2, end: 2)]],
                     codemapAutoEnabled: true
                 ),
@@ -300,10 +250,10 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
         XCTAssertFalse(packagedContents.contains("excludedAfterSlice"), packagedContents)
         XCTAssertFalse(packagedContents.contains("canonicalFullContentSentinel"), packagedContents)
         XCTAssertFalse(packagedContents.contains(worktreeRoot.standardizedFileURL.path), packagedContents)
-        XCTAssertEqual(occurrences(of: "worktreeTargetCodemapSymbol", in: message.fileTree), 1)
+        XCTAssertEqual(occurrences(of: "targetFullContentSentinel", in: message.fileTree), 0)
         XCTAssertFalse(message.fileTree.contains("<Referenced APIs>"), message.fileTree)
         XCTAssertFalse(message.fileTree.contains(worktreeRoot.standardizedFileURL.path), message.fileTree)
-        XCTAssertFalse(packagedContents.contains("worktreeTargetCodemapSymbol"), packagedContents)
+        XCTAssertFalse(packagedContents.contains("targetFullContentSentinel"), packagedContents)
         XCTAssertFalse(packagedContents.contains("targetFullContentSentinel"), packagedContents)
     }
 
@@ -314,7 +264,14 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
     ) async -> (window: WindowState, workspaceID: UUID) {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(
+            workspaceFileContextStore: WorkspaceFileContextStore(
+                codemapGitEligibilityProbe: .init { _ in
+                    .transientUnavailable(.repositoryChanging)
+                },
+                codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+            )
+        )
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 
@@ -361,32 +318,6 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             codeMapUsage: .auto,
             gitInclusion: .none,
             storedPromptIds: []
-        )
-    }
-
-    private func makeFileAPI(
-        path: String,
-        symbolName: String,
-        className: String? = nil,
-        referencedTypes: [String] = []
-    ) -> FileAPI {
-        FileAPI(
-            filePath: path,
-            imports: [],
-            classes: className.map { [ClassInfo(name: $0, methods: [], properties: [])] } ?? [],
-            functions: [
-                FunctionInfo(
-                    name: symbolName,
-                    parameters: [],
-                    returnType: nil,
-                    definitionLine: "func \(symbolName)()",
-                    lineNumber: 1
-                )
-            ],
-            enums: [],
-            globalVars: [],
-            macros: [],
-            referencedTypes: referencedTypes
         )
     }
 

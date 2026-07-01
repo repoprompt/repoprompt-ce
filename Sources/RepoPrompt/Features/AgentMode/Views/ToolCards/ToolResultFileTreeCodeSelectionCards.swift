@@ -188,13 +188,8 @@ struct CodeStructureResultCard: View {
     let item: AgentChatItem
     @State private var isExpanded = false
 
-    private var dto: ToolResultDTOs.SelectedCodeStructureDTO? {
-        ToolJSON.decode(ToolResultDTOs.SelectedCodeStructureDTO.self, from: item.toolResultJSON)
-    }
-
-    private var totalOmitted: Int {
-        guard let dto else { return 0 }
-        return dto.omittedTotal ?? ((dto.omittedCount ?? 0) + (dto.tokenBudgetOmittedCount ?? 0))
+    private var dto: ToolResultDTOs.CodeStructureReplyDTO? {
+        ToolJSON.decode(ToolResultDTOs.CodeStructureReplyDTO.self, from: item.toolResultJSON)
     }
 
     private var headerStatusText: String? {
@@ -205,11 +200,11 @@ struct CodeStructureResultCard: View {
         if let stored = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON) {
             return stored.detailText
         }
-        guard let unmapped = dto?.unmappedPaths, !unmapped.isEmpty else { return nil }
-        let visible = unmapped.prefix(2).map { shortenPath($0) }
+        guard let paths = dto?.issues.compactMap(\.path), !paths.isEmpty else { return nil }
+        let visible = paths.prefix(2).map { shortenPath($0) }
         var parts = visible
-        if unmapped.count > visible.count {
-            parts.append("(+\(unmapped.count - visible.count) more)")
+        if paths.count > visible.count {
+            parts.append("(+\(paths.count - visible.count) more)")
         }
         return parts.joined(separator: " • ")
     }
@@ -219,14 +214,7 @@ struct CodeStructureResultCard: View {
             return stored.subtitle ?? ""
         }
         if let dto {
-            var parts = ["\(dto.fileCount) files"]
-            if totalOmitted > 0 {
-                parts.append("\(totalOmitted) omitted")
-            }
-            if let unmapped = dto.unmappedPaths?.count, unmapped > 0 {
-                parts.append("\(unmapped) unmapped")
-            }
-            return parts.joined(separator: " • ")
+            return "\(dto.summary.returnedFiles) files • \(dto.status)"
         }
         if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON) {
             if args.scope == "selected" { return "selected" }
@@ -243,9 +231,12 @@ struct CodeStructureResultCard: View {
             return storedStatus
         }
         if let dto {
-            if totalOmitted > 0 { return .warning }
-            if dto.fileCount > 0 { return .success }
-            return .neutral
+            return switch dto.status {
+            case "ready": .success
+            case "partial", "pending", "budget": .warning
+            case "unavailable", "stale": .failure
+            default: .neutral
+            }
         }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }

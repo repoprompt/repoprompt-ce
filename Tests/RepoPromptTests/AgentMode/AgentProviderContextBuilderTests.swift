@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPrompt
 import XCTest
 
@@ -52,7 +53,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let missingSnapshotBlock = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: StoredSelection(
                 selectedPaths: [],
-                autoCodemapPaths: [logicalCodemapURL.path],
+
                 codemapAutoEnabled: true
             ),
             tokenCap: 10000,
@@ -62,23 +63,22 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         XCTAssertFalse(missingSnapshotBlock.contains("let branchOnly = true"), missingSnapshotBlock)
         XCTAssertFalse(missingSnapshotBlock.contains("<file_map>"), missingSnapshotBlock)
 
-        await fixture.store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: worktreeCodemapURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(path: worktreeCodemapURL.path, symbolName: "branchOnlyCodemapSymbol")
-            )
-        ])
+        let presentation = try await makePresentation(
+            store: fixture.store,
+            fileURL: worktreeCodemapURL,
+            artifact: makeSyntaxArtifact(path: worktreeCodemapURL.path, symbolName: "branchOnlyCodemapSymbol")
+        )
 
         let block = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: StoredSelection(
                 selectedPaths: [fixture.logicalRoot.appendingPathComponent("Sources/App.swift").path],
-                autoCodemapPaths: [logicalCodemapURL.path],
+
                 codemapAutoEnabled: true
             ),
             tokenCap: 10000,
             store: fixture.store,
-            lookupContext: lookupContext
+            lookupContext: lookupContext,
+            codemapPresentation: presentation
         )
 
         XCTAssertTrue(block.contains("<file_map>"), block)
@@ -95,55 +95,163 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let lookupContext = await makeLookupContext(fixture: fixture)
         let logicalURL = fixture.logicalRoot.appendingPathComponent("Sources/BranchOnly.swift")
         let worktreeURL = fixture.worktreeRoot.appendingPathComponent("Sources/BranchOnly.swift")
-        let api = makeFileAPI(
+        let artifact = makeSyntaxArtifact(
             path: worktreeURL.path,
             symbolName: "forkCapCodemapSentinel",
             imports: ["Foundation", "Combine"]
         )
-        await fixture.store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: worktreeURL.path,
-                modificationDate: Date(),
-                fileAPI: api
-            )
-        ])
         let selection = StoredSelection(
-            autoCodemapPaths: [logicalURL.path],
             codemapAutoEnabled: true
         )
-        let rendered = api.getFullAPIDescription(displayPath: "Sources/BranchOnly.swift")
+        let rendered = artifact.renderedCodeMap(displayPath: "Sources/BranchOnly.swift")
         let renderedTokens = TokenCalculationService.estimateTokens(for: rendered)
+        let presentation = try await makePresentation(
+            store: fixture.store,
+            fileURL: worktreeURL,
+            artifact: artifact
+        )
 
         let atCap = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
             tokenCap: renderedTokens,
             store: fixture.store,
-            lookupContext: lookupContext
+            lookupContext: lookupContext,
+            codemapPresentation: presentation
         )
         XCTAssertTrue(atCap.contains("forkCapCodemapSentinel"), atCap)
         XCTAssertTrue(atCap.contains("  - Foundation"), atCap)
         XCTAssertFalse(atCap.contains(fixture.worktreeRoot.path), atCap)
 
+        let summaryCalls = AgentProviderLockedCounter()
         let overCap = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
             tokenCap: renderedTokens - 1,
             store: fixture.store,
             lookupContext: lookupContext,
-            overTokenCapSummaryProvider: { _, _, frozenBundle in
-                await fixture.store.applyObservedCodemapResults([
-                    WorkspaceObservedCodemapResult(
-                        fullPath: worktreeURL.path,
-                        modificationDate: Date(),
-                        fileAPI: nil
-                    )
-                ])
-                let retainedOriginal = frozenBundle.orderedSnapshots.contains { snapshot in
-                    snapshot.fileAPI?.apiDescription.contains("forkCapCodemapSentinel") == true
+            codemapPresentation: presentation,
+            overTokenCapSummaryProvider: { _, _, suppliedPresentation in
+                summaryCalls.increment()
+                XCTAssertEqual(suppliedPresentation.id, presentation.id)
+                let retainedOriginal = suppliedPresentation.orderedEntries.contains {
+                    $0.text.contains("forkCapCodemapSentinel")
                 }
                 return retainedOriginal ? "<selection_summary>frozen bundle</selection_summary>" : nil
             }
         )
         XCTAssertEqual(overCap, "<selection_summary>frozen bundle</selection_summary>")
+        XCTAssertEqual(summaryCalls.value, 1)
+    }
+
+    @MainActor
+    func testAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "func makeTarget() -> Target { Target() }\n",
+                "Sources/Target.swift": "struct Target {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        addTeardownBlock { @MainActor in
+            window.beginClose()
+            await window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
+
+        let tabID = UUID()
+        let selection = StoredSelection(
+            selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+            codemapAutoEnabled: true
+        )
+        let workspace = WorkspaceModel(
+            name: "Agent over-cap borrowed presentation",
+            repoPaths: [root.path],
+            ephemeralFlag: true,
+            composeTabs: [ComposeTabState(id: tabID, name: "Agent", selection: selection)],
+            activeComposeTabID: tabID
+        )
+        window.workspaceManager.workspaces = [workspace]
+        await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "agentProviderContextBuilderTests"
+        )
+        window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+        window.agentModeViewModel.test_setCurrentTabIDOverride(tabID)
+
+        var countsBeforeSummary: WorkspaceFileContextStore.CodemapPresentationOperationCounts?
+        #if DEBUG
+            let refreshStartsBeforeHandoff = window.mcpServer.virtualTokenRefreshStartCountForTesting()
+        #endif
+        let block = await window.agentModeViewModel.buildCurrentTabHandoffFileContentsBlock(
+            tokenCap: 0,
+            overTokenCapSummaryWillBegin: {
+                countsBeforeSummary = await window.workspaceFileContextStore
+                    .codemapPresentationOperationCountsForTesting()
+            }
+        )
+        let beforeSummary = try XCTUnwrap(countsBeforeSummary)
+        let afterSummary = await window.workspaceFileContextStore.codemapPresentationOperationCountsForTesting()
+
+        XCTAssertTrue(block.contains("<selection_summary>"), block)
+        XCTAssertGreaterThan(beforeSummary.artifactDemandRequests, 0)
+        XCTAssertEqual(afterSummary.artifactDemandRequests - beforeSummary.artifactDemandRequests, 0)
+        XCTAssertEqual(afterSummary.presentationFreezeRequests - beforeSummary.presentationFreezeRequests, 0)
+        #if DEBUG
+            XCTAssertEqual(
+                window.mcpServer.virtualTokenRefreshStartCountForTesting() - refreshStartsBeforeHandoff,
+                0
+            )
+        #endif
+    }
+
+    private func makePresentation(
+        store: WorkspaceFileContextStore,
+        fileURL: URL,
+        artifact: CodeMapSyntaxArtifact
+    ) async throws -> WorkspaceCodemapOperationPresentation {
+        let lookup = await store.lookupPath(fileURL.path, rootScope: .allLoaded)
+        let file = try XCTUnwrap(lookup?.file)
+        let rendered = artifact.renderedCodeMap(displayPath: file.standardizedRelativePath)
+        let pipeline = try SyntaxManager().pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let bundleID = WorkspaceCodemapFrozenPresentationBundleID()
+        let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "LogicalRoot",
+            standardizedRelativePath: file.standardizedRelativePath
+        ))
+        return WorkspaceCodemapOperationPresentation(
+            orderedEntries: [
+                WorkspaceCodemapOperationRenderedEntry(
+                    bundleID: bundleID,
+                    fileID: file.id,
+                    rootEpoch: WorkspaceCodemapRootEpoch(
+                        rootID: file.rootID,
+                        rootLifetimeID: UUID()
+                    ),
+                    artifactKey: CodeMapArtifactKey(
+                        rawSHA256: CodeMapRawSourceDigest(bytes: Data(repeating: 1, count: 32)),
+                        rawByteCount: UInt64(rendered.utf8.count),
+                        pipelineIdentity: pipeline
+                    ),
+                    logicalPath: logicalPath,
+                    text: rendered,
+                    tokenCount: TokenCalculationService.estimateTokens(for: rendered)
+                )
+            ],
+            coverage: .complete,
+            issues: [],
+            publicationReceipt: nil
+        )
     }
 
     func testNonWorktreeForkFileContentsPreservesVisibleWorkspaceBehavior() async throws {
@@ -159,6 +267,34 @@ final class AgentProviderContextBuilderTests: XCTestCase {
 
         XCTAssertTrue(block.contains("let origin = \"base\""), block)
         XCTAssertFalse(block.contains("let origin = \"worktree\""), block)
+    }
+
+    func testNonGitForkExportPreservesSelectedContentWithoutStartingCodemapRuntime() async throws {
+        let root = try makeTemporaryRoot(name: "AgentProviderNonGit")
+        try write(
+            "struct NonGitSelected { let selectedContentSentinel = true }\n",
+            to: root.appendingPathComponent("Sources/App.swift")
+        )
+        let runtimeAccessCount = AgentProviderLockedCounter()
+        let store = WorkspaceFileContextStore(codemapRuntimeProvider: {
+            runtimeAccessCount.increment()
+            throw AgentProviderContextTestError.unexpectedRuntimeAccess
+        })
+        _ = try await store.loadRoot(path: root.path)
+
+        let block = await AgentProviderContextBuilder.forkFileContentsBlock(
+            selection: StoredSelection(
+                selectedPaths: ["Sources/App.swift"],
+                codemapAutoEnabled: true
+            ),
+            tokenCap: 10000,
+            store: store,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertTrue(block.contains("selectedContentSentinel"), block)
+        XCTAssertFalse(block.contains("<file_map>"), block)
+        XCTAssertEqual(runtimeAccessCount.value, 0)
     }
 
     private func makeBoundFixture() async throws -> (
@@ -233,13 +369,12 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private func makeFileAPI(
+    private func makeSyntaxArtifact(
         path: String,
         symbolName: String,
         imports: [String] = []
-    ) -> FileAPI {
-        FileAPI(
-            filePath: path,
+    ) -> CodeMapSyntaxArtifact {
+        CodeMapSyntaxArtifact(
             imports: imports,
             classes: [],
             functions: [
@@ -256,5 +391,26 @@ final class AgentProviderContextBuilderTests: XCTestCase {
             macros: [],
             referencedTypes: []
         )
+    }
+}
+
+private enum AgentProviderContextTestError: Error {
+    case unexpectedRuntimeAccess
+}
+
+private final class AgentProviderLockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
     }
 }

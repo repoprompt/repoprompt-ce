@@ -301,141 +301,63 @@ struct CLIProvidersSettingsView: View {
         )
     }
 
-    // MARK: - Permission Summary Link
-
-    /// Compact read-only permission summary shown inside each connected CLI provider card,
-    /// with a button that deep-links into Agent Permissions where the editable controls
-    /// live (A4). Keeps CLI Providers focused on connection/auth/model discovery/trace
-    /// without duplicating provider-native permission editors.
-    ///
-    /// SEARCH-HELPER: Open Agent Permissions, Configure in Agent Permissions, A4 progressive disclosure,
-    /// CLI Providers permission summary
-    @ViewBuilder
-    private func permissionSummaryLinkRow(for providerID: AgentProviderBindingID) -> some View {
-        let summary = permissionSummaryText(for: providerID)
-        HStack(alignment: .center, spacing: 8) {
-            Image(systemName: "lock.shield")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Permissions")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.secondary)
-                Text(summary)
-                    .font(.caption)
-                    .foregroundColor(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 8)
-            if onNavigate != nil {
-                Button {
-                    onNavigate?(.agentPermissions)
-                } label: {
-                    Label("Open Agent Permissions", systemImage: "arrow.up.forward.app")
-                        .font(.caption)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-        }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.05))
-        .cornerRadius(6)
-    }
-
-    /// Short summary of the provider-native permission level, read through the same
-    /// defaults/secure-store context as the injected Agent Permissions VM.
-    private func permissionSummaryText(for providerID: AgentProviderBindingID) -> String {
-        let defaults = providerPermissionsVM.defaults
-        let secureStore = providerPermissionsVM.securePermissions
-        switch providerID {
-        case .codex:
-            let level = CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: secureStore)
-            let sandbox = CodexAgentToolPreferences.sandboxMode(defaults: defaults, secureStore: secureStore)
-            return "\(level.displayName) · Sandbox \(sandbox.displayName)"
-        case .claude:
-            let level = ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: secureStore)
-            let strict = ClaudeAgentToolPreferences.mcpStrictModeEnabled(defaults: defaults, secureStore: secureStore)
-            return strict
-                ? "\(level.displayName) · Strict MCP (RepoPrompt only)"
-                : "\(level.displayName) · External MCP allowed"
-        case .openCode:
-            let level = OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: secureStore)
-            return "ACP session mode: \(level.displayName)"
-        case .cursor:
-            let level = CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: secureStore)
-            return level.autoApprovesACPToolPermissions
-                ? "ACP auto-approve: on"
-                : "ACP auto-approve: off"
-        }
-    }
-
     // MARK: - Inline Direct-Provider Permissions
 
     @ViewBuilder
     private func directProviderInlineControls(for providerID: AgentProviderBindingID) -> some View {
-        switch providerID {
-        case .codex, .claude:
-            if let binding = providerPermissionsVM.controlsBinding(for: providerID) {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "lock.shield")
-                            .font(.system(size: 12))
+        if let binding = providerPermissionsVM.controlsBinding(for: providerID) {
+            let hasToolRuntimeOptions = binding.codexTools != nil || binding.claudeTools != nil
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "lock.shield")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(hasToolRuntimeOptions ? "Permissions & Runtime" : "Permissions")
+                            .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.secondary)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Permissions & Runtime")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.secondary)
-                            Text("Direct Agent settings. Sub-agent policy remains in Agent Permissions.")
-                                .font(.caption)
-                                .foregroundColor(.primary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer(minLength: 8)
-                        if onNavigate != nil {
-                            Button {
-                                onNavigate?(.agentPermissions)
-                            } label: {
-                                Label("Open Agent Permissions", systemImage: "arrow.up.forward.app")
-                                    .font(.caption)
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
+                        Text("Direct Agent settings. Sub-agent policy remains in Agent Permissions.")
+                            .font(.caption)
+                            .foregroundColor(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    Spacer(minLength: 8)
+                    if onNavigate != nil {
+                        Button {
+                            onNavigate?(.agentPermissions)
+                        } label: {
+                            Label("Open Agent Permissions", systemImage: "arrow.up.forward.app")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
 
-                    AgentProviderPermissionLevelSection(
-                        binding: binding.permission,
-                        onSelectPermissionLevel: { providerPermissionsVM.setPermissionLevel($0) }
-                    )
+                AgentProviderPermissionLevelSection(
+                    binding: binding.permission,
+                    onSelectPermissionLevel: { providerPermissionsVM.setPermissionLevel($0) }
+                )
 
+                if hasToolRuntimeOptions {
                     AgentProviderToolsRuntimeControls(
                         providerID: providerID,
                         binding: binding,
-                        onSetCodexBashToolEnabled: { providerPermissionsVM.setCodexBashToolEnabled($0) },
-                        onSetCodexSearchToolEnabled: { providerPermissionsVM.setCodexSearchToolEnabled($0) },
-                        onSetCodexGoalSupportEnabled: { providerPermissionsVM.setCodexGoalSupportEnabled($0) },
-                        onSetCodexMCPServerEnabled: { normalizedName, enabled in
-                            providerPermissionsVM.setCodexMCPServerEnabled(
-                                normalizedName: normalizedName,
-                                enabled: enabled
-                            )
+                        onApplyCodexToolSettingMutation: {
+                            providerPermissionsVM.applyCodexToolSettingMutation($0)
                         },
-                        onSetClaudeBashToolEnabled: { providerPermissionsVM.setClaudeBashToolEnabled($0) },
-                        onSetClaudeMCPStrictModeEnabled: { providerPermissionsVM.setClaudeMCPStrictModeEnabled($0) },
-                        onSetClaudeToolSearchEnabled: { providerPermissionsVM.setClaudeToolSearchEnabled($0) }
+                        onApplyClaudeToolSettingMutation: {
+                            providerPermissionsVM.applyClaudeToolSettingMutation($0)
+                        }
                     )
                 }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.secondary.opacity(0.05))
-                .cornerRadius(6)
-            } else {
-                permissionControlsUnavailableRow()
             }
-        case .openCode, .cursor:
-            EmptyView()
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.05))
+            .cornerRadius(6)
+        } else {
+            permissionControlsUnavailableRow()
         }
     }
 
@@ -1552,7 +1474,9 @@ struct CLIProvidersSettingsView: View {
                             get: { claudeNativePromptMode },
                             set: { newValue in
                                 claudeNativePromptMode = newValue
-                                ClaudeAgentToolPreferences.setAgentModePromptDelivery(newValue)
+                                providerPermissionsVM.applyClaudeToolSettingMutation(
+                                    .agentModePromptDelivery(delivery: newValue)
+                                )
                             }
                         )) {
                             ForEach(ClaudeAgentToolPreferences.AgentModePromptDelivery.allCases, id: \.rawValue) { mode in
@@ -1733,7 +1657,7 @@ struct CLIProvidersSettingsView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    permissionSummaryLinkRow(for: .openCode)
+                    directProviderInlineControls(for: .openCode)
                 } else {
                     HStack(spacing: 10) {
                         Button(action: { testOpenCodeConnection() }) {
@@ -1816,7 +1740,7 @@ struct CLIProvidersSettingsView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    permissionSummaryLinkRow(for: .cursor)
+                    directProviderInlineControls(for: .cursor)
                 } else {
                     HStack(spacing: 10) {
                         Button(action: { testCursorConnection() }) {

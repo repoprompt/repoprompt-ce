@@ -242,7 +242,7 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
             "gitdir: \(siblingGitDir.path)\n",
             to: siblingRoot.appendingPathComponent(".git")
         )
-        try FileSystemTestSupport.write("../..\n", to: siblingGitDir.appendingPathComponent("commondir"))
+        try writeMinimalLinkedWorktreeGitMetadata(commonGitDir: layout.commonDir, gitDir: siblingGitDir)
         _ = try await fixture.store.loadRoot(path: siblingRoot.path, kind: .primaryWorkspace)
         let siblingIdentities = await FrozenVisibleGitCheckoutResolver(vcsService: VCSService()).resolve(
             workspaceRootPaths: [siblingRoot.path],
@@ -713,6 +713,16 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
         )
     }
 
+    private func writeMinimalLinkedWorktreeGitMetadata(commonGitDir: URL, gitDir: URL) throws {
+        try FileSystemTestSupport.write("../..\n", to: gitDir.appendingPathComponent("commondir"))
+        try FileSystemTestSupport.write("ref: refs/heads/main\n", to: gitDir.appendingPathComponent("HEAD"))
+        try FileSystemTestSupport.write("[core]\n\trepositoryformatversion = 0\n", to: commonGitDir.appendingPathComponent("config"))
+        try FileManager.default.createDirectory(
+            at: commonGitDir.appendingPathComponent("objects", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+    }
+
     private func makeBoundFixture(
         omitManifestTab: Bool = false,
         omitWorktreeMetadata: Bool = false,
@@ -729,7 +739,7 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
             "gitdir: \(gitDir.path)\n",
             to: worktreeRoot.appendingPathComponent(".git")
         )
-        try FileSystemTestSupport.write("../..\n", to: gitDir.appendingPathComponent("commondir"))
+        try writeMinimalLinkedWorktreeGitMetadata(commonGitDir: commonGitDir, gitDir: gitDir)
 
         let layout = try XCTUnwrap(
             GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: worktreeRoot)
@@ -792,7 +802,7 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
             "gitdir: \(gitDir.path)\n",
             to: worktreeRoot.appendingPathComponent(".git")
         )
-        try FileSystemTestSupport.write("../..\n", to: gitDir.appendingPathComponent("commondir"))
+        try writeMinimalLinkedWorktreeGitMetadata(commonGitDir: commonGitDir, gitDir: gitDir)
 
         let creatorTabID = UUID()
         let snapshotID = "2026-06-20/0900"

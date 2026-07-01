@@ -107,6 +107,7 @@ struct SelectedFilesGrid: View {
                                 PromptFileTagRow(
                                     entry: element.entry,
                                     kind: element.kind,
+                                    fileManager: fileManager,
                                     onRemove: onRemove,
                                     rowIndex: index
                                 )
@@ -239,6 +240,7 @@ struct SelectedFilesGrid: View {
 private struct PromptFileTagRow: View {
     let entry: PromptFileEntry
     let kind: SelectedFilesGrid.FileDisplayKind
+    let fileManager: WorkspaceFilesViewModel
     let onRemove: (PromptFileEntry) -> Void
     let rowIndex: Int
 
@@ -363,7 +365,8 @@ private struct PromptFileTagRow: View {
             FilePreviewPopover(
                 file: entry.file,
                 fileSlices: entry.ranges,
-                showCodeMap: entry.isCodemap,
+                codemapEntry: entry.codemap,
+                fileManager: fileManager,
                 showPreview: $showPopover
             )
         }
@@ -371,9 +374,8 @@ private struct PromptFileTagRow: View {
 
     private func copyToClipboard() {
         NSPasteboard.general.clearContents()
-        if entry.isCodemap {
-            let codemap = entry.file.fileAPI?.getFullAPIDescription(displayPath: entry.file.uniqueRelativePath) ?? ""
-            NSPasteboard.general.setString(codemap, forType: .string)
+        if let codemap = entry.codemap {
+            NSPasteboard.general.setString(codemap.text, forType: .string)
         } else if let content = entry.file.cachedContent {
             NSPasteboard.general.setString(content, forType: .string)
         } else {

@@ -95,12 +95,15 @@ extension MCPServerViewModel {
         collections: SelectionReplyAssembler.SelectionCollections,
         resolvedContext: PromptContextResolved,
         lookupContext: WorkspaceLookupContext,
-        activeTabCompatibility: Bool
+        activeTabCompatibility: Bool,
+        allowActivePublishedSnapshotRefresh: Bool = true,
+        allowVirtualTokenRefresh: Bool = true
     ) async -> MCPPreparedTokenAccounting {
         let cachedEvaluation = await cachedPromptEntriesEvaluation(collections: collections)
         if activeTabCompatibility {
             let published = promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
-                for: effectiveSelection
+                for: effectiveSelection,
+                scheduleRefreshIfNeeded: allowActivePublishedSnapshotRefresh
             )
             var entryResults = cachedEvaluation.entryResultsByFileID
             for entry in collections.selected {
@@ -157,8 +160,9 @@ extension MCPServerViewModel {
             lookupContext: lookupContext,
             codeMapUsage: collections.codeMapUsage
         )
-        let cachedSnapshot = mcpVirtualTokenSnapshotsByTabID[context.tabID]?[signature]
-        if let cachedSnapshot {
+        if allowVirtualTokenRefresh,
+           let cachedSnapshot = mcpVirtualTokenSnapshotsByTabID[context.tabID]?[signature]
+        {
             enqueueVirtualTokenRefresh(
                 signature: signature,
                 context: context,
@@ -189,7 +193,7 @@ extension MCPServerViewModel {
         if resolvedContext.gitInclusion != .none {
             incompleteComponents.append("git")
         }
-        if !incompleteComponents.isEmpty {
+        if allowVirtualTokenRefresh, !incompleteComponents.isEmpty {
             enqueueVirtualTokenRefresh(
                 signature: signature,
                 context: context,
@@ -222,7 +226,7 @@ extension MCPServerViewModel {
             tokenAccounting: .init(
                 status: incompleteComponents.isEmpty ? "fresh" : "incomplete",
                 source: "bound_tab_cached_state",
-                refreshPending: !incompleteComponents.isEmpty,
+                refreshPending: allowVirtualTokenRefresh && !incompleteComponents.isEmpty,
                 incompleteComponents: incompleteComponents.isEmpty ? nil : incompleteComponents
             ),
             activePublishedSnapshot: nil
@@ -236,7 +240,7 @@ extension MCPServerViewModel {
         let entries = collections.selected.map(\.entry) + collections.codemap.map(\.entry)
         let snapshots = await PromptContextAccountingService().makePromptFileEntrySnapshots(
             from: entries,
-            codemapSnapshotBundle: collections.codemapSnapshotBundle,
+            codemapPresentation: collections.codemapPresentation,
             filePathDisplay: promptVM.filePathDisplayOption
         )
         return await TokenCalculationService().evaluatePromptEntries(snapshots)
@@ -299,7 +303,8 @@ extension MCPServerViewModel {
                 resolvedContext: resolvedContext,
                 selectedFiles: collections.selected.map(\.file),
                 codemapFiles: collections.codemap.map(\.file),
-                lookupContext: lookupContext
+                lookupContext: lookupContext,
+                codemapPresentation: collections.codemapPresentation
             )
             guard !Task.isCancelled,
                   mcpVirtualTokenRefreshGenerationByTabID[context.tabID]?[signature] == generation

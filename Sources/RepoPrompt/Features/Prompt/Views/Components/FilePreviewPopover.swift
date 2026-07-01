@@ -4,7 +4,8 @@ import SwiftUI
 struct FilePreviewPopover: View {
     let file: FileViewModel
     let fileSlices: [LineRange]?
-    let showCodeMap: Bool // New parameter to indicate codemap mode
+    let codemapEntry: WorkspaceCodemapUIPresentationEntry?
+    let fileManager: WorkspaceFilesViewModel
     @Binding var showPreview: Bool
 
     @State private var previewContent: String = "Loading..."
@@ -14,6 +15,7 @@ struct FilePreviewPopover: View {
     @State private var viewRefreshID = UUID() // Force view refresh
     @State private var previewMode: FilePreviewMode = .syntaxHighlighted
     @State private var statusMessage: String? = nil
+    @State private var codemapLogicalPath: String? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,7 +45,7 @@ struct FilePreviewPopover: View {
 
     private var headerView: some View {
         HStack {
-            Text(file.relativePath)
+            Text(codemapLogicalPath ?? file.relativePath)
                 .font(.headline)
             Spacer()
             // Show toggle if file has slices
@@ -141,17 +143,28 @@ struct FilePreviewPopover: View {
         loadingTask?.cancel()
 
         loadingTask = Task {
-            // If showing codemap, display the API description
-            if showCodeMap {
-                let codeMapText = file.fileAPI?.apiDescription ?? "No codemap available for this file"
-                if !Task.isCancelled {
-                    await MainActor.run {
-                        previewContent = codeMapText
-                        previewHighlightRanges = nil
-                        previewMode = .syntaxHighlighted // Codemaps are safe
+            if let codemapEntry {
+                await MainActor.run {
+                    codemapLogicalPath = codemapEntry.logicalPath.displayPath
+                }
+                let disposition = await fileManager.codemapPreview(for: file.id)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    switch disposition {
+                    case let .ready(entry):
+                        previewContent = entry.text
+                        codemapLogicalPath = entry.logicalPath.displayPath
                         statusMessage = nil
-                        viewRefreshID = UUID()
+                    case let .unavailable(coverage, _):
+                        previewContent = "Codemap unavailable for this file."
+                        statusMessage = Self.codemapStatusMessage(for: coverage)
+                    case .revoked:
+                        previewContent = "Codemap preview was revoked because the workspace or selection changed."
+                        statusMessage = "Preview revoked"
                     }
+                    previewHighlightRanges = nil
+                    previewMode = .syntaxHighlighted
+                    viewRefreshID = UUID()
                 }
                 return
             }
@@ -243,6 +256,21 @@ struct FilePreviewPopover: View {
                     }
                 }
             }
+        }
+    }
+
+    private static func codemapStatusMessage(
+        for coverage: WorkspaceCodemapOperationPresentationCoverage
+    ) -> String {
+        switch coverage {
+        case .complete:
+            "No renderable codemap is available."
+        case .partial:
+            "Codemap coverage is partial."
+        case .pending:
+            "Codemap generation is pending."
+        case .unavailable:
+            "Codemap generation is unavailable."
         }
     }
 

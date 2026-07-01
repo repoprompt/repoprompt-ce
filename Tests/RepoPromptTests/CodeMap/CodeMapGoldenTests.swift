@@ -82,9 +82,9 @@ final class CodeMapGoldenTests: XCTestCase {
 
         for fixture in fixtures {
             try XCTContext.runActivity(named: fixture.relativePath) { _ in
-                let actual = try CodeMapFixtureRunner.renderCodeMap(for: fixture, tempRoot: tempRoot)
+                let rendered = try CodeMapFixtureRunner.renderArtifactCodeMap(for: fixture, tempRoot: tempRoot)
                 let expected = try CodeMapFixtureRunner.expectedCodeMap(for: fixture)
-                XCTAssertEqual(actual, expected)
+                XCTAssertEqual(rendered, expected)
             }
         }
     }

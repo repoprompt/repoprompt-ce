@@ -227,7 +227,6 @@ struct MCPManageSelectionArtifactResolver {
         }
 
         selection.selectedPaths.forEach(append)
-        selection.autoCodemapPaths.forEach(append)
         selection.slices
             .filter { !$0.value.isEmpty }
             .keys

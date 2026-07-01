@@ -487,9 +487,14 @@ extension AgentModeViewModel {
         /// The effective workspace path the current Codex controller was created with.
         /// Used to recycle the provider when a session worktree binding changes cwd.
         var codexControllerWorkspacePath: String?
+        struct CodexControllerFeatureState: Equatable {
+            var computerUseEnabled: Bool
+            var goalSupportEnabled: Bool
+            var reasoningSummariesEnabled: Bool
+        }
+
         var pendingCodexComputerUseActivation: CodexComputerUseActivation?
-        var codexControllerComputerUseEnabled: Bool = false
-        var codexControllerGoalSupportEnabled: Bool = false
+        var codexControllerFeatureState: CodexControllerFeatureState?
         var wantsCodexComputerUseForNextTurn: Bool {
             pendingCodexComputerUseActivation != nil
         }

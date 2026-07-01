@@ -138,9 +138,14 @@ actor GitBackend: VCSBackend {
 
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
-        at repoURL: URL
+        at repoURL: URL,
+        initializationContext: GitWorktreeInitializationContext? = nil
     ) async throws -> GitWorktreeCreateResult {
-        try await gitService.createWorktreeWithResult(request: request, at: repoURL)
+        try await gitService.createWorktreeWithResult(
+            request: request,
+            at: repoURL,
+            initializationContext: initializationContext
+        )
     }
 
     // MARK: - Worktree Merge Operations

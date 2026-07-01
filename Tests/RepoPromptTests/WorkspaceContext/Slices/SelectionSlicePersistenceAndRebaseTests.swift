@@ -404,7 +404,7 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
         let unrelatedPath = "/tmp/Unrelated.swift"
         let selection = StoredSelection(
             selectedPaths: [editedPath, unrelatedPath],
-            autoCodemapPaths: ["/tmp/Codemap.swift"],
+
             slices: [
                 editedPath: [LineRange(start: 4, end: 5, description: "edited")],
                 unrelatedPath: [LineRange(start: 10, end: 12, description: "unrelated")]
@@ -417,7 +417,6 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
             transform: { _ in [LineRange(start: 5, end: 6, description: "edited")] }
         ))
         XCTAssertEqual(updated?.selectedPaths, selection.selectedPaths)
-        XCTAssertEqual(updated?.autoCodemapPaths, selection.autoCodemapPaths)
         XCTAssertEqual(updated?.codemapAutoEnabled, selection.codemapAutoEnabled)
         XCTAssertEqual(updated?.slices[editedPath], [LineRange(start: 5, end: 6, description: "edited")])
         XCTAssertEqual(updated?.slices[unrelatedPath], selection.slices[unrelatedPath])
@@ -535,7 +534,6 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
             let attachedPublisherIngress = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: root.id)
             XCTAssertTrue(attachedPublisherIngress)
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             manager.setActiveTabID(UUID())
             addTeardownBlock {
@@ -805,7 +803,6 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
                 .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootID)
             XCTAssertTrue(attachedPublisherIngress)
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             manager.setActiveTabID(UUID())
             addTeardownBlock {

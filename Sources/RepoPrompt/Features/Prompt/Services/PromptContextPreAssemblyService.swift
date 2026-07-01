@@ -19,7 +19,6 @@ struct PromptContextPreAssemblyRequest {
     let selectedGitDiffFolderPolicy: SelectedGitDiffFolderPolicy
     let selectedGitDiffLookupProfile: PathLocateProfile
     /// Compatibility input retained for callers that previously requested hidden local-definition discovery.
-    /// Canonical codemap inclusion is now controlled exclusively by `selection.autoCodemapPaths`.
     let includeLocalDefinitionsInFileTree: Bool
     let selectedGitDiffArtifactPolicy: SelectedGitDiffArtifactPolicy
     let reviewGitContext: FrozenPromptGitReviewContext
@@ -96,17 +95,21 @@ struct PromptContextPreAssemblyResult {
     let entries: [ResolvedPromptFileEntry]
     let missingPaths: [String]
     let invalidPaths: [String]
-    let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
+    let codemapPresentation: WorkspaceCodemapOperationPresentation
     let fileTreeContent: String?
     let gitDiff: String?
     let gitDiffResolution: PromptGitDiffResolution
     let selectedGitArtifactDispositions: [SelectedGitArtifactDisposition]
     let lookupContext: WorkspaceLookupContext
     let filePathDisplay: FilePathDisplay
+    let roots: [WorkspaceRootRef]
+    let logicalRootDisplayNamesByRootID: [UUID: String]
 
     func displayPath(for entry: ResolvedPromptFileEntry) -> String? {
-        lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-            forPhysicalPath: entry.file.standardizedFullPath,
+        lookupContext.logicalDisplayPath(
+            for: entry.file,
+            roots: roots,
+            rootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
             display: filePathDisplay
         )
     }
@@ -118,32 +121,71 @@ enum PromptContextPreAssemblyService {
         let content: String?
     }
 
-    static func resolve(_ request: PromptContextPreAssemblyRequest) async -> PromptContextPreAssemblyResult {
-        precondition(
-            request.finalReviewAuthorization == nil,
-            "Strict Context Builder review packaging must use resolveStrict"
-        )
-        let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
-        let artifactAuthorization = await authorizeSelectedGitArtifacts(
-            request: request,
-            physicalSelection: physicalSelection
-        )
+    private struct PreparedRequest {
+        let physicalSelection: StoredSelection
+        let ordinarySelection: StoredSelection
+        let ordinaryRootScope: WorkspaceLookupRootScope
+        let artifactAuthorization: SelectedGitArtifactAuthorizationResult
+    }
+
+    static func resolve(
+        _ request: PromptContextPreAssemblyRequest,
+        accountingService: PromptContextAccountingService = PromptContextAccountingService(),
+        codemapPresentation: WorkspaceCodemapOperationPresentation? = nil
+    ) async -> PromptContextPreAssemblyResult {
         do {
-            return try await resolveCore(
+            return try await withResolved(
                 request,
-                physicalSelection: physicalSelection,
-                artifactAuthorization: artifactAuthorization
-            )
+                accountingService: accountingService,
+                codemapPresentation: codemapPresentation
+            ) { $0 }
         } catch {
-            preconditionFailure("Non-strict prompt preassembly unexpectedly failed: \(error)")
+            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
+                .cancelled
+            } else {
+                .coordinationUnavailable
+            }
+            return emptyResult(request: request, issue: issue)
         }
     }
 
-    static func resolveStrict(
-        _ request: PromptContextPreAssemblyRequest
-    ) async throws -> PromptContextPreAssemblyResult {
+    static func withResolved<Value>(
+        _ request: PromptContextPreAssemblyRequest,
+        accountingService: PromptContextAccountingService = PromptContextAccountingService(),
+        codemapPresentation: WorkspaceCodemapOperationPresentation? = nil,
+        presentationCoordinator: WorkspaceCodemapPresentationCoordinator? = nil,
+        operation: (PromptContextPreAssemblyResult) async throws -> Value
+    ) async throws -> Value {
+        precondition(
+            request.finalReviewAuthorization == nil,
+            "Strict Context Builder review packaging must use withResolvedStrict"
+        )
+        let prepared = await prepare(request)
+        return try await withPrepared(
+            request: request,
+            prepared: prepared,
+            accountingService: accountingService,
+            codemapPresentation: codemapPresentation,
+            presentationCoordinator: presentationCoordinator,
+            operation: operation
+        )
+    }
+
+    static func withResolvedStrict<Value>(
+        _ request: PromptContextPreAssemblyRequest,
+        accountingService: PromptContextAccountingService = PromptContextAccountingService(),
+        codemapPresentation: WorkspaceCodemapOperationPresentation? = nil,
+        presentationCoordinator: WorkspaceCodemapPresentationCoordinator? = nil,
+        operation: (PromptContextPreAssemblyResult) async throws -> Value
+    ) async throws -> Value {
         guard let authorization = request.finalReviewAuthorization else {
-            return await resolve(request)
+            return try await withResolved(
+                request,
+                accountingService: accountingService,
+                codemapPresentation: codemapPresentation,
+                presentationCoordinator: presentationCoordinator,
+                operation: operation
+            )
         }
         let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
         let artifactAuthorization = try await validateStrictAuthorization(
@@ -151,10 +193,23 @@ enum PromptContextPreAssemblyService {
             physicalSelection: physicalSelection,
             authorization: authorization
         )
-        let result = try await resolveCore(
-            request,
+        let ordinaryRootScope = request.lookupContext.rootScope.excludingWorkspaceGitData
+        let prepared = PreparedRequest(
             physicalSelection: physicalSelection,
+            ordinarySelection: selection(
+                physicalSelection,
+                excluding: artifactAuthorization.consumedSelectionPaths
+            ),
+            ordinaryRootScope: ordinaryRootScope,
             artifactAuthorization: artifactAuthorization
+        )
+        let value = try await withPrepared(
+            request: request,
+            prepared: prepared,
+            accountingService: accountingService,
+            codemapPresentation: codemapPresentation,
+            presentationCoordinator: presentationCoordinator,
+            operation: operation
         )
         let finalArtifactAuthorization = try await validateStrictAuthorization(
             request: request,
@@ -166,58 +221,166 @@ enum PromptContextPreAssemblyService {
                 count: authorization.selectedArtifactAuthorizations.count
             )
         }
-        return result
+        return value
     }
 
-    private static func resolveCore(
-        _ request: PromptContextPreAssemblyRequest,
-        physicalSelection: StoredSelection,
-        artifactAuthorization: SelectedGitArtifactAuthorizationResult
+    static func resolveStrict(
+        _ request: PromptContextPreAssemblyRequest
     ) async throws -> PromptContextPreAssemblyResult {
+        try await withResolvedStrict(request) { $0 }
+    }
+
+    private static func withPrepared<Value>(
+        request: PromptContextPreAssemblyRequest,
+        prepared: PreparedRequest,
+        accountingService: PromptContextAccountingService,
+        codemapPresentation: WorkspaceCodemapOperationPresentation?,
+        presentationCoordinator: WorkspaceCodemapPresentationCoordinator?,
+        operation: (PromptContextPreAssemblyResult) async throws -> Value
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        if let codemapPresentation {
+            let result = try await buildResult(
+                request: request,
+                prepared: prepared,
+                accountingService: accountingService,
+                codemapPresentation: codemapPresentation
+            )
+            try Task.checkCancellation()
+            return try await operation(result)
+        }
+        let plan = await WorkspaceCodemapPresentationIntentResolver.plan(
+            codeMapUsage: request.codeMapUsage,
+            selection: prepared.ordinarySelection,
+            store: request.store,
+            rootScope: prepared.ordinaryRootScope,
+            profile: request.entryResolutionProfile
+        )
+        let rootDisplayNames = await request.lookupContext.logicalRootDisplayNamesByRootID(
+            store: request.store
+        )
+        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(
+            store: request.store
+        )
+        return try await coordinator.withPresentation(
+            for: plan.intent,
+            rootScope: prepared.ordinaryRootScope,
+            logicalRootDisplayNamesByRootID: rootDisplayNames
+        ) { presentation in
+            let result = try await buildResult(
+                request: request,
+                prepared: prepared,
+                accountingService: accountingService,
+                codemapPresentation: WorkspaceCodemapPresentationIntentResolver.merging(
+                    presentation,
+                    preflightIssues: plan.preflightIssues
+                )
+            )
+            try Task.checkCancellation()
+            return try await operation(result)
+        }
+    }
+
+    private static func prepare(
+        _ request: PromptContextPreAssemblyRequest
+    ) async -> PreparedRequest {
+        let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
         let ordinaryRootScope = request.lookupContext.rootScope.excludingWorkspaceGitData
+        let artifactAuthorization = await authorizeSelectedGitArtifacts(
+            request: request,
+            physicalSelection: physicalSelection
+        )
         let ordinarySelection = selection(
             physicalSelection,
             excluding: artifactAuthorization.consumedSelectionPaths
         )
-        let codemapSnapshotBundle = await request.store.codemapSnapshotBundle(
-            rootScope: ordinaryRootScope
+        return PreparedRequest(
+            physicalSelection: physicalSelection,
+            ordinarySelection: ordinarySelection,
+            ordinaryRootScope: ordinaryRootScope,
+            artifactAuthorization: artifactAuthorization
         )
-        let accountingService = PromptContextAccountingService()
+    }
+
+    private static func buildResult(
+        request: PromptContextPreAssemblyRequest,
+        prepared: PreparedRequest,
+        accountingService: PromptContextAccountingService,
+        codemapPresentation: WorkspaceCodemapOperationPresentation
+    ) async throws -> PromptContextPreAssemblyResult {
+        let logicalRootDisplayNamesByRootID = await request.lookupContext
+            .logicalRootDisplayNamesByRootID(store: request.store)
+        let roots = await request.store.rootRefs(scope: prepared.ordinaryRootScope)
         let resolution = await accountingService.resolveEntries(
-            selection: ordinarySelection,
+            selection: prepared.ordinarySelection,
             store: request.store,
-            rootScope: ordinaryRootScope,
+            rootScope: prepared.ordinaryRootScope,
             profile: request.entryResolutionProfile,
             codeMapUsage: request.codeMapUsage,
-            codemapSnapshotBundle: codemapSnapshotBundle
+            codemapPresentation: codemapPresentation,
+            codemapLogicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
+        )
+        let fileTreeSelection = fileTreeSelectionForPreassembly(
+            base: prepared.ordinarySelection,
+            resolvedEntries: resolution.entries,
+            request: request
         )
         let fileTreeContent = await resolveFileTreeContent(
             request: request,
-            physicalSelection: ordinarySelection,
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            rootScope: ordinaryRootScope
+            physicalSelection: fileTreeSelection,
+            codemapPresentation: resolution.codemapPresentation,
+            rootScope: prepared.ordinaryRootScope
         )
-        let allEntries = artifactAuthorization.entries + resolution.entries
+        let allEntries = prepared.artifactAuthorization.entries + resolution.entries
         let gitDiffResolution = try await resolveGitDiff(
             request: request,
-            physicalSelection: ordinarySelection,
+            physicalSelection: prepared.ordinarySelection,
             entries: allEntries,
-            rootScope: ordinaryRootScope
+            rootScope: prepared.ordinaryRootScope
         )
         let packagingEntries = entriesForPackaging(request: request, entries: allEntries)
 
         return PromptContextPreAssemblyResult(
-            physicalSelection: physicalSelection,
+            physicalSelection: prepared.physicalSelection,
             entries: packagingEntries,
             missingPaths: resolution.missingPaths,
             invalidPaths: resolution.invalidPaths,
-            codemapSnapshotBundle: codemapSnapshotBundle,
+            codemapPresentation: resolution.codemapPresentation,
             fileTreeContent: fileTreeContent,
             gitDiff: gitDiffResolution.text,
             gitDiffResolution: gitDiffResolution,
-            selectedGitArtifactDispositions: artifactAuthorization.dispositions,
+            selectedGitArtifactDispositions: prepared.artifactAuthorization.dispositions,
             lookupContext: request.lookupContext,
-            filePathDisplay: request.filePathDisplay
+            filePathDisplay: request.filePathDisplay,
+            roots: roots,
+            logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
+        )
+    }
+
+    private static func emptyResult(
+        request: PromptContextPreAssemblyRequest,
+        issue: WorkspaceCodemapOperationIssue
+    ) -> PromptContextPreAssemblyResult {
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .unavailable([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+        return PromptContextPreAssemblyResult(
+            physicalSelection: request.lookupContext.physicalizeSelection(request.selection),
+            entries: [],
+            missingPaths: [],
+            invalidPaths: [],
+            codemapPresentation: presentation,
+            fileTreeContent: nil,
+            gitDiff: nil,
+            gitDiffResolution: .none,
+            selectedGitArtifactDispositions: [],
+            lookupContext: request.lookupContext,
+            filePathDisplay: request.filePathDisplay,
+            roots: [],
+            logicalRootDisplayNamesByRootID: [:]
         )
     }
 
@@ -379,36 +542,60 @@ enum PromptContextPreAssemblyService {
         }
         return StoredSelection(
             selectedPaths: selection.selectedPaths.filter { !isConsumed($0) },
-            autoCodemapPaths: selection.autoCodemapPaths.filter { !isConsumed($0) },
+            manualCodemapPaths: selection.manualCodemapPaths,
             slices: selection.slices.filter { !isConsumed($0.key) },
             codemapAutoEnabled: selection.codemapAutoEnabled
+        )
+    }
+
+    private static func fileTreeSelectionForPreassembly(
+        base: StoredSelection,
+        resolvedEntries: [ResolvedPromptFileEntry],
+        request: PromptContextPreAssemblyRequest
+    ) -> StoredSelection {
+        guard request.codeMapUsage == .auto,
+              base.codemapAutoEnabled
+        else { return base }
+
+        var selectedPaths = base.selectedPaths
+        var seen = Set(selectedPaths.compactMap(StoredSelectionPathNormalization.standardizedPath))
+        for entry in resolvedEntries where entry.isCodemap && entry.mode == .codemap {
+            let path = entry.file.standardizedFullPath
+            let key = StoredSelectionPathNormalization.standardizedPath(path) ?? path
+            guard seen.insert(key).inserted else { continue }
+            selectedPaths.append(path)
+        }
+        guard selectedPaths.count != base.selectedPaths.count else { return base }
+        return StoredSelection(
+            selectedPaths: selectedPaths,
+            slices: base.slices,
+            codemapAutoEnabled: base.codemapAutoEnabled
         )
     }
 
     private static func resolveFileTreeContent(
         request: PromptContextPreAssemblyRequest,
         physicalSelection: StoredSelection,
-        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
         rootScope: WorkspaceLookupRootScope
     ) async -> String? {
         guard request.cfg.rendersFileTree else { return nil }
 
-        let rawFileTreeSnapshot = await request.store.makeFileTreeSelectionSnapshot(
+        let presentation = await request.store.makeFileTreePresentation(
             selection: physicalSelection,
-            request: WorkspaceFileTreeSnapshotRequest(
-                mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: request.cfg.effectiveFileTreeMode),
+            request: WorkspaceFileTreePresentationRequest(
+                mode: WorkspaceFileTreePresentationMode(fileTreeOption: request.cfg.effectiveFileTreeMode),
                 filePathDisplay: request.filePathDisplay,
                 onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
                 includeLegend: request.includeFileTreeLegend,
                 showCodeMapMarkers: request.showCodeMapMarkers,
                 rootScope: rootScope
             ),
-            codemapSnapshotBundle: codemapSnapshotBundle,
+            lookupContext: request.lookupContext,
+            codemapPresentation: codemapPresentation,
             profile: request.entryResolutionProfile
         )
-        let fileTreeSnapshot = request.lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawFileTreeSnapshot) ?? rawFileTreeSnapshot
-        let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-        return tree.isEmpty ? nil : tree
+        return presentation.content.isEmpty ? nil : presentation.content
     }
 
     private static func entriesForPackaging(
@@ -427,7 +614,7 @@ enum PromptContextPreAssemblyService {
         physicalSelection: StoredSelection,
         entries: [ResolvedPromptFileEntry],
         rootScope: WorkspaceLookupRootScope
-    ) async throws -> PromptGitDiffResolution {
+    ) async -> PromptGitDiffResolution {
         let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(entries)
         if request.selectedGitDiffArtifactPolicy == .respectGitInclusion,
            request.cfg.gitInclusion == .none
@@ -435,49 +622,41 @@ enum PromptContextPreAssemblyService {
             return .none
         }
 
-        if let selected = PromptPackagingService.selectedGitDiffText(fromDiffEntries: diffEntries) {
-            return .selectedArtifact(selected)
-        }
-
-        switch request.cfg.gitInclusion {
-        case .none:
-            return .none
-        case .selected:
-            if let authorization = request.finalReviewAuthorization {
-                let result = await request.selectedGitDiffProvider(
+        return await PromptPackagingService.resolveGitDiffResolution(fromDiffEntries: diffEntries) {
+            switch request.cfg.gitInclusion {
+            case .none:
+                return .none
+            case .selected:
+                let pathResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
+                    for: physicalSelection,
+                    store: request.store,
+                    rootScope: rootScope,
+                    folderPolicy: request.selectedGitDiffFolderPolicy,
+                    profile: request.selectedGitDiffLookupProfile,
+                    allowFilesystemFallback: rootScope.allowsSelectedGitDiffFilesystemFallback,
+                    excluding: []
+                )
+                let automaticRequest = if let finalReviewAuthorization = request.finalReviewAuthorization {
                     AutomaticReviewGitDiffRequest(
-                        finalReviewAuthorization: authorization,
+                        finalReviewAuthorization: finalReviewAuthorization,
                         compareIntent: request.reviewGitContext.compareIntent,
-                        displayContext: authorization.target.displayContext
+                        displayContext: request.reviewGitContext.displayContext
                     )
-                )
-                if let failure = result.authorizationFailure {
-                    throw failure
+                } else {
+                    AutomaticReviewGitDiffRequest(
+                        pathResolution: pathResolution,
+                        compareIntent: request.reviewGitContext.compareIntent,
+                        displayContext: request.reviewGitContext.displayContext
+                    )
                 }
+                let result = await request.selectedGitDiffProvider(automaticRequest)
                 return .automatic(result)
+            case .complete:
+                if request.lookupContext.bindingProjection != nil {
+                    return .complete(PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
+                }
+                return await .complete(request.completeGitDiffProvider())
             }
-            let pathResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
-                for: physicalSelection,
-                store: request.store,
-                rootScope: rootScope,
-                folderPolicy: request.selectedGitDiffFolderPolicy,
-                profile: request.selectedGitDiffLookupProfile,
-                allowFilesystemFallback: rootScope.allowsSelectedGitDiffFilesystemFallback,
-                excluding: []
-            )
-            let result = await request.selectedGitDiffProvider(
-                AutomaticReviewGitDiffRequest(
-                    pathResolution: pathResolution,
-                    compareIntent: request.reviewGitContext.compareIntent,
-                    displayContext: request.reviewGitContext.displayContext
-                )
-            )
-            return .automatic(result)
-        case .complete:
-            if request.lookupContext.bindingProjection != nil {
-                return .complete(PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
-            }
-            return await .complete(request.completeGitDiffProvider())
         }
     }
 }

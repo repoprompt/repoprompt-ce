@@ -36,15 +36,28 @@ enum ToolResultDTOs {
 
         static func sessionBound(from projection: WorkspaceRootBindingProjection?) -> WorktreeScopeDTO? {
             guard let projection, !projection.isEmpty else { return nil }
+            let rootLabels = WorkspaceLogicalRootIdentity.labels(
+                for: projection.boundRootsForMetadata.map { boundRoot in
+                    WorkspaceLogicalRootIdentity.RootDescriptor(
+                        physicalRootID: boundRoot.physicalRoot.id,
+                        rootEpoch: WorkspaceCodemapRootEpoch(
+                            rootID: boundRoot.logicalRoot.id,
+                            rootLifetimeID: boundRoot.physicalRoot.id
+                        ),
+                        preferredName: boundRoot.logicalRoot.name
+                    )
+                }
+            )
             let mappings = projection.boundRootsForMetadata.compactMap { boundRoot -> RootMappingDTO? in
                 let logicalPath = boundRoot.logicalRoot.standardizedFullPath
                 let effectivePath = boundRoot.physicalRoot.standardizedFullPath
                 guard logicalPath != effectivePath else { return nil }
+                let logicalRootLabel = rootLabels[boundRoot.physicalRoot.id] ?? boundRoot.logicalRoot.name
                 return RootMappingDTO(
-                    logicalRootName: boundRoot.logicalRoot.name,
-                    logicalRootPath: logicalPath,
+                    logicalRootName: logicalRootLabel,
+                    logicalRootPath: logicalRootLabel,
                     effectiveRootName: effectiveRootName(for: boundRoot),
-                    effectiveRootPath: effectivePath,
+                    effectiveRootPath: "session-bound",
                     worktreeID: boundRoot.binding.worktreeID,
                     worktreeName: boundRoot.binding.worktreeName,
                     branch: boundRoot.binding.branch,
@@ -265,6 +278,80 @@ enum ToolResultDTOs {
     }
 
     // MARK: - Code Structure
+
+    struct CodeStructureReplyDTO: Codable, Equatable {
+        struct FileDTO: Codable, Equatable {
+            let path: String
+            let role: String
+            let depth: Int
+            let reachedBy: [String]
+            let content: String
+            let tokens: Int
+
+            private enum CodingKeys: String, CodingKey {
+                case path, role, depth, content, tokens
+                case reachedBy = "reached_by"
+            }
+        }
+
+        struct SummaryDTO: Codable, Equatable {
+            let requestedSeeds: Int
+            let resolvedSeeds: Int
+            let returnedSeeds: Int
+            let returnedRelated: Int
+            let returnedFiles: Int
+            let codemapContentTokens: Int
+            let examinedEdges: Int
+
+            private enum CodingKeys: String, CodingKey {
+                case requestedSeeds = "requested_seeds"
+                case resolvedSeeds = "resolved_seeds"
+                case returnedSeeds = "returned_seeds"
+                case returnedRelated = "returned_related"
+                case returnedFiles = "returned_files"
+                case codemapContentTokens = "codemap_content_tokens"
+                case examinedEdges = "examined_edges"
+            }
+        }
+
+        struct IssueDTO: Codable, Equatable {
+            let code: String
+            let phase: String
+            let path: String?
+            let retryable: Bool
+            let retryAfterMilliseconds: Int?
+            let attempted: Int?
+            let limit: Int?
+            let message: String
+
+            private enum CodingKeys: String, CodingKey {
+                case code, phase, path, retryable, attempted, limit, message
+                case retryAfterMilliseconds = "retry_after_ms"
+            }
+        }
+
+        struct RetryDTO: Codable, Equatable {
+            let retryable: Bool
+            let retryAfterMilliseconds: Int?
+
+            private enum CodingKeys: String, CodingKey {
+                case retryable
+                case retryAfterMilliseconds = "retry_after_ms"
+            }
+        }
+
+        let status: String
+        let files: [FileDTO]
+        let summary: SummaryDTO
+        let issues: [IssueDTO]
+        let retry: RetryDTO?
+        let worktreeScope: WorktreeScopeDTO?
+
+        private enum CodingKeys: String, CodingKey {
+            case status, files, summary, issues, retry
+            case worktreeScope = "worktree_scope"
+        }
+    }
 
     struct SelectedCodeStructureDTO: Codable, Equatable {
         let fileCount: Int

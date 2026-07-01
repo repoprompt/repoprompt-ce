@@ -1338,7 +1338,6 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             _ = try await store.loadRoot(path: searchRoot.path)
             let holdingService = try await FileSystemService(
                 path: holdingRoot.path,
-                respectGitignore: false,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true
@@ -1715,6 +1714,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let targetRecord = try await store.loadRoot(path: targetRoot.path)
             let blockedRecord = try await store.loadRoot(path: blockedRoot.path)
             try await store.startWatchingRoot(id: blockedRecord.id)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: blockedRecord.id)
             let sinkGate = AsyncGate()
             await store.setWatcherSinkWillApplyHandler { observedRootID in
                 guard observedRootID == blockedRecord.id else { return }

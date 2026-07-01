@@ -263,7 +263,6 @@ struct GlobalScalarPreferences: Codable, Equatable {
     }
 
     struct FileSystemSettings: Codable, Equatable {
-        var respectGitignore: Bool?
         var respectRepoIgnore: Bool?
         var respectCursorignore: Bool?
         var globalIgnoreDefaults: String?
@@ -272,7 +271,6 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var showEmptyFolders: Bool?
 
         init(
-            respectGitignore: Bool? = nil,
             respectRepoIgnore: Bool? = nil,
             respectCursorignore: Bool? = nil,
             globalIgnoreDefaults: String? = nil,
@@ -280,7 +278,6 @@ struct GlobalScalarPreferences: Codable, Equatable {
             skipSymlinks: Bool? = nil,
             showEmptyFolders: Bool? = nil
         ) {
-            self.respectGitignore = respectGitignore
             self.respectRepoIgnore = respectRepoIgnore
             self.respectCursorignore = respectCursorignore
             self.globalIgnoreDefaults = globalIgnoreDefaults
@@ -320,6 +317,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var maxBackgroundAgentComposeTabs: Int?
         var showBuiltInWorkflowCleanupGuidance: Bool?
         var codexGoalSupportEnabled: Bool?
+        var codexReasoningSummariesEnabled: Bool?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
 
         init(
@@ -331,6 +329,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             maxBackgroundAgentComposeTabs: Int? = nil,
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
+            codexReasoningSummariesEnabled: Bool? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil
         ) {
             self.proEditAgentMode = proEditAgentMode
@@ -341,6 +340,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.maxBackgroundAgentComposeTabs = maxBackgroundAgentComposeTabs
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
+            self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
         }
     }

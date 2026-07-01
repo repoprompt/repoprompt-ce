@@ -49,7 +49,6 @@ final class AppSettingsMCPService: Service {
                 - `{"op":"get","keys":["ui.appearance_mode","ui.show_tooltips"]}`
                 - `{"op":"get","group":"file_system"}`
                 - `{"op":"set","key":"models.planning_model","value":null}`
-                - `{"op":"set","key":"file_system.respect_gitignore","value":false}`
                 - `{"op":"set","key":"file_system.global_ignore_defaults","value":"**/node_modules/\\n"}`
                 - `{"op":"options","key":"models.planning_model","agent":"codexExec"}`
 
@@ -97,6 +96,12 @@ final class AppSettingsMCPService: Service {
             return try await options(args)
         }
     }
+
+    #if DEBUG
+        func handleForTesting(_ args: [String: Value]) async throws -> Value {
+            try await handle(args)
+        }
+    #endif
 
     private func list(_ args: [String: Value]) async throws -> Value {
         let group = try parseOptionalString(args["group"], parameter: "group")
@@ -798,17 +803,17 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.codexGoalSupportEnabled()) },
             write: { try $0.setCodexGoalSupportEnabled(requiredBool(from: $1)) }
         ),
+        boolSetting(
+            key: "agent_mode.codex_reasoning_summaries_enabled",
+            group: "agent_mode",
+            label: "Codex Reasoning Summaries",
+            description: "Whether Codex Agent Mode app-server threads request Codex model reasoning summaries. Defaults off; when disabled RepoPrompt sends model_reasoning_summary=none in Codex thread/start and thread/resume config. Does not affect Chat/Oracle model preferences, reasoning effort selection, or non-Agent Mode Codex runs.",
+            read: { .bool($0.codexReasoningSummariesEnabled()) },
+            write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
+        ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.
-        boolSetting(
-            key: "file_system.respect_gitignore",
-            group: "file_system",
-            description: "Whether RepoPrompt honors .gitignore files while scanning workspace folders.",
-            read: { .bool($0.respectGitignore()) },
-            write: { try $0.setRespectGitignore(requiredBool(from: $1)) },
-            afterWrite: fileSystemPreferencesDidChangeHook(key: "file_system.respect_gitignore")
-        ),
         boolSetting(
             key: "file_system.respect_repo_ignore",
             group: "file_system",
@@ -896,6 +901,19 @@ private enum AppSettingsMCPRegistry {
                 description: "DEBUG-only toggle for mirroring Agent Mode performance diagnostics to OSLog. Writes UserDefaults key 'emitAgentModePerfDiagnosticsToOSLog'.",
                 read: { .bool($0.agentModePerfDiagnosticsOSLogEnabled()) },
                 write: { try $0.setAgentModePerfDiagnosticsOSLogEnabled(requiredBool(from: $1)) }
+            ),
+            boolSetting(
+                key: "agent_mode.worktree_startup_benchmark_diagnostics_enabled",
+                group: "agent_mode",
+                label: "Worktree Startup Benchmark Diagnostics",
+                description: "DEBUG-only opt-in gate for the scoped worktree startup benchmark diagnostics surface. This setting alone does not alter startup routing.",
+                read: { .bool($0.worktreeStartupBenchmarkDiagnosticsEnabled()) },
+                write: { try $0.setWorktreeStartupBenchmarkDiagnosticsEnabled(requiredBool(from: $1)) },
+                afterWrite: { store, _, _ in
+                    WorktreeStartupBenchmarkDiagnostics.setGateEnabled(
+                        store.worktreeStartupBenchmarkDiagnosticsEnabled()
+                    )
+                }
             )
         ]
     #else

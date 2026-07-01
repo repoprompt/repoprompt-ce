@@ -5,103 +5,74 @@ import XCTest
 @MainActor
 final class MCPSelectionContentPackagingTests: XCTestCase {
     func testContentViewIncludesCanonicalCodemapBlocksExactlyOnce() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("MCPSelectionContentPackaging-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let selectedURL = root.appendingPathComponent("Selected.swift")
-        let codemapURL = root.appendingPathComponent("Canonical.swift")
-        try "let selectedContentSentinel = true\n".write(to: selectedURL, atomically: true, encoding: .utf8)
-        try "func canonicalFullContentSentinel() {}\n".write(to: codemapURL, atomically: true, encoding: .utf8)
-
-        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-        let previousCodeMapsDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
-        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(false, commit: false)
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Selected.swift": "let selectedContentSentinel = true\n",
+                "Canonical.swift": "func canonicalFullContentSentinel() {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
-        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        defer {
-            WindowStatesManager.shared.unregisterWindowState(window)
-            GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(previousCodeMapsDisabled, commit: false)
-        }
-
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
-        let selection = StoredSelection(
-            selectedPaths: [selectedURL.path],
-            autoCodemapPaths: [codemapURL.path],
-            codemapAutoEnabled: true
+        let selectedLookup = await window.workspaceFileContextStore.lookupPath(
+            root.appendingPathComponent("Selected.swift").path
         )
-        let missingSnapshotReply = await window.mcpServer.buildSelectionPreviewReply(
-            selection: selection,
-            includeBlocks: true,
-            display: .relative,
-            extraInvalid: [],
-            viewMode: nil,
-            codeMapUsageOverride: .auto
+        let codemapLookup = await window.workspaceFileContextStore.lookupPath(
+            root.appendingPathComponent("Canonical.swift").path
         )
-        let missingSnapshotBlocks = try XCTUnwrap(missingSnapshotReply.blocks)
-        let missingSnapshotPackaged = missingSnapshotBlocks.joined(separator: "\n")
-        XCTAssertEqual(missingSnapshotReply.files?.map(\.renderMode), ["full"])
-        XCTAssertEqual(missingSnapshotReply.summary?.codemapCount, 0)
-        XCTAssertEqual(missingSnapshotBlocks.count, 1)
-        XCTAssertFalse(missingSnapshotPackaged.contains("canonicalFullContentSentinel"), missingSnapshotPackaged)
-
-        let codemapLookup = await window.workspaceFileContextStore.lookupPath(codemapURL.path)
+        let selectedRecord = try XCTUnwrap(selectedLookup?.file)
         let codemapRecord = try XCTUnwrap(codemapLookup?.file)
-        let malformedCodemapEntry = ResolvedPromptFileEntry(
+        let selectedEntry = ResolvedPromptFileEntry(
+            file: selectedRecord,
+            isCodemap: false,
+            mode: .fullFile,
+            loadedContent: "let selectedContentSentinel = true\n",
+            rootFolderPath: root.path
+        )
+        let codemapEntry = ResolvedPromptFileEntry(
             file: codemapRecord,
             isCodemap: true,
             mode: .codemap,
-            loadedContent: "canonicalFullContentSentinel",
+            loadedContent: "func canonicalFullContentSentinel() {}",
             rootFolderPath: root.path
         )
-        let failClosedBlocks = PromptPackagingService.generateFileBlocksDetailed(
-            files: [malformedCodemapEntry],
+        let failClosed = PromptPackagingService.generateFileBlocksDetailed(
+            files: [codemapEntry],
             filePathDisplay: .relative,
-            codemapSnapshotBundle: .empty
+            codemapPresentation: .empty
         )
-        XCTAssertTrue(failClosedBlocks.isEmpty)
+        XCTAssertTrue(failClosed.isEmpty)
 
-        await window.workspaceFileContextStore.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: codemapURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(path: codemapURL.path, symbolName: "canonicalCodemapSymbol")
-            )
-        ])
-
-        let reply = await window.mcpServer.buildSelectionPreviewReply(
-            selection: selection,
-            includeBlocks: true,
-            display: .relative,
-            extraInvalid: [],
-            viewMode: nil,
-            codeMapUsageOverride: .auto
+        let codemapText = "File: Canonical.swift\nfunc canonicalCodemapSymbol()"
+        let presentation = try makePresentation(file: codemapRecord, text: codemapText)
+        let blocks = PromptPackagingService.generateFileBlocksDetailed(
+            files: [selectedEntry, codemapEntry],
+            filePathDisplay: .relative,
+            codemapPresentation: presentation
         )
-        let blocks = try XCTUnwrap(reply.blocks)
-        let packaged = blocks.joined(separator: "\n")
+        let packaged = blocks.map(\.text).joined(separator: "\n")
 
-        XCTAssertEqual(reply.files?.map(\.renderMode), ["full", "codemap"])
-        XCTAssertEqual(reply.summary?.codemapCount, 1)
+        XCTAssertEqual(blocks.map(\.isCodemap), [false, true])
         XCTAssertEqual(blocks.count, 2)
         XCTAssertEqual(packaged.components(separatedBy: "selectedContentSentinel").count - 1, 1, packaged)
         XCTAssertEqual(packaged.components(separatedBy: "canonicalCodemapSymbol").count - 1, 1, packaged)
         XCTAssertFalse(packaged.contains("canonicalFullContentSentinel"), packaged)
     }
 
-    func testSelectionReplyCodemapTokensUseFrozenBundleInsteadOfStaleEntryResults() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("MCPSelectionFrozenTokens-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-
+    func testSelectionReplyCodemapTokensUseFrozenPresentationInsteadOfStaleEntryResults() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Nested/Frozen.swift": "import Foundation\nimport Combine\nfunc frozenReplyTokenSentinel() {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
         let codemapURL = root.appendingPathComponent("Nested/Frozen.swift")
-        try FileManager.default.createDirectory(at: codemapURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "func fullContentMustNotAffectTokens() {}\n".write(to: codemapURL, atomically: true, encoding: .utf8)
 
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -111,44 +82,31 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
         _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
-        let api = makeFileAPI(
-            path: codemapURL.path,
-            symbolName: "frozenReplyTokenSentinel",
-            imports: ["Foundation", "Combine"]
+        let codemapLookup = await window.workspaceFileContextStore.lookupPath(codemapURL.path)
+        let codemapRecord = try XCTUnwrap(codemapLookup?.file)
+        let frozenPresentation = try makePresentation(
+            file: codemapRecord,
+            text: "File: Nested/Frozen.swift\nimport Foundation\nimport Combine\nfunc frozenReplyTokenSentinel() {}"
         )
-        await window.workspaceFileContextStore.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: codemapURL.path,
-                modificationDate: Date(),
-                fileAPI: api
-            )
-        ])
         let selection = StoredSelection(
-            autoCodemapPaths: [codemapURL.path],
-            codemapAutoEnabled: true
-        )
-        let frozenBundle = await window.workspaceFileContextStore.codemapSnapshotBundle(
-            rootScope: .visibleWorkspace
+            selectedPaths: [codemapURL.path],
+            codemapAutoEnabled: false
         )
         let source = MCPServerViewModel.StoredSelectionSource(
             stored: selection,
-            codeMapUsage: .auto
+            codeMapUsage: .selected
         )
         let collections = await MCPServerViewModel.SelectionReplyAssembler.collect(
             from: source,
             owner: window.mcpServer,
             rootScope: .visibleWorkspace,
-            codemapSnapshotBundle: frozenBundle,
-            contentPolicy: .cachedOnly
+            contentPolicy: .cachedOnly,
+            codemapPresentation: frozenPresentation
         )
         let codemapEntry = try XCTUnwrap(collections.codemap.first)
-        await window.workspaceFileContextStore.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: codemapURL.path,
-                modificationDate: Date(),
-                fileAPI: nil
-            )
-        ])
+        let frozenEntry = try XCTUnwrap(
+            collections.codemapPresentation.renderedEntriesByFileID[codemapEntry.file.id]
+        )
         let staleResult = PromptEntriesEvaluation.EntryResult(
             fileID: codemapEntry.file.id,
             renderMode: .codemap,
@@ -166,35 +124,92 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
             entryResultsByFileID: [codemapEntry.file.id: staleResult]
         )
 
-        let expectedText = api.getFullAPIDescription(displayPath: "Nested/Frozen.swift")
-        let expectedTokens = TokenCalculationService.estimateTokens(for: expectedText)
-        XCTAssertEqual(filesReply.summary?.codemapTokens, expectedTokens)
-        XCTAssertEqual(filesReply.totalTokens, expectedTokens)
+        XCTAssertEqual(filesReply.summary?.codemapTokens, frozenEntry.tokenCount)
+        XCTAssertEqual(filesReply.totalTokens, frozenEntry.tokenCount)
         XCTAssertNotEqual(filesReply.totalTokens, staleResult.displayTokens)
     }
 
-    private func makeFileAPI(
-        path: String,
-        symbolName: String,
-        imports: [String] = []
-    ) -> FileAPI {
-        FileAPI(
-            filePath: path,
-            imports: imports,
-            classes: [],
-            functions: [
-                FunctionInfo(
-                    name: symbolName,
-                    parameters: [],
-                    returnType: nil,
-                    definitionLine: "func \(symbolName)()",
-                    lineNumber: 1
+    func testBorrowedSelectionReplyTokenAccountingUsesFrozenPresentationNotActiveSnapshot() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Nested/Borrowed.swift": "import Foundation\nfunc borrowedFrozenTokenSentinel() {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        let codemapURL = root.appendingPathComponent("Nested/Borrowed.swift")
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        let codemapLookup = await window.workspaceFileContextStore.lookupPath(codemapURL.path)
+        let codemapRecord = try XCTUnwrap(codemapLookup?.file)
+        let frozenText = "File: Nested/Borrowed.swift\nimport Foundation\nfunc borrowedFrozenTokenSentinel() {}"
+        let frozenPresentation = try makePresentation(
+            file: codemapRecord,
+            text: frozenText
+        )
+        let frozenEntry = try XCTUnwrap(frozenPresentation.renderedEntriesByFileID[codemapRecord.id])
+        let selection = StoredSelection(
+            manualCodemapPaths: [codemapURL.path],
+            codemapAutoEnabled: false
+        )
+
+        let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: frozenPresentation,
+            from: selection,
+            includeBlocks: true,
+            display: .relative,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertNotEqual(reply.tokenAccounting?.source, "active_tab_published")
+        XCTAssertEqual(reply.summary?.codemapTokens, frozenEntry.tokenCount)
+        XCTAssertEqual(reply.totalTokens, frozenEntry.tokenCount)
+        XCTAssertEqual(reply.tokenStats?.codemaps, frozenEntry.tokenCount)
+        XCTAssertTrue(reply.blocks?.contains { $0.contains("borrowedFrozenTokenSentinel") } ?? false)
+    }
+
+    private func makePresentation(
+        file: WorkspaceFileRecord,
+        text: String
+    ) throws -> WorkspaceCodemapOperationPresentation {
+        let pipeline = try SyntaxManager().pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "repository",
+            standardizedRelativePath: file.standardizedRelativePath
+        ))
+        return WorkspaceCodemapOperationPresentation(
+            orderedEntries: [
+                WorkspaceCodemapOperationRenderedEntry(
+                    bundleID: WorkspaceCodemapFrozenPresentationBundleID(),
+                    fileID: file.id,
+                    rootEpoch: WorkspaceCodemapRootEpoch(
+                        rootID: file.rootID,
+                        rootLifetimeID: UUID()
+                    ),
+                    artifactKey: CodeMapArtifactKey(
+                        rawSHA256: CodeMapRawSourceDigest(bytes: Data(repeating: 7, count: 32)),
+                        rawByteCount: UInt64(text.utf8.count),
+                        pipelineIdentity: pipeline
+                    ),
+                    logicalPath: logicalPath,
+                    text: text,
+                    tokenCount: TokenCalculationService.estimateTokens(for: text)
                 )
             ],
-            enums: [],
-            globalVars: [],
-            macros: [],
-            referencedTypes: []
+            coverage: .complete,
+            issues: [],
+            publicationReceipt: nil
         )
     }
 }

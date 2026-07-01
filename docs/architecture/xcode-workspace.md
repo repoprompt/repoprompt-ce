@@ -34,4 +34,6 @@ Generated app, MCP, and test builds are conductor-coordinated. Xcode cancellatio
 
 ## Validation ownership
 
-`Scripts/test_xcode_workspace_generator.py` protects deterministic output, manifest assumptions, scheme wiring, safe destinations, and stale-output detection. CI runs both `make xcode-generator-test` and `make xcode-validate`; existing SwiftPM/conductor build and test jobs remain authoritative.
+`Scripts/test_xcode_workspace_generator.py` protects deterministic output, manifest assumptions, scheme wiring, safe destinations, and stale-output detection. Default CI runs this fast contract through `make xcode-generator-test`; existing SwiftPM/conductor build and test jobs remain authoritative.
+
+Full generated-workspace validation, including the heavier `xcodebuild -list` check in `make xcode-validate`, is explicit. Run it locally when needed, let `pr-ready` select it for executable Xcode workspace boundary changes, or use the dedicated `Xcode Workspace Validation` workflow for manual, scheduled, PR path-filtered, and `main` path-filtered hosted coverage. The hosted workflow also tracks this documentation page; docs-only changes do not broaden the local `pr-ready` lane.

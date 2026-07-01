@@ -102,6 +102,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             messages: [StoredMessage(isUser: false, rawText: "newer", sequenceIndex: 0)]
         )
         fixture.oracleViewModel.sessions = [exact, newer]
+        let didLoadExactSessionMessages = await fixture.oracleViewModel.ensureSessionMessagesLoaded(exact.id)
+        XCTAssertTrue(didLoadExactSessionMessages)
 
         XCTAssertEqual(
             AgentOraclePillLogic.latestSession(

@@ -236,8 +236,6 @@ enum WorkspaceOpenError: LocalizedError {
 @MainActor
 class WorkspaceManagerViewModel: ObservableObject {
     private static let logger = Logger(subsystem: "com.repoprompt.workspace", category: "WorkspaceSwitch")
-    private static var coalescedInitialCodeMapPurgeTask: Task<Void, Never>?
-    private static var coalescedInitialCodeMapPurgeRoots: Set<String> = []
 
     @Published var workspaces: [WorkspaceModel] = [] {
         didSet {
@@ -825,7 +823,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private enum WorkspaceFolderInitialUnloadMode {
-        case perform(cancelScans: Bool)
+        case perform
         case skipPreviouslyCompleted
     }
 
@@ -854,7 +852,6 @@ class WorkspaceManagerViewModel: ObservableObject {
     // Tracked reload tasks and tokens
     private var reloadWorkspacesTask: Task<Void, Never>?
     private var reloadPresetsTask: Task<Void, Never>?
-    private var codeMapPurgeTask: Task<Void, Never>?
     private var reloadWorkspacesToken: UUID?
     private var reloadPresetsToken: UUID?
 
@@ -1470,7 +1467,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         #endif
         workspaces = loaded
         recordRepoPathBaselines(for: loaded)
-        purgeStaleCodeMapCachesForKnownRoots(coalesceAcrossInitialManagers: true)
 
         startPollTimer()
 
@@ -1542,62 +1538,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    private func purgeStaleCodeMapCachesForKnownRoots(coalesceAcrossInitialManagers: Bool = false) {
-        let roots = workspaces.flatMap(\.repoPaths)
-        #if DEBUG
-            WorkspaceRestorePerfLog.log("workspaceManager.codemapPurge scheduled managerID=\(instanceID.uuidString.prefix(8)) workspaceCount=\(workspaces.count) rootCount=\(roots.count)")
-        #endif
-        if coalesceAcrossInitialManagers {
-            // Init-time managers have not loaded roots/scans yet; coalescing here
-            // avoids repeated on-disk cache purges during window restore without
-            // dropping actor-local cleanup for established managers. Non-init callers
-            // use the per-manager debounce below.
-            let normalizedRoots = Set(roots.map { ($0 as NSString).standardizingPath })
-            let purgeFileManager = fileManager
-            Self.coalescedInitialCodeMapPurgeRoots.formUnion(normalizedRoots)
-            Self.coalescedInitialCodeMapPurgeTask?.cancel()
-            Self.coalescedInitialCodeMapPurgeTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled else { return }
-                let coalescedRoots = Array(Self.coalescedInitialCodeMapPurgeRoots)
-                Self.coalescedInitialCodeMapPurgeRoots.removeAll()
-                Self.coalescedInitialCodeMapPurgeTask = nil
-                await Self.performStaleCodeMapCachePurge(fileManager: purgeFileManager, roots: coalescedRoots)
-            }
-            return
-        }
-        codeMapPurgeTask?.cancel()
-        codeMapPurgeTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            guard !Task.isCancelled else { return }
-            await self?.performStaleCodeMapCachePurge(roots: roots)
-        }
-    }
-
-    private func performStaleCodeMapCachePurge(roots: [String]) async {
-        await Self.performStaleCodeMapCachePurge(fileManager: fileManager, roots: roots)
-    }
-
-    private static func performStaleCodeMapCachePurge(fileManager: WorkspaceFilesViewModel, roots: [String]) async {
-        #if DEBUG
-            let purgeStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-        #endif
-        await fileManager.purgeStaleCodeMapCaches(keepingRoots: roots)
-        #if DEBUG
-            if let purgeStartMS {
-                WorkspaceRestorePerfLog.log(
-                    "workspaceManager.codemapPurge complete rootCount=\(roots.count) duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: purgeStartMS))"
-                )
-            }
-        #endif
-    }
-
     deinit {
         pollTimer?.invalidate()
         pollTimer = nil
         reloadWorkspacesTask?.cancel()
         reloadPresetsTask?.cancel()
-        codeMapPurgeTask?.cancel()
         composeTabApplyTask?.cancel()
         for tasks in postCatalogRootWorkTasks.values {
             tasks.forEach { $0.cancel() }
@@ -1611,8 +1556,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         reloadWorkspacesTask = nil
         reloadPresetsTask?.cancel()
         reloadPresetsTask = nil
-        codeMapPurgeTask?.cancel()
-        codeMapPurgeTask = nil
         composeTabApplyTask?.cancel()
         composeTabApplyTask = nil
         postSwitchGitDataLoadTask?.cancel()
@@ -1747,7 +1690,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                 {
                     activeWorkspaceID = currentActiveID
                 }
-                purgeStaleCodeMapCachesForKnownRoots()
 
                 // Clear running task reference
                 reloadWorkspacesTask = nil
@@ -2863,7 +2805,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         #endif
         await promptViewModel.stopTokenCountUpdateTimer()
         await workspaceSearchService.reset()
-        await fileManager.cancelAllScans()
         if let cancellation = cancellationResult(
             operationID: operationID,
             targetWorkspace: newWorkspace,
@@ -2898,7 +2839,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #if DEBUG
                 let preloadUnloadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
-            await fileManager.unloadAllRootFolders(cancelScans: true)
+            await fileManager.unloadAllRootFolders()
             rootsUnloadedBeforeFolderLoad = true
             markWorkspaceSwitchRootsUnloaded(operationID)
             if let cancellation = cancellationResult(
@@ -2914,7 +2855,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                     fields: [
                         "workspaceID": WorkspaceRestorePerfLog.shortID(oldActive.id),
                         "workspaceName": oldActive.name,
-                        "cancelScans": "true",
                         "outcome": "completed",
                         "duration": preloadUnloadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
@@ -3055,7 +2995,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             for: activeWS,
             hydrationGeneration: hydrationGeneration,
             gitDataRootLoadMode: .deferredAfterSwitch,
-            initialUnloadMode: rootsUnloadedBeforeFolderLoad ? .skipPreviouslyCompleted : .perform(cancelScans: true),
+            initialUnloadMode: rootsUnloadedBeforeFolderLoad ? .skipPreviouslyCompleted : .perform,
             onInitialRootUnloadCompleted: { [weak self] in
                 self?.markWorkspaceSwitchRootsUnloaded(operationID)
             },
@@ -3186,7 +3126,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             invalidateWorkspaceSearchReadiness()
             await workspaceSearchService.reset()
-            await fileManager.cancelAllScans()
             fileManager.cancelAllLoadingTasks()
             return
         }
@@ -4395,7 +4334,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard nextSlices != selection.slices else { return nil }
         return StoredSelection(
             selectedPaths: selection.selectedPaths,
-            autoCodemapPaths: selection.autoCodemapPaths,
+            manualCodemapPaths: selection.manualCodemapPaths,
             slices: nextSlices,
             codemapAutoEnabled: selection.codemapAutoEnabled
         )
@@ -4523,7 +4462,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 let expectedSelection = latestTab.selection
                 let nextSelection = StoredSelection(
                     selectedPaths: expectedSelection.selectedPaths,
-                    autoCodemapPaths: expectedSelection.autoCodemapPaths,
+                    manualCodemapPaths: expectedSelection.manualCodemapPaths,
                     slices: nextSlices,
                     codemapAutoEnabled: expectedSelection.codemapAutoEnabled
                 )
@@ -4809,7 +4748,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                     "workspaceID": WorkspaceRestorePerfLog.shortID(wsID),
                     "tabID": WorkspaceRestorePerfLog.shortID(activeTab.id),
                     "selectedPaths": "\(activeTab.selection.selectedPaths.count)",
-                    "autoCodemapPaths": "\(activeTab.selection.autoCodemapPaths.count)",
                     "sliceFiles": "\(activeTab.selection.slices.count)",
                     "expandedFolders": "\(activeTab.expandedFolders.count)",
                     "selectedPromptIDs": "\(activeTab.selectedMetaPromptIDs.count)",
@@ -5066,7 +5004,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             let tokenRecountTabID = latestAppliedTab.id
             let tokenRecountSelection = latestAppliedTab.selection
             let tokenRecountSelectedPaths = tokenRecountSelection.selectedPaths.count
-            let tokenRecountAutoCodemapPaths = tokenRecountSelection.autoCodemapPaths.count
             let tokenRecountSliceFiles = tokenRecountSelection.slices.count
             let tokenRecountSelectionFields = WorkspaceSelectionDebugSignature.unprefixedFields(for: tokenRecountSelection)
             debugSelectionOwnerTraceEvent("restore.tokenRecount.begin", workspace: activeWorkspace)
@@ -5092,7 +5029,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                 fields["rootCount"] = "\(fileManager.rootFolders.count)"
                 fields["selectedFiles"] = "\(fileManager.selectedFiles.count)"
                 fields["tabSelectedPaths"] = "\(tokenRecountSelectedPaths)"
-                fields["tabAutoCodemapPaths"] = "\(tokenRecountAutoCodemapPaths)"
                 fields["tabSliceFiles"] = "\(tokenRecountSliceFiles)"
                 for (key, value) in tokenRecountSelectionFields {
                     fields[key] = value
@@ -5344,7 +5280,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaces[commitCanonicalIndex] = merged
             let committedDuplicateIDs = Set(commitDuplicates.map(\.id))
             workspaces.removeAll { committedDuplicateIDs.contains($0.id) }
-            purgeStaleCodeMapCachesForKnownRoots()
 
             for duplicate in commitDuplicates {
                 await preserveDuplicateWorkspaceStorage(duplicate)
@@ -5678,7 +5613,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
-        purgeStaleCodeMapCachesForKnownRoots()
 
         let workspaceDir = workspaceDirectory(for: workspace)
 
@@ -5945,7 +5879,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         hydrationGeneration: UInt64,
         skipSecurityScope: Bool = false,
         gitDataRootLoadMode: GitDataRootLoadMode = .inline,
-        initialUnloadMode: WorkspaceFolderInitialUnloadMode = .perform(cancelScans: true),
+        initialUnloadMode: WorkspaceFolderInitialUnloadMode = .perform,
         onInitialRootUnloadCompleted: (() -> Void)? = nil,
         onAllPrimaryRootsVisible: (() -> Void)? = nil
     ) async {
@@ -5965,11 +5899,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         #endif
         switch initialUnloadMode {
-        case let .perform(cancelScans):
+        case .perform:
             #if DEBUG
                 let initialUnloadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
-            await fileManager.unloadAllRootFolders(cancelScans: cancelScans)
+            await fileManager.unloadAllRootFolders()
             onInitialRootUnloadCompleted?()
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
@@ -5977,7 +5911,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                     fields: [
                         "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
                         "mode": "performed",
-                        "cancelScans": "\(cancelScans)",
                         "outcome": "completed",
                         "duration": initialUnloadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
@@ -6453,7 +6386,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                         path: request.canonicalPath,
                         isSystemRoot: false,
                         kind: .primaryWorkspace,
-                        respectGitignore: fileManager.respectGitignore,
                         respectRepoIgnore: fileManager.respectRepoIgnore,
                         respectCursorignore: fileManager.respectCursorignore,
                         skipSymlinks: fileManager.skipSymlinks,
@@ -6466,7 +6398,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                     path: request.canonicalPath,
                     isSystemRoot: false,
                     kind: .primaryWorkspace,
-                    respectGitignore: fileManager.respectGitignore,
                     respectRepoIgnore: fileManager.respectRepoIgnore,
                     respectCursorignore: fileManager.respectCursorignore,
                     skipSymlinks: fileManager.skipSymlinks,
@@ -7562,7 +7493,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             recordRepoPathBaseline(for: workspaceToSave)
             postWorkspaceRepoPathsDidChange(for: workspaceToSave.id)
             await fileManager.unloadRootFolderPath(folderPath)
-            purgeStaleCodeMapCachesForKnownRoots()
         } catch {
             print("Error saving workspace after removing folder: \(error)")
         }

@@ -636,10 +636,13 @@ class OracleViewModel: ObservableObject {
                 && session.workspaceID == workspaceID
                 && session.composeTabID == tabID
         }
-        func registeredMatch(for sessionID: UUID) -> ChatSession? {
-            sessions.first(where: { $0.id == sessionID }).flatMap { session in
-                matchesRequestedTab(session) ? session : nil
+        func stableScopedSession(_ loaded: ChatSession) -> ChatSession? {
+            guard matchesRequestedTab(loaded), workspaceManager.activeWorkspaceID == workspaceID else { return nil }
+            if let registered = sessions.first(where: { $0.id == loaded.id }) {
+                return matchesRequestedTab(registered) ? registered : nil
             }
+            sessions.append(loaded)
+            return loaded
         }
 
         let initialIdentityMatches = sessions.filter(matchesIdentity)
@@ -650,7 +653,7 @@ class OracleViewModel: ObservableObject {
                   let loaded = await ensureSessionLoadedForBackground(inMemory),
                   matchesRequestedTab(loaded)
             else { return nil }
-            return registeredMatch(for: loaded.id)
+            return stableScopedSession(loaded)
         }
         if targetUUID != nil, !initialIdentityMatches.isEmpty { return nil }
 
@@ -689,7 +692,7 @@ class OracleViewModel: ObservableObject {
                   let loaded = await ensureSessionLoadedForBackground(inMemory),
                   matchesRequestedTab(loaded)
             else { return nil }
-            return registeredMatch(for: loaded.id)
+            return stableScopedSession(loaded)
         }
         if targetUUID != nil, !refreshedIdentityMatches.isEmpty { return nil }
         guard let persisted else { return nil }
@@ -698,7 +701,7 @@ class OracleViewModel: ObservableObject {
         guard let loaded = await ensureSessionLoadedForBackground(persisted), matchesRequestedTab(loaded) else {
             return nil
         }
-        return registeredMatch(for: loaded.id)
+        return stableScopedSession(loaded)
     }
 
     var isAnySessionStreaming: Bool {
@@ -1625,7 +1628,6 @@ class OracleViewModel: ObservableObject {
         var updatedTab = newTab
         updatedTab.selection = StoredSelection(
             selectedPaths: session.selectedFilePaths,
-            autoCodemapPaths: [],
             slices: [:],
             codemapAutoEnabled: true
         )

@@ -467,7 +467,12 @@ final class CodexNativeSessionController {
         var sandboxModeProvider: () -> CodexAgentToolPreferences.SandboxMode
         var approvalReviewerProvider: () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() }
         var authTokensRefreshHandler: ChatgptAuthTokensRefreshHandler?
+        /// Process-level reasoning summary override for app-server launch.
+        /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
+        /// Agent Mode omits this so thread start/resume config is authoritative.
+        var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
+        var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
 
         static func agentModeDefault(
@@ -478,6 +483,7 @@ final class CodexNativeSessionController {
             shellToolEnabled: Bool? = nil,
             suppressThirdPartyMCPServers: Bool = false,
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
+            reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
         ) -> Options {
             Options(
@@ -486,6 +492,7 @@ final class CodexNativeSessionController {
                     let featurePolicy = await MainActor.run {
                         (
                             goalSupportEnabled: goalSupportEnabledProvider(),
+                            reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
                             computerUseEnabled: computerUseEnabledProvider()
                         )
                     }
@@ -497,6 +504,7 @@ final class CodexNativeSessionController {
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
+                        reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled
                     )
                 },
@@ -504,7 +512,9 @@ final class CodexNativeSessionController {
                 sandboxModeProvider: sandboxModeProvider,
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
+                processModelReasoningSummary: nil,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
+                reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 computerUseEnabledProvider: computerUseEnabledProvider
             )
         }
@@ -1073,8 +1083,7 @@ final class CodexNativeSessionController {
                 )
             }
             await client.updateWorkingDirectory(workspacePath)
-            let featurePolicy = await currentFeaturePolicy()
-            await client.updateProcessFeaturePolicy(featurePolicy)
+            await updateClientProcessLaunchPolicy()
             try await client.startIfNeeded()
             await ensureInboundStreamsStarted()
 
@@ -1815,7 +1824,15 @@ final class CodexNativeSessionController {
     }
 
     private func updateClientProcessFeaturePolicy() async {
-        await client.updateProcessFeaturePolicy(currentFeaturePolicy())
+        await updateClientProcessLaunchPolicy()
+    }
+
+    private func updateClientProcessLaunchPolicy() async {
+        let featurePolicy = await currentFeaturePolicy()
+        await client.updateProcessLaunchPolicy(
+            featurePolicy: featurePolicy,
+            modelReasoningSummary: options.processModelReasoningSummary
+        )
     }
 
     private func currentFeaturePolicy() async -> CodexOverrides.FeaturePolicy {
@@ -7908,7 +7925,8 @@ final class CodexNativeSessionController {
     static func defaultAppServerToolPolicy(
         shellToolEnabled: Bool,
         webSearchRequestEnabled: Bool,
-        forceExperimentalSteering: Bool
+        forceExperimentalSteering: Bool,
+        modelReasoningSummary: CodexOverrides.ReasoningSummary? = .auto
     ) -> CodexOverrides.ToolPolicy {
         CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
@@ -7918,7 +7936,8 @@ final class CodexNativeSessionController {
             // Best-effort only; native FileChange events are still the authoritative patch signal.
             includeApplyPatchTool: false,
             multiAgentEnabled: false,
-            experimentalSteeringEnabled: forceExperimentalSteering ? true : nil
+            experimentalSteeringEnabled: forceExperimentalSteering ? true : nil,
+            modelReasoningSummary: modelReasoningSummary
         )
     }
 
@@ -7930,14 +7949,19 @@ final class CodexNativeSessionController {
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
         goalSupportEnabled: Bool = false,
+        reasoningSummariesEnabled: Bool? = nil,
         computerUseEnabled: Bool = false
     ) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
+        let modelReasoningSummary = reasoningSummariesEnabled.map {
+            $0 ? CodexOverrides.ReasoningSummary.auto : .none
+        }
         let toolPolicy = defaultAppServerToolPolicy(
             shellToolEnabled: shellToolEnabled ?? preferences.bashToolEnabled,
             webSearchRequestEnabled: preferences.searchToolEnabled,
-            forceExperimentalSteering: forceExperimentalSteering
+            forceExperimentalSteering: forceExperimentalSteering,
+            modelReasoningSummary: modelReasoningSummary
         )
         var overrides = CodexOverrides.appServerConfigMap(
             toolPolicy: toolPolicy,

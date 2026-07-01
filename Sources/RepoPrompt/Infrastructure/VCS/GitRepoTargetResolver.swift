@@ -104,6 +104,28 @@ struct GitRepoTargetResolver {
         repo: GitRepoDescriptor,
         allRepos: [GitRepoDescriptor]
     ) async throws -> GitWorktreeDescriptor {
+        let worktree = try await resolveWorktreeDescriptor(
+            selector: rawSelector,
+            repo: repo,
+            allRepos: allRepos
+        )
+        // Fail closed on stale/prunable worktrees. Git reports a worktree as prunable when its
+        // gitdir points to a non-existent location (the checkout was removed or left incomplete).
+        // Binding a session to such a worktree, or operating on it, would crawl and search an
+        // empty or partial tree and silently return no results, so refuse to resolve it.
+        if worktree.isPrunable {
+            throw GitRepoTargetResolverError.invalidParams(
+                "Worktree '\(worktree.path)' is stale (\(worktree.prunableReason ?? "gitdir points to a non-existent location")). Run `git worktree prune` or recreate the worktree."
+            )
+        }
+        return worktree
+    }
+
+    private func resolveWorktreeDescriptor(
+        selector rawSelector: String?,
+        repo: GitRepoDescriptor,
+        allRepos: [GitRepoDescriptor]
+    ) async throws -> GitWorktreeDescriptor {
         let selector = rawSelector?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "@current"
         let (_, specifier) = parseRepoTreeSpecifier(selector)
         let candidateRepos = candidateRepos(allRepos: allRepos, defaultRepo: repo)

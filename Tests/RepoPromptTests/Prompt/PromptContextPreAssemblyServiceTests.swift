@@ -29,6 +29,19 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         }
     }
 
+    private actor InvocationCounter {
+        private var value = 0
+
+        func increment() -> Int {
+            value += 1
+            return value
+        }
+
+        func count() -> Int {
+            value
+        }
+    }
+
     private struct ArtifactFixture {
         let repositoryFixture: ReviewGitRepositoryFixture
         let repoRoot: URL
@@ -69,7 +82,8 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         XCTAssertEqual(result.entries.count, 1)
         XCTAssertTrue(result.entries.first?.loadedContent?.contains("worktree") ?? false)
         XCTAssertFalse(result.entries.first?.loadedContent?.contains("base") ?? true)
-        XCTAssertTrue(result.fileTreeContent?.contains(fixture.logicalRoot.standardizedFileURL.path) ?? false, result.fileTreeContent ?? "")
+        XCTAssertTrue(result.fileTreeContent?.contains("App.swift *") ?? false, result.fileTreeContent ?? "")
+        XCTAssertFalse(result.fileTreeContent?.contains(fixture.logicalRoot.standardizedFileURL.path) ?? true, result.fileTreeContent ?? "")
         XCTAssertFalse(result.fileTreeContent?.contains(fixture.worktreeRoot.standardizedFileURL.path) ?? true, result.fileTreeContent ?? "")
         XCTAssertEqual(result.gitDiff, PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
     }
@@ -117,25 +131,15 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
 
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: root.path)
-        await store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(
-                fullPath: selectedURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(
-                    path: selectedURL.path,
-                    symbolName: "selectedCodemapSymbol",
-                    referencedTypes: ["TargetType"]
-                )
-            ),
-            WorkspaceObservedCodemapResult(
-                fullPath: targetURL.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(
-                    path: targetURL.path,
-                    symbolName: "targetCodemapSymbol",
-                    className: "TargetType"
-                )
-            )
+        let targetLookup = await store.lookupPath(targetURL.path)
+        let targetRecord = try XCTUnwrap(targetLookup?.file)
+        let targetAPI = makeSyntaxArtifact(
+            path: targetURL.path,
+            symbolName: "targetCodemapSymbol",
+            className: "TargetType"
+        )
+        let targetPresentation = try makePresentation(entries: [
+            (targetRecord, targetAPI.renderedCodeMap(displayPath: "LogicalRoot/Target.swift"))
         ])
         let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
 
@@ -143,7 +147,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             cfg: makeConfig(gitInclusion: .none, codeMapUsage: .auto),
             selection: StoredSelection(
                 selectedPaths: [selectedURL.path],
-                autoCodemapPaths: [],
+
                 codemapAutoEnabled: false
             ),
             store: store,
@@ -167,8 +171,8 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             cfg: makeConfig(gitInclusion: .none, codeMapUsage: .auto),
             selection: StoredSelection(
                 selectedPaths: [selectedURL.path],
-                autoCodemapPaths: [targetURL.path],
-                codemapAutoEnabled: false
+
+                codemapAutoEnabled: true
             ),
             store: store,
             lookupContext: lookupContext,
@@ -181,7 +185,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
             completeGitDiffProvider: { nil }
         )
-        let canonicalResult = await PromptContextPreAssemblyService.resolve(canonicalRequest)
+        let canonicalResult = await PromptContextPreAssemblyService.resolve(
+            canonicalRequest,
+            codemapPresentation: targetPresentation
+        )
         let clipboard = await PromptPackagingService.generateClipboardContent(
             metaInstructions: [],
             userInstructions: "",
@@ -192,7 +199,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             includeFiles: true,
             includeUserPrompt: false,
             filePathDisplay: .relative,
-            codemapSnapshotBundle: canonicalResult.codemapSnapshotBundle,
+            codemapPresentation: canonicalResult.codemapPresentation,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: [],
             duplicateUserInstructionsAtTop: false
@@ -215,18 +222,17 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
 
             let store = WorkspaceFileContextStore()
             let rootRecord = try await store.loadRoot(path: root.path)
+            let targetLookup = await store.lookupPath(targetURL.path)
+            let targetRecord = try XCTUnwrap(targetLookup?.file)
+            let targetAPI = makeSyntaxArtifact(
+                path: targetURL.path,
+                symbolName: "frozenCodemapSentinel"
+            )
+            let frozenPresentation = try makePresentation(entries: [
+                (targetRecord, targetAPI.renderedCodeMap(displayPath: "LogicalRoot/Target.swift"))
+            ])
             let loadedFileSystemService = await store.fileSystemServiceForTesting(rootID: rootRecord.id)
             let fileSystemService = try XCTUnwrap(loadedFileSystemService)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(
-                    fullPath: targetURL.path,
-                    modificationDate: Date(),
-                    fileAPI: makeFileAPI(
-                        path: targetURL.path,
-                        symbolName: "frozenCodemapSentinel"
-                    )
-                )
-            ])
             let gate = PreAssemblyContentReadGate()
             await fileSystemService.setContentReadChunkHandlerForTesting { _ in
                 await gate.markStartedAndWaitForRelease()
@@ -242,7 +248,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 cfg: makeConfig(gitInclusion: .none, codeMapUsage: .auto),
                 selection: StoredSelection(
                     selectedPaths: [selectedURL.path],
-                    autoCodemapPaths: [targetURL.path],
+
                     codemapAutoEnabled: true
                 ),
                 store: store,
@@ -256,16 +262,17 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 completeGitDiffProvider: { nil }
             )
             let resolveTask = Task {
-                await PromptContextPreAssemblyService.resolve(request)
+                await PromptContextPreAssemblyService.resolve(
+                    request,
+                    codemapPresentation: frozenPresentation
+                )
             }
             await gate.waitUntilStarted()
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(
-                    fullPath: targetURL.path,
-                    modificationDate: Date(),
-                    fileAPI: nil
-                )
-            ])
+            _ = try await store.editFile(
+                rootID: rootRecord.id,
+                relativePath: "Target.swift",
+                newContent: "struct TargetV2 {}\n"
+            )
             await gate.release()
             let result = await resolveTask.value
             await fileSystemService.setContentReadChunkHandlerForTesting(nil)
@@ -279,24 +286,145 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 includeFiles: true,
                 includeUserPrompt: false,
                 filePathDisplay: .relative,
-                codemapSnapshotBundle: result.codemapSnapshotBundle,
+                codemapPresentation: result.codemapPresentation,
                 promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
                 disabledPromptSections: [],
                 duplicateUserInstructionsAtTop: false
             )
 
             XCTAssertEqual(result.entries.filter(\.isCodemap).map(\.file.standardizedFullPath), [targetURL.standardizedFileURL.path])
-            XCTAssertTrue(result.fileTreeContent?.contains("Target.swift +") == true, result.fileTreeContent ?? "")
+            XCTAssertTrue(result.fileTreeContent?.contains("Target.swift * +") == true, result.fileTreeContent ?? "")
             XCTAssertTrue(clipboard.contains("frozenCodemapSentinel"), clipboard)
-            XCTAssertTrue(result.codemapSnapshotBundle.orderedSnapshots.contains {
-                $0.fileAPI?.apiDescription.contains("frozenCodemapSentinel") == true
-            })
-            let currentBundle = await store.codemapSnapshotBundle()
-            XCTAssertFalse(currentBundle.orderedSnapshots.contains {
-                $0.fileAPI?.apiDescription.contains("frozenCodemapSentinel") == true
+            XCTAssertTrue(result.codemapPresentation.orderedEntries.contains {
+                $0.text.contains("frozenCodemapSentinel")
             })
         #endif
     }
+
+    func testFinalPackagingRetriesAfterRevocationAndDoesNotPublishFirstAssembly() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "prompt-revoked-logical",
+            files: ["Sources/App.swift": "struct LogicalPromptSentinel {}\n"]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "prompt-revoked-worktree",
+            files: [
+                "Sources/App.swift": "struct RevokedPromptSentinel { func value() -> Int { 1 } }\n"
+            ]
+        )
+        addTeardownBlock { repositoryFixture.cleanup() }
+        let store = WorkspaceFileContextStore(codemapProjectionPreloadLaunchPolicyForTesting: .disabled)
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: UUID(),
+            bindings: [makeBinding(logicalRoot: logicalRoot, worktreeRoot: worktreeRoot)]
+        )
+        let projection = try XCTUnwrap(materializedProjection)
+        let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+        let boundRoots = await store.rootRefs(scope: lookupContext.rootScope)
+        let physicalRootID = try XCTUnwrap(boundRoots.first {
+            $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
+        }?.id)
+        let appLookup = await store.lookupPath(
+            worktreeRoot.appendingPathComponent("Sources/App.swift").path,
+            rootScope: lookupContext.rootScope
+        )
+        let appFile = try XCTUnwrap(appLookup?.file)
+        let ready = try await readyCodemapDemand(store: store, fileID: appFile.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .none, codeMapUsage: .selected),
+            selection: StoredSelection(
+                selectedPaths: ["Sources/App.swift"],
+                codemapAutoEnabled: false
+            ),
+            store: store,
+            lookupContext: lookupContext,
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: .automaticOnly(),
+            selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
+            completeGitDiffProvider: { nil }
+        )
+        let publicationCount = InvocationCounter()
+        let operationCount = InvocationCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            ),
+            beforePublicationRevalidation: { _ in
+                if await publicationCount.increment() == 1 {
+                    await store.unloadRoot(id: physicalRootID)
+                }
+            }
+        )
+
+        let packaged = try await PromptContextPreAssemblyService.withResolved(
+            request,
+            presentationCoordinator: coordinator
+        ) { preAssembly in
+            _ = await operationCount.increment()
+            let blocks = PromptPackagingService.generatePartitionedFileBlocks(
+                preAssembly.entries,
+                filePathDisplay: .relative,
+                codemapPresentation: preAssembly.codemapPresentation,
+                displayPathResolver: { preAssembly.displayPath(for: $0) }
+            )
+            return (blocks.codemapBlocks + blocks.contentBlocks).joined(separator: "\n")
+        }
+
+        let finalPublicationCount = await publicationCount.count()
+        let finalOperationCount = await operationCount.count()
+        XCTAssertEqual(finalPublicationCount, 1)
+        XCTAssertEqual(finalOperationCount, 2)
+        XCTAssertFalse(packaged.contains("RevokedPromptSentinel"))
+    }
+
+    #if DEBUG
+        func testFinalPackagingCancellationThrowsWithoutPublishingPayload() async throws {
+            let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+            let root = try repositoryFixture.makeRepository(
+                named: "repository",
+                files: ["Sources/App.swift": "struct CancelledPromptSentinel {}\n"]
+            )
+            addTeardownBlock { repositoryFixture.cleanup() }
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            let request = makeScopedRequest(
+                store: store,
+                selection: StoredSelection(
+                    selectedPaths: ["Sources/App.swift"],
+                    codemapAutoEnabled: false
+                ),
+                codeMapUsage: .selected
+            )
+            let gate = PreAssemblyContentReadGate()
+            let task = Task {
+                try await PromptContextPreAssemblyService.withResolved(request) { _ in
+                    await gate.markStartedAndWaitForRelease()
+                    try Task.checkCancellation()
+                    return "must-not-publish"
+                }
+            }
+
+            await gate.waitUntilStarted()
+            task.cancel()
+            await gate.release()
+            do {
+                _ = try await task.value
+                XCTFail("Expected cancellation")
+            } catch is CancellationError {
+                // Expected.
+            }
+        }
+    #endif
 
     func testSelectedArtifactWinsLazilyAndMapRemainsOrdinaryContext() async throws {
         let diffText = "diff --git a/Sources/App.swift b/Sources/App.swift\n"
@@ -349,7 +477,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             includeFiles: true,
             includeUserPrompt: false,
             filePathDisplay: .relative,
-            codemapSnapshotBundle: includeResult.codemapSnapshotBundle,
+            codemapPresentation: includeResult.codemapPresentation,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: [],
             duplicateUserInstructionsAtTop: false
@@ -473,7 +601,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             includeFiles: true,
             includeUserPrompt: false,
             filePathDisplay: .relative,
-            codemapSnapshotBundle: respectResult.codemapSnapshotBundle,
+            codemapPresentation: respectResult.codemapPresentation,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: [],
             duplicateUserInstructionsAtTop: false
@@ -529,7 +657,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         }
     }
 
-    func testSliceOnlyAndAutoCodemapOnlyAuthorizedPatchSelectionsRemainArtifacts() async throws {
+    func testSliceOnlyAuthorizedPatchSelectionRemainsArtifact() async throws {
         let diffText = "diff --git a/Sources/App.swift b/Sources/App.swift\n"
         let fixture = try await makeArtifactFixture(patchContent: diffText)
         let noncanonicalPatchPath = fixture.patchURL.deletingLastPathComponent().path
@@ -544,50 +672,42 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             ),
             [fixture.patchURL.path]
         )
-        let selections = [
-            StoredSelection(
-                slices: [fixture.patchURL.path: [LineRange(start: 1, end: 1)]],
-                codemapAutoEnabled: false
-            ),
-            StoredSelection(
-                autoCodemapPaths: [fixture.patchURL.path],
-                codemapAutoEnabled: true
-            )
-        ]
+        let selection = StoredSelection(
+            slices: [fixture.patchURL.path: [LineRange(start: 1, end: 1)]],
+            codemapAutoEnabled: false
+        )
 
-        for selection in selections {
-            let capture = ProviderCapture()
-            let finalAuthorization = try await makeFinalAuthorization(
-                fixture: fixture,
-                selection: selection
-            )
-            let request = PromptContextPreAssemblyRequest(
-                cfg: makeConfig(gitInclusion: .selected),
-                selection: selection,
-                store: fixture.store,
-                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
-                filePathDisplay: .relative,
-                onlyIncludeRootsWithSelectedFiles: true,
-                showCodeMapMarkers: true,
-                selectedGitDiffFolderPolicy: .filesOnly,
-                reviewGitContext: fixture.reviewContext,
-                sourceTabID: finalAuthorization.tabID,
-                finalReviewAuthorization: finalAuthorization,
-                selectedGitDiffProvider: { automaticRequest in
-                    await capture.record(automaticRequest)
-                    return Self.automaticResult("automatic diff must not appear")
-                },
-                completeGitDiffProvider: { nil }
-            )
+        let capture = ProviderCapture()
+        let finalAuthorization = try await makeFinalAuthorization(
+            fixture: fixture,
+            selection: selection
+        )
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .selected),
+            selection: selection,
+            store: fixture.store,
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: fixture.reviewContext,
+            sourceTabID: finalAuthorization.tabID,
+            finalReviewAuthorization: finalAuthorization,
+            selectedGitDiffProvider: { automaticRequest in
+                await capture.record(automaticRequest)
+                return Self.automaticResult("automatic diff must not appear")
+            },
+            completeGitDiffProvider: { nil }
+        )
 
-            let result = try await PromptContextPreAssemblyService.resolveStrict(request)
-            let providerInvocationCount = await capture.count()
+        let result = try await PromptContextPreAssemblyService.resolveStrict(request)
+        let providerInvocationCount = await capture.count()
 
-            XCTAssertEqual(result.gitDiff, diffText)
-            XCTAssertEqual(providerInvocationCount, 0)
-            XCTAssertEqual(result.entries.map(\.role), [.authorizedGitDiffArtifact])
-            XCTAssertEqual(result.entries.first?.lineRanges, nil)
-        }
+        XCTAssertEqual(result.gitDiff, diffText)
+        XCTAssertEqual(providerInvocationCount, 0)
+        XCTAssertEqual(result.entries.map(\.role), [.authorizedGitDiffArtifact])
+        XCTAssertEqual(result.entries.first?.lineRanges, nil)
     }
 
     func testStrictReviewRejectsChangedArtifactProvenanceBeforeAutomaticFallback() async throws {
@@ -942,14 +1062,60 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         )
     }
 
-    private func makeFileAPI(
+    private func readyCodemapDemand(
+        store: WorkspaceFileContextStore,
+        fileID: UUID,
+        timeout: Duration = .seconds(20)
+    ) async throws -> WorkspaceCodemapArtifactDemandReady {
+        var result = await store.requestCodemapArtifact(forFileID: fileID)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            switch result {
+            case let .ready(ready):
+                return ready
+            case let .pending(ticket):
+                try await Task.sleep(for: .milliseconds(25))
+                result = await store.codemapArtifactDemandStatus(ticket)
+            case let .unavailable(reason):
+                XCTFail("Expected ready codemap demand, got \(reason)")
+                throw NSError(domain: "PromptContextPreAssemblyServiceTests", code: 1)
+            }
+        }
+        XCTFail("Timed out waiting for ready codemap demand")
+        throw NSError(domain: "PromptContextPreAssemblyServiceTests", code: 1)
+    }
+
+    private func makeScopedRequest(
+        store: WorkspaceFileContextStore,
+        selection: StoredSelection,
+        codeMapUsage: CodeMapUsage
+    ) -> PromptContextPreAssemblyRequest {
+        PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .none, codeMapUsage: codeMapUsage),
+            selection: selection,
+            store: store,
+            lookupContext: WorkspaceLookupContext(
+                rootScope: .allLoaded,
+                bindingProjection: nil
+            ),
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: .automaticOnly(),
+            selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
+            completeGitDiffProvider: { nil }
+        )
+    }
+
+    private func makeSyntaxArtifact(
         path: String,
         symbolName: String,
         className: String? = nil,
         referencedTypes: [String] = []
-    ) -> FileAPI {
-        FileAPI(
-            filePath: path,
+    ) -> CodeMapSyntaxArtifact {
+        CodeMapSyntaxArtifact(
             imports: [],
             classes: className.map { [ClassInfo(name: $0, methods: [], properties: [])] } ?? [],
             functions: [
@@ -965,6 +1131,44 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             globalVars: [],
             macros: [],
             referencedTypes: referencedTypes
+        )
+    }
+
+    private func makePresentation(
+        entries: [(WorkspaceFileRecord, String)]
+    ) throws -> WorkspaceCodemapOperationPresentation {
+        let pipeline = try SyntaxManager().pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let bundleID = WorkspaceCodemapFrozenPresentationBundleID()
+        let rendered = try entries.enumerated().map { index, pair in
+            let (file, text) = pair
+            let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                rootDisplayName: "LogicalRoot",
+                standardizedRelativePath: file.standardizedRelativePath
+            ))
+            return WorkspaceCodemapOperationRenderedEntry(
+                bundleID: bundleID,
+                fileID: file.id,
+                rootEpoch: WorkspaceCodemapRootEpoch(rootID: file.rootID, rootLifetimeID: UUID()),
+                artifactKey: CodeMapArtifactKey(
+                    rawSHA256: CodeMapRawSourceDigest(
+                        bytes: Data(repeating: UInt8((index % 254) + 1), count: 32)
+                    ),
+                    rawByteCount: UInt64(text.utf8.count),
+                    pipelineIdentity: pipeline
+                ),
+                logicalPath: logicalPath,
+                text: text,
+                tokenCount: TokenCalculationService.estimateTokens(for: text)
+            )
+        }
+        return WorkspaceCodemapOperationPresentation(
+            orderedEntries: rendered,
+            coverage: .complete,
+            issues: [],
+            publicationReceipt: nil
         )
     }
 

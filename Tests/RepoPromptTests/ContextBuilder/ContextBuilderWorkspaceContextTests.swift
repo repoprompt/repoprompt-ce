@@ -261,7 +261,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         do {
             _ = try await context.authorizeFinalReviewSelection(
                 StoredSelection(
-                    autoCodemapPaths: ["_git_data/repos/fake/diff/all.patch"],
+                    selectedPaths: ["_git_data/repos/fake/diff/all.patch"],
                     codemapAutoEnabled: true
                 ),
                 workspaceID: authorization.workspaceID,
@@ -314,7 +314,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
 
         let artifactContext = try await ContextBuilderWorkspaceContext.resolve(
             from: snapshot(selection: StoredSelection(
-                autoCodemapPaths: ["_git_data/repos/fake/diff/all.patch"],
+                selectedPaths: ["_git_data/repos/fake/diff/all.patch"],
                 codemapAutoEnabled: true
             )),
             workspaceRepoPaths: [root.path],
@@ -466,7 +466,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             promptText: "Review selected CE file",
             selection: StoredSelection(
                 selectedPaths: [],
-                autoCodemapPaths: [classicFile.path],
+
                 slices: [selectedFile.path: [LineRange(start: 1, end: 1)]],
                 codemapAutoEnabled: true
             ),

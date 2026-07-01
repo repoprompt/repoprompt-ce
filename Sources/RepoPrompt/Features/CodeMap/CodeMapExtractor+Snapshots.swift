@@ -1,41 +1,13 @@
 import Foundation
 
 extension CodeMapExtractor {
-    @MainActor
-    static func makeFileTreeSnapshot(using context: FileTreeSelectionContext) -> FileTreeSelectionSnapshot {
-        var roots: [FileTreeFolderSnapshot] = []
-        roots.reserveCapacity(context.rootFolders.count)
-
-        for root in context.rootFolders {
-            var visited = Set<UUID>()
-            if let snapshot = snapshot(
-                folder: root,
-                rootStandardizedPath: root.standardizedFullPath,
-                visited: &visited
-            ) {
-                roots.append(snapshot)
-            }
-        }
-
-        let mode = switch context.option {
-        case .none: "none"
-        case .selected: "selected"
-        case .files: "full"
-        case .auto: "auto"
-        }
-
-        return FileTreeSelectionSnapshot(
-            roots: roots,
-            selectedFileIDs: context.selectedFileIDs,
-            mode: mode,
-            showFullPaths: context.filePathDisplay == .full,
-            onlyIncludeRootsWithSelectedFiles: context.onlyIncludeRootsWithSelectedFiles,
-            includeLegend: context.includeLegend,
-            showCodeMapMarkers: context.showCodeMapMarkers
-        )
-    }
-
     static func generateFileTree(using snapshot: FileTreeSelectionSnapshot) -> String {
+        WorkspaceFileTreePresentationRenderer.render(snapshot)
+    }
+}
+
+enum WorkspaceFileTreePresentationRenderer {
+    static func render(_ snapshot: WorkspaceFileTreePresentationSnapshot) -> String {
         guard snapshot.mode.lowercased() != "none" else { return "" }
         guard !snapshot.roots.isEmpty else { return "" }
         if Task.isCancelled { return "" }
@@ -98,7 +70,10 @@ extension CodeMapExtractor {
                 usedSelectedMarker = usedSelectedMarker || usedSelection
 
                 if let currentRemaining = remaining {
-                    let consumedTokens = text.isEmpty ? 0 : max(1, estimateTokens(for: text))
+                    let consumedTokens = text.isEmpty ? 0 : max(
+                        1,
+                        TokenCalculationService.estimateTokens(for: text)
+                    )
                     remaining = max(0, currentRemaining - consumedTokens)
                 }
 
@@ -166,7 +141,7 @@ extension CodeMapExtractor {
 
             var text = built.tree
             let usedCodeMapMarker = snapshot.showCodeMapMarkers && text.contains(snapshotCodeMapMark)
-            if estimateTokens(for: text) <= snapshotAutoTokenBudget {
+            if TokenCalculationService.estimateTokens(for: text) <= snapshotAutoTokenBudget {
                 text = finalizeSnapshotTree(
                     tree: text,
                     includeLegend: snapshot.includeLegend,
@@ -185,51 +160,6 @@ extension CodeMapExtractor {
         return effectiveRoots
             .map { snapshot.showFullPaths ? $0.fullPath : $0.name }
             .joined(separator: "\n")
-    }
-
-    @MainActor
-    private static func snapshot(
-        folder: FolderViewModel,
-        rootStandardizedPath: String,
-        visited: inout Set<UUID>
-    ) -> FileTreeFolderSnapshot? {
-        guard visited.insert(folder.id).inserted else { return nil }
-
-        var children: [FileTreeNodeSnapshot] = []
-        children.reserveCapacity(folder.children.count)
-        for child in folder.children {
-            switch child {
-            case let .folder(subfolder):
-                if let subfolderSnapshot = snapshot(
-                    folder: subfolder,
-                    rootStandardizedPath: rootStandardizedPath,
-                    visited: &visited
-                ) {
-                    children.append(.folder(subfolderSnapshot))
-                }
-            case let .file(file):
-                children.append(.file(snapshot(file: file)))
-            }
-        }
-
-        return FileTreeFolderSnapshot(
-            id: folder.id,
-            name: folder.name,
-            fullPath: folder.fullPath,
-            standardizedFullPath: folder.standardizedFullPath,
-            standardizedRootPath: rootStandardizedPath,
-            children: children
-        )
-    }
-
-    @MainActor
-    private static func snapshot(file: FileViewModel) -> FileTreeFileSnapshot {
-        FileTreeFileSnapshot(
-            id: file.id,
-            name: file.name,
-            fileExtension: file.fileExtension,
-            hasCodeMap: file.hasAcceptedCodeMap
-        )
     }
 }
 

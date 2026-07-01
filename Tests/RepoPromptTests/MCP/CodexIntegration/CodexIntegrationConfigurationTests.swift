@@ -387,6 +387,48 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         }
     }
 
+    func testModelReasoningSummaryOverridesEmitExpectedAppServerValues() {
+        var policy = CodexOverrides.ToolPolicy(
+            toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
+            shellToolEnabled: false,
+            webSearchRequestEnabled: false,
+            viewImageToolEnabled: false,
+            includeApplyPatchTool: false
+        )
+
+        policy.modelReasoningSummary = CodexOverrides.ReasoningSummary.none
+        XCTAssertEqual(
+            CodexOverrides.appServerConfigMap(toolPolicy: policy)["model_reasoning_summary"] as? String,
+            "none"
+        )
+
+        policy.modelReasoningSummary = .auto
+        XCTAssertEqual(
+            CodexOverrides.appServerConfigMap(toolPolicy: policy)["model_reasoning_summary"] as? String,
+            "auto"
+        )
+
+        policy.modelReasoningSummary = nil
+        XCTAssertNil(CodexOverrides.appServerConfigMap(toolPolicy: policy)["model_reasoning_summary"])
+
+        let omittedDefault = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            forceExperimentalSteering: false
+        )
+        XCTAssertNil(omittedDefault["model_reasoning_summary"])
+
+        let explicitOff = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            forceExperimentalSteering: false,
+            reasoningSummariesEnabled: false
+        )
+        XCTAssertEqual(explicitOff["model_reasoning_summary"] as? String, "none")
+
+        let optIn = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            forceExperimentalSteering: false,
+            reasoningSummariesEnabled: true
+        )
+        XCTAssertEqual(optIn["model_reasoning_summary"] as? String, "auto")
+    }
+
     func testRuntimePoliciesDoNotForceParallelToolCallsOff() {
         let policy = CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,

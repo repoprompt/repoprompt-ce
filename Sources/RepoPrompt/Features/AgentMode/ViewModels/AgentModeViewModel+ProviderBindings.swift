@@ -95,38 +95,13 @@ extension AgentModeViewModel {
         providerPreferenceDidChange(providerID, bumpProviderBindingRevision: false)
     }
 
-    func setCodexBashToolEnabled(_ enabled: Bool) {
-        providerBindingService.setCodexBashToolEnabled(enabled)
+    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) {
+        providerBindingService.applyCodexToolSettingMutation(mutation)
         providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
     }
 
-    func setCodexSearchToolEnabled(_ enabled: Bool) {
-        providerBindingService.setCodexSearchToolEnabled(enabled)
-        providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
-    }
-
-    func setCodexGoalSupportEnabled(_ enabled: Bool) {
-        providerBindingService.setCodexGoalSupportEnabled(enabled)
-        providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
-    }
-
-    func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
-        providerBindingService.setCodexMCPServerEnabled(normalizedName: normalizedName, enabled: enabled)
-        providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
-    }
-
-    func setClaudeBashToolEnabled(_ enabled: Bool) {
-        providerBindingService.setClaudeBashToolEnabled(enabled)
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
-    }
-
-    func setClaudeMCPStrictModeEnabled(_ enabled: Bool) {
-        providerBindingService.setClaudeMCPStrictModeEnabled(enabled)
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
-    }
-
-    func setClaudeToolSearchEnabled(_ enabled: Bool) {
-        providerBindingService.setClaudeToolSearchEnabled(enabled)
+    func applyClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation) {
+        providerBindingService.applyClaudeToolSettingMutation(mutation)
         providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
     }
 
@@ -147,11 +122,6 @@ extension AgentModeViewModel {
                 reason: "claude_effort_changed"
             )
         }
-    }
-
-    func setClaudeAgentModePromptDelivery(_ delivery: ClaudeAgentToolPreferences.AgentModePromptDelivery) {
-        providerBindingService.setClaudeAgentModePromptDelivery(delivery)
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
     }
 
     func providerPreferenceDidChange(

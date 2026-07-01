@@ -13,6 +13,7 @@ extension MCPServerViewModel {
         let requireSelectionData = includeSelection
             || include.contains("files")
             || include.contains("code")
+            || include.contains("tree")
             || include.contains("tokens")
 
         var collections: SelectionReplyAssembler.SelectionCollections? = nil
@@ -49,13 +50,19 @@ extension MCPServerViewModel {
                 stored: effectiveSelection,
                 codeMapUsage: effectiveMCPCodeMapUsage(.auto)
             )
-            let formatter = PathFormatter(format: .relative, owner: self, projection: lookupContext.bindingProjection)
+            let formatter = PathFormatter(
+                format: .relative,
+                owner: self,
+                projection: lookupContext.bindingProjection,
+                rootScope: lookupContext.rootScope
+            )
             let tokens = TokenServices(owner: self)
             let gathered = await SelectionReplyAssembler.collect(
                 from: source,
                 owner: self,
                 rootScope: lookupContext.rootScope,
-                contentPolicy: include.contains("files") ? .loadContent : .cachedOnly
+                contentPolicy: include.contains("files") ? .loadContent : .cachedOnly,
+                lookupContext: lookupContext
             )
             let preparedAccounting = await prepareMCPTokenAccounting(
                 context: context,
@@ -98,18 +105,17 @@ extension MCPServerViewModel {
         if include.contains("code"), !promptVM.codeMapsGloballyDisabled, let coll = collections {
             let builder = CodeStructureBuilder(owner: self, lookupContext: lookupContext)
             let combined = coll.selected.map(\.file) + coll.codemap.map(\.file)
-            codeStructDTO = try await builder.build(for: combined)
+            codeStructDTO = await builder.build(
+                for: combined,
+                presentation: coll.codemapPresentation
+            )
         }
 
         var fileTreeDTO: ToolResultDTOs.FileTreeDTO? = nil
-        var fileTreeTokens = 0
         if include.contains("tree") {
-            let treeSelection = activeTabCompatibility
-                ? storedSelection(for: context, includeCodemapPathsWhenSelectedUsage: true)
-                : effectiveSelection
-            let rawTreeSnapshot = await promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
-                selection: treeSelection,
-                request: WorkspaceFileTreeSnapshotRequest(
+            let treePresentation = await promptVM.workspaceFileContextStore.makeFileTreePresentation(
+                selection: effectiveSelection,
+                request: WorkspaceFileTreePresentationRequest(
                     mode: .selected,
                     filePathDisplay: promptVM.filePathDisplayOption,
                     onlyIncludeRootsWithSelectedFiles: false,
@@ -117,10 +123,11 @@ extension MCPServerViewModel {
                     showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
                     rootScope: lookupContext.rootScope
                 ),
+                lookupContext: lookupContext,
+                codemapPresentation: collections?.codemapPresentation ?? .empty,
                 profile: .uiAssisted
             )
-            let treeSnapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawTreeSnapshot) ?? rawTreeSnapshot
-            if treeSnapshot.roots.isEmpty {
+            if treePresentation.rootCount == 0 {
                 let msg = activeTabCompatibility
                     ? await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: nil)
                     : await tabWorkspaceContextMessage(forOperation: tabFileTreeToolName, path: nil)
@@ -131,19 +138,14 @@ extension MCPServerViewModel {
                     note: activeTabCompatibility ? "No workspace loaded" : nil,
                     worktreeScope: worktreeScope
                 )
-                fileTreeTokens = TokenCalculationService.estimateTokens(for: msg)
             } else {
-                let tree = await Task.detached(priority: .userInitiated) {
-                    CodeMapExtractor.generateFileTree(using: treeSnapshot)
-                }.value
                 fileTreeDTO = .init(
-                    rootsCount: treeSnapshot.roots.count,
-                    usesLegend: true,
-                    tree: tree,
+                    rootsCount: treePresentation.rootCount,
+                    usesLegend: treePresentation.usesLegend,
+                    tree: treePresentation.content,
                     note: nil,
                     worktreeScope: worktreeScope
                 )
-                fileTreeTokens = TokenCalculationService.estimateTokens(for: tree)
             }
         }
 
@@ -233,7 +235,12 @@ extension MCPServerViewModel {
         } else {
             WorkspaceLookupContext.visibleWorkspace
         }
-        let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
+        let formatter = PathFormatter(
+            format: display,
+            owner: self,
+            projection: lookupContext.bindingProjection,
+            rootScope: lookupContext.rootScope
+        )
         let selectionForCollections = selectionOverride ?? resolved?.snapshot.selection
         let collections: SelectionReplyAssembler.SelectionCollections
         if let selectionForCollections {
@@ -241,7 +248,12 @@ extension MCPServerViewModel {
                 stored: lookupContext.physicalizeSelection(selectionForCollections),
                 codeMapUsage: effectiveCodeMapUsage
             )
-            collections = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
+            collections = await SelectionReplyAssembler.collect(
+                from: source,
+                owner: self,
+                rootScope: lookupContext.rootScope,
+                lookupContext: lookupContext
+            )
         } else {
             collections = SelectionReplyAssembler.SelectionCollections.empty(codeMapUsage: effectiveCodeMapUsage)
         }
@@ -291,26 +303,24 @@ extension MCPServerViewModel {
         let coordinator = AutomaticReviewGitDiffCoordinator()
         var effectiveCfg = cfg
         effectiveCfg.codeMapUsage = effectiveMCPCodeMapUsage(cfg.codeMapUsage)
-        let preAssembly = await PromptContextPreAssemblyService.resolve(
-            PromptContextPreAssemblyRequest(
-                cfg: effectiveCfg,
-                selection: context.selection,
-                store: store,
-                lookupContext: lookupContext,
-                filePathDisplay: promptVM.filePathDisplayOption,
-                onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
-                showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
-                selectedGitDiffFolderPolicy: .filesOnly,
-                selectedGitDiffLookupProfile: .mcpSelection,
-                selectedGitDiffArtifactPolicy: .respectGitInclusion,
-                reviewGitContext: reviewGitContext,
-                selectedGitDiffProvider: { request in
-                    await coordinator.resolve(request)
-                },
-                completeGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] in
-                    await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
-                }
-            )
+        let preAssemblyRequest = PromptContextPreAssemblyRequest(
+            cfg: effectiveCfg,
+            selection: context.selection,
+            store: store,
+            lookupContext: lookupContext,
+            filePathDisplay: promptVM.filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            selectedGitDiffLookupProfile: .mcpSelection,
+            selectedGitDiffArtifactPolicy: .respectGitInclusion,
+            reviewGitContext: reviewGitContext,
+            selectedGitDiffProvider: { request in
+                await coordinator.resolve(request)
+            },
+            completeGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] in
+                await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
+            }
         )
 
         let combinedMeta = promptVM.metaInstructions(
@@ -319,25 +329,33 @@ extension MCPServerViewModel {
         )
         let includeMetaBlock = !combinedMeta.isEmpty
 
-        return await PromptPackagingService.generateClipboardContent(
-            metaInstructions: combinedMeta,
-            userInstructions: cfg.includeUserPrompt ? effectivePromptText : "",
-            files: preAssembly.entries,
-            fileTreeContent: preAssembly.fileTreeContent,
-            gitDiff: preAssembly.gitDiff,
-            includeSavedPrompts: includeMetaBlock,
-            includeFiles: cfg.includeFiles,
-            includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: promptVM.filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            includeDatetimeInUserInstructions: promptVM.includeDatetimeInUserInstructions,
-            promptSectionsOrder: promptVM.promptSectionsOrder,
-            disabledPromptSections: promptVM.disabledPromptSections,
-            duplicateUserInstructionsAtTop: promptVM.duplicateUserInstructionsAtTop,
-            displayPathResolver: { entry in
-                preAssembly.displayPath(for: entry)
+        do {
+            return try await PromptContextPreAssemblyService.withResolved(
+                preAssemblyRequest
+            ) { preAssembly in
+                await PromptPackagingService.generateClipboardContent(
+                    metaInstructions: combinedMeta,
+                    userInstructions: cfg.includeUserPrompt ? effectivePromptText : "",
+                    files: preAssembly.entries,
+                    fileTreeContent: preAssembly.fileTreeContent,
+                    gitDiff: preAssembly.gitDiff,
+                    includeSavedPrompts: includeMetaBlock,
+                    includeFiles: cfg.includeFiles,
+                    includeUserPrompt: cfg.includeUserPrompt,
+                    filePathDisplay: self.promptVM.filePathDisplayOption,
+                    codemapPresentation: preAssembly.codemapPresentation,
+                    includeDatetimeInUserInstructions: self.promptVM.includeDatetimeInUserInstructions,
+                    promptSectionsOrder: self.promptVM.promptSectionsOrder,
+                    disabledPromptSections: self.promptVM.disabledPromptSections,
+                    duplicateUserInstructionsAtTop: self.promptVM.duplicateUserInstructionsAtTop,
+                    displayPathResolver: { entry in
+                        preAssembly.displayPath(for: entry)
+                    }
+                )
             }
-        )
+        } catch {
+            return ""
+        }
     }
 }
 

@@ -149,7 +149,11 @@ final class CodexSteerAckTrackerTests: XCTestCase {
             runAttemptID: XCTUnwrap(session.activeRunAttemptID)
         )
         session.codexRoutingObservedTurnID = "turn"
-        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
         controller.onEnsureEventsStreamReady = { [weak session, weak controller] in
             guard let session, let controller,
                   let runID = session.runID,

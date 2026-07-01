@@ -38,10 +38,6 @@ import MCP
                     guard let selectedPathsOptional else {
                         return debugDiagnosticsError(op: op, code: "invalid_params", message: "`selected_paths` must be an array of strings when provided.")
                     }
-                    let autoCodemapPathsOptional = debugStringArray(arguments, "auto_codemap_paths", op: op)
-                    guard let autoCodemapPathsOptional else {
-                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "`auto_codemap_paths` must be an array of strings when provided.")
-                    }
                     let parsedSlices = Self.debugParseSelectionFixtureSlices(arguments["slices"])
                     if let message = parsedSlices.error {
                         return debugDiagnosticsError(op: op, code: "invalid_params", message: message)
@@ -49,7 +45,6 @@ import MCP
                     let slices = parsedSlices.slices ?? [:]
                     let selection = StoredSelection(
                         selectedPaths: (selectedPathsOptional ?? []).map(StandardizedPath.absolute),
-                        autoCodemapPaths: (autoCodemapPathsOptional ?? []).map(StandardizedPath.absolute),
                         slices: slices,
                         codemapAutoEnabled: debugBool(arguments, "codemap_auto_enabled") ?? true
                     )
@@ -159,7 +154,6 @@ import MCP
                 "snapshotFlushedPendingUI": true,
                 "requestedSelectionSignature": requestedFields["selectionSignature"] ?? "",
                 "requestedSelectedPaths": requestedFields["selectedPaths"] ?? "0",
-                "requestedAutoCodemapPaths": requestedFields["autoCodemapPaths"] ?? "0",
                 "requestedSliceFiles": requestedFields["sliceFiles"] ?? "0",
                 "requestedSliceRanges": requestedFields["sliceRanges"] ?? "0",
                 "requestedCodemapAutoEnabled": requestedFields["codemapAutoEnabled"] ?? "false",

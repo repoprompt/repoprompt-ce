@@ -374,7 +374,7 @@ import XCTest
             XCTAssertEqual(indexed.results, authoritative)
         }
 
-        func testOverlayCompactsAtBoundWhileRetainedReadersStayImmutable() async throws {
+        func testOverlaySegmentBlocksCrossFormerBoundWhileRetainedReadersStayImmutable() async throws {
             let rootURL = try makeTemporaryRoot(name: "OverlayCompaction")
             try write("seed", to: rootURL.appendingPathComponent("Seed.swift"))
 
@@ -382,37 +382,37 @@ import XCTest
             let root = try await loadStoppedRoot(in: store, path: rootURL.path)
             let oldSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
             let oldIndex = try rootPathIndex(rootID: root.id, snapshot: oldSnapshot)
-            let overlayBound = await store.storeWorkDiagnosticsSnapshot()
-                .rootCatalogShards.maxPathIndexOverlayChangedFileCount
-            XCTAssertEqual(overlayBound, 32)
+            let patchCount = 40
 
-            var lastOverlaySnapshot: WorkspaceSearchCatalogSnapshot?
-            for index in 0 ..< overlayBound {
+            var retainedSnapshot: WorkspaceSearchCatalogSnapshot?
+            for index in 0 ..< patchCount {
                 let relativePath = String(format: "Added-%02d-Target.swift", index)
                 try write("added", to: rootURL.appendingPathComponent(relativePath))
                 await store.replayObservedFileSystemDeltas(rootID: root.id, deltas: [.fileAdded(relativePath)])
-                if index == overlayBound - 2 {
-                    lastOverlaySnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                if index == 15 {
+                    retainedSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
                 }
             }
 
-            let compactedSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-            let compactedIndex = try rootPathIndex(rootID: root.id, snapshot: compactedSnapshot)
-            let overlayIndex = try rootPathIndex(
+            let currentSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            let currentIndex = try rootPathIndex(rootID: root.id, snapshot: currentSnapshot)
+            let retainedIndex = try rootPathIndex(
                 rootID: root.id,
-                snapshot: XCTUnwrap(lastOverlaySnapshot)
+                snapshot: XCTUnwrap(retainedSnapshot)
             )
             XCTAssertTrue(oldIndex.search("Added", limit: 100).isEmpty)
-            XCTAssertEqual(overlayIndex.search("Added", limit: 100).count, overlayBound - 1)
-            XCTAssertEqual(compactedIndex.search("Added", limit: 100).count, overlayBound)
+            XCTAssertEqual(retainedIndex.search("Added", limit: 100).count, 16)
+            XCTAssertEqual(retainedIndex.overlaySegmentCountForTesting, 16)
+            XCTAssertEqual(currentIndex.search("Added", limit: 100).count, patchCount)
+            XCTAssertLessThanOrEqual(currentIndex.overlaySegmentCountForTesting, 16)
 
             let diagnostics = try await shardDiagnostics(
                 rootID: root.id,
                 diagnostics: store.storeWorkDiagnosticsSnapshot().rootCatalogShards
             )
-            XCTAssertEqual(diagnostics.pathIndexBuildCount, 2)
-            XCTAssertEqual(diagnostics.overlayPathIndexBuildCount, overlayBound - 1)
-            XCTAssertEqual(diagnostics.patchCount, overlayBound)
+            XCTAssertEqual(diagnostics.pathIndexBuildCount, 1)
+            XCTAssertEqual(diagnostics.overlayPathIndexBuildCount, patchCount)
+            XCTAssertEqual(diagnostics.patchCount, patchCount)
             XCTAssertEqual(diagnostics.authoritativeRebuildCount, 1)
         }
 

@@ -12,14 +12,13 @@ extension PromptViewModel {
     func hasPromptSnapshotEntriesForChat() -> Bool {
         let selectionCount = fileManager.selectedFiles.count
         let codeMapUsage = effectiveCodeMapUsageForChatPromptEntries()
+        let presentation = tokenCountingViewModel.codemapPresentation
 
         switch codeMapUsage {
         case .none, .selected:
             return selectionCount > 0
-        case .auto:
-            return selectionCount > 0 || !fileManager.autoCodemapFiles.isEmpty
-        case .complete:
-            return selectionCount > 0 || !chatCodemapFileAPIs.isEmpty
+        case .auto, .complete:
+            return selectionCount > 0 || !presentation.orderedEntries.isEmpty
         }
     }
 
@@ -31,7 +30,7 @@ extension PromptViewModel {
             selectionVersion: chatSelectionVersion,
             slicesVersion: chatSlicesVersion,
             autoCodemapVersion: chatAutoCodemapVersion,
-            fileAPIsVersion: chatFileAPIsVersion
+            codemapAuthorityVersion: chatCodemapAuthorityVersion
         )
 
         if let cache = chatPromptEntriesCache, cache.key == key {
@@ -47,16 +46,21 @@ extension PromptViewModel {
     private func buildPromptSnapshotEntriesForCurrentChatProjection(codeMapUsage: CodeMapUsage) -> [PromptFileEntry] {
         let selectedFiles = fileManager.selectedFiles
         let selectedIDs = Set(selectedFiles.map(\.id))
+        let presentation = tokenCountingViewModel.codemapPresentation
         var entries: [PromptFileEntry] = selectedFiles.map { file in
             PromptFileEntry(
                 file: file,
-                isCodemap: false,
+                codemap: nil,
                 ranges: fileManager.selectionSlicesByFileID[file.id]
             )
         }
 
-        for file in fileManager.autoCodemapFiles where !selectedIDs.contains(file.id) {
-            entries.append(PromptFileEntry(file: file, isCodemap: true, ranges: nil))
+        let codemapFiles = fileManager.codemapAutoEnabled
+            ? fileManager.autoCodemapFiles
+            : fileManager.manualCodemapFiles
+        for file in codemapFiles where !selectedIDs.contains(file.id) {
+            guard let codemap = presentation.entriesByFileID[file.id] else { continue }
+            entries.append(PromptFileEntry(file: file, codemap: codemap, ranges: nil))
         }
 
         switch codeMapUsage {
@@ -67,26 +71,19 @@ extension PromptViewModel {
         case .selected:
             entries = entries.compactMap { entry in
                 guard selectedIDs.contains(entry.file.id) else { return nil }
-                let canCodemap = fileManager.validatedFileAPI(for: entry.file) != nil
+                let codemap = presentation.entriesByFileID[entry.file.id]
                 return PromptFileEntry(
                     file: entry.file,
-                    isCodemap: canCodemap,
-                    ranges: canCodemap ? nil : entry.ranges
+                    codemap: codemap,
+                    ranges: codemap == nil ? entry.ranges : nil
                 )
             }
         case .complete:
-            var existingPaths = Set(entries.map(\.file.standardizedFullPath))
-            let selectedPaths = Set(selectedFiles.map(\.standardizedFullPath))
-
-            for api in fileManager.validatedCurrentFileAPIs(from: chatCodemapFileAPIs) {
-                let standardizedPath = StandardizedPath.absolute(api.filePath)
-                guard !selectedPaths.contains(standardizedPath),
-                      !existingPaths.contains(standardizedPath),
-                      let file = fileManager.findFileByFullPath(standardizedPath)
+            for codemap in presentation.orderedEntries {
+                guard !selectedIDs.contains(codemap.fileID),
+                      let file = fileManager.fileViewModel(id: codemap.fileID)
                 else { continue }
-
-                entries.append(PromptFileEntry(file: file, isCodemap: true, ranges: nil))
-                existingPaths.insert(standardizedPath)
+                entries.append(PromptFileEntry(file: file, codemap: codemap, ranges: nil))
             }
         }
 

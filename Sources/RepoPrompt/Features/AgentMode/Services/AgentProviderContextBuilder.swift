@@ -10,9 +10,67 @@ enum AgentProviderContextBuilder {
         showCodeMapMarkers: Bool = true
     ) async -> String {
         let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
-        let rawFileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+        let presentationPlan = await AgentContextExportResolver.codemapPresentationPlan(
+            codeMapUsage: .auto,
             selection: physicalSelection,
-            request: WorkspaceFileTreeSnapshotRequest(
+            store: store,
+            rootScope: lookupContext.rootScope,
+            profile: .uiAssisted
+        )
+        do {
+            return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+                for: presentationPlan.intent,
+                rootScope: lookupContext.rootScope,
+                logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(
+                    store: store
+                )
+            ) { presentation in
+                await makeInitialFileTree(
+                    physicalSelection: physicalSelection,
+                    store: store,
+                    lookupContext: lookupContext,
+                    filePathDisplay: filePathDisplay,
+                    onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                    showCodeMapMarkers: showCodeMapMarkers,
+                    codemapPresentation: AgentContextExportResolver.merging(
+                        presentation,
+                        preflightIssues: presentationPlan.preflightIssues
+                    )
+                )
+            }
+        } catch {
+            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
+                .cancelled
+            } else {
+                .coordinationUnavailable
+            }
+            return await makeInitialFileTree(
+                physicalSelection: physicalSelection,
+                store: store,
+                lookupContext: lookupContext,
+                filePathDisplay: filePathDisplay,
+                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: showCodeMapMarkers,
+                codemapPresentation: AgentContextExportResolver.merging(
+                    AgentContextExportResolver.unavailablePresentation(issue),
+                    preflightIssues: presentationPlan.preflightIssues
+                )
+            )
+        }
+    }
+
+    private static func makeInitialFileTree(
+        physicalSelection: StoredSelection,
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext,
+        filePathDisplay: FilePathDisplay,
+        onlyIncludeRootsWithSelectedFiles: Bool,
+        showCodeMapMarkers: Bool,
+        codemapPresentation: WorkspaceCodemapOperationPresentation
+    ) async -> String {
+        let fileTree = await store.makeFileTreePresentation(
+            selection: physicalSelection,
+            request: WorkspaceFileTreePresentationRequest(
                 mode: .auto,
                 filePathDisplay: filePathDisplay,
                 onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
@@ -20,10 +78,11 @@ enum AgentProviderContextBuilder {
                 showCodeMapMarkers: showCodeMapMarkers,
                 rootScope: lookupContext.rootScope
             ),
+            lookupContext: lookupContext,
+            codemapPresentation: codemapPresentation,
             profile: .uiAssisted
         )
-        let fileTreeSnapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawFileTreeSnapshot) ?? rawFileTreeSnapshot
-        return CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
+        return fileTree.content
     }
 
     static func forkFileContentsBlock(
@@ -31,9 +90,85 @@ enum AgentProviderContextBuilder {
         tokenCap: Int,
         store: WorkspaceFileContextStore,
         lookupContext: WorkspaceLookupContext,
-        overTokenCapSummaryProvider: ((StoredSelection, WorkspaceLookupContext, WorkspaceCodemapSnapshotBundle) async -> String?)? = nil
+        codemapPresentation: WorkspaceCodemapOperationPresentation? = nil,
+        overTokenCapSummaryProvider: ((StoredSelection, WorkspaceLookupContext, WorkspaceCodemapOperationPresentation) async -> String?)? = nil,
+        overTokenCapSummaryWillBegin: (() async -> Void)? = nil
     ) async -> String {
         let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
+        if let codemapPresentation {
+            return await makeForkFileContentsBlock(
+                logicalSelection: logicalSelection,
+                physicalSelection: physicalSelection,
+                tokenCap: tokenCap,
+                store: store,
+                lookupContext: lookupContext,
+                codemapPresentation: codemapPresentation,
+                overTokenCapSummaryProvider: overTokenCapSummaryProvider,
+                overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
+            )
+        }
+        let presentationPlan = await AgentContextExportResolver.codemapPresentationPlan(
+            codeMapUsage: .auto,
+            selection: physicalSelection,
+            store: store,
+            rootScope: lookupContext.rootScope,
+            profile: .uiAssisted
+        )
+        do {
+            return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+                for: presentationPlan.intent,
+                rootScope: lookupContext.rootScope,
+                logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(
+                    store: store
+                )
+            ) { presentation in
+                let presentation = AgentContextExportResolver.merging(
+                    presentation,
+                    preflightIssues: presentationPlan.preflightIssues
+                )
+                return await makeForkFileContentsBlock(
+                    logicalSelection: logicalSelection,
+                    physicalSelection: physicalSelection,
+                    tokenCap: tokenCap,
+                    store: store,
+                    lookupContext: lookupContext,
+                    codemapPresentation: presentation,
+                    overTokenCapSummaryProvider: overTokenCapSummaryProvider,
+                    overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
+                )
+            }
+        } catch {
+            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
+                .cancelled
+            } else {
+                .coordinationUnavailable
+            }
+            return await makeForkFileContentsBlock(
+                logicalSelection: logicalSelection,
+                physicalSelection: physicalSelection,
+                tokenCap: tokenCap,
+                store: store,
+                lookupContext: lookupContext,
+                codemapPresentation: AgentContextExportResolver.merging(
+                    AgentContextExportResolver.unavailablePresentation(issue),
+                    preflightIssues: presentationPlan.preflightIssues
+                ),
+                overTokenCapSummaryProvider: overTokenCapSummaryProvider,
+                overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
+            )
+        }
+    }
+
+    private static func makeForkFileContentsBlock(
+        logicalSelection: StoredSelection,
+        physicalSelection: StoredSelection,
+        tokenCap: Int,
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext,
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
+        overTokenCapSummaryProvider: ((StoredSelection, WorkspaceLookupContext, WorkspaceCodemapOperationPresentation) async -> String?)?,
+        overTokenCapSummaryWillBegin: (() async -> Void)?
+    ) async -> String {
         let accountingService = PromptContextAccountingService()
         let request = PromptContextAccountingRequest(
             selection: physicalSelection,
@@ -42,27 +177,33 @@ enum AgentProviderContextBuilder {
             rootScope: lookupContext.rootScope,
             pathLocateProfile: .uiAssisted
         )
+        let roots = await store.rootRefs(scope: lookupContext.rootScope)
+        let rootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
         let displayPathResolver: (ResolvedPromptFileEntry) -> String? = { entry in
-            lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-                forPhysicalPath: entry.file.standardizedFullPath,
+            lookupContext.logicalDisplayPath(
+                for: entry.file,
+                roots: roots,
+                rootDisplayNamesByRootID: rootDisplayNames,
                 display: .relative
             )
         }
         let accounting = await accountingService.calculatePromptStats(
             request: request,
             store: store,
+            codemapPresentation: codemapPresentation,
             codemapDisplayPathResolver: displayPathResolver
         )
         let entries = accounting.resolvedEntries
         let selectionTokens = accounting.tokenResult.totalTokenCountFilesOnly
             + accounting.tokenResult.codeMapTokenCount
-        let codemapSnapshotBundle = accounting.codemapSnapshotBundle
+        let resolvedPresentation = accounting.codemapPresentation
 
         if selectionTokens > tokenCap {
+            await overTokenCapSummaryWillBegin?()
             if let summary = await overTokenCapSummaryProvider?(
                 logicalSelection,
                 lookupContext,
-                codemapSnapshotBundle
+                resolvedPresentation
             ),
                 !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
@@ -72,12 +213,12 @@ enum AgentProviderContextBuilder {
         }
 
         let renderableEntries = entries.filter { entry in
-            !entry.isCodemap || codemapSnapshotBundle.hasRenderableCodemap(for: entry.file)
+            !entry.isCodemap || resolvedPresentation.renderedEntriesByFileID[entry.file.id] != nil
         }
         let (codemapBlocks, contentBlocks) = PromptPackagingService.generatePartitionedFileBlocks(
             renderableEntries,
             filePathDisplay: .relative,
-            codemapSnapshotBundle: codemapSnapshotBundle,
+            codemapPresentation: resolvedPresentation,
             displayPathResolver: displayPathResolver
         )
         var sections: [String] = []

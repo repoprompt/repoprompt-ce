@@ -3,6 +3,13 @@ import MCP
 
 @MainActor
 struct AgentMCPStartWorktreeCoordinator {
+    typealias TransitionObserver = @MainActor @Sendable (
+        _ sessionID: UUID,
+        _ bindings: [AgentSessionWorktreeBinding],
+        _ startupContext: WorktreeStartupContext?,
+        _ initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
+    ) throws -> Void
+
     struct Request {
         enum Mode: Equatable {
             case none
@@ -54,6 +61,19 @@ struct AgentMCPStartWorktreeCoordinator {
     let operationName: String
     let vcsService: VCSService
     let gitTargetResolver: GitRepoTargetResolver
+    private let transitionObserver: TransitionObserver?
+
+    init(
+        operationName: String,
+        vcsService: VCSService,
+        gitTargetResolver: GitRepoTargetResolver,
+        transitionObserver: TransitionObserver? = nil
+    ) {
+        self.operationName = operationName
+        self.vcsService = vcsService
+        self.gitTargetResolver = gitTargetResolver
+        self.transitionObserver = transitionObserver
+    }
 
     func containsArguments(_ args: [String: Value]) -> Bool {
         Request.argumentKeys.contains { args[$0] != nil }
@@ -125,14 +145,27 @@ struct AgentMCPStartWorktreeCoordinator {
     func prepare(
         request: Request,
         target: AgentModeViewModel.MCPSessionTarget,
-        targetWindow: WindowState
+        targetWindow: WindowState,
+        startupContext: WorktreeStartupContext? = nil
     ) async throws {
         guard let targetSessionID = target.sessionID else {
             throw MCPError.internalError("\(operationName) target did not resolve a session ID for worktree binding.")
         }
         let agentModeVM = targetWindow.agentModeViewModel
+        if let startupContext {
+            guard startupContext.agentSessionID == targetSessionID else {
+                throw MCPError.internalError("\(operationName) startup context does not belong to the target Agent session.")
+            }
+            WorktreeStartupInstrumentation.record(.worktreePreparationStarted, context: startupContext)
+        }
         try Task.checkCancellation()
         if request.hasExplicitWorktreeArgs {
+            #if DEBUG
+                var receiptCoordinatorDecision = startupContext.map { _ in
+                    WorktreeStartupInstrumentation.ReceiptCoordinatorDecision()
+                }
+                var createdReceiptAttemptCorrelationID: UUID?
+            #endif
             do {
                 let context = try await resolveRepositoryContext(
                     request: request,
@@ -140,6 +173,11 @@ struct AgentMCPStartWorktreeCoordinator {
                 )
                 try validateRuntimeRoot(context.logicalRoot, targetWindow: targetWindow)
                 let worktree: GitWorktreeDescriptor
+                let initializationReceipt: GitWorktreeCreationReceipt?
+                let initializationFallbackReason: WorkspaceRootSeedFallbackReason?
+                let expectedOwnerBindingGeneration = await targetWindow.promptManager
+                    .workspaceFileContextStore
+                    .nextSessionWorktreeOwnershipGeneration(ownerID: targetSessionID)
                 switch request.mode {
                 case .none:
                     throw MCPError.internalError("\(operationName) worktree preparation reached an unexpected empty worktree mode.")
@@ -150,35 +188,155 @@ struct AgentMCPStartWorktreeCoordinator {
                             repo: context.repo,
                             allRepos: context.allRepos
                         )
+                        initializationReceipt = nil
+                        initializationFallbackReason = nil
                     } catch let error as GitRepoTargetResolverError {
                         throw MCPError.invalidParams(error.message)
                     }
                 case .create:
-                    worktree = try await createWorktree(
+                    let result = try await createWorktree(
                         request: request,
                         context: context,
-                        sessionID: targetSessionID
+                        sessionID: targetSessionID,
+                        expectedOwnerBindingGeneration: expectedOwnerBindingGeneration,
+                        startupContext: startupContext
                     )
+                    worktree = result.descriptor
+                    initializationReceipt = result.initializationReceipt
+                    initializationFallbackReason = result.initializationFallbackReason
+                    #if DEBUG
+                        if let startupContext {
+                            var decision = WorktreeStartupInstrumentation.ReceiptCoordinatorDecision()
+                            decision.createResultReceiptCount = result.initializationReceipt == nil ? 0 : 1
+                            decision.creationFallbackObserved = result.initializationFallbackReason
+                            receiptCoordinatorDecision = decision
+                            createdReceiptAttemptCorrelationID = startupContext.correlationID
+                        }
+                    #endif
                 }
                 try Task.checkCancellation()
                 let identity = try persistVisualIdentity(for: worktree, request: request)
+                let rootPrefix = try repositoryRelativeRootPrefix(
+                    logicalRoot: context.logicalRoot,
+                    repositoryRoot: context.repo.rootURL
+                )
                 let binding = makeBinding(
                     worktree: worktree,
                     logicalRoot: context.logicalRoot,
+                    repositoryRelativeRootPrefix: rootPrefix,
                     visualIdentity: identity,
                     replacing: agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID).first {
                         standardizedPath($0.logicalRootPath) == standardizedPath(context.logicalRoot.standardizedFullPath)
                     }
                 )
+                #if DEBUG
+                    if WorktreeStartupBenchmarkDiagnostics.currentPendingStart != nil {
+                        guard let correlationID = startupContext?.correlationID else {
+                            throw DebugWorktreeStartupBenchmarkError.invalidRecovery
+                        }
+                        let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+                        try diagnostics.recordRecoverableStartBinding(
+                            correlationID: correlationID,
+                            bindingID: binding.id,
+                            physicalRootPath: binding.worktreeRootPath
+                        )
+                        try diagnostics.requireRecoverableStartNotAborted(correlationID: correlationID)
+                    }
+                #endif
                 var desiredBindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID)
                     .filter { standardizedPath($0.logicalRootPath) != standardizedPath(context.logicalRoot.standardizedFullPath) }
                 desiredBindings.append(binding)
-                _ = try await agentModeVM.transitionWorktreeBindings(
+                let initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = if let initializationReceipt,
+                                                                                                    let startupContext
+                {
+                    [
+                        binding.id: WorkspaceRootMaterializationHint(
+                            bindingID: binding.id,
+                            standardizedTargetPath: binding.worktreeRootPath,
+                            creationReceipt: initializationReceipt,
+                            correlationID: startupContext.correlationID
+                        )
+                    ]
+                } else {
+                    [:]
+                }
+                #if DEBUG
+                    if let startupContext, var decision = receiptCoordinatorDecision {
+                        decision.hintCount = initializationHintsByBindingID.count
+                        decision.bindingCount = desiredBindings.count
+                        if initializationHintsByBindingID[binding.id] != nil {
+                            decision.hintKeyedByCreatedBinding = .match
+                        } else if initializationReceipt != nil {
+                            decision.hintKeyedByCreatedBinding = .mismatch
+                        }
+                        decision.creationFallbackObserved = initializationFallbackReason
+                        receiptCoordinatorDecision = decision
+                        WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                            correlationID: startupContext.correlationID,
+                            decision: decision
+                        )
+                    }
+                #endif
+                try transitionObserver?(
+                    targetSessionID,
                     desiredBindings,
-                    forSessionID: targetSessionID,
-                    intent: .initialSend
+                    startupContext,
+                    initializationHintsByBindingID
                 )
+                #if DEBUG
+                    if WorktreeStartupBenchmarkDiagnostics.currentPendingStart != nil,
+                       let correlationID = startupContext?.correlationID
+                    {
+                        try WorktreeStartupBenchmarkDiagnostics.shared.requireRecoverableStartNotAborted(
+                            correlationID: correlationID
+                        )
+                    }
+                    let metricTag = startupContext.flatMap {
+                        WorktreeStartupInstrumentation.benchmarkMetricTag(correlationID: $0.correlationID)
+                    }
+                    _ = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(metricTag) {
+                        try await agentModeVM.transitionWorktreeBindings(
+                            desiredBindings,
+                            forSessionID: targetSessionID,
+                            intent: .initialSend,
+                            startupContext: startupContext,
+                            initializationHintsByBindingID: initializationHintsByBindingID
+                        )
+                    }
+                #else
+                    _ = try await agentModeVM.transitionWorktreeBindings(
+                        desiredBindings,
+                        forSessionID: targetSessionID,
+                        intent: .initialSend,
+                        startupContext: startupContext,
+                        initializationHintsByBindingID: initializationHintsByBindingID
+                    )
+                #endif
+                #if DEBUG
+                    if WorktreeStartupBenchmarkDiagnostics.currentPendingStart != nil,
+                       let correlationID = startupContext?.correlationID
+                    {
+                        try WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                            correlationID: correlationID,
+                            phase: .ownershipCommitted
+                        )
+                        try WorktreeStartupBenchmarkDiagnostics.shared.requireRecoverableStartNotAborted(
+                            correlationID: correlationID
+                        )
+                    }
+                #endif
             } catch {
+                #if DEBUG
+                    if let correlationID = createdReceiptAttemptCorrelationID,
+                       let receiptCoordinatorDecision
+                    {
+                        WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                            correlationID: correlationID,
+                            decision: receiptCoordinatorDecision,
+                            terminal: true
+                        )
+                    }
+                #endif
                 throw preparationError(error)
             }
         }
@@ -239,8 +397,7 @@ struct AgentMCPStartWorktreeCoordinator {
             bindingFingerprint: bindingFingerprint,
             physicalRootPaths: physicalRootPaths
         )
-        if let alreadyInstalled {
-            _ = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: alreadyInstalled.map(\.id))
+        if alreadyInstalled != nil {
             return
         }
 
@@ -319,8 +476,10 @@ struct AgentMCPStartWorktreeCoordinator {
     private func createWorktree(
         request: Request,
         context: RepositoryContext,
-        sessionID: UUID
-    ) async throws -> GitWorktreeDescriptor {
+        sessionID: UUID,
+        expectedOwnerBindingGeneration: UInt64,
+        startupContext: WorktreeStartupContext?
+    ) async throws -> GitWorktreeCreateResult {
         let existingWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
         let mainRootPath = existingWorktrees.first(where: \.isMain)?.path ?? context.repo.rootPath
         let plan = try GitWorktreeDefaultPathPlanner.plan(
@@ -336,7 +495,125 @@ struct AgentMCPStartWorktreeCoordinator {
                 purpose: .agentStart(sessionID: sessionID.uuidString)
             )
         )
-        return try await vcsService.createGitWorktree(request: plan.createRequest, at: context.repo.rootURL)
+        #if DEBUG
+            var benchmarkMetricTag: WorktreeStartupInstrumentation.BenchmarkMetricTag?
+            if let pending = WorktreeStartupBenchmarkDiagnostics.currentPendingStart {
+                guard request.path == nil, !request.allowExternalPath else {
+                    throw MCPError.invalidParams("Benchmark worktree starts require the default app-managed destination.")
+                }
+                guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: context.repo.rootURL) else {
+                    throw MCPError.invalidParams("Benchmark repository identity could not be resolved.")
+                }
+                let preflight = try WorktreeStartupBenchmarkDiagnostics.shared.preflight(token: pending.token)
+                let repository = GitWorktreeIdentity.repositoryIdentity(
+                    commonGitDir: layout.commonDir,
+                    mainWorktreeRoot: URL(fileURLWithPath: mainRootPath)
+                )
+                let destination = plan.path.standardizedFileURL.path
+                let container = plan.appManagedContainer.standardizedFileURL.path
+                guard destination.hasPrefix(container + "/") else {
+                    throw MCPError.invalidParams("Benchmark worktree destination is not app-managed.")
+                }
+                let validated = DebugWorktreeStartupBenchmarkValidatedStart(
+                    scope: preflight.expectedStart.rootIdentity.scope,
+                    logicalRootID: context.logicalRoot.id,
+                    standardizedLogicalRootPath: context.logicalRoot.standardizedFullPath,
+                    repositoryID: repository.repositoryID,
+                    repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+                    requestedBranch: request.branch,
+                    requestedBaseRef: request.baseRef,
+                    standardizedDestinationPath: destination,
+                    standardizedAppManagedContainerPath: container,
+                    destinationID: GitWorktreeIdentity.worktreeID(
+                        repositoryID: repository.repositoryID,
+                        gitDir: nil,
+                        isMain: false,
+                        path: plan.path
+                    ),
+                    agentSessionID: sessionID,
+                    startAttemptID: pending.startAttemptID
+                )
+                let consumption = try WorktreeStartupBenchmarkDiagnostics.shared.consume(
+                    token: pending.token,
+                    validatedStart: validated
+                )
+                guard startupContext?.agentSessionID == sessionID,
+                      startupContext?.correlationID == consumption.correlationID
+                else {
+                    throw MCPError.invalidParams("Benchmark start correlation did not match its Agent session.")
+                }
+                benchmarkMetricTag = consumption.metricTag
+            }
+        #endif
+        let initializationContext: GitWorktreeInitializationContext? = if let startupContext,
+                                                                          startupContext.flags.observeDiffSeededWorktreeStartup
+        {
+            try GitWorktreeInitializationContext(
+                agentSessionID: sessionID,
+                correlationID: startupContext.correlationID,
+                logicalRootPath: context.logicalRoot.standardizedFullPath,
+                expectedOwnerBindingGeneration: expectedOwnerBindingGeneration,
+                repositoryRelativeRootPrefix: repositoryRelativeRootPrefix(
+                    logicalRoot: context.logicalRoot,
+                    repositoryRoot: context.repo.rootURL
+                ),
+                observeReceipt: true
+            )
+        } else {
+            nil
+        }
+        let result: GitWorktreeCreateResult
+        #if DEBUG
+            result = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(benchmarkMetricTag) {
+                try await vcsService.createGitWorktreeWithResult(
+                    request: plan.createRequest,
+                    at: context.repo.rootURL,
+                    initializationContext: initializationContext
+                )
+            }
+            if WorktreeStartupBenchmarkDiagnostics.currentPendingStart != nil {
+                guard let correlationID = startupContext?.correlationID else {
+                    throw DebugWorktreeStartupBenchmarkError.invalidRecovery
+                }
+                let descriptor = result.descriptor
+                guard let head = descriptor.head else {
+                    throw DebugWorktreeStartupBenchmarkError.invalidRecovery
+                }
+                let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+                try diagnostics.recordRecoverableStartWorktree(
+                    correlationID: correlationID,
+                    worktreeID: descriptor.worktreeID,
+                    repositoryID: descriptor.repository.repositoryID,
+                    repositoryKey: descriptor.repository.repoKey,
+                    branch: descriptor.branch,
+                    head: head,
+                    physicalPath: descriptor.path
+                )
+                try diagnostics.requireRecoverableStartNotAborted(correlationID: correlationID)
+            }
+        #else
+            result = try await vcsService.createGitWorktreeWithResult(
+                request: plan.createRequest,
+                at: context.repo.rootURL,
+                initializationContext: initializationContext
+            )
+        #endif
+        return result
+    }
+
+    private func repositoryRelativeRootPrefix(
+        logicalRoot: WorkspaceRootRef,
+        repositoryRoot: URL
+    ) throws -> GitRepositoryRelativeRootPrefix {
+        let rootPath = StandardizedPath.absolute(logicalRoot.standardizedFullPath)
+        let repositoryPath = StandardizedPath.absolute(repositoryRoot.path)
+        guard rootPath == repositoryPath || rootPath.hasPrefix(repositoryPath + "/") else {
+            throw MCPError.invalidParams("The logical root is outside the selected Git repository.")
+        }
+        let relative = rootPath == repositoryPath
+            ? ""
+            : String(rootPath.dropFirst(repositoryPath.count + 1))
+        return try GitRepositoryRelativeRootPrefix(relative)
     }
 
     private func persistVisualIdentity(
@@ -359,17 +636,23 @@ struct AgentMCPStartWorktreeCoordinator {
     private func makeBinding(
         worktree: GitWorktreeDescriptor,
         logicalRoot: WorkspaceRootRef,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
         visualIdentity: WorktreeVisualIdentity,
         replacing previous: AgentSessionWorktreeBinding?
     ) -> AgentSessionWorktreeBinding {
-        AgentSessionWorktreeBinding(
+        let physicalRootPath = repositoryRelativeRootPrefix.value.isEmpty
+            ? worktree.path
+            : URL(fileURLWithPath: worktree.path, isDirectory: true)
+            .appendingPathComponent(repositoryRelativeRootPrefix.value, isDirectory: true)
+            .standardizedFileURL.path
+        return AgentSessionWorktreeBinding(
             id: previous?.id ?? UUID().uuidString,
             repositoryID: worktree.repository.repositoryID,
             repoKey: worktree.repository.repoKey,
             logicalRootPath: logicalRoot.standardizedFullPath,
             logicalRootName: logicalRoot.name,
             worktreeID: worktree.worktreeID,
-            worktreeRootPath: worktree.path,
+            worktreeRootPath: physicalRootPath,
             worktreeName: worktree.name,
             branch: worktree.branch,
             head: worktree.head,

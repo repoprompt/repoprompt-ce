@@ -1338,7 +1338,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             if runState.isActive,
                session.codexController != nil,
-               session.codexControllerGoalSupportEnabled == false
+               session.codexControllerFeatureState?.goalSupportEnabled == false
             {
                 return "Codex goal support will be available after the current Codex turn finishes and reconnects."
             }
@@ -2659,8 +2659,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexControllerTaskLabelKind = nil
             session.codexControllerWorkspacePath = nil
             session.pendingCodexComputerUseActivation = nil
-            session.codexControllerComputerUseEnabled = false
-            session.codexControllerGoalSupportEnabled = false
+            session.codexControllerFeatureState = nil
             session.codexEventTask?.cancel()
             session.codexEventTask = nil
             session.codexEventTaskRunID = nil
@@ -3466,6 +3465,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return !wasReconnectNeeded
     }
 
+    private func codexFeatureReconnectSource(
+        previous: AgentModeViewModel.TabSession.CodexControllerFeatureState?,
+        desired: AgentModeViewModel.TabSession.CodexControllerFeatureState
+    ) -> String {
+        guard let previous else { return "feature-state-unknown" }
+        if previous.computerUseEnabled != desired.computerUseEnabled {
+            return desired.computerUseEnabled ? "computer-use-enabled" : "computer-use-disabled"
+        }
+        if previous.goalSupportEnabled != desired.goalSupportEnabled {
+            return desired.goalSupportEnabled ? "goal-support-enabled" : "goal-support-disabled"
+        }
+        if previous.reasoningSummariesEnabled != desired.reasoningSummariesEnabled {
+            return desired.reasoningSummariesEnabled ? "reasoning-summaries-enabled" : "reasoning-summaries-disabled"
+        }
+        return "feature-state-unknown"
+    }
+
     @discardableResult
     private func invalidateCodexControllerForReconnect(
         session: AgentModeViewModel.TabSession,
@@ -3505,8 +3521,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexControllerPermissionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
-        session.codexControllerComputerUseEnabled = false
-        session.codexControllerGoalSupportEnabled = false
+        session.codexControllerFeatureState = nil
         if !preserveRunID {
             session.runID = nil
         }
@@ -3660,27 +3675,27 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         let wantsGoalSupport = CodexGoalSupport.isEnabled
+        let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
         let codexComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
         if !codexComputerUseFeatureEnabled {
             session.pendingCodexComputerUseActivation = nil
         }
         let wantsComputerUse = session.wantsCodexComputerUseForNextTurn && codexComputerUseFeatureEnabled
+        let desiredFeatureState = AgentModeViewModel.TabSession.CodexControllerFeatureState(
+            computerUseEnabled: wantsComputerUse,
+            goalSupportEnabled: wantsGoalSupport,
+            reasoningSummariesEnabled: wantsReasoningSummaries
+        )
         if let existingController = session.codexController,
-           session.codexControllerComputerUseEnabled != wantsComputerUse
+           session.codexControllerFeatureState != desiredFeatureState
         {
             _ = invalidateCodexControllerForReconnect(
                 session: session,
                 expectedController: existingController,
-                source: wantsComputerUse ? "computer-use-enabled" : "computer-use-disabled"
-            )
-        }
-        if let existingController = session.codexController,
-           session.codexControllerGoalSupportEnabled != wantsGoalSupport
-        {
-            _ = invalidateCodexControllerForReconnect(
-                session: session,
-                expectedController: existingController,
-                source: wantsGoalSupport ? "goal-support-enabled" : "goal-support-disabled"
+                source: codexFeatureReconnectSource(
+                    previous: session.codexControllerFeatureState,
+                    desired: desiredFeatureState
+                )
             )
         }
         if let existingController = session.codexController,
@@ -3736,8 +3751,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.codexControllerPermissionProfile = session.permissionProfile
                 session.codexControllerTaskLabelKind = currentTaskLabelKind
                 session.codexControllerWorkspacePath = runtimeWorkspacePath
-                session.codexControllerComputerUseEnabled = wantsComputerUse
-                session.codexControllerGoalSupportEnabled = wantsGoalSupport
+                session.codexControllerFeatureState = desiredFeatureState
             }
             guard let controller = session.codexController else { return nil }
             controller.ensureEventsStreamReady()
@@ -5389,7 +5403,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         let hadActivation = session.pendingCodexComputerUseActivation != nil
         session.pendingCodexComputerUseActivation = nil
-        guard session.codexControllerComputerUseEnabled else { return }
+        guard session.codexControllerFeatureState?.computerUseEnabled == true else { return }
         _ = invalidateCodexControllerForReconnect(
             session: session,
             expectedController: session.codexController,
@@ -8010,8 +8024,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexControllerPermissionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
-        session.codexControllerComputerUseEnabled = false
-        session.codexControllerGoalSupportEnabled = false
+        session.codexControllerFeatureState = nil
         session.codexEventTask?.cancel()
         session.codexEventTask = nil
         session.codexEventTaskRunID = nil
@@ -8090,8 +8103,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexControllerPermissionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
-        session.codexControllerComputerUseEnabled = false
-        session.codexControllerGoalSupportEnabled = false
+        session.codexControllerFeatureState = nil
         session.runID = nil
         session.codexEventTask?.cancel()
         session.codexEventTask = nil
@@ -8174,8 +8186,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexControllerPermissionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
-        session.codexControllerComputerUseEnabled = false
-        session.codexControllerGoalSupportEnabled = false
+        session.codexControllerFeatureState = nil
         session.runID = nil
         session.codexEventTask?.cancel()
         session.codexEventTask = nil
