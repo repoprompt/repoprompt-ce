@@ -1107,12 +1107,15 @@ import XCTest
                     _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: fixture.contextA.rootURL)
                     await markGitDirectoryObserved(fixture.contextA)
                     let relativePath = "Sources/\(fixture.contextA.fileURL.lastPathComponent)"
-                    let warmedCodemap = try await waitForCodemapDemandReady(
-                        in: store,
-                        rootID: fixture.contextA.rootID,
-                        relativePath: relativePath
-                    )
-                    _ = await store.cancelCodemapArtifactDemand(warmedCodemap.ticket)
+                    let runCodemapE2E = CodemapE2ETestGate.isEnabled
+                    if runCodemapE2E {
+                        let warmedCodemap = try await waitForCodemapDemandReady(
+                            in: store,
+                            rootID: fixture.contextA.rootID,
+                            relativePath: relativePath
+                        )
+                        _ = await store.cancelCodemapArtifactDemand(warmedCodemap.ticket)
+                    }
                     let canonicalSentinel = "CanonicalNonAgentContextBuilderType"
                     try write(
                         "struct \(canonicalSentinel) { func canonicalMethod() {} }\n",
@@ -1130,12 +1133,14 @@ import XCTest
                         userPath: fixture.contextA.fileURL.path,
                         fallbackScope: .visibleWorkspace
                     )
-                    try await waitForCodemap(
-                        in: store,
-                        rootID: fixture.contextA.rootID,
-                        relativePath: relativePath,
-                        containing: canonicalSentinel
-                    )
+                    if runCodemapE2E {
+                        try await waitForCodemap(
+                            in: store,
+                            rootID: fixture.contextA.rootID,
+                            relativePath: relativePath,
+                            containing: canonicalSentinel
+                        )
+                    }
                     let sourceSelection = StoredSelection(
                         selectedPaths: [fixture.contextA.fileURL.path],
                         codemapAutoEnabled: false
@@ -1316,7 +1321,40 @@ import XCTest
                     XCTAssertEqual(run.workspacePath, fixture.contextA.rootURL.standardizedFileURL.path)
                     XCTAssertTrue(run.read.contains(canonicalSentinel), run.read)
                     XCTAssertTrue(run.search.contains(canonicalSentinel), run.search)
-                    XCTAssertTrue(run.codeStructure.contains(canonicalSentinel), run.codeStructure)
+                    let codeStructure = run.codeStructure
+                    let codeStructureHasCanonicalPath = codeStructure.contains(relativePath)
+                        || (
+                            codeStructure.contains("- **Sources**")
+                                && codeStructure.contains("  - `\(fixture.contextA.fileURL.lastPathComponent)`")
+                        )
+                    XCTAssertTrue(codeStructureHasCanonicalPath, codeStructure)
+                    for leakageMarker in [
+                        "session-bound worktree",
+                        "WorktreeContextBuilderType",
+                        "BranchOnlyContextBuilderType",
+                        "worktreeOnly"
+                    ] {
+                        XCTAssertFalse(codeStructure.contains(leakageMarker), codeStructure)
+                    }
+                    let codeStructureNotReadyMarkers = [
+                        "**Status**: `pending`",
+                        "**Status**: `timeout`",
+                        "**Status**: `unavailable`",
+                        "artifact_pending",
+                        "artifact_unavailable",
+                        "codemap_busy",
+                        "readiness_timeout",
+                        "registration"
+                    ]
+                    let codeStructureLooksNotReady = codeStructureNotReadyMarkers.contains {
+                        codeStructure.range(of: $0, options: .caseInsensitive) != nil
+                    }
+                    if runCodemapE2E {
+                        XCTAssertTrue(codeStructure.contains(canonicalSentinel), codeStructure)
+                    } else if !codeStructureLooksNotReady {
+                        XCTAssertFalse(codeStructure.contains("Without codemap"), codeStructure)
+                        XCTAssertTrue(codeStructure.contains(canonicalSentinel), codeStructure)
+                    }
 
                     let followUp = try XCTUnwrap(state.followUps.first)
                     XCTAssertEqual(followUp.mode, "review")

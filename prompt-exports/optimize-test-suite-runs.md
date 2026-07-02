@@ -3058,3 +3058,51 @@ Primary metric eligible: no
 - Validation: `make dev-test FILTER=RepoPromptTests.FileSystemContentLoadingConcurrencyTests` passed, ticket `4e52f655-49cc-4513-b9ce-8a94083fc953`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/4e52f655-49cc-4513-b9ce-8a94083fc953.log`; `make dev-format-check` passed, ticket `dd7fce24-e74d-4c78-886f-628e8d206c3b`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/dd7fce24-e74d-4c78-886f-628e8d206c3b.log`.
 - Method delta `0`; contract delta `0`; scenario delta `0`; XCTest-ID delta `0`; ledger untouched; raw logs uncommitted.
 - root delta not individually measured; see future Wave 2 gate.
+
+### Focused: 2026-07-02T19:09:38+00:00 — root — wave2-after-m3prime-contextbuilder-codemap-gate-20260702T190736Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.ContextBuilderWorktreeInheritanceTests --json`
+Artifact: `prompt-exports/test-suite-focused-root-wave2-after-m3prime-contextbuilder-codemap-gate-20260702T190736Z.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.ContextBuilderWorktreeInheritanceTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 40.784 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/75220637-5cf5-48a6-815d-e45fa5d7fc13.log` |  |
+| 2 | yes | 34.005 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/592978ea-71ce-46e7-983c-3c7d61a35d9d.log` |  |
+| 3 | yes | 45.687 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2c999fcf-4e2f-42a7-80e0-39291fd0e836.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T19:09:38+00:00/25a0d3fe8159 | wave2-after-m3prime-contextbuilder-codemap-gate-20260702T190736Z | root | filtered: `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | 3 valid + 0 invalid | 2825 | 7 | 2832 | 40.784 | 45.687 | 0.1202 | unstable | `prompt-exports/test-suite-focused-root-wave2-after-m3prime-contextbuilder-codemap-gate-20260702T190736Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | 4 | 31.899 | 35.476 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeEmptyInitialSelectionDefersAndRoutesWithoutExplicitContext` | 3 | 20.744 | 35.476 | 35.476 | 0 |
+| 2 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeTwoRootContextBuilderImplicitGitPublishesSelectedRepository` | 3 | 4.804 | 7.759 | 7.759 | 0 |
+| 3 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps` | 3 | 2.929 | 3.140 | 3.140 | 0 |
+| 4 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeContextBuilderFailsClosedBeforeProviderCreationWhenWorktreeIsUnavailable` | 3 | 0.465 | 0.471 | 0.471 | 0 |
+
+### Wave 2 M3′ member note: 2026-07-02T19:11Z — optimization-wave2-m3prime-contextbuilder-codemap-gate
+
+- Decision/tags: `reliability-hardening`, `coverage-tradeoff`.
+- Scope: test-only helper `Tests/RepoPromptTests/Helpers/CodemapE2ETestGating.swift`; one-method test change in `Tests/RepoPromptTests/ContextBuilder/ContextBuilderWorktreeInheritanceTests.swift`; contributor docs in `docs/testing.md`; evidence-only updates under `prompt-exports/`; production diff `0`.
+- Contract preserved: `testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior` still proves canonical non-agent workspace routing, read/search sentinel visibility, selected git artifact publication, review follow-up packaging, canonical code-structure path shape, and no worktree leakage. Routine gates no longer await live tree-sitter codemap generation for this pipeline contract.
+- Coverage tradeoff: the strict live codemap generation scenario moved from the routine gate to `RPCE_RUN_CODEMAP_E2E=1` or `/tmp/RepoPromptCE-codemap-e2e-opt-in`; compensating leaf generation coverage remains in codemap golden/builder tests per `docs/analysis/test-suite-codemap-sensitive-test-strategy-2026-07-02.md`.
+- Focused before pivot artifact (exact non-agent method): `prompt-exports/test-suite-focused-root-wave2-before-m3-contextbuilder-registrationfailed-nonagent-20260702T181503Z.json` — `2 valid + 1 invalid`; invalid sample hit the registration/real-generation flake; median `25.664s`, observed p95 `32.606s`, noise `unstable`.
+- Focused before pivot artifact (full ContextBuilder suite): `prompt-exports/test-suite-focused-root-wave2-before-m3-contextbuilder-registrationfailed-suite-20260702T181641Z.json` — `3 valid + 0 invalid`, median `85.225s`, observed p95 `85.781s`, relative MAD `0.0065`, noise `stable`.
+- Focused after artifact: `prompt-exports/test-suite-focused-root-wave2-after-m3prime-contextbuilder-codemap-gate-20260702T190736Z.json` — `3 valid + 0 invalid`, median `40.784s`, observed p95 `45.687s`, relative MAD `0.1202`, noise `unstable`.
+- Strict E2E validation: `RPCE_RUN_CODEMAP_E2E=1 make dev-test FILTER=RepoPromptTests.ContextBuilderWorktreeInheritanceTests` passed, ticket `330ba2ad-6429-4b86-bd97-30af670a3ce6`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/330ba2ad-6429-4b86-bd97-30af670a3ce6.log`.
+- List/ledger/style validation: `make dev-test-list` passed, ticket `3ccd78b5-71a5-46eb-b993-cf1c135e1550`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3ccd78b5-71a5-46eb-b993-cf1c135e1550.log`; `python3 Scripts/test_suite_optimizer.py verify-ledger --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv` failed with pre-existing live-ID reconciliation mismatch `missing=46 stale=2`; `make dev-format` passed after the final Swift edit, ticket `7cc562fd-9dab-41f4-9896-3faa0afca893`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7cc562fd-9dab-41f4-9896-3faa0afca893.log`; `make dev-format-check` passed, ticket `d979927f-6c70-414b-8382-c174a8b7373c`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d979927f-6c70-414b-8382-c174a8b7373c.log`; `make dev-lint` passed, ticket `0c0d5584-ecd3-42fe-83c7-e6ce5865d063`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0c0d5584-ecd3-42fe-83c7-e6ce5865d063.log`.
+- Method delta `0`; contract delta `0`; scenario delta `0`; XCTest-ID delta `0`; ledger unchanged; raw logs uncommitted.
+- root timing deferred to the next root stabilization gate; no individual root delta claimed. root delta not individually measured; see future Wave 2 gate.

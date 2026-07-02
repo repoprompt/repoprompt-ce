@@ -31,6 +31,19 @@ make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTes
 
 Use the narrowest relevant filter, then broaden only for the affected boundary.
 
+### Codemap-sensitive changes
+
+Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
+
+For local strict codemap E2E coverage, opt in with either `RPCE_RUN_CODEMAP_E2E=1` or the marker file `/tmp/RepoPromptCE-codemap-e2e-opt-in`:
+
+```bash
+RPCE_RUN_CODEMAP_E2E=1 make dev-test FILTER=ContextBuilderWorktreeInheritanceTests
+touch /tmp/RepoPromptCE-codemap-e2e-opt-in && make dev-test FILTER=ContextBuilderWorktreeInheritanceTests ; rm /tmp/RepoPromptCE-codemap-e2e-opt-in
+```
+
+Run this strict gate when changes touch `Sources/RepoPrompt/Features/CodeMap/`, codemap paths in `Sources/RepoPrompt/Infrastructure/WorkspaceContext/`, `Sources/RepoPrompt/Infrastructure/SyntaxParsing/`, or `Sources/TreeSitterScannerSupport/`. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
+
 ## Authoritative executable IDs
 
 Never derive the executable census from source text or a stale build. Use:
