@@ -2652,3 +2652,142 @@ Primary metric eligible: no
   - No third sample is counted for this root gate by user direction.
   - Overrun evidence not counted: ticket `b533efea-c21c-487e-acc9-116d8ef7d2ce` was already running when this bookkeeping pass resumed, reached failed state (`2835 tests`, `5 skipped`, `1 failure`, `708.785s` XCTest elapsed), and its copied raw log is `prompt-exports/raw-logs/current-reliability/root-gate-graph-source-authority-overrun-sample3-invalid-b533efea.log`. Failure signature: `ContextBuilderWorktreeInheritanceTests/testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps` codemap artifact unavailable for `Sources/DistinctConnectionA.swift`.
 - Deltas: method delta `0`; contract delta `0`; scenario delta `0`; ledger delta `0`; production-code delta `0`; XCTest ID delta `0`.
+### Focused: 2026-07-02T16:14:56+00:00 — root — wave1-after-worktree-exact-20260702
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections --json`
+Artifact: `prompt-exports/wave1-after-worktree-exact-20260702.json`
+Inventory: ``
+Scope/filter: filtered: `RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 12.348 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e3011e17-9599-4746-848b-6e5ded54ef37.log` |  |
+| 2 | yes | 12.179 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/126cd5f1-b908-435a-96f3-4e8e03505a0d.log` |  |
+| 3 | yes | 9.713 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ec391bce-748a-40de-b86e-c014799b0126.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T16:14:56+00:00/4423bf1dbe10 | wave1-after-worktree-exact-20260702 | root | filtered: `RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections` | 3 valid + 0 invalid |  |  |  | 12.179 | 12.348 | 0.0139 | stable | `prompt-exports/wave1-after-worktree-exact-20260702.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | 1 | 11.341 | 11.563 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | `testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections` | 3 | 11.341 | 11.563 | 11.563 | 0 |
+
+### Focused: 2026-07-02T16:15:05+00:00 — root — wave1-after-contextbuilder-startup-20260702
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.ContextBuilderModelStartupSelectionTests --json`
+Artifact: `prompt-exports/wave1-after-contextbuilder-startup-20260702.json`
+Inventory: ``
+Scope/filter: filtered: `RepoPromptTests.ContextBuilderModelStartupSelectionTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 0.828 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/18b6ef0e-7953-4047-9619-258ccf8c801d.log` |  |
+| 2 | yes | 0.954 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e4734fa0-bd52-4a58-bda7-1068e97243aa.log` |  |
+| 3 | yes | 0.819 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b09a0da0-c72e-4f5e-bdc8-38b880311f35.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T16:15:05+00:00/4423bf1dbe10 | wave1-after-contextbuilder-startup-20260702 | root | filtered: `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | 3 valid + 0 invalid |  |  |  | 0.828 | 0.954 | 0.0105 | stable | `prompt-exports/wave1-after-contextbuilder-startup-20260702.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | 12 | 0.051 | 0.110 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testCachedCLIFlagIsNotReadyUntilCurrentProcessVerification` | 3 | 0.043 | 0.043 | 0.043 | 0 |
+| 2 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testTransientFallbackResolutionDoesNotMutatePersistedSelection` | 3 | 0.003 | 0.003 | 0.003 | 0 |
+| 3 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testValidPersistedSelectionSurvivesStoreReloadAndStartupResolution` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+| 4 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testOpenCodeStartupReadinessJoinsRunningPollAndEmitsLiveSnapshot` | 3 | 0.001 | 0.110 | 0.110 | 0 |
+| 5 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testCursorStartupReadinessJoinsRunningPollWithoutDynamicMetadata` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 6 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testDynamicPersistedSelectionSurvivesAfterACPDiscovery` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 7 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testPersistedDynamicSelectionSurvivesStandardCatalogWarmup` | 3 | 0.000 | 0.001 | 0.001 | 0 |
+| 8 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testFallbackUsesWizardRecommendationProviderFilter` | 3 | 0.000 | 0.000 | 0.000 | 0 |
+| 9 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testFilteredRecommendationProvidersDoNotReappearThroughGenericFallback` | 3 | 0.000 | 0.000 | 0.000 | 0 |
+| 10 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testStaticOpenCodeDefaultSurvivesAfterACPDiscovery` | 3 | 0.000 | 0.000 | 0.000 | 0 |
+| 11 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testUnavailablePersistedSelectionFallsBackToRecommendedAvailableProvider` | 3 | 0.000 | 0.000 | 0.000 | 0 |
+| 12 | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `testUnconfiguredClaudeCodeCannotBecomeEffectiveStartupSelection` | 3 | 0.000 | 0.000 | 0.000 | 0 |
+
+### Focused: 2026-07-02T16:15:14+00:00 — root — wave1-after-mention-coordinator-20260702
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.MentionCoordinatorTests --json`
+Artifact: `prompt-exports/wave1-after-mention-coordinator-20260702.json`
+Inventory: ``
+Scope/filter: filtered: `RepoPromptTests.MentionCoordinatorTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 0.936 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/84a3a792-bd5c-4a81-a754-b3d9f276d991.log` |  |
+| 2 | yes | 0.976 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8c6cca86-301d-4e71-ac17-4ab00254c3aa.log` |  |
+| 3 | yes | 0.978 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3693c67a-621f-4aa7-be2f-6566ef665e67.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T16:15:14+00:00/4423bf1dbe10 | wave1-after-mention-coordinator-20260702 | root | filtered: `RepoPromptTests.MentionCoordinatorTests` | 3 valid + 0 invalid |  |  |  | 0.976 | 0.978 | 0.0021 | stable | `prompt-exports/wave1-after-mention-coordinator-20260702.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.MentionCoordinatorTests` | 4 | 0.158 | 0.155 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.MentionCoordinatorTests` | `testClickingAncestorWindowMakesThatLevelCurrentForFurtherNavigation` | 3 | 0.154 | 0.155 | 0.155 | 0 |
+| 2 | `RepoPromptTests.MentionCoordinatorTests` | `testWorkspaceReuseKeepsSuggestionsAndCommitRemovalOnNewFileManager` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+| 3 | `RepoPromptTests.MentionCoordinatorTests` | `testDeallocatedManagerUpdatingToNilInvalidatesActiveMentionState` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 4 | `RepoPromptTests.MentionCoordinatorTests` | `testWorkspaceSwitchInvalidatesStaleDebouncedQuery` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+
+### Wave 1 bookkeeping: 2026-07-02T16:15Z — optimization-wave1-mechanical-polling
+
+- Wave label: `optimization-wave1-mechanical-polling`.
+- Commit range: `7452e2db..4423bf1d`.
+- Wave head verified before validation: clean working tree, `HEAD=4423bf1d`.
+- Members/files changed:
+  - `f3dca88d` Optimize worktree API smoke selection settles — `Tests/RepoPromptTests/MCP/WorktreeAPISmokeHarnessTests.swift`.
+  - `39b40a31` Optimize ACP startup fake discovery gates — `Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPModelPollingService.swift`, `Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPModelPollingService.swift`, `Tests/RepoPromptTests/ContextBuilder/ContextBuilderModelStartupSelectionTests.swift`.
+  - `4423bf1d` Optimize mention coordinator debounce tests — `Sources/RepoPrompt/Infrastructure/UI/TextField/MentionCoordinator.swift`, `Tests/RepoPromptTests/Mentions/MentionCoordinatorTests.swift`.
+- Per-member root deltas were not individually measured. No pre-change focused optimizer artifacts were captured for these three members, so the after-only focused artifacts below are recorded as post-change evidence and the aggregate root delta is deferred to a future wave/root gate.
+- No complete-root gate was run in this pass. Raw conductor logs remain outside the repository and were not committed.
+- AgentRun 2s member was inspected/deferred; no speed claim is made for it here.
+- Method delta `0`; contract delta `0`; scenario delta `0`; XCTest ID delta `0`; ledger drift unchanged and the ledger was not edited.
+
+Validation recovered from pair agents:
+
+- Worktree exact: focused ticket `6b120e29-5cce-47b7-b5a0-8929f625dc06`, suite ticket `44d18e52-53a6-4841-8afc-6def5665c062`, format-check `b24480ca-aa73-4977-b781-e6aaea25c6bf`.
+- ContextBuilder suite: ticket `8e52bd18-8c0b-4081-8766-8df0e563d7b1`, format-check `6c14412f-0790-4c10-96f8-53402a8de2bc`, test-list `51dea008-413a-49f5-96ad-faac84619196`.
+- Mention suite: ticket `cdc8cb18-91fc-40b3-aec8-9bc05a9b9b86`, format-check `fd3494ee-65fd-467c-825b-1eee50106a0a`.
+
+Wave-head validation run in this bookkeeping pass:
+
+- `make dev-lint` passed: conductor lint ticket `7dc495ea-2721-4631-899a-40fe5f61d9df`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7dc495ea-2721-4631-899a-40fe5f61d9df.log`; SwiftFormat reported `0/1371 files require formatting`; SwiftLint reported `0 violations, 0 serious in 1371 files`.
+- `python3 Scripts/test_suite_optimizer.py verify-ledger --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv` exited nonzero with the known pre-existing drift: `missing=46 stale=2`; examples printed were `AgentContextExportResolverTests/testBoundWorktreeAutoCodemapDoesNotUseMetadataOnlyFastPathWhenAutoCodemapEnabled`, `testEmptyBoundExportSkipsWorktreeProjection`, `testEmptyDirectFilePreviewReturnsEmptyContent`, `testMetadataOnlyWorktreeExportDoesNotDirectReadSymlinkEscapingRoot`, `testNonGitAutomaticExportBatchesSelectedPathLookupsWithoutRuntimeFallback`; stale examples `AgentContextExportResolverTests/testNonGitAutomaticExportPreservesSelectedRowsWithoutRuntimeOrLegacyFallback`, `WorkspaceSelectionAutoCodemapInvariantTests/testStoredSelectionPersistsManualPathsButDiscardsLegacyInferredPathKey`. Underlying test-list tickets: root `2e346a09-b6f7-40ce-ad86-470713f0b0ec` (log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2e346a09-b6f7-40ce-ad86-470713f0b0ec.log`) and provider `7ae38411-79e7-4d67-ba06-7f7a72c50a5a` (log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7ae38411-79e7-4d67-ba06-7f7a72c50a5a.log`). Ledger intentionally unchanged.
+
+After-only focused optimizer artifacts from this pass (`--samples 3`, `--source-change-guard content`, primary metric eligible: no):
+
+| Label | Filter | Tickets | Samples | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact |
+|---|---|---|---:|---:|---:|---:|---|---|
+| `wave1-after-worktree-exact-20260702` | `RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections` | `e3011e17-9599-4746-848b-6e5ded54ef37`, `126cd5f1-b908-435a-96f3-4e8e03505a0d`, `ec391bce-748a-40de-b86e-c014799b0126` | 3 valid + 0 invalid | 12.179 | 12.348 | 0.0139 | stable | `prompt-exports/wave1-after-worktree-exact-20260702.json` |
+| `wave1-after-contextbuilder-startup-20260702` | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `18b6ef0e-7953-4047-9619-258ccf8c801d`, `e4734fa0-bd52-4a58-bda7-1068e97243aa`, `b09a0da0-c72e-4f5e-bdc8-38b880311f35` | 3 valid + 0 invalid | 0.828 | 0.954 | 0.0105 | stable | `prompt-exports/wave1-after-contextbuilder-startup-20260702.json` |
+| `wave1-after-mention-coordinator-20260702` | `RepoPromptTests.MentionCoordinatorTests` | `84a3a792-bd5c-4a81-a754-b3d9f276d991`, `8c6cca86-301d-4e71-ac17-4ab00254c3aa`, `3693c67a-621f-4aa7-be2f-6566ef665e67` | 3 valid + 0 invalid | 0.976 | 0.978 | 0.0021 | stable | `prompt-exports/wave1-after-mention-coordinator-20260702.json` |
