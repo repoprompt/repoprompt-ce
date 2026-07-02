@@ -914,3 +914,98 @@ Primary metric eligible: no
 | Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
 |---:|---|---|---:|---:|---:|---:|---:|
 | 1 | `RepoPromptTests.MCPCodeStructureWorktreeTests` | `testInheritedWorktreeSequentialStructureThenTreePublishesLogicalMarkerWithoutPhysicalLeakage` | 20 | 3.667 | 3.914 | 4.733 | 0 |
+### Focused: 2026-07-02T01:50:56+00:00 — root — reliability-gate-20260702-focused-durable-crash-catalog-pointer
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.DurableArtifactCrashAndCatalogTests/testSubprocessCrashReplacingCatalogLeavesOldOrNewCompletePointer --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-20260702-focused-durable-crash-catalog-pointer.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.DurableArtifactCrashAndCatalogTests/testSubprocessCrashReplacingCatalogLeavesOldOrNewCompletePointer`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 1.034 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7ee4af08-3bfa-4094-af4e-fe8ff2d6575d.log` |  |
+| 2 | yes | 1.034 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/89bfae74-58ab-4f15-b223-461cb4b32cd4.log` |  |
+| 3 | yes | 1.021 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b5e4e50a-8f10-4aba-81bd-91e758be4ef2.log` |  |
+| 4 | yes | 1.027 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/546a40db-71f0-4d37-b7e8-844171ee60b8.log` |  |
+| 5 | yes | 1.033 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c6a994b3-80b5-4633-beed-4c937dc9f812.log` |  |
+| 6 | yes | 1.033 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/39f144cf-eac0-45f5-b0dc-988c21125219.log` |  |
+| 7 | yes | 1.026 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/82bbfe12-510c-4605-9d85-9043b00e1b96.log` |  |
+| 8 | yes | 1.049 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1ed2552f-a2c9-4abc-8b4f-c88deed2175d.log` |  |
+| 9 | yes | 1.033 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/bea8712e-48cd-42f2-a57a-2bd7593c991f.log` |  |
+| 10 | yes | 1.071 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/503d2ec2-7916-4f99-9112-27c3791f62ee.log` |  |
+| 11 | yes | 1.026 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/dde49442-da98-4047-8f2b-d7aff9353380.log` |  |
+| 12 | yes | 1.053 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/42e0b002-97b9-4196-840a-2c2621e6dc37.log` |  |
+| 13 | yes | 1.056 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/858cdd2e-890d-41db-9580-7a16fa6e4771.log` |  |
+| 14 | yes | 1.042 | 0.007 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6736bf51-dc3b-4c6f-b69d-ceaaea4550e0.log` |  |
+| 15 | yes | 1.118 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/29c19bd6-6daa-429c-a25f-f484062ddf39.log` |  |
+| 16 | yes | 1.022 | 0.008 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3035d86e-9c6e-47fa-bcf8-37686df36e44.log` |  |
+| 17 | yes | 1.021 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7d4feeec-40ce-43b7-9582-8621c02d4dfd.log` |  |
+| 18 | yes | 1.025 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1b4a1873-1c97-4ddd-a34f-c62db226af81.log` |  |
+| 19 | yes | 1.013 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8a4aae7b-7738-43c2-b5c3-fa5356a2330a.log` |  |
+| 20 | yes | 1.034 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1ee57b6f-f3f0-4153-8534-49ec05909817.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T01:50:56+00:00/f37309e7a095 | reliability-gate-20260702-focused-durable-crash-catalog-pointer | root | filtered: `RepoPromptTests.DurableArtifactCrashAndCatalogTests/testSubprocessCrashReplacingCatalogLeavesOldOrNewCompletePointer` | 20 valid + 0 invalid | 2825 | 7 | 2832 | 1.033 | 1.071 | 0.0084 | stable | `prompt-exports/test-suite-focused-root-reliability-gate-20260702-focused-durable-crash-catalog-pointer.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.DurableArtifactCrashAndCatalogTests` | 1 | 0.345 | 0.374 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.DurableArtifactCrashAndCatalogTests` | `testSubprocessCrashReplacingCatalogLeavesOldOrNewCompletePointer` | 20 | 0.345 | 0.365 | 0.374 | 0 |
+
+### Focused: 2026-07-02T01:51:33+00:00 — root — reliability-gate-20260702-focused-durable-catalog-cas-after-publish-retry
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.DurableArtifactCrashAndCatalogTests/testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-20260702-focused-durable-catalog-cas-after-publish-retry.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.DurableArtifactCrashAndCatalogTests/testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 0.862 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6c6b2e57-7670-4f0c-8d02-4a6314717fd5.log` |  |
+| 2 | yes | 0.850 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a180967a-006f-40cf-83f0-7793a6ae71c5.log` |  |
+| 3 | yes | 0.862 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/be4c3346-75ab-41f7-a95c-9642dad1b521.log` |  |
+| 4 | yes | 0.848 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/95f76053-435c-49e0-bf9c-68d604d640be.log` |  |
+| 5 | yes | 0.840 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/86a385b9-137f-477d-8b01-03faa1c46d45.log` |  |
+| 6 | yes | 0.859 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/5c5d43b6-250c-4bba-a811-d23585621063.log` |  |
+| 7 | yes | 0.855 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e3808971-ba79-4762-a0ce-009098dec320.log` |  |
+| 8 | yes | 0.834 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d32ab88d-16ba-43a3-89b7-5c8f815f1e3d.log` |  |
+| 9 | yes | 0.843 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/88391b92-249b-4da1-be7a-7e14e483a59c.log` |  |
+| 10 | yes | 0.855 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/78a09f1b-1b30-4c74-823a-65fec5de7846.log` |  |
+| 11 | yes | 0.865 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/90af38de-62b7-471a-aedd-10e8f5df8721.log` |  |
+| 12 | yes | 0.864 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8bdd83d2-f396-447e-9065-04026ca56257.log` |  |
+| 13 | yes | 0.833 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1d48f529-0dd4-4716-af6e-9d2103221d43.log` |  |
+| 14 | yes | 0.843 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6246ff8d-bfa9-4ab7-bb83-80c0a5cf2c8a.log` |  |
+| 15 | yes | 0.847 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9ce101e5-e6c8-4152-90dd-61cacdd0dccc.log` |  |
+| 16 | yes | 0.860 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f193d231-70e6-4600-9cd8-89fe81273014.log` |  |
+| 17 | yes | 0.846 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9243c7a9-6f00-4ec6-8c3e-abaa20d443b5.log` |  |
+| 18 | yes | 0.853 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f3a0fb6e-c743-4a63-b685-43ad7df26cc0.log` |  |
+| 19 | yes | 0.852 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6fca6bbb-c544-48fe-8da7-7fc3b5fc4c34.log` |  |
+| 20 | yes | 0.840 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d9f63181-3723-4b90-bb55-4fa90d245dec.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T01:51:33+00:00/f37309e7a095 | reliability-gate-20260702-focused-durable-catalog-cas-after-publish-retry | root | filtered: `RepoPromptTests.DurableArtifactCrashAndCatalogTests/testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner` | 20 valid + 0 invalid | 2825 | 7 | 2832 | 0.851 | 0.864 | 0.0099 | stable | `prompt-exports/test-suite-focused-root-reliability-gate-20260702-focused-durable-catalog-cas-after-publish-retry.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.DurableArtifactCrashAndCatalogTests` | 1 | 0.165 | 0.185 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.DurableArtifactCrashAndCatalogTests` | `testConcurrentSubprocessCatalogCASPublishesExactlyOneWinner` | 20 | 0.165 | 0.181 | 0.185 | 0 |
