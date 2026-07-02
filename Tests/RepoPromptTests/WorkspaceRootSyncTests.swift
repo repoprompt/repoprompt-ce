@@ -1,3 +1,4 @@
+import Combine
 @testable import RepoPrompt
 import XCTest
 
@@ -123,6 +124,59 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertTrue(viewModel.rootShellProjections[1].isSystemRoot)
     }
 
+    func testRootShellProjectionPublisherFiresForProjectionChanges() {
+        let viewModel = WorkspaceFilesViewModel()
+        var changeCount = 0
+        var cancellables = Set<AnyCancellable>()
+        viewModel.rootShellProjectionsChangedPublisher
+            .sink { changeCount += 1 }
+            .store(in: &cancellables)
+
+        viewModel.addRootFolder(makeRoot(name: "A", path: "/tmp/A"))
+
+        XCTAssertEqual(changeCount, 1)
+    }
+
+    func testRootShellProjectionPublisherIgnoresUnrelatedPublishedChanges() {
+        let viewModel = WorkspaceFilesViewModel()
+        var changeCount = 0
+        var cancellables = Set<AnyCancellable>()
+        viewModel.rootShellProjectionsChangedPublisher
+            .sink { changeCount += 1 }
+            .store(in: &cancellables)
+
+        viewModel.currentSortMethod = .dateNewest
+        viewModel.codemapAutoEnabled = false
+
+        XCTAssertEqual(changeCount, 0)
+    }
+
+    func testRootShellProjectionBatchPublishesOneFinalNotification() {
+        let viewModel = WorkspaceFilesViewModel()
+        var changeCount = 0
+        var snapshots: [[UUID]] = []
+        var cancellables = Set<AnyCancellable>()
+        viewModel.rootShellProjectionsChangedPublisher
+            .sink {
+                changeCount += 1
+                snapshots.append(viewModel.visibleRootShellProjections.map(\.id))
+            }
+            .store(in: &cancellables)
+        let rootA = makeRoot(name: "A", path: "/tmp/A")
+        let rootB = makeRoot(name: "B", path: "/tmp/B")
+
+        viewModel.beginRootShellProjectionChangeBatch()
+        viewModel.addRootFolder(rootA)
+        viewModel.addRootFolder(rootB)
+        XCTAssertEqual(changeCount, 0)
+        _ = viewModel.reorderRootFolders(to: ["/tmp/B", "/tmp/A"])
+
+        viewModel.endRootShellProjectionChangeBatch()
+
+        XCTAssertEqual(changeCount, 1)
+        XCTAssertEqual(snapshots, [[rootB.id, rootA.id]])
+    }
+
     func testDefaultWorkspaceAndWindowRootsUseCESupportRoot() {
         let workspaceRoot = WorkspaceStoragePaths.defaultRoot.path
         XCTAssertTrue(workspaceRoot.contains("/Application Support/RepoPrompt CE/Workspaces"), workspaceRoot)
@@ -169,6 +223,32 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertFalse(encoded.contains("workingFilePaths"), encoded)
         XCTAssertFalse(encoded.contains("contextBuilderState"), encoded)
         XCTAssertFalse(encoded.contains("discoveryInstructions"), encoded)
+    }
+
+    func testLoadFolderPublishesRootShellProjectionWhenReorderIsNoOp() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptRootSyncTests")
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        try "hello".write(to: tempRoot.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        let viewModel = WorkspaceFilesViewModel()
+        let workspace = WorkspaceModel(name: "Load Folder", repoPaths: [tempRoot.path])
+        var changeCount = 0
+        var snapshots: [[UUID]] = []
+        var cancellables = Set<AnyCancellable>()
+        viewModel.rootShellProjectionsChangedPublisher
+            .sink {
+                changeCount += 1
+                snapshots.append(viewModel.visibleRootShellProjections.map(\.id))
+            }
+            .store(in: &cancellables)
+
+        try await viewModel.loadFolder(at: tempRoot, for: workspace)
+
+        XCTAssertEqual(changeCount, 1)
+        XCTAssertEqual(snapshots, [viewModel.visibleRootShellProjections.map(\.id)])
+        XCTAssertEqual(viewModel.visibleRootShellProjections.map(\.fullPath), [tempRoot.path])
     }
 
     func testWorkspaceFolderLoadConcurrencyLimitIsBounded() {

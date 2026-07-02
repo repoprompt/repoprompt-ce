@@ -63,7 +63,8 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
     let windowID: Int
 
     private var cancellables: Set<AnyCancellable> = []
-    private var resnapshotTask: Task<Void, Never>?
+    private var rootRowsResnapshotTask: Task<Void, Never>?
+    private var workspaceMetadataResnapshotTask: Task<Void, Never>?
 
     var workspaceManagerForPicker: WorkspaceManagerViewModel {
         workspaceManager
@@ -84,12 +85,14 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         self.workspaceManager = workspaceManager
         self.windowID = windowID
 
-        resnapshot()
+        resnapshotRootRows()
+        resnapshotWorkspaceMetadata()
         observeInputs()
     }
 
     deinit {
-        resnapshotTask?.cancel()
+        rootRowsResnapshotTask?.cancel()
+        workspaceMetadataResnapshotTask?.cancel()
     }
 
     static func rows(
@@ -158,7 +161,7 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         rootChanges
             .sink { [weak self] in
                 Task { @MainActor in
-                    self?.scheduleResnapshot()
+                    self?.scheduleRootRowsResnapshot()
                 }
             }
             .store(in: &cancellables)
@@ -166,7 +169,7 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         gitContextChanges
             .sink { [weak self] in
                 Task { @MainActor in
-                    self?.scheduleResnapshot()
+                    self?.scheduleRootRowsResnapshot()
                 }
             }
             .store(in: &cancellables)
@@ -174,34 +177,49 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         workspaceManager.objectWillChange
             .sink { [weak self] _ in
                 Task { @MainActor in
-                    self?.scheduleResnapshot()
+                    self?.scheduleWorkspaceMetadataResnapshot()
                 }
             }
             .store(in: &cancellables)
     }
 
-    private func scheduleResnapshot() {
-        resnapshotTask?.cancel()
-        resnapshotTask = Task { [weak self] in
+    private func scheduleRootRowsResnapshot() {
+        rootRowsResnapshotTask?.cancel()
+        rootRowsResnapshotTask = Task { [weak self] in
             await Task.yield()
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                self?.resnapshot()
+                self?.resnapshotRootRows()
             }
         }
     }
 
-    private func resnapshot() {
+    private func scheduleWorkspaceMetadataResnapshot() {
+        workspaceMetadataResnapshotTask?.cancel()
+        workspaceMetadataResnapshotTask = Task { [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.resnapshotWorkspaceMetadata()
+            }
+        }
+    }
+
+    private func resnapshotRootRows() {
         let nextRootRows = Self.rows(
             from: rootProjections(),
             gitContextLookup: gitContextLookup
         )
-        let nextWorkspaceLabel = Self.workspaceLabel(for: workspaceManager.activeWorkspace)
-        let nextIsExitDisabled = workspaceManager.activeWorkspace?.isSystemWorkspace ?? true
 
         if rootRows != nextRootRows {
             rootRows = nextRootRows
         }
+    }
+
+    private func resnapshotWorkspaceMetadata() {
+        let nextWorkspaceLabel = Self.workspaceLabel(for: workspaceManager.activeWorkspace)
+        let nextIsExitDisabled = workspaceManager.activeWorkspace?.isSystemWorkspace ?? true
+
         if workspaceLabel != nextWorkspaceLabel {
             workspaceLabel = nextWorkspaceLabel
         }

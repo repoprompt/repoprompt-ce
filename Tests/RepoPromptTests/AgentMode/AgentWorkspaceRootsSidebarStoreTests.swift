@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPrompt
 import XCTest
@@ -77,6 +78,34 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows[1].gitContext, contextB)
         XCTAssertEqual(rows[1].gitContext?.breadcrumbText, "Repo / B / feature/b")
         XCTAssertTrue(rows[1].gitContext?.isMain == true)
+    }
+
+    func testWorkspaceManagerChangesDoNotRefreshRootRows() async {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+        var projections = [rootA]
+        let rootChanges = PassthroughSubject<Void, Never>()
+        let manager = makeWorkspaceManager()
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { projections },
+            rootChanges: rootChanges.eraseToAnyPublisher(),
+            workspaceManager: manager,
+            windowID: -1
+        )
+        XCTAssertEqual(store.rootRows.map(\.id), [rootA.id])
+
+        projections = [rootB]
+        let metadataWorkspace = WorkspaceModel(name: "Manager Metadata Only", repoPaths: [])
+        manager.workspaces = [metadataWorkspace]
+        manager.activeWorkspace = metadataWorkspace
+        await waitUntil { store.workspaceLabel == "Manager Metadata…" }
+
+        XCTAssertEqual(store.rootRows.map(\.id), [rootA.id])
+
+        rootChanges.send(())
+        await waitUntil { store.rootRows.map(\.id) == [rootB.id] }
+
+        XCTAssertEqual(store.rootRows.map(\.id), [rootB.id])
     }
 
     // MARK: - Root context actions
@@ -361,6 +390,46 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
             isAvailable: true
         )
+    }
+
+    private func makeWorkspaceManager() -> WorkspaceManagerViewModel {
+        let fileManager = WorkspaceFilesViewModel()
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1,
+            settingsManager: WindowSettingsManager(windowID: -1)
+        )
+        return WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+    }
+
+    private func drainSidebarStoreTasks() async {
+        await Task.yield()
+        await Task.yield()
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTFail("Timed out waiting for condition")
     }
 
     private func makeProjection(

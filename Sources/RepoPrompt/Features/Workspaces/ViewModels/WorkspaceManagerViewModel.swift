@@ -6042,77 +6042,82 @@ class WorkspaceManagerViewModel: ObservableObject {
         #if DEBUG
             let rootAttachLoopStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        for result in hydrationResults.sorted(by: { $0.request.rootIndex < $1.request.rootIndex }) {
-            if result.wasCancelled {
-                continue
-            }
-            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else {
-                if let rootRecord = result.rootRecord {
-                    await fileManager.workspaceFileContextStore.unloadRoot(id: rootRecord.id)
+        let reorderChanged: Bool
+        do {
+            fileManager.beginRootShellProjectionChangeBatch()
+            defer { fileManager.endRootShellProjectionChangeBatch() }
+            for result in hydrationResults.sorted(by: { $0.request.rootIndex < $1.request.rootIndex }) {
+                if result.wasCancelled {
+                    continue
                 }
-                continue
-            }
-            if let failure = result.failure {
-                failures.append(failure)
-            }
-            guard let rootRecord = result.rootRecord else {
-                workspaceSearchReadinessState = .loadingCatalog(
-                    workspaceID: workspace.id,
-                    generation: hydrationGeneration,
-                    loadedRootCount: loadedRootCount,
-                    expectedRootCount: rootLoadRequests.count,
-                    failures: failures
-                )
-                continue
-            }
-            do {
-                #if DEBUG
-                    let rootAttachStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-                #endif
-                try fileManager.attachRootShell(for: rootRecord, workspaceID: workspace.id)
-                loadedRootCount += 1
-                #if DEBUG
-                    debugRecordRootShellAttach(
-                        workspace: workspace,
-                        rootRecord: rootRecord,
-                        request: result.request,
-                        attachedPrimaryRoots: loadedRootCount,
-                        failureCount: failures.count,
-                        attachDurationMS: rootAttachStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) },
-                        outcome: "success"
+                guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else {
+                    if let rootRecord = result.rootRecord {
+                        await fileManager.workspaceFileContextStore.unloadRoot(id: rootRecord.id)
+                    }
+                    continue
+                }
+                if let failure = result.failure {
+                    failures.append(failure)
+                }
+                guard let rootRecord = result.rootRecord else {
+                    workspaceSearchReadinessState = .loadingCatalog(
+                        workspaceID: workspace.id,
+                        generation: hydrationGeneration,
+                        loadedRootCount: loadedRootCount,
+                        expectedRootCount: rootLoadRequests.count,
+                        failures: failures
                     )
-                #endif
-                workspaceSearchReadinessState = .loadingCatalog(
-                    workspaceID: workspace.id,
-                    generation: hydrationGeneration,
-                    loadedRootCount: loadedRootCount,
-                    expectedRootCount: rootLoadRequests.count,
-                    failures: failures
-                )
-                schedulePostCatalogRootWork(for: rootRecord, workspace: workspace, generation: hydrationGeneration)
-            } catch {
-                failures.append(WorkspaceRootLoadFailure(
-                    rootPath: result.request.canonicalPath,
-                    kind: .primaryWorkspace,
-                    errorDescription: String(describing: error)
-                ))
-                await fileManager.workspaceFileContextStore.unloadRoot(id: rootRecord.id)
-                #if DEBUG
-                    debugRecordRootShellAttach(
-                        workspace: workspace,
-                        rootRecord: rootRecord,
-                        request: result.request,
-                        attachedPrimaryRoots: loadedRootCount,
-                        failureCount: failures.count,
-                        attachDurationMS: nil,
-                        outcome: "error",
-                        error: String(describing: error)
+                    continue
+                }
+                do {
+                    #if DEBUG
+                        let rootAttachStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    #endif
+                    try fileManager.attachRootShell(for: rootRecord, workspaceID: workspace.id)
+                    loadedRootCount += 1
+                    #if DEBUG
+                        debugRecordRootShellAttach(
+                            workspace: workspace,
+                            rootRecord: rootRecord,
+                            request: result.request,
+                            attachedPrimaryRoots: loadedRootCount,
+                            failureCount: failures.count,
+                            attachDurationMS: rootAttachStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) },
+                            outcome: "success"
+                        )
+                    #endif
+                    workspaceSearchReadinessState = .loadingCatalog(
+                        workspaceID: workspace.id,
+                        generation: hydrationGeneration,
+                        loadedRootCount: loadedRootCount,
+                        expectedRootCount: rootLoadRequests.count,
+                        failures: failures
                     )
-                #endif
+                    schedulePostCatalogRootWork(for: rootRecord, workspace: workspace, generation: hydrationGeneration)
+                } catch {
+                    failures.append(WorkspaceRootLoadFailure(
+                        rootPath: result.request.canonicalPath,
+                        kind: .primaryWorkspace,
+                        errorDescription: String(describing: error)
+                    ))
+                    await fileManager.workspaceFileContextStore.unloadRoot(id: rootRecord.id)
+                    #if DEBUG
+                        debugRecordRootShellAttach(
+                            workspace: workspace,
+                            rootRecord: rootRecord,
+                            request: result.request,
+                            attachedPrimaryRoots: loadedRootCount,
+                            failureCount: failures.count,
+                            attachDurationMS: nil,
+                            outcome: "error",
+                            error: String(describing: error)
+                        )
+                    #endif
+                }
             }
+            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+            reorderChanged = fileManager.reorderRootFolders(to: pathsToLoad)
         }
-        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
-        let reorderChanged = fileManager.reorderRootFolders(to: pathsToLoad)
         let allPrimaryRootsVisibleSuccessfully = loadedRootCount == rootLoadRequests.count && failures.isEmpty
         #if DEBUG
             debugRecordAllPrimaryRootsVisible(
