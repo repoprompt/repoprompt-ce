@@ -49,7 +49,7 @@ final class MentionCoordinatorTests: XCTestCase {
         XCTAssertFalse(second.file.isChecked)
     }
 
-    func testClickingAncestorWindowMakesThatLevelCurrentForFurtherNavigation() async throws {
+    func testClickingAncestorWindowMakesThatLevelCurrentForFurtherNavigation() throws {
         let fixture = makeFixture(rootName: "ClickedWorkspace")
         let owner = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
@@ -73,15 +73,13 @@ final class MentionCoordinatorTests: XCTestCase {
         coordinator.mentionStarted(at: NSRect(x: 100, y: 100, width: 1, height: 18))
         coordinator.mentionNavigate(.down)
         coordinator.mentionNavigate(.right)
-        try await waitUntil {
-            coordinator.testOverlayWindowCount == 2
-                && !coordinator.testSuggestions(atLevel: 1).isEmpty
-        }
+        XCTAssertTrue(coordinator.testFlushPendingDebouncedQuery())
+        XCTAssertEqual(coordinator.testOverlayWindowCount, 2)
+        XCTAssertFalse(coordinator.testSuggestions(atLevel: 1).isEmpty)
         coordinator.mentionNavigate(.right)
-        try await waitUntil {
-            coordinator.testOverlayWindowCount == 3
-                && !coordinator.testSuggestions(atLevel: 2).isEmpty
-        }
+        XCTAssertTrue(coordinator.testFlushPendingDebouncedQuery())
+        XCTAssertEqual(coordinator.testOverlayWindowCount, 3)
+        XCTAssertFalse(coordinator.testSuggestions(atLevel: 2).isEmpty)
 
         let ancestorSuggestions = coordinator.testSuggestions(atLevel: 1)
         let previousHighlight = try XCTUnwrap(coordinator.testHighlightedIndex(atLevel: 1))
@@ -96,10 +94,9 @@ final class MentionCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(coordinator.testOverlayWindowCount, 2)
         coordinator.mentionNavigate(.right)
-        try await waitUntil {
-            coordinator.testOverlayWindowCount == 3
-                && !coordinator.testSuggestions(atLevel: 2).isEmpty
-        }
+        XCTAssertTrue(coordinator.testFlushPendingDebouncedQuery())
+        XCTAssertEqual(coordinator.testOverlayWindowCount, 3)
+        XCTAssertFalse(coordinator.testSuggestions(atLevel: 2).isEmpty)
 
         coordinator.mentionAccept()
         let expectedFileName = clickedFolder.displayName == "Sources"
@@ -108,7 +105,7 @@ final class MentionCoordinatorTests: XCTestCase {
         XCTAssertEqual(committed?.displayName, expectedFileName)
     }
 
-    func testDeallocatedManagerUpdatingToNilInvalidatesActiveMentionState() async {
+    func testDeallocatedManagerUpdatingToNilInvalidatesActiveMentionState() {
         var manager: WorkspaceFilesViewModel? = makeFixture(rootName: "ReleasedWorkspace").fileManager
         let textView = MentionTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
         let coordinator = MentionCoordinator(
@@ -124,12 +121,11 @@ final class MentionCoordinatorTests: XCTestCase {
         manager = nil
 
         coordinator.updateFileManager(nil)
-        try? await Task.sleep(nanoseconds: 150_000_000)
-
+        XCTAssertTrue(coordinator.testFlushPendingDebouncedQuery())
         XCTAssertTrue(coordinator.testSuggestions.isEmpty)
     }
 
-    func testWorkspaceSwitchInvalidatesStaleDebouncedQuery() async {
+    func testWorkspaceSwitchInvalidatesStaleDebouncedQuery() {
         let first = makeFixture(rootName: "FirstWorkspace")
         let second = makeFixture(rootName: "SecondWorkspace", fileName: "SecondOnly.swift")
         let textView = MentionTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
@@ -143,20 +139,8 @@ final class MentionCoordinatorTests: XCTestCase {
         coordinator.mentionStarted(at: .zero)
         coordinator.mentionQueryChanged("SecondOnly", parent: nil)
         coordinator.updateFileManager(second.fileManager)
-
-        try? await Task.sleep(nanoseconds: 150_000_000)
-
+        XCTAssertTrue(coordinator.testFlushPendingDebouncedQuery())
         XCTAssertTrue(coordinator.testSuggestions.isEmpty)
-    }
-
-    private func waitUntil(
-        _ condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        for _ in 0 ..< 200 {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition")
     }
 
     private func makeFixture(

@@ -91,6 +91,9 @@ final class MentionCoordinator: MentionTextViewDelegate {
     private let querySubject = PassthroughSubject<QueryRequest, Never>()
     private var cancellables = Set<AnyCancellable>()
     private var queryEpoch: UInt64 = 0
+    #if DEBUG
+        private var testPendingDebouncedQuery: QueryRequest?
+    #endif
     private var pendingReanchorTask: Task<Void, Never>?
     private var reanchorGeneration: UInt64 = 0
 
@@ -119,12 +122,16 @@ final class MentionCoordinator: MentionTextViewDelegate {
         parent: MentionSuggestion?,
         preserveIndex: Bool = false
     ) {
-        querySubject.send(QueryRequest(
+        let request = QueryRequest(
             query: query,
             parent: parent,
             preserveIndex: preserveIndex,
             epoch: queryEpoch
-        ))
+        )
+        #if DEBUG
+            testPendingDebouncedQuery = request
+        #endif
+        querySubject.send(request)
     }
 
     func mentionNavigate(_ command: MentionNavigationCommand) {
@@ -290,6 +297,17 @@ final class MentionCoordinator: MentionTextViewDelegate {
         func testHighlightedIndex(atLevel level: Int) -> Int? {
             guard levels.indices.contains(level) else { return nil }
             return levels[level].highlightedIndex
+        }
+
+        @discardableResult
+        func testFlushPendingDebouncedQuery(cancelScheduledEmission: Bool = true) -> Bool {
+            guard let request = testPendingDebouncedQuery else { return false }
+            testPendingDebouncedQuery = nil
+            runQuery(request)
+            if cancelScheduledEmission {
+                invalidatePendingQueries()
+            }
+            return true
         }
 
         func testClickOverlayRow(level: Int, index: Int) {
