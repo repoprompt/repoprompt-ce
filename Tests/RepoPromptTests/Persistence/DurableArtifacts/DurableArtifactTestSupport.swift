@@ -28,20 +28,73 @@ enum DurableArtifactTestSupport {
         token: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         crashAction: (@Sendable (DurableArtifactCrashPoint) throws -> Void)? = nil
     ) throws -> LocalDurableArtifactStore {
-        let hooks = DurableArtifactStoreHooks(
-            now: { now },
-            randomBytes: randomBytes,
-            token: token,
-            crash: { point in
-                if point == crashExitPoint { _exit(86) }
-                if point == crashPoint { throw DurableArtifactStoreError.simulatedCrash(point) }
-                try crashAction?(point)
+        #if DEBUG
+            return try makeStore(
+                at: applicationSupport,
+                now: now,
+                crashPoint: crashPoint,
+                crashExitPoint: crashExitPoint,
+                forcedDigestByte: forcedDigestByte,
+                randomBytes: randomBytes,
+                token: token,
+                crashAction: crashAction,
+                catalogCASBusy: { _ in }
+            )
+        #else
+            let hooks = DurableArtifactStoreHooks(
+                now: { now },
+                randomBytes: randomBytes,
+                token: token,
+                crash: { point in
+                    if point == crashExitPoint { _exit(86) }
+                    if point == crashPoint { throw DurableArtifactStoreError.simulatedCrash(point) }
+                    try crashAction?(point)
+                },
+                transformDigest: { digest in
+                    forcedDigestByte.map { Data(repeating: $0, count: 32) } ?? digest
+                }
+            )
+            return try makeStore(at: applicationSupport, hooks: hooks)
+        #endif
+    }
+
+    #if DEBUG
+        static func makeStore(
+            at applicationSupport: URL,
+            now: UInt64 = 10000,
+            crashPoint: DurableArtifactCrashPoint? = nil,
+            crashExitPoint: DurableArtifactCrashPoint? = nil,
+            forcedDigestByte: UInt8? = nil,
+            randomBytes: @escaping @Sendable (Int) throws -> Data = { count in
+                Data((0 ..< count).map { UInt8(truncatingIfNeeded: $0 + 17) })
             },
-            transformDigest: { digest in
-                forcedDigestByte.map { Data(repeating: $0, count: 32) } ?? digest
-            }
-        )
-        return try LocalDurableArtifactStore(
+            token: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
+            crashAction: (@Sendable (DurableArtifactCrashPoint) throws -> Void)? = nil,
+            catalogCASBusy: @escaping @Sendable (DurableArtifactCatalogCASBusyEvent) -> Void
+        ) throws -> LocalDurableArtifactStore {
+            let hooks = DurableArtifactStoreHooks(
+                now: { now },
+                randomBytes: randomBytes,
+                token: token,
+                crash: { point in
+                    if point == crashExitPoint { _exit(86) }
+                    if point == crashPoint { throw DurableArtifactStoreError.simulatedCrash(point) }
+                    try crashAction?(point)
+                },
+                transformDigest: { digest in
+                    forcedDigestByte.map { Data(repeating: $0, count: 32) } ?? digest
+                },
+                catalogCASBusy: catalogCASBusy
+            )
+            return try makeStore(at: applicationSupport, hooks: hooks)
+        }
+    #endif
+
+    private static func makeStore(
+        at applicationSupport: URL,
+        hooks: DurableArtifactStoreHooks
+    ) throws -> LocalDurableArtifactStore {
+        try LocalDurableArtifactStore(
             applicationSupportURL: applicationSupport,
             buildFlavor: "tests",
             framingPolicy: .default,
@@ -107,10 +160,78 @@ enum DurableArtifactTestSupport {
         )
     }
 
+    static func catalogCASWithBusyRetry(
+        timeout: TimeInterval = 1,
+        maximumAttempts: Int = 10000,
+        shouldRetryBusy: () -> Bool = { true },
+        diagnostics: () -> String = { "" },
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ operation: () throws -> DurableArtifactCatalogCASResult
+    ) throws -> DurableArtifactCatalogCASResult {
+        let deadline = Date().addingTimeInterval(timeout)
+        var attempts = 0
+        while true {
+            attempts += 1
+            let result = try operation()
+            guard result == .busy else { return result }
+            guard shouldRetryBusy() else { return result }
+            guard attempts < maximumAttempts, Date() < deadline else {
+                let details = diagnostics()
+                XCTFail(
+                    "Catalog CAS remained busy after \(attempts) attempts in \(timeout)s" +
+                        (details.isEmpty ? "" : ": \(details)"),
+                    file: file,
+                    line: line
+                )
+                return result
+            }
+            sched_yield()
+        }
+    }
+
     enum Failure: Error {
         case unexpectedPublication(DurableArtifactPublicationResult)
     }
 }
+
+#if DEBUG
+    final class DurableArtifactCatalogCASBusyRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recordedEvents: [DurableArtifactCatalogCASBusyEvent] = []
+
+        func record(_ event: DurableArtifactCatalogCASBusyEvent) {
+            lock.withLock {
+                recordedEvents.append(event)
+            }
+        }
+
+        func events() -> [DurableArtifactCatalogCASBusyEvent] {
+            lock.withLock { recordedEvents }
+        }
+
+        func summary() -> String {
+            let values = events()
+            guard !values.isEmpty else { return "no catalog CAS busy events" }
+            return values.map { event in
+                let operation = event.targetIsDeletion ? "delete" : "publish"
+                return "\(operation) \(event.familyRawValue) \(event.reason.rawValue) root=\(event.rootPath)"
+            }.joined(separator: "; ")
+        }
+
+        func containsIdentitySafeRemovalForDeletion(
+            familyRawValue: String,
+            rootPath: String
+        ) -> Bool {
+            events().contains { event in
+                event.targetIsDeletion &&
+                    event.familyRawValue == familyRawValue &&
+                    event.rootPath == rootPath &&
+                    event.reason == .identitySafeRemoval
+            }
+        }
+    }
+#endif
 
 enum DurableArtifactSubprocess {
     struct Context {

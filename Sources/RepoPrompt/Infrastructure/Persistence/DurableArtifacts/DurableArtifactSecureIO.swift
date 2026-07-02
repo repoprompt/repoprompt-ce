@@ -24,12 +24,63 @@ enum DurableArtifactCrashPoint: CaseIterable {
     case afterObsoleteVersionRename
 }
 
+#if DEBUG
+    enum DurableArtifactCatalogCASBusyReason: String, Equatable {
+        case layoutLock
+        case maintenanceLock
+        case catalogLock
+        case identitySafeRemoval
+    }
+
+    struct DurableArtifactCatalogCASBusyEvent: Equatable {
+        let rootPath: String
+        let familyRawValue: String
+        let targetIsDeletion: Bool
+        let reason: DurableArtifactCatalogCASBusyReason
+    }
+#endif
+
 struct DurableArtifactStoreHooks: @unchecked Sendable {
     var now: @Sendable () -> UInt64
     var randomBytes: @Sendable (Int) throws -> Data
     var token: @Sendable () -> String
     var crash: @Sendable (DurableArtifactCrashPoint) throws -> Void
     var transformDigest: @Sendable (Data) throws -> Data
+    #if DEBUG
+        var catalogCASBusy: @Sendable (DurableArtifactCatalogCASBusyEvent) -> Void
+    #endif
+
+    #if DEBUG
+        init(
+            now: @escaping @Sendable () -> UInt64,
+            randomBytes: @escaping @Sendable (Int) throws -> Data,
+            token: @escaping @Sendable () -> String,
+            crash: @escaping @Sendable (DurableArtifactCrashPoint) throws -> Void,
+            transformDigest: @escaping @Sendable (Data) throws -> Data,
+            catalogCASBusy: @escaping @Sendable (DurableArtifactCatalogCASBusyEvent) -> Void = { _ in }
+        ) {
+            self.now = now
+            self.randomBytes = randomBytes
+            self.token = token
+            self.crash = crash
+            self.transformDigest = transformDigest
+            self.catalogCASBusy = catalogCASBusy
+        }
+    #else
+        init(
+            now: @escaping @Sendable () -> UInt64,
+            randomBytes: @escaping @Sendable (Int) throws -> Data,
+            token: @escaping @Sendable () -> String,
+            crash: @escaping @Sendable (DurableArtifactCrashPoint) throws -> Void,
+            transformDigest: @escaping @Sendable (Data) throws -> Data
+        ) {
+            self.now = now
+            self.randomBytes = randomBytes
+            self.token = token
+            self.crash = crash
+            self.transformDigest = transformDigest
+        }
+    #endif
 
     static let live = DurableArtifactStoreHooks(
         now: { UInt64(max(0, Date().timeIntervalSince1970)) },

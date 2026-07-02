@@ -399,7 +399,15 @@ final class DurableArtifactIdentityLeaseGCTests: XCTestCase {
     func testCatalogMarksProtectObjectsAndMarkLossOnlyProducesCacheMiss() throws {
         let root = try DurableArtifactTestSupport.makeApplicationSupport()
         defer { try? FileManager.default.removeItem(at: root) }
-        let store = try DurableArtifactTestSupport.makeStore(at: root)
+        #if DEBUG
+            let catalogCASBusyRecorder = DurableArtifactCatalogCASBusyRecorder()
+            let store = try DurableArtifactTestSupport.makeStore(
+                at: root,
+                catalogCASBusy: { catalogCASBusyRecorder.record($0) }
+            )
+        #else
+            let store = try DurableArtifactTestSupport.makeStore(at: root)
+        #endif
         let id = try DurableArtifactTestSupport.publish(store)
         guard case let .published(pointer) = try store.compareAndSwapCatalog(
             family: id.family,
@@ -418,15 +426,33 @@ final class DurableArtifactIdentityLeaseGCTests: XCTestCase {
         XCTAssertEqual(retained.markedCount, 1)
         XCTAssertEqual(retained.quarantinedObjectCount, 0)
 
-        XCTAssertEqual(
+        #if DEBUG
+            let shouldRetryCatalogDeleteBusy = {
+                !catalogCASBusyRecorder.containsIdentitySafeRemovalForDeletion(
+                    familyRawValue: id.family.rawValue,
+                    rootPath: store.rootURL.path
+                )
+            }
+            let catalogCASDiagnostics = { catalogCASBusyRecorder.summary() }
+        #else
+            let shouldRetryCatalogDeleteBusy = { true }
+            let catalogCASDiagnostics = { "" }
+        #endif
+        // This test verifies that losing the catalog mark causes only a cache miss and GC collection.
+        // Catalog CAS itself is non-blocking, so lock-derived `.busy` can be transient; identity-safe
+        // removal `.busy` is a security signal and is intentionally not retried here.
+        let catalogDeletion = try DurableArtifactTestSupport.catalogCASWithBusyRetry(
+            shouldRetryBusy: shouldRetryCatalogDeleteBusy,
+            diagnostics: catalogCASDiagnostics
+        ) {
             try store.compareAndSwapCatalog(
                 family: id.family,
                 expectedRevision: pointer.revision,
                 target: nil,
                 admittedByteUpperBound: 0
-            ),
-            .deleted
-        )
+            )
+        }
+        XCTAssertEqual(catalogDeletion, .deleted, catalogCASDiagnostics())
         let removed = try store.garbageCollect(
             protecting: [],
             referenceEnumerator: nil,

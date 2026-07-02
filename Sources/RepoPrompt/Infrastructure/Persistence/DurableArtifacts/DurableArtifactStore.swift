@@ -250,6 +250,21 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
         installationIdentity = DurableArtifactInstallationIdentity(layout: layout, hooks: hooks)
     }
 
+    #if DEBUG
+        private func reportCatalogCASBusy(
+            _ reason: DurableArtifactCatalogCASBusyReason,
+            family: DurableArtifactFamily,
+            target: DurableArtifactObjectID?
+        ) {
+            hooks.catalogCASBusy(DurableArtifactCatalogCASBusyEvent(
+                rootPath: rootURL.path,
+                familyRawValue: family.rawValue,
+                targetIsDeletion: target == nil,
+                reason: reason
+            ))
+        }
+    #endif
+
     func repositoryNamespace(
         for commonDirectory: DurableArtifactCommonDirectoryIdentity
     ) throws -> WorkspaceDurableRepositoryNamespace {
@@ -605,7 +620,12 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
             exclusive: false,
             nonBlocking: true
         )
-        guard let layoutLock else { return .busy }
+        guard let layoutLock else {
+            #if DEBUG
+                reportCatalogCASBusy(.layoutLock, family: family, target: target)
+            #endif
+            return .busy
+        }
         defer { layoutLock.close() }
         try validateCurrentLayout()
         let maintenance = try DurableArtifactSecureIO.lockDescriptor(
@@ -614,7 +634,12 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
             exclusive: true,
             nonBlocking: true
         )
-        guard let maintenance else { return .busy }
+        guard let maintenance else {
+            #if DEBUG
+                reportCatalogCASBusy(.maintenanceLock, family: family, target: target)
+            #endif
+            return .busy
+        }
         defer { maintenance.close() }
         let catalogLock = try DurableArtifactSecureIO.lockDescriptor(
             parent: layout.catalogLocks,
@@ -622,7 +647,12 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
             exclusive: true,
             nonBlocking: true
         )
-        guard let catalogLock else { return .busy }
+        guard let catalogLock else {
+            #if DEBUG
+                reportCatalogCASBusy(.catalogLock, family: family, target: target)
+            #endif
+            return .busy
+        }
         defer { catalogLock.close() }
 
         let current: DurableArtifactCatalogPointer?
@@ -656,7 +686,12 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                 descriptor: currentFile.0.rawValue,
                 identity: currentFile.1,
                 beforeCapturedUnlink: { try self.hooks.crash(.beforeIdentitySafeRemoval) }
-            ) else { return .busy }
+            ) else {
+                #if DEBUG
+                    reportCatalogCASBusy(.identitySafeRemoval, family: family, target: target)
+                #endif
+                return .busy
+            }
             return .deleted
         }
         if current?.target == target, let current { return .unchanged(current) }

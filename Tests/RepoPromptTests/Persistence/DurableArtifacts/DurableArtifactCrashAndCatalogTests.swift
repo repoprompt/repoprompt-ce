@@ -77,7 +77,7 @@ final class DurableArtifactCrashAndCatalogTests: XCTestCase {
         let first = try DurableArtifactTestSupport.publish(store, identity: "catalog-a", records: ["a"])
         let second = try DurableArtifactTestSupport.publish(store, identity: "catalog-b", records: ["b"])
         XCTAssertNotEqual(first, second)
-        guard case let .published(initial) = try catalogCASWithBusyRetry({
+        guard case let .published(initial) = try DurableArtifactTestSupport.catalogCASWithBusyRetry({
             try store.compareAndSwapCatalog(
                 family: DurableArtifactTestSupport.family,
                 expectedRevision: nil,
@@ -94,7 +94,7 @@ final class DurableArtifactCrashAndCatalogTests: XCTestCase {
             ),
             .conflict(currentRevision: initial.revision)
         )
-        let replacement = try catalogCASWithBusyRetry {
+        let replacement = try DurableArtifactTestSupport.catalogCASWithBusyRetry {
             try store.compareAndSwapCatalog(
                 family: DurableArtifactTestSupport.family,
                 expectedRevision: initial.revision,
@@ -387,18 +387,6 @@ final class DurableArtifactCrashAndCatalogTests: XCTestCase {
                 DurableArtifactTestSupport.expectation(id: id)
             ) else { return XCTFail("\(mutation) should quarantine") }
         }
-    }
-
-    private func catalogCASWithBusyRetry(
-        _ operation: () throws -> DurableArtifactCatalogCASResult
-    ) throws -> DurableArtifactCatalogCASResult {
-        let deadline = Date().addingTimeInterval(1)
-        var result = try operation()
-        while result == .busy, Date() < deadline {
-            usleep(10000)
-            result = try operation()
-        }
-        return result
     }
 
     private func crashPoint(_ value: String) throws -> DurableArtifactCrashPoint {

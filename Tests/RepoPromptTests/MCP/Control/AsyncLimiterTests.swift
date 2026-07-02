@@ -4202,28 +4202,152 @@ import XCTest
     private actor LimiterSnapshotSignal {
         typealias Snapshot = AsyncLimiter.DebugSnapshot
 
-        private var latest: Snapshot?
-        private var waiter: (
-            predicate: @Sendable (Snapshot) -> Bool,
-            continuation: CheckedContinuation<Snapshot, Never>
-        )?
+        private struct HistoryEntry {
+            let index: Int
+            let snapshot: Snapshot
+        }
+
+        private struct Waiter {
+            let id: UUID
+            let startIndex: Int
+            let predicate: @Sendable (Snapshot) -> Bool
+            let continuation: CheckedContinuation<Snapshot, Never>
+            let file: StaticString
+            let line: UInt
+        }
+
+        private static let maximumHistoryCount = 512
+        private static let emptySnapshot = Snapshot(
+            limit: 0,
+            permits: 0,
+            activePermitCount: 0,
+            waiterCount: 0,
+            inFlight: 0,
+            oldestWaiterAgeMilliseconds: nil,
+            cancelledWaiterCount: 0,
+            isClosed: false,
+            isIdle: false
+        )
+
+        private var history: [HistoryEntry] = []
+        private var nextHistoryIndex = 0
+        private var nextSearchIndex = 0
+        private var waiters: [UUID: Waiter] = [:]
+        private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
 
         func record(_ snapshot: Snapshot) {
-            latest = snapshot
-            guard let waiter, waiter.predicate(snapshot) else { return }
-            self.waiter = nil
-            waiter.continuation.resume(returning: snapshot)
+            appendToHistory(snapshot)
+
+            var resumptions: [(continuation: CheckedContinuation<Snapshot, Never>, snapshot: Snapshot)] = []
+            for waiter in Array(waiters.values) {
+                guard let match = firstMatch(from: waiter.startIndex, predicate: waiter.predicate) else { continue }
+                waiters.removeValue(forKey: waiter.id)
+                timeoutTasks.removeValue(forKey: waiter.id)?.cancel()
+                nextSearchIndex = max(nextSearchIndex, match.index + 1)
+                resumptions.append((waiter.continuation, match.snapshot))
+            }
+            for resumption in resumptions {
+                resumption.continuation.resume(returning: resumption.snapshot)
+            }
         }
 
         func waitUntil(
+            timeout: Duration = .seconds(30),
+            file: StaticString = #filePath,
+            line: UInt = #line,
             _ predicate: @escaping @Sendable (Snapshot) -> Bool
         ) async -> Snapshot {
-            if let latest, predicate(latest) {
-                return latest
+            let waiterID = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if let match = firstMatch(from: nextSearchIndex, predicate: predicate) {
+                        nextSearchIndex = max(nextSearchIndex, match.index + 1)
+                        continuation.resume(returning: match.snapshot)
+                        return
+                    }
+
+                    waiters[waiterID] = Waiter(
+                        id: waiterID,
+                        startIndex: nextSearchIndex,
+                        predicate: predicate,
+                        continuation: continuation,
+                        file: file,
+                        line: line
+                    )
+                    timeoutTasks[waiterID] = Task {
+                        do {
+                            try await Task.sleep(for: timeout)
+                        } catch {
+                            return
+                        }
+                        await self.timeoutWaiter(waiterID, timeout: timeout)
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelWaiter(waiterID) }
             }
-            return await withCheckedContinuation { continuation in
-                waiter = (predicate, continuation)
+        }
+
+        private func appendToHistory(_ snapshot: Snapshot) {
+            history.append(HistoryEntry(index: nextHistoryIndex, snapshot: snapshot))
+            nextHistoryIndex += 1
+            if history.count > Self.maximumHistoryCount {
+                history.removeFirst(history.count - Self.maximumHistoryCount)
             }
+        }
+
+        private func firstMatch(
+            from startIndex: Int,
+            predicate: @Sendable (Snapshot) -> Bool
+        ) -> (index: Int, snapshot: Snapshot)? {
+            for entry in history where entry.index >= startIndex {
+                if predicate(entry.snapshot) {
+                    return (entry.index, entry.snapshot)
+                }
+            }
+            return nil
+        }
+
+        private func timeoutWaiter(_ waiterID: UUID, timeout: Duration) {
+            guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
+            timeoutTasks.removeValue(forKey: waiterID)
+            XCTFail(timeoutMessage(timeout: timeout, waiter: waiter), file: waiter.file, line: waiter.line)
+            waiter.continuation.resume(returning: fallbackSnapshot())
+        }
+
+        private func cancelWaiter(_ waiterID: UUID) {
+            guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
+            timeoutTasks.removeValue(forKey: waiterID)?.cancel()
+            waiter.continuation.resume(returning: fallbackSnapshot())
+        }
+
+        private func fallbackSnapshot() -> Snapshot {
+            history.last?.snapshot ?? Self.emptySnapshot
+        }
+
+        private func timeoutMessage(timeout: Duration, waiter: Waiter) -> String {
+            """
+            Timed out after \(timeout) waiting for AsyncLimiter snapshot. \
+            retainedSnapshots=\(history.count), totalSnapshots=\(nextHistoryIndex), \
+            nextSearchIndex=\(nextSearchIndex), waiterStartIndex=\(waiter.startIndex), \
+            last=\(history.last.map { Self.describe($0.snapshot) } ?? "none")
+            Snapshot history tail:
+            \(historyTailDescription(limit: 50))
+            """
+        }
+
+        private func historyTailDescription(limit: Int) -> String {
+            guard !history.isEmpty else { return "no snapshots recorded" }
+            return history.suffix(limit)
+                .map { "[\($0.index)] \(Self.describe($0.snapshot))" }
+                .joined(separator: "\n")
+        }
+
+        private static func describe(_ snapshot: Snapshot) -> String {
+            "limit=\(snapshot.limit) permits=\(snapshot.permits) active=\(snapshot.activePermitCount) " +
+                "waiters=\(snapshot.waiterCount) inFlight=\(snapshot.inFlight) " +
+                "oldestWaiterMs=\(snapshot.oldestWaiterAgeMilliseconds.map(String.init) ?? "nil") " +
+                "cancelled=\(snapshot.cancelledWaiterCount) closed=\(snapshot.isClosed) idle=\(snapshot.isIdle)"
         }
     }
 #endif
