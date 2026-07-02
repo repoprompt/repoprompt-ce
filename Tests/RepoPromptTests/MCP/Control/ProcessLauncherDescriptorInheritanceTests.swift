@@ -95,8 +95,8 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         XCTAssertFalse(Self.hasCloseOnExec(sessionFD))
 
         let spawned = try ProcessLauncher.spawn(
-            command: "/bin/sleep",
-            arguments: ["5"],
+            command: "/bin/cat",
+            arguments: [],
             environment: ProcessInfo.processInfo.environment,
             workingDirectory: nil
         )
@@ -135,7 +135,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
 
             var environment = ProcessInfo.processInfo.environment
             environment["SESSION_FD"] = String(sessionFD)
-            let script = "if [ -e \"/dev/fd/$SESSION_FD\" ]; then printf 'session:open\\n'; else printf 'session:closed\\n'; fi; sleep 5"
+            let script = "if [ -e \"/dev/fd/$SESSION_FD\" ]; then printf 'session:open\\n'; else printf 'session:closed\\n'; fi; exec /bin/cat >/dev/null"
             let spawned = try ProcessLauncher.spawn(
                 command: "/bin/sh",
                 arguments: ["-c", script],
