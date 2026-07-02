@@ -322,25 +322,60 @@ final class DurableArtifactCrashAndCatalogTests: XCTestCase {
             "v1/catalogs/\(DurableArtifactTestSupport.family.rawValue).catalog"
         )
         let replacement = Data("attacker replacement".utf8)
-        let attacking = try DurableArtifactTestSupport.makeStore(at: root, crashAction: { point in
-            guard point == .beforeIdentitySafeRemoval else { return }
-            XCTAssertFalse(FileManager.default.fileExists(atPath: catalog.path))
-            guard FileManager.default.createFile(atPath: catalog.path, contents: replacement) else {
-                throw CocoaError(.fileWriteUnknown)
+        #if DEBUG
+            let catalogCASBusyRecorder = DurableArtifactCatalogCASBusyRecorder()
+            let attacking = try DurableArtifactTestSupport.makeStore(
+                at: root,
+                crashAction: { point in
+                    guard point == .beforeIdentitySafeRemoval else { return }
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: catalog.path))
+                    guard FileManager.default.createFile(atPath: catalog.path, contents: replacement) else {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
+                    guard chmod(catalog.path, 0o600) == 0 else {
+                        throw DurableArtifactStoreError.ioFailure(operation: "replacement-mode", code: errno)
+                    }
+                },
+                catalogCASBusy: { catalogCASBusyRecorder.record($0) }
+            )
+            let shouldRetryCatalogDeleteBusy = {
+                !catalogCASBusyRecorder.containsIdentitySafeRemovalForDeletion(
+                    familyRawValue: DurableArtifactTestSupport.family.rawValue,
+                    rootPath: attacking.rootURL.path
+                )
             }
-            guard chmod(catalog.path, 0o600) == 0 else {
-                throw DurableArtifactStoreError.ioFailure(operation: "replacement-mode", code: errno)
+            let catalogCASDiagnostics = { catalogCASBusyRecorder.summary() }
+            let deletion = try DurableArtifactTestSupport.catalogCASWithBusyRetry(
+                shouldRetryBusy: shouldRetryCatalogDeleteBusy,
+                diagnostics: catalogCASDiagnostics
+            ) {
+                try attacking.compareAndSwapCatalog(
+                    family: DurableArtifactTestSupport.family,
+                    expectedRevision: pointer.revision,
+                    target: nil,
+                    admittedByteUpperBound: 0
+                )
             }
-        })
-        XCTAssertEqual(
-            try attacking.compareAndSwapCatalog(
+        #else
+            let attacking = try DurableArtifactTestSupport.makeStore(at: root, crashAction: { point in
+                guard point == .beforeIdentitySafeRemoval else { return }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: catalog.path))
+                guard FileManager.default.createFile(atPath: catalog.path, contents: replacement) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+                guard chmod(catalog.path, 0o600) == 0 else {
+                    throw DurableArtifactStoreError.ioFailure(operation: "replacement-mode", code: errno)
+                }
+            })
+            let catalogCASDiagnostics = { "" }
+            let deletion = try attacking.compareAndSwapCatalog(
                 family: DurableArtifactTestSupport.family,
                 expectedRevision: pointer.revision,
                 target: nil,
                 admittedByteUpperBound: 0
-            ),
-            .busy
-        )
+            )
+        #endif
+        XCTAssertEqual(deletion, .busy, catalogCASDiagnostics())
         XCTAssertEqual(try Data(contentsOf: catalog), replacement)
         var replacementStatus = stat()
         XCTAssertEqual(lstat(catalog.path, &replacementStatus), 0)
