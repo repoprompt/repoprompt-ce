@@ -35,6 +35,11 @@ final class ReviewGitRepositoryFixture {
         _ = try runGit(["config", "user.name", "RepoPrompt Test"], at: root)
         _ = try runGit(["config", "user.email", "repoprompt@example.test"], at: root)
         _ = try runGit(["config", "commit.gpgSign", "false"], at: root)
+        // The product reads checkout config at engine runtime with the host environment, so
+        // fixture repos pin transform-relevant keys locally to stay hermetic against host gitconfig.
+        _ = try runGit(["config", "core.autocrlf", "false"], at: root)
+        _ = try runGit(["config", "core.eol", "native"], at: root)
+        _ = try runGit(["config", "core.attributesfile", "/dev/null"], at: root)
         _ = try runGit(["checkout", "-b", "main"], at: root)
 
         for (path, contents) in files {

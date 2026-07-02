@@ -2283,6 +2283,33 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         XCTAssertEqual(source, .cleanManifest)
     }
 
+    /// Characterization test codifying the current silent-skip behavior described in
+    /// docs/investigations/codemap-binding-engine-test-hang-2026-07-02.md. The codemaps owner
+    /// may deliberately change this behavior; update this test in the same commit if so.
+    func testAutoCRLFInputClassifiesWorktreeAndSkipsManifestPersistence() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+        )
+        _ = try repository.runGit(["config", "core.autocrlf", "input"], at: root)
+        let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        let runtime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+
+        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Warm.swift")) else {
+            return XCTFail("Expected worktree-classified demand to resolve ready.")
+        }
+
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.counters.worktreeClassifications, 1)
+        XCTAssertEqual(accounting.counters.cleanClassifications, 0)
+        XCTAssertEqual(accounting.counters.manifestWrites, 0)
+        XCTAssertEqual(accounting.counters.manifestFailures, 0)
+        XCTAssertEqual(accounting.counters.validatedWorktreeReads, 1)
+    }
+
     func testManifestAdoptionSkipsRecordWhenCandidateGenerationIsNewerThanBindingGeneration() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
@@ -2810,15 +2837,23 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             ))
         }
         let sharedLoadEntered = await loadGate.waitUntilEntered()
-        XCTAssertTrue(sharedLoadEntered)
+        guard sharedLoadEntered else {
+            await loadGate.release()
+            return XCTFail("Expected the warm manifest load to reach afterReadAdmission.")
+        }
         let second = Task {
             await fixture.engine.demand(fixture.demand(
                 path: "Sources/Warm.swift",
                 priority: .background
             ))
         }
-        while await fixture.engine.accounting().queuedRequestCount != 1 {
-            await Task.yield()
+        let secondQueued = await waitForEngineCondition {
+            await fixture.engine.accounting().queuedRequestCount == 1
+        }
+        guard secondQueued else {
+            first.cancel()
+            await loadGate.release()
+            return XCTFail("Expected the second demand to occupy the queue slot.")
         }
 
         first.cancel()
@@ -2837,7 +2872,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         XCTAssertEqual(recovered.counters.cancellations, 1)
 
         await loadGate.release()
-        guard await isReady(second.value) else {
+        guard let secondResult = await demandResult(second, before: .seconds(10)), isReady(secondResult) else {
             return XCTFail("Expected the remaining waiter to complete from the shared adoption.")
         }
         XCTAssertFalse(sharedLoadCancellation.value)
