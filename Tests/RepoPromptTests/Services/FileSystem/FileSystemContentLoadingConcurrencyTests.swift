@@ -506,7 +506,10 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             }
         }
         let reachedLimit = await enteredCount.waitUntilValue(atLeast: limit)
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        let saturatedSnapshot = await waitForProcessContentReadWorkerLimiterSnapshot {
+            $0.activePermitCount == limit &&
+                $0.queuedWaiterCount >= readCount - limit
+        }
         let enteredBeforeRelease = await enteredCount.value()
         await gate.release()
         for task in tasks {
@@ -514,6 +517,8 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         XCTAssertTrue(reachedLimit)
+        XCTAssertEqual(saturatedSnapshot.activePermitCount, limit)
+        XCTAssertGreaterThanOrEqual(saturatedSnapshot.queuedWaiterCount, readCount - limit)
         XCTAssertEqual(enteredBeforeRelease, limit)
         await service.setContentReadChunkHandlerForTesting(nil)
     }
@@ -1130,15 +1135,38 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             timeoutNanoseconds: UInt64 = 1_000_000_000,
             predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
         ) async -> ContentReadAsyncLimiter.Snapshot {
+            await waitForLimiterSnapshot(
+                timeoutNanoseconds: timeoutNanoseconds,
+                snapshotProvider: { await limiter.snapshotForTesting() },
+                predicate: predicate
+            )
+        }
+
+        private func waitForProcessContentReadWorkerLimiterSnapshot(
+            timeoutNanoseconds: UInt64 = 1_000_000_000,
+            predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
+        ) async -> ContentReadAsyncLimiter.Snapshot {
+            await waitForLimiterSnapshot(
+                timeoutNanoseconds: timeoutNanoseconds,
+                snapshotProvider: { await FileSystemService.contentReadWorkerLimiterSnapshotForTesting() },
+                predicate: predicate
+            )
+        }
+
+        private func waitForLimiterSnapshot(
+            timeoutNanoseconds: UInt64,
+            snapshotProvider: () async -> ContentReadAsyncLimiter.Snapshot,
+            predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
+        ) async -> ContentReadAsyncLimiter.Snapshot {
             let interval: UInt64 = 10_000_000
             var waited: UInt64 = 0
             while waited < timeoutNanoseconds {
-                let snapshot = await limiter.snapshotForTesting()
+                let snapshot = await snapshotProvider()
                 if predicate(snapshot) { return snapshot }
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }
-            return await limiter.snapshotForTesting()
+            return await snapshotProvider()
         }
 
         private func saturateContentReadWorkers(
@@ -1306,10 +1334,17 @@ private actor AsyncGate {
 }
 
 private actor AsyncCounter {
+    private struct Waiter {
+        let target: Int
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private var count = 0
+    private var waiters: [UUID: Waiter] = [:]
 
     func incrementAndValue() -> Int {
         count += 1
+        resumeSatisfiedWaiters()
         return count
     }
 
@@ -1318,13 +1353,37 @@ private actor AsyncCounter {
     }
 
     func waitUntilValue(atLeast target: Int, timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-        let interval: UInt64 = 10_000_000
-        var waited: UInt64 = 0
-        while count < target, waited < timeoutNanoseconds {
-            try? await Task.sleep(nanoseconds: interval)
-            waited += interval
+        guard count < target else { return true }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard count < target, !Task.isCancelled else {
+                    continuation.resume(returning: count >= target)
+                    return
+                }
+                waiters[waiterID] = Waiter(target: target, continuation: continuation)
+                Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    await self.finishWaiter(waiterID)
+                }
+            }
+        } onCancel: {
+            Task { await self.finishWaiter(waiterID) }
         }
-        return count >= target
+    }
+
+    private func resumeSatisfiedWaiters() {
+        let readyIDs = waiters.compactMap { id, waiter in
+            waiter.target <= count ? id : nil
+        }
+        for id in readyIDs {
+            waiters.removeValue(forKey: id)?.continuation.resume(returning: true)
+        }
+    }
+
+    private func finishWaiter(_ waiterID: UUID) {
+        guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
+        waiter.continuation.resume(returning: count >= waiter.target)
     }
 }
 
@@ -1342,9 +1401,14 @@ private actor AsyncValueRecorder {
 
 private actor AsyncSignal {
     private var marked = false
+    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
 
     func mark() {
+        guard !marked else { return }
         marked = true
+        let continuations = Array(waiters.values)
+        waiters.removeAll()
+        continuations.forEach { $0.resume(returning: true) }
     }
 
     func isMarked() -> Bool {
@@ -1352,12 +1416,27 @@ private actor AsyncSignal {
     }
 
     func waitUntilMarked(timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-        let interval: UInt64 = 10_000_000
-        var waited: UInt64 = 0
-        while !marked, waited < timeoutNanoseconds {
-            try? await Task.sleep(nanoseconds: interval)
-            waited += interval
+        guard !marked else { return true }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !marked, !Task.isCancelled else {
+                    continuation.resume(returning: marked)
+                    return
+                }
+                waiters[waiterID] = continuation
+                Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    await self.finishWaiter(waiterID)
+                }
+            }
+        } onCancel: {
+            Task { await self.finishWaiter(waiterID) }
         }
-        return marked
+    }
+
+    private func finishWaiter(_ waiterID: UUID) {
+        guard let continuation = waiters.removeValue(forKey: waiterID) else { return }
+        continuation.resume(returning: marked)
     }
 }

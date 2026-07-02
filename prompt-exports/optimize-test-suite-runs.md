@@ -2948,3 +2948,113 @@ Primary metric eligible: no
 | 2 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testOverlappingStopAndStartUnregistersOldObserverAndReleasesCallbacks` | 3 | 0.001 | 0.001 | 0.001 | 0 |
 | 3 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes` | 3 | 0.001 | 0.001 | 0.001 | 0 |
 | 4 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testStopWaitsForCapturedObserverToEnterMailboxAndDrain` | 3 | 0.000 | 0.000 | 0.000 | 0 |
+### Focused: 2026-07-02T17:59:08+00:00 — root — wave2-before-m2-content-loading-gates-20260702T175847Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.FileSystemContentLoadingConcurrencyTests --json`
+Artifact: `prompt-exports/test-suite-focused-root-wave2-before-m2-content-loading-gates-20260702T175847Z.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.FileSystemContentLoadingConcurrencyTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 16.807 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/71ae8032-8697-4248-8164-2597e9ca69e4.log` |  |
+| 2 | yes | 1.706 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f60b3c14-391b-4b89-b7df-fbf676004c96.log` |  |
+| 3 | yes | 1.619 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a02a4ddd-1936-4f37-94fe-8f74bfbf4642.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T17:59:08+00:00/304a44f19e27 | wave2-before-m2-content-loading-gates-20260702T175847Z | root | filtered: `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | 3 valid + 0 invalid | 2825 | 7 | 2832 | 1.706 | 16.807 | 0.0512 | noisy | `prompt-exports/test-suite-focused-root-wave2-before-m2-content-loading-gates-20260702T175847Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | 24 | 0.880 | 0.224 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testSlowSameRootContentReadDoesNotDelayAcceptedWatcherFlush` | 3 | 0.224 | 0.224 | 0.224 | 0 |
+| 2 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testOffActorContentReadWorkerConcurrencyIsBounded` | 3 | 0.128 | 0.129 | 0.129 | 0 |
+| 3 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerReservesPermitForLatencySensitiveReadsAcrossSupportedCapacities` | 3 | 0.109 | 0.206 | 0.206 | 0 |
+| 4 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerRoundRobinsOwnersWhilePreservingOwnerFIFO` | 3 | 0.060 | 0.061 | 0.061 | 0 |
+| 5 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerForegroundTokensBlockCodemapReplacementUntilFinalEnd` | 3 | 0.048 | 0.048 | 0.048 | 0 |
+| 6 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerNeverPromotesAgedCodemapAheadOfForegroundWaiters` | 3 | 0.046 | 0.047 | 0.047 | 0 |
+| 7 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerBoundsQueueCancelsWaitersAndReturnsIdle` | 3 | 0.038 | 0.042 | 0.042 | 0 |
+| 8 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testQueuedContentReadWorkerPermitWaitRecordsCorrelatedAcquireAndPrivacySafeDimensions` | 3 | 0.038 | 0.040 | 0.040 | 0 |
+| 9 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testStaleChunkedReadDoesNotOverwriteEncodingCacheAfterConcurrentEdit` | 3 | 0.037 | 0.041 | 0.041 | 0 |
+| 10 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testCancelledQueuedContentReadWorkerPermitWaitRecordsCancellationWithoutAcquisitionOrLeak` | 3 | 0.037 | 0.037 | 0.037 | 0 |
+| 11 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentLoadingPreservesTextBinaryEmptyFallbackLargeFileAndCacheBehavior` | 3 | 0.024 | 0.025 | 0.025 | 0 |
+| 12 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerPrioritizesInteractiveWaitersOverBulk` | 3 | 0.024 | 0.024 | 0.024 | 0 |
+| 13 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testChunkedReadEnforcesConfiguredSizeLimitWhenFileGrows` | 3 | 0.022 | 0.022 | 0.022 | 0 |
+| 14 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testSlowContentReadOnRootADoesNotDelayRootBReadAndWatcherFlush` | 3 | 0.020 | 0.021 | 0.021 | 0 |
+| 15 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testForegroundActivityTokensCleanUpOnSuccessErrorAndCancellation` | 3 | 0.013 | 0.013 | 0.013 | 0 |
+| 16 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testCancelledActiveBackgroundReadRetainsPermitUntilBodyReturns` | 3 | 0.012 | 0.013 | 0.013 | 0 |
+| 17 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testCancellationDuringChunkedReadDoesNotCommitEncodingCache` | 3 | 0.005 | 0.007 | 0.007 | 0 |
+| 18 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testValidatedRawContentRejectsSymlinkRetargetDuringRead` | 3 | 0.003 | 0.003 | 0.003 | 0 |
+| 19 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentLoadingRejectsTraversalAndSymlinkTargets` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+| 20 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testValidatedRawContentReadsExactBytesWithoutProbeOrReread` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+
+### Focused: 2026-07-02T18:02:30+00:00 — root — wave2-after-m2-content-loading-gates-20260702T180225Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.FileSystemContentLoadingConcurrencyTests --json`
+Artifact: `prompt-exports/test-suite-focused-root-wave2-after-m2-content-loading-gates-20260702T180225Z.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.FileSystemContentLoadingConcurrencyTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 1.563 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/eb839605-2479-403e-8097-ea75cb84731e.log` |  |
+| 2 | yes | 1.455 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d7e90aa4-a44e-46b7-9d78-a60bb605c5d8.log` |  |
+| 3 | yes | 1.443 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/bff4d446-4bc0-490a-8c4a-62c8d3e89219.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T18:02:30+00:00/304a44f19e27 | wave2-after-m2-content-loading-gates-20260702T180225Z | root | filtered: `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | 3 valid + 0 invalid | 2825 | 7 | 2832 | 1.455 | 1.563 | 0.0082 | stable | `prompt-exports/test-suite-focused-root-wave2-after-m2-content-loading-gates-20260702T180225Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | 24 | 0.685 | 0.219 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testSlowSameRootContentReadDoesNotDelayAcceptedWatcherFlush` | 3 | 0.215 | 0.219 | 0.219 | 0 |
+| 2 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerReservesPermitForLatencySensitiveReadsAcrossSupportedCapacities` | 3 | 0.079 | 0.082 | 0.082 | 0 |
+| 3 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerRoundRobinsOwnersWhilePreservingOwnerFIFO` | 3 | 0.049 | 0.053 | 0.053 | 0 |
+| 4 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerNeverPromotesAgedCodemapAheadOfForegroundWaiters` | 3 | 0.047 | 0.048 | 0.048 | 0 |
+| 5 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerForegroundTokensBlockCodemapReplacementUntilFinalEnd` | 3 | 0.046 | 0.049 | 0.049 | 0 |
+| 6 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testStaleChunkedReadDoesNotOverwriteEncodingCacheAfterConcurrentEdit` | 3 | 0.037 | 0.038 | 0.038 | 0 |
+| 7 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerBoundsQueueCancelsWaitersAndReturnsIdle` | 3 | 0.036 | 0.043 | 0.043 | 0 |
+| 8 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testCancelledQueuedContentReadWorkerPermitWaitRecordsCancellationWithoutAcquisitionOrLeak` | 3 | 0.030 | 0.033 | 0.033 | 0 |
+| 9 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentLoadingPreservesTextBinaryEmptyFallbackLargeFileAndCacheBehavior` | 3 | 0.025 | 0.025 | 0.025 | 0 |
+| 10 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentReadSchedulerPrioritizesInteractiveWaitersOverBulk` | 3 | 0.024 | 0.024 | 0.024 | 0 |
+| 11 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testChunkedReadEnforcesConfiguredSizeLimitWhenFileGrows` | 3 | 0.022 | 0.023 | 0.023 | 0 |
+| 12 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testQueuedContentReadWorkerPermitWaitRecordsCorrelatedAcquireAndPrivacySafeDimensions` | 3 | 0.022 | 0.023 | 0.023 | 0 |
+| 13 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testCancelledActiveBackgroundReadRetainsPermitUntilBodyReturns` | 3 | 0.012 | 0.015 | 0.015 | 0 |
+| 14 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testOffActorContentReadWorkerConcurrencyIsBounded` | 3 | 0.012 | 0.013 | 0.013 | 0 |
+| 15 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testSlowContentReadOnRootADoesNotDelayRootBReadAndWatcherFlush` | 3 | 0.008 | 0.010 | 0.010 | 0 |
+| 16 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testCancellationDuringChunkedReadDoesNotCommitEncodingCache` | 3 | 0.005 | 0.006 | 0.006 | 0 |
+| 17 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testValidatedRawContentRejectsSymlinkRetargetDuringRead` | 3 | 0.003 | 0.003 | 0.003 | 0 |
+| 18 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testContentLoadingRejectsTraversalAndSymlinkTargets` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+| 19 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testForegroundActivityTokensCleanUpOnSuccessErrorAndCancellation` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+| 20 | `RepoPromptTests.FileSystemContentLoadingConcurrencyTests` | `testValidatedRawContentReadsExactBytesWithoutProbeOrReread` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+
+### Wave 2 M2 member note: 2026-07-02T18:04Z — optimization-wave2-m2-content-loading-gates
+
+- Scope: test-only deterministic gates in `Tests/RepoPromptTests/Services/FileSystem/FileSystemContentLoadingConcurrencyTests.swift`; evidence-only updates under `prompt-exports/`; production diff `0`.
+- Contract preserved: `testOffActorContentReadWorkerConcurrencyIsBounded` still proves no overflow worker enters before the gate is released, now by observing a held-gate limiter snapshot with `activePermitCount == limit` and queued overflow work present before preserving `enteredBeforeRelease == limit`.
+- Source changes: replaced the 100ms negative wait with positive process-wide limiter snapshot proof; converted test-local `AsyncCounter.waitUntilValue` and `AsyncSignal.waitUntilMarked` from 10ms polling to continuation-backed waiters with timeout-returning, idempotent cleanup. Lifecycle/publication/snapshot positive polling helpers remain bounded polls where no exact signal exists; the 60s cancellation sentinel is untouched.
+- Focused before artifact: `prompt-exports/test-suite-focused-root-wave2-before-m2-content-loading-gates-20260702T175847Z.json` — `3 valid + 0 invalid`, median `1.706s`, observed p95 `16.807s`, relative MAD `0.0512`, noise `noisy`.
+- Focused after artifact: `prompt-exports/test-suite-focused-root-wave2-after-m2-content-loading-gates-20260702T180225Z.json` — `3 valid + 0 invalid`, median `1.455s`, observed p95 `1.563s`, relative MAD `0.0082`, noise `stable`.
+- Validation: `make dev-test FILTER=RepoPromptTests.FileSystemContentLoadingConcurrencyTests` passed, ticket `4e52f655-49cc-4513-b9ce-8a94083fc953`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/4e52f655-49cc-4513-b9ce-8a94083fc953.log`; `make dev-format-check` passed, ticket `dd7fce24-e74d-4c78-886f-628e8d206c3b`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/dd7fce24-e74d-4c78-886f-628e8d206c3b.log`.
+- Method delta `0`; contract delta `0`; scenario delta `0`; XCTest-ID delta `0`; ledger untouched; raw logs uncommitted.
+- root delta not individually measured; see future Wave 2 gate.
