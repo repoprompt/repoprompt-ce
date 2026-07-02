@@ -426,8 +426,13 @@ actor CodeMapRootManifestStore {
 
     #if DEBUG
         func waitForPendingAccessRefreshesForTesting() async {
-            while let task = accessRefreshTask {
-                await task.value
+            while true {
+                if let task = accessRefreshTask {
+                    await task.value
+                    continue
+                }
+                guard !pendingAccessRefreshes.isEmpty else { return }
+                await drainPendingAccessRefreshes()
             }
         }
     #endif

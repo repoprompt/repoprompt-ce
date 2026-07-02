@@ -1,0 +1,111 @@
+{
+  "artifact": "prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-contextbuilder-clean.json",
+  "artifact_kind": "failed_root_rebaseline_attempt",
+  "timestamp": "2026-07-01T21:28:41+00:00",
+  "target": "root",
+  "label": "reliability-gate-20260701-root-after-contextbuilder-clean",
+  "inventory": "prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json",
+  "scope": "complete",
+  "filter": null,
+  "primary_metric_eligible": false,
+  "source_guard": {
+    "kind": "metadata"
+  },
+  "git": {
+    "commit": "8bbaae9dabf7623226a7d192a5e0482df1eda490"
+  },
+  "command": [
+    "python3",
+    "Scripts/test_suite_optimizer.py",
+    "baseline",
+    "--target",
+    "root",
+    "--samples",
+    "5",
+    "--label",
+    "reliability-gate-20260701-root-after-contextbuilder-clean",
+    "--inventory",
+    "prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json",
+    "--scoreboard",
+    "prompt-exports/optimize-test-suite-runs.md",
+    "--output",
+    "prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-contextbuilder-clean.json",
+    "--source-change-guard",
+    "metadata"
+  ],
+  "intended_output": "prompt-exports/test-suite-baseline-root-reliability-gate-20260701-root-after-contextbuilder-clean.json",
+  "optimizer_exit": {
+    "normal_exit_observed": false,
+    "exit_code": 137,
+    "termination": "SIGKILL after canceling hung conductor sample; optimizer had no internal timeout and briefly advanced to a second sample during shutdown",
+    "notes": "The normal optimizer artifact was not emitted because there were zero valid samples and the first sample hung indefinitely in ./conductor test --json. The wrapper was stopped after preserving conductor evidence."
+  },
+  "summary": {
+    "requested_samples": 5,
+    "attempted_samples": 2,
+    "valid_samples": 0,
+    "invalid_samples": 2,
+    "median_execution_seconds": null,
+    "p95_execution_seconds": null,
+    "relative_mad": null,
+    "noise": "not_available_zero_valid",
+    "phase4_can_resume": false,
+    "context_builder_failures_repeated": false,
+    "top_invalid_cluster": "Primary root sample hung/stopped making log progress for about 54 minutes at RepoPromptTests.AgentWorktreeMergeAttentionTests/testActiveConflictOperationReturnsNilWhenOnlyTerminalOrReviewStatesArePresent. This is not a repeated known ContextBuilder failure. The second invalid sample was a cleanup cancellation after the optimizer advanced during shutdown, not an independent root failure signal."
+  },
+  "notes": "Measurement-only reliability gate. No code changes or commits. Artifact preserves a zero-valid root re-baseline attempt after the optimizer did not emit a normal baseline artifact.",
+  "samples": [
+    {
+      "index": 1,
+      "target": "root",
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--json"
+      ],
+      "ticket": "614bf6c0-e3d0-4e86-bf42-c7a96470acba",
+      "state": "canceled",
+      "exit_code": 130,
+      "valid": false,
+      "invalid_reasons": [
+        "sample hung or stopped producing XCTest log output for about 54 minutes",
+        "operator cancellation to preserve zero-valid evidence",
+        "terminal state canceled",
+        "test exit 130"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/614bf6c0-e3d0-4e86-bf42-c7a96470acba.log",
+      "failure_signature": {
+        "classification": "root_xctest_hang_stale_output",
+        "last_observed_test_before_stale_period": "RepoPromptTests.AgentWorktreeMergeAttentionTests/testActiveConflictOperationReturnsNilWhenOnlyTerminalOrReviewStatesArePresent",
+        "last_log_mtime_local": "2026-07-01 16:27:51 EDT",
+        "observed_stale_at_local": "2026-07-01 17:21:17 EDT",
+        "stale_duration_seconds_approx": 3206,
+        "context_builder_related": false
+      }
+    },
+    {
+      "index": 2,
+      "target": "root",
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--json"
+      ],
+      "ticket": "3f735856-82e5-43eb-bf68-7f18b8661f06",
+      "state": "canceled",
+      "exit_code": 130,
+      "valid": false,
+      "invalid_reasons": [
+        "cleanup cancellation after optimizer advanced to the next sample during shutdown",
+        "terminal state canceled",
+        "test exit 130"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3f735856-82e5-43eb-bf68-7f18b8661f06.log",
+      "failure_signature": {
+        "classification": "cleanup_cancellation_not_independent_failure_signal",
+        "last_observed_test_before_cancellation": "RepoPromptTests.CodeMapArtifactStoreTests/testPendingScanAdmissionAndReadRetainOneDescriptorAcrossAtomicReplacement",
+        "context_builder_related": false
+      }
+    }
+  ]
+}

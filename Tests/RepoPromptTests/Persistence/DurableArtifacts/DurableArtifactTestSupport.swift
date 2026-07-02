@@ -61,22 +61,31 @@ enum DurableArtifactTestSupport {
         family: DurableArtifactFamily = family,
         identity: String = "identity",
         records: [String] = ["a", "b"],
-        upperBound: UInt64 = 16 * 1024 * 1024
+        upperBound: UInt64 = 16 * 1024 * 1024,
+        retryBusy: Bool = false
     ) throws -> DurableArtifactObjectID {
-        let result = try store.publishObject(
-            family: family,
-            schemaVersion: 1,
-            canonicalIdentity: Data(identity.utf8),
-            admittedByteUpperBound: upperBound
-        ) { writer in
-            for record in records {
-                try writer.appendRecord(Data(record.utf8))
+        let attempts = retryBusy ? 10 : 1
+        for attempt in 1 ... attempts {
+            let result = try store.publishObject(
+                family: family,
+                schemaVersion: 1,
+                canonicalIdentity: Data(identity.utf8),
+                admittedByteUpperBound: upperBound
+            ) { writer in
+                for record in records {
+                    try writer.appendRecord(Data(record.utf8))
+                }
+            }
+            switch result {
+            case let .published(id, _), let .coalesced(id, _):
+                return id
+            case .busy where attempt < attempts:
+                usleep(10000)
+            default:
+                throw Failure.unexpectedPublication(result)
             }
         }
-        switch result {
-        case let .published(id, _), let .coalesced(id, _): return id
-        default: throw Failure.unexpectedPublication(result)
-        }
+        throw Failure.unexpectedPublication(.busy)
     }
 
     static func objectURL(store: LocalDurableArtifactStore, id: DurableArtifactObjectID) -> URL {

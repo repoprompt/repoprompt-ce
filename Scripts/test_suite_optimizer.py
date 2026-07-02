@@ -16,7 +16,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 LEDGER_COLUMNS = [
     "method_id",
@@ -58,6 +58,11 @@ XCTEST_CASE_RE = re.compile(
     r"(?P<status>passed|failed|skipped)(?: \((?P<paren_seconds>[0-9.]+) seconds\)"
     r"| after (?P<after_seconds>[0-9.]+) seconds)?\.\s*$"
 )
+MEASUREMENT_SOURCE_SUFFIXES = {".swift", ".c", ".h"}
+SOURCE_GUARD_CONTENT = "content"
+SOURCE_GUARD_METADATA = "metadata"
+PROGRESS_PREFIX = "test_suite_optimizer.progress "
+ProgressSink = Callable[[dict[str, Any]], None]
 
 
 class OptimizerError(RuntimeError):
@@ -98,6 +103,7 @@ class ConductorRun:
     stderr: str
     result: dict[str, Any]
     log_text: str
+    ticket: str | None = None
 
 
 @dataclasses.dataclass
@@ -116,6 +122,8 @@ class Sample:
     log_path: str
     invalid_reasons: list[str]
     timings: list[TestCaseTiming]
+    source_guard_kind: str = SOURCE_GUARD_CONTENT
+    source_changed: bool = False
 
     @property
     def valid(self) -> bool:
@@ -124,6 +132,17 @@ class Sample:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def progress_line(event: dict[str, Any]) -> str:
+    return PROGRESS_PREFIX + json.dumps(event, sort_keys=True, separators=(",", ":"))
+
+
+def emit_progress_event(event: dict[str, Any]) -> None:
+    try:
+        print(progress_line(event), file=sys.stderr, flush=True)
+    except (BrokenPipeError, OSError):
+        return
 
 
 def parse_test_list(text: str, target: str) -> list[ListedTest]:
@@ -221,12 +240,42 @@ def parse_conductor_json(stdout: str) -> dict[str, Any]:
     return payload
 
 
-def run_conductor(repo_root: Path, target: str, list_mode: bool = False) -> ConductorRun:
+def conductor_ticket_from_payload(payload: dict[str, Any], result: dict[str, Any]) -> str | None:
+    for source in (result, payload):
+        value = source.get("ticket")
+        if value is None:
+            continue
+        ticket = str(value)
+        if ticket:
+            return ticket
+    return None
+
+
+def conductor_command(
+    repo_root: Path,
+    target: str,
+    list_mode: bool = False,
+    filter_value: str | None = None,
+) -> list[str]:
+    if list_mode and filter_value:
+        raise OptimizerError("--filter cannot be used with list mode")
     operation = "test" if target == "root" else "provider-test"
     command = [str(repo_root / "conductor"), operation]
     if list_mode:
         command.append("--list")
+    if filter_value:
+        command.extend(["--filter", filter_value])
     command.append("--json")
+    return command
+
+
+def run_conductor(
+    repo_root: Path,
+    target: str,
+    list_mode: bool = False,
+    filter_value: str | None = None,
+) -> ConductorRun:
+    command = conductor_command(repo_root, target, list_mode=list_mode, filter_value=filter_value)
     completed = run_command(command, repo_root)
     payload = parse_conductor_json(completed.stdout)
     result = payload["result"]
@@ -239,6 +288,7 @@ def run_conductor(repo_root: Path, target: str, list_mode: bool = False) -> Cond
         stderr=completed.stderr,
         result=result,
         log_text=log_text,
+        ticket=conductor_ticket_from_payload(payload, result),
     )
 
 
@@ -386,8 +436,7 @@ def git_metadata(repo_root: Path) -> dict[str, str]:
     }
 
 
-def measurement_source_fingerprint(repo_root: Path) -> str:
-    digest = hashlib.sha256()
+def measurement_source_paths(repo_root: Path) -> list[Path]:
     roots = [
         repo_root / "Package.swift",
         repo_root / "Sources",
@@ -401,8 +450,18 @@ def measurement_source_fingerprint(repo_root: Path) -> str:
         if root.is_file():
             files.append(root)
         elif root.is_dir():
-            files.extend(path for path in root.rglob("*") if path.is_file() and path.suffix in {".swift", ".c", ".h"})
-    for path in sorted(files):
+            files.extend(
+                path
+                for path in root.rglob("*")
+                if path.is_file() and path.suffix in MEASUREMENT_SOURCE_SUFFIXES
+            )
+    return sorted(files)
+
+
+def measurement_source_fingerprint(repo_root: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"content-v1\0")
+    for path in measurement_source_paths(repo_root):
         digest.update(str(path.relative_to(repo_root)).encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -410,10 +469,34 @@ def measurement_source_fingerprint(repo_root: Path) -> str:
     return digest.hexdigest()
 
 
+def measurement_source_metadata_fingerprint(repo_root: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"metadata-v1\0")
+    for path in measurement_source_paths(repo_root):
+        stat = path.stat()
+        mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+        digest.update(str(path.relative_to(repo_root)).encode("utf-8"))
+        digest.update(b"\0file\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def measurement_source_guard_fingerprint(repo_root: Path, kind: str) -> str:
+    if kind == SOURCE_GUARD_CONTENT:
+        return measurement_source_fingerprint(repo_root)
+    if kind == SOURCE_GUARD_METADATA:
+        return measurement_source_metadata_fingerprint(repo_root)
+    raise OptimizerError(f"unsupported source change guard: {kind}")
+
+
 def sample_invalid_reasons(
     process_exit_code: int,
     result: dict[str, Any],
     source_changed: bool,
+    filtered_without_timings: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     if process_exit_code != 0:
@@ -432,6 +515,8 @@ def sample_invalid_reasons(
         reasons.append("measurement source changed during execution")
     if result.get("executionSeconds") is None:
         reasons.append("missing conductor execution timing")
+    if filtered_without_timings:
+        reasons.append("filtered baseline produced no parsed XCTest timings")
     return reasons
 
 
@@ -440,8 +525,11 @@ def sample_from_run(
     target: str,
     run: ConductorRun,
     source_changed: bool,
+    source_guard_kind: str = SOURCE_GUARD_CONTENT,
+    require_timings: bool = False,
 ) -> Sample:
     result = run.result
+    timings = parse_xctest_timings(run.log_text)
     return Sample(
         index=index,
         target=target,
@@ -455,8 +543,15 @@ def sample_from_run(
         measurement_invalid=bool(result.get("measurementInvalid")),
         diagnostic_paths=[str(path) for path in result.get("diagnosticPaths") or []],
         log_path=str(result.get("logPath") or ""),
-        invalid_reasons=sample_invalid_reasons(run.process_exit_code, result, source_changed),
-        timings=parse_xctest_timings(run.log_text),
+        invalid_reasons=sample_invalid_reasons(
+            run.process_exit_code,
+            result,
+            source_changed,
+            filtered_without_timings=require_timings and not timings,
+        ),
+        timings=timings,
+        source_guard_kind=source_guard_kind,
+        source_changed=source_changed,
     )
 
 
@@ -492,6 +587,41 @@ def suite_ranking(samples: Sequence[Sample]) -> list[dict[str, Any]]:
     )
 
 
+def test_ranking(samples: Sequence[Sample]) -> list[dict[str, Any]]:
+    per_test_seconds: dict[tuple[str, str], list[float]] = defaultdict(list)
+    maximums: dict[tuple[str, str], float] = defaultdict(float)
+    failures: dict[tuple[str, str], int] = defaultdict(int)
+    for sample in samples:
+        for timing in sample.timings:
+            key = (timing.suite, timing.method)
+            per_test_seconds[key].append(timing.seconds)
+            maximums[key] = max(maximums[key], timing.seconds)
+            if timing.status != "passed":
+                failures[key] += 1
+    rows: list[dict[str, Any]] = []
+    for (suite, method), values in per_test_seconds.items():
+        rows.append(
+            {
+                "suite": suite,
+                "method": method,
+                "observations": len(values),
+                "median_seconds": statistics.median(values),
+                "observed_p95_seconds": nearest_rank_p95(values),
+                "max_seconds": maximums[(suite, method)],
+                "failure_or_skip_count": failures[(suite, method)],
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            -float(row["median_seconds"]),
+            -float(row["observed_p95_seconds"]),
+            str(row["suite"]),
+            str(row["method"]),
+        ),
+    )
+
+
 def sample_to_dict(sample: Sample) -> dict[str, Any]:
     return {
         "index": sample.index,
@@ -509,6 +639,8 @@ def sample_to_dict(sample: Sample) -> dict[str, Any]:
         "valid": sample.valid,
         "invalid_reasons": sample.invalid_reasons,
         "parsed_test_case_timings": len(sample.timings),
+        "source_guard_kind": sample.source_guard_kind,
+        "source_changed": sample.source_changed,
     }
 
 
@@ -519,6 +651,7 @@ def baseline_summary(samples: Sequence[Sample]) -> dict[str, Any]:
         raise OptimizerError("baseline produced no valid samples")
     rel_mad = relative_mad(values)
     return {
+        "attempts": len(samples),
         "valid_samples": len(valid),
         "invalid_samples": len(samples) - len(valid),
         "raw_execution_seconds": values,
@@ -534,29 +667,63 @@ def scoreboard_scaffold() -> str:
 
 ## Measurement contract
 
-- Primary metric: warm local root `swift test` conductor execution seconds.
-- Structural target: approximately 877 executable first-party XCTest methods.
-- Count authority: coordinated root/provider `swift test list`.
-- Root and provider timings remain separate.
-- CI class-per-process timing is not summed as local root wall clock.
-- Rows and corrections are append-only; corrections supersede rather than rewrite history.
+- Primary metric: warm local root `Scripts/test_suite_optimizer.py baseline --target root` using conductor JSON `executionSeconds` from `./conductor test --json`.
+- Provider package timing is measured separately with `Scripts/test_suite_optimizer.py baseline --target provider`.
+- A root+provider number may be reported only as a derived secondary serial estimate, not as an observed single-process wallclock.
+- Normal timing samples must not enable XCTest stall diagnostics or wake probes.
+- Comparable baseline series use 3–5 valid samples; iteration-0 and release-gate series prefer five valid samples.
+- Invalid samples are excluded only by optimizer-recorded invalid reasons.
+- Noise classes use relative MAD: stable `<= 0.05`, noisy `<= 0.10`, unstable `> 0.10`.
+- The curated ledger `Scripts/Fixtures/test-suite-contract-ledger.tsv` is never regenerated or overwritten. Executable add, rename, consolidation, or removal requires surgical exact-ID ledger updates in the same patch.
+- Rows are append-only. Corrections are appended and supersede earlier rows; earlier artifacts and rows are not edited.
 
 ## Baseline summary
 
-| Date/commit | Topology | Samples | Root methods | Provider methods | Total | Median seconds | Observed p95 | Relative MAD | Notes |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+
+## Derived complete-suite secondary
+
+| Date/commit | Label | Root artifact | Provider artifact | Root median | Provider median | Derived serial median | Root p95 | Provider p95 | Conservative serial p95 sum | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
 
 ## Iteration ledger
 
-| Iteration | Commit/range | Attributed change | Root methods | Provider methods | Total methods | Method delta | Contract delta | Scenario delta | Root median | Root p95 | Provider median | Slowest suites | Lifecycle defects fixed | Added | Removed | Consolidated | Validation and exit codes | Decision |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---|---|
+| Iteration | Commit/range | Attributed change | Primary/secondary scope | Root methods | Provider methods | Total methods | Method delta | Contract delta | Scenario delta | Exact old→new/removed mappings | Focused artifacts | Full-root artifacts | Provider artifacts | Root median delta | Root p95 delta | Provider median delta | Provider p95 delta | Derived secondary delta | Slowest suites/tests after change | Validation and exit codes | Decision |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---|---|---|
+
+## Candidate queue
+
+| Rank | Candidate | Metric scope | Expected effect | Risk | Entry criteria | Required evidence | Status |
+|---:|---|---|---|---|---|---|---|
+| 1 | Optimizer source-change guard, focused baseline support, and per-method ranking | Tooling only | Reduces campaign overhead and improves targeting; no primary suite-speed claim | Low | Always first setup step | Python optimizer tests, append-only scaffold, zero method/contract/scenario delta | Planned |
+| 2 | ACP mode-config fake ACP server fixture setup reduction | Root primary, conditional | Reduces repeated test fixture IO/setup if ACP suite ranks high | Low to medium | Initial root slow-suite/method ranking implicates `ACPAgentSessionControllerModeConfigTests` | Focused before/after artifact, focused XCTest, full-root after artifact, ledger verify | Waiting for baseline |
+| 3 | Hosted CI class-per-process batching | CI-only secondary | Reduces hosted CI subprocess overhead; no local root primary improvement | Medium/high | CI elapsed becomes explicit target after local baseline | CI runner self-tests and GitHub Build and Test evidence | Waiting for CI prioritization |
 
 ## Reverted attempts
 
-| Date | Iteration | Attempt | Reason reverted | Count delta | Median delta | p95 delta | Correctness/lifecycle evidence | Artifact paths |
-|---|---|---|---|---:|---:|---:|---|---|
+| Date | Iteration | Attempt | Reason reverted | Method delta | Scenario delta | Median delta | p95 delta | Correctness/lifecycle evidence | Artifact paths |
+|---|---|---|---|---:|---:|---:|---:|---|---|
 
 ## Baseline run records
+
+Append complete root/provider baseline records here. Include raw sample values, invalid reasons, slowest suites/tests, inventory path, and conductor log paths.
+
+## Focused run records
+
+Append focused before/after records here. Focused records are not primary metric results unless explicitly promoted through a complete root baseline.
+
+## Handoff checklist per iteration
+
+- Protected contract, plausible defect, chosen layer, and observable oracle.
+- Exact executable IDs added, renamed, consolidated, or removed.
+- Complete old→new/removed mapping when IDs change.
+- Scenario-count rationale and before/after affected-suite plus repository totals for consolidations.
+- Surgical ledger update confirmed; curated ledger was not regenerated.
+- Focused command results and full-root/provider baseline artifact paths.
+- Median, observed p95, relative MAD, and noise class for comparable series.
+- Validation commands and exit codes.
+- Any deliberately omitted or moved coverage with justification.
 
 """
 
@@ -579,16 +746,26 @@ def append_baseline_scoreboard(
 ) -> None:
     ensure_scoreboard(path)
     target = payload["target"]
+    scope = str(payload.get("scope") or "complete")
+    filter_value = payload.get("filter")
+    scope_filter = scope if not filter_value else f"{scope}: `{filter_value}`"
+    source_guard = (payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT
     summary = payload["summary"]
     metadata = payload["git"]
     counts = method_counts or {}
     root_count = counts.get("root", 0)
     provider_count = counts.get("provider", 0)
     total_count = root_count + provider_count if counts else 0
+    record_heading = "Focused" if scope == "filtered" else "Baseline"
     lines = [
-        f"### {payload['timestamp']} — {target} — {payload['label']}",
+        f"### {record_heading}: {payload['timestamp']} — {target} — {payload['label']}",
         "",
         f"Command: `{' '.join(payload['command'])}`",
+        f"Artifact: `{payload.get('artifact') or ''}`",
+        f"Inventory: `{payload.get('inventory') or ''}`",
+        f"Scope/filter: {scope_filter}",
+        f"Source-change guard: `{source_guard}`",
+        f"Primary metric eligible: {'yes' if payload.get('primary_metric_eligible') else 'no'}",
         "",
         "| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |",
         "|---:|---|---:|---:|---|---:|---|---|---|",
@@ -611,12 +788,14 @@ def append_baseline_scoreboard(
     lines.extend(
         [
             "",
-            "| Date/commit | Topology | Samples | Root methods | Provider methods | Total | Median seconds | Observed p95 | Relative MAD | Notes |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
-            "| {date}/{commit} | warm local {target} one-process conductor run | {valid} valid + {invalid} invalid | {root} | {provider} | {total} | {median:.3f} | {p95:.3f} | {mad:.4f} | {noise}; build-lane coordinated |".format(
+            "| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
+            "| {date}/{commit} | {label} | {target} | {scope_filter} | {valid} valid + {invalid} invalid | {root} | {provider} | {total} | {median:.3f} | {p95:.3f} | {mad:.4f} | {noise} | `{artifact}` | source guard `{guard}`; build-lane coordinated |".format(
                 date=payload["timestamp"],
                 commit=metadata["commit"][:12],
+                label=payload["label"],
                 target=target,
+                scope_filter=scope_filter,
                 valid=summary["valid_samples"],
                 invalid=summary["invalid_samples"],
                 root=root_count or "",
@@ -626,11 +805,13 @@ def append_baseline_scoreboard(
                 p95=summary["observed_p95_seconds"],
                 mad=summary["relative_mad"],
                 noise=summary["noise_classification"],
+                artifact=payload.get("artifact") or "",
+                guard=source_guard,
             ),
             "",
         ]
     )
-    if target == "root":
+    if payload.get("slowest_suites"):
         lines.extend(
             [
                 "20 slowest suites by median aggregate XCTest case seconds across valid samples:",
@@ -644,6 +825,22 @@ def append_baseline_scoreboard(
                 f"| {index} | `{row['suite']}` | {row['method_count']} | "
                 f"{row['median_aggregate_seconds']:.3f} | {row['max_method_seconds']:.3f} | "
                 f"{row['failure_or_skip_count']} |"
+            )
+        lines.append("")
+    if payload.get("slowest_tests"):
+        lines.extend(
+            [
+                "20 slowest tests by median XCTest case seconds across valid samples:",
+                "",
+                "| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |",
+                "|---:|---|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for index, row in enumerate(payload["slowest_tests"][:20], start=1):
+            lines.append(
+                f"| {index} | `{row['suite']}` | `{row['method']}` | {row['observations']} | "
+                f"{row['median_seconds']:.3f} | {row['observed_p95_seconds']:.3f} | "
+                f"{row['max_seconds']:.3f} | {row['failure_or_skip_count']} |"
             )
         lines.append("")
     with path.open("a", encoding="utf-8") as handle:
@@ -722,26 +919,85 @@ def baseline(
     scoreboard: Path,
     output: Path,
     method_counts: dict[str, int] | None,
+    inventory_path: Path | None = None,
+    source_change_guard: str = SOURCE_GUARD_CONTENT,
+    filter_value: str | None = None,
+    progress_sink: ProgressSink | None = emit_progress_event,
 ) -> dict[str, Any]:
     if samples_requested <= 0:
         raise OptimizerError("--samples must be greater than zero")
     samples: list[Sample] = []
-    command = [str(repo_root / "conductor"), "test" if target == "root" else "provider-test", "--json"]
+    command = conductor_command(repo_root, target, filter_value=filter_value)
+    scope = "filtered" if filter_value else "complete"
     for index in range(1, samples_requested + 1):
-        before = measurement_source_fingerprint(repo_root)
-        run = run_conductor(repo_root, target, list_mode=False)
-        after = measurement_source_fingerprint(repo_root)
-        samples.append(sample_from_run(index, target, run, source_changed=before != after))
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "baseline_sample_start",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "scope": scope,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "command": command,
+                    "ticket": None,
+                    "log_path": None,
+                }
+            )
+        before = measurement_source_guard_fingerprint(repo_root, source_change_guard)
+        run = run_conductor(repo_root, target, list_mode=False, filter_value=filter_value)
+        after = measurement_source_guard_fingerprint(repo_root, source_change_guard)
+        sample = sample_from_run(
+            index,
+            target,
+            run,
+            source_changed=before != after,
+            source_guard_kind=source_change_guard,
+            require_timings=filter_value is not None,
+        )
+        samples.append(sample)
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "baseline_sample_end",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "scope": scope,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "ticket": run.ticket,
+                    "log_path": sample.log_path or None,
+                    "process_exit_code": sample.process_exit_code,
+                    "state": sample.state,
+                    "exit_code": sample.exit_code,
+                    "execution_seconds": sample.execution_seconds,
+                    "measurement_invalid": sample.measurement_invalid,
+                    "source_changed": sample.source_changed,
+                    "valid": sample.valid,
+                    "invalid_reasons": sample.invalid_reasons,
+                }
+            )
     valid_samples = [sample for sample in samples if sample.valid]
     payload = {
         "timestamp": utc_now(),
         "target": target,
         "label": label,
+        "artifact": str(output),
+        "inventory": str(inventory_path) if inventory_path else None,
+        "scope": scope,
+        "filter": filter_value,
+        "primary_metric_eligible": target == "root" and filter_value is None,
+        "source_guard": {"kind": source_change_guard},
         "command": command,
         "git": git_metadata(repo_root),
         "samples": [sample_to_dict(sample) for sample in samples],
         "summary": baseline_summary(samples),
         "slowest_suites": suite_ranking(valid_samples),
+        "slowest_tests": test_ranking(valid_samples),
     }
     write_json_new(output, payload)
     append_baseline_scoreboard(scoreboard, payload, method_counts)
@@ -760,13 +1016,24 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     timing_samples: list[Sample] = []
     targets: set[str] = set()
+    scopes: set[str] = set()
+    filters: set[str | None] = set()
+    source_guards: set[str] = set()
     for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
         target = str(payload.get("target") or "")
+        scope = str(payload.get("scope") or "complete")
+        filter_value = payload.get("filter")
+        source_guard = str((payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT)
         targets.add(target)
+        scopes.add(scope)
+        filters.add(str(filter_value) if filter_value is not None else None)
+        source_guards.add(source_guard)
         for raw_sample in payload.get("samples") or []:
             sample = dict(raw_sample)
             sample["source_artifact"] = str(path)
+            sample.setdefault("source_guard_kind", source_guard)
+            sample.setdefault("source_changed", False)
             samples.append(sample)
             if sample.get("valid"):
                 log_path = Path(str(sample.get("log_path") or ""))
@@ -787,17 +1054,35 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
                         log_path=str(log_path),
                         invalid_reasons=list(sample.get("invalid_reasons") or []),
                         timings=parse_xctest_timings(log_text),
+                        source_guard_kind=str(sample.get("source_guard_kind") or source_guard),
+                        source_changed=bool(sample.get("source_changed")),
                     )
                 )
     if len(targets) != 1:
         raise OptimizerError(f"combined baselines must have one target, found: {sorted(targets)}")
+    if len(scopes) != 1:
+        raise OptimizerError(f"combined baselines must have one scope, found: {sorted(scopes)}")
+    if len(filters) != 1:
+        raise OptimizerError(f"combined baselines must have one filter, found: {sorted(filters, key=str)}")
+    if len(source_guards) != 1:
+        raise OptimizerError(
+            f"combined baselines must have one source change guard, found: {sorted(source_guards)}"
+        )
     values = [float(sample["execution_seconds"]) for sample in samples if sample.get("valid")]
     if not values:
         raise OptimizerError("combined baselines contain no valid samples")
     rel_mad = relative_mad(values)
+    target = next(iter(targets))
+    scope = next(iter(scopes))
+    filter_value = next(iter(filters))
+    source_guard = next(iter(source_guards))
     return {
         "timestamp": utc_now(),
-        "target": next(iter(targets)),
+        "target": target,
+        "scope": scope,
+        "filter": filter_value,
+        "primary_metric_eligible": target == "root" and filter_value is None,
+        "source_guard": {"kind": source_guard},
         "source_artifacts": [str(path) for path in paths],
         "samples": samples,
         "summary": {
@@ -812,6 +1097,7 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
             "reliable": len(values) >= 3,
         },
         "slowest_suites": suite_ranking(timing_samples)[:top],
+        "slowest_tests": test_ranking(timing_samples)[:top],
     }
 
 
@@ -854,7 +1140,12 @@ def rank_logs(paths: Sequence[Path], top: int) -> dict[str, Any]:
         )
         for index, path in enumerate(paths, start=1)
     ]
-    return {"logs": [str(path) for path in paths], "ranking": suite_ranking(samples)[:top]}
+    return {
+        "logs": [str(path) for path in paths],
+        "ranking": suite_ranking(samples)[:top],
+        "suite_ranking": suite_ranking(samples)[:top],
+        "test_ranking": test_ranking(samples)[:top],
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -873,6 +1164,13 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_parser.add_argument("--scoreboard", type=Path, required=True)
     baseline_parser.add_argument("--output", type=Path, required=True)
     baseline_parser.add_argument("--inventory", type=Path)
+    baseline_parser.add_argument("--filter", help="optional XCTest filter for focused baseline artifacts")
+    baseline_parser.add_argument(
+        "--source-change-guard",
+        choices=[SOURCE_GUARD_CONTENT, SOURCE_GUARD_METADATA],
+        default=SOURCE_GUARD_CONTENT,
+        help="source mutation guard used before/after each sample",
+    )
 
     combine_parser = subparsers.add_parser("combine-baselines", help="combine append-only baseline artifacts")
     combine_parser.add_argument("--input", action="append", type=Path, required=True)
@@ -907,6 +1205,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scoreboard=args.scoreboard,
                 output=args.output,
                 method_counts=load_counts(args.inventory),
+                inventory_path=args.inventory,
+                source_change_guard=args.source_change_guard,
+                filter_value=args.filter,
             )
         elif args.command == "combine-baselines":
             payload = combine_baselines(args.input, args.top)

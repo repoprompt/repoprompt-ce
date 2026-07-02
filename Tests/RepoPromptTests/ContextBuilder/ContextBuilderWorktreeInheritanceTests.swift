@@ -4,6 +4,12 @@ import Foundation
 import XCTest
 
 #if DEBUG
+    private let contextBuilderWorktreeProbeToolTimeoutSeconds = 60
+    private let contextBuilderWorktreeProbeRunTimeoutSeconds = 120
+    private let contextBuilderWorktreeCodeStructureRetryTimeout: Duration = .seconds(50)
+    private let contextBuilderWorktreeCodeStructureRetryDelay: Duration = .milliseconds(250)
+    private let contextBuilderWorktreeCodemapDemandWarmupTimeout: Duration = .seconds(60)
+
     @MainActor
     final class ContextBuilderWorktreeInheritanceTests: XCTestCase {
         func testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps() async throws {
@@ -25,6 +31,7 @@ import XCTest
                     _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: logicalRoot)
                     _ = try gitFixture.runGit(["add", "."], at: logicalRoot)
                     _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: logicalRoot)
+                    await markGitDirectoryObserved(fixture.contextA)
                     let worktreeRoot = try gitFixture.makeLinkedWorktree(
                         from: logicalRoot,
                         named: "worktree",
@@ -54,6 +61,14 @@ import XCTest
                         logicalRoot: logicalRoot,
                         worktreeRoot: worktreeRoot,
                         suffix: "context-builder"
+                    )
+                    try await waitForGitRepositoriesVisible(
+                        in: fixture.contextA.window.workspaceFileContextStore,
+                        source: AgentWorkspaceLookupContextSource(
+                            activeAgentSessionID: sessionID,
+                            worktreeBindings: [binding]
+                        ),
+                        expectedRepoRoots: [worktreeRoot]
                     )
                     let selectionIdentity = WorkspaceSelectionIdentity(
                         workspaceID: fixture.contextA.workspaceID,
@@ -270,7 +285,7 @@ import XCTest
                                 "instructions": "Inspect the selected implementation.",
                                 "response_type": responseType
                             ],
-                            timeoutSeconds: 45
+                            timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
                         )
                         let text = try toolResultText(response)
                         XCTAssertTrue(text.contains("generated \(responseType)"), text)
@@ -499,6 +514,7 @@ import XCTest
                     _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: logicalRoot)
                     _ = try gitFixture.runGit(["add", "."], at: logicalRoot)
                     _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: logicalRoot)
+                    await markGitDirectoryObserved(fixture.contextA)
                     let worktreeRoot = try gitFixture.makeLinkedWorktree(
                         from: logicalRoot,
                         named: "worktree",
@@ -536,6 +552,14 @@ import XCTest
                         worktreeRoot: worktreeRoot,
                         suffix: "deferred-route"
                     )
+                    try await waitForGitRepositoriesVisible(
+                        in: fixture.contextA.window.workspaceFileContextStore,
+                        source: AgentWorkspaceLookupContextSource(
+                            activeAgentSessionID: sessionID,
+                            worktreeBindings: [binding]
+                        ),
+                        expectedRepoRoots: [worktreeRoot]
+                    )
                     let frozenContext = MCPServerViewModel.TabContextSnapshot(
                         tabID: fixture.contextA.tabID,
                         windowID: fixture.contextA.window.windowID,
@@ -561,7 +585,8 @@ import XCTest
                     factory.configure(
                         networkManager: fixture.networkManager,
                         logicalFilePath: logicalBranchOnly.path,
-                        searchPattern: "DeferredOnlyAgentRoute"
+                        searchPattern: "DeferredOnlyAgentRoute",
+                        probeCodeStructure: false
                     )
 
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
@@ -602,7 +627,7 @@ import XCTest
                             "instructions": "Find and review the branch-only file.",
                             "response_type": "review"
                         ],
-                        timeoutSeconds: 45
+                        timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
                     )
                     let text = try toolResultText(response)
                     XCTAssertTrue(text.contains("generated deferred review"), text)
@@ -726,7 +751,7 @@ import XCTest
                             "instructions": "Exercise the pre-authorization revision fence.",
                             "response_type": "review"
                         ],
-                        timeoutSeconds: 45
+                        timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
                     )
                     XCTAssertTrue(
                         preFenceRace.rawJSON.contains(
@@ -755,13 +780,23 @@ import XCTest
                                 )
                             }
                         )
+                    try await waitForFrozenWorktreeBindingReady(
+                        in: fixture.contextA.window.mcpServer,
+                        store: fixture.contextA.window.workspaceFileContextStore,
+                        connectionID: outerEndpoint.connectionID,
+                        expectedSessionID: sessionID,
+                        expectedBindings: [binding],
+                        logicalPath: logicalBranchOnly.path,
+                        expectedPhysicalPath: worktreeBranchOnly.standardizedFileURL.path,
+                        phase: "post-fence Context Builder review"
+                    )
                     let postFenceRace = try await outerEndpoint.callTool(
                         name: MCPWindowToolName.contextBuilder,
                         arguments: [
                             "instructions": "Exercise the post-authorization revision fence.",
                             "response_type": "review"
                         ],
-                        timeoutSeconds: 45
+                        timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
                     )
                     XCTAssertTrue(
                         postFenceRace.rawJSON.contains(
@@ -874,6 +909,7 @@ import XCTest
                     _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: classicRoot)
                     _ = try gitFixture.runGit(["add", "."], at: classicRoot)
                     _ = try gitFixture.runGit(["commit", "-m", "Initial Classic commit"], at: classicRoot)
+                    await markGitDirectoryObserved(fixture.contextA)
                     let ceRoot = try gitFixture.makeRepository(
                         named: "selected-ce",
                         files: ["Sources/Selected.swift": "let ce = 1\n"]
@@ -888,6 +924,11 @@ import XCTest
                     ).repoPaths.map { ($0 as NSString).standardizingPath }
                     XCTAssertEqual(orderedRepoPaths.first, classicRoot.standardizedFileURL.path)
                     XCTAssertEqual(orderedRepoPaths.last, ceRoot.standardizedFileURL.path)
+                    try await waitForGitRepositoriesVisible(
+                        in: fixture.contextA.window.workspaceFileContextStore,
+                        rootScope: .visibleWorkspace,
+                        expectedRepoRoots: [classicRoot, ceRoot]
+                    )
                     let ceMarker = "CE_CONTEXT_BUILDER_TARGET_MARKER"
                     let classicMarker = "CLASSIC_CONTEXT_BUILDER_LEAK_MARKER"
                     try write("let marker = \"\(ceMarker)\"\n", to: ceFile)
@@ -943,7 +984,8 @@ import XCTest
                         networkManager: fixture.networkManager,
                         logicalFilePath: ceFile.path,
                         searchPattern: ceMarker,
-                        publishImplicitGitArtifacts: true
+                        publishImplicitGitArtifacts: true,
+                        probeCodeStructure: false
                     )
                     fixture.contextA.window.promptManager
                         .setAutomaticReviewGitDiffProviderOverrideForTesting { _ in
@@ -993,7 +1035,7 @@ import XCTest
                             "instructions": "Inspect the selected checkout.",
                             "response_type": "review"
                         ],
-                        timeoutSeconds: 60
+                        timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
                     )
                     let responseText = try toolResultText(response)
                     XCTAssertTrue(responseText.contains("generated review"), responseText)
@@ -1063,10 +1105,7 @@ import XCTest
                     _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: fixture.contextA.rootURL)
                     _ = try gitFixture.runGit(["add", "."], at: fixture.contextA.rootURL)
                     _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: fixture.contextA.rootURL)
-                    await store.replayObservedFileSystemDeltas(
-                        rootID: fixture.contextA.rootID,
-                        deltas: [.folderAdded(".git")]
-                    )
+                    await markGitDirectoryObserved(fixture.contextA)
                     let relativePath = "Sources/\(fixture.contextA.fileURL.lastPathComponent)"
                     let warmedCodemap = try await waitForCodemapDemandReady(
                         in: store,
@@ -1268,7 +1307,7 @@ import XCTest
                             "context_id": fixture.contextA.tabID.uuidString,
                             "response_type": "review"
                         ],
-                        timeoutSeconds: 45
+                        timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
                     )
                     let text = try toolResultText(response)
                     XCTAssertTrue(text.contains(fixture.contextA.fileURL.lastPathComponent), text)
@@ -1309,6 +1348,234 @@ import XCTest
             }
         }
 
+        private func markGitDirectoryObserved(_ context: PersistentMCPTestContext) async {
+            await context.window.workspaceFileContextStore.replayObservedFileSystemDeltas(
+                rootID: context.rootID,
+                deltas: [.folderAdded(".git")]
+            )
+        }
+
+        private func waitForGitRepositoriesVisible(
+            in store: WorkspaceFileContextStore,
+            source: AgentWorkspaceLookupContextSource,
+            expectedRepoRoots: [URL],
+            timeout: Duration = contextBuilderWorktreeCodemapDemandWarmupTimeout
+        ) async throws {
+            func failure(
+                refs: [String],
+                resolved: [String],
+                lastError: Error?
+            ) -> NSError {
+                let expected = expectedRepoRoots.map(\.standardizedFileURL.path).sorted()
+                let suffix = lastError.map { "; last lookup error: \($0)" } ?? ""
+                return NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Timed out waiting for session-bound Git repositories. expected=\(expected) refs=\(refs.sorted()) resolved=\(resolved.sorted())\(suffix)"
+                    ]
+                )
+            }
+
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var lastRefs: [String] = []
+            var lastResolved: [String] = []
+            var lastError: Error?
+
+            while clock.now < deadline {
+                do {
+                    let lookupContext = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
+                        source: source,
+                        store: store
+                    )
+                    let visibility = await gitRepositoryVisibility(in: store, rootScope: lookupContext.rootScope)
+                    lastRefs = visibility.refs
+                    lastResolved = visibility.resolved
+                    if gitRepositoryVisibilityMatches(
+                        visibility.resolved,
+                        expectedRepoRoots: expectedRepoRoots
+                    ) {
+                        return
+                    }
+                } catch {
+                    lastError = error
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            throw failure(refs: lastRefs, resolved: lastResolved, lastError: lastError)
+        }
+
+        private func waitForGitRepositoriesVisible(
+            in store: WorkspaceFileContextStore,
+            rootScope: WorkspaceLookupRootScope,
+            expectedRepoRoots: [URL],
+            timeout: Duration = contextBuilderWorktreeCodemapDemandWarmupTimeout
+        ) async throws {
+            func failure(refs: [String], resolved: [String]) -> NSError {
+                let expected = expectedRepoRoots.map(\.standardizedFileURL.path).sorted()
+                return NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Timed out waiting for visible Git repositories. expected=\(expected) refs=\(refs.sorted()) resolved=\(resolved.sorted())"
+                    ]
+                )
+            }
+
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var lastRefs: [String] = []
+            var lastResolved: [String] = []
+
+            while clock.now < deadline {
+                let visibility = await gitRepositoryVisibility(in: store, rootScope: rootScope)
+                lastRefs = visibility.refs
+                lastResolved = visibility.resolved
+                if gitRepositoryVisibilityMatches(
+                    visibility.resolved,
+                    expectedRepoRoots: expectedRepoRoots
+                ) {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            throw failure(refs: lastRefs, resolved: lastResolved)
+        }
+
+        private func gitRepositoryVisibility(
+            in store: WorkspaceFileContextStore,
+            rootScope: WorkspaceLookupRootScope
+        ) async -> (refs: [String], resolved: [String]) {
+            let refs = await store.rootRefs(scope: rootScope).map(\.standardizedFullPath).sorted()
+            var resolved = Set<String>()
+            for ref in refs {
+                if let repo = await VCSService.shared.resolveRepo(
+                    from: URL(fileURLWithPath: ref, isDirectory: true)
+                ) {
+                    resolved.insert(GitRepoRootAuthorization.canonicalPath(repo.rootURL.path))
+                }
+            }
+            return (refs, resolved.sorted())
+        }
+
+        private func gitRepositoryVisibilityMatches(
+            _ resolvedRoots: [String],
+            expectedRepoRoots: [URL]
+        ) -> Bool {
+            let resolved = Set(resolvedRoots.map(GitRepoRootAuthorization.canonicalPath))
+            let expected = Set(expectedRepoRoots.map {
+                GitRepoRootAuthorization.canonicalPath($0.standardizedFileURL.path)
+            })
+            return expected.isSubset(of: resolved)
+        }
+
+        private func waitForFrozenWorktreeBindingReady(
+            in mcpServer: MCPServerViewModel,
+            store: WorkspaceFileContextStore,
+            connectionID: UUID,
+            expectedSessionID: UUID,
+            expectedBindings: [AgentSessionWorktreeBinding],
+            logicalPath: String,
+            expectedPhysicalPath: String,
+            phase: String,
+            timeout: Duration = contextBuilderWorktreeCodemapDemandWarmupTimeout
+        ) async throws {
+            func failure(_ message: String) -> NSError {
+                NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: message]
+                )
+            }
+
+            let expectedFingerprint = AgentWorkspaceLookupContextSource
+                .worktreeBindingFingerprint(expectedBindings)
+            let expectedPhysicalPath = StandardizedPath.absolute(
+                (expectedPhysicalPath as NSString).expandingTildeInPath
+            )
+            let logicalPath = StandardizedPath.absolute(
+                (logicalPath as NSString).expandingTildeInPath
+            )
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var attempts = 0
+            var lastDiagnostic = "not inspected"
+
+            while true {
+                attempts += 1
+                if let frozen = mcpServer.tabContextByConnectionID[connectionID] {
+                    if frozen.activeAgentSessionID != expectedSessionID {
+                        lastDiagnostic = "frozen activeAgentSessionID=\(String(describing: frozen.activeAgentSessionID)) expected=\(expectedSessionID)"
+                    } else if case let .hydrated(bindings) = frozen.worktreeBindingState {
+                        let currentFingerprint = AgentWorkspaceLookupContextSource
+                            .worktreeBindingFingerprint(bindings)
+                        if currentFingerprint != expectedFingerprint {
+                            lastDiagnostic = "frozen binding fingerprint=\(currentFingerprint) expected=\(expectedFingerprint)"
+                        } else {
+                            do {
+                                let lookupContext = try await AgentWorkspaceLookupContextResolver
+                                    .requiredLookupContext(
+                                        source: AgentWorkspaceLookupContextSource(
+                                            activeAgentSessionID: expectedSessionID,
+                                            worktreeBindingState: frozen.worktreeBindingState
+                                        ),
+                                        store: store
+                                    )
+                                if let projection = lookupContext.bindingProjection {
+                                    let projectionFingerprint = AgentWorkspaceLookupContextSource
+                                        .worktreeBindingFingerprint(
+                                            projection.boundRootsForMetadata.map(\.binding)
+                                        )
+                                    let translatedPath = StandardizedPath.absolute(
+                                        (lookupContext.translateInputPath(logicalPath) as NSString)
+                                            .expandingTildeInPath
+                                    )
+                                    let availability = await store.rootScopeAvailability(lookupContext.rootScope)
+                                    let lifetimeSnapshot = await store
+                                        .sessionBoundRootScopeValidationSnapshot(
+                                            lookupContext.rootScope,
+                                            expectedPhysicalRoots: projection.physicalRootRefs
+                                        )
+                                    if projection.sessionID != expectedSessionID {
+                                        lastDiagnostic = "projection sessionID=\(projection.sessionID) expected=\(expectedSessionID)"
+                                    } else if !projection.isFullyMaterialized {
+                                        lastDiagnostic = "projection is not fully materialized; physicalRoots=\(projection.physicalRootRefs.map(\.standardizedFullPath))"
+                                    } else if projectionFingerprint != expectedFingerprint {
+                                        lastDiagnostic = "projection binding fingerprint=\(projectionFingerprint) expected=\(expectedFingerprint)"
+                                    } else if translatedPath != expectedPhysicalPath {
+                                        lastDiagnostic = "translated path=\(translatedPath) expected=\(expectedPhysicalPath)"
+                                    } else if availability != .available {
+                                        lastDiagnostic = "root scope unavailable: \(availability)"
+                                    } else if lifetimeSnapshot?.isGenerationCurrent() != true {
+                                        lastDiagnostic = "session root lifetime snapshot missing or stale"
+                                    } else {
+                                        return
+                                    }
+                                } else {
+                                    lastDiagnostic = "lookup context has no binding projection"
+                                }
+                            } catch {
+                                lastDiagnostic = "required lookup context failed: \(error)"
+                            }
+                        }
+                    } else {
+                        lastDiagnostic = "frozen worktree binding state=\(frozen.worktreeBindingState)"
+                    }
+                } else {
+                    lastDiagnostic = "missing frozen context for connectionID=\(connectionID)"
+                }
+
+                guard clock.now < deadline else { break }
+                await Task.yield()
+                try await Task.sleep(for: .milliseconds(100))
+            }
+
+            let message = "Timed out waiting for frozen worktree binding readiness before \(phase) after \(attempts) attempts; connectionID=\(connectionID) sessionID=\(expectedSessionID) expectedBindingFingerprint=\(expectedFingerprint) expectedPhysicalPath=\(expectedPhysicalPath); last=\(lastDiagnostic)"
+            XCTFail(message)
+            throw failure(message)
+        }
+
         private func codemapWarmupUnavailableIsRetryable(
             _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
         ) -> Bool {
@@ -1336,7 +1603,7 @@ import XCTest
             in store: WorkspaceFileContextStore,
             rootID: UUID,
             relativePath: String,
-            timeout: Duration = .seconds(20)
+            timeout: Duration = contextBuilderWorktreeCodemapDemandWarmupTimeout
         ) async throws -> WorkspaceCodemapArtifactDemandReady {
             func failure(_ message: String) -> NSError {
                 NSError(
@@ -1587,6 +1854,7 @@ import XCTest
             let logicalFilePath: String
             let searchPattern: String
             let publishImplicitGitArtifacts: Bool
+            let probeCodeStructure: Bool
         }
 
         private let state: ContextBuilderWorktreeProbeState
@@ -1600,13 +1868,15 @@ import XCTest
             networkManager: ServerNetworkManager,
             logicalFilePath: String,
             searchPattern: String,
-            publishImplicitGitArtifacts: Bool = false
+            publishImplicitGitArtifacts: Bool = false,
+            probeCodeStructure: Bool = true
         ) {
             configuration = Configuration(
                 networkManager: networkManager,
                 logicalFilePath: logicalFilePath,
                 searchPattern: searchPattern,
-                publishImplicitGitArtifacts: publishImplicitGitArtifacts
+                publishImplicitGitArtifacts: publishImplicitGitArtifacts,
+                probeCodeStructure: probeCodeStructure
             )
         }
 
@@ -1629,6 +1899,7 @@ import XCTest
                 logicalFilePath: configuration.logicalFilePath,
                 searchPattern: configuration.searchPattern,
                 publishImplicitGitArtifacts: configuration.publishImplicitGitArtifacts,
+                probeCodeStructure: configuration.probeCodeStructure,
                 clientName: clientName,
                 workspacePath: workspacePath
             )
@@ -1641,6 +1912,7 @@ import XCTest
         private let logicalFilePath: String
         private let searchPattern: String
         private let publishImplicitGitArtifacts: Bool
+        private let probeCodeStructure: Bool
         private let clientName: String
         private let workspacePath: String?
         private var endpoint: PersistentMCPTestEndpoint?
@@ -1652,6 +1924,7 @@ import XCTest
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool,
+            probeCodeStructure: Bool,
             clientName: String,
             workspacePath: String?
         ) {
@@ -1660,6 +1933,7 @@ import XCTest
             self.logicalFilePath = logicalFilePath
             self.searchPattern = searchPattern
             self.publishImplicitGitArtifacts = publishImplicitGitArtifacts
+            self.probeCodeStructure = probeCodeStructure
             self.clientName = clientName
             self.workspacePath = workspacePath
         }
@@ -1699,17 +1973,17 @@ import XCTest
                     "path_display": "full",
                     "_rawJSON": true
                 ],
-                timeoutSeconds: 20
+                timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
             let tree = try await toolResultText(endpoint.callTool(
                 name: MCPWindowToolName.getFileTree,
                 arguments: [:],
-                timeoutSeconds: 20
+                timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
             let read = try await toolResultText(endpoint.callTool(
                 name: MCPWindowToolName.readFile,
                 arguments: ["path": logicalFilePath],
-                timeoutSeconds: 20
+                timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
             let selectionAfterRead = try await selectionObservation(endpoint.callTool(
                 name: MCPWindowToolName.manageSelection,
@@ -1719,7 +1993,7 @@ import XCTest
                     "path_display": "full",
                     "_rawJSON": true
                 ],
-                timeoutSeconds: 20
+                timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
             let search = try await toolResultText(endpoint.callTool(
                 name: MCPWindowToolName.search,
@@ -1728,16 +2002,13 @@ import XCTest
                     "mode": "content",
                     "regex": false
                 ],
-                timeoutSeconds: 20
+                timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
-            let codeStructure = try await toolResultText(endpoint.callTool(
-                name: MCPWindowToolName.getCodeStructure,
-                arguments: [
-                    "scope": "paths",
-                    "paths": [logicalFilePath]
-                ],
-                timeoutSeconds: 30
-            ))
+            let codeStructure = if probeCodeStructure {
+                try await codeStructureWithReadinessRetry(endpoint: endpoint)
+            } else {
+                ""
+            }
             let selection = try await toolResultText(endpoint.callTool(
                 name: MCPWindowToolName.manageSelection,
                 arguments: [
@@ -1745,7 +2016,7 @@ import XCTest
                     "paths": [logicalFilePath],
                     "mode": "full"
                 ],
-                timeoutSeconds: 20
+                timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
             let git: String? = if publishImplicitGitArtifacts {
                 try await toolResultText(endpoint.callTool(
@@ -1757,7 +2028,7 @@ import XCTest
                         "artifacts": true,
                         "mode": "deep"
                     ],
-                    timeoutSeconds: 30
+                    timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
                 ))
             } else {
                 nil
@@ -1767,7 +2038,7 @@ import XCTest
                 arguments: [
                     "include": ["selection", "tree", "tokens"]
                 ],
-                timeoutSeconds: 30
+                timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
             await state.recordRun(ContextBuilderWorktreeProbeState.Run(
                 workspacePath: workspacePath,
@@ -1806,6 +2077,41 @@ import XCTest
             }
             endpoint = nil
             activeRunID = nil
+        }
+
+        private func codeStructureWithReadinessRetry(
+            endpoint: PersistentMCPTestEndpoint
+        ) async throws -> String {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: contextBuilderWorktreeCodeStructureRetryTimeout)
+            var latestOutput: String?
+
+            repeat {
+                let output = try await toolResultText(endpoint.callTool(
+                    name: MCPWindowToolName.getCodeStructure,
+                    arguments: [
+                        "scope": "paths",
+                        "paths": [logicalFilePath]
+                    ],
+                    timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
+                ))
+                latestOutput = output
+                guard codeStructureOutputNeedsReadinessRetry(output) else {
+                    return output
+                }
+                try await Task.sleep(for: contextBuilderWorktreeCodeStructureRetryDelay)
+            } while clock.now < deadline
+
+            return latestOutput ?? ""
+        }
+
+        private func codeStructureOutputNeedsReadinessRetry(_ output: String) -> Bool {
+            output.contains("- **Status**: `timeout`")
+                && (
+                    output.contains("`artifact_pending`")
+                        || output.contains("`readiness_timeout`")
+                        || output.contains("`codemap_busy`")
+                )
         }
 
         private func selectionObservation(

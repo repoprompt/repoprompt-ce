@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -48,6 +51,28 @@ class TestListParsingTests(unittest.TestCase):
 
 
 class TimingTests(unittest.TestCase):
+    def make_sample(
+        self,
+        index: int,
+        timings: list[optimizer.TestCaseTiming],
+    ) -> optimizer.Sample:
+        return optimizer.Sample(
+            index=index,
+            target="root",
+            command=[],
+            process_exit_code=0,
+            state="completed",
+            exit_code=0,
+            queue_wait_seconds=0.0,
+            execution_seconds=1.0,
+            timed_out=False,
+            measurement_invalid=False,
+            diagnostic_paths=[],
+            log_path=f"/{index}.log",
+            invalid_reasons=[],
+            timings=timings,
+        )
+
     def test_parse_xctest_timings_supports_objc_and_dotted_formats(self) -> None:
         text = "\n".join(
             [
@@ -92,34 +117,87 @@ class TimingTests(unittest.TestCase):
         self.assertIn("measurement source changed during execution", reasons)
         self.assertIn("missing conductor execution timing", reasons)
 
-    def test_suite_ranking_uses_median_aggregate_seconds(self) -> None:
-        def sample(index: int, a: float, b: float) -> optimizer.Sample:
-            return optimizer.Sample(
-                index=index,
-                target="root",
-                command=[],
-                process_exit_code=0,
-                state="completed",
-                exit_code=0,
-                queue_wait_seconds=0.0,
-                execution_seconds=1.0,
-                timed_out=False,
-                measurement_invalid=False,
-                diagnostic_paths=[],
-                log_path=f"/{index}.log",
-                invalid_reasons=[],
-                timings=[
-                    optimizer.TestCaseTiming("RepoPromptTests.A", "testOne", "passed", a),
-                    optimizer.TestCaseTiming("RepoPromptTests.B", "testTwo", "passed", b),
-                ],
-            )
+    def test_filtered_sample_without_timings_is_invalid(self) -> None:
+        run = optimizer.ConductorRun(
+            command=["/repo/conductor", "test", "--filter", "RepoPromptTests.Empty", "--json"],
+            process_exit_code=0,
+            stdout="{}",
+            stderr="",
+            result={
+                "state": "completed",
+                "exitCode": 0,
+                "queueWaitSeconds": 0.0,
+                "executionSeconds": 1.0,
+                "timedOut": False,
+                "measurementInvalid": False,
+                "logPath": "/tmp/empty.log",
+            },
+            log_text="",
+        )
 
-        ranking = optimizer.suite_ranking([sample(1, 1.0, 4.0), sample(2, 5.0, 4.0)])
+        sample = optimizer.sample_from_run(
+            1,
+            "root",
+            run,
+            source_changed=False,
+            source_guard_kind=optimizer.SOURCE_GUARD_METADATA,
+            require_timings=True,
+        )
+
+        self.assertFalse(sample.valid)
+        self.assertEqual(sample.source_guard_kind, optimizer.SOURCE_GUARD_METADATA)
+        self.assertIn("filtered baseline produced no parsed XCTest timings", sample.invalid_reasons)
+
+    def test_suite_ranking_uses_median_aggregate_seconds(self) -> None:
+        ranking = optimizer.suite_ranking([
+            self.make_sample(
+                1,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testOne", "passed", 1.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testTwo", "passed", 4.0),
+                ],
+            ),
+            self.make_sample(
+                2,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testOne", "passed", 5.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testTwo", "passed", 4.0),
+                ],
+            ),
+        ])
 
         self.assertEqual(ranking[0]["suite"], "RepoPromptTests.B")
         self.assertEqual(ranking[0]["median_aggregate_seconds"], 4.0)
         self.assertEqual(ranking[1]["median_aggregate_seconds"], 3.0)
         self.assertEqual(ranking[1]["max_method_seconds"], 5.0)
+
+    def test_test_ranking_uses_median_p95_and_stable_ties(self) -> None:
+        samples = [
+            self.make_sample(
+                1,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testSlow", "passed", 5.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testSlow", "passed", 5.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testFast", "passed", 1.0),
+                ],
+            ),
+            self.make_sample(
+                2,
+                [
+                    optimizer.TestCaseTiming("RepoPromptTests.B", "testSlow", "skipped", 7.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testSlow", "passed", 7.0),
+                    optimizer.TestCaseTiming("RepoPromptTests.A", "testFast", "passed", 2.0),
+                ],
+            ),
+        ]
+
+        ranking = optimizer.test_ranking(samples)
+
+        self.assertEqual((ranking[0]["suite"], ranking[0]["method"]), ("RepoPromptTests.A", "testSlow"))
+        self.assertEqual((ranking[1]["suite"], ranking[1]["method"]), ("RepoPromptTests.B", "testSlow"))
+        self.assertEqual(ranking[0]["median_seconds"], 6.0)
+        self.assertEqual(ranking[0]["observed_p95_seconds"], 7.0)
+        self.assertEqual(ranking[1]["failure_or_skip_count"], 1)
 
 
 class SourceAndLedgerTests(unittest.TestCase):
@@ -131,6 +209,49 @@ class SourceAndLedgerTests(unittest.TestCase):
             "    func testOne() {}\n}\n",
             encoding="utf-8",
         )
+
+    def test_conductor_command_adds_filter_before_json(self) -> None:
+        command = optimizer.conductor_command(
+            Path("/repo"),
+            "root",
+            filter_value="RepoPromptTests.ExampleTests/testOne",
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/repo/conductor",
+                "test",
+                "--filter",
+                "RepoPromptTests.ExampleTests/testOne",
+                "--json",
+            ],
+        )
+        with self.assertRaisesRegex(optimizer.OptimizerError, "--filter cannot be used with list mode"):
+            optimizer.conductor_command(Path("/repo"), "provider", list_mode=True, filter_value="Suite")
+
+    def test_metadata_source_guard_changes_on_add_modify_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_repo(root)
+            tests = root / "Tests" / "RepoPromptTests" / "MCP"
+            initial = optimizer.measurement_source_metadata_fingerprint(root)
+
+            new_file = tests / "AnotherTests.swift"
+            new_file.write_text("final class AnotherTests {}\n", encoding="utf-8")
+            after_add = optimizer.measurement_source_metadata_fingerprint(root)
+
+            new_file.write_text("final class AnotherTests { func testTwo() {} }\n", encoding="utf-8")
+            after_modify = optimizer.measurement_source_metadata_fingerprint(root)
+
+            new_file.unlink()
+            after_delete = optimizer.measurement_source_metadata_fingerprint(root)
+
+        self.assertNotEqual(initial, after_add)
+        self.assertNotEqual(after_add, after_modify)
+        self.assertEqual(initial, after_delete)
+        with self.assertRaisesRegex(optimizer.OptimizerError, "unsupported source change guard"):
+            optimizer.measurement_source_guard_fingerprint(root, "unknown")
 
     def test_source_mapping_and_ledger_scaffold_are_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,6 +299,150 @@ class SourceAndLedgerTests(unittest.TestCase):
                 optimizer.read_ledger_ids(path)
 
 
+class ProgressOutputTests(unittest.TestCase):
+    def test_emit_progress_event_uses_stderr_compact_json_and_ignores_pipe_errors(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            optimizer.emit_progress_event({"z": 1, "event": "unit", "a": None})
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            f'{optimizer.PROGRESS_PREFIX}{{"a":null,"event":"unit","z":1}}\n',
+        )
+
+        class BrokenStderr:
+            def write(self, text: str) -> int:
+                raise BrokenPipeError()
+
+            def flush(self) -> None:
+                raise OSError()
+
+        with contextlib.redirect_stderr(BrokenStderr()):
+            optimizer.emit_progress_event({"event": "unit"})
+
+    def test_conductor_ticket_helper_uses_current_ticket_only(self) -> None:
+        self.assertEqual(
+            optimizer.conductor_ticket_from_payload({"ticket": "top"}, {"ticket": "result"}),
+            "result",
+        )
+        self.assertEqual(optimizer.conductor_ticket_from_payload({"ticket": "top"}, {}), "top")
+        self.assertEqual(optimizer.conductor_ticket_from_payload({}, {"ticket": 123}), "123")
+        self.assertIsNone(optimizer.conductor_ticket_from_payload({"ticket": ""}, {}))
+        self.assertIsNone(
+            optimizer.conductor_ticket_from_payload({}, {"supersededByTicket": "old-ticket"})
+        )
+
+
+class BaselineProgressTests(unittest.TestCase):
+    def make_run(self, index: int, *, exit_code: int = 0) -> optimizer.ConductorRun:
+        result = {
+            "state": "completed",
+            "exitCode": exit_code,
+            "queueWaitSeconds": 0.25,
+            "executionSeconds": 10.0 + index,
+            "timedOut": False,
+            "measurementInvalid": False,
+            "logPath": f"/tmp/test-suite-optimizer-sample-{index}.log",
+        }
+        return optimizer.ConductorRun(
+            command=["/repo/conductor", "test", "--json"],
+            process_exit_code=0,
+            stdout=json.dumps({"result": result}),
+            stderr="",
+            result=result,
+            log_text="Test Case 'RepoPromptTests.ExampleTests.testOne' passed after 1.000 seconds.\n",
+            ticket=f"ticket-{index}",
+        )
+
+    def test_baseline_progress_events_are_ordered_and_include_invalid_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filter_value = "RepoPromptTests.ExampleTests"
+            expected_command = optimizer.conductor_command(root, "root", filter_value=filter_value)
+            events: list[dict[str, object]] = []
+            operations: list[tuple[str, object]] = []
+            run_count = 0
+            runs = [self.make_run(1, exit_code=1), self.make_run(2)]
+
+            def progress_sink(event: dict[str, object]) -> None:
+                operations.append(("progress", event["event"]))
+                events.append(dict(event))
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+            ) -> optimizer.ConductorRun:
+                nonlocal run_count
+                run_count += 1
+                self.assertFalse(list_mode)
+                self.assertEqual((target, filter_value), ("root", "RepoPromptTests.ExampleTests"))
+                operations.append(("run", run_count))
+                return runs.pop(0)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "a" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-01T00:00:00+00:00"),
+            ):
+                payload = optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=2,
+                    label="progress-test",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    source_change_guard=optimizer.SOURCE_GUARD_METADATA,
+                    filter_value=filter_value,
+                    progress_sink=progress_sink,
+                )
+
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "baseline_sample_start",
+                "baseline_sample_end",
+                "baseline_sample_start",
+                "baseline_sample_end",
+            ],
+        )
+        self.assertEqual(operations[0], ("progress", "baseline_sample_start"))
+        self.assertEqual(operations[1], ("run", 1))
+        self.assertEqual(payload["summary"]["valid_samples"], 1)
+        self.assertEqual(payload["summary"]["invalid_samples"], 1)
+
+        start = events[0]
+        self.assertEqual(start["command"], expected_command)
+        self.assertEqual(start["target"], "root")
+        self.assertEqual(start["scope"], "filtered")
+        self.assertEqual(start["filter"], filter_value)
+        self.assertEqual(start["source_guard"], optimizer.SOURCE_GUARD_METADATA)
+        self.assertEqual(start["sample_index"], 1)
+        self.assertEqual(start["sample_count"], 2)
+        self.assertIsNone(start["ticket"])
+        self.assertIsNone(start["log_path"])
+
+        invalid_end = events[1]
+        self.assertEqual(invalid_end["ticket"], "ticket-1")
+        self.assertEqual(invalid_end["log_path"], "/tmp/test-suite-optimizer-sample-1.log")
+        self.assertEqual(invalid_end["process_exit_code"], 0)
+        self.assertEqual(invalid_end["state"], "completed")
+        self.assertEqual(invalid_end["exit_code"], 1)
+        self.assertEqual(invalid_end["execution_seconds"], 11.0)
+        self.assertEqual(invalid_end["measurement_invalid"], False)
+        self.assertEqual(invalid_end["source_changed"], False)
+        self.assertEqual(invalid_end["valid"], False)
+        self.assertEqual(invalid_end["invalid_reasons"], ["test exit 1"])
+        self.assertEqual(events[3]["valid"], True)
+        self.assertEqual(events[3]["invalid_reasons"], [])
+
+
 class CombinedBaselineTests(unittest.TestCase):
     def test_combine_baselines_marks_fewer_than_three_valid_samples_unreliable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,9 +484,62 @@ class CombinedBaselineTests(unittest.TestCase):
         self.assertEqual(combined["summary"]["attempts"], 3)
         self.assertEqual(combined["summary"]["valid_samples"], 2)
         self.assertFalse(combined["summary"]["reliable"])
+        self.assertEqual(combined["scope"], "complete")
+        self.assertIsNone(combined["filter"])
+        self.assertEqual(combined["source_guard"]["kind"], optimizer.SOURCE_GUARD_CONTENT)
         self.assertEqual(combined["summary"]["median_seconds"], 12.0)
         self.assertEqual(combined["summary"]["observed_p95_seconds"], 14.0)
         self.assertEqual(combined["slowest_suites"][0]["median_aggregate_seconds"], 3.0)
+        self.assertEqual(combined["slowest_tests"][0]["median_seconds"], 3.0)
+
+    def test_combine_baselines_rejects_mixed_scope_filter_or_guard(self) -> None:
+        def artifact(
+            root: Path,
+            name: str,
+            *,
+            scope: str = "complete",
+            filter_value: str | None = None,
+            guard: str = optimizer.SOURCE_GUARD_CONTENT,
+        ) -> Path:
+            path = root / f"{name}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "target": "root",
+                        "scope": scope,
+                        "filter": filter_value,
+                        "source_guard": {"kind": guard},
+                        "samples": [
+                            {
+                                "command": ["/repo/conductor", "test", "--json"],
+                                "process_exit_code": 0,
+                                "state": "completed",
+                                "exit_code": 0,
+                                "execution_seconds": 10.0,
+                                "valid": True,
+                                "log_path": str(root / "missing.log"),
+                                "invalid_reasons": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            complete = artifact(root, "complete")
+            focused = artifact(root, "focused", scope="filtered", filter_value="RepoPromptTests.A")
+            focused_other = artifact(root, "focused-other", scope="filtered", filter_value="RepoPromptTests.B")
+            metadata = artifact(root, "metadata", guard=optimizer.SOURCE_GUARD_METADATA)
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one scope"):
+                optimizer.combine_baselines([complete, focused])
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one filter"):
+                optimizer.combine_baselines([focused, focused_other])
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one source change guard"):
+                optimizer.combine_baselines([complete, metadata])
 
     def test_compare_baselines_reports_fractional_deltas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,6 +562,12 @@ class AppendOnlyArtifactTests(unittest.TestCase):
             "timestamp": timestamp,
             "target": "provider",
             "label": "warm-baseline",
+            "artifact": "/tmp/provider-baseline.json",
+            "inventory": "/tmp/inventory.json",
+            "scope": "complete",
+            "filter": None,
+            "primary_metric_eligible": False,
+            "source_guard": {"kind": optimizer.SOURCE_GUARD_METADATA},
             "command": ["./conductor", "provider-test", "--json"],
             "git": {"commit": "a" * 40, "working_tree": ""},
             "samples": [
@@ -268,6 +592,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
                 "noise_classification": "stable",
             },
             "slowest_suites": [],
+            "slowest_tests": [],
         }
 
     def test_scoreboard_appends_without_rewriting_prior_rows(self) -> None:
@@ -281,6 +606,8 @@ class AppendOnlyArtifactTests(unittest.TestCase):
         self.assertTrue(second.startswith(first))
         self.assertIn("/one.log", second)
         self.assertIn("/two.log", second)
+        self.assertIn("Source-change guard: `metadata`", second)
+        self.assertIn("Primary metric eligible: no", second)
 
     def test_json_artifacts_refuse_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

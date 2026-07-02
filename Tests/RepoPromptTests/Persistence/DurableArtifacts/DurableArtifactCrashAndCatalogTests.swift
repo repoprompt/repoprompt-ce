@@ -267,8 +267,18 @@ final class DurableArtifactCrashAndCatalogTests: XCTestCase {
             let root = try DurableArtifactTestSupport.makeApplicationSupport()
             defer { try? FileManager.default.removeItem(at: root) }
             let store = try DurableArtifactTestSupport.makeStore(at: root)
-            let old = try DurableArtifactTestSupport.publish(store, identity: "old", records: ["a"])
-            let new = try DurableArtifactTestSupport.publish(store, identity: "new", records: ["b"])
+            let old = try DurableArtifactTestSupport.publish(
+                store,
+                identity: "old",
+                records: ["a"],
+                retryBusy: true
+            )
+            let new = try DurableArtifactTestSupport.publish(
+                store,
+                identity: "new",
+                records: ["b"],
+                retryBusy: true
+            )
             guard case let .published(initial) = try store.compareAndSwapCatalog(
                 family: DurableArtifactTestSupport.family,
                 expectedRevision: nil,

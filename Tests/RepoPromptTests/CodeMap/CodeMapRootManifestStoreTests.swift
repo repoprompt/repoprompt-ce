@@ -1235,6 +1235,10 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             return XCTFail("expected hot manifest hit")
         }
         await store.waitForPendingAccessRefreshesForTesting()
+        let touched = try decodeManifest(fixtures[0].namespace, from: store)
+        XCTAssertEqual(touched.lastAccessEpochSeconds, 100)
+        XCTAssertEqual(touched.manifestGeneration, 1)
+        XCTAssertEqual(touched.records, [fixtures[0].record])
         try FileManager.default.setAttributes(
             [.modificationDate: Date(timeIntervalSince1970: 1)],
             ofItemAtPath: store.manifestURL(for: fixtures[0].namespace).path
