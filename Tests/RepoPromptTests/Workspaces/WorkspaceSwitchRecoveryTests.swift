@@ -670,6 +670,98 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertEqual(savedTab.selection, fixture.selection)
     }
 
+    func testWorkspaceSwitchSkipsOutgoingRefreshAndReconcilesEmptyTargetSelection() async throws {
+        #if DEBUG
+            let sourceRoot = try makeTemporaryDirectory(named: "OutgoingRefreshSourceRoot")
+            let targetRoot = try makeTemporaryDirectory(named: "OutgoingRefreshTargetRoot")
+            defer {
+                try? FileManager.default.removeItem(at: sourceRoot)
+                try? FileManager.default.removeItem(at: targetRoot)
+            }
+
+            let sourceFolder = sourceRoot.appendingPathComponent("Sources", isDirectory: true)
+            try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+            let selectedSourceFile = sourceFolder.appendingPathComponent("Selected.swift")
+            let unselectedSourceFile = sourceFolder.appendingPathComponent("Unselected.swift")
+            try "let selected = true\n".write(to: selectedSourceFile, atomically: true, encoding: .utf8)
+            try "let unselected = true\n".write(to: unselectedSourceFile, atomically: true, encoding: .utf8)
+            let targetFile = targetRoot.appendingPathComponent("Target.swift")
+            try "let target = true\n".write(to: targetFile, atomically: true, encoding: .utf8)
+
+            let sourceTab = ComposeTabState(selection: StoredSelection(
+                selectedPaths: [selectedSourceFile.path],
+                codemapAutoEnabled: false
+            ))
+            let sourceWorkspace = WorkspaceModel(
+                name: "Outgoing Refresh Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [sourceRoot.path],
+                ephemeralFlag: true,
+                composeTabs: [sourceTab],
+                activeComposeTabID: sourceTab.id
+            )
+            let targetTab = ComposeTabState(selection: StoredSelection(
+                selectedPaths: [],
+                codemapAutoEnabled: false
+            ))
+            let targetWorkspace = WorkspaceModel(
+                name: "Outgoing Refresh Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [targetRoot.path],
+                ephemeralFlag: true,
+                composeTabs: [targetTab],
+                activeComposeTabID: targetTab.id
+            )
+
+            let composition = makeComposition()
+            let manager = composition.workspaceManager
+            let fileManager = composition.workspaceFilesViewModel
+            await manager.awaitInitialized()
+            manager.workspaces.append(contentsOf: [sourceWorkspace, targetWorkspace])
+
+            let sourceResult = await manager.switchWorkspace(
+                to: sourceWorkspace,
+                saveState: false,
+                reason: "outgoingRefreshSource"
+            )
+            XCTAssertEqual(sourceResult, .switched)
+            XCTAssertEqual(fileManager.snapshotSelection().selectedPaths, [selectedSourceFile.path])
+            XCTAssertNotEqual(fileManager.rootFolders.first?.checkboxState, .unchecked)
+
+            var refreshEvents: [(phase: WorkspaceSwitchPhase?, rootPaths: [String], selectedFileCount: Int)] = []
+            fileManager.setRefreshRootFolderStateDidRunHandlerForTesting {
+                refreshEvents.append((
+                    manager.activeWorkspaceSwitch?.phase,
+                    fileManager.rootFolders.map(\.standardizedFullPath),
+                    fileManager.selectedFiles.count
+                ))
+            }
+
+            let targetResult = await manager.switchWorkspace(
+                to: targetWorkspace,
+                saveState: false,
+                reason: "outgoingRefreshTargetEmptySelection"
+            )
+            fileManager.setRefreshRootFolderStateDidRunHandlerForTesting(nil)
+
+            XCTAssertEqual(targetResult, .switched)
+            XCTAssertFalse(
+                refreshEvents.contains { $0.phase == .restoringState },
+                "Switch restore should not refresh checkbox state for outgoing roots that loadWorkspaceFolders will unload"
+            )
+            XCTAssertTrue(
+                refreshEvents.contains { event in
+                    event.phase == .hydratingRoots
+                        && event.rootPaths == [targetRoot.path]
+                        && event.selectedFileCount == 0
+                },
+                "Switch must reconcile target checkbox state after target root hydration, including empty restored selections"
+            )
+            XCTAssertEqual(fileManager.snapshotSelection().selectedPaths, [])
+            XCTAssertTrue(fileManager.selectedFiles.isEmpty)
+            XCTAssertEqual(fileManager.rootFolders.map(\.standardizedFullPath), [targetRoot.path])
+            XCTAssertEqual(fileManager.rootFolders.first?.checkboxState, .unchecked)
+        #endif
+    }
+
     func testInitialDiskBackedActivationAndReopenPreserveHydratedSelection() async throws {
         let root = try makeTemporaryDirectory(named: "InitialSelectionReplayRoot")
         let storageRoot = try makeTemporaryDirectory(named: "InitialSelectionReplayStorage")

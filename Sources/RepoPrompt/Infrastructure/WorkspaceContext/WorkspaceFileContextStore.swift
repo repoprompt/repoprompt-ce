@@ -9318,7 +9318,9 @@ actor WorkspaceFileContextStore {
             reason: .rootLoad,
             affectedRootIDs: [root.id]
         )
-        if WorktreeStartupFeatureFlags.current().observeDiffSeededWorktreeStartup {
+        if root.kind == .sessionWorktree,
+           WorktreeStartupFeatureFlags.current().observeDiffSeededWorktreeStartup
+        {
             _ = try? await admitReusableSnapshotForLoadedRoot(
                 rootID: root.id,
                 expectedStandardizedPath: root.standardizedFullPath

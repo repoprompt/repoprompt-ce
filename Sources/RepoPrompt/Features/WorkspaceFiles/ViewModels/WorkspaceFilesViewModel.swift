@@ -1107,6 +1107,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
         private var hiddenSessionSliceRebaseWillCommitHandler: (@Sendable (String) async -> Void)?
         private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
+        private var refreshRootFolderStateDidRunHandlerForTesting: (() -> Void)?
 
         func setAppliedIndexProjectionWillHandleHandlerForTesting(
             _ handler: (@Sendable (UUID, UInt64) async -> Void)?
@@ -1125,6 +1126,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         ) {
             appliedIndexProjectionStateObserver = observer
             observer?(appliedIndexProjectionDiagnosticsSnapshot())
+        }
+
+        func setRefreshRootFolderStateDidRunHandlerForTesting(_ handler: (() -> Void)?) {
+            refreshRootFolderStateDidRunHandlerForTesting = handler
         }
 
         @MainActor
@@ -7926,6 +7931,9 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     func refreshRootFolderState() {
+        #if DEBUG
+            refreshRootFolderStateDidRunHandlerForTesting?()
+        #endif
         for rootFolder in rootFolders {
             _ = updateFolderStateRecursive(rootFolder)
         }
