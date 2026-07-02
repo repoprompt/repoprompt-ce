@@ -6,6 +6,53 @@ import XCTest
 final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
     private let fullSuiteAsyncTimeoutNanoseconds: UInt64 = 30_000_000_000
 
+    func testNilWorkspaceSwitchClearsStateWhenLastKnownSnapshotExists() async throws {
+        let tabID = UUID()
+        let sessionID = UUID()
+        let workspace = WorkspaceModel(
+            name: "Loaded workspace",
+            repoPaths: [],
+            composeTabs: [
+                ComposeTabState(
+                    id: tabID,
+                    name: "Active tab",
+                    activeAgentSessionID: sessionID
+                )
+            ],
+            activeComposeTabID: tabID
+        )
+        let fixture = makeWorkspaceFixture(workspaces: [workspace])
+        fixture.manager.activeWorkspace = workspace
+
+        let viewModel = makeViewModel()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+        viewModel.test_setSidebarAutoArchiveDependencies(
+            promptManager: fixture.prompt,
+            workspaceManager: fixture.manager
+        )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
+
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.hasLoadedPersistedState = true
+        session.replaceItems([.user("active", sequenceIndex: 0)])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+        viewModel.test_setActiveSessionBindingsAreHydrated(true)
+        XCTAssertEqual(viewModel.test_bindingResolution(sessionID: sessionID), .unique(tabID: tabID))
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.hydratedPersistentBinding?.sessionID, sessionID)
+
+        viewModel.test_setCurrentTabIDOverride(nil)
+        fixture.manager.activeWorkspace = nil
+        await viewModel.handleWorkspaceSwitch(nil)
+
+        XCTAssertTrue(viewModel.sessions.isEmpty)
+        XCTAssertNil(viewModel.activeTranscriptPresentation.hydratedPersistentBinding)
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
+    }
+
     func testWorkspaceSwitchClearsForegroundBeforeSlowProviderDisposeCompletes() async throws {
         let provider = BlockingHeadlessProvider()
         let viewModel = makeViewModel()
@@ -183,6 +230,33 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
             mcpRunToolCanceller: mcpRunToolCanceller,
             testWorkspaceFileContextStore: workspaceFileContextStore
         )
+    }
+
+    private func makeWorkspaceFixture(
+        workspaces: [WorkspaceModel]
+    ) -> (manager: WorkspaceManagerViewModel, prompt: PromptViewModel) {
+        let fileManager = WorkspaceFilesViewModel()
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1,
+            settingsManager: WindowSettingsManager(windowID: -1)
+        )
+        let manager = WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        manager.workspaces = workspaces
+        return (manager, prompt)
     }
 }
 

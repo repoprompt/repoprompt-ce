@@ -142,9 +142,6 @@ final class ClaudeAgentModeCoordinator {
     }
 
     func stop() {
-        // Stop all tracked sessions to prevent stale observer registrations.
-        let handlers = toolHandlerByTabID
-        toolHandlerByTabID.removeAll()
         controllerLaunchSettingsByTabID.removeAll()
         controllerRetirementGenerationByTabID.removeAll()
         let resumeTransferTasks = Array(pendingResumeTransferTasksByTabID.values)
@@ -153,6 +150,16 @@ final class ClaudeAgentModeCoordinator {
         pendingResumeTransferTasksByTabID.removeAll()
         pendingResumeTransferGenerationByTabID.removeAll()
         retiredResumeTransferTasksByTabID.removeAll()
+    }
+
+    /// Detaches every tab-scoped Claude tool tracker from the coordinator map without blocking.
+    ///
+    /// Call from workspace-switch discard before the foreground session map is cleared so
+    /// recycled tab IDs do not inherit stale tracking state. Do not call from `stop()`, which
+    /// also runs when agent mode UI is hidden while sessions remain alive.
+    func detachAllClaudeToolTrackingHandlersForWorkspaceSwitch() {
+        let handlers = toolHandlerByTabID
+        toolHandlerByTabID.removeAll()
         for (tabID, handler) in handlers {
             let session = AgentModeViewModel.TabSession(tabID: tabID)
             Task { await handler.stopTracking(for: session) }
@@ -1136,7 +1143,8 @@ final class ClaudeAgentModeCoordinator {
 
     func shutdownClaudeSession(
         _ session: AgentModeViewModel.TabSession,
-        clearTabScopedCoordinatorState: Bool = true
+        clearTabScopedCoordinatorState: Bool = true,
+        detachedRunID: UUID? = nil
     ) async {
         await awaitPendingClaudeResumeTransferIfNeeded(
             for: session,
@@ -1169,6 +1177,8 @@ final class ClaudeAgentModeCoordinator {
         session.setRunningStatus(nil, source: nil)
         if clearTabScopedCoordinatorState {
             await clearClaudeToolTracking(for: session)
+        } else {
+            await clearClaudeToolTracking(for: session, matchingRunID: detachedRunID)
         }
     }
 
@@ -1176,6 +1186,17 @@ final class ClaudeAgentModeCoordinator {
         for session: AgentModeViewModel.TabSession
     ) async {
         guard let handler = toolHandlerByTabID.removeValue(forKey: session.tabID) else { return }
+        await handler.stopTracking(for: session)
+    }
+
+    private func clearClaudeToolTracking(
+        for session: AgentModeViewModel.TabSession,
+        matchingRunID runID: UUID?
+    ) async {
+        guard let runID else { return }
+        guard let handler = toolHandlerByTabID[session.tabID] else { return }
+        guard handler.currentTrackedRunID == runID else { return }
+        toolHandlerByTabID.removeValue(forKey: session.tabID)
         await handler.stopTracking(for: session)
     }
 

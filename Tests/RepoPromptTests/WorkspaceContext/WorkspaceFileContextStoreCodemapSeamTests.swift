@@ -294,6 +294,73 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
         return ready
     }
 
+    /// Requests a codemap artifact demand and retries through transient unavailability
+    /// (git transient failures, busy backoff, runtime setup hiccups) until the demand
+    /// settles ready or a stable unavailability/timeout is reached. Hosted CI runners
+    /// can transiently fail git authority capture under load; re-requesting detaches
+    /// the failed session and re-triggers setup so the test reaches the ready state
+    /// it needs without masking genuine terminal failures.
+    fileprivate func readyArtifactDemand(
+        store: WorkspaceFileContextStore,
+        forFileID fileID: UUID,
+        timeout: Duration = .seconds(30),
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> (ticket: WorkspaceCodemapArtifactDemandTicket, ready: WorkspaceCodemapArtifactDemandReady) {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var lastNonReadyResult: WorkspaceCodemapArtifactDemandResult?
+        while clock.now < deadline {
+            let initial = await store.requestCodemapArtifact(forFileID: fileID)
+            switch initial {
+            case let .pending(ticket):
+                let result = try await settledResult(store: store, ticket: ticket)
+                switch result {
+                case let .ready(ready):
+                    return (ticket, ready)
+                case let .unavailable(reason) where !Self.demandUnavailableIsStable(reason):
+                    lastNonReadyResult = result
+                    try await Task.sleep(for: .milliseconds(50))
+                    continue
+                default:
+                    lastNonReadyResult = result
+                    throw CodemapStoreTestError.expectedReady
+                }
+            case let .ready(ready):
+                return (ready.ticket, ready)
+            case let .unavailable(reason) where !Self.demandUnavailableIsStable(reason):
+                lastNonReadyResult = initial
+                try await Task.sleep(for: .milliseconds(50))
+                continue
+            default:
+                lastNonReadyResult = initial
+                throw CodemapStoreTestError.expectedReady
+            }
+        }
+        XCTFail(
+            "Timed out waiting for ready codemap artifact demand; last result = \(String(describing: lastNonReadyResult)).",
+            file: file,
+            line: line
+        )
+        throw CodemapStoreTestError.timedOut
+    }
+
+    private static func demandUnavailableIsStable(
+        _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+    ) -> Bool {
+        switch reason {
+        case .rootNotLoaded, .fileNotCataloged, .unsupportedFileType:
+            true
+        case let .gitTerminal(reason):
+            reason != .releasedRootEpoch
+        case let .demandUnavailable(reason):
+            reason != .transient
+        case .gitTransient, .busy, .rejected, .routeConflict, .registrationFailed,
+             .runtimeFailure, .staleCurrentness, .cancelled:
+            false
+        }
+    }
+
     fileprivate func frozenPresentationBundle(
         _ disposition: WorkspaceCodemapPresentationFreezeDisposition
     ) throws -> WorkspaceCodemapFrozenPresentationBundle {
@@ -5695,8 +5762,9 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         let loaded = try await store.loadRoot(path: root.path)
         let loadedFiles = await store.files(inRoot: loaded.id)
         let feature = try XCTUnwrap(loadedFiles.first)
-        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: feature.id))
-        let ready = try await readyResult(settledResult(store: store, ticket: ticket))
+        let initialDemand = try await readyArtifactDemand(store: store, forFileID: feature.id)
+        let ticket = initialDemand.ticket
+        let ready = initialDemand.ready
         let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
             rootDisplayName: "Workspace",
             standardizedRelativePath: feature.standardizedRelativePath
@@ -5733,12 +5801,9 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             relativePath: feature.standardizedRelativePath
         )
         let successorFile = try XCTUnwrap(successorFileValue)
-        let successorTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: successorFile.id))
+        let successorDemand = try await readyArtifactDemand(store: store, forFileID: successorFile.id)
+        let successorTicket = successorDemand.ticket
         XCTAssertGreaterThan(successorTicket.catalogGeneration, ticket.catalogGeneration)
-        let successorResult = try await settledResult(store: store, ticket: successorTicket)
-        guard case .ready = successorResult else {
-            return XCTFail("Expected checkout successor ready, got \(successorResult).")
-        }
         _ = try await store.createFile(
             rootID: loaded.id,
             relativePath: "Sources/CatalogReplacement.swift",

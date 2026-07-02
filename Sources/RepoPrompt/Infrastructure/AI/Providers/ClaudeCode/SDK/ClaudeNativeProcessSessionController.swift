@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final actor ClaudeNativeProcessSessionController {
@@ -233,6 +234,61 @@ final actor ClaudeNativeProcessSessionController {
         process != nil
     }
 
+    deinit {
+        performSynchronousDeinitCleanup()
+    }
+
+    /// Last-resort process cleanup for controller deallocation.
+    ///
+    /// Normal owners must call async `shutdown()`, which can reap the process and
+    /// clear expected PID registrations. `deinit` cannot await that path, so this
+    /// method releases file-handle callbacks, closes stdin, sends SIGTERM to any
+    /// still-owned child process, and schedules expected-PID cleanup on the MCP actor.
+    private func performSynchronousDeinitCleanup() {
+        closeOutputChannelsAndInput()
+
+        if let process {
+            _ = Darwin.kill(process.pid, SIGTERM)
+            var status: Int32 = 0
+            _ = Darwin.waitpid(process.pid, &status, WNOHANG)
+        }
+
+        scheduleExpectedAgentPIDDeinitClearIfNeeded()
+    }
+
+    private func closeOutputChannelsAndInput() {
+        stdoutChunkChannel?.finish()
+        stderrChunkChannel?.finish()
+        stdoutConsumerTask?.cancel()
+        stderrConsumerTask?.cancel()
+
+        stdoutChunkChannel = nil
+        stderrChunkChannel = nil
+        stdoutConsumerTask = nil
+        stderrConsumerTask = nil
+
+        if let process {
+            process.stdout.readabilityHandler = nil
+            process.stderr.readabilityHandler = nil
+            process.stdin?.closeFile()
+        }
+    }
+
+    /// Clears MCP expected-agent PID registration when async `shutdown()` did not run.
+    private func scheduleExpectedAgentPIDDeinitClearIfNeeded() {
+        guard config.toolContext == .agentRun,
+              let registeredExpectedAgentPID,
+              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+        else {
+            return
+        }
+        let pid = registeredExpectedAgentPID
+        let runID = runID
+        Task {
+            await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+        }
+    }
+
     var hasTurnInFlight: Bool {
         pendingTurnIDHead < pendingTurnIDBuffer.count
     }
@@ -450,20 +506,9 @@ final actor ClaudeNativeProcessSessionController {
         clearTurnIDQueue()
         cancelAuthoritativeLifecycleState()
 
-        // Tear down chunk channels and consumer tasks before process cleanup.
-        stdoutChunkChannel?.finish()
-        stderrChunkChannel?.finish()
-        stdoutConsumerTask?.cancel()
-        stderrConsumerTask?.cancel()
-        stdoutChunkChannel = nil
-        stderrChunkChannel = nil
-        stdoutConsumerTask = nil
-        stderrConsumerTask = nil
+        closeOutputChannelsAndInput()
 
         if let process {
-            process.stdout.readabilityHandler = nil
-            process.stderr.readabilityHandler = nil
-            process.stdin?.closeFile()
             let pid = process.pid
             _ = await ProcessTermination.terminateAndReap(
                 pid: pid,

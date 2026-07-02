@@ -56,6 +56,10 @@ final class ClaudeAgentToolTrackingHandler {
     private var toolCorrelationStartSequenceIndex: Int = 0
     /// Currently tracked Claude run for explicit provider `tool_result` acknowledgements.
     private var trackedRunID: UUID?
+    var currentTrackedRunID: UUID? {
+        trackedRunID
+    }
+
     /// Dedup set of explicit provider `tool_result` invocation IDs acknowledged for the tracked run.
     private var explicitProviderToolResultAckedInvocationIDs: Set<UUID> = []
     /// Monotonic count of deduped explicit provider `tool_result` acknowledgements for the tracked run.

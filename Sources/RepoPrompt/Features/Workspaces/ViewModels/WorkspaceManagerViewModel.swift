@@ -602,8 +602,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     #endif
 
     private struct WorkspaceDidSwitchListener {
+        let token: UUID
         let label: String
         let listener: (WorkspaceModel?) -> Void
+    }
+
+    private struct BeforeSaveListener {
+        let token: UUID
+        let listener: (WorkspaceModel) -> Void
     }
 
     private struct WorkspaceRootHydrationResult {
@@ -644,8 +650,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private var workspaceDidSwitchListeners: [WorkspaceDidSwitchListener] = []
 
-    /// Multiple callbacks that will be triggered before saving the active workspace
-    private var beforeSaveListeners: [(WorkspaceModel) -> Void] = []
+    /// Multiple callbacks that will be triggered before saving the active workspace.
+    private var beforeSaveListeners: [BeforeSaveListener] = []
     private var composeTabApplyTask: Task<Void, Never>?
     private var composeTabApplyTaskID = UUID()
 
@@ -711,24 +717,67 @@ class WorkspaceManagerViewModel: ObservableObject {
         await switchSessionRegistry.cancelActiveSessions()
     }
 
+    /// Registers a listener for active-workspace switches.
+    ///
+    /// This compatibility overload intentionally discards the registration token.
+    /// Prefer `addWorkspaceDidSwitchListener(label:_:)` when the owner has a
+    /// bounded lifetime and needs to unregister during teardown.
     func addWorkspaceDidSwitchListener(_ listener: @escaping (WorkspaceModel?) -> Void) {
         addWorkspaceDidSwitchListener(label: "unknown", listener)
     }
 
-    func addWorkspaceDidSwitchListener(label: String, _ listener: @escaping (WorkspaceModel?) -> Void) {
+    /// Registers a listener for active-workspace switches and returns a removal token.
+    ///
+    /// Call `removeWorkspaceDidSwitchListener(_:)` with the returned token when
+    /// the owning object is torn down. This keeps listener arrays from retaining
+    /// dead weak-capture closures across repeated window/view-model lifetimes.
+    @discardableResult
+    func addWorkspaceDidSwitchListener(label: String, _ listener: @escaping (WorkspaceModel?) -> Void) -> UUID {
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = UUID()
         workspaceDidSwitchListeners.append(
             WorkspaceDidSwitchListener(
+                token: token,
                 label: trimmedLabel.isEmpty ? "unknown" : trimmedLabel,
                 listener: listener
             )
         )
+        return token
     }
 
-    /// Let other components register a "before save" hook
-    func addBeforeSaveListener(_ listener: @escaping (WorkspaceModel) -> Void) {
-        beforeSaveListeners.append(listener)
+    /// Removes a previously registered workspace-switch listener.
+    func removeWorkspaceDidSwitchListener(_ token: UUID) {
+        workspaceDidSwitchListeners.removeAll { $0.token == token }
     }
+
+    /// Registers a hook that runs immediately before the active workspace is saved.
+    ///
+    /// The returned token should be removed by owners with finite lifetimes using
+    /// `removeBeforeSaveListener(_:)`.
+    @discardableResult
+    func addBeforeSaveListener(_ listener: @escaping (WorkspaceModel) -> Void) -> UUID {
+        let token = UUID()
+        beforeSaveListeners.append(BeforeSaveListener(token: token, listener: listener))
+        return token
+    }
+
+    /// Removes a previously registered before-save listener.
+    func removeBeforeSaveListener(_ token: UUID) {
+        beforeSaveListeners.removeAll { $0.token == token }
+    }
+
+    #if DEBUG
+        /// Returns the number of registered workspace-switch listeners for lifecycle tests.
+        func test_workspaceDidSwitchListenerCount(label: String? = nil) -> Int {
+            guard let label else { return workspaceDidSwitchListeners.count }
+            return workspaceDidSwitchListeners.count { $0.label == label }
+        }
+
+        /// Returns the number of registered before-save listeners for lifecycle tests.
+        func test_beforeSaveListenerCount() -> Int {
+            beforeSaveListeners.count
+        }
+    #endif
 
     private func notifyWorkspaceDidSwitch(_ workspace: WorkspaceModel?) {
         for (index, listenerRecord) in workspaceDidSwitchListeners.enumerated() {
@@ -4582,8 +4631,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // 1) Call all "beforeSave" listeners, passing the active workspace
         if let active = activeWorkspace {
-            for listener in beforeSaveListeners {
-                listener(active)
+            for listenerRecord in beforeSaveListeners {
+                listenerRecord.listener(active)
             }
         }
 
@@ -4617,8 +4666,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // Call before-save listeners on the active
         if let active = activeWorkspace {
-            for listener in beforeSaveListeners {
-                listener(active)
+            for listenerRecord in beforeSaveListeners {
+                listenerRecord.listener(active)
             }
         }
 

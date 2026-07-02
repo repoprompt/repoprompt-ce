@@ -300,6 +300,43 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertFalse(manager.isSwitchingWorkspace)
     }
 
+    func testListenerRemovalTokensDropRegisteredCallbacks() async {
+        let composition = makeComposition()
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+        let initialBeforeSaveCount = manager.test_beforeSaveListenerCount()
+
+        let workspaceSwitchToken = manager.addWorkspaceDidSwitchListener(label: "removal-token-test") { _ in
+            XCTFail("Removed workspace-switch listener should not be invoked")
+        }
+        let beforeSaveToken = manager.addBeforeSaveListener { _ in
+            XCTFail("Removed before-save listener should not be invoked")
+        }
+
+        XCTAssertEqual(manager.test_workspaceDidSwitchListenerCount(label: "removal-token-test"), 1)
+        XCTAssertEqual(manager.test_beforeSaveListenerCount(), initialBeforeSaveCount + 1)
+
+        manager.removeWorkspaceDidSwitchListener(workspaceSwitchToken)
+        manager.removeBeforeSaveListener(beforeSaveToken)
+
+        XCTAssertEqual(manager.test_workspaceDidSwitchListenerCount(label: "removal-token-test"), 0)
+        XCTAssertEqual(manager.test_beforeSaveListenerCount(), initialBeforeSaveCount)
+
+        let target = manager.createWorkspace(
+            name: "Removed Listener Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let result = await manager.requestWorkspaceSwitch(
+            to: target,
+            saveState: true,
+            reason: "listenerRemovalToken"
+        )
+
+        XCTAssertEqual(result, .switched)
+        XCTAssertEqual(manager.activeWorkspaceID, target.id)
+    }
+
     func testCancellationAfterUnloadRetainsOwnershipUntilFallbackRecoveryCompletes() async throws {
         let root = try makeTemporaryDirectory(named: "OwnedFallbackRecovery")
         defer { try? FileManager.default.removeItem(at: root) }

@@ -6,6 +6,8 @@ from __future__ import annotations
 import io
 import time
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import ci_app_test_runner
 
@@ -196,6 +198,125 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.attempts, 2)
         self.assertEqual(len(stopped), 1)
+
+    def test_silent_startup_timeout_kills_before_full_suite_timeout(self) -> None:
+        attempts = [FakeProcess([]), FakeProcess(returncode=0)]
+        stopped: list[FakeProcess] = []
+
+        start = time.monotonic()
+        result = ci_app_test_runner.run_suite(
+            "RepoPromptTests.S",
+            timeout_seconds=2.0,
+            silent_timeout_retries=1,
+            process_factory=lambda suite: attempts.pop(0),
+            stop_process_tree_func=self.stop_fake_process(stopped),
+            output=io.StringIO(),
+            poll_interval_seconds=0.001,
+            silent_startup_seconds=0.02,
+        )
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result.state, "passed")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(len(stopped), 1)
+        # The silent startup timeout (0.02s) must fire well before the full suite
+        # timeout (2.0s); otherwise the retry would not happen until the whole budget
+        # elapsed.
+        self.assertLess(elapsed, 1.0)
+
+    def test_discover_test_bundle_finds_xctest_in_bin_path(self) -> None:
+        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(args, **kwargs):
+            if "build" in args and "--show-bin-path" in args:
+                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
+            raise AssertionError(f"unexpected call: {args}")
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
+                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
+                    fake_bin_dir / "RepoPromptCEPackageTests.xctest",
+                ]):
+                    bundle = ci_app_test_runner.discover_test_bundle("swift", None)
+
+        self.assertEqual(bundle, fake_bin_dir / "RepoPromptCEPackageTests.xctest")
+
+    def test_discover_test_bundle_returns_none_when_bin_path_missing(self) -> None:
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(args, **kwargs):
+            return FakeCompletedProcess("/nonexistent/path\n")
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=False):
+                bundle = ci_app_test_runner.discover_test_bundle("swift", None)
+
+        self.assertIsNone(bundle)
+
+    def test_discover_test_bundle_returns_none_on_swift_failure(self) -> None:
+        import subprocess as sp
+
+        def fake_run(args, **kwargs):
+            raise sp.CalledProcessError(returncode=1, cmd=args)
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            bundle = ci_app_test_runner.discover_test_bundle("swift", None)
+
+        self.assertIsNone(bundle)
+
+    def test_create_suite_process_uses_xctest_when_bundle_provided(self) -> None:
+        captured_args: list[list[str]] = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs) -> None:
+                captured_args.append(args)
+                self.pid = -1
+                self.stdout = None
+                self.returncode = 0
+
+        bundle = Path("/fake/Tests.xctest")
+        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
+            ci_app_test_runner.create_suite_process(
+                "RepoPromptTests.S",
+                swift_binary="swift",
+                cwd=None,
+                test_bundle=bundle,
+                xctest_binary="/usr/bin/xctest",
+            )
+
+        self.assertEqual(len(captured_args), 1)
+        self.assertEqual(captured_args[0], ["/usr/bin/xctest", "-XCTest", "RepoPromptTests.S", str(bundle)])
+
+    def test_create_suite_process_falls_back_to_swift_test_without_bundle(self) -> None:
+        captured_args: list[list[str]] = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs) -> None:
+                captured_args.append(args)
+                self.pid = -1
+                self.stdout = None
+                self.returncode = 0
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
+            ci_app_test_runner.create_suite_process(
+                "RepoPromptTests.S",
+                swift_binary="swift",
+                cwd=None,
+            )
+
+        self.assertEqual(len(captured_args), 1)
+        self.assertEqual(captured_args[0], ["swift", "test", "--skip-build", "--filter", "RepoPromptTests.S"])
 
 
 if __name__ == "__main__":

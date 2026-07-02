@@ -229,21 +229,14 @@ struct AgentModeSidebarSessionBuilder {
         entries: [AgentSessionIndexEntry]
     ) -> AgentSessionIndexEntry? {
         let preferredName = tabName.map(normalizedSessionTitle)
-        var bestEntry: AgentSessionIndexEntry?
-
-        for entry in entries where entry.tabID == tabID {
+        let resolvedEntries = entries.lazy.compactMap { entry -> AgentSessionIndexEntry? in
+            guard entry.tabID == tabID else { return nil }
             var resolved = entry
             resolved.name = preferredName ?? normalizedSessionTitle(entry.name)
-            if let existing = bestEntry {
-                if AgentSessionRestoreSupport.shouldPreferSidebarEntry(resolved, over: existing) {
-                    bestEntry = resolved
-                }
-            } else {
-                bestEntry = resolved
-            }
+            return resolved
         }
 
-        return bestEntry
+        return AgentSessionRestoreSupport.preferredEntriesByTabID(from: resolvedEntries)[tabID]
     }
 
     private func sidebarRow(
