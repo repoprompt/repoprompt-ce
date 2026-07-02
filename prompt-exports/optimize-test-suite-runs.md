@@ -2801,3 +2801,150 @@ After-only focused optimizer artifacts from this pass (`--samples 3`, `--source-
 - Experimental result (not committed): full focused suite worsened to roughly `112–124s`; the non-agent path exposed intermittent `registrationFailed` around codemap demand timing; graph-drain changes materially increased wallclock.
 - Decision: defer P1 pending a diagnostic investigation of the codemap `registrationFailed` timing and the ContextBuilder fence cost profile. No source code, production semantics, XCTest IDs, ledger rows, method/contract/scenario counts, or root-gate claims changed in this note.
 - Next suggested planning path: ask design/context-builder to split P1 into diagnostic sub-problems or move to the next low-risk breadth cleanup wave if P1 remains unsafe.
+### Focused: 2026-07-02T17:30:58+00:00 — root — wave2-before-m1-tool-tracking-20260702T172942Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.AgentToolTrackingControllerTests --json`
+Artifact: `prompt-exports/test-suite-focused-root-wave2-before-m1-tool-tracking-20260702T172942Z.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.AgentToolTrackingControllerTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 71.929 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/cf208564-b449-48c0-a4b1-24bb18efe3c4.log` |  |
+| 2 | yes | 1.355 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8a022cf7-c0f5-4dda-83a7-3776515e3d34.log` |  |
+| 3 | yes | 1.370 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/effe8eed-b25d-4947-b48a-38e5c6663660.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T17:30:58+00:00/8654b62b3445 | wave2-before-m1-tool-tracking-20260702T172942Z | root | filtered: `RepoPromptTests.AgentToolTrackingControllerTests` | 3 valid + 0 invalid | 2825 | 7 | 2832 | 1.370 | 71.929 | 0.0110 | stable | `prompt-exports/test-suite-focused-root-wave2-before-m1-tool-tracking-20260702T172942Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | 4 | 0.563 | 0.328 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes` | 3 | 0.310 | 0.328 | 0.328 | 0 |
+| 2 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testConcurrentRawUnregisterAndStopJoinCapturedDeliveryBarrier` | 3 | 0.170 | 0.172 | 0.172 | 0 |
+| 3 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testStopWaitsForCapturedObserverToEnterMailboxAndDrain` | 3 | 0.080 | 0.085 | 0.085 | 0 |
+| 4 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testOverlappingStopAndStartUnregistersOldObserverAndReleasesCallbacks` | 3 | 0.003 | 0.003 | 0.003 | 0 |
+
+### Focused: 2026-07-02T17:34:20+00:00 — root — wave2-after-m1-tool-tracking-20260702T173417Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.AgentToolTrackingControllerTests --json`
+Artifact: `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173417Z.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.AgentToolTrackingControllerTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 0.827 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9a18f137-595e-4f54-84d2-a11aca9f859f.log` |  |
+| 2 | yes | 0.783 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a013a63c-5e4e-477b-bbd5-4cc2beda4475.log` |  |
+| 3 | yes | 0.776 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/bc2e3aef-20fb-43e3-842e-e24f62097544.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T17:34:20+00:00/8654b62b3445 | wave2-after-m1-tool-tracking-20260702T173417Z | root | filtered: `RepoPromptTests.AgentToolTrackingControllerTests` | 3 valid + 0 invalid | 2825 | 7 | 2832 | 0.783 | 0.827 | 0.0093 | stable | `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173417Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | 4 | 0.005 | 0.003 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testConcurrentRawUnregisterAndStopJoinCapturedDeliveryBarrier` | 3 | 0.003 | 0.003 | 0.003 | 0 |
+| 2 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testOverlappingStopAndStartUnregistersOldObserverAndReleasesCallbacks` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 3 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 4 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testStopWaitsForCapturedObserverToEnterMailboxAndDrain` | 3 | 0.000 | 0.001 | 0.001 | 0 |
+
+### Focused: 2026-07-02T17:36:36+00:00 — root — wave2-after-m1-tool-tracking-20260702T173633Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.AgentToolTrackingControllerTests --json`
+Artifact: `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173633Z.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.AgentToolTrackingControllerTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 0.827 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8236c640-51ed-473b-9e73-947d9edc00cc.log` |  |
+| 2 | yes | 0.879 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2940930d-2bd5-4e8b-b74f-4c5e5e11da72.log` |  |
+| 3 | yes | 0.773 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6be41db2-6e30-4356-80d3-ca053e1c77c4.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T17:36:36+00:00/8654b62b3445 | wave2-after-m1-tool-tracking-20260702T173633Z | root | filtered: `RepoPromptTests.AgentToolTrackingControllerTests` | 3 valid + 0 invalid | 2825 | 7 | 2832 | 0.827 | 0.879 | 0.0635 | noisy | `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173633Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | 4 | 0.005 | 0.104 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testConcurrentRawUnregisterAndStopJoinCapturedDeliveryBarrier` | 3 | 0.003 | 0.003 | 0.003 | 0 |
+| 2 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testStopWaitsForCapturedObserverToEnterMailboxAndDrain` | 3 | 0.001 | 0.104 | 0.104 | 0 |
+| 3 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testOverlappingStopAndStartUnregistersOldObserverAndReleasesCallbacks` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 4 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+
+### Wave 2 M1 member note: 2026-07-02T17:46Z — optimization-wave2-m1-tool-tracking-gates
+
+- Scope: test-only deterministic gates in `Tests/RepoPromptTests/AgentMode/AgentToolTrackingControllerTests.swift`; production diff `0`.
+- Contract preserved: observer fire calls still return before FIFO transcript callback bodies drain; `stopTracking()` / raw unregister still wait on captured delivery barriers and mailbox drain; FIFO/order assertions retained.
+- Source changes: replaced fixed `Thread.sleep` / `Task.sleep` waits in the suite with test-local synchronous callback/checkpoint gates plus cooperative observer-count checks. No wallclock sleeps remain in the target file.
+- Focused before artifact: `prompt-exports/test-suite-focused-root-wave2-before-m1-tool-tracking-20260702T172942Z.json` — `3 valid + 0 invalid`, median `1.370s`, observed p95 `71.929s`, relative MAD `0.0110`, noise `stable`.
+- Focused after artifact (final source): `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T174531Z.json` — `3 valid + 0 invalid`, median `0.716s`, observed p95 `0.775s`, relative MAD `0.0055`, noise `stable`.
+- Superseded after artifacts `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173417Z.json` and `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173633Z.json` were generated before later style/review refinements; final comparison uses `20260702T174531Z`.
+- Validation: `make dev-test FILTER=RepoPromptTests.AgentToolTrackingControllerTests` passed, ticket `58c9fa87-368e-49d0-8871-ff9478161e25`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/58c9fa87-368e-49d0-8871-ff9478161e25.log`; `make dev-format-check` passed, ticket `e3295503-04ba-49c7-a4e2-532c8c5bfb64`, log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e3295503-04ba-49c7-a4e2-532c8c5bfb64.log`.
+- Method delta `0`; contract delta `0`; scenario delta `0`; XCTest-ID delta `0`; ledger untouched.
+- root delta not individually measured; see future Wave 2 gate.
+
+### Focused: 2026-07-02T17:45:34+00:00 — root — wave2-after-m1-tool-tracking-20260702T174531Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.AgentToolTrackingControllerTests --json`
+Artifact: `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T174531Z.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: filtered: `RepoPromptTests.AgentToolTrackingControllerTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 0.775 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/672c6469-f879-42d3-8c74-83ddbec1dd42.log` |  |
+| 2 | yes | 0.712 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7d9c9a47-5283-45a1-9762-04198ae80ebd.log` |  |
+| 3 | yes | 0.716 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/25f5a14d-1dd7-4a90-9315-ef55b9b6c573.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T17:45:34+00:00/8654b62b3445 | wave2-after-m1-tool-tracking-20260702T174531Z | root | filtered: `RepoPromptTests.AgentToolTrackingControllerTests` | 3 valid + 0 invalid | 2825 | 7 | 2832 | 0.716 | 0.775 | 0.0055 | stable | `prompt-exports/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T174531Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | 4 | 0.004 | 0.002 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testConcurrentRawUnregisterAndStopJoinCapturedDeliveryBarrier` | 3 | 0.002 | 0.002 | 0.002 | 0 |
+| 2 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testOverlappingStopAndStartUnregistersOldObserverAndReleasesCallbacks` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 3 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes` | 3 | 0.001 | 0.001 | 0.001 | 0 |
+| 4 | `RepoPromptTests.AgentToolTrackingControllerTests` | `testStopWaitsForCapturedObserverToEnterMailboxAndDrain` | 3 | 0.000 | 0.000 | 0.000 | 0 |
