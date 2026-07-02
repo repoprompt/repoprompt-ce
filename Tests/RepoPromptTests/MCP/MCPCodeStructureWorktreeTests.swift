@@ -132,6 +132,12 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             rootID: physicalRoot.id,
             rootLifetimeID: rootLifetimeID
         )
+        let graphClock = ContinuousClock()
+        let graphReady = await store.waitForCodemapGraphPublication(
+            rootEpoch: rootEpoch,
+            deadline: graphClock.now.advanced(by: .seconds(8))
+        )
+        XCTAssertTrue(graphReady, "Timed out waiting for root-local codemap graph publication")
         let markerBeforeTreeValue = await store.codemapMarkerReadinessSnapshotForTesting(
             rootEpoch: rootEpoch
         )
