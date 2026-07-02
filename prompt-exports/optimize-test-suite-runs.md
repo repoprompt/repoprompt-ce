@@ -1279,3 +1279,71 @@ Filter proof: for each method, sample 1 captured `$ swift test --filter <exact m
 | unix-peer-write-hangup | `RepoPromptTests.UnixSocketMCPTerminalCleanupTests/testPeerCloseDuringWritePublishesPeerWriteHangup` | 20 valid + 0 invalid | 0.815 | `/tmp/rpce-focused-loop-20260702/unix-peer-write-hangup-sample-01.out` | `d1627f4e-eb33-4ce5-8fbd-2fd1af2922d0` | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d1627f4e-eb33-4ce5-8fbd-2fd1af2922d0.log` |
 | manifest-logical-access-eviction | `RepoPromptTests.CodeMapRootManifestStoreTests/testLogicalAccessEvictionKeepsHotOldManifestOverColdNewManifest` | 20 valid + 0 invalid | 2.210 | `/tmp/rpce-focused-loop-20260702/manifest-logical-access-eviction-sample-01.out` | `89783f51-7eb4-4705-89d8-d49b9e6a2f6b` | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/89783f51-7eb4-4705-89d8-d49b9e6a2f6b.log` |
 | binding-draining-projection-materialization | `RepoPromptTests.WorkspaceCodemapBindingEngineTests/testDemandAdmissionCountsActiveAndDrainingProjectionMaterializationUsage` | 20 valid + 0 invalid | 1.897 | `/tmp/rpce-focused-loop-20260702/binding-draining-projection-materialization-sample-01.out` | `7ed66185-dbcb-4cd0-90f5-eb39c2cc7ee0` | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7ed66185-dbcb-4cd0-90f5-eb39c2cc7ee0.log` |
+### Baseline: 2026-07-02T04:25:20+00:00 — root — reliability-gate-20260702-root-after-latest-signatures
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --json`
+Artifact: `prompt-exports/test-suite-baseline-root-reliability-gate-20260702-root-after-latest-signatures.json`
+Inventory: `prompt-exports/test-suite-inventory-phase3-setup-20260701T141721Z.json`
+Scope/filter: complete
+Source-change guard: `metadata`
+Primary metric eligible: yes
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 678.364 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/834f1641-ad86-4451-a7c0-2a45701262e1.log` |  |
+| 2 | no | 650.872 | 0.001 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0517da9b-ccb8-4a39-8b6e-0bbb668bd7b3.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 3 | yes | 679.909 | 0.001 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/030104a7-7278-4bb8-9f72-906a9150f74a.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T04:25:20+00:00/a9a1cc840297 | reliability-gate-20260702-root-after-latest-signatures | root | complete | 2 valid + 1 invalid | 2825 | 7 | 2832 | 679.137 | 679.909 | 0.0011 | stable | `prompt-exports/test-suite-baseline-root-reliability-gate-20260702-root-after-latest-signatures.json` | source guard `metadata`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceCodemapBindingEngineTests` | 65 | 47.770 | 6.049 | 0 |
+| 2 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | 3 | 47.194 | 34.852 | 0 |
+| 3 | `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests` | 65 | 46.919 | 2.394 | 0 |
+| 4 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | 34 | 45.013 | 4.904 | 0 |
+| 5 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | 33 | 31.356 | 5.430 | 0 |
+| 6 | `RepoPromptTests.MCPAskOracleWorktreeTests` | 23 | 21.624 | 2.803 | 0 |
+| 7 | `RepoPromptTests.MCPCodeStructureWorktreeTests` | 18 | 21.404 | 3.605 | 0 |
+| 8 | `RepoPromptTests.AgentRunWorktreeStartTests` | 34 | 21.228 | 3.290 | 0 |
+| 9 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | 5 | 20.712 | 15.612 | 0 |
+| 10 | `RepoPromptTests.GitLoadedRootAuthorityEvidenceTests` | 47 | 20.258 | 16.434 | 2 |
+| 11 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | 16 | 20.138 | 10.322 | 0 |
+| 12 | `RepoPromptTests.WorkspacePendingSeededRootTests` | 12 | 18.077 | 2.830 | 0 |
+| 13 | `RepoPromptTests.WorkspaceCodemapLiveOverlayTests` | 37 | 15.734 | 1.169 | 0 |
+| 14 | `RepoPromptTests.CodeMapRootManifestStoreTests` | 28 | 12.431 | 3.380 | 0 |
+| 15 | `RepoPromptTests.AgentProviderContextBuilderTests` | 7 | 11.977 | 12.640 | 0 |
+| 16 | `RepoPromptTests.ACPAgentSessionControllerModeConfigTests` | 27 | 10.485 | 1.144 | 0 |
+| 17 | `RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests` | 3 | 10.089 | 10.093 | 0 |
+| 18 | `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests` | 17 | 9.715 | 1.182 | 0 |
+| 19 | `RepoPromptTests.PersistentAgentModeMCPReadFileConnectionTests` | 16 | 9.625 | 2.610 | 0 |
+| 20 | `RepoPromptTests.WorkspaceCodemapSelectionGraphTests` | 19 | 9.151 | 0.794 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeEmptyInitialSelectionDefersAndRoutesWithoutExplicitContext` | 2 | 34.285 | 34.852 | 34.852 | 0 |
+| 2 | `RepoPromptTests.GitLoadedRootAuthorityEvidenceTests` | `testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBounded` | 2 | 16.427 | 16.434 | 16.434 | 0 |
+| 3 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | `testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections` | 2 | 13.704 | 15.612 | 15.612 | 0 |
+| 4 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior` | 2 | 12.646 | 12.871 | 12.871 | 0 |
+| 5 | `RepoPromptTests.AgentProviderContextBuilderTests` | `testAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze` | 2 | 11.874 | 12.640 | 12.640 | 0 |
+| 6 | `RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests` | `testManifestScaleStreamsOneHundredThousandByDefaultAndOneMillionOptIn` | 2 | 10.086 | 10.093 | 10.093 | 0 |
+| 7 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | `testFinalPackagingRetriesAfterRevocationAndDoesNotPublishFirstAssembly` | 2 | 9.204 | 10.322 | 10.322 | 0 |
+| 8 | `RepoPromptTests.WorkspaceCodemapLocalGitClassificationTests` | `testGitLayoutWatcherChangeReprobesAndAdmitsConvertedRepository` | 2 | 8.411 | 9.178 | 9.178 | 0 |
+| 9 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | `testFinalPackagingCancellationThrowsWithoutPublishingPayload` | 2 | 8.351 | 9.293 | 9.293 | 0 |
+| 10 | `RepoPromptTests.FileSystemAcceptedIngressBarrierTests` | `testSyntheticHundredThousandPathReplayUsesBoundedSpillWorkingSet` | 2 | 7.163 | 7.291 | 7.291 | 0 |
+| 11 | `RepoPromptTests.WorkspaceRootNamespaceManifestTests` | `testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes` | 2 | 6.896 | 6.898 | 6.898 | 0 |
+| 12 | `RepoPromptTests.SelectionSlicePersistenceAndRebaseTests` | `testCanonicalStoreWatcherEditsPreserveLargeBeginningMiddleEndSlices` | 2 | 6.883 | 6.895 | 6.895 | 0 |
+| 13 | `RepoPromptTests.WorkspaceCodemapBindingEngineTests` | `testWarmManifestRejectsExplicitNonCleanCandidateStatesWithoutSourceRead` | 2 | 5.787 | 6.049 | 6.049 | 0 |
+| 14 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | `testLoadedRootAdmissionCurrentnessClassifiesCatalogStaleness` | 2 | 5.242 | 5.430 | 5.430 | 0 |
+| 15 | `RepoPromptTests.CLIProcessRunnerLifecycleTests` | `testStreamingProcessTerminationCallbackRunsAfterRunnerCancellation` | 2 | 5.034 | 5.037 | 5.037 | 0 |
+| 16 | `RepoPromptTests.ProcessLauncherDescriptorInheritanceTests` | `testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive` | 2 | 5.021 | 5.023 | 5.023 | 0 |
+| 17 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | `testAutomaticSelectionIgnoresUnsupportedEnterpriseInventoryForCompleteness` | 2 | 4.787 | 4.904 | 4.904 | 0 |
+| 18 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | `testReceiptCreationFailurePointsAreCorrelationScopedOneShotAndFailClosed` | 2 | 4.027 | 4.066 | 4.066 | 0 |
+| 19 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | `testColdAutomaticSelectionUsesManifestEnvelopeAndCASWithoutUnrelatedBuild` | 2 | 3.712 | 3.719 | 3.719 | 0 |
+| 20 | `RepoPromptTests.AgentManageMCPToolServiceResumeTests` | `testResumeOfControlledSessionPreservesWaitOwnershipAcrossSteering` | 2 | 3.640 | 3.656 | 3.656 | 0 |
