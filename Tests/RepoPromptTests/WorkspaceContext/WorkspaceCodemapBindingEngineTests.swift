@@ -3596,27 +3596,96 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             ]
         )
         let fault = EngineManifestFaultOnce()
+        let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
             manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
-        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+        )
         _ = await fixture.engine.registerRoot(fixture.registration)
-        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Failure.swift")) else {
-            return XCTFail("Manifest failure must not discard ready overlay state.")
+        let failureResult = await fixture.engine.demand(fixture.demand(path: "Sources/Failure.swift"))
+        guard case .ready = failureResult else {
+            let accounting = await fixture.engine.accounting()
+            return XCTFail(bindingDemandFailureMessage(
+                "Manifest failure must not discard ready overlay state.",
+                result: failureResult,
+                accounting: accounting,
+                events: hookEvents.snapshot()
+            ))
         }
+        XCTAssertTrue(hookEvents.wait(
+            kind: .manifestRevisionQueued,
+            rootEpoch: fixture.rootEpoch,
+            numericValue: 1
+        ))
+        XCTAssertTrue(hookEvents.wait(
+            kind: .manifestFailure,
+            rootEpoch: fixture.rootEpoch,
+            numericValue: 0
+        ))
+        XCTAssertEqual(fault.triggeredCount, 1)
+        XCTAssertEqual(
+            hookEvents.values(kind: .manifestFailure).count(where: { $0.rootEpoch == fixture.rootEpoch }),
+            1
+        )
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.dirtyManifestCount, 1)
         XCTAssertEqual(accounting.counters.manifestFailures, 1)
         let bundleValue = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
         XCTAssertEqual(try XCTUnwrap(bundleValue).entries.count, 1)
 
-        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Recovery.swift")) else {
-            return XCTFail("Expected newer manifest revision to recover publication.")
+        let recoveryResult = await fixture.engine.demand(fixture.demand(path: "Sources/Recovery.swift"))
+        guard case .ready = recoveryResult else {
+            let accounting = await fixture.engine.accounting()
+            return XCTFail(bindingDemandFailureMessage(
+                "Expected newer manifest revision to recover publication.",
+                result: recoveryResult,
+                accounting: accounting,
+                events: hookEvents.snapshot()
+            ))
         }
+        XCTAssertTrue(hookEvents.wait(
+            kind: .manifestRevisionQueued,
+            rootEpoch: fixture.rootEpoch,
+            numericValue: 2
+        ))
+        XCTAssertTrue(hookEvents.wait(
+            kind: .manifestWrite,
+            rootEpoch: fixture.rootEpoch,
+            numericValue: 0
+        ))
         let recoveredAccounting = await fixture.engine.accounting()
         XCTAssertEqual(recoveredAccounting.dirtyManifestCount, 0)
         XCTAssertEqual(recoveredAccounting.counters.manifestWrites, 1)
+
+        let state = await fixture.capabilityService.state(for: fixture.rootEpoch)
+        let capability = try eligible(state)
+        let pipeline = try SyntaxManager.shared.pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let namespace = try CodeMapRootManifestNamespace(
+            capability: capability,
+            pipelineIdentity: pipeline
+        )
+        let authority = try CodeMapRootManifestAuthority(
+            namespace: namespace,
+            token: capability.repositoryAuthority
+        )
+        guard case let .hit(snapshot) = try await runtime.manifestStore.loadCurrentManifest(
+            namespace: namespace,
+            currentAuthority: authority
+        ) else {
+            return XCTFail("Expected recovered manifest publication after retry.")
+        }
+        XCTAssertEqual(
+            Set(snapshot.records.map(\.repositoryRelativePath)),
+            ["Sources/Failure.swift", "Sources/Recovery.swift"]
+        )
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
 
         let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
@@ -3626,7 +3695,12 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         guard await isReady(reloaded.engine.demand(
             reloaded.demand(path: "Sources/Failure.swift")
         )) else {
-            return XCTFail("Expected recovered manifest to retain both revisions on demand.")
+            return XCTFail("Expected recovered manifest to retain failed revision on demand.")
+        }
+        guard await isReady(reloaded.engine.demand(
+            reloaded.demand(path: "Sources/Recovery.swift")
+        )) else {
+            return XCTFail("Expected recovered manifest to retain retry revision on demand.")
         }
     }
 
@@ -5202,6 +5276,42 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         }
     }
 
+    private func bindingDemandFailureMessage(
+        _ message: String,
+        result: WorkspaceCodemapBindingDemandResult,
+        accounting: WorkspaceCodemapBindingEngineAccounting,
+        events: [WorkspaceCodemapBindingEngineHookEvent]
+    ) -> String {
+        """
+        \(message) result=\(String(describing: result)); \
+        accounting={\(bindingAccountingSummary(accounting))}; \
+        events=[\(bindingHookSummary(events))]
+        """
+    }
+
+    private func bindingAccountingSummary(
+        _ accounting: WorkspaceCodemapBindingEngineAccounting
+    ) -> String {
+        [
+            "dirtyManifestCount=\(accounting.dirtyManifestCount)",
+            "activeRequestCount=\(accounting.activeRequestCount)",
+            "queuedRequestCount=\(accounting.queuedRequestCount)",
+            "manifestWrites=\(accounting.counters.manifestWrites)",
+            "manifestFailures=\(accounting.counters.manifestFailures)",
+            "overlayReadyPublications=\(accounting.counters.overlayReadyPublications)",
+            "overlayExactDuplicateCompletions=\(accounting.counters.overlayExactDuplicateCompletions)"
+        ].joined(separator: ", ")
+    }
+
+    private func bindingHookSummary(
+        _ events: [WorkspaceCodemapBindingEngineHookEvent]
+    ) -> String {
+        events.enumerated().map { index, event in
+            let rootDescription = event.rootEpoch.map { String(describing: $0) } ?? "nil"
+            return "#\(index):\(event.kind.rawValue)(root=\(rootDescription),value=\(event.numericValue))"
+        }.joined(separator: " -> ")
+    }
+
     private func demandResult(
         _ task: Task<WorkspaceCodemapBindingDemandResult, Never>,
         before timeout: Duration
@@ -5354,11 +5464,17 @@ private final class EngineUptimeClock: @unchecked Sendable {
 private final class EngineManifestFaultOnce: @unchecked Sendable {
     private let lock = NSLock()
     private var failed = false
+    private var triggerCount = 0
+
+    var triggeredCount: Int {
+        lock.withLock { triggerCount }
+    }
 
     func action(_ point: CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction {
         lock.withLock {
             guard point == .afterTemporaryWrite, !failed else { return .proceed }
             failed = true
+            triggerCount += 1
             return .simulateProcessTermination
         }
     }
