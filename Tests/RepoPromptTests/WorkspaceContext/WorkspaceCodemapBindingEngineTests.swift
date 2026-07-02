@@ -946,8 +946,8 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
                 "Sources/Unrelated.swift": "struct Unrelated {}\n"
             ]
         )
-        let gate = EngineBuildGate()
-        addTeardownBlock { await gate.release() }
+        let gate = EngineMultiEntryGate()
+        addTeardownBlock { await gate.releaseAll() }
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
             builder: CodeMapArtifactBuilderClient(build: { _, _, _ in
@@ -992,10 +992,15 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
-        let enteredBuild = await gate.waitUntilEntered()
-        let activeProjectionAccounting = await fixture.engine.accounting()
+        let enteredBuild = await gate.waitUntilEntered(1)
         XCTAssertTrue(enteredBuild)
-        XCTAssertEqual(activeProjectionAccounting.projectionResources.retainedSourceBytes, sourceLimit)
+        let activeProjectionRetained = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return accounting.projectionResources.retainedSourceBytes == sourceLimit &&
+                accounting.activeProjectionBatchCount == 1 &&
+                accounting.projectionRoots.first?.activeBatchCount == 1
+        }
+        XCTAssertTrue(activeProjectionRetained)
 
         let blockedByActive = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/Foreground.swift"))
@@ -1009,6 +1014,11 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         guard case .cancelled = await blockedByActive.value else {
             return XCTFail("Expected the active-usage demand to cancel from the admission queue.")
         }
+        let activeDemandQueueDrained = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return accounting.activeRequestCount == 0 && accounting.queuedRequestCount == 0
+        }
+        XCTAssertTrue(activeDemandQueueDrained)
 
         _ = await fixture.engine.invalidateModified(
             rootEpoch: fixture.rootEpoch,
@@ -1017,6 +1027,8 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let drainingRetained = await waitForEngineCondition {
             let accounting = await fixture.engine.accounting()
             return accounting.projectionJobCount == 0 &&
+                accounting.drainingProjectionTaskCount == 1 &&
+                accounting.activeProjectionBatchCount == 1 &&
                 accounting.projectionResources.retainedSourceBytes == sourceLimit
         }
         XCTAssertTrue(drainingRetained)
@@ -1029,8 +1041,11 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             return accounting.activeRequestCount == 0 && accounting.queuedRequestCount == 1
         }
         XCTAssertTrue(queuedBehindDrain)
-        await gate.release()
-        guard let drainedResult = await demandResult(blockedByDrain, before: .seconds(5)),
+        let buildCountBeforeRelease = await gate.count
+        XCTAssertEqual(buildCountBeforeRelease, 1)
+
+        await gate.releaseAll()
+        guard let drainedResult = await demandResult(blockedByDrain, before: .seconds(10)),
               isReady(drainedResult)
         else {
             blockedByDrain.cancel()
@@ -1040,6 +1055,8 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             let accounting = await fixture.engine.accounting()
             return accounting.activeRequestCount == 0 &&
                 accounting.queuedRequestCount == 0 &&
+                accounting.drainingProjectionTaskCount == 0 &&
+                accounting.activeProjectionBatchCount == 0 &&
                 accounting.projectionResources == .zero
         }
         XCTAssertTrue(fullyDrained)

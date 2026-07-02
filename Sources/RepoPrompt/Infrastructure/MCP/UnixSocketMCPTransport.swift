@@ -56,6 +56,12 @@ import RepoPromptShared
             lock.unlock()
             callbacks.forEach { $0() }
         }
+
+        func pendingCount(_ kind: Kind) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return pendingCallbacks[kind]?.count ?? 0
+        }
     }
 
     struct UnixSocketMCPTransportCleanupSnapshot {
@@ -64,6 +70,7 @@ import RepoPromptShared
         let earlyReaderCancellationCount: Int
         let readerIsRetained: Bool
         let terminalCallbackCount: Int
+        let pendingTerminalCallbackCount: Int
         let cancellationCallbackCount: Int
         let finalizationCount: Int
         let descriptorCloseCount: Int
@@ -953,6 +960,10 @@ public actor UnixSocketMCPTransport: Transport {
         errno == ECONNRESET ? .peer : .transport
     }
 
+    private nonisolated static func isPeerWriteHangupErrno(_ errno: Int32) -> Bool {
+        errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN
+    }
+
     #if DEBUG
         private struct DebugExistingFDConnectFailure: Swift.Error {}
 
@@ -999,6 +1010,7 @@ public actor UnixSocketMCPTransport: Transport {
                 earlyReaderCancellationCount: earlyReaderCancellations.count,
                 readerIsRetained: debugLastReader != nil,
                 terminalCallbackCount: debugTerminalCallbackCount,
+                pendingTerminalCallbackCount: callbackGate.pendingCount(.terminal),
                 cancellationCallbackCount: debugCancellationCallbackCount,
                 finalizationCount: debugReaderFinalizationCount,
                 descriptorCloseCount: debugDescriptorCloseCount,
@@ -1092,7 +1104,7 @@ public actor UnixSocketMCPTransport: Transport {
                         bytesRemaining: remaining.count
                     )
                     continue
-                } else if err == EPIPE || err == ECONNRESET {
+                } else if Self.isPeerWriteHangupErrno(err) {
                     closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer, errno: err)
                     throw MCPError.connectionClosed
                 } else {

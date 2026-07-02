@@ -57,6 +57,15 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                 Self.closeIfOpen(peerFD)
                 peerFD = -1
 
+                let terminalHeld = await Self.waitUntil {
+                    let snapshot = await transport.debugCleanupSnapshot()
+                    return snapshot.hasActiveReader &&
+                        snapshot.socketIsOwned &&
+                        snapshot.terminalCallbackCount == 0 &&
+                        snapshot.pendingTerminalCallbackCount == 1
+                }
+                XCTAssertTrue(terminalHeld)
+
                 do {
                     try await transport.send(Data("peer-close-write".utf8))
                     XCTFail("Expected write to fail after the peer closed")
@@ -67,7 +76,8 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                 let close = try await Self.firstCloseSnapshot(closeStream)
                 XCTAssertEqual(close.cause, .writeHangup)
                 XCTAssertEqual(close.initiator, .peer)
-                XCTAssertTrue(close.errno == EPIPE || close.errno == ECONNRESET)
+                let acceptedPeerHangupErrnos: Set<Int32> = [EPIPE, ECONNRESET, ENOTCONN]
+                XCTAssertTrue(acceptedPeerHangupErrnos.contains(close.errno ?? -1))
                 let storedClose = await transport.closeSnapshot()
                 XCTAssertEqual(storedClose, close)
             }
