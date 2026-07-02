@@ -237,46 +237,57 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
             )],
             currentModelRaw: dynamicModelRaw
         )
-        let client = DelayedOpenCodeDiscoveryClient(result: discovered)
+        let gate = DiscoveryGate()
+        let client = GatedOpenCodeDiscoveryClient(result: discovered, gate: gate)
         let service = OpenCodeACPModelPollingService(client: client, intervalNanos: 60_000_000_000)
+        addTeardownBlock { await service.shutdown() }
+        let discoveryStartedEvents = await gate.discoveryStartedEvents()
+        let joinEvents = await service.test_refreshNowInFlightJoinEvents()
         let stream = await service.subscribe(workspacePath: nil)
-        await client.waitUntilCalled()
+        await awaitFirstEvent(discoveryStartedEvents, description: "OpenCode background discovery started")
 
         async let readiness = service.refreshNow(workspacePath: nil)
-        var iterator = stream.makeAsyncIterator()
-        let emittedSnapshot = await iterator.next()
-        let snapshot = try XCTUnwrap(emittedSnapshot)
+        await awaitFirstEvent(joinEvents, description: "OpenCode refreshNow joined the in-flight poll")
+        await gate.release()
+
+        let emittedSnapshot = await liveOpenCodeSnapshot(from: stream)
         let isReady = await readiness
-        let discoveryCallCount = await client.callCount()
+        let discoveryCallCount = await gate.callCount()
+        let snapshot = try XCTUnwrap(emittedSnapshot)
 
         XCTAssertTrue(isReady)
         XCTAssertTrue(snapshot.isLiveDiscovery)
         XCTAssertEqual(snapshot.models.currentModelRaw, dynamicModelRaw)
         XCTAssertEqual(discoveryCallCount, 1)
-        await service.shutdown()
     }
 
     func testCursorStartupReadinessJoinsRunningPollWithoutDynamicMetadata() async {
-        let client = DelayedCursorDiscoveryClient(result: nil)
+        let providerID = ACPProviderID.cursor
+        AgentACPModelRegistry.shared.test_reset(providerID: providerID)
+        addTeardownBlock {
+            AgentACPModelRegistry.shared.test_reset(providerID: providerID)
+        }
+
+        let gate = DiscoveryGate()
+        let client = GatedCursorDiscoveryClient(result: nil, gate: gate)
         let service = CursorACPModelPollingService(client: client, intervalNanos: 60_000_000_000)
+        addTeardownBlock { await service.shutdown() }
+        let discoveryStartedEvents = await gate.discoveryStartedEvents()
+        let joinEvents = await service.test_refreshNowInFlightJoinEvents()
         let stream = await service.subscribe(workspacePath: nil)
-        await client.waitUntilCalled()
+        await awaitFirstEvent(discoveryStartedEvents, description: "Cursor background discovery started")
 
         async let readiness = service.refreshNow(workspacePath: nil)
-        var iterator = stream.makeAsyncIterator()
-        var liveSnapshot: CursorACPModelPollingService.Snapshot?
-        while liveSnapshot == nil, let snapshot = await iterator.next() {
-            if snapshot.isLiveDiscovery {
-                liveSnapshot = snapshot
-            }
-        }
+        await awaitFirstEvent(joinEvents, description: "Cursor refreshNow joined the in-flight poll")
+        await gate.release()
+
+        let liveSnapshot = await liveCursorSnapshot(from: stream)
         let isReady = await readiness
-        let discoveryCallCount = await client.callCount()
+        let discoveryCallCount = await gate.callCount()
 
         XCTAssertTrue(isReady)
         XCTAssertEqual(liveSnapshot?.isLiveDiscovery, true)
         XCTAssertEqual(discoveryCallCount, 1)
-        await service.shutdown()
     }
 
     func testTransientFallbackResolutionDoesNotMutatePersistedSelection() throws {
@@ -341,6 +352,62 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         XCTAssertTrue(viewModel.contextBuilderRestorationAvailabilityContext.claudeCodeAvailable)
     }
 
+    private func awaitFirstEvent(
+        _ stream: AsyncStream<Void>,
+        description: String,
+        timeout: TimeInterval = 1
+    ) async {
+        let observed = expectation(description: description)
+        let observer = Task { @MainActor in
+            var iterator = stream.makeAsyncIterator()
+            if await iterator.next() != nil {
+                observed.fulfill()
+            }
+        }
+        await fulfillment(of: [observed], timeout: timeout)
+        observer.cancel()
+    }
+
+    private func liveOpenCodeSnapshot(
+        from stream: AsyncStream<OpenCodeACPModelPollingService.Snapshot>,
+        timeout: TimeInterval = 1
+    ) async -> OpenCodeACPModelPollingService.Snapshot? {
+        var liveSnapshot: OpenCodeACPModelPollingService.Snapshot?
+        let observed = expectation(description: "OpenCode emitted a live model snapshot")
+        let observer = Task { @MainActor in
+            var iterator = stream.makeAsyncIterator()
+            while let snapshot = await iterator.next() {
+                guard snapshot.isLiveDiscovery else { continue }
+                liveSnapshot = snapshot
+                observed.fulfill()
+                return
+            }
+        }
+        await fulfillment(of: [observed], timeout: timeout)
+        observer.cancel()
+        return liveSnapshot
+    }
+
+    private func liveCursorSnapshot(
+        from stream: AsyncStream<CursorACPModelPollingService.Snapshot>,
+        timeout: TimeInterval = 1
+    ) async -> CursorACPModelPollingService.Snapshot? {
+        var liveSnapshot: CursorACPModelPollingService.Snapshot?
+        let observed = expectation(description: "Cursor emitted a live model snapshot")
+        let observer = Task { @MainActor in
+            var iterator = stream.makeAsyncIterator()
+            while let snapshot = await iterator.next() {
+                guard snapshot.isLiveDiscovery else { continue }
+                liveSnapshot = snapshot
+                observed.fulfill()
+                return
+            }
+        }
+        await fulfillment(of: [observed], timeout: timeout)
+        observer.cancel()
+        return liveSnapshot
+    }
+
     private func makeStoreFixture() throws -> (
         store: GlobalSettingsStore,
         defaults: UserDefaults,
@@ -367,52 +434,85 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
     }
 }
 
-private actor DelayedOpenCodeDiscoveryClient: OpenCodeACPModelDiscoveryClient {
-    private let result: ACPDiscoveredSessionModels?
+private actor DiscoveryGate {
     private var calls = 0
+    private var isReleased = false
+    private var discoveryStartedObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(result: ACPDiscoveredSessionModels?) {
-        self.result = result
+    func discoveryStartedEvents() -> AsyncStream<Void> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        discoveryStartedObservers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeDiscoveryStartedObserver(id) }
+        }
+        if calls > 0 {
+            continuation.yield(())
+        }
+        return stream
     }
 
-    func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+    func waitForReleaseAfterRecordingDiscoveryStarted() async {
         calls += 1
-        try await Task.sleep(nanoseconds: 100_000_000)
-        return result
+        publishDiscoveryStarted()
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
     }
 
-    func waitUntilCalled() async {
-        while calls == 0 {
-            await Task.yield()
+    func release() {
+        guard !isReleased else { return }
+        isReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
     func callCount() -> Int {
         calls
+    }
+
+    private func publishDiscoveryStarted() {
+        for continuation in discoveryStartedObservers.values {
+            continuation.yield(())
+        }
+    }
+
+    private func removeDiscoveryStartedObserver(_ id: UUID) {
+        discoveryStartedObservers.removeValue(forKey: id)
     }
 }
 
-private actor DelayedCursorDiscoveryClient: CursorACPModelDiscoveryClient {
+private actor GatedOpenCodeDiscoveryClient: OpenCodeACPModelDiscoveryClient {
     private let result: ACPDiscoveredSessionModels?
-    private var calls = 0
+    private let gate: DiscoveryGate
 
-    init(result: ACPDiscoveredSessionModels?) {
+    init(result: ACPDiscoveredSessionModels?, gate: DiscoveryGate) {
         self.result = result
+        self.gate = gate
     }
 
     func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
-        calls += 1
-        try await Task.sleep(nanoseconds: 100_000_000)
+        await gate.waitForReleaseAfterRecordingDiscoveryStarted()
         return result
     }
+}
 
-    func waitUntilCalled() async {
-        while calls == 0 {
-            await Task.yield()
-        }
+private actor GatedCursorDiscoveryClient: CursorACPModelDiscoveryClient {
+    private let result: ACPDiscoveredSessionModels?
+    private let gate: DiscoveryGate
+
+    init(result: ACPDiscoveredSessionModels?, gate: DiscoveryGate) {
+        self.result = result
+        self.gate = gate
     }
 
-    func callCount() -> Int {
-        calls
+    func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+        await gate.waitForReleaseAfterRecordingDiscoveryStarted()
+        return result
     }
 }

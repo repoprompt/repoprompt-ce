@@ -88,6 +88,9 @@ actor OpenCodeACPModelPollingService {
     private var pollingTask: Task<Void, Never>?
     private var inFlightRefresh: Task<Bool, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
+    #if DEBUG
+        private var testRefreshNowInFlightJoinObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
+    #endif
     private var latest: Snapshot?
     private var preferredWorkspacePath: String?
     private var isShutdown = false
@@ -104,6 +107,18 @@ actor OpenCodeACPModelPollingService {
         if let latest { return latest }
         return await registrySnapshotAfterWarmingStore()
     }
+
+    #if DEBUG
+        func test_refreshNowInFlightJoinEvents() -> AsyncStream<Void> {
+            let id = UUID()
+            let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            testRefreshNowInFlightJoinObservers[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeTestRefreshNowInFlightJoinObserver(id) }
+            }
+            return stream
+        }
+    #endif
 
     /// Force a foreground OpenCode ACP model discovery and return the normalized snapshot.
     ///
@@ -162,6 +177,9 @@ actor OpenCodeACPModelPollingService {
         guard !isShutdown else { return false }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
+            #if DEBUG
+                publishTestRefreshNowInFlightJoin()
+            #endif
             return await existing.value
         }
         return await performRefresh()
@@ -173,6 +191,13 @@ actor OpenCodeACPModelPollingService {
         pollingTask = nil
         inFlightRefresh?.cancel()
         inFlightRefresh = nil
+        #if DEBUG
+            let activeTestJoinObservers = testRefreshNowInFlightJoinObservers
+            testRefreshNowInFlightJoinObservers.removeAll()
+            for continuation in activeTestJoinObservers.values {
+                continuation.finish()
+            }
+        #endif
         if finishSubscribers {
             let activeContinuations = continuations
             continuations.removeAll()
@@ -208,6 +233,18 @@ actor OpenCodeACPModelPollingService {
         continuations.removeValue(forKey: id)
         stopPollingIfIdle()
     }
+
+    #if DEBUG
+        private func publishTestRefreshNowInFlightJoin() {
+            for continuation in testRefreshNowInFlightJoinObservers.values {
+                continuation.yield(())
+            }
+        }
+
+        private func removeTestRefreshNowInFlightJoinObserver(_ id: UUID) {
+            testRefreshNowInFlightJoinObservers.removeValue(forKey: id)
+        }
+    #endif
 
     private func performRefresh() async -> Bool {
         guard !isShutdown else { return false }
