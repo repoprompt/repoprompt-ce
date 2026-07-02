@@ -33,6 +33,43 @@ final class FileSystemServiceIgnoreRecoveryTests: XCTestCase {
         XCTAssertFalse(paths.contains("cursor-blocked.txt"), ".cursorignore should hide its positive match.")
     }
 
+    func testBroadPackageJSONNegationDoesNotDescendIntoIgnoredNodeModules() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemServiceIgnoreRecovery")
+        try FileSystemTestSupport.write(
+            """
+            **/node_modules/
+            **/*.json
+            !**/package.json
+            """,
+            to: root.appendingPathComponent(".repo_ignore")
+        )
+        try FileSystemTestSupport.write("{}", to: root.appendingPathComponent("package.json"))
+        try FileSystemTestSupport.write("{}", to: root.appendingPathComponent("src/package.json"))
+        try FileSystemTestSupport.write("{}", to: root.appendingPathComponent("src/other.json"))
+        try FileSystemTestSupport.write("{}", to: root.appendingPathComponent("node_modules/pkg/package.json"))
+        try FileSystemTestSupport.write("{}", to: root.appendingPathComponent("hub/node_modules/pkg/package.json"))
+        try FileSystemTestSupport.write("swift", to: root.appendingPathComponent("src/App.swift"))
+
+        let service = try await FileSystemService(
+            path: root.path,
+            respectGitignore: false,
+            respectRepoIgnore: true,
+            respectCursorignore: false,
+            skipSymlinks: true
+        )
+
+        let paths = try await FileSystemTestSupport.collectRelativePaths(from: service, root: root)
+
+        XCTAssertTrue(paths.contains("package.json"))
+        XCTAssertTrue(paths.contains("src/package.json"))
+        XCTAssertTrue(paths.contains("src/App.swift"))
+        XCTAssertFalse(paths.contains("src/other.json"))
+        XCTAssertFalse(paths.contains("node_modules"))
+        XCTAssertFalse(paths.contains("node_modules/pkg/package.json"))
+        XCTAssertFalse(paths.contains("hub/node_modules"))
+        XCTAssertFalse(paths.contains("hub/node_modules/pkg/package.json"))
+    }
+
     func testLoadContentsSkipsDirectorySymlinksWhenConfigured() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemServiceIgnoreRecovery")
         let real = root.appendingPathComponent("real", isDirectory: true)
