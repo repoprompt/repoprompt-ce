@@ -267,6 +267,28 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
         return completion.isFinished
     }
 
+    fileprivate func waitForCodemapGraphPublicationDrain(
+        store: WorkspaceFileContextStore,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        timeout: Duration = .seconds(5)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            let state = await store.codemapGraphPublicationRecoveryStateForTesting(
+                rootEpoch: rootEpoch
+            )
+            if !state.flightActive, !state.observerActive {
+                return true
+            }
+            await Task.yield()
+        }
+        let state = await store.codemapGraphPublicationRecoveryStateForTesting(
+            rootEpoch: rootEpoch
+        )
+        return !state.flightActive && !state.observerActive
+    }
+
     fileprivate func pendingTicket(
         _ result: WorkspaceCodemapArtifactDemandResult
     ) throws -> WorkspaceCodemapArtifactDemandTicket {
@@ -4601,6 +4623,16 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             after: firstObservedKey.contributionGeneration
         )
         XCTAssertNotNil(latestObservedKey)
+        // `waitUntilObservedKey` returns once the graph actor accepts the newer desired key,
+        // before the store necessarily resumes from `observeDesiredKey` and installs its
+        // matching desired key / pending snapshot.  The publication flight drains only after
+        // `enqueueCodemapGraphSnapshot` returns, so wait for that store-side handoff before
+        // releasing the admission gate that lets the blocked worker resume.
+        let latestPublicationDrained = await waitForCodemapGraphPublicationDrain(
+            store: store,
+            rootEpoch: firstTicket.rootEpoch
+        )
+        XCTAssertTrue(latestPublicationDrained)
 
         await admissionWaitGate.release()
         buildGate.release(generation: blockerGeneration)
