@@ -301,11 +301,11 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
         let outputPath = "\(fixture.repo.lastPathComponent)/WorktreeOnly.swift"
         XCTAssertEqual(try Self.selectionPaths(setValue), [outputPath])
+        let canonicalSelectionRevision = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         #if DEBUG
-            let canonicalSelectionRevision = window.workspaceManager.selectionRevisionForMCP(
-                workspaceID: workspaceID,
-                tabID: tabID
-            )
             XCTAssertGreaterThan(canonicalSelectionRevision, staleSelectionRevision)
             XCTAssertEqual(
                 window.mcpServer.debugSelectionRevisionForBoundConnection(setterConnectionID),
@@ -327,7 +327,22 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         // Reproduce the app-only race absent from direct provider tests: a debounced file-tree
         // publisher captured the empty logical-base UI before MCP persistence and fires later.
         window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
-        try await Task.sleep(for: .milliseconds(250))
+        let staleUIPublishSelectionRevision = await Self.drainMainActorAndReadSelectionRevision(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertEqual(staleUIPublishSelectionRevision, canonicalSelectionRevision)
+        #if DEBUG
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(setterConnectionID),
+                canonicalSelectionRevision
+            )
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(staleConnectionID),
+                staleSelectionRevision
+            )
+        #endif
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
@@ -336,11 +351,19 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
         // Exec-mode CLI disconnect is asynchronous. Exercise the stale cleanup ordering where
         // an older bound snapshot commits after the setter has persisted newer canonical state.
+        let selectionRevisionBeforeStaleCleanup = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         let staleCleanup = Task { @MainActor in
             await window.mcpServer.commitAndClearTabContext(connectionID: staleConnectionID)
         }
         let staleCommitSucceeded = await staleCleanup.value
         XCTAssertTrue(staleCommitSucceeded)
+        XCTAssertEqual(
+            window.workspaceManager.selectionRevisionForMCP(workspaceID: workspaceID, tabID: tabID),
+            selectionRevisionBeforeStaleCleanup
+        )
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         window.mcpServer.removeTabContext(
@@ -415,8 +438,17 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         await ServerNetworkManager.shared.setRunPurpose(.unknown, for: readConnectionID)
 
+        let selectionRevisionBeforeFinalStalePublish = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
-        try await Task.sleep(for: .milliseconds(250))
+        let selectionRevisionAfterFinalStalePublish = await Self.drainMainActorAndReadSelectionRevision(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertEqual(selectionRevisionAfterFinalStalePublish, selectionRevisionBeforeFinalStalePublish)
 
         let finalConnectionID = UUID()
         try window.mcpServer.bindTabForConnection(
@@ -453,9 +485,18 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             selectedPaths: [fixture.trackedFile.path],
             codemapAutoEnabled: false
         )
+        let selectionRevisionBeforeManualUIPublish = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         await window.workspaceFilesViewModel.applyStoredSelection(manualUISelection)
         window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
-        try await Task.sleep(for: .milliseconds(250))
+        let selectionRevisionAfterManualUIPublish = await Self.drainMainActorAndReadSelectionRevision(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertGreaterThan(selectionRevisionAfterManualUIPublish, selectionRevisionBeforeManualUIPublish)
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection, manualUISelection)
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection,
@@ -754,6 +795,17 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertEqual(result.status, .success)
         XCTAssertEqual(try String(contentsOf: originalTrackedFile, encoding: .utf8), "original\n")
         XCTAssertEqual(try String(contentsOfFile: readPath, encoding: .utf8), "worktree-edited\n")
+    }
+
+    private static func drainMainActorAndReadSelectionRevision(
+        window: WindowState,
+        workspaceID: UUID,
+        tabID: UUID
+    ) async -> UInt64 {
+        for _ in 0 ..< 3 {
+            await Task.yield()
+        }
+        return window.workspaceManager.selectionRevisionForMCP(workspaceID: workspaceID, tabID: tabID)
     }
 
     private static func makeAgentRunService(window: WindowState, targetTabID: UUID) -> AgentRunMCPToolService {
