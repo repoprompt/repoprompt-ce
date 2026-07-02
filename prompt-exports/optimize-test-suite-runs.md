@@ -2098,3 +2098,160 @@ Primary metric eligible: yes
 - Latest clean anchor comparison: vs `prompt-exports/test-suite-baseline-root-reliability-gate-worktree-read-certificate-boundary-20260702T092236Z.json` (median 595.361s / p95 634.898s), median delta -4.189s (-0.70%), p95 delta -11.945s (-1.88%).
 - Invalid sample/flakes: root sample 2 failed `WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests/testAutomaticSelectionRetriesBusySourceTwiceThenBecomesReady` at `Tests/RepoPromptTests/WorkspaceContext/WorkspaceFileContextStoreCodemapSeamTests.swift:7945` ("Busy-retry sequence did not complete within the external bound"). It is outside the changed Git fixture/cache scope; no replacement sample was run.
 - Validation: `make dev-format` passed; `make dev-lint` passed; required focused suites passed: `GitWorktreeCreationReceiptTests`, `MCPCodeStructureWorktreeTests`, `MCPAskOracleWorktreeTests`, `WorkspaceCodemapGitCapabilityServiceTests`, `AutomaticReviewGitDiffCoordinatorTests`, `FrozenVisibleGitCheckoutResolverTests`.
+### Focused: 2026-07-02T11:41:12+00:00 — root — reliability-gate-busy-retry-flake-20260702T113812Z-focused-busy-retry-50x
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests/testAutomaticSelectionRetriesBusySourceTwiceThenBecomesReady --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-busy-retry-flake-20260702T113812Z-busy-retry-50x.json`
+Inventory: `prompt-exports/test-suite-inventory-reliability-gate-busy-retry-flake-20260702T113812Z.json`
+Scope/filter: filtered: `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests/testAutomaticSelectionRetriesBusySourceTwiceThenBecomesReady`
+Source-change guard: `metadata`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 2.407 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3233d3e5-9e1c-4a4c-b6f6-116af5c72791.log` |  |
+| 2 | yes | 2.223 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d73d1255-cfcb-4199-a4b0-1e881c273d42.log` |  |
+| 3 | yes | 2.172 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/167d9cbb-0a86-4918-8c97-4b7ccf8ae0a6.log` |  |
+| 4 | yes | 2.178 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/42fecdc6-e14f-4482-9836-7c9585c10819.log` |  |
+| 5 | yes | 2.247 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b13b563a-34f5-4895-99a8-380e90fe83bc.log` |  |
+| 6 | yes | 2.284 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/94393e50-2f69-4bd4-bf96-858a7a465eb6.log` |  |
+| 7 | yes | 2.188 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3012925d-25d1-4711-984d-0f1547bb3e54.log` |  |
+| 8 | yes | 2.127 | 0.001 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c8c0c73b-0419-44cd-9f62-4c11e9c4a34c.log` |  |
+| 9 | yes | 2.212 | 0.001 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/546a5266-513b-4ab1-9ce2-80c5f07d8820.log` |  |
+| 10 | yes | 2.123 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/10405260-879e-400f-9696-f9b3a925ebc5.log` |  |
+| 11 | yes | 2.168 | 0.001 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/825c7ea2-eb89-427d-80ba-6c9aee0e4ac7.log` |  |
+| 12 | yes | 2.176 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/68d25451-a234-4e50-95e5-3a43056354ae.log` |  |
+| 13 | yes | 2.421 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/fdd15637-bfc1-401d-a21b-a70d3a0e27c8.log` |  |
+| 14 | yes | 2.193 | 0.001 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2d356eef-4720-4638-9d41-5eb8633523b8.log` |  |
+| 15 | yes | 2.208 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/753ac1d8-4d9b-4bb0-a7e7-d35b849d1934.log` |  |
+| 16 | yes | 2.174 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f56d296f-1263-4493-8311-402e9985e4ad.log` |  |
+| 17 | yes | 2.151 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b97e4762-a2cb-4567-a138-a8b59c21fab8.log` |  |
+| 18 | yes | 2.201 | 0.001 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/21a6a3bc-5070-4f65-a333-21f5bb2c3546.log` |  |
+| 19 | yes | 2.246 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3481b7ca-8b64-437e-a416-d04ad9fe0ea9.log` |  |
+| 20 | yes | 2.245 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6352a653-b1e3-41b5-bd53-1d201cfbdb84.log` |  |
+| 21 | yes | 2.166 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b9bf0ad8-de3c-4974-9071-97162df8598b.log` |  |
+| 22 | yes | 2.174 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/71c4af07-384c-456d-be50-b4c46a18ce2b.log` |  |
+| 23 | yes | 2.199 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/82345486-ebd1-414a-99e8-d664b1b0e354.log` |  |
+| 24 | yes | 2.198 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ab0a05f1-4c53-4d5f-b233-49c2596be1eb.log` |  |
+| 25 | yes | 2.158 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/05c0bb3b-bca4-4495-b6c5-b93e10ca26a1.log` |  |
+| 26 | yes | 2.186 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/68144dd6-292d-40b0-8a21-834ff70dfb5c.log` |  |
+| 27 | yes | 2.151 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0aba04b1-206d-4bb1-8200-3fa446cc29e6.log` |  |
+| 28 | yes | 2.128 | 0.001 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d60f18a7-5b31-4ae4-bfc2-943cef02d9c2.log` |  |
+| 29 | yes | 2.162 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/118e2b2f-5663-4fb8-8b33-6ec87dcb53bc.log` |  |
+| 30 | yes | 2.182 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7eafa6b7-1531-4a65-8bd3-3954e18ad0f3.log` |  |
+| 31 | yes | 2.188 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/578d5e89-c2ab-45e8-a703-fcb93785061e.log` |  |
+| 32 | yes | 2.244 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/272d58cd-1be5-4aeb-8563-d684bfaa272d.log` |  |
+| 33 | yes | 2.312 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9ead6ddc-81c1-435d-93db-bbf8f2ad9856.log` |  |
+| 34 | yes | 2.281 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/5b533809-ddc1-42df-9d7c-2a6655f35e89.log` |  |
+| 35 | yes | 2.291 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/976fe414-c2be-417c-b0b7-80a68e3a5ca5.log` |  |
+| 36 | yes | 2.187 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e6e3fa5f-d823-405a-9277-509a9c69a162.log` |  |
+| 37 | yes | 2.245 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/bbd07a72-8321-4f1f-a5a4-25d1b1e96d2e.log` |  |
+| 38 | yes | 2.279 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9266ed33-6c3e-4a0f-bd98-6aae7cd400a2.log` |  |
+| 39 | yes | 2.307 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9671e295-b7e3-411e-a264-a9125c03bee3.log` |  |
+| 40 | yes | 2.212 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ee57b730-f3cb-4368-abf5-9d7a89b2538f.log` |  |
+| 41 | yes | 2.184 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c6333db1-00cb-428f-bffb-dd19350363a1.log` |  |
+| 42 | yes | 2.161 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/61ce6faf-3869-49b3-a688-bae4d748d25e.log` |  |
+| 43 | yes | 2.306 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/74201580-56ca-4e20-8e49-ae148ab898d8.log` |  |
+| 44 | yes | 2.177 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/806b25a8-87e6-48bf-a183-b6fc3f3c47ad.log` |  |
+| 45 | yes | 2.224 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7446d311-7337-4215-81e1-8bb4f6d0c3e7.log` |  |
+| 46 | yes | 2.173 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/63d0b1fb-b8f7-4224-ad21-8606cd4860e8.log` |  |
+| 47 | yes | 2.205 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/50120703-e262-4b17-be0d-6e401164d9d6.log` |  |
+| 48 | yes | 2.182 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/fc06217c-2f56-4e84-be20-0290dccd4caf.log` |  |
+| 49 | yes | 2.224 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/52cd2134-6853-4e9c-bd36-5156551ba6d2.log` |  |
+| 50 | yes | 2.172 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d7c97902-de29-43b8-a736-930dc1c6bd23.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T11:41:12+00:00/ac287333a72d | reliability-gate-busy-retry-flake-20260702T113812Z-focused-busy-retry-50x | root | filtered: `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests/testAutomaticSelectionRetriesBusySourceTwiceThenBecomesReady` | 50 valid + 0 invalid | 2835 | 7 | 2842 | 2.190 | 2.312 | 0.0121 | stable | `prompt-exports/test-suite-focused-root-reliability-gate-busy-retry-flake-20260702T113812Z-busy-retry-50x.json` | source guard `metadata`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | 1 | 1.518 | 1.768 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | `testAutomaticSelectionRetriesBusySourceTwiceThenBecomesReady` | 50 | 1.518 | 1.628 | 1.768 | 0 |
+
+### Baseline: 2026-07-02T12:18:31+00:00 — root — reliability-gate-busy-retry-flake-20260702T113812Z
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --json`
+Artifact: `prompt-exports/test-suite-baseline-root-reliability-gate-busy-retry-flake-20260702T113812Z.json`
+Inventory: `prompt-exports/test-suite-inventory-reliability-gate-busy-retry-flake-20260702T113812Z.json`
+Scope/filter: complete
+Source-change guard: `content`
+Primary metric eligible: yes
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | no | 579.312 | 0.002 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0e063528-44df-42b0-aee5-aec2213e52cb.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 2 | yes | 649.130 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/aae62d0f-b4d6-4a40-8be9-d2a40cf485dd.log` |  |
+| 3 | no | 665.979 | 0.004 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8caaeeac-07cf-4744-ba8c-819d08f7297a.log` | conductor process exit 1; terminal state failed; test exit 1 |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T12:18:31+00:00/ac287333a72d | reliability-gate-busy-retry-flake-20260702T113812Z | root | complete | 1 valid + 2 invalid | 2835 | 7 | 2842 | 649.130 | 649.130 | 0.0000 | stable | `prompt-exports/test-suite-baseline-root-reliability-gate-busy-retry-flake-20260702T113812Z.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceCodemapBindingEngineTests` | 65 | 56.864 | 7.226 | 0 |
+| 2 | `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests` | 65 | 53.923 | 2.890 | 0 |
+| 3 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | 34 | 49.782 | 5.050 | 0 |
+| 4 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | 3 | 33.873 | 21.662 | 0 |
+| 5 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | 33 | 25.879 | 3.777 | 0 |
+| 6 | `RepoPromptTests.WorkspacePendingSeededRootTests` | 12 | 22.588 | 2.841 | 0 |
+| 7 | `RepoPromptTests.GitLoadedRootAuthorityEvidenceTests` | 47 | 20.702 | 16.942 | 1 |
+| 8 | `RepoPromptTests.WorkspaceCodemapLiveOverlayTests` | 37 | 19.175 | 1.490 | 0 |
+| 9 | `RepoPromptTests.AgentRunWorktreeStartTests` | 34 | 18.738 | 2.995 | 0 |
+| 10 | `RepoPromptTests.MCPAskOracleWorktreeTests` | 23 | 18.241 | 1.973 | 0 |
+| 11 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | 5 | 17.385 | 9.658 | 0 |
+| 12 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | 16 | 16.571 | 7.443 | 0 |
+| 13 | `RepoPromptTests.MCPCodeStructureWorktreeTests` | 17 | 12.597 | 2.167 | 0 |
+| 14 | `RepoPromptTests.CodeMapRootManifestStoreTests` | 28 | 12.072 | 3.288 | 0 |
+| 15 | `RepoPromptTests.AgentProviderContextBuilderTests` | 7 | 11.113 | 10.867 | 0 |
+| 16 | `RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests` | 3 | 10.744 | 10.740 | 0 |
+| 17 | `RepoPromptTests.PersistentAgentModeMCPReadFileConnectionTests` | 16 | 10.528 | 1.350 | 0 |
+| 18 | `RepoPromptTests.WorkspaceCodemapSelectionGraphTests` | 19 | 10.437 | 0.903 | 0 |
+| 19 | `RepoPromptTests.ACPAgentSessionControllerModeConfigTests` | 27 | 10.186 | 1.037 | 0 |
+| 20 | `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests` | 17 | 9.800 | 1.309 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testAgentModeEmptyInitialSelectionDefersAndRoutesWithoutExplicitContext` | 1 | 21.662 | 21.662 | 21.662 | 0 |
+| 2 | `RepoPromptTests.GitLoadedRootAuthorityEvidenceTests` | `testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBounded` | 1 | 16.942 | 16.942 | 16.942 | 0 |
+| 3 | `RepoPromptTests.ContextBuilderWorktreeInheritanceTests` | `testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior` | 1 | 11.953 | 11.953 | 11.953 | 0 |
+| 4 | `RepoPromptTests.AgentProviderContextBuilderTests` | `testAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze` | 1 | 10.867 | 10.867 | 10.867 | 0 |
+| 5 | `RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests` | `testManifestScaleStreamsOneHundredThousandByDefaultAndOneMillionOptIn` | 1 | 10.740 | 10.740 | 10.740 | 0 |
+| 6 | `RepoPromptTests.WorktreeAPISmokeHarnessTests` | `testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections` | 1 | 9.658 | 9.658 | 9.658 | 0 |
+| 7 | `RepoPromptTests.WorkspaceCodemapLocalGitClassificationTests` | `testGitLayoutWatcherChangeReprobesAndAdmitsConvertedRepository` | 1 | 8.964 | 8.964 | 8.964 | 0 |
+| 8 | `RepoPromptTests.WorkspaceRootNamespaceManifestTests` | `testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes` | 1 | 7.587 | 7.587 | 7.587 | 0 |
+| 9 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | `testFinalPackagingRetriesAfterRevocationAndDoesNotPublishFirstAssembly` | 1 | 7.443 | 7.443 | 7.443 | 0 |
+| 10 | `RepoPromptTests.SelectionSlicePersistenceAndRebaseTests` | `testCanonicalStoreWatcherEditsPreserveLargeBeginningMiddleEndSlices` | 1 | 7.264 | 7.264 | 7.264 | 0 |
+| 11 | `RepoPromptTests.WorkspaceCodemapBindingEngineTests` | `testWarmManifestRejectsExplicitNonCleanCandidateStatesWithoutSourceRead` | 1 | 7.226 | 7.226 | 7.226 | 0 |
+| 12 | `RepoPromptTests.FileSystemAcceptedIngressBarrierTests` | `testSyntheticHundredThousandPathReplayUsesBoundedSpillWorkingSet` | 1 | 7.153 | 7.153 | 7.153 | 0 |
+| 13 | `RepoPromptTests.PromptContextPreAssemblyServiceTests` | `testFinalPackagingCancellationThrowsWithoutPublishingPayload` | 1 | 6.023 | 6.023 | 6.023 | 0 |
+| 14 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | `testAutomaticSelectionIgnoresUnsupportedEnterpriseInventoryForCompleteness` | 1 | 5.050 | 5.050 | 5.050 | 0 |
+| 15 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | `testColdAutomaticSelectionUsesManifestEnvelopeAndCASWithoutUnrelatedBuild` | 1 | 3.918 | 3.918 | 3.918 | 0 |
+| 16 | `RepoPromptTests.GitWorktreeCreationReceiptTests` | `testReceiptCreationFailurePointsAreCorrelationScopedOneShotAndFailClosed` | 1 | 3.777 | 3.777 | 3.777 | 0 |
+| 17 | `RepoPromptTests.AgentManageMCPToolServiceResumeTests` | `testResumeOfControlledSessionPreservesWaitOwnershipAcrossSteering` | 1 | 3.681 | 3.681 | 3.681 | 0 |
+| 18 | `RepoPromptTests.WorkspaceCodemapBindingEngineTests` | `testProjectionPreloadReusesUnchangedBlobAndBuildsOnlyChangedFilePerWorktree` | 1 | 3.553 | 3.553 | 3.553 | 0 |
+| 19 | `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` | `testAutomaticSelectionFinalizationDeadlineFailsClosedWhileCleanupContinues` | 1 | 3.542 | 3.542 | 3.542 | 0 |
+| 20 | `RepoPromptTests.AgentRunDiffSeededWorktreeInitializationTests` | `testDefaultOffAndForcedFullCrawlUseOrdinaryRouteExactlyOnce` | 1 | 3.516 | 3.516 | 3.516 | 0 |
+
+### Iteration note: 2026-07-02T12:18:31+00:00 — reliability-gate-busy-retry-flake
+
+- Scope: targeted reliability remediation only for `WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests/testAutomaticSelectionRetriesBusySourceTwiceThenBecomesReady` plus the sibling `testAutomaticSelectionBusySourceRoundBoundStopsBeforeDeadline` that shared the identical busy sequence harness. Production code, recently hardened unrelated seams, XCTest IDs, curated ledger rows, method counts, contract counts, and scenario counts were unchanged.
+- Raw failure log inspected first: iteration-2 sample 2 failed only at `Tests/RepoPromptTests/WorkspaceContext/WorkspaceFileContextStoreCodemapSeamTests.swift:7945` with `Busy-retry sequence did not complete within the external bound`; method runtime was 7.507s. Adjacent tests continued normally. Nearby drain/cancellation log hits belonged to other named cancellation/drain tests, not teardown for the busy-retry failure.
+- Fix shape: replaced the busy sequence harness's polling `waitUntilWaitCount` / `waitUntilDemandCount` milestone observation with `AsyncStream` continuation-backed event observation, and removed per-step 2s milestone/status timeout stacking from the two busy-round orchestrator loops. The 5s external bound remains the fail-safe; semantic assertions still require two busy outcomes, the third ready outcome, 5 waiter invocations, final receipt/currentness, stale tickets, and zero source retain count.
+- Focused evidence: exact failing test stress `prompt-exports/test-suite-focused-root-reliability-gate-busy-retry-flake-20260702T113812Z-busy-retry-50x.json` (`RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests/testAutomaticSelectionRetriesBusySourceTwiceThenBecomesReady`, 50 valid + 0 invalid, median 2.190s, observed p95 2.312s, relative MAD 0.0121 stable, metadata guard). Single-run sibling evidence: `testAutomaticSelectionBusySourceRoundBoundStopsBeforeDeadline` passed in 1.580s; unchanged deadline sibling `testAutomaticSelectionBusySourceDeadlineStopsBeforeRoundBound` passed in 1.758s.
+- Suite/style/ledger validation: full `RepoPromptTests.WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests` passed 34 tests in 43.231s; `make dev-format` passed with 0/1371 files formatted; `make dev-lint` passed with 0 SwiftFormat/SwiftLint violations. Direct ledger verifier remained the pre-existing mismatch from before this patch: `missing=46 stale=2`.
+- Full-root evidence: exactly 3 complete-root attempts, no replacements, in `prompt-exports/test-suite-baseline-root-reliability-gate-busy-retry-flake-20260702T113812Z.json`; result 1 valid + 2 invalid, valid raw `[649.130]`, content guard, no source changes. Because only one sample was valid, median/p95 are artifact-reported but not a robust root timing comparison.
+- Invalid root samples: sample 1 failed unrelated `MCPCodeStructureWorktreeTests/testInheritedWorktreeSequentialStructureThenTreePublishesLogicalMarkerWithoutPhysicalLeakage` at `Tests/RepoPromptTests/MCP/MCPCodeStructureWorktreeTests.swift:215` (`presentationCandidateRequests` 8 vs 7; log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0e063528-44df-42b0-aee5-aec2213e52cb.log`). Sample 3 failed unrelated `WorkspaceCodemapBindingEngineTests/testProjectionPreloadMapsWorktreeAndTerminalGitClassificationsWithoutCleanReuse` at `Tests/RepoPromptTests/WorkspaceContext/WorkspaceCodemapBindingEngineTests.swift:2043/2045/2046` (counts 2 vs 1 and 6 vs 4; log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8caaeeac-07cf-4744-ba8c-819d08f7297a.log`). Neither invalid sample reproduced the busy-retry failure.
+- Deltas: method delta 0; contract delta 0; scenario delta 0; ledger delta 0. Inventory `prompt-exports/test-suite-inventory-reliability-gate-busy-retry-flake-20260702T113812Z.json` still reports root 2835, provider 7, total executable methods 2842.

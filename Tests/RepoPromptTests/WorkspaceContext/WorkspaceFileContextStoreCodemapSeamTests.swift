@@ -7911,19 +7911,18 @@ final class WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests:
             }
             for demandIndex in 1 ... 3 {
                 let pendingWaitIndex = demandIndex * 2 - 1
-                guard await sequence.waitUntilWaitCount(pendingWaitIndex, timeout: .seconds(2)),
-                      let tickets = await sequence.waitUntilDemandCount(demandIndex, timeout: .seconds(2)),
+                guard await sequence.waitUntilWaitCount(pendingWaitIndex),
+                      let tickets = await sequence.waitUntilDemandCount(demandIndex),
                       let ticket = tickets.last
                 else { throw CodemapStoreTestError.timedOut }
                 try await settledOutcomes.append(settledResult(
                     store: store,
-                    ticket: ticket,
-                    timeout: .seconds(2)
+                    ticket: ticket
                 ))
                 await sequence.releaseWait(pendingWaitIndex)
                 if demandIndex < 3 {
                     let retryWaitIndex = pendingWaitIndex + 1
-                    guard await sequence.waitUntilWaitCount(retryWaitIndex, timeout: .seconds(2)) else {
+                    guard await sequence.waitUntilWaitCount(retryWaitIndex) else {
                         throw CodemapStoreTestError.timedOut
                     }
                     await sequence.releaseWait(retryWaitIndex)
@@ -8071,19 +8070,18 @@ final class WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests:
             }
             for demandIndex in 1 ... 3 {
                 let pendingWaitIndex = demandIndex * 2 - 1
-                guard await sequence.waitUntilWaitCount(pendingWaitIndex, timeout: .seconds(2)),
-                      let tickets = await sequence.waitUntilDemandCount(demandIndex, timeout: .seconds(2)),
+                guard await sequence.waitUntilWaitCount(pendingWaitIndex),
+                      let tickets = await sequence.waitUntilDemandCount(demandIndex),
                       let ticket = tickets.last
                 else { throw CodemapStoreTestError.timedOut }
                 try await settledOutcomes.append(settledResult(
                     store: store,
-                    ticket: ticket,
-                    timeout: .seconds(2)
+                    ticket: ticket
                 ))
                 await sequence.releaseWait(pendingWaitIndex)
                 if demandIndex < 3 {
                     let retryWaitIndex = pendingWaitIndex + 1
-                    guard await sequence.waitUntilWaitCount(retryWaitIndex, timeout: .seconds(2)) else {
+                    guard await sequence.waitUntilWaitCount(retryWaitIndex) else {
                         throw CodemapStoreTestError.timedOut
                     }
                     await sequence.releaseWait(retryWaitIndex)
@@ -10002,6 +10000,8 @@ private actor CodemapAutomaticSelectionSequenceHarness {
     private var releasedWaits = Set<Int>()
     private var releaseAllWaits = false
     private var continuations: [Int: CheckedContinuation<Void, Error>] = [:]
+    private var demandCountObservers: [UUID: AsyncStream<[WorkspaceCodemapArtifactDemandTicket]>.Continuation] = [:]
+    private var waitCountObservers: [UUID: AsyncStream<Int>.Continuation] = [:]
 
     var recordedTickets: [WorkspaceCodemapArtifactDemandTicket] {
         demandTickets
@@ -10013,6 +10013,7 @@ private actor CodemapAutomaticSelectionSequenceHarness {
 
     func recordDemand(_ ticket: WorkspaceCodemapArtifactDemandTicket) -> Int {
         demandTickets.append(ticket)
+        publishDemandTickets()
         return demandTickets.count
     }
 
@@ -10020,6 +10021,7 @@ private actor CodemapAutomaticSelectionSequenceHarness {
         try Task.checkCancellation()
         waiterInvocationCount += 1
         let invocation = waiterInvocationCount
+        publishWaitCount()
         guard !releaseAllWaits, !releasedWaits.contains(invocation) else { return }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
@@ -10044,40 +10046,87 @@ private actor CodemapAutomaticSelectionSequenceHarness {
         releaseAllWaits = true
         let pending = Array(continuations.values)
         continuations.removeAll()
+        let demandObservers = Array(demandCountObservers.values)
+        demandCountObservers.removeAll()
+        let waitObservers = Array(waitCountObservers.values)
+        waitCountObservers.removeAll()
         for continuation in pending {
             continuation.resume(returning: ())
+        }
+        for observer in demandObservers {
+            observer.finish()
+        }
+        for observer in waitObservers {
+            observer.finish()
         }
     }
 
     func waitUntilDemandCount(
-        _ expectedCount: Int,
-        timeout: Duration
+        _ expectedCount: Int
     ) async -> [WorkspaceCodemapArtifactDemandTicket]? {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while demandTickets.count < expectedCount, clock.now < deadline {
+        if demandTickets.count >= expectedCount { return demandTickets }
+        let stream = demandTicketStream()
+        for await tickets in stream {
+            if tickets.count >= expectedCount { return tickets }
             guard !Task.isCancelled else { return nil }
-            do {
-                try await Task.sleep(for: .milliseconds(10))
-            } catch {
-                return nil
-            }
         }
         return demandTickets.count >= expectedCount ? demandTickets : nil
     }
 
-    func waitUntilWaitCount(_ expectedCount: Int, timeout: Duration) async -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while waiterInvocationCount < expectedCount, clock.now < deadline {
+    func waitUntilWaitCount(_ expectedCount: Int) async -> Bool {
+        if waiterInvocationCount >= expectedCount { return true }
+        let stream = waitCountStream()
+        for await count in stream {
+            if count >= expectedCount { return true }
             guard !Task.isCancelled else { return false }
-            do {
-                try await Task.sleep(for: .milliseconds(10))
-            } catch {
-                return false
-            }
         }
         return waiterInvocationCount >= expectedCount
+    }
+
+    private func demandTicketStream() -> AsyncStream<[WorkspaceCodemapArtifactDemandTicket]> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<[WorkspaceCodemapArtifactDemandTicket]>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        demandCountObservers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeDemandObserver(id) }
+        }
+        continuation.yield(demandTickets)
+        return stream
+    }
+
+    private func waitCountStream() -> AsyncStream<Int> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<Int>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        waitCountObservers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeWaitObserver(id) }
+        }
+        continuation.yield(waiterInvocationCount)
+        return stream
+    }
+
+    private func publishDemandTickets() {
+        for continuation in demandCountObservers.values {
+            continuation.yield(demandTickets)
+        }
+    }
+
+    private func publishWaitCount() {
+        for continuation in waitCountObservers.values {
+            continuation.yield(waiterInvocationCount)
+        }
+    }
+
+    private func removeDemandObserver(_ id: UUID) {
+        demandCountObservers.removeValue(forKey: id)
+    }
+
+    private func removeWaitObserver(_ id: UUID) {
+        waitCountObservers.removeValue(forKey: id)
     }
 
     private func cancelWait(_ invocation: Int) {
