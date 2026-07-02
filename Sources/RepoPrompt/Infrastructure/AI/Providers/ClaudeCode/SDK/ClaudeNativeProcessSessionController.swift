@@ -244,13 +244,26 @@ final actor ClaudeNativeProcessSessionController {
     /// clear expected PID registrations. `deinit` cannot await that path, so this
     /// method releases file-handle callbacks, closes stdin, sends SIGTERM to any
     /// still-owned child process, and schedules expected-PID cleanup on the MCP actor.
+    ///
+    /// The non-blocking `waitpid(WNOHANG)` here will usually return before the
+    /// child exits, leaving a zombie. A detached `Task` is scheduled to reap the
+    /// process asynchronously via `ProcessTermination.terminateAndReap`, which
+    /// sends a follow-up SIGTERM (harmless if the child already exited) and
+    /// waits for exit so the zombie is collected.
     private func performSynchronousDeinitCleanup() {
         closeOutputChannelsAndInput()
 
         if let process {
-            _ = Darwin.kill(process.pid, SIGTERM)
+            let pid = process.pid
+            _ = Darwin.kill(pid, SIGTERM)
             var status: Int32 = 0
-            _ = Darwin.waitpid(process.pid, &status, WNOHANG)
+            _ = Darwin.waitpid(pid, &status, WNOHANG)
+            // Schedule an async reap so the child is collected even if the
+            // non-blocking waitpid above did not reap it. The detached task is
+            // cancellation-shielded by design — the actor is already gone.
+            Task.detached(priority: .utility) {
+                _ = await ProcessTermination.terminateAndReap(pid: pid)
+            }
         }
 
         scheduleExpectedAgentPIDDeinitClearIfNeeded()

@@ -292,11 +292,87 @@ class CIAppTestRunnerTests(unittest.TestCase):
                 swift_binary="swift",
                 cwd=None,
                 test_bundle=bundle,
-                xctest_binary="/usr/bin/xctest",
+                xctest_binary=["/usr/bin/xctest"],
             )
 
         self.assertEqual(len(captured_args), 1)
         self.assertEqual(captured_args[0], ["/usr/bin/xctest", "-XCTest", "RepoPromptTests.S", str(bundle)])
+
+    def test_create_suite_process_xctest_fallback_uses_xcrun_xctest_prefix(self) -> None:
+        captured_args: list[list[str]] = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs) -> None:
+                captured_args.append(args)
+                self.pid = -1
+                self.stdout = None
+                self.returncode = 0
+
+        bundle = Path("/fake/Tests.xctest")
+        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
+            ci_app_test_runner.create_suite_process(
+                "RepoPromptTests.S",
+                swift_binary="swift",
+                cwd=None,
+                test_bundle=bundle,
+                xctest_binary=["xcrun", "xctest"],
+            )
+
+        self.assertEqual(len(captured_args), 1)
+        self.assertEqual(
+            captured_args[0],
+            ["xcrun", "xctest", "-XCTest", "RepoPromptTests.S", str(bundle)],
+        )
+
+    def test_xctest_binary_path_returns_resolved_path_as_single_element_list(self) -> None:
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        with mock.patch.object(
+            ci_app_test_runner.subprocess,
+            "run",
+            return_value=FakeCompletedProcess("/usr/bin/xctest\n"),
+        ):
+            result = ci_app_test_runner.xctest_binary_path()
+
+        self.assertEqual(result, ["/usr/bin/xctest"])
+
+    def test_xctest_binary_path_falls_back_to_xcrun_xctest_prefix(self) -> None:
+        import subprocess as sp
+
+        def fake_run(args, **kwargs):
+            raise sp.CalledProcessError(returncode=1, cmd=args)
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            result = ci_app_test_runner.xctest_binary_path()
+
+        self.assertEqual(result, ["xcrun", "xctest"])
+
+    def test_discover_test_bundle_fails_when_multiple_bundles_found(self) -> None:
+        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(args, **kwargs):
+            if "build" in args and "--show-bin-path" in args:
+                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
+            raise AssertionError(f"unexpected call: {args}")
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
+                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
+                    fake_bin_dir / "RepoPromptCEPackageTests.xctest",
+                    fake_bin_dir / "OtherTests.xctest",
+                ]):
+                    with self.assertRaises(ValueError):
+                        ci_app_test_runner.discover_test_bundle("swift", None)
 
     def test_create_suite_process_falls_back_to_swift_test_without_bundle(self) -> None:
         captured_args: list[list[str]] = []

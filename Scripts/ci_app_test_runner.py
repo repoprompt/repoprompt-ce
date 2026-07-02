@@ -120,6 +120,9 @@ def discover_test_bundle(swift_binary: str, cwd: Path | None) -> Path | None:
     startup budget. Running ``xcrun xctest -XCTest <suite> <bundle>`` directly
     skips swift's process management entirely and starts producing XCTest output
     immediately.
+
+    Fails if multiple candidate bundles are found, since silently picking the
+    first sorted bundle could run suites against the wrong test target.
     """
     try:
         show_bin = subprocess.run(
@@ -135,10 +138,24 @@ def discover_test_bundle(swift_binary: str, cwd: Path | None) -> Path | None:
     if not bin_path.is_dir():
         return None
     candidates = sorted(bin_path.glob(XCTEST_BUNDLE_GLOB))
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Multiple XCTest bundles found under {bin_path}; refusing to pick one "
+            f"ambiguously: {[str(c) for c in candidates]}"
+        )
+    return candidates[0]
 
 
-def xctest_binary_path() -> str:
+def xctest_binary_path() -> list[str]:
+    """Return a command prefix for invoking xctest.
+
+    Prefers the resolved path from ``xcrun --find xctest``. If that fails,
+    falls back to ``["xcrun", "xctest"]`` so the invocation is still
+    ``xcrun xctest -XCTest <suite> <bundle>`` rather than the invalid
+    ``xcrun -XCTest ...``.
+    """
     try:
         result = subprocess.run(
             ["xcrun", "--find", "xctest"],
@@ -146,9 +163,12 @@ def xctest_binary_path() -> str:
             capture_output=True,
             text=True,
         )
-        return result.stdout.strip()
+        path = result.stdout.strip()
+        if path:
+            return [path]
     except (OSError, subprocess.CalledProcessError):
-        return "xcrun"
+        pass
+    return ["xcrun", "xctest"]
 
 
 def descendant_process_groups(root_pid: int) -> set[int]:
@@ -255,12 +275,12 @@ def create_suite_process(
     swift_binary: str,
     cwd: Path | None,
     test_bundle: Path | None = None,
-    xctest_binary: str | None = None,
+    xctest_binary: list[str] | None = None,
 ) -> subprocess.Popen[str]:
     if test_bundle is not None:
-        xctest = xctest_binary or "xcrun"
+        xctest_prefix = xctest_binary if xctest_binary is not None else ["xcrun", "xctest"]
         return subprocess.Popen(
-            [xctest, "-XCTest", suite, str(test_bundle)],
+            [*xctest_prefix, "-XCTest", suite, str(test_bundle)],
             cwd=cwd,
             start_new_session=True,
             stdout=subprocess.PIPE,
@@ -488,7 +508,7 @@ def run_all_suites(
     output: TextIO = sys.stdout,
     silent_startup_seconds: float | None = None,
     test_bundle: Path | None = None,
-    xctest_binary: str | None = None,
+    xctest_binary: list[str] | None = None,
 ) -> int:
     passed_results: list[SuiteRunResult] = []
     if test_bundle is not None:
@@ -571,7 +591,11 @@ def main(argv: list[str]) -> int:
 
     test_bundle = args.test_bundle
     if test_bundle is None and not args.no_xctest_bundle:
-        test_bundle = discover_test_bundle(args.swift_binary, args.cwd)
+        try:
+            test_bundle = discover_test_bundle(args.swift_binary, args.cwd)
+        except ValueError as error:
+            print(f"::error::{error}", flush=True)
+            return 1
     xctest_binary = xctest_binary_path() if test_bundle is not None else None
 
     return run_all_suites(

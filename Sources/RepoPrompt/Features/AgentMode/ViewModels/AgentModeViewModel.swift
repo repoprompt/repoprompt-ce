@@ -2753,6 +2753,14 @@ final class AgentModeViewModel: ObservableObject {
     private func prepareSessionForWindowClose(_ session: TabSession) async {
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
+        // cancelEphemeralRuntimeState() cancels and nils agentTask before the
+        // graceful cancelAgentRun() path below. This ordering is safe because
+        // cancelAgentRun → runService.cancelRun only uses agentTask for a
+        // belt-and-suspenders cancel() call (a no-op when nil); the real work
+        // — terminal commit barrier, provider dispose, MCP tool cancellation —
+        // does not depend on agentTask being non-nil. Cancelling the task
+        // handle early just sends the stop signal sooner; the graceful path
+        // still finalizes run state and disposes the provider.
         session.cancelEphemeralRuntimeState()
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
@@ -9682,6 +9690,9 @@ final class AgentModeViewModel: ObservableObject {
         )
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
+        // cancelEphemeralRuntimeState() cancels and nils agentTask before the
+        // graceful cancelAgentRun() call in handleWorkspaceSwitch. See
+        // prepareSessionForWindowClose for why this ordering is safe.
         session.cancelEphemeralRuntimeState()
         clearPendingAssistantDelta(session)
         cancelPendingQuestion(for: session)

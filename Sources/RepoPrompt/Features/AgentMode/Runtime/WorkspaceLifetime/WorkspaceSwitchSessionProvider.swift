@@ -51,8 +51,6 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     private var backgroundCleanupTasks: [UUID: Task<Void, Never>] = [:]
     #if DEBUG
         private(set) var test_backgroundCleanupDrainTasks: [UUID: Task<Void, Never>] = [:]
-        private var test_backgroundCleanupDrainWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
-        private var test_backgroundCleanupDrainTimeoutTasks: [UUID: Task<Void, Never>] = [:]
     #endif
 
     init(
@@ -68,12 +66,22 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     /// cleaned up, provider disposed, and coordinators shut down — all in a
     /// detached task that yields between sessions to avoid blocking the main
     /// actor.
+    ///
+    /// The coordinators are captured before the initial yield so that process
+    /// termination (`disposeDetachedTarget`) can complete even if the provider
+    /// is deallocated before the task resumes. Only the delegate-dependent MCP
+    /// teardown is skipped when the provider/delegate is gone — that state is
+    /// owned by the delegate and is irrelevant once it is deallocated.
     func scheduleBackgroundCleanup(
         targets: [WorkspaceSwitchSessionCleanupTarget],
         reason: String
     ) {
         guard !targets.isEmpty else { return }
         let cleanupID = UUID()
+        // Capture coordinators strongly before the yield so process termination
+        // does not depend on `self` surviving past the initial suspension.
+        let codexCoordinator = codexCoordinator
+        let claudeCoordinator = claudeCoordinator
         let task = Task { @MainActor [weak self] in
             defer {
                 self?.backgroundCleanupTasks.removeValue(forKey: cleanupID)
@@ -84,23 +92,30 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
                 }
             #endif
             await Task.yield()
-            guard let self else { return }
-            for target in targets {
-                await delegate?.teardownMCPControlForDiscardedSession(
-                    target.session,
-                    cleanupSessionStore: true,
-                    publishChanges: false,
-                    deactivateLiveControlContext: false
-                )
-                await delegate?.cleanupMCPRunRoutingForDiscardedSession(
-                    boundSessionID: target.boundSessionID,
-                    liveSession: target.session,
-                    explicitRunID: target.runID,
-                    reason: reason
-                )
-                await Task.yield()
+            // MCP control teardown requires the delegate; skip if provider is
+            // gone. Process termination below does not depend on `self`.
+            if let delegate = self?.delegate {
+                for target in targets {
+                    if Task.isCancelled { break }
+                    await delegate.teardownMCPControlForDiscardedSession(
+                        target.session,
+                        cleanupSessionStore: true,
+                        publishChanges: false,
+                        deactivateLiveControlContext: false
+                    )
+                    await delegate.cleanupMCPRunRoutingForDiscardedSession(
+                        boundSessionID: target.boundSessionID,
+                        liveSession: target.session,
+                        explicitRunID: target.runID,
+                        reason: reason
+                    )
+                    await Task.yield()
+                }
             }
+            // Process termination must run even if the provider is deallocated.
+            // Coordinators were captured before the yield.
             for target in targets {
+                if Task.isCancelled { break }
                 await Self.disposeDetachedTarget(
                     target,
                     codexCoordinator: codexCoordinator,
@@ -140,10 +155,6 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     #if DEBUG
         private func test_completeBackgroundCleanup(_ cleanupID: UUID) {
             test_backgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
-            if let waiter = test_backgroundCleanupDrainWaiters.removeValue(forKey: cleanupID) {
-                waiter.resume()
-            }
-            test_backgroundCleanupDrainTimeoutTasks.removeValue(forKey: cleanupID)?.cancel()
         }
 
         func test_drainBackgroundCleanup(timeoutNanoseconds: UInt64) async throws {
@@ -183,29 +194,24 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
                     }
                 }
                 test_backgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
-                test_backgroundCleanupDrainTimeoutTasks.removeValue(forKey: cleanupID)?.cancel()
             }
         }
     #endif
 
+    /// Stops tracking background cleanup tasks without cancelling them.
+    ///
+    /// Cancellation was previously used here, but the cleanup body calls
+    /// `ProcessTermination.terminateAndReap` which uses `try? Task.sleep` in
+    /// its polling loop — cancelling the parent task makes those sleeps return
+    /// immediately, turning a bounded wait into a busy poll on the main actor.
+    /// Instead of cancelling, we simply stop tracking the tasks and let them
+    /// drain naturally. The tasks hold their own references to sessions and
+    /// coordinators (captured before the initial yield), so process
+    /// termination completes even if the provider is deallocated.
     func cancelAllBackgroundCleanup() {
-        for task in backgroundCleanupTasks.values {
-            task.cancel()
-        }
         backgroundCleanupTasks.removeAll()
         #if DEBUG
-            for task in test_backgroundCleanupDrainTasks.values {
-                task.cancel()
-            }
             test_backgroundCleanupDrainTasks.removeAll()
-            for (_, waiter) in test_backgroundCleanupDrainWaiters {
-                waiter.resume(throwing: CancellationError())
-            }
-            test_backgroundCleanupDrainWaiters.removeAll()
-            for task in test_backgroundCleanupDrainTimeoutTasks.values {
-                task.cancel()
-            }
-            test_backgroundCleanupDrainTimeoutTasks.removeAll()
         #endif
     }
 }
