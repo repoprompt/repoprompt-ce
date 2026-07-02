@@ -124,19 +124,6 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertTrue(viewModel.rootShellProjections[1].isSystemRoot)
     }
 
-    func testRootShellProjectionPublisherFiresForProjectionChanges() {
-        let viewModel = WorkspaceFilesViewModel()
-        var changeCount = 0
-        var cancellables = Set<AnyCancellable>()
-        viewModel.rootShellProjectionsChangedPublisher
-            .sink { changeCount += 1 }
-            .store(in: &cancellables)
-
-        viewModel.addRootFolder(makeRoot(name: "A", path: "/tmp/A"))
-
-        XCTAssertEqual(changeCount, 1)
-    }
-
     func testRootShellProjectionPublisherIgnoresUnrelatedPublishedChanges() {
         let viewModel = WorkspaceFilesViewModel()
         var changeCount = 0

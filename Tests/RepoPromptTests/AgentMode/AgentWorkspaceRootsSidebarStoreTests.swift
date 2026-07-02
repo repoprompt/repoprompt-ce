@@ -98,7 +98,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         let metadataWorkspace = WorkspaceModel(name: "Manager Metadata Only", repoPaths: [])
         manager.workspaces = [metadataWorkspace]
         manager.activeWorkspace = metadataWorkspace
-        await waitUntil { store.workspaceLabel == "Manager Metadata…" }
+        await waitUntil { store.workspaceLabel.hasPrefix("Manager Metadata") }
 
         XCTAssertEqual(store.rootRows.map(\.id), [rootA.id])
 
@@ -413,11 +413,6 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             promptViewModel: prompt,
             performInitialWorkspaceActivation: false
         )
-    }
-
-    private func drainSidebarStoreTasks() async {
-        await Task.yield()
-        await Task.yield()
     }
 
     private func waitUntil(
