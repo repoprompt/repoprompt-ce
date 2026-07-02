@@ -69,6 +69,13 @@ struct RepoPromptApp: App {
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
+        #if REPOPROMPT_SENTRY_ENABLED
+            SentryTelemetryBootstrap.start()
+            SentryTelemetryBootstrap.trace(.appLaunch) {
+                SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
+            }
+        #endif
+
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
             "RepoPromptApp.init scheduling ServerNetworkManager.start",
@@ -80,7 +87,14 @@ struct RepoPromptApp: App {
                 "RepoPromptApp.init start task running",
                 flushStdout: true
             )
-            await ServerController.shared.startServer()
+            #if REPOPROMPT_SENTRY_ENABLED
+                await SentryTelemetryBootstrap.traceAsync(.mcpServerStart) {
+                    await ServerController.shared.startServer()
+                    SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
+                }
+            #else
+                await ServerController.shared.startServer()
+            #endif
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {
