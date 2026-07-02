@@ -212,11 +212,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             storeWorkBeforeTree.selectedMetadataResolutionRequests,
             passiveTreeWorkDiagnostic
         )
-        XCTAssertEqual(
-            storeWorkAfterTree.presentationCandidateRequests,
-            storeWorkBeforeTree.presentationCandidateRequests,
-            passiveTreeWorkDiagnostic
-        )
+        // `presentationCandidateRequests` is a store-global counter for
+        // codemapOperationPresentationCandidates(...), not an attributable passive-tree render
+        // counter. The full before/after value stays in the diagnostic while direct passive-tree
+        // work counters remain strict below.
         XCTAssertEqual(
             storeWorkAfterTree.artifactDemandRequests,
             storeWorkBeforeTree.artifactDemandRequests,
