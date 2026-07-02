@@ -26,23 +26,27 @@ final class ReviewGitRepositoryFixture {
         objectFormat: GitObjectFormat? = nil
     ) throws -> URL {
         let root = sandbox.appendingPathComponent(name, isDirectory: true).standardizedFileURL
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        var initArguments = ["init"]
         if let objectFormat {
-            initArguments.append("--object-format=\(objectFormat.rawValue)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try initializeRepository(at: root, objectFormat: objectFormat)
+        } else {
+            try ImmutableGitRepositoryTemplate.copy(.configuredMain, to: root)
         }
-        _ = try runGit(initArguments, at: root)
-        _ = try runGit(["config", "user.name", "RepoPrompt Test"], at: root)
-        _ = try runGit(["config", "user.email", "repoprompt@example.test"], at: root)
-        _ = try runGit(["config", "commit.gpgSign", "false"], at: root)
-        _ = try runGit(["checkout", "-b", "main"], at: root)
 
         for (path, contents) in files {
             try write(contents, to: path, at: root)
         }
-        _ = try runGit(["add", "."], at: root)
+        _ = try runGit(["add", "-A"], at: root)
         _ = try runGit(["commit", "-m", "Initial commit"], at: root)
         return root
+    }
+
+    private func initializeRepository(at root: URL, objectFormat: GitObjectFormat) throws {
+        _ = try runGit(["init", "--object-format=\(objectFormat.rawValue)"], at: root)
+        _ = try runGit(["config", "user.name", "RepoPrompt Test"], at: root)
+        _ = try runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+        _ = try runGit(["config", "commit.gpgSign", "false"], at: root)
+        _ = try runGit(["checkout", "-b", "main"], at: root)
     }
 
     func makeLinkedWorktree(

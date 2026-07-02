@@ -1,0 +1,43 @@
+{
+  "counts": {
+    "provider": 7,
+    "root": 2835,
+    "total": 2842
+  },
+  "git": {
+    "commit": "d2b57f0449a4d855a5ecf6eede18f76830bb1087",
+    "working_tree": " M Tests/RepoPromptTests/Helpers/ReviewGitRepositoryFixture.swift\n M Tests/RepoPromptTests/Services/VCS/GitWorktreeCreationReceiptTests.swift\n?? Tests/RepoPromptTests/Helpers/ImmutableGitRepositoryTemplate.swift\n?? prompt-exports/oracle-plan-2026-07-02-061053-git-template-cache-c-d5b5.md"
+  },
+  "ledger": "/var/folders/8b/tgpwpwcx4pv57dhcxyd8m0_c0000gn/T/tmp.S68XI5xd3Q/generated-ledger.tsv",
+  "list_runs": {
+    "provider": {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "provider-test",
+        "--list",
+        "--json"
+      ],
+      "execution_seconds": 0.4122800827026367,
+      "exit_code": 0,
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c86c4e33-6146-4f1a-a3eb-a9026d094b73.log",
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0007100105285644531,
+      "state": "completed"
+    },
+    "root": {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--list",
+        "--json"
+      ],
+      "execution_seconds": 2.9676737785339355,
+      "exit_code": 0,
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/394671dd-7a42-46f0-981f-acdcee3e4e37.log",
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.002586841583251953,
+      "state": "completed"
+    }
+  },
+  "timestamp": "2026-07-02T10:30:35+00:00"
+}

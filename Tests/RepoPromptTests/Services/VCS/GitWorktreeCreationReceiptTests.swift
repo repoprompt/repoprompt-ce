@@ -1904,19 +1904,8 @@ private struct ReceiptFixture {
             .appendingPathComponent("GitWorktreeCreationReceiptTests-\(UUID().uuidString)", isDirectory: true)
         root = sandbox.appendingPathComponent("repo", isDirectory: true)
         worktrees = sandbox.appendingPathComponent("worktrees", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try ImmutableGitRepositoryTemplate.copy(.gitWorktreeReceiptBase, to: root)
         try FileManager.default.createDirectory(at: worktrees, withIntermediateDirectories: true)
-        try git(["init"])
-        try git(["config", "user.name", "RepoPrompt Test"])
-        try git(["config", "user.email", "repoprompt@example.test"])
-        try git(["config", "commit.gpgSign", "false"])
-        try write("Tracked.swift", "let value = 1\n")
-        try write(".gitignore", "secret.txt\nnested/ignored.txt\n")
-        try write(".worktreeinclude", "secret.txt\nnested/ignored.txt\n")
-        try write("secret.txt", "ephemeral secret\n")
-        try write("nested/ignored.txt", "nested ephemeral secret\n")
-        try git(["add", "Tracked.swift", ".gitignore", ".worktreeinclude"])
-        try git(["commit", "-m", "base"])
     }
 
     func initializationContext(
