@@ -4305,14 +4305,14 @@ final class MCPServerViewModel: ObservableObject {
             return false
         }
         let bindingFingerprint = AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
-        let catalog = await promptVM.workspaceFileContextStore.readFileAutoSelectionCatalogValidationSnapshot(
-            rootScope: authoritativeLookupContext.rootScope
-        )
         #if DEBUG
             if let handler = readFileAutoSelectionFinalRevalidationHandlerForTesting {
                 await handler()
             }
         #endif
+        let catalog = await promptVM.workspaceFileContextStore.readFileAutoSelectionCatalogValidationSnapshot(
+            rootScope: authoritativeLookupContext.rootScope
+        )
         guard !Task.isCancelled,
               catalog.rootScopeAvailability == .available,
               isReadFileAutoSelectionContextCurrent(key),

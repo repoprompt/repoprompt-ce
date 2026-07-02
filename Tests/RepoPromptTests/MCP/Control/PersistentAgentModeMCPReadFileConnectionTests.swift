@@ -1198,14 +1198,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 await gate.markStartedAndWaitForRelease()
             }
             fixture.window.mcpServer.setReadFileAutoSelectionFinalRevalidationHandlerForTesting {
-                guard var tab = fixture.window.workspaceManager.composeTab(with: Fixture.tabID) else {
-                    return XCTFail("Missing canonical tab during final certificate revalidation")
+                do {
+                    try await self.persistCertificateBoundaryFinalSelectionAdvance(fixture: fixture)
+                } catch {
+                    XCTFail("Failed final certificate revalidation selection advance: \(error)")
                 }
-                tab.selection = StoredSelection(selectedPaths: [fixture.fileURL.path, fixture.liveFileURL.path])
-                XCTAssertTrue(fixture.window.workspaceManager.updateComposeTabStoredOnly(
-                    tab,
-                    inWorkspaceID: fixture.workspaceID
-                ))
             }
             defer {
                 fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting(nil)
@@ -1220,18 +1217,79 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             await gate.release()
             await assertReadFileAutoSelectionSettled(fixture: fixture)
-            let certificate = try XCTUnwrap(fixture.readFileAutoSelectionCoverageCertificate())
-            XCTAssertEqual(certificate.selectionRevision, fixture.canonicalSelectionRevision())
+            let certificate = try XCTUnwrap(
+                fixture.readFileAutoSelectionCoverageCertificate(),
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+            XCTAssertEqual(
+                certificate.selectionRevision,
+                fixture.canonicalSelectionRevision(),
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
             XCTAssertEqual(
                 fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection.selectedPaths,
-                [fixture.fileURL.path, fixture.liveFileURL.path]
+                [fixture.fileURL.path, fixture.liveFileURL.path],
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
             )
 
             _ = try await readFile(fixture: fixture, id: 5, path: fixture.fileURL.path)
             await assertReadFileAutoSelectionSettled(fixture: fixture)
             let final = try fixture.readFileAutoSelectionContextSnapshot()
-            XCTAssertEqual(final.coverageCertificateHitCount, 1)
-            XCTAssertEqual(final.authoritativeFallbackCount, 1)
+            XCTAssertEqual(
+                final.coverageCertificateHitCount,
+                1,
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+            XCTAssertEqual(
+                final.authoritativeFallbackCount,
+                1,
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+        }
+
+        func persistCertificateBoundaryFinalSelectionAdvance(fixture: Fixture) async throws {
+            let identity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            let currentSelection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(for: identity)?.selection,
+                "Missing canonical tab during final certificate revalidation"
+            )
+            let advancedSelection = StoredSelection(
+                selectedPaths: [fixture.fileURL.path, fixture.liveFileURL.path],
+                manualCodemapPaths: currentSelection.manualCodemapPaths,
+                slices: [:],
+                codemapAutoEnabled: currentSelection.codemapAutoEnabled
+            )
+            let persisted = await fixture.window.selectionCoordinator.persistSelection(
+                advancedSelection,
+                for: identity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: false,
+                expectedCurrentSelection: currentSelection
+            )
+            XCTAssertEqual(
+                persisted,
+                advancedSelection,
+                "Final certificate revalidation selection advance did not persist through the canonical coordinator. \(readFileAutoSelectionBoundaryFailureContext(fixture: fixture))"
+            )
+        }
+
+        func readFileAutoSelectionBoundaryFailureContext(fixture: Fixture) -> String {
+            let identity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            let diagnostics = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
+            let contextSnapshot = (try? fixture.readFileAutoSelectionContextSnapshot()).map(String.init(describing:))
+                ?? "<unavailable>"
+            let certificate = (try? fixture.readFileAutoSelectionCoverageCertificate()).map(String.init(describing:))
+                ?? "<nil>"
+            let canonicalSelection = fixture.window.workspaceManager.composeTab(for: identity)?.selection
+            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
+            let boundRevision = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selectionRevision
+            return "readFileAutoSelectionBoundary diagnostics=\(diagnostics) context=\(contextSnapshot) certificate=\(certificate) canonicalRevision=\(fixture.canonicalSelectionRevision()) canonicalSelection=\(String(describing: canonicalSelection)) boundSelection=\(String(describing: boundSelection)) boundRevision=\(String(describing: boundRevision))"
         }
 
         func assertWorktreeCoverageCertificateFailClosed(fixture: Fixture) async throws {
