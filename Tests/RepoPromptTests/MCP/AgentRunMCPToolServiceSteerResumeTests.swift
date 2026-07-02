@@ -92,7 +92,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(hasActiveRegistration)
     }
 
-    func testSteerReactivationDispatchFailureDoesNotClearReplacementControlContext() async throws {
+    func testSteerReactivationDispatchFailurePreservesReplacementControlContextButClearsPendingMask() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
@@ -146,7 +146,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let context = try XCTUnwrap(session.mcpControlContext)
         XCTAssertEqual(context.activationID, activationID)
         XCTAssertEqual(context.registration, registration)
-        XCTAssertTrue(session.mcpFollowUpRunPending)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
         XCTAssertFalse(session.isMCPOriginated)
         let currentRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
         XCTAssertEqual(currentRegistration, registration)

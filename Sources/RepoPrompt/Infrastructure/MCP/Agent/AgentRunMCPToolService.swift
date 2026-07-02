@@ -995,6 +995,11 @@ struct AgentRunMCPToolService {
         resolution: SteerControlResolution,
         agentModeVM: AgentModeViewModel
     ) {
+        // The pending running mask is session-scoped rather than activation-scoped. A failed
+        // inactive steer must always drop it so MCP snapshots stop reporting a queued run,
+        // even if a concurrent replacement means destructive context cleanup must be skipped.
+        agentModeVM.setMCPFollowUpRunPending(sessionID: sessionID, false)
+
         if let identity = resolution.reactivatedControlIdentity {
             guard let session = agentModeVM.mcpControlledSession(sessionID: identity.sessionID),
                   let context = session.mcpControlContext,
@@ -1005,7 +1010,6 @@ struct AgentRunMCPToolService {
                 return
             }
         }
-        agentModeVM.setMCPFollowUpRunPending(sessionID: sessionID, false)
     }
 
     private func ensureSteerControlContext(
