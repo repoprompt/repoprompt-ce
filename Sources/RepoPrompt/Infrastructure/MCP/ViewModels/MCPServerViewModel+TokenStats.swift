@@ -88,6 +88,21 @@ extension MCPServerViewModel {
         let activePublishedSnapshot: TokenCountingViewModel.PublishedTokenSnapshot?
     }
 
+    /// Canonical `TokenAccountingDTO.incompleteComponents` values, in stable display order.
+    ///
+    /// - `published_snapshot`: the active tab's published token snapshot is stale/incomplete.
+    /// - `files`: selected file content or per-file token inputs are missing.
+    /// - `codemap_presentation`: requested codemap presentation is pending or retryable.
+    /// - `file_tree`: file-tree tokens require asynchronous virtual-context rendering.
+    /// - `git`: git-review tokens require asynchronous virtual-context rendering.
+    private static let tokenAccountingComponentOrder = [
+        "published_snapshot",
+        "files",
+        "codemap_presentation",
+        "file_tree",
+        "git"
+    ]
+
     @MainActor
     func prepareMCPTokenAccounting(
         context: TabScopedContext,
@@ -106,6 +121,7 @@ extension MCPServerViewModel {
                 scheduleRefreshIfNeeded: allowActivePublishedSnapshotRefresh
             )
             var entryResults = cachedEvaluation.entryResultsByFileID
+            var reliablePublishedFileIDs = Set<UUID>()
             for entry in collections.selected {
                 guard let info = promptVM.tokenCountingViewModel.latestPublishedTokenInfo(
                     forFullPath: entry.file.standardizedFullPath
@@ -119,6 +135,7 @@ extension MCPServerViewModel {
                     fullTokens: info.fullCount,
                     codemapTokens: info.codemapCount
                 )
+                reliablePublishedFileIDs.insert(entry.file.id)
             }
             for entry in collections.codemap {
                 guard let info = promptVM.tokenCountingViewModel.latestPublishedTokenInfo(
@@ -131,8 +148,45 @@ extension MCPServerViewModel {
                     fullTokens: info.fullCount,
                     codemapTokens: info.codemapCount
                 )
+                reliablePublishedFileIDs.insert(entry.file.id)
             }
-            let status = !published.isComplete ? "incomplete" : (published.isStale ? "stale" : "fresh")
+
+            var incompleteComponents = Set<String>()
+            if !published.isComplete {
+                incompleteComponents.insert("published_snapshot")
+            }
+            if Self.hasMissingFileTokenInputs(
+                collections: collections,
+                reliableFileIDs: reliablePublishedFileIDs
+            ) {
+                incompleteComponents.insert("files")
+            }
+            if Self.hasPendingCodemapPresentationGaps(collections: collections) {
+                incompleteComponents.insert("codemap_presentation")
+            }
+
+            let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
+            if allowActivePublishedSnapshotRefresh, !incompleteComponents.isEmpty {
+                if incompleteComponents.contains("files") {
+                    promptVM.tokenCountingViewModel.markDirty(.selection)
+                }
+                if incompleteComponents.contains("codemap_presentation") {
+                    promptVM.tokenCountingViewModel.markDirty(.codeMap)
+                }
+                if incompleteComponents.contains("published_snapshot") {
+                    promptVM.tokenCountingViewModel.markDirty()
+                }
+            }
+            let refreshPending = published.refreshPending
+                || (allowActivePublishedSnapshotRefresh && !incompleteComponents.isEmpty)
+            let status = if !incompleteComponents.isEmpty {
+                "incomplete"
+            } else if published.isStale {
+                "stale"
+            } else {
+                "fresh"
+            }
+
             return MCPPreparedTokenAccounting(
                 entryResultsByFileID: entryResults,
                 breakdown: .init(
@@ -146,8 +200,8 @@ extension MCPServerViewModel {
                 tokenAccounting: .init(
                     status: status,
                     source: "active_tab_published",
-                    refreshPending: published.refreshPending,
-                    incompleteComponents: published.isComplete ? nil : ["published_snapshot"]
+                    refreshPending: refreshPending,
+                    incompleteComponents: orderedIncomplete
                 ),
                 activePublishedSnapshot: published
             )
@@ -171,28 +225,43 @@ extension MCPServerViewModel {
                 collections: collections,
                 lookupContext: lookupContext
             )
+            var incompleteComponents = Set<String>()
+            if Self.hasMissingFileTokenInputs(
+                collections: collections,
+                reliableFileIDs: Set(cachedSnapshot.entryResultsByFileID.keys)
+            ) {
+                incompleteComponents.insert("files")
+            }
+            if Self.hasPendingCodemapPresentationGaps(collections: collections) {
+                incompleteComponents.insert("codemap_presentation")
+            }
             return MCPPreparedTokenAccounting(
                 entryResultsByFileID: cachedSnapshot.entryResultsByFileID,
                 breakdown: cachedSnapshot.breakdown,
                 tokenAccounting: .init(
                     status: "stale",
                     source: "bound_tab_cache",
-                    refreshPending: true
+                    refreshPending: true,
+                    incompleteComponents: Self.orderedIncompleteComponents(incompleteComponents)
                 ),
                 activePublishedSnapshot: nil
             )
         }
 
-        var incompleteComponents: [String] = []
-        if collections.selected.contains(where: { $0.entry.loadedContent == nil }) {
-            incompleteComponents.append("files")
+        var incompleteComponents = Set<String>()
+        if Self.hasMissingFileTokenInputs(collections: collections, reliableFileIDs: []) {
+            incompleteComponents.insert("files")
+        }
+        if Self.hasPendingCodemapPresentationGaps(collections: collections) {
+            incompleteComponents.insert("codemap_presentation")
         }
         if resolvedContext.rendersFileTree {
-            incompleteComponents.append("file_tree")
+            incompleteComponents.insert("file_tree")
         }
         if resolvedContext.gitInclusion != .none {
-            incompleteComponents.append("git")
+            incompleteComponents.insert("git")
         }
+        let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
         if allowVirtualTokenRefresh, !incompleteComponents.isEmpty {
             enqueueVirtualTokenRefresh(
                 signature: signature,
@@ -227,9 +296,35 @@ extension MCPServerViewModel {
                 status: incompleteComponents.isEmpty ? "fresh" : "incomplete",
                 source: "bound_tab_cached_state",
                 refreshPending: allowVirtualTokenRefresh && !incompleteComponents.isEmpty,
-                incompleteComponents: incompleteComponents.isEmpty ? nil : incompleteComponents
+                incompleteComponents: orderedIncomplete
             ),
             activePublishedSnapshot: nil
+        )
+    }
+
+    private static func orderedIncompleteComponents(
+        _ components: Set<String>
+    ) -> [String]? {
+        let ordered = tokenAccountingComponentOrder.filter(components.contains)
+        return ordered.isEmpty ? nil : ordered
+    }
+
+    private static func hasMissingFileTokenInputs(
+        collections: SelectionReplyAssembler.SelectionCollections,
+        reliableFileIDs: Set<UUID>
+    ) -> Bool {
+        collections.selected.contains { entry in
+            entry.entry.loadedContent == nil && !reliableFileIDs.contains(entry.file.id)
+        }
+    }
+
+    private static func hasPendingCodemapPresentationGaps(
+        collections: SelectionReplyAssembler.SelectionCollections
+    ) -> Bool {
+        SelectionReplyAssembler.hasPendingCodemapPresentationGaps(
+            for: SelectionReplyAssembler.codemapDiagnosticFiles(for: collections),
+            presentation: collections.codemapPresentation,
+            codeMapUsage: collections.codeMapUsage
         )
     }
 

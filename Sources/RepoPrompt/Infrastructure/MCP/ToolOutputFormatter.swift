@@ -2255,12 +2255,28 @@ extension ToolOutputFormatter {
 
             // Token breakdown - organized by category
             if let ts = ctx.tokenStats {
-                out.append("**\(formatTokenCount(ts.total)) total tokens**")
+                let totalPending = selectionTokenTotalIsPending(
+                    totalTokens: ts.total,
+                    fileCount: selectionCount,
+                    accounting: ctx.tokenAccounting
+                )
+                let selectionPending = selectionTokenTotalIsPending(
+                    totalTokens: ts.files,
+                    fileCount: selectionCount,
+                    accounting: ctx.tokenAccounting
+                )
+                if totalPending {
+                    out.append("**Token accounting pending**")
+                } else {
+                    out.append("**\(formatTokenCount(ts.total)) total tokens**")
+                }
                 out.append("")
 
                 // Selection section (files + codemaps)
                 let hasFilesBreakdown = (ts.filesContent != nil && ts.filesContent! > 0) || (ts.codemaps != nil && ts.codemaps! > 0)
-                if hasFilesBreakdown {
+                if selectionPending {
+                    out.append("- **Selection**: pending")
+                } else if hasFilesBreakdown {
                     out.append("- **Selection**: \(formatTokenCount(ts.files))")
                     if let filesContent = ts.filesContent, filesContent > 0 {
                         out.append("  - Files: \(formatTokenCount(filesContent))")
@@ -2287,7 +2303,7 @@ extension ToolOutputFormatter {
                 }
             }
             if let accounting = ctx.tokenAccounting {
-                out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
+                out.append("- Token accounting: \(tokenAccountingSummaryText(accounting))")
             }
             if let sel = ctx.selection {
                 if let summary = sel.summary {
@@ -2688,6 +2704,35 @@ extension ToolOutputFormatter {
         return formatGeneric(value: value)
     }
 
+    private static func tokenAccountingSummaryText(_ accounting: ToolResultDTOs.TokenAccountingDTO) -> String {
+        var text = "\(accounting.status) from \(accounting.source)"
+        if accounting.refreshPending {
+            text += "; refresh pending"
+        }
+        if let incomplete = accounting.incompleteComponents, !incomplete.isEmpty {
+            text += "; incomplete: \(incomplete.joined(separator: ", "))"
+        }
+        return text
+    }
+
+    private static func selectionTokenTotalIsPending(
+        totalTokens: Int?,
+        fileCount: Int,
+        accounting: ToolResultDTOs.TokenAccountingDTO?
+    ) -> Bool {
+        guard fileCount > 0 else { return false }
+        guard totalTokens.map({ $0 == 0 }) ?? true else { return false }
+        guard let accounting else { return false }
+        if accounting.status == "incomplete" { return true }
+        if accounting.incompleteComponents?.isEmpty == false { return true }
+        let pendingSources: Set = [
+            "active_tab_published",
+            "bound_tab_cached_state",
+            "bound_tab_cache"
+        ]
+        return accounting.refreshPending && pendingSources.contains(accounting.source)
+    }
+
     /// Formats a SelectionReply to a string for embedding in other responses
     static func formatSelectionReplyToString(_ dto: ToolResultDTOs.SelectionReply) -> String {
         var out: [String] = []
@@ -2706,7 +2751,15 @@ extension ToolOutputFormatter {
                 }
             }
             let totalTokens = dto.totalTokens ?? (summary.fullTokens + summary.sliceTokens + summary.codemapTokens)
-            out.append("- Total tokens: \(totalTokens) (Auto view)")
+            if selectionTokenTotalIsPending(
+                totalTokens: totalTokens,
+                fileCount: fileCount,
+                accounting: dto.tokenAccounting
+            ) {
+                out.append("- Total tokens: pending (Auto view)")
+            } else {
+                out.append("- Total tokens: \(totalTokens) (Auto view)")
+            }
             let tokenBreakdown = selectionTokenBreakdownText(summary)
             if !tokenBreakdown.isEmpty {
                 out.append("- Token breakdown: \(tokenBreakdown)")
@@ -2716,12 +2769,20 @@ extension ToolOutputFormatter {
                 out.append("- Files: \(files.count)")
             }
             if let total = dto.totalTokens {
-                out.append("- Total tokens: \(total) (Auto view)")
+                if selectionTokenTotalIsPending(
+                    totalTokens: total,
+                    fileCount: fileCount,
+                    accounting: dto.tokenAccounting
+                ) {
+                    out.append("- Total tokens: pending (Auto view)")
+                } else {
+                    out.append("- Total tokens: \(total) (Auto view)")
+                }
             }
         }
 
         if let accounting = dto.tokenAccounting {
-            out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
+            out.append("- Token accounting: \(tokenAccountingSummaryText(accounting))")
         }
 
         // Copy preset effect (only if it differs from auto)
@@ -2775,9 +2836,27 @@ extension ToolOutputFormatter {
             let copyMode = dto.userCopyCodeMapUsage ?? "auto"
             let isNonAutoMode = copyMode != "auto"
 
+            let totalPending = selectionTokenTotalIsPending(
+                totalTokens: actualTotal,
+                fileCount: fileCount,
+                accounting: dto.tokenAccounting
+            )
+            let autoFileTokensPending = selectionTokenTotalIsPending(
+                totalTokens: fileTokens,
+                fileCount: fileCount,
+                accounting: dto.tokenAccounting
+            )
+
             // Header
             out.append("## Selection \(statusIcon(success: true))")
-            out.append("**\(formatTokenCount(actualTotal)) total tokens**")
+            if totalPending {
+                out.append("**Token accounting pending**")
+            } else {
+                out.append("**\(formatTokenCount(actualTotal)) total tokens**")
+            }
+            if let accounting = dto.tokenAccounting {
+                out.append("Token accounting: \(tokenAccountingSummaryText(accounting))")
+            }
 
             if let ts = dto.tokenStats {
                 out.append("")
@@ -2796,7 +2875,15 @@ extension ToolOutputFormatter {
                     if hiddenFiles > 0 {
                         fileDesc += ", \(hiddenFiles) hidden"
                     }
-                    out.append("Files: \(formatTokenCount(copyPresetTokens)) (\(fileDesc))")
+                    if selectionTokenTotalIsPending(
+                        totalTokens: copyPresetTokens,
+                        fileCount: visibleFiles,
+                        accounting: dto.tokenAccounting
+                    ) {
+                        out.append("Files: pending (\(fileDesc))")
+                    } else {
+                        out.append("Files: \(formatTokenCount(copyPresetTokens)) (\(fileDesc))")
+                    }
 
                     // Show auto view as reference for MCP tools
                     let hasFilesBreakdown = (ts.filesContent != nil && ts.filesContent! > 0) || (ts.codemaps != nil && ts.codemaps! > 0)
@@ -2809,7 +2896,9 @@ extension ToolOutputFormatter {
                 } else {
                     // Auto mode - show breakdown directly
                     let hasFilesBreakdown = (ts.filesContent != nil && ts.filesContent! > 0) || (ts.codemaps != nil && ts.codemaps! > 0)
-                    if hasFilesBreakdown {
+                    if autoFileTokensPending {
+                        out.append("Files: pending (\(fileCount) file\(fileCount == 1 ? "" : "s"))")
+                    } else if hasFilesBreakdown {
                         var parts: [String] = []
                         if let fc = ts.filesContent, fc > 0 { parts.append("\(formatTokenCount(fc)) full") }
                         if let cm = ts.codemaps, cm > 0 { parts.append("\(formatTokenCount(cm)) codemaps") }

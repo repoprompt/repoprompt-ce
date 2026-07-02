@@ -50,6 +50,254 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         }
     }
 
+    func testSupportedMissingCodemapDiagnosticsArePending() async {
+        let file = makeFileRecord(relativePath: "Sources/Pending.swift")
+        let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+
+        let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
+            for: [file],
+            presentation: presentation
+        ) { file in
+            file.standardizedRelativePath
+        }
+
+        XCTAssertEqual(diagnostics.pendingPaths, ["Sources/Pending.swift"])
+        XCTAssertEqual(diagnostics.unmappedPaths, [])
+    }
+
+    func testUnsupportedMissingCodemapDiagnosticsRemainUnmapped() async {
+        let file = makeFileRecord(relativePath: "README.txt")
+
+        let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
+            for: [file],
+            presentation: .empty
+        ) { file in
+            file.standardizedRelativePath
+        }
+
+        XCTAssertEqual(diagnostics.pendingPaths, [])
+        XCTAssertEqual(diagnostics.unmappedPaths, ["README.txt"])
+    }
+
+    func testAutoModeOnlyDiagnosesRequestedCodemapFiles() async {
+        let selectedFile = makeFileRecord(relativePath: "Sources/Selected.swift")
+        let requestedCodemapFile = makeFileRecord(relativePath: "Sources/Requested.swift")
+        let selectedEntry = MCPServerViewModel.SelectionReplyAssembler.SelectedEntry(
+            entry: ResolvedPromptFileEntry(file: selectedFile)
+        )
+        let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+        let collections = MCPServerViewModel.SelectionReplyAssembler.SelectionCollections(
+            selected: [selectedEntry],
+            codemap: [],
+            requestedCodemapFiles: [requestedCodemapFile],
+            codemapAutoEnabled: false,
+            codeMapUsage: .auto,
+            invalid: [],
+            codemapPresentation: presentation
+        )
+
+        let diagnosticFiles = MCPServerViewModel.SelectionReplyAssembler.codemapDiagnosticFiles(
+            for: collections
+        )
+        XCTAssertEqual(diagnosticFiles.map(\.id), [requestedCodemapFile.id])
+
+        let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
+            for: diagnosticFiles,
+            presentation: presentation
+        ) { file in
+            file.standardizedRelativePath
+        }
+        XCTAssertEqual(diagnostics.pendingPaths, ["Sources/Requested.swift"])
+        XCTAssertEqual(diagnostics.unmappedPaths, [])
+    }
+
+    func testTerminalCodemapDispositionOverridesPendingRegardlessOfIssueOrder() async {
+        let file = makeFileRecord(relativePath: "Sources/Terminal.swift")
+        let ticket = makeCodemapTicket(fileID: file.id, rootID: file.rootID)
+        let pending = WorkspaceCodemapOperationIssue.pending(fileID: file.id, ticket: ticket)
+        let terminal = WorkspaceCodemapOperationIssue.unavailable(
+            fileID: file.id,
+            reason: .unsupportedFileType
+        )
+
+        for issues in [[terminal, pending], [pending, terminal]] {
+            let presentation = WorkspaceCodemapOperationPresentation(
+                orderedEntries: [],
+                coverage: .pending(issues),
+                issues: issues,
+                publicationReceipt: nil
+            )
+            let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
+                for: [file],
+                presentation: presentation
+            ) { file in
+                file.standardizedRelativePath
+            }
+
+            XCTAssertEqual(diagnostics.pendingPaths, [], "Issue order: \(issues)")
+            XCTAssertEqual(diagnostics.unmappedPaths, ["Sources/Terminal.swift"], "Issue order: \(issues)")
+        }
+    }
+
+    func testAutoUnsupportedNoTargetPresentationDoesNotMarkCodemapIncomplete() async throws {
+        let root = try makeTemporaryRoot(name: "AutoUnsupportedNoTarget")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let readme = root.appendingPathComponent("README.txt")
+        try write("plain text\n", to: readme)
+
+        let tabID = UUID()
+        let selection = StoredSelection(
+            selectedPaths: [readme.path],
+            codemapAutoEnabled: true
+        )
+        let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+
+        let issue = WorkspaceCodemapOperationIssue.automatic(.unavailable(.noReadySources))
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+        let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: presentation,
+            from: selection,
+            includeBlocks: true,
+            display: .relative,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertFalse(
+            reply.tokenAccounting?.incompleteComponents?.contains("codemap_presentation") == true,
+            String(describing: reply.tokenAccounting?.incompleteComponents)
+        )
+        XCTAssertTrue(reply.codeStructure?.pendingPaths?.isEmpty ?? true)
+        XCTAssertTrue(reply.codeStructure?.unmappedPaths?.isEmpty ?? true)
+    }
+
+    func testBorrowedAutoReplyReportsPendingAutomaticTargetCodemap() async throws {
+        let root = try makeTemporaryRoot(name: "AutoPendingTarget")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let source = root.appendingPathComponent("Source.swift")
+        let target = root.appendingPathComponent("Target.swift")
+        try write("struct Source {}\n", to: source)
+        try write("struct Target {}\n", to: target)
+
+        let tabID = UUID()
+        let selection = StoredSelection(
+            selectedPaths: [source.path],
+            codemapAutoEnabled: true
+        )
+        let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+        let maybeTargetRecord = await window.promptManager.workspaceFileContextStore.file(
+            rootID: loadedRoot.id,
+            relativePath: "Target.swift"
+        )
+        let targetRecord = try XCTUnwrap(maybeTargetRecord)
+        let rootEpoch = makeRootEpoch(rootID: targetRecord.rootID)
+        let issue = WorkspaceCodemapOperationIssue.automatic(.pending([
+            .candidateDemand(
+                rootEpoch: rootEpoch,
+                fileID: targetRecord.id,
+                ticket: makeCodemapTicket(fileID: targetRecord.id, rootID: targetRecord.rootID)
+            )
+        ]))
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+
+        let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: presentation,
+            from: selection,
+            includeBlocks: true,
+            display: .full,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertTrue(
+            reply.tokenAccounting?.incompleteComponents?.contains("codemap_presentation") == true,
+            String(describing: reply.tokenAccounting?.incompleteComponents)
+        )
+        XCTAssertEqual(reply.codeStructure?.pendingPaths, [target.standardizedFileURL.path])
+        XCTAssertTrue(reply.codeStructure?.unmappedPaths?.isEmpty ?? true)
+    }
+
+    func testActiveVisibleSelectionMarksMissingCachedFileTokensIncomplete() async throws {
+        let root = try makeTemporaryRoot(name: "ActiveVisibleIncomplete")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let oldFile = root.appendingPathComponent("Old.swift")
+        let newFile = root.appendingPathComponent("New.swift")
+        try write("struct OldTokenBaseline {}\n", to: oldFile)
+        try write("struct NewVisibleSelection {}\n", to: newFile)
+
+        let tabID = UUID()
+        let oldSelection = StoredSelection(selectedPaths: [oldFile.path])
+        let newSelection = StoredSelection(selectedPaths: [newFile.path])
+        let (window, workspaceID) = await makeWindow(root: root, tabID: tabID, selection: oldSelection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+        await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
+
+        var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+        liveTab.selection = newSelection
+        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
+        let context = makeContext(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: newSelection
+        )
+        let activeResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
+            snapshot: context,
+            usesActiveTabCompatibility: true
+        )
+
+        let reply = await window.mcpServer.buildCurrentSelectionReply(
+            includeBlocks: false,
+            display: .full,
+            resolvedContext: activeResolution,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertEqual(reply.files?.map(\.path), [newFile.path])
+        XCTAssertEqual(reply.tokenAccounting?.source, "active_tab_published")
+        XCTAssertEqual(reply.tokenAccounting?.status, "incomplete")
+        XCTAssertTrue(reply.tokenAccounting?.refreshPending == true)
+        XCTAssertTrue(reply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+        XCTAssertEqual(reply.totalTokens, 0)
+        let formatted = ToolOutputFormatter.formatSelectionReplyToString(reply)
+        XCTAssertTrue(formatted.contains("- Total tokens: pending (Auto view)"), formatted)
+        XCTAssertFalse(formatted.contains("- Total tokens: 0 (Auto view)"), formatted)
+    }
+
     func testMutationReplyRereadsLiveTabSelectionAfterProviderStabilization() async throws {
         let root = try makeTemporaryRoot(name: "MutationReply")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -757,12 +1005,15 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             XCTAssertEqual(resolvedFirstReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedFirstReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedFirstReply.tokenAccounting?.refreshPending == true)
+            XCTAssertTrue(resolvedFirstReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(resolvedSecondReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedSecondReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedSecondReply.tokenAccounting?.refreshPending == true)
+            XCTAssertTrue(resolvedSecondReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(resolvedWorkspaceReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedWorkspaceReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedWorkspaceReply.tokenAccounting?.refreshPending == true)
+            XCTAssertTrue(resolvedWorkspaceReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(window.mcpServer.virtualTokenRefreshStartCountForTesting(), baselineStarts + 1)
             let refreshStartCount = await refreshGate.startCount()
             // Identical bound selection and workspace token requests share one signature,
@@ -1526,6 +1777,39 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let root = parent.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root.standardizedFileURL
+    }
+
+    private func makeFileRecord(
+        relativePath: String,
+        rootID: UUID = UUID()
+    ) -> WorkspaceFileRecord {
+        WorkspaceFileRecord(
+            rootID: rootID,
+            name: URL(fileURLWithPath: relativePath).lastPathComponent,
+            relativePath: relativePath,
+            fullPath: "/workspace/project/\(relativePath)",
+            parentFolderID: nil
+        )
+    }
+
+    private func makeRootEpoch(rootID: UUID = UUID()) -> WorkspaceCodemapRootEpoch {
+        WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: UUID())
+    }
+
+    private func makeCodemapTicket(
+        fileID: UUID,
+        rootID: UUID = UUID()
+    ) -> WorkspaceCodemapArtifactDemandTicket {
+        WorkspaceCodemapArtifactDemandTicket(
+            retainID: UUID(),
+            requestID: UUID(),
+            rootEpoch: makeRootEpoch(rootID: rootID),
+            fileID: fileID,
+            requestGeneration: 1,
+            catalogGeneration: 1,
+            pathGeneration: 1,
+            ingressGeneration: 1
+        )
     }
 
     private func write(_ content: String, to url: URL) throws {

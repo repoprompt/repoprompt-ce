@@ -64,6 +64,28 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         }
     }
 
+    func testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup() throws {
+        let caseLabel = "testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup"
+        let storeSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+        let startPathSnapshot = try XCTUnwrap(storeSource.slice(
+            from: "    private func makeFileTreeSelectionSnapshot(\n        _ request: WorkspaceFileTreeSnapshotRequest,\n        selectedStoreFileIDs: Set<UUID>,\n        renderableCodemapFileIDs: Set<UUID>,\n        profile: PathLocateProfile\n    ) async -> FileTreeSelectionSnapshot {\n",
+            to: "    private func resolveFileTreeStartFolder("
+        ), caseLabel)
+        XCTAssertTrue(startPathSnapshot.contains("resolveFileTreeStartFolder("), caseLabel)
+        XCTAssertFalse(startPathSnapshot.contains("lookupSelectionPath(trimmedStartPath"), caseLabel)
+
+        let startFolderResolver = try XCTUnwrap(storeSource.slice(
+            from: "    private func resolveFileTreeStartFolder(",
+            to: "    private func makeFileTreeSelectionSnapshot(\n        _ request: WorkspaceFileTreeSnapshotRequest,\n        selectedStoreFileIDs: Set<UUID>,\n        renderableCodemapFileIDs: Set<UUID>,\n        startFolder: WorkspaceFolderRecord?"
+        ), caseLabel)
+        try assertOrdered([
+            "let roots = rootRefs(scope: request.rootScope)",
+            "resolveFolderInput(",
+            "rootRefs: roots",
+            "allowGeneralLookupFallback: false"
+        ], in: startFolderResolver, label: caseLabel)
+    }
+
     func testExactAbsoluteInputValidationCoversQualificationEmptyAndEmbeddedNUL() async throws {
         do {
             let caseLabel = "testExactAbsoluteQualificationAcceptsTrimmedAndTildeExpandedAbsoluteInputsOnly"

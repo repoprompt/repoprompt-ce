@@ -274,6 +274,7 @@ extension MCPServerViewModel {
         struct SelectionCollections {
             let selected: [SelectedEntry]
             let codemap: [CodemapEntry]
+            let requestedCodemapFiles: [WorkspaceFileRecord]
             let codemapAutoEnabled: Bool
             let codeMapUsage: CodeMapUsage
             let invalid: [String]
@@ -283,11 +284,400 @@ extension MCPServerViewModel {
                 SelectionCollections(
                     selected: [],
                     codemap: [],
+                    requestedCodemapFiles: [],
                     codemapAutoEnabled: false,
                     codeMapUsage: codeMapUsage,
                     invalid: [],
                     codemapPresentation: .empty
                 )
+            }
+        }
+
+        struct CodemapPathDiagnostics: Equatable {
+            let pendingPaths: [String]
+            let unmappedPaths: [String]
+
+            var isEmpty: Bool {
+                pendingPaths.isEmpty && unmappedPaths.isEmpty
+            }
+        }
+
+        private enum MissingCodemapDisposition {
+            case pending
+            case unmapped
+        }
+
+        private enum CodemapIssueDisposition {
+            case pending
+            case unmapped(terminal: Bool)
+        }
+
+        static func codemapDiagnosticFiles(
+            for collections: SelectionCollections
+        ) -> [WorkspaceFileRecord] {
+            switch collections.codeMapUsage {
+            case .none:
+                []
+            case .auto:
+                collections.requestedCodemapFiles + collections.codemap.map(\.file)
+            case .selected, .complete:
+                collections.selected.map(\.file)
+                    + collections.codemap.map(\.file)
+                    + collections.requestedCodemapFiles
+            }
+        }
+
+        static func missingCodemapDiagnostics(
+            for files: [WorkspaceFileRecord],
+            presentation: WorkspaceCodemapOperationPresentation,
+            displayPath: (WorkspaceFileRecord) async -> String
+        ) async -> CodemapPathDiagnostics {
+            let missingFiles = codemapDiagnosticFiles(files, presentation: presentation)
+            var pendingPaths: [String] = []
+            var unmappedPaths: [String] = []
+            var seenPending = Set<String>()
+            var seenUnmapped = Set<String>()
+
+            for file in missingFiles {
+                let path = await displayPath(file)
+                switch missingCodemapDisposition(for: file, presentation: presentation) {
+                case .pending:
+                    if seenPending.insert(path).inserted {
+                        pendingPaths.append(path)
+                    }
+                case .unmapped:
+                    if seenUnmapped.insert(path).inserted {
+                        unmappedPaths.append(path)
+                    }
+                }
+            }
+
+            return CodemapPathDiagnostics(
+                pendingPaths: pendingPaths,
+                unmappedPaths: unmappedPaths
+            )
+        }
+
+        static func hasPendingCodemapPresentationGaps(
+            for files: [WorkspaceFileRecord],
+            presentation: WorkspaceCodemapOperationPresentation,
+            codeMapUsage: CodeMapUsage
+        ) -> Bool {
+            guard codeMapUsage != .none else { return false }
+            return codemapDiagnosticFiles(files, presentation: presentation).contains { file in
+                missingCodemapDisposition(for: file, presentation: presentation) == .pending
+            }
+        }
+
+        private static func codemapDiagnosticFiles(
+            _ files: [WorkspaceFileRecord],
+            presentation: WorkspaceCodemapOperationPresentation
+        ) -> [WorkspaceFileRecord] {
+            var seen = Set<UUID>()
+            var missing: [WorkspaceFileRecord] = []
+            for file in files {
+                guard seen.insert(file.id).inserted else { continue }
+                guard presentation.renderedEntriesByFileID[file.id] == nil else { continue }
+                missing.append(file)
+            }
+            return missing
+        }
+
+        private static func missingCodemapDisposition(
+            for file: WorkspaceFileRecord,
+            presentation: WorkspaceCodemapOperationPresentation
+        ) -> MissingCodemapDisposition {
+            guard supportsCodemap(file) else { return .unmapped }
+
+            let issues = presentation.issues + coverageIssues(presentation.coverage)
+            var sawPending = false
+            var sawUnmapped = false
+            var sawTerminalUnmapped = false
+            for issue in issues {
+                guard let disposition = codemapDisposition(
+                    for: issue,
+                    fileID: file.id
+                ) else { continue }
+                switch disposition {
+                case .pending:
+                    sawPending = true
+                case let .unmapped(terminal):
+                    sawUnmapped = true
+                    sawTerminalUnmapped = sawTerminalUnmapped || terminal
+                }
+            }
+            if sawTerminalUnmapped { return .unmapped }
+            if sawPending { return .pending }
+            if sawUnmapped { return .unmapped }
+
+            if presentationCoverageIsIncomplete(presentation.coverage) || !issues.isEmpty {
+                return .pending
+            }
+
+            // A supported file absent from an otherwise empty/complete presentation is
+            // ambiguous in MCP's non-blocking path: CAS may not have produced a rendered
+            // bundle yet, or the codemap may not have been requested by the stale snapshot.
+            // Prefer a retryable/pending diagnostic over a final-looking unmapped result.
+            return .pending
+        }
+
+        private static func supportsCodemap(_ file: WorkspaceFileRecord) -> Bool {
+            let fileExtension = (file.name as NSString).pathExtension.lowercased()
+            guard !fileExtension.isEmpty else { return false }
+            return SyntaxManager.supportsCodeMap(fileExtension: fileExtension)
+        }
+
+        private static func coverageIssues(
+            _ coverage: WorkspaceCodemapOperationPresentationCoverage
+        ) -> [WorkspaceCodemapOperationIssue] {
+            switch coverage {
+            case .complete:
+                []
+            case let .partial(issues), let .pending(issues), let .unavailable(issues):
+                issues
+            }
+        }
+
+        private static func presentationCoverageIsIncomplete(
+            _ coverage: WorkspaceCodemapOperationPresentationCoverage
+        ) -> Bool {
+            switch coverage {
+            case .complete:
+                false
+            case .partial, .pending, .unavailable:
+                true
+            }
+        }
+
+        private static func codemapDisposition(
+            for issue: WorkspaceCodemapOperationIssue,
+            fileID: UUID
+        ) -> CodemapIssueDisposition? {
+            switch issue {
+            case .coordinationUnavailable, .cancelled, .publicationStale:
+                return .pending
+            case let .candidate(candidateIssue):
+                return candidateDisposition(candidateIssue, fileID: fileID)
+            case let .pending(pendingFileID, _):
+                return pendingFileID == fileID ? .pending : nil
+            case let .unavailable(unavailableFileID, reason):
+                guard unavailableFileID == fileID else { return nil }
+                return unavailableDisposition(reason)
+            case let .automatic(coverage):
+                return automaticCoverageDisposition(coverage, fileID: fileID)
+            case let .freezeUnavailable(_, reason):
+                return freezeUnavailableDisposition(reason)
+            case let .renderUnavailable(_, reason):
+                return renderUnavailableDisposition(reason, fileID: fileID)
+            }
+        }
+
+        private static func candidateDisposition(
+            _ issue: WorkspaceCodemapOperationCandidateIssue,
+            fileID: UUID
+        ) -> CodemapIssueDisposition? {
+            switch issue {
+            case let .fileNotCataloged(candidateFileID):
+                candidateFileID == fileID ? .pending : nil
+            case let .fileOutsideRootScope(candidateFileID),
+                 let .logicalPathUnavailable(candidateFileID):
+                candidateFileID == fileID ? .unmapped(terminal: true) : nil
+            case let .incompleteRootSet(missingFileIDs):
+                missingFileIDs.contains(fileID) ? .pending : nil
+            }
+        }
+
+        private static func unavailableDisposition(
+            _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+        ) -> CodemapIssueDisposition {
+            switch reason {
+            case .unsupportedFileType:
+                .unmapped(terminal: true)
+            case .gitTerminal:
+                .unmapped(terminal: true)
+            case let .demandUnavailable(reason):
+                demandUnavailableDisposition(reason)
+            case .rootNotLoaded, .fileNotCataloged, .gitTransient, .busy,
+                 .rejected, .routeConflict, .registrationFailed, .runtimeFailure,
+                 .staleCurrentness, .cancelled:
+                .pending
+            }
+        }
+
+        private static func demandUnavailableDisposition(
+            _ reason: WorkspaceCodemapBindingDemandUnavailableReason
+        ) -> CodemapIssueDisposition {
+            switch reason {
+            case .unsupportedFileType, .missing, .securityExcluded, .nonRegular,
+                 .oversized, .terminalArtifact:
+                .unmapped(terminal: true)
+            case .transient:
+                .pending
+            }
+        }
+
+        private static func automaticCoverageDisposition(
+            _ coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage,
+            fileID: UUID
+        ) -> CodemapIssueDisposition? {
+            automaticCoverageDispositionByFileID(coverage)[fileID]
+        }
+
+        private static func automaticCoverageDispositionByFileID(
+            _ coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
+        ) -> [UUID: CodemapIssueDisposition] {
+            var dispositions: [UUID: CodemapIssueDisposition] = [:]
+
+            func merged(
+                _ existing: CodemapIssueDisposition?,
+                _ next: CodemapIssueDisposition
+            ) -> CodemapIssueDisposition {
+                guard let existing else { return next }
+                switch (existing, next) {
+                case (.unmapped(terminal: true), _), (_, .unmapped(terminal: true)):
+                    return .unmapped(terminal: true)
+                case (.pending, _), (_, .pending):
+                    return .pending
+                case (.unmapped, .unmapped):
+                    return .unmapped(terminal: false)
+                }
+            }
+
+            func record(_ fileID: UUID, _ disposition: CodemapIssueDisposition) {
+                dispositions[fileID] = merged(dispositions[fileID], disposition)
+            }
+
+            func recordPending(_ fileID: UUID) {
+                record(fileID, .pending)
+            }
+
+            func recordUnavailable(
+                _ fileID: UUID,
+                _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+            ) {
+                record(fileID, unavailableDisposition(reason))
+            }
+
+            func recordSourceIssue(_ issue: WorkspaceCodemapAutomaticSelectionSourceIssue) {
+                switch issue {
+                case let .outsideRootScope(source):
+                    record(source.fileID, .unmapped(terminal: true))
+                case let .notCataloged(source), let .notDemanded(source),
+                     let .staleCatalogGeneration(source, _):
+                    recordPending(source.fileID)
+                case let .pending(source, _):
+                    recordPending(source.fileID)
+                case let .unavailable(source, reason):
+                    recordUnavailable(source.fileID, reason)
+                }
+            }
+
+            func recordTargetIssue(_ issue: WorkspaceCodemapAutomaticSelectionTargetIssue) {
+                switch issue {
+                case let .notCataloged(_, fileID), let .staleGeneration(_, fileID, _):
+                    recordPending(fileID)
+                case let .logicalPathUnavailable(_, fileID):
+                    record(fileID, .unmapped(terminal: true))
+                }
+            }
+
+            func recordPartialReason(_ reason: WorkspaceCodemapAutomaticSelectionPartialReason) {
+                switch reason {
+                case .graph:
+                    break
+                case let .source(issue):
+                    recordSourceIssue(issue)
+                case let .sourceDemandTimedOut(source):
+                    recordPending(source.fileID)
+                case let .candidateUnavailable(_, fileID, reason):
+                    recordUnavailable(fileID, reason)
+                }
+            }
+
+            func recordPendingReason(_ reason: WorkspaceCodemapAutomaticSelectionPendingReason) {
+                switch reason {
+                case let .sourceDemand(source, _), let .sourceBusy(source, _):
+                    recordPending(source.fileID)
+                case let .candidateDemand(_, fileID, _), let .candidateBusy(_, fileID, _):
+                    recordPending(fileID)
+                case .manifestAdmission, .graphRebuild:
+                    break
+                }
+            }
+
+            func recordUnavailableReason(_ reason: WorkspaceCodemapAutomaticSelectionUnavailableReason) {
+                switch reason {
+                case .noReadySources, .graph:
+                    break
+                case let .candidate(_, fileID, reason):
+                    recordUnavailable(fileID, reason)
+                }
+            }
+
+            func recordStaleReason(_ reason: WorkspaceCodemapAutomaticSelectionStaleReason) {
+                switch reason {
+                case let .sourceStateChanged(source), let .sourceCatalogGeneration(source, _):
+                    recordPending(source.fileID)
+                case let .targetStateChanged(issue):
+                    recordTargetIssue(issue)
+                case .rootEpochNotCurrent, .rootScopeChanged, .coverageProof, .graph,
+                     .publicationReceipt:
+                    break
+                }
+            }
+
+            switch coverage {
+            case .complete:
+                break
+            case let .partial(_, reasons):
+                reasons.forEach(recordPartialReason)
+            case let .provisional(_, pending, partial):
+                pending.forEach(recordPendingReason)
+                partial.forEach(recordPartialReason)
+            case .incomplete:
+                break
+            case let .pending(reasons):
+                reasons.forEach(recordPendingReason)
+            case let .unavailable(reason):
+                recordUnavailableReason(reason)
+            case let .stale(reason):
+                recordStaleReason(reason)
+            case .busy, .budget:
+                break
+            }
+
+            return dispositions
+        }
+
+        private static func automaticCoverageFileIDs(
+            _ coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
+        ) -> [UUID] {
+            automaticCoverageDispositionByFileID(coverage).keys.sorted { lhs, rhs in
+                lhs.uuidString < rhs.uuidString
+            }
+        }
+
+        private static func freezeUnavailableDisposition(
+            _ reason: WorkspaceCodemapPresentationFreezeUnavailableReason
+        ) -> CodemapIssueDisposition {
+            switch reason {
+            case .emptyRequest, .entryLimitExceeded, .retainedBundleLimitExceeded,
+                 .duplicateFileID, .mixedRootEpoch, .pending, .demandUnavailable,
+                 .logicalPathMismatch, .staleCurrentness, .handleRevoked:
+                .pending
+            }
+        }
+
+        private static func renderUnavailableDisposition(
+            _ reason: WorkspaceCodemapPresentationRenderUnavailableReason,
+            fileID: UUID
+        ) -> CodemapIssueDisposition? {
+            switch reason {
+            case .bundleNotRetained, .bundleMetadataMismatch, .staleCurrentness,
+                 .handleRevoked:
+                .pending
+            case let .noRenderableCodemap(unavailableFileID):
+                unavailableFileID == fileID ? .unmapped(terminal: true) : nil
             }
         }
 
@@ -371,11 +761,20 @@ extension MCPServerViewModel {
                         display: issuePathDisplay
                     )
                 }.sorted(by: utf8Precedes)
+                let requestedCodemapFiles = await requestedCodemapFiles(
+                    selection: selection,
+                    usage: usage,
+                    resolution: resolution,
+                    store: store,
+                    rootScope: rootScope,
+                    profile: .uiAssisted
+                )
                 let collections = makeCollections(
                     resolution: resolution,
                     selection: selection,
                     usage: usage,
-                    invalid: invalid
+                    invalid: invalid,
+                    requestedCodemapFiles: requestedCodemapFiles
                 )
                 try Task.checkCancellation()
                 return try await operation(collections)
@@ -408,7 +807,8 @@ extension MCPServerViewModel {
             resolution: PromptContextEntryResolution,
             selection: StoredSelection,
             usage: CodeMapUsage,
-            invalid: [String]
+            invalid: [String],
+            requestedCodemapFiles: [WorkspaceFileRecord]
         ) -> SelectionCollections {
             let selected = resolution.entries.compactMap { entry -> SelectedEntry? in
                 entry.isCodemap ? nil : SelectedEntry(entry: entry)
@@ -430,11 +830,135 @@ extension MCPServerViewModel {
             return SelectionCollections(
                 selected: selected,
                 codemap: codemap,
+                requestedCodemapFiles: requestedCodemapFiles,
                 codemapAutoEnabled: selection.codemapAutoEnabled,
                 codeMapUsage: usage,
                 invalid: invalid,
                 codemapPresentation: resolution.codemapPresentation
             )
+        }
+
+        private static func requestedCodemapFiles(
+            selection: StoredSelection,
+            usage: CodeMapUsage,
+            resolution: PromptContextEntryResolution,
+            store: WorkspaceFileContextStore,
+            rootScope: WorkspaceLookupRootScope,
+            profile: PathLocateProfile
+        ) async -> [WorkspaceFileRecord] {
+            var files: [WorkspaceFileRecord] = []
+            var seen = Set<UUID>()
+            func append(_ file: WorkspaceFileRecord?) {
+                guard let file, seen.insert(file.id).inserted else { return }
+                files.append(file)
+            }
+
+            switch usage {
+            case .none:
+                break
+            case .auto:
+                if selection.codemapAutoEnabled {
+                    for fileID in codemapIssueFileIDs(resolution.codemapPresentation) {
+                        await append(store.file(id: fileID))
+                    }
+                } else {
+                    await appendManualCodemapFiles(
+                        selection: selection,
+                        store: store,
+                        rootScope: rootScope,
+                        profile: profile,
+                        append: append
+                    )
+                }
+            case .selected:
+                for entry in resolution.entries {
+                    append(entry.file)
+                }
+                await appendManualCodemapFiles(
+                    selection: selection,
+                    store: store,
+                    rootScope: rootScope,
+                    profile: profile,
+                    append: append
+                )
+                for fileID in codemapIssueFileIDs(resolution.codemapPresentation) {
+                    await append(store.file(id: fileID))
+                }
+            case .complete:
+                for fileID in codemapIssueFileIDs(resolution.codemapPresentation) {
+                    await append(store.file(id: fileID))
+                }
+            }
+            return files
+        }
+
+        private static func appendManualCodemapFiles(
+            selection: StoredSelection,
+            store: WorkspaceFileContextStore,
+            rootScope: WorkspaceLookupRootScope,
+            profile: PathLocateProfile,
+            append: (WorkspaceFileRecord?) -> Void
+        ) async {
+            guard !selection.manualCodemapPaths.isEmpty else { return }
+            let requests = selection.manualCodemapPaths.map {
+                WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+            }
+            let results = await store.lookupPaths(requests)
+            for path in selection.manualCodemapPaths {
+                append(results[path]?.file)
+            }
+        }
+
+        private static func codemapIssueFileIDs(
+            _ presentation: WorkspaceCodemapOperationPresentation
+        ) -> [UUID] {
+            var ids: [UUID] = []
+            var seen = Set<UUID>()
+            func append(_ id: UUID) {
+                if seen.insert(id).inserted {
+                    ids.append(id)
+                }
+            }
+            for issue in presentation.issues + coverageIssues(presentation.coverage) {
+                for id in codemapIssueFileIDs(issue) {
+                    append(id)
+                }
+            }
+            return ids
+        }
+
+        private static func codemapIssueFileIDs(
+            _ issue: WorkspaceCodemapOperationIssue
+        ) -> [UUID] {
+            switch issue {
+            case .coordinationUnavailable, .cancelled, .freezeUnavailable,
+                 .publicationStale:
+                return []
+            case let .automatic(coverage):
+                return automaticCoverageFileIDs(coverage)
+            case let .candidate(candidateIssue):
+                return candidateIssueFileIDs(candidateIssue)
+            case let .pending(fileID, _), let .unavailable(fileID, _):
+                return [fileID]
+            case let .renderUnavailable(_, reason):
+                if case let .noRenderableCodemap(fileID) = reason {
+                    return [fileID]
+                }
+                return []
+            }
+        }
+
+        private static func candidateIssueFileIDs(
+            _ issue: WorkspaceCodemapOperationCandidateIssue
+        ) -> [UUID] {
+            switch issue {
+            case let .fileNotCataloged(fileID),
+                 let .fileOutsideRootScope(fileID),
+                 let .logicalPathUnavailable(fileID):
+                [fileID]
+            case let .incompleteRootSet(missingFileIDs):
+                missingFileIDs
+            }
         }
 
         static func logicalIssuePath(
@@ -1026,7 +1550,8 @@ extension MCPServerViewModel {
                 normalizedCodeMapUsage: reply.normalizedCodeMapUsage,
                 // Preserve workspace token stats (total breakdown stays the same even for filtered view)
                 tokenStats: reply.tokenStats,
-                tokenAccounting: reply.tokenAccounting
+                tokenAccounting: reply.tokenAccounting,
+                copyPresetProjection: reply.copyPresetProjection
             )
         }
     }
@@ -1046,22 +1571,24 @@ extension MCPServerViewModel {
             let fileIDs = Set(files.map(\.id))
             let rendered = presentation.orderedEntries.filter { fileIDs.contains($0.fileID) }
             let included = Array(rendered.prefix(25))
-            let renderedIDs = Set(rendered.map(\.fileID))
-            var unmapped: [String] = []
-            for file in files where !renderedIDs.contains(file.id) {
+            let diagnostics = await SelectionReplyAssembler.missingCodemapDiagnostics(
+                for: files,
+                presentation: presentation
+            ) { file in
                 if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
                     forPhysicalPath: file.standardizedFullPath,
                     display: .relative
                 ) {
-                    unmapped.append(projected)
-                } else {
-                    unmapped.append(file.standardizedRelativePath)
+                    return projected
                 }
+                return file.standardizedRelativePath
             }
+            guard !included.isEmpty || !diagnostics.isEmpty else { return nil }
             return ToolResultDTOs.SelectedCodeStructureDTO(
                 fileCount: included.count,
                 content: included.map(\.text).joined(separator: "\n\n"),
-                unmappedPaths: unmapped.isEmpty ? nil : unmapped.sorted(),
+                unmappedPaths: diagnostics.unmappedPaths.isEmpty ? nil : diagnostics.unmappedPaths,
+                pendingPaths: diagnostics.pendingPaths.isEmpty ? nil : diagnostics.pendingPaths,
                 omittedCount: rendered.count > included.count ? rendered.count - included.count : nil,
                 worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(
                     from: lookupContext.bindingProjection

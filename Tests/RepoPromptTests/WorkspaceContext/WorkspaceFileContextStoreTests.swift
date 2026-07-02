@@ -4588,6 +4588,148 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(tree.contains("B.swift"), caseLabel)
             XCTAssertFalse(tree.contains("Other.swift"), caseLabel)
         }
+
+        do {
+            let caseLabel = "testFileTreeSnapshotStartPathResolvesRootAliasesAndAbsoluteSubfolders"
+            let rootA = try makeTemporaryRoot(name: "AliasTreeA")
+            let rootB = try makeTemporaryRoot(name: "AliasTreeB")
+            try write("app", to: rootA.appendingPathComponent("Sources/App.swift"))
+            try write("mcp", to: rootA.appendingPathComponent("Sources/RepoPromptMCP/Main.swift"))
+            try write("other", to: rootA.appendingPathComponent("Other.swift"))
+            try write("sdk", to: rootB.appendingPathComponent("Sources/SDK.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let recordA = try await store.loadRoot(path: rootA.path)
+            _ = try await store.loadRoot(path: rootB.path)
+
+            let rootAliasSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: recordA.name
+                ),
+                profile: .mcpRead
+            )
+            let rootAliasTree = CodeMapExtractor.generateFileTree(using: rootAliasSnapshot)
+            XCTAssertEqual(rootAliasSnapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(rootAliasTree.contains("App.swift"), caseLabel)
+            XCTAssertTrue(rootAliasTree.contains("Other.swift"), caseLabel)
+            XCTAssertFalse(rootAliasTree.contains("SDK.swift"), caseLabel)
+
+            let prefixedSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "\(recordA.name)/Sources"
+                ),
+                profile: .mcpRead
+            )
+            let prefixedTree = CodeMapExtractor.generateFileTree(using: prefixedSnapshot)
+            XCTAssertEqual(prefixedSnapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(prefixedTree.contains("Sources"), caseLabel)
+            XCTAssertTrue(prefixedTree.contains("App.swift"), caseLabel)
+            XCTAssertTrue(prefixedTree.contains("RepoPromptMCP"), caseLabel)
+            XCTAssertFalse(prefixedTree.contains("Other.swift"), caseLabel)
+            XCTAssertFalse(prefixedTree.contains("SDK.swift"), caseLabel)
+
+            let absoluteSubfolderSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: rootA.appendingPathComponent("Sources/RepoPromptMCP").path
+                ),
+                profile: .mcpRead
+            )
+            let absoluteSubfolderTree = CodeMapExtractor.generateFileTree(using: absoluteSubfolderSnapshot)
+            XCTAssertEqual(absoluteSubfolderSnapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(absoluteSubfolderTree.contains("RepoPromptMCP"), caseLabel)
+            XCTAssertTrue(absoluteSubfolderTree.contains("Main.swift"), caseLabel)
+            XCTAssertFalse(absoluteSubfolderTree.contains("App.swift"), caseLabel)
+            XCTAssertFalse(absoluteSubfolderTree.contains("Other.swift"), caseLabel)
+
+            let missingRelativeSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "Missing/Subtree"
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(missingRelativeSnapshot.roots.isEmpty, caseLabel)
+
+            let missingAbsoluteSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: rootA.appendingPathComponent("Missing/Subtree").path
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(missingAbsoluteSnapshot.roots.isEmpty, caseLabel)
+        }
+
+        do {
+            let caseLabel = "testFileTreeSnapshotStartPathAcceptsGeneratedDisplayAlias"
+            let parentA = try makeTemporaryRoot(name: "GeneratedAliasParentA")
+            let parentB = try makeTemporaryRoot(name: "GeneratedAliasParentB")
+            let rootA = parentA.appendingPathComponent("App", isDirectory: true)
+            let rootB = parentB.appendingPathComponent("App", isDirectory: true)
+            try write("a", to: rootA.appendingPathComponent("Sources/A.swift"))
+            try write("b", to: rootB.appendingPathComponent("Sources/B.swift"))
+            try write("other", to: rootA.appendingPathComponent("Other.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let recordA = try await store.loadRoot(path: rootA.path)
+            _ = try await store.loadRoot(path: rootB.path)
+            let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+            let rootRefA = try XCTUnwrap(visibleRoots.first { $0.id == recordA.id }, caseLabel)
+            let generatedAlias = ClientPathFormatter.nonAbsoluteRootAlias(root: rootRefA, visibleRoots: visibleRoots)
+
+            let snapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "\(generatedAlias)/Sources"
+                ),
+                profile: .mcpRead
+            )
+            let tree = CodeMapExtractor.generateFileTree(using: snapshot)
+
+            XCTAssertEqual(snapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(tree.contains("A.swift"), caseLabel)
+            XCTAssertFalse(tree.contains("B.swift"), caseLabel)
+            XCTAssertFalse(tree.contains("Other.swift"), caseLabel)
+        }
     }
 
     func testAmbiguousLookupConsumersFailWithoutMaterializingCandidates() async throws {
@@ -4680,6 +4822,36 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 profile: .mcpRead
             )
             XCTAssertTrue(snapshot.selectedFileIDs.isEmpty, caseLabel)
+
+            let rootAliasTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "App"
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(rootAliasTreeSnapshot.roots.isEmpty, caseLabel)
+
+            let prefixedAliasTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "App/Sources"
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(prefixedAliasTreeSnapshot.roots.isEmpty, caseLabel)
         }
     }
 

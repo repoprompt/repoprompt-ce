@@ -195,12 +195,19 @@ extension MCPServerViewModel {
             stored: selection,
             codeMapUsage: effectiveMCPCodeMapUsage(promptVM.codeMapUsage)
         )
+        let lookupContext = WorkspaceLookupContext(rootScope: lookupRootScope, bindingProjection: nil)
         let collections = await SelectionReplyAssembler.collect(
             from: source,
             owner: self,
-            contentPolicy: includeBlocks ? .loadContent : .cachedOnly
+            rootScope: lookupRootScope,
+            contentPolicy: includeBlocks ? .loadContent : .cachedOnly,
+            lookupContext: lookupContext
         )
-        let formatter = PathFormatter(format: display, owner: self)
+        let formatter = PathFormatter(
+            format: display,
+            owner: self,
+            rootScope: lookupRootScope
+        )
         let tokens = TokenServices(owner: self)
         var out = await SelectionReplyAssembler.buildSelectionReply(
             collections: collections,
@@ -214,7 +221,11 @@ extension MCPServerViewModel {
 
         // Inject minimal codeStructure.unmappedPaths to report pending codemaps
         if out.codeStructure == nil {
-            if let minimal = await buildUnmappedOnlyCodeStructure(collections: collections, display: display) {
+            if let minimal = await buildUnmappedOnlyCodeStructure(
+                collections: collections,
+                display: display,
+                rootScope: lookupRootScope
+            ) {
                 out = ToolResultDTOs.SelectionReply(
                     files: out.files,
                     totalTokens: out.totalTokens,
@@ -233,7 +244,8 @@ extension MCPServerViewModel {
                     userChatTokens: out.userChatTokens,
                     normalizedCodeMapUsage: out.normalizedCodeMapUsage,
                     tokenStats: out.tokenStats,
-                    tokenAccounting: out.tokenAccounting
+                    tokenAccounting: out.tokenAccounting,
+                    copyPresetProjection: out.copyPresetProjection
                 )
             }
         }
