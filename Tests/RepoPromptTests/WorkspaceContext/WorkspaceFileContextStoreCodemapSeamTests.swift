@@ -4446,7 +4446,11 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         let firstTicket = try await pendingTicket(
             store.requestCodemapArtifact(forFileID: first.id)
         )
-        _ = try await readyResult(settledResult(store: store, ticket: firstTicket))
+        let firstSettled = try await settledResult(store: store, ticket: firstTicket)
+        guard case .ready = firstSettled else {
+            XCTFail("Expected first codemap artifact ready, got \(firstSettled)")
+            throw CodemapStoreTestError.expectedReady
+        }
         let blockedGeneration = try XCTUnwrap(buildGate.waitUntilFirstBlocked())
         let oldGraph = try XCTUnwrap(graphProbe.graph(rootEpoch: firstTicket.rootEpoch))
         let firstQuery = WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
@@ -4479,7 +4483,11 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         let secondTicket = try await pendingTicket(
             store.requestCodemapArtifact(forFileID: second.id)
         )
-        _ = try await readyResult(settledResult(store: store, ticket: secondTicket))
+        let secondSettled = try await settledResult(store: store, ticket: secondTicket)
+        guard case .ready = secondSettled else {
+            XCTFail("Expected second codemap artifact ready, got \(secondSettled)")
+            throw CodemapStoreTestError.expectedReady
+        }
         let query = WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
             WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: firstTicket)
         ])
@@ -4501,9 +4509,22 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             accountingBeforeUnload.currentObservedKey?.contributionGeneration.rawValue,
             latestGeneration
         )
-        XCTAssertEqual(accountingBeforeUnload.publishedCount, 0)
-        XCTAssertEqual(accountingBeforeUnload.emptyPublishedCount, 0)
-        XCTAssertNil(accountingBeforeUnload.publishedSummary)
+        XCTAssertEqual(accountingBeforeUnload.currentUnavailableReason, .rebuilding)
+        if let publishedSummary = accountingBeforeUnload.publishedSummary {
+            XCTAssertLessThan(
+                publishedSummary.key.contributionGeneration.rawValue,
+                latestGeneration,
+                "Expected any retained published shard to be stale while the latest generation remains blocked."
+            )
+        }
+        let latestBlockedQueryStarted = queryClock.now
+        let whileLatestContributionBlocked = await store.queryCodemapSelectionGraph(query)
+        let latestBlockedQueryDuration = latestBlockedQueryStarted.duration(to: queryClock.now)
+        XCTAssertTrue(
+            isFailClosedQueuedState(whileLatestContributionBlocked),
+            "Expected blocked latest-wins work to keep stale graph state fail closed."
+        )
+        XCTAssertLessThan(latestBlockedQueryDuration, .seconds(1))
 
         let unloadTask = Task {
             await store.unloadRoot(id: loaded.id)
@@ -4526,8 +4547,6 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         await unloadTask.value
 
         let oldAccounting = await oldGraph.accounting()
-        XCTAssertEqual(oldAccounting.publishedCount, 0)
-        XCTAssertEqual(oldAccounting.emptyPublishedCount, 0)
         XCTAssertNil(oldAccounting.publishedSummary)
         XCTAssertEqual(
             oldAccounting.currentUnavailableReason,

@@ -31,6 +31,7 @@ final class ReviewGitRepositoryFixture {
             try initializeRepository(at: root, objectFormat: objectFormat)
         } else {
             try ImmutableGitRepositoryTemplate.copy(.configuredMain, to: root)
+            try configureHermeticAttributesFile(at: root)
         }
 
         for (path, contents) in files {
@@ -46,7 +47,26 @@ final class ReviewGitRepositoryFixture {
         _ = try runGit(["config", "user.name", "RepoPrompt Test"], at: root)
         _ = try runGit(["config", "user.email", "repoprompt@example.test"], at: root)
         _ = try runGit(["config", "commit.gpgSign", "false"], at: root)
+        _ = try runGit(["config", "core.autocrlf", "false"], at: root)
+        _ = try runGit(["config", "core.eol", "native"], at: root)
+        try configureHermeticAttributesFile(at: root)
         _ = try runGit(["checkout", "-b", "main"], at: root)
+    }
+
+    private func configureHermeticAttributesFile(at root: URL) throws {
+        let attributesFile = root
+            .appendingPathComponent(".git", isDirectory: true)
+            .appendingPathComponent("info", isDirectory: true)
+            .appendingPathComponent("repoprompt-empty-global-attributes")
+            .standardizedFileURL
+        try FileManager.default.createDirectory(
+            at: attributesFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !FileManager.default.fileExists(atPath: attributesFile.path) {
+            try Data().write(to: attributesFile, options: .atomic)
+        }
+        _ = try runGit(["config", "core.attributesFile", attributesFile.path], at: root)
     }
 
     func makeLinkedWorktree(

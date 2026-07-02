@@ -318,6 +318,8 @@ private final class TemplateRepository: @unchecked Sendable {
         try runGit(["config", "user.name", "RepoPrompt Test"], cwd: repositoryURL, environment: environment)
         try runGit(["config", "user.email", "repoprompt@example.test"], cwd: repositoryURL, environment: environment)
         try runGit(["config", "commit.gpgSign", "false"], cwd: repositoryURL, environment: environment)
+        try runGit(["config", "core.autocrlf", "false"], cwd: repositoryURL, environment: environment)
+        try runGit(["config", "core.eol", "native"], cwd: repositoryURL, environment: environment)
         if checkoutMain {
             try runGit(["checkout", "-b", "main"], cwd: repositoryURL, environment: environment)
         }

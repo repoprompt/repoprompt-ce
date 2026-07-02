@@ -2438,3 +2438,217 @@ Primary metric eligible: yes
   - Sample 3 invalid copied log: `prompt-exports/raw-logs/current-reliability/root-gate-counter-flakes-sample3-3821b9dd.log`; unrelated `WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes`, line `600` `XCTUnwrap` nil `WorkspaceCodemapSourceAuthorityToken`.
   - Recurrence check: Flake A, Flake B, and the prior busy-retry signature did not recur in the 3 root samples.
 - Deltas: method delta `0`; contract delta `0`; scenario delta `0`; ledger delta `0`; production-code delta `0`; XCTest ID delta `0`.
+### Focused: 2026-07-02T14:11:25+00:00 — root — reliability-gate-graph-source-authority-graph-20x
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests/testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-graph-20x.json`
+Inventory: ``
+Scope/filter: filtered: `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests/testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 3.095 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/97715961-5ed1-4bc0-919f-952a4c8503e9.log` |  |
+| 2 | no | 2.355 | 0.002 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/deeadeea-f7be-4bfc-aa3c-0b95726e1394.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 3 | yes | 2.925 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/541304f1-d37e-4b83-99ff-044d08010e14.log` |  |
+| 4 | yes | 2.823 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0910e7a3-ba84-4dd2-9ddb-3d3b999f6d7f.log` |  |
+| 5 | no | 2.350 | 0.004 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b5f0d5af-afc0-4e42-8603-a7ba53d2b1b4.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 6 | yes | 3.051 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2ee2d4f8-3eb6-46b1-9c24-c446511a10f2.log` |  |
+| 7 | no | 1.682 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ca165630-e135-4518-8c61-b661c693a1c8.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 8 | no | 2.836 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/bbf84e7f-6200-41f4-ab85-eb66783bc531.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 9 | no | 1.684 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7df04522-134a-44f0-9964-81aeca85244c.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 10 | no | 1.645 | 0.003 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/72168be5-6d5c-444a-ac0a-db51f3f2ec59.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 11 | no | 2.876 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/800115ea-645d-489a-953d-3350613cb7e5.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 12 | yes | 2.832 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/44e61054-96a6-4f36-862a-c06f60cc6d93.log` |  |
+| 13 | no | 1.685 | 0.003 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/cd701a72-54fd-493f-97df-b6d3954521c8.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 14 | yes | 2.775 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/cbcf0248-67b7-4ab5-8e92-6c94520d7d37.log` |  |
+| 15 | no | 2.320 | 0.004 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9beb7815-7ee0-476c-a1aa-c7c0b9b7c6f3.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 16 | no | 2.830 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/34e797e0-dbd0-40ff-ac4c-73e9794354ee.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 17 | no | 2.325 | 0.004 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/82443cd1-4bf0-4dc4-a972-8e6f5b83a21f.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 18 | yes | 2.826 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ed7cc1fb-563c-4a23-9e57-d136a4669219.log` |  |
+| 19 | yes | 2.827 | 0.006 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6ebab8b8-6c8d-461c-a1ef-7ff9fd0f8642.log` |  |
+| 20 | yes | 2.911 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f15071ae-5c35-4943-9c54-602ad884f71f.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T14:11:25+00:00/209469caefdd | reliability-gate-graph-source-authority-graph-20x | root | filtered: `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests/testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild` | 9 valid + 11 invalid |  |  |  | 2.832 | 3.095 | 0.0201 | stable | `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-graph-20x.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests` | 1 | 2.035 | 2.283 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests` | `testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild` | 9 | 2.035 | 2.283 | 2.283 | 0 |
+
+### Focused: 2026-07-02T14:12:08+00:00 — root — reliability-gate-graph-source-authority-source-authority-20x
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-20x.json`
+Inventory: ``
+Scope/filter: filtered: `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 2.055 | 0.006 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0c095b06-e034-494d-9bf7-d8c5f109997c.log` |  |
+| 2 | no | 1.863 | 0.006 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/5d5aeed6-141b-4ed3-9638-e2dfa587def3.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 3 | yes | 2.022 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b423464a-2d38-4196-88d3-4e7f4acdf984.log` |  |
+| 4 | yes | 2.017 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a69b7bc4-4da2-47ca-9559-4e117b439717.log` |  |
+| 5 | yes | 2.000 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ef0a4312-840f-4a3e-94bf-31994bc818fe.log` |  |
+| 6 | no | 1.900 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/82d1ec05-b451-47b7-8eb3-a14848b48590.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 7 | no | 1.903 | 0.004 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3d53d429-7c19-43df-a329-4adb837ae84f.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 8 | yes | 2.015 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/5cea0996-8222-4002-97b3-43e4c683b811.log` |  |
+| 9 | no | 1.485 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/822d4241-e14e-4031-ad8a-aba5a2f62b08.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 10 | yes | 1.954 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6e07d424-6adf-4449-acae-239482f4baba.log` |  |
+| 11 | yes | 2.017 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0f707992-75f1-4532-93d1-97b66792b741.log` |  |
+| 12 | no | 1.956 | 0.006 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8e43308a-0a44-43b7-b0cc-8f716149d04d.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 13 | no | 2.007 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e7b4397a-a772-4c73-9b09-c06cab9ce6f8.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 14 | yes | 1.981 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f1ac9485-ef14-4775-a82f-6a2ca0315988.log` |  |
+| 15 | yes | 2.078 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/53f791d0-905e-44dd-97e7-dd0db3c808bb.log` |  |
+| 16 | yes | 1.968 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9bdaab87-95e3-4a53-ae66-43551e025f4b.log` |  |
+| 17 | no | 1.473 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/178da5ff-4705-481d-bac5-c36309f6172e.log` | conductor process exit 1; terminal state failed; test exit 1 |
+| 18 | yes | 1.968 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/4db297be-1a03-4de2-bb36-b8b1bcfa183a.log` |  |
+| 19 | yes | 1.962 | 0.006 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3121370b-ba0d-466c-a9ec-0aba73725d6f.log` |  |
+| 20 | no | 1.910 | 0.005 | failed | 1 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6b2ce915-d7cf-4678-add4-0c7a713e4d4f.log` | conductor process exit 1; terminal state failed; test exit 1 |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T14:12:08+00:00/209469caefdd | reliability-gate-graph-source-authority-source-authority-20x | root | filtered: `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes` | 12 valid + 8 invalid |  |  |  | 2.008 | 2.078 | 0.0165 | stable | `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-20x.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests` | 1 | 1.191 | 1.259 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests` | `testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes` | 12 | 1.191 | 1.259 | 1.259 | 0 |
+
+### Focused: 2026-07-02T14:21:39+00:00 — root — reliability-gate-graph-source-authority-graph-stable-attrs-20x
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests/testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-graph-stable-attrs-20x.json`
+Inventory: ``
+Scope/filter: filtered: `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests/testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 3.157 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/838609b3-f8a6-4790-9229-5272e1b4a69a.log` |  |
+| 2 | yes | 3.118 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e796c43f-76ff-47e0-a920-b188e309a3fe.log` |  |
+| 3 | yes | 3.185 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8760a710-4b41-427d-b364-95903e14d4c2.log` |  |
+| 4 | yes | 3.202 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/92b19744-3b20-4ff6-a257-7e97e73268d2.log` |  |
+| 5 | yes | 3.122 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/54ef2cb2-760d-4f2d-9c3a-960ade9d699e.log` |  |
+| 6 | yes | 3.207 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/31be9932-022d-4a95-b377-1c339c112660.log` |  |
+| 7 | yes | 3.221 | 0.005 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/fdb44953-2e5a-4730-8d2e-90c383edf59a.log` |  |
+| 8 | yes | 2.823 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0719af77-147c-456b-a639-ccbb69c56dbb.log` |  |
+| 9 | yes | 2.746 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/df881fc7-5708-4702-9306-3686e5626d49.log` |  |
+| 10 | yes | 2.787 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/14e75ecf-251d-4b42-bca9-34922212ecef.log` |  |
+| 11 | yes | 2.643 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/84481bab-a32b-4f2d-b774-4c16bf0d14f8.log` |  |
+| 12 | yes | 2.651 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/543826cd-8c42-42ea-928f-07a354b9efbf.log` |  |
+| 13 | yes | 2.564 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/efe25539-480e-4e2c-8463-3a8bb695a085.log` |  |
+| 14 | yes | 2.549 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1a4e1600-a354-49e9-9dbd-74bc8b162c88.log` |  |
+| 15 | yes | 2.604 | 0.010 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/bbd6f7d8-9be9-4f01-8e08-18ededd3adfa.log` |  |
+| 16 | yes | 3.600 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/fc879cfc-169c-49d5-8395-ca11afb43d53.log` |  |
+| 17 | yes | 2.560 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/33aff576-bf1c-463a-91ec-81f6c055d814.log` |  |
+| 18 | yes | 2.610 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/77801e2e-4225-484d-9e6d-11c9303cccb6.log` |  |
+| 19 | yes | 2.597 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b897b862-8ec1-493d-831b-56452f75181e.log` |  |
+| 20 | yes | 2.622 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/46177457-d1cf-42b9-a06d-d9b6a2aaca1e.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T14:21:39+00:00/209469caefdd | reliability-gate-graph-source-authority-graph-stable-attrs-20x | root | filtered: `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests/testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild` | 20 valid + 0 invalid |  |  |  | 2.766 | 3.221 | 0.0738 | noisy | `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-graph-stable-attrs-20x.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests` | 1 | 2.002 | 2.890 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests` | `testGraphUpdateHidesQueuedContributionAndUnloadRevokesBlockedBuild` | 20 | 2.002 | 2.438 | 2.890 | 0 |
+
+### Focused: 2026-07-02T14:22:16+00:00 — root — reliability-gate-graph-source-authority-source-authority-stable-attrs-20x
+
+Command: `/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor test --filter RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes --json`
+Artifact: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-stable-attrs-20x.json`
+Inventory: ``
+Scope/filter: filtered: `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |
+|---:|---|---:|---:|---|---:|---|---|---|
+| 1 | yes | 1.684 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3212e6a2-c66e-431d-9cdf-9f676416b07b.log` |  |
+| 2 | yes | 1.611 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/56dec673-2672-427f-89b1-79b653ae76c3.log` |  |
+| 3 | yes | 1.715 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/201811c8-f479-4ced-ab40-8055e04db33f.log` |  |
+| 4 | yes | 1.619 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c48a8634-d17a-4252-a644-82d7b6a6b82f.log` |  |
+| 5 | yes | 1.564 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b1568f38-19fb-4325-a16e-0062d9266ea1.log` |  |
+| 6 | yes | 1.624 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8b623ca5-57b3-4d6b-b23c-b4c78de4bb56.log` |  |
+| 7 | yes | 1.588 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2a5a0344-b7d9-4829-858c-cca77829c516.log` |  |
+| 8 | yes | 1.627 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/617eba3a-16a4-4108-ae6b-fd7e8a995035.log` |  |
+| 9 | yes | 1.622 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/73409220-38cf-4a8d-8ef3-e4bbdb4c55ac.log` |  |
+| 10 | yes | 1.665 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/627521de-165a-4c9c-a6d9-cb3cf4dc795b.log` |  |
+| 11 | yes | 1.605 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/96d519f0-813e-48ce-85ab-d0cd4799cffa.log` |  |
+| 12 | yes | 1.621 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6bb35e42-ac97-4642-b497-834f588a1e91.log` |  |
+| 13 | yes | 1.599 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/81770d7d-a88b-4147-8f15-c18207241108.log` |  |
+| 14 | yes | 1.611 | 0.003 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/63b938b9-1f7c-4bb7-a1dc-9fb1cbccb75d.log` |  |
+| 15 | yes | 1.598 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/109a17e4-6904-4f87-8f81-d0dd7293ee94.log` |  |
+| 16 | yes | 1.611 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3ddee51a-01e3-4091-8e19-68c6b6db9dd1.log` |  |
+| 17 | yes | 1.629 | 0.002 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e48169d3-b9fe-44ad-8679-99149071f0e9.log` |  |
+| 18 | yes | 1.608 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8dee9192-b61d-495d-820d-8f7cde3ab0b7.log` |  |
+| 19 | yes | 1.604 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1ada8867-1660-44fd-ae00-be03af13a140.log` |  |
+| 20 | yes | 1.608 | 0.004 | completed | 0 | no | `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a286dd13-213f-411d-898b-66166710d472.log` |  |
+
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 2026-07-02T14:22:16+00:00/209469caefdd | reliability-gate-graph-source-authority-source-authority-stable-attrs-20x | root | filtered: `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes` | 20 valid + 0 invalid |  |  |  | 1.611 | 1.684 | 0.0072 | stable | `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-stable-attrs-20x.json` | source guard `content`; build-lane coordinated |
+
+20 slowest suites by median aggregate XCTest case seconds across valid samples:
+
+| Rank | Suite | Methods | Median aggregate seconds | Max method seconds | Fail/skip observations |
+|---:|---|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests` | 1 | 0.893 | 0.962 | 0 |
+
+20 slowest tests by median XCTest case seconds across valid samples:
+
+| Rank | Suite | Method | Observations | Median seconds | Observed p95 | Max seconds | Fail/skip observations |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | `RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests` | `testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes` | 20 | 0.893 | 0.956 | 0.962 | 0 |
+
+
+
+### Reliability remediation note: 2026-07-02T15:03Z — graph/source-authority two-sample root exception
+
+- Change scope: bookkeeping/evidence recovery only in this pass; no implementation changes, no staging, no commits, and no additional complete-root samples were started by this bookkeeping pass.
+- User-directed exception: the original 3-sample root gate was cut off at 2 counted complete-root samples because the app/control handle crashed or expired during testing. This entry intentionally records a 2-sample exception and does not fabricate a third counted sample.
+- Focused graph/source-authority evidence:
+  - Initial focused graph stress artifact: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-graph-20x.json` (`9 valid + 11 invalid`).
+  - Initial focused source-authority stress artifact: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-20x.json` (`12 valid + 8 invalid`).
+  - Stable-attrs graph stress artifact passed: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-graph-stable-attrs-20x.json` (`20 valid + 0 invalid`).
+  - Stable-attrs source-authority stress artifact passed: `prompt-exports/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-stable-attrs-20x.json` (`20 valid + 0 invalid`).
+- Validation/bookkeeping commands recovered from conductor, not rerun here:
+  - `make dev-format` / conductor format ticket `0acd32c4-17aa-42cb-b775-c0f1f4ee267f` passed (`0/1371 files formatted`).
+  - `make dev-lint` / conductor lint ticket `dfeb5658-45cd-4da6-a912-d37b1141fc94` passed (`0 violations`).
+  - Root XCTest list ticket `e55253c6-8f93-417a-a445-8392845d1dc4` passed; provider XCTest list ticket `54c0ec65-b9fc-4a99-832b-ffd58d7af47c` passed.
+  - Source-authority enclosing suite ticket `4e553a3b-708e-4d01-996e-0716ed7cc288` passed (`17/17`).
+- Root gate artifact: `prompt-exports/test-suite-baseline-root-reliability-gate-graph-source-authority-2sample-exception.json`; label `reliability-gate-graph-source-authority-2sample-exception`; primary metric eligible: no (user-directed 2-sample exception, not the standard 3-sample gate).
+  - Counted sample 1 valid: ticket `7a244f75-7087-4f17-999e-f72dcbb3c887`, `2835 tests`, `5 skipped`, `0 failures`, `~708.6s` conductor/sample elapsed (`705.309s` XCTest elapsed; log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7a244f75-7087-4f17-999e-f72dcbb3c887.log`).
+  - Counted sample 2 valid: ticket `f169e22a-dccf-4896-9e5e-2031dba53382`, `2835 tests`, `5 skipped`, `0 failures`, `652.531s` XCTest elapsed (log `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f169e22a-dccf-4896-9e5e-2031dba53382.log`).
+  - No third sample is counted for this root gate by user direction.
+  - Overrun evidence not counted: ticket `b533efea-c21c-487e-acc9-116d8ef7d2ce` was already running when this bookkeeping pass resumed, reached failed state (`2835 tests`, `5 skipped`, `1 failure`, `708.785s` XCTest elapsed), and its copied raw log is `prompt-exports/raw-logs/current-reliability/root-gate-graph-source-authority-overrun-sample3-invalid-b533efea.log`. Failure signature: `ContextBuilderWorktreeInheritanceTests/testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps` codemap artifact unavailable for `Sources/DistinctConnectionA.swift`.
+- Deltas: method delta `0`; contract delta `0`; scenario delta `0`; ledger delta `0`; production-code delta `0`; XCTest ID delta `0`.
