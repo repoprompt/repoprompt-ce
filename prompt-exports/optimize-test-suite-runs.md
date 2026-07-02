@@ -2791,3 +2791,13 @@ After-only focused optimizer artifacts from this pass (`--samples 3`, `--source-
 | `wave1-after-worktree-exact-20260702` | `RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections` | `e3011e17-9599-4746-848b-6e5ded54ef37`, `126cd5f1-b908-435a-96f3-4e8e03505a0d`, `ec391bce-748a-40de-b86e-c014799b0126` | 3 valid + 0 invalid | 12.179 | 12.348 | 0.0139 | stable | `prompt-exports/wave1-after-worktree-exact-20260702.json` |
 | `wave1-after-contextbuilder-startup-20260702` | `RepoPromptTests.ContextBuilderModelStartupSelectionTests` | `18b6ef0e-7953-4047-9619-258ccf8c801d`, `e4734fa0-bd52-4a58-bda7-1068e97243aa`, `b09a0da0-c72e-4f5e-bdc8-38b880311f35` | 3 valid + 0 invalid | 0.828 | 0.954 | 0.0105 | stable | `prompt-exports/wave1-after-contextbuilder-startup-20260702.json` |
 | `wave1-after-mention-coordinator-20260702` | `RepoPromptTests.MentionCoordinatorTests` | `84a3a792-bd5c-4a81-a754-b3d9f276d991`, `8c6cca86-301d-4e71-ac17-4ab00254c3aa`, `3693c67a-621f-4aa7-be2f-6566ef665e67` | 3 valid + 0 invalid | 0.976 | 0.978 | 0.0021 | stable | `prompt-exports/wave1-after-mention-coordinator-20260702.json` |
+
+### Deferred optimization note: 2026-07-02T16:55Z — P1 ContextBuilder readiness fences
+
+- Candidate: standalone P1 `ContextBuilderWorktreeInheritanceTests` readiness fences.
+- Plan source: context-builder plan `p1-readiness-fences-2A0AD4`; consumed plan export was deleted after handoff.
+- Pair attempted the scoped implementation experimentally and restored all source changes because the attempt did not stay inside the optimization/safety boundary.
+- Preserved before artifact: `prompt-exports/test-suite-focused-root-optimization-p1-contextbuilder-worktree-readiness-before-20260702T163300Z.json` (`3 valid + 0 invalid`, median `66.087s`, observed p95 `75.848s`, commit `4a5790e2`).
+- Experimental result (not committed): full focused suite worsened to roughly `112–124s`; the non-agent path exposed intermittent `registrationFailed` around codemap demand timing; graph-drain changes materially increased wallclock.
+- Decision: defer P1 pending a diagnostic investigation of the codemap `registrationFailed` timing and the ContextBuilder fence cost profile. No source code, production semantics, XCTest IDs, ledger rows, method/contract/scenario counts, or root-gate claims changed in this note.
+- Next suggested planning path: ask design/context-builder to split P1 into diagnostic sub-problems or move to the next low-risk breadth cleanup wave if P1 remains unsafe.
