@@ -293,7 +293,7 @@ Use `make dev-run` (or `make run`) only when it is safe to stop any existing Rep
 
 See [`docs/testing.md`](docs/testing.md) for the contributor workflow, exact XCTest IDs, surgical contract-ledger maintenance, scenario accounting, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test, authoritative list, and `verify-ledger`; never regenerate or overwrite the curated ledger.
 
-Optimization/performance campaigns additionally require append-only inventory, baseline, focused, and full-root artifacts plus updates to `prompt-exports/optimize-test-suite-runs.md`. The primary metric is warm local root conductor execution time, provider timing remains separate, and diagnostic/wake-probe runs are invalid timing samples retained only as lifecycle evidence.
+Optimization/performance campaigns additionally require append-only inventory, baseline, focused, and full-root artifacts under `docs/test-suite-optimizer/artifacts/` plus updates to `docs/test-suite-optimizer/scoreboard.md`. The primary metric is warm local root conductor execution time, provider timing remains separate, and diagnostic/wake-probe runs are invalid timing samples retained only as local/uncommitted lifecycle evidence.
 
 ## Cleanup
 

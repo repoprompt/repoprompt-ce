@@ -1,0 +1,162 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-after-m3prime-contextbuilder-codemap-gate-20260702T190736Z.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+  "git": {
+    "commit": "25a0d3fe8159604d4379e131491b9b9b1639a542",
+    "working_tree": " M Tests/RepoPromptTests/ContextBuilder/ContextBuilderWorktreeInheritanceTests.swift\n M docs/testing.md\n?? Tests/RepoPromptTests/Helpers/CodemapE2ETestGating.swift\n?? prompt-exports/oracle-plan-2026-07-02-145257-w2-m3-prime-991938-b139.md\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-before-m3-contextbuilder-registrationfailed-nonagent-20260702T181503Z.json\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-before-m3-contextbuilder-registrationfailed-suite-20260702T181641Z.json"
+  },
+  "inventory": "docs/test-suite-optimizer/artifacts/test-suite-inventory-phase3-setup-20260701T141721Z.json",
+  "label": "wave2-after-m3prime-contextbuilder-codemap-gate-20260702T190736Z",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 40.78366994857788,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/75220637-5cf5-48a6-815d-e45fa5d7fc13.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.003857135772705078,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 34.00466203689575,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/592978ea-71ce-46e7-983c-3c7d61a35d9d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004166126251220703,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 45.68714904785156,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2c999fcf-4e2f-42a7-80e0-39291fd0e836.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0025548934936523438,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 35.476,
+      "median_aggregate_seconds": 31.899,
+      "method_count": 4,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 35.476,
+      "median_seconds": 20.744,
+      "method": "testAgentModeEmptyInitialSelectionDefersAndRoutesWithoutExplicitContext",
+      "observations": 3,
+      "observed_p95_seconds": 35.476,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 7.759,
+      "median_seconds": 4.804,
+      "method": "testAgentModeTwoRootContextBuilderImplicitGitPublishesSelectedRepository",
+      "observations": 3,
+      "observed_p95_seconds": 7.759,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 3.14,
+      "median_seconds": 2.929,
+      "method": "testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps",
+      "observations": 3,
+      "observed_p95_seconds": 3.14,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.471,
+      "median_seconds": 0.465,
+      "method": "testAgentModeContextBuilderFailsClosedBeforeProviderCreationWhenWorktreeIsUnavailable",
+      "observations": 3,
+      "observed_p95_seconds": 0.471,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 3,
+    "invalid_samples": 0,
+    "median_seconds": 40.78366994857788,
+    "noise_classification": "unstable",
+    "observed_p95_seconds": 45.68714904785156,
+    "raw_execution_seconds": [
+      40.78366994857788,
+      34.00466203689575,
+      45.68714904785156
+    ],
+    "relative_mad": 0.12023143345010973,
+    "valid_samples": 3
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T19:09:38+00:00"
+}

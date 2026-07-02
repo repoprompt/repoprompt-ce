@@ -1,0 +1,166 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-baseline-root-reliability-gate-graph-source-authority-2sample-exception.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--json"
+  ],
+  "filter": null,
+  "git": {
+    "commit": "209469caefdd128e5c4e1b1c5705b748d28872fd",
+    "working_tree": " M Tests/RepoPromptTests/Helpers/ImmutableGitRepositoryTemplate.swift\n M Tests/RepoPromptTests/Helpers/ReviewGitRepositoryFixture.swift\n M Tests/RepoPromptTests/WorkspaceContext/WorkspaceFileContextStoreCodemapSeamTests.swift\n M docs/test-suite-optimizer/scoreboard.md\n?? prompt-exports/oracle-plan-2026-07-02-095553-root-blockers-fd829c-17fc.md\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-graph-20x.json\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-graph-stable-attrs-20x.json\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-20x.json\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-stable-attrs-20x.json"
+  },
+  "inventory": null,
+  "label": "reliability-gate-graph-source-authority-2sample-exception",
+  "primary_metric_eligible": false,
+  "scope": "complete",
+  "source_guard": {
+    "kind": "content"
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T15:03:00+00:00",
+  "user_directed_exception": {
+    "reason": "User directed the interrupted graph/source-authority root gate to stop at 2 counted complete-root samples after app crash/control-handle expiry; no replacement or third counted sample was run by this bookkeeping pass.",
+    "planned_samples_before_exception": 3,
+    "counted_sample_cutoff": 2,
+    "no_new_complete_root_samples_started_by_bookkeeping": true,
+    "sample3_counted": false
+  },
+  "samples": [
+    {
+      "index": 1,
+      "ticket": "7a244f75-7087-4f17-999e-f72dcbb3c887",
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 708.6,
+      "xctest_body_seconds": 704.24,
+      "exit_code": 0,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7a244f75-7087-4f17-999e-f72dcbb3c887.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 2835,
+      "process_exit_code": 0,
+      "queue_wait_seconds": null,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true,
+      "xctest_result": "Executed 2835 tests, with 5 tests skipped and 0 failures (0 unexpected) in 704.240 (705.309) seconds",
+      "conductor_reported_seconds_approximate": 708.6,
+      "xctest_elapsed_seconds": 705.309
+    },
+    {
+      "index": 2,
+      "ticket": "f169e22a-dccf-4896-9e5e-2031dba53382",
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 652.531,
+      "xctest_body_seconds": 651.478,
+      "exit_code": 0,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f169e22a-dccf-4896-9e5e-2031dba53382.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 2835,
+      "process_exit_code": 0,
+      "queue_wait_seconds": null,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true,
+      "xctest_result": "Executed 2835 tests, with 5 tests skipped and 0 failures (0 unexpected) in 651.478 (652.531) seconds"
+    }
+  ],
+  "overrun_samples_not_counted": [
+    {
+      "index": 3,
+      "ticket": "b533efea-c21c-487e-acc9-116d8ef7d2ce",
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--json"
+      ],
+      "diagnostic_paths": [
+        "prompt-exports/raw-logs/current-reliability/root-gate-graph-source-authority-overrun-sample3-invalid-b533efea.log"
+      ],
+      "execution_seconds": 708.785,
+      "xctest_body_seconds": 707.807,
+      "exit_code": 1,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "not counted because user-directed cutoff is 2 samples"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b533efea-c21c-487e-acc9-116d8ef7d2ce.log",
+      "copied_log_path": "prompt-exports/raw-logs/current-reliability/root-gate-graph-source-authority-overrun-sample3-invalid-b533efea.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 2835,
+      "process_exit_code": 1,
+      "queue_wait_seconds": null,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false,
+      "xctest_result": "Executed 2835 tests, with 5 tests skipped and 1 failure (0 unexpected) in 707.807 (708.785) seconds",
+      "failure": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests/testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps failed: codemap artifact unavailable for Sources/DistinctConnectionA.swift."
+    }
+  ],
+  "summary": {
+    "attempts": 2,
+    "valid_samples": 2,
+    "invalid_samples": 0,
+    "median_seconds": 680.5654999999999,
+    "observed_p95_seconds": 708.6,
+    "raw_execution_seconds": [
+      708.6,
+      652.531
+    ],
+    "relative_mad": 0.04119294909894792,
+    "noise_classification": "user-directed-2-sample-exception",
+    "counted_root_methods": 2835,
+    "counted_skipped_tests_per_sample": 5,
+    "overrun_not_counted": 1
+  },
+  "focused_evidence": {
+    "graph_stable_attrs_20x": {
+      "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-graph-stable-attrs-20x.json",
+      "valid_samples": 20,
+      "invalid_samples": 0,
+      "passed": true
+    },
+    "source_authority_stable_attrs_20x": {
+      "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-stable-attrs-20x.json",
+      "valid_samples": 20,
+      "invalid_samples": 0,
+      "passed": true
+    },
+    "initial_graph_20x": {
+      "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-graph-20x.json",
+      "valid_samples": 9,
+      "invalid_samples": 11,
+      "passed": false
+    },
+    "initial_source_authority_20x": {
+      "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-20x.json",
+      "valid_samples": 12,
+      "invalid_samples": 8,
+      "passed": false
+    }
+  },
+  "slowest_suites": [],
+  "slowest_tests": []
+}

@@ -1,0 +1,601 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-source-authority-20x.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+  "git": {
+    "commit": "209469caefdd128e5c4e1b1c5705b748d28872fd",
+    "working_tree": " M Tests/RepoPromptTests/Helpers/ImmutableGitRepositoryTemplate.swift\n M Tests/RepoPromptTests/Helpers/ReviewGitRepositoryFixture.swift\n M Tests/RepoPromptTests/WorkspaceContext/WorkspaceFileContextStoreCodemapSeamTests.swift\n M docs/test-suite-optimizer/scoreboard.md\n?? prompt-exports/oracle-plan-2026-07-02-095553-root-blockers-fd829c-17fc.md\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-graph-source-authority-graph-20x.json"
+  },
+  "inventory": null,
+  "label": "reliability-gate-graph-source-authority-source-authority-20x",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.055058002471924,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0c095b06-e034-494d-9bf7-d8c5f109997c.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0059659481048583984,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.8627939224243164,
+      "exit_code": 1,
+      "index": 2,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/5d5aeed6-141b-4ed3-9638-e2dfa587def3.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.005576133728027344,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.0220842361450195,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b423464a-2d38-4196-88d3-4e7f4acdf984.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004321098327636719,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.016813039779663,
+      "exit_code": 0,
+      "index": 4,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a69b7bc4-4da2-47ca-9559-4e117b439717.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004403114318847656,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.0003960132598877,
+      "exit_code": 0,
+      "index": 5,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ef0a4312-840f-4a3e-94bf-31994bc818fe.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004412174224853516,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.8996009826660156,
+      "exit_code": 1,
+      "index": 6,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/82d1ec05-b451-47b7-8eb3-a14848b48590.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.005163908004760742,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.9034550189971924,
+      "exit_code": 1,
+      "index": 7,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3d53d429-7c19-43df-a329-4adb837ae84f.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0037047863006591797,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.015040159225464,
+      "exit_code": 0,
+      "index": 8,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/5cea0996-8222-4002-97b3-43e4c683b811.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004183769226074219,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.4847369194030762,
+      "exit_code": 1,
+      "index": 9,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/822d4241-e14e-4031-ad8a-aba5a2f62b08.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.00465703010559082,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.9536619186401367,
+      "exit_code": 0,
+      "index": 10,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6e07d424-6adf-4449-acae-239482f4baba.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004060029983520508,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.017040967941284,
+      "exit_code": 0,
+      "index": 11,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0f707992-75f1-4532-93d1-97b66792b741.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004589080810546875,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.9555399417877197,
+      "exit_code": 1,
+      "index": 12,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8e43308a-0a44-43b7-b0cc-8f716149d04d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.005558013916015625,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.007174015045166,
+      "exit_code": 1,
+      "index": 13,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e7b4397a-a772-4c73-9b09-c06cab9ce6f8.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.004684925079345703,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.9812657833099365,
+      "exit_code": 0,
+      "index": 14,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f1ac9485-ef14-4775-a82f-6a2ca0315988.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.002946138381958008,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.078360080718994,
+      "exit_code": 0,
+      "index": 15,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/53f791d0-905e-44dd-97e7-dd0db3c808bb.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0039031505584716797,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.9677860736846924,
+      "exit_code": 0,
+      "index": 16,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9bdaab87-95e3-4a53-ae66-43551e025f4b.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004491090774536133,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.4725918769836426,
+      "exit_code": 1,
+      "index": 17,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/178da5ff-4705-481d-bac5-c36309f6172e.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0053958892822265625,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.9678218364715576,
+      "exit_code": 0,
+      "index": 18,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/4db297be-1a03-4de2-bb36-b8b1bcfa183a.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.005442142486572266,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.9618020057678223,
+      "exit_code": 0,
+      "index": 19,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3121370b-ba0d-466c-a9ec-0aba73725d6f.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.005671024322509766,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests/testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.909947156906128,
+      "exit_code": 1,
+      "index": 20,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/6b2ce915-d7cf-4678-add4-0c7a713e4d4f.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.004519939422607422,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 1.259,
+      "median_aggregate_seconds": 1.1905000000000001,
+      "method_count": 1,
+      "suite": "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 1.259,
+      "median_seconds": 1.1905000000000001,
+      "method": "testSourceAuthorityFactoryRejectsCollisionMatrixAndTracksNestedAttributes",
+      "observations": 12,
+      "observed_p95_seconds": 1.259,
+      "suite": "RepoPromptTests.WorkspaceCodemapGitCapabilityServiceTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 20,
+    "invalid_samples": 8,
+    "median_seconds": 2.007718086242676,
+    "noise_classification": "stable",
+    "observed_p95_seconds": 2.078360080718994,
+    "raw_execution_seconds": [
+      2.055058002471924,
+      2.0220842361450195,
+      2.016813039779663,
+      2.0003960132598877,
+      2.015040159225464,
+      1.9536619186401367,
+      2.017040967941284,
+      1.9812657833099365,
+      2.078360080718994,
+      1.9677860736846924,
+      1.9678218364715576,
+      1.9618020057678223
+    ],
+    "relative_mad": 0.016523373764098716,
+    "valid_samples": 12
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T14:12:08+00:00"
+}

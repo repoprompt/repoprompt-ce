@@ -154,16 +154,19 @@ Ordinary additions, fixes, renames, and removals do not need timing artifacts me
 
 ### Optimization or performance campaigns
 
-In addition to ordinary evidence, create new append-only inventory, baseline, focused, and full-root artifacts and append the result to `prompt-exports/optimize-test-suite-runs.md`. Never rewrite earlier artifacts or scoreboard history.
+In addition to ordinary evidence, create new append-only inventory, baseline, focused, and full-root artifacts under `docs/test-suite-optimizer/`. The active append-only scoreboard is `docs/test-suite-optimizer/scoreboard.md`, and committed optimizer JSON artifacts live under `docs/test-suite-optimizer/artifacts/`. Raw logs and copied conductor logs stay local/uncommitted; use ignored local scratch such as `docs/test-suite-optimizer/raw-logs/` when needed.
 
 Collect 3–5 comparable normal timing samples per measured series. Root and provider timings remain separate; report any root+provider value only as a derived secondary serial estimate. Use a fresh temporary generated ledger path when creating the append-only inventory artifact; never use the curated ledger as inventory output:
 
 ```bash
 label=example-campaign
-scoreboard="prompt-exports/optimize-test-suite-runs.md"
-inventory="prompt-exports/test-suite-inventory-${label}.json"
-root_baseline="prompt-exports/test-suite-baseline-root-${label}.json"
-provider_baseline="prompt-exports/test-suite-baseline-provider-${label}.json"
+campaign_dir="docs/test-suite-optimizer"
+artifact_dir="$campaign_dir/artifacts"
+scoreboard="$campaign_dir/scoreboard.md"
+inventory="$artifact_dir/test-suite-inventory-${label}.json"
+root_baseline="$artifact_dir/test-suite-baseline-root-${label}.json"
+provider_baseline="$artifact_dir/test-suite-baseline-provider-${label}.json"
+mkdir -p "$artifact_dir"
 tmpdir="$(mktemp -d)"
 python3 Scripts/test_suite_optimizer.py inventory \
   --ledger "$tmpdir/generated-ledger.tsv" \
@@ -196,7 +199,7 @@ During `baseline`, `Scripts/test_suite_optimizer.py` emits `test_suite_optimizer
 Focused before/after evidence uses the same artifact path and append-only scoreboard, but is not the primary root metric unless followed by a complete root baseline:
 
 ```bash
-focused="prompt-exports/test-suite-focused-root-${label}-example.json"
+focused="$artifact_dir/test-suite-focused-root-${label}-example.json"
 python3 Scripts/test_suite_optimizer.py baseline \
   --target root \
   --filter RepoPromptTests.ExampleTests \

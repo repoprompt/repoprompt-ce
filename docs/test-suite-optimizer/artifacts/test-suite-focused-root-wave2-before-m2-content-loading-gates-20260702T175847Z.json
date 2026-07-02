@@ -1,0 +1,342 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-before-m2-content-loading-gates-20260702T175847Z.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.FileSystemContentLoadingConcurrencyTests",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests",
+  "git": {
+    "commit": "304a44f19e273a584fc8b39a9243edac0d90a2a8",
+    "working_tree": "?? prompt-exports/oracle-plan-2026-07-02-135643-wave2-m2-loading-3a7-664d.md"
+  },
+  "inventory": "docs/test-suite-optimizer/artifacts/test-suite-inventory-phase3-setup-20260701T141721Z.json",
+  "label": "wave2-before-m2-content-loading-gates-20260702T175847Z",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.FileSystemContentLoadingConcurrencyTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 16.806590795516968,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/71ae8032-8697-4248-8164-2597e9ca69e4.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 24,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.003141164779663086,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.FileSystemContentLoadingConcurrencyTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.706373929977417,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/f60b3c14-391b-4b89-b7df-fbf676004c96.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 24,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.003484964370727539,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.FileSystemContentLoadingConcurrencyTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 1.6190738677978516,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a02a4ddd-1936-4f37-94fe-8f74bfbf4642.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 24,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.00402522087097168,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 0.224,
+      "median_aggregate_seconds": 0.88,
+      "method_count": 24,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.224,
+      "median_seconds": 0.224,
+      "method": "testSlowSameRootContentReadDoesNotDelayAcceptedWatcherFlush",
+      "observations": 3,
+      "observed_p95_seconds": 0.224,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.129,
+      "median_seconds": 0.128,
+      "method": "testOffActorContentReadWorkerConcurrencyIsBounded",
+      "observations": 3,
+      "observed_p95_seconds": 0.129,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.206,
+      "median_seconds": 0.109,
+      "method": "testContentReadSchedulerReservesPermitForLatencySensitiveReadsAcrossSupportedCapacities",
+      "observations": 3,
+      "observed_p95_seconds": 0.206,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.061,
+      "median_seconds": 0.06,
+      "method": "testContentReadSchedulerRoundRobinsOwnersWhilePreservingOwnerFIFO",
+      "observations": 3,
+      "observed_p95_seconds": 0.061,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.048,
+      "median_seconds": 0.048,
+      "method": "testContentReadSchedulerForegroundTokensBlockCodemapReplacementUntilFinalEnd",
+      "observations": 3,
+      "observed_p95_seconds": 0.048,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.047,
+      "median_seconds": 0.046,
+      "method": "testContentReadSchedulerNeverPromotesAgedCodemapAheadOfForegroundWaiters",
+      "observations": 3,
+      "observed_p95_seconds": 0.047,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.042,
+      "median_seconds": 0.038,
+      "method": "testContentReadSchedulerBoundsQueueCancelsWaitersAndReturnsIdle",
+      "observations": 3,
+      "observed_p95_seconds": 0.042,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.04,
+      "median_seconds": 0.038,
+      "method": "testQueuedContentReadWorkerPermitWaitRecordsCorrelatedAcquireAndPrivacySafeDimensions",
+      "observations": 3,
+      "observed_p95_seconds": 0.04,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.041,
+      "median_seconds": 0.037,
+      "method": "testStaleChunkedReadDoesNotOverwriteEncodingCacheAfterConcurrentEdit",
+      "observations": 3,
+      "observed_p95_seconds": 0.041,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.037,
+      "median_seconds": 0.037,
+      "method": "testCancelledQueuedContentReadWorkerPermitWaitRecordsCancellationWithoutAcquisitionOrLeak",
+      "observations": 3,
+      "observed_p95_seconds": 0.037,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.025,
+      "median_seconds": 0.024,
+      "method": "testContentLoadingPreservesTextBinaryEmptyFallbackLargeFileAndCacheBehavior",
+      "observations": 3,
+      "observed_p95_seconds": 0.025,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.024,
+      "median_seconds": 0.024,
+      "method": "testContentReadSchedulerPrioritizesInteractiveWaitersOverBulk",
+      "observations": 3,
+      "observed_p95_seconds": 0.024,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.022,
+      "median_seconds": 0.022,
+      "method": "testChunkedReadEnforcesConfiguredSizeLimitWhenFileGrows",
+      "observations": 3,
+      "observed_p95_seconds": 0.022,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.021,
+      "median_seconds": 0.02,
+      "method": "testSlowContentReadOnRootADoesNotDelayRootBReadAndWatcherFlush",
+      "observations": 3,
+      "observed_p95_seconds": 0.021,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.013,
+      "median_seconds": 0.013,
+      "method": "testForegroundActivityTokensCleanUpOnSuccessErrorAndCancellation",
+      "observations": 3,
+      "observed_p95_seconds": 0.013,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.013,
+      "median_seconds": 0.012,
+      "method": "testCancelledActiveBackgroundReadRetainsPermitUntilBodyReturns",
+      "observations": 3,
+      "observed_p95_seconds": 0.013,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.007,
+      "median_seconds": 0.005,
+      "method": "testCancellationDuringChunkedReadDoesNotCommitEncodingCache",
+      "observations": 3,
+      "observed_p95_seconds": 0.007,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.003,
+      "median_seconds": 0.003,
+      "method": "testValidatedRawContentRejectsSymlinkRetargetDuringRead",
+      "observations": 3,
+      "observed_p95_seconds": 0.003,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.002,
+      "median_seconds": 0.002,
+      "method": "testContentLoadingRejectsTraversalAndSymlinkTargets",
+      "observations": 3,
+      "observed_p95_seconds": 0.002,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.002,
+      "median_seconds": 0.002,
+      "method": "testValidatedRawContentReadsExactBytesWithoutProbeOrReread",
+      "observations": 3,
+      "observed_p95_seconds": 0.002,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.002,
+      "median_seconds": 0.002,
+      "method": "testValidatedRawContentRejectsMidReadMutation",
+      "observations": 3,
+      "observed_p95_seconds": 0.002,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.002,
+      "median_seconds": 0.002,
+      "method": "testValidatedRawContentRejectsUnsafeMissingAndOversizedInputs",
+      "observations": 3,
+      "observed_p95_seconds": 0.002,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testTestModeKeepsContentReadOnSerialFallbackWithoutInvokingWorkerHook",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testValidatedRawContentRejectsCancellationBeforeBufferedRead",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.FileSystemContentLoadingConcurrencyTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 3,
+    "invalid_samples": 0,
+    "median_seconds": 1.706373929977417,
+    "noise_classification": "noisy",
+    "observed_p95_seconds": 16.806590795516968,
+    "raw_execution_seconds": [
+      16.806590795516968,
+      1.706373929977417,
+      1.6190738677978516
+    ],
+    "relative_mad": 0.051161155621218854,
+    "valid_samples": 3
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T17:59:08+00:00"
+}

@@ -1,0 +1,243 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-baseline-provider-phase3-setup-20260701T141721Z.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "provider-test",
+    "--json"
+  ],
+  "filter": null,
+  "git": {
+    "commit": "d0abf8f0ba018804ca8b1aeaa7773ce2c69570fb",
+    "working_tree": " M Scripts/test_suite_optimizer.py\n M Scripts/test_test_suite_optimizer.py\n M docs/testing.md\n?? prompt-exports/"
+  },
+  "inventory": "docs/test-suite-optimizer/artifacts/test-suite-inventory-phase3-setup-20260701T141721Z.json",
+  "label": "phase3-setup-20260701T141721Z",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "provider-test",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.5359420776367188,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/25a73101-a323-4f4e-bef4-1d125136f26e.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 7,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0016281604766845703,
+      "source_changed": false,
+      "source_guard_kind": "metadata",
+      "state": "completed",
+      "target": "provider",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "provider-test",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.4216151237487793,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8524c029-f24f-4a60-92e1-f085adae707e.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 7,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0012028217315673828,
+      "source_changed": false,
+      "source_guard_kind": "metadata",
+      "state": "completed",
+      "target": "provider",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "provider-test",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.4093668460845947,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1d780cfc-c248-4207-9838-7b03e1bda309.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 7,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0003399848937988281,
+      "source_changed": false,
+      "source_guard_kind": "metadata",
+      "state": "completed",
+      "target": "provider",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "provider-test",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.40786099433898926,
+      "exit_code": 0,
+      "index": 4,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a9dacf62-1cf6-42d3-b0a9-b35f45f78dc0.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 7,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0008139610290527344,
+      "source_changed": false,
+      "source_guard_kind": "metadata",
+      "state": "completed",
+      "target": "provider",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "provider-test",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.48279714584350586,
+      "exit_code": 0,
+      "index": 5,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/353123ab-37be-404b-8547-5e41f81efdbc.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 7,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.00030112266540527344,
+      "source_changed": false,
+      "source_guard_kind": "metadata",
+      "state": "completed",
+      "target": "provider",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "complete",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 0.001,
+      "median_aggregate_seconds": 0.001,
+      "method_count": 4,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeCompatibleRuntimeSupportTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 0.0,
+      "median_aggregate_seconds": 0.0,
+      "method_count": 1,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeSDKProtocolCodecTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 0.0,
+      "median_aggregate_seconds": 0.0,
+      "method_count": 2,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeSDKNDJSONTranslatorTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testNoModelBackendRejectsEffortEncodedSelections",
+      "observations": 5,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeCompatibleRuntimeSupportTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testProviderCatalogDefaultsExposeStableRawValues",
+      "observations": 5,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeCompatibleRuntimeSupportTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testResolverStripsEncodedEffortAndValidatesXHighAgainstBackendModelID",
+      "observations": 5,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeCompatibleRuntimeSupportTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testRuntimeLaunchAndHeadlessSmokesPromptEnvironmentAndModels",
+      "observations": 5,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeCompatibleRuntimeSupportTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testAssistantToolAndResultSmokePreservesUsageArgsAndStableInvocationID",
+      "observations": 5,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeSDKNDJSONTranslatorTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testLifecycleAndStreamSmokeCoversSessionCancellationDeltaStopAndContextUsage",
+      "observations": 5,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeSDKNDJSONTranslatorTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testProtocolCodecSmokeDecodesControlRepairsControlCharactersAndEncodesUserMessage",
+      "observations": 5,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptClaudeCompatibleProviderTests.ClaudeSDKProtocolCodecTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "metadata"
+  },
+  "summary": {
+    "attempts": 5,
+    "invalid_samples": 0,
+    "median_seconds": 0.4216151237487793,
+    "noise_classification": "stable",
+    "observed_p95_seconds": 0.5359420776367188,
+    "raw_execution_seconds": [
+      0.5359420776367188,
+      0.4216151237487793,
+      0.4093668460845947,
+      0.40786099433898926,
+      0.48279714584350586
+    ],
+    "relative_mad": 0.032622476365400686,
+    "valid_samples": 5
+  },
+  "target": "provider",
+  "timestamp": "2026-07-01T15:15:43+00:00"
+}

@@ -301,6 +301,9 @@ allowed_tracked_docs=(
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )
+while IFS= read -r path; do
+  allowed_tracked_docs+=("$path")
+done < <(git ls-files 'docs/test-suite-optimizer')
 unexpected_tracked_docs="$(comm -23 \
   <(git ls-files docs | sort) \
   <(printf '%s\n' "${allowed_tracked_docs[@]}" | sort))"
