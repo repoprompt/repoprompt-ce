@@ -4159,7 +4159,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let wasRunAlreadyActive = session.runState.isActive
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
-        if let activeSendRunID {
+        let shouldDrainActiveAgentRunWaits = fallbackContext?.origin.isMCP != true
+        if let activeSendRunID, shouldDrainActiveAgentRunWaits {
             let drained = await activeAgentRunWaitDrain(activeSendRunID, "codex-native-active-send")
             if Task.isCancelled {
                 viewModel?.finalizeAttachmentsForTurn(

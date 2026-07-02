@@ -33,6 +33,16 @@ struct AgentPersistedToolResultSummary: Equatable {
     let summaryOnly: Bool
 }
 
+struct AgentToolResultRetentionInspection: Equatable {
+    let isToolResult: Bool
+    let summaryOnly: Bool?
+    let preservesRawPayload: Bool?
+    let retainsEphemeralRawPayload: Bool
+    let retainedPayload: String?
+    let rawPayloadByteCount: Int
+    let persistedPayloadByteCount: Int?
+}
+
 enum AgentToolResultSanitizationPurpose {
     case runtimePresentation
     case persistentStorage
@@ -215,17 +225,61 @@ enum AgentToolResultPersistencePolicy {
         )
     }
 
+    static func inspectRetention(
+        for item: AgentChatItem,
+        toolExecution: AgentTranscriptToolExecution? = nil,
+        context: AgentToolResultProcessingContext? = nil
+    ) -> AgentToolResultRetentionInspection {
+        let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard item.kind == .toolResult else {
+            return AgentToolResultRetentionInspection(
+                isToolResult: false,
+                summaryOnly: nil,
+                preservesRawPayload: nil,
+                retainsEphemeralRawPayload: false,
+                retainedPayload: nil,
+                rawPayloadByteCount: raw.utf8.count,
+                persistedPayloadByteCount: nil
+            )
+        }
+        guard let sanitized = sanitizedToolResult(for: item, toolExecution: toolExecution, context: context) else {
+            return AgentToolResultRetentionInspection(
+                isToolResult: true,
+                summaryOnly: nil,
+                preservesRawPayload: nil,
+                retainsEphemeralRawPayload: false,
+                retainedPayload: nil,
+                rawPayloadByteCount: raw.utf8.count,
+                persistedPayloadByteCount: nil
+            )
+        }
+        let persisted = sanitized.resultJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let retainedPayload: String? = {
+            guard sanitized.shouldRetainEphemeralRawPayload,
+                  !raw.isEmpty,
+                  raw != (persisted ?? "")
+            else {
+                return nil
+            }
+            return raw
+        }()
+        return AgentToolResultRetentionInspection(
+            isToolResult: true,
+            summaryOnly: sanitized.summaryOnly,
+            preservesRawPayload: sanitized.preservesRawPayload,
+            retainsEphemeralRawPayload: retainedPayload != nil,
+            retainedPayload: retainedPayload,
+            rawPayloadByteCount: raw.utf8.count,
+            persistedPayloadByteCount: persisted?.utf8.count
+        )
+    }
+
     static func retainedEphemeralRawPayload(
         for item: AgentChatItem,
         toolExecution: AgentTranscriptToolExecution? = nil,
         context: AgentToolResultProcessingContext? = nil
     ) -> String? {
-        guard let sanitized = sanitizedToolResult(for: item, toolExecution: toolExecution, context: context) else { return nil }
-        guard sanitized.shouldRetainEphemeralRawPayload else { return nil }
-        let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let persisted = sanitized.resultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !raw.isEmpty, raw != persisted else { return nil }
-        return raw
+        inspectRetention(for: item, toolExecution: toolExecution, context: context).retainedPayload
     }
 
     static func shouldRetainEphemeralRawPayload(for item: AgentChatItem) -> Bool {

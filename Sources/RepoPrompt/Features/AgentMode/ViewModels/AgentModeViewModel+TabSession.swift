@@ -16,6 +16,7 @@ extension AgentModeViewModel {
         @Published var items: [AgentChatItem] = [] {
             didSet {
                 guard !suppressSourceItemsChanged else { return }
+                repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
                 rebuildSourceItemDerivedState()
                 onSourceItemsChanged?(self, .structural)
             }
@@ -262,6 +263,15 @@ extension AgentModeViewModel {
         enum CodexFallbackOrigin: Equatable {
             case manual
             case mcp(attemptID: UUID)
+
+            var isMCP: Bool {
+                switch self {
+                case .mcp:
+                    true
+                case .manual:
+                    false
+                }
+            }
         }
 
         @MainActor
@@ -997,10 +1007,12 @@ extension AgentModeViewModel {
 
         private func commitSourceItems(
             _ newItems: [AgentChatItem],
-            dispatch: SourceItemsDispatch
+            dispatch: SourceItemsDispatch,
+            diagnosticContext: String
         ) {
+            let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
             suppressSourceItemsChanged = true
-            items = newItems
+            items = repairedItems
             suppressSourceItemsChanged = false
             rebuildSourceItemDerivedState()
             sourceItemsRevision &+= 1
@@ -1010,11 +1022,58 @@ extension AgentModeViewModel {
             }
         }
 
+        private func repairedSourceItems(
+            _ candidateItems: [AgentChatItem],
+            diagnosticContext: String
+        ) -> [AgentChatItem] {
+            let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
+            if repair.didRepair {
+                AgentSourceItemIDRepair.logDiagnostics(
+                    repair.diagnostics,
+                    context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
+                )
+            }
+            return repair.items
+        }
+
+        @discardableResult
+        private func repairStoredSourceItemsIfNeeded(diagnosticContext: String) -> Bool {
+            let repairedItems = repairedSourceItems(items, diagnosticContext: diagnosticContext)
+            guard repairedItems != items else { return false }
+            suppressSourceItemsChanged = true
+            items = repairedItems
+            suppressSourceItemsChanged = false
+            return true
+        }
+
+        @discardableResult
+        private func commitRepairedSourceItemsIfNeeded(
+            _ candidateItems: [AgentChatItem],
+            diagnosticContext: String
+        ) -> Bool {
+            let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
+            guard repair.didRepair else { return false }
+            AgentSourceItemIDRepair.logDiagnostics(
+                repair.diagnostics,
+                context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
+            )
+            commitSourceItems(
+                repair.items,
+                dispatch: .notify(.structural),
+                diagnosticContext: "\(diagnosticContext).commit"
+            )
+            return true
+        }
+
         private func rebuildSourceItemDerivedState() {
+            repairStoredSourceItemsIfNeeded(diagnosticContext: "rebuildSourceItemDerivedState")
             syncNextSequenceIndexFromItems()
             liveItemIDs = Set(items.map(\.id))
             replaceEphemeralToolResultPayloadMap(
-                AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: items),
+                AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(
+                    from: items,
+                    diagnosticContext: "tab_session tab_id=\(tabID.uuidString) rebuildSourceItemDerivedState"
+                ),
                 liveItemIDs: liveItemIDs
             )
             rebuildToolCorrelationIndexes()
@@ -1232,6 +1291,7 @@ extension AgentModeViewModel {
         ) {
             #if DEBUG
                 assert(liveItemIDs == Set(items.map(\.id)), "live item ID index desynchronized", file: file, line: line)
+                assert(items.count == liveItemIDs.count, "duplicate live item IDs detected", file: file, line: line)
                 assert(
                     ephemeralToolResultPayloadByItemID.keys.allSatisfy { liveItemIDs.contains($0) },
                     "ephemeral payload map contains non-live item IDs",
@@ -1260,7 +1320,11 @@ extension AgentModeViewModel {
             var updatedItems = previousItems
             body(&updatedItems)
             guard updatedItems != previousItems else { return false }
-            commitSourceItems(updatedItems, dispatch: .notify(mutation))
+            commitSourceItems(
+                updatedItems,
+                dispatch: .notify(mutation),
+                diagnosticContext: "mutateItemsBatch"
+            )
             if touchActivity {
                 lastActivityAt = Date()
             }
@@ -1292,7 +1356,11 @@ extension AgentModeViewModel {
                     ))
                 }
             #endif
-            commitSourceItems(items, dispatch: .silent)
+            commitSourceItems(
+                items,
+                dispatch: .silent,
+                diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
+            )
             pendingSourceItemsMutationSummary = nil
             pendingDerivedTranscriptRefreshReason = nil
             derivedTranscriptRefreshGeneration &+= 1
@@ -1344,6 +1412,9 @@ extension AgentModeViewModel {
         /// pruned. Mirrors the ephemeral-payload invariants that normal
         /// `TabSession` mutation helpers preserve via `reconcileEphemeralPayloadMap`.
         func compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap() {
+            if repairStoredSourceItemsIfNeeded(diagnosticContext: "compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap") {
+                rebuildSourceItemDerivedState()
+            }
             var alignedItems: [AgentChatItem] = []
             alignedItems.reserveCapacity(items.count)
             var alignedMap: [UUID: String] = [:]
@@ -1437,6 +1508,16 @@ extension AgentModeViewModel {
             var newItem = item
             newItem.sequenceIndex = nextSequenceIndex
             nextSequenceIndex += 1
+            let candidateItems = items + [newItem]
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "appendItem") {
+                if newItem.kind == .user {
+                    hasSentFirstMessage = true
+                    lastUserMessageAt = newItem.timestamp
+                }
+                lastActivityAt = Date()
+                isDirty = true
+                return
+            }
             let appendedIndex = items.count
             suppressSourceItemsChanged = true
             items.append(newItem)
@@ -1456,6 +1537,13 @@ extension AgentModeViewModel {
             guard items.indices.contains(index) else { return }
             let previousItem = items[index]
             guard updatedItem != previousItem else { return }
+            var candidateItems = items
+            candidateItems[index] = updatedItem
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem") {
+                lastActivityAt = Date()
+                isDirty = true
+                return
+            }
             suppressSourceItemsChanged = true
             items[index] = updatedItem
             suppressSourceItemsChanged = false
@@ -1475,6 +1563,13 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
+            var candidateItems = items
+            candidateItems[index] = updatedItem
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem") {
+                lastActivityAt = Date()
+                isDirty = true
+                return
+            }
             suppressSourceItemsChanged = true
             items[index] = updatedItem
             suppressSourceItemsChanged = false
@@ -1508,6 +1603,13 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
+            var candidateItems = items
+            candidateItems[index] = updatedItem
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem") {
+                lastActivityAt = Date()
+                isDirty = true
+                return
+            }
             suppressSourceItemsChanged = true
             items[index] = updatedItem
             suppressSourceItemsChanged = false

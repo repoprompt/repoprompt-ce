@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 
 enum AgentConversationReplayMode: String, Equatable {
     case equivalent
@@ -1908,6 +1909,239 @@ enum AgentTranscriptSummaryTextFormatter {
     }
 }
 
+enum AgentSourceItemIDRepair {
+    struct Result: Equatable {
+        let items: [AgentChatItem]
+        let diagnostics: [DuplicateDiagnostic]
+
+        var didRepair: Bool {
+            !diagnostics.isEmpty
+        }
+    }
+
+    enum RepairAction: Equatable {
+        case droppedExactDuplicate
+        case rekeyedNonIdenticalDuplicate(newID: UUID)
+
+        var logValue: String {
+            switch self {
+            case .droppedExactDuplicate:
+                "dropped_exact_duplicate"
+            case .rekeyedNonIdenticalDuplicate:
+                "rekeyed_non_identical_duplicate"
+            }
+        }
+
+        var newID: UUID? {
+            switch self {
+            case .droppedExactDuplicate:
+                nil
+            case let .rekeyedNonIdenticalDuplicate(newID):
+                newID
+            }
+        }
+    }
+
+    enum RetainedPayloadRelationship: String, Equatable {
+        case neitherRetained = "neither_retained"
+        case firstOnly = "first_only"
+        case duplicateOnly = "duplicate_only"
+        case equal
+        case different
+    }
+
+    struct ItemSummary: Equatable {
+        let kind: AgentChatItemKind
+        let sequenceIndex: Int
+        let toolName: String?
+        let invocationID: UUID?
+        let summaryOnly: Bool?
+        let preservesRawPayload: Bool?
+        let retainsEphemeralRawPayload: Bool
+        let rawPayloadByteCount: Int
+        let persistedPayloadByteCount: Int?
+
+        var logValue: String {
+            let toolValue = toolName ?? "nil"
+            let invocationValue = invocationID?.uuidString ?? "nil"
+            let summaryOnlyValue = summaryOnly.map { String($0) } ?? "nil"
+            let preservesRawPayloadValue = preservesRawPayload.map { String($0) } ?? "nil"
+            let persistedPayloadByteCountValue = persistedPayloadByteCount.map { String($0) } ?? "nil"
+            return [
+                "kind=\(kind.rawValue)",
+                "sequence_index=\(sequenceIndex)",
+                "tool=\(toolValue)",
+                "invocation=\(invocationValue)",
+                "summary_only=\(summaryOnlyValue)",
+                "preserves_raw=\(preservesRawPayloadValue)",
+                "retains_raw=\(retainsEphemeralRawPayload)",
+                "raw_bytes=\(rawPayloadByteCount)",
+                "persisted_bytes=\(persistedPayloadByteCountValue)"
+            ].joined(separator: ",")
+        }
+    }
+
+    struct DuplicateDiagnostic: Equatable {
+        let duplicateID: UUID
+        let firstIndex: Int
+        let duplicateIndex: Int
+        let action: RepairAction
+        let firstSummary: ItemSummary
+        let duplicateSummary: ItemSummary
+        let retainedPayloadRelationship: RetainedPayloadRelationship
+    }
+
+    private static let logger = Logger(
+        subsystem: "com.repoprompt.agents",
+        category: "AgentModeSourceItemIntegrity"
+    )
+
+    static func repairDuplicateIDs(
+        in items: [AgentChatItem],
+        context: AgentToolResultProcessingContext? = nil
+    ) -> Result {
+        guard !items.isEmpty else { return Result(items: items, diagnostics: []) }
+        var acceptedItems: [AgentChatItem] = []
+        acceptedItems.reserveCapacity(items.count)
+        var firstItemByID: [UUID: (index: Int, item: AgentChatItem)] = [:]
+        let originalIDs = Set(items.map(\.id))
+        var reservedIDs = originalIDs
+        var diagnostics: [DuplicateDiagnostic] = []
+
+        for (index, item) in items.enumerated() {
+            guard let first = firstItemByID[item.id] else {
+                firstItemByID[item.id] = (index, item)
+                acceptedItems.append(item)
+                continue
+            }
+
+            if item == first.item {
+                diagnostics.append(makeDiagnostic(
+                    duplicateID: item.id,
+                    firstIndex: first.index,
+                    duplicateIndex: index,
+                    action: .droppedExactDuplicate,
+                    firstItem: first.item,
+                    duplicateItem: item,
+                    context: context
+                ))
+                continue
+            }
+
+            let newID = uniqueReplacementID(reservedIDs: &reservedIDs)
+            let repairedItem = item.replacingID(newID)
+            firstItemByID[newID] = (index, repairedItem)
+            acceptedItems.append(repairedItem)
+            diagnostics.append(makeDiagnostic(
+                duplicateID: item.id,
+                firstIndex: first.index,
+                duplicateIndex: index,
+                action: .rekeyedNonIdenticalDuplicate(newID: newID),
+                firstItem: first.item,
+                duplicateItem: item,
+                context: context
+            ))
+        }
+
+        return Result(items: acceptedItems, diagnostics: diagnostics)
+    }
+
+    static func logDiagnostics(_ diagnostics: [DuplicateDiagnostic], context: String?) {
+        let contextValue = context ?? "unknown"
+        for diagnostic in diagnostics {
+            let newIDValue = diagnostic.action.newID?.uuidString ?? "nil"
+            logger.error(
+                "Agent source item duplicate ID repaired context=\(contextValue, privacy: .public) duplicate_id=\(diagnostic.duplicateID.uuidString, privacy: .public) first_index=\(diagnostic.firstIndex, privacy: .public) duplicate_index=\(diagnostic.duplicateIndex, privacy: .public) action=\(diagnostic.action.logValue, privacy: .public) new_id=\(newIDValue, privacy: .public) retained_payload=\(diagnostic.retainedPayloadRelationship.rawValue, privacy: .public) first=\(diagnostic.firstSummary.logValue, privacy: .public) duplicate=\(diagnostic.duplicateSummary.logValue, privacy: .public)"
+            )
+        }
+    }
+
+    static func logDuplicateRetainedToolResultPayload(
+        duplicateID: UUID,
+        firstIndex: Int,
+        duplicateIndex: Int,
+        firstItem: AgentChatItem,
+        duplicateItem: AgentChatItem,
+        firstPayload: String,
+        duplicatePayload: String,
+        context: String?,
+        toolResultContext: AgentToolResultProcessingContext? = nil
+    ) {
+        let contextValue = context ?? "unknown"
+        let firstSummary = itemSummary(for: firstItem, context: toolResultContext)
+        let duplicateSummary = itemSummary(for: duplicateItem, context: toolResultContext)
+        logger.error(
+            "Duplicate retained tool-result payload item ID ignored context=\(contextValue, privacy: .public) duplicate_id=\(duplicateID.uuidString, privacy: .public) first_index=\(firstIndex, privacy: .public) duplicate_index=\(duplicateIndex, privacy: .public) payload_equal=\(firstPayload == duplicatePayload, privacy: .public) first_payload_bytes=\(firstPayload.utf8.count, privacy: .public) duplicate_payload_bytes=\(duplicatePayload.utf8.count, privacy: .public) first=\(firstSummary.logValue, privacy: .public) duplicate=\(duplicateSummary.logValue, privacy: .public)"
+        )
+    }
+
+    private static func makeDiagnostic(
+        duplicateID: UUID,
+        firstIndex: Int,
+        duplicateIndex: Int,
+        action: RepairAction,
+        firstItem: AgentChatItem,
+        duplicateItem: AgentChatItem,
+        context: AgentToolResultProcessingContext?
+    ) -> DuplicateDiagnostic {
+        DuplicateDiagnostic(
+            duplicateID: duplicateID,
+            firstIndex: firstIndex,
+            duplicateIndex: duplicateIndex,
+            action: action,
+            firstSummary: itemSummary(for: firstItem, context: context),
+            duplicateSummary: itemSummary(for: duplicateItem, context: context),
+            retainedPayloadRelationship: retainedPayloadRelationship(firstItem: firstItem, duplicateItem: duplicateItem, context: context)
+        )
+    }
+
+    private static func itemSummary(
+        for item: AgentChatItem,
+        context: AgentToolResultProcessingContext?
+    ) -> ItemSummary {
+        let inspection = AgentToolResultPersistencePolicy.inspectRetention(for: item, context: context)
+        return ItemSummary(
+            kind: item.kind,
+            sequenceIndex: item.sequenceIndex,
+            toolName: item.toolName,
+            invocationID: item.toolInvocationID,
+            summaryOnly: inspection.summaryOnly,
+            preservesRawPayload: inspection.preservesRawPayload,
+            retainsEphemeralRawPayload: inspection.retainsEphemeralRawPayload,
+            rawPayloadByteCount: inspection.rawPayloadByteCount,
+            persistedPayloadByteCount: inspection.persistedPayloadByteCount
+        )
+    }
+
+    private static func retainedPayloadRelationship(
+        firstItem: AgentChatItem,
+        duplicateItem: AgentChatItem,
+        context: AgentToolResultProcessingContext?
+    ) -> RetainedPayloadRelationship {
+        let firstPayload = AgentToolResultPersistencePolicy.inspectRetention(for: firstItem, context: context).retainedPayload
+        let duplicatePayload = AgentToolResultPersistencePolicy.inspectRetention(for: duplicateItem, context: context).retainedPayload
+        switch (firstPayload, duplicatePayload) {
+        case (nil, nil):
+            return .neitherRetained
+        case (.some, nil):
+            return .firstOnly
+        case (nil, .some):
+            return .duplicateOnly
+        case let (.some(firstPayload), .some(duplicatePayload)):
+            return firstPayload == duplicatePayload ? .equal : .different
+        }
+    }
+
+    private static func uniqueReplacementID(reservedIDs: inout Set<UUID>) -> UUID {
+        var candidate = UUID()
+        while reservedIDs.contains(candidate) {
+            candidate = UUID()
+        }
+        reservedIDs.insert(candidate)
+        return candidate
+    }
+}
+
 enum AgentTranscriptIO {
     private static let hiddenTranscriptToolNames: Set<String> = [
         "wait_for_next_user_instruction",
@@ -1924,6 +2158,17 @@ enum AgentTranscriptIO {
     static func shouldHideToolFromTranscript(_ name: String?) -> Bool {
         guard let name else { return false }
         return hiddenTranscriptToolNames.contains(AgentTranscriptToolNormalizer.normalizedToolName(name) ?? "")
+    }
+
+    private static func repairedSourceItems(
+        _ items: [AgentChatItem],
+        diagnosticContext: String
+    ) -> [AgentChatItem] {
+        let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: items)
+        if repair.didRepair {
+            AgentSourceItemIDRepair.logDiagnostics(repair.diagnostics, context: diagnosticContext)
+        }
+        return repair.items
     }
 
     static func shouldIncludeLegacyItem(
@@ -2023,17 +2268,18 @@ enum AgentTranscriptIO {
                 }
                 return lhs.sequenceIndex < rhs.sequenceIndex
             }
+        let repairedRows = repairedSourceItems(rows, diagnosticContext: "working_source_items")
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 AgentTranscriptDebugInstrumentation.workingSourceItemsHandler?(.init(
                     transcriptTurnCount: transcript.turns.count,
                     fullTurnCount: transcript.turns.count(where: { $0.retentionTier == .full }),
-                    itemCount: rows.count,
+                    itemCount: repairedRows.count,
                     durationMS: AgentTranscriptDebugInstrumentation.durationMS(since: startedAt)
                 ))
             }
         #endif
-        return rows
+        return repairedRows
     }
 
     #if DEBUG

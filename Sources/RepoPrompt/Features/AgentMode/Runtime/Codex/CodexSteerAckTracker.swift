@@ -36,6 +36,34 @@ final class CodexSteerAckTracker {
         case cancelled
         case stale(reason: String)
         case timedOut
+
+        var confirmsInstructionDeliveryOrDurableQueue: Bool {
+            switch self {
+            case .steerAccepted, .startAccepted, .controlAccepted, .durablyQueued:
+                true
+            case .failed, .cancelled, .stale, .timedOut:
+                false
+            }
+        }
+
+        var failureDescriptionForMCP: String? {
+            switch self {
+            case .steerAccepted, .startAccepted, .controlAccepted, .durablyQueued:
+                nil
+            case let .failed(message):
+                message.isEmpty
+                    ? "Codex steer failed before reaching the active run."
+                    : message
+            case .cancelled:
+                "Codex steer was cancelled before it reached the active run."
+            case let .stale(reason):
+                reason.isEmpty
+                    ? "Codex steer was dropped because the active run changed before delivery."
+                    : reason
+            case .timedOut:
+                "Timed out waiting for Codex to acknowledge the steer message. The run may have changed state."
+            }
+        }
     }
 
     private struct AttemptRecord {
