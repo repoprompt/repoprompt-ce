@@ -135,6 +135,15 @@ private struct CancelledSingleWaitResolution {
     let completion: AgentRunWaitScopeCompletion
 }
 
+private struct SteerControlResolution {
+    let session: AgentModeViewModel.TabSession
+    let reactivatedTarget: AgentModeViewModel.MCPSessionTarget?
+
+    var wasReactivated: Bool {
+        reactivatedTarget != nil
+    }
+}
+
 private final class WaitScopeCompletionBox: @unchecked Sendable {
     private let lock = NSLock()
     private var storedCompletion: AgentRunWaitScopeCompletion?
@@ -231,6 +240,12 @@ struct AgentRunMCPToolService {
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
         var testBeforeProviderDispatch: (() async -> Void)?
         var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?
+        var testDispatchSteerInstruction: ((
+            _ sessionID: UUID,
+            _ text: String,
+            _ workflow: AgentWorkflowDefinition?,
+            _ agentModeVM: AgentModeViewModel
+        ) async throws -> AgentModeViewModel.MCPInstructionDispatch)?
     #endif
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
@@ -855,16 +870,21 @@ struct AgentRunMCPToolService {
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let text = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
+        let metadata = await captureRequestMetadata()
+        let control = try await ensureSteerControlContext(
+            sessionID: sessionID,
+            metadata: metadata,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM
+        )
         let delivery: AgentModeViewModel.MCPInstructionDispatch
         let snapshot: AgentRunMCPSnapshot
-        if let controlledSession = agentModeVM.mcpControlledSession(sessionID: sessionID),
-           controlledSession.runState.isActive
-        {
-            delivery = try await agentModeVM.mcpDispatchInstruction(
+        if control.session.runState.isActive {
+            delivery = try await dispatchSteerInstruction(
                 sessionID: sessionID,
                 text: text,
-                allowStartingRun: true,
-                workflow: workflow
+                workflow: workflow,
+                agentModeVM: agentModeVM
             )
             await Task.yield()
             snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
@@ -876,15 +896,24 @@ struct AgentRunMCPToolService {
                     sessionID: sessionID,
                     kind: .steering
                 ) {
-                    try await agentModeVM.mcpDispatchInstruction(
+                    try await dispatchSteerInstruction(
                         sessionID: sessionID,
                         text: text,
-                        allowStartingRun: true,
-                        workflow: workflow
+                        workflow: workflow,
+                        agentModeVM: agentModeVM
                     )
                 }
             } catch {
                 agentModeVM.setMCPFollowUpRunPending(sessionID: sessionID, false)
+                if control.wasReactivated {
+                    await agentModeVM.mcpDeactivateControlContext(
+                        sessionID: sessionID,
+                        cleanupSessionStore: true
+                    )
+                    if let target = control.reactivatedTarget {
+                        await agentModeVM.mcpDiscardSessionTarget(target)
+                    }
+                }
                 throw error
             }
             await Task.yield()
@@ -915,7 +944,6 @@ struct AgentRunMCPToolService {
             ? snapshot.interaction == nil
             : (!snapshot.status.isTerminal && snapshot.interaction == nil)
         if shouldWait, shouldBlockForSteeredOutput {
-            let metadata = await captureRequestMetadata()
             let timeout = steerTimeoutSeconds ?? Self.defaultWaitTimeoutSeconds
             if timeout > 0 {
                 return try await waitForInterestingState(
@@ -936,6 +964,95 @@ struct AgentRunMCPToolService {
             workflow: workflow,
             delivery: delivery,
             warning: ignoredTimeoutWarning
+        )
+    }
+
+    private func ensureSteerControlContext(
+        sessionID: UUID,
+        metadata: RequestMetadata,
+        targetWindow: WindowState,
+        agentModeVM: AgentModeViewModel
+    ) async throws -> SteerControlResolution {
+        if let session = agentModeVM.mcpControlledSession(sessionID: sessionID) {
+            return SteerControlResolution(session: session, reactivatedTarget: nil)
+        }
+
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available to resolve agent session '\(sessionID.uuidString)'.")
+        }
+        guard try await agentModeVM.mcpResolveSessionID(reference: sessionID.uuidString, workspace: workspace) == sessionID else {
+            throw MCPError.invalidParams("Session '\(sessionID.uuidString)' was not found in the active workspace.")
+        }
+
+        // Steer reactivation is not a spawn: it can only target an existing persisted
+        // session in this workspace, preserves that session's parent/binding state, and
+        // does not bind the current request to the tab. Spawn-capacity validation is
+        // therefore intentionally left to true new-session/resume operations.
+        let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: sessionID,
+            createIfNeeded: true,
+            sessionName: nil,
+            parentSessionID: nil,
+            inheritWorktreeBindings: false
+        )
+        var didActivateControl = false
+        do {
+            guard target.sessionID == sessionID else {
+                throw MCPError.internalError("Reactivated agent session target did not match the requested session ID.")
+            }
+            guard let session = agentModeVM.session(for: target.tabID, createIfNeeded: false) else {
+                throw MCPError.internalError("Failed to hydrate the requested agent session for steering.")
+            }
+            guard session.activeAgentSessionID == sessionID else {
+                throw MCPError.invalidParams("The requested agent session binding changed before steering.")
+            }
+            guard !session.runState.isActive else {
+                throw MCPError.invalidParams("The requested agent run is active but is not MCP-controlled; wait for it to finish before steering it through agent_run.")
+            }
+
+            try await agentModeVM.mcpActivateControlContext(
+                forTabID: target.tabID,
+                sessionID: sessionID,
+                originatingConnectionID: metadata.connectionID,
+                taskLabelKind: nil,
+                startPending: true,
+                markSessionAsMCPOriginated: false,
+                requireInactiveRunState: true
+            )
+            didActivateControl = true
+            guard let controlledSession = agentModeVM.mcpControlledSession(sessionID: sessionID) else {
+                throw MCPError.internalError("Failed to reactivate MCP control for the requested agent session.")
+            }
+            return SteerControlResolution(session: controlledSession, reactivatedTarget: target)
+        } catch {
+            if didActivateControl {
+                await agentModeVM.mcpDeactivateControlContext(
+                    sessionID: sessionID,
+                    cleanupSessionStore: true
+                )
+            }
+            await agentModeVM.mcpDiscardSessionTarget(target)
+            throw error
+        }
+    }
+
+    private func dispatchSteerInstruction(
+        sessionID: UUID,
+        text: String,
+        workflow: AgentWorkflowDefinition?,
+        agentModeVM: AgentModeViewModel
+    ) async throws -> AgentModeViewModel.MCPInstructionDispatch {
+        #if DEBUG
+            if let testDispatchSteerInstruction {
+                return try await testDispatchSteerInstruction(sessionID, text, workflow, agentModeVM)
+            }
+        #endif
+        return try await agentModeVM.mcpDispatchInstruction(
+            sessionID: sessionID,
+            text: text,
+            allowStartingRun: true,
+            workflow: workflow
         )
     }
 

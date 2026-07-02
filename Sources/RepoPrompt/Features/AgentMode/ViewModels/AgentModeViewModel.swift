@@ -4695,10 +4695,10 @@ final class AgentModeViewModel: ObservableObject {
             else { return nil }
             return intent
         }
-        let transitionKind: AgentRunEpochTransitionKind = if originalContext.currentEpoch == nil {
-            .initial
-        } else if let scopedTransitionIntent {
+        let transitionKind: AgentRunEpochTransitionKind = if let scopedTransitionIntent {
             scopedTransitionIntent.kind
+        } else if originalContext.currentEpoch == nil {
+            .initial
         } else if originalContext.pendingEpochTransition != nil {
             .unrelated
         } else if session.mcpFollowUpRunPending {
@@ -6389,7 +6389,9 @@ final class AgentModeViewModel: ObservableObject {
         sessionID: UUID,
         originatingConnectionID: UUID?,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
-        startPending: Bool = false
+        startPending: Bool = false,
+        markSessionAsMCPOriginated: Bool = true,
+        requireInactiveRunState: Bool = false
     ) async throws {
         let session = await ensureSessionReady(tabID: tabID)
         guard sessions[tabID] === session,
@@ -6397,6 +6399,9 @@ final class AgentModeViewModel: ObservableObject {
               !session.bindingTransitionInProgress
         else {
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
+        }
+        if requireInactiveRunState, session.runState.isActive {
+            throw MCPError.invalidParams("The requested agent run became active before MCP control activation.")
         }
         // A new control activation owns a new launch lifecycle. Never retain review state from a
         // prior activation, including direct/source-equals-target starts that do not stage anew.
@@ -6424,7 +6429,8 @@ final class AgentModeViewModel: ObservableObject {
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress,
-              session.mcpControlActivationGeneration == activationGeneration
+              session.mcpControlActivationGeneration == activationGeneration,
+              !requireInactiveRunState || !session.runState.isActive
         else {
             await AgentRunSessionStore.cleanup(registration: registration)
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
@@ -6451,8 +6457,11 @@ final class AgentModeViewModel: ObservableObject {
         )
         session.mcpFollowUpRunPending = startPending
         mcpControlledTabIDs.insert(tabID)
-        // Mark session as MCP-originated so cleanup can scope to MCP sessions only
-        session.isMCPOriginated = true
+        // Mark MCP-created sessions so cleanup can scope to MCP sessions only.
+        // Reactivating an existing user-owned session for steer must preserve its origin.
+        if markSessionAsMCPOriginated {
+            session.isMCPOriginated = true
+        }
         // MCP-controlled sessions use the sub-agent permission policy, even when
         // they are top-level MCP starts without a parent session.
         session.permissionProfile = permissionProfileForMCPActivation(session: session)
@@ -6484,7 +6493,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Discard a session target created by `mcpResolveOrCreateSessionTarget` when a later step
-    /// in start/create/resume fails before the target becomes a real session. Only targets with
+    /// in start/create/resume/steer fails before the target becomes a real session. Only targets with
     /// origin `.createdNewTab` or `.createdForSessionResume` are eligible for discard.
     func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async {
         switch target.origin {
