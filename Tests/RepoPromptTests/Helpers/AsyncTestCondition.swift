@@ -20,10 +20,26 @@ enum AsyncTestWait {
         maximumDelayNanoseconds: UInt64 = 25_000_000,
         condition: @escaping () async -> Bool
     ) async throws {
+        try await waitUntilThrowing(
+            description,
+            timeout: timeout,
+            initialDelayNanoseconds: initialDelayNanoseconds,
+            maximumDelayNanoseconds: maximumDelayNanoseconds,
+            condition: condition
+        )
+    }
+
+    static func waitUntilThrowing(
+        _ description: String,
+        timeout: TimeInterval = 3,
+        initialDelayNanoseconds: UInt64 = 1_000_000,
+        maximumDelayNanoseconds: UInt64 = 25_000_000,
+        condition: @escaping () async throws -> Bool
+    ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         var delay = initialDelayNanoseconds
         while true {
-            if await condition() { return }
+            if try await condition() { return }
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else {
                 throw AsyncTestConditionTimeout(description: description, timeout: timeout)

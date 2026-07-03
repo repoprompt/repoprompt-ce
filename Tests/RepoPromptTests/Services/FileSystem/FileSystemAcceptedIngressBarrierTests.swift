@@ -513,13 +513,20 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
-    func testSyntheticHundredThousandPathReplayUsesBoundedSpillWorkingSet() throws {
+    func testSyntheticPathReplayUsesBoundedSpillWorkingSet() throws {
+        try exerciseSyntheticPathReplay(recordCount: 50000, retainedGenerationCount: 20000)
+    }
+
+    func testSyntheticHundredThousandPathReplayWhenEnabled() throws {
+        try TestScaleGate.requireEnabled("Run the 100K accepted ingress replay scale contract")
+        try exerciseSyntheticPathReplay(recordCount: 100_000, retainedGenerationCount: 40000)
+    }
+
+    private func exerciseSyntheticPathReplay(recordCount: Int, retainedGenerationCount: Int) throws {
         let inventory = FileSystemVisitedInventory()
         let manifest = try FileSystemSeededInventoryManifest.makeForTesting(records: [])
         inventory.installSeeded(manifest: manifest)
 
-        let recordCount = 100_000
-        let retainedGenerationCount = 40000
         var retainedSnapshot: FileSystemSeededInventorySnapshot?
         for index in 0 ..< recordCount {
             inventory.applySeededChangeForTesting(
@@ -547,6 +554,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
                 + (FileSystemSeededInventoryChangeOverlay.maximumSegmentCount + 2)
                 * FileSystemSeededInventoryChangeOverlay.maximumRecordPathBytes
         XCTAssertLessThanOrEqual(statistics.peakMergeResidentPathBytes, mergePathByteBound)
+        XCTAssertGreaterThan(statistics.peakOpenSegmentCount, FileSystemSeededInventoryChangeOverlay.maximumSegmentCount)
         XCTAssertEqual(statistics.currentSegmentCount, 1)
 
         let oldReader = try XCTUnwrap(retainedSnapshot).makeReader()

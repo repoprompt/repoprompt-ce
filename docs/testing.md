@@ -44,6 +44,21 @@ touch /tmp/RepoPromptCE-codemap-e2e-opt-in && make dev-test FILTER=ContextBuilde
 
 Run this strict gate when changes touch `Sources/RepoPrompt/Features/CodeMap/`, codemap paths in `Sources/RepoPrompt/Infrastructure/WorkspaceContext/`, `Sources/RepoPrompt/Infrastructure/SyntaxParsing/`, or `Sources/TreeSitterScannerSupport/`. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
 
+### Scale-sensitive contract gates
+
+Routine root tests should use lower-cost boundary variants when they still exercise the same spill, merge, streaming, or retained-reader path. The 100K scale contracts that are intentionally retained for Git authority evidence, target seed plan manifests, namespace manifests, and accepted-ingress seeded replay are opt-in:
+
+```bash
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.GitLoadedRootAuthorityEvidenceTests/testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBoundedWhenEnabled
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests/testManifestScaleStreamsOneHundredThousandOrMillionWhenEnabled
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.FileSystemAcceptedIngressBarrierTests/testSyntheticHundredThousandPathReplayWhenEnabled
+```
+
+Use direct `swift test` for these explicit opt-in scale checks so the environment gate reaches the XCTest process. Prefer `make dev-test` for the lower-cost routine variants and ordinary focused validation.
+
+Existing higher-scale overrides remain separate opt-ins, such as `RPCE_RUN_MILLION_RECORD_GIT_AUTHORITY_TESTS=1`, `RPCE_RUN_MILLION_ENTRY_TESTS=1`, and `REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=<count>`.
+
 ## Authoritative executable IDs
 
 Never derive the executable census from source text or a stale build. Use:
@@ -915,22 +930,21 @@ valid samples.
 
 ### 100k and 1M synthetic hooks
 
-The routine namespace-manifest scale contract generates 100,000 records and
-asserts exact record/read counts, more than 100 initial spill runs, and bounded
-buffer bytes:
+The routine namespace-manifest scale contract uses a lower record count with a
+small batch size so ordinary root-suite timing still exercises exact record/read
+counts, more than 100 initial spill runs, and bounded buffer bytes:
 
 ```bash
 make dev-test \
-  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes
+  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticEntriesRemainWithinConfiguredBatchBytes
 ```
 
-The opt-in one-million-record version uses the same executable oracle and
-resource policy; keep it separate from ordinary root-suite timing:
+The 100K/configured namespace-manifest version uses the same executable oracle
+and remains separate from ordinary root-suite timing:
 
 ```bash
-REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=1000000 \
-  make dev-test \
-  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
+REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=1000000 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
 ```
 
 These hooks validate spill/streaming scale, not live Agent Mode latency. The

@@ -2889,17 +2889,23 @@ import XCTest
 
         private func waitUntil(
             timeout: Duration = .seconds(2),
-            condition: @MainActor () -> Bool
+            condition: @escaping @MainActor () -> Bool
         ) async -> Bool {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while clock.now < deadline {
-                if condition() {
-                    return true
+            let timeoutSeconds = TimeInterval(timeout.components.seconds)
+                + TimeInterval(timeout.components.attoseconds) / 1_000_000_000_000_000_000
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "MCPAskOracleWorktreeTests.waitUntil",
+                    timeout: max(timeoutSeconds, 0.001),
+                    initialDelayNanoseconds: 1_000_000,
+                    maximumDelayNanoseconds: 25_000_000
+                ) {
+                    await condition()
                 }
-                try? await Task.sleep(for: .milliseconds(1))
+                return true
+            } catch {
+                return condition()
             }
-            return condition()
         }
     }
 
@@ -3089,12 +3095,25 @@ import XCTest
         }
 
         func waitUntilStarted(timeout: Duration = .seconds(2)) async -> Bool {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while !started, clock.now < deadline {
-                try? await Task.sleep(for: .milliseconds(1))
+            let timeoutSeconds = TimeInterval(timeout.components.seconds)
+                + TimeInterval(timeout.components.attoseconds) / 1_000_000_000_000_000_000
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "OracleWorktreeGate started",
+                    timeout: max(timeoutSeconds, 0.001),
+                    initialDelayNanoseconds: 1_000_000,
+                    maximumDelayNanoseconds: 25_000_000
+                ) {
+                    await self.hasStarted()
+                }
+                return true
+            } catch {
+                return started
             }
-            return started
+        }
+
+        private func hasStarted() -> Bool {
+            started
         }
 
         func release() {

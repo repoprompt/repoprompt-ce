@@ -3259,20 +3259,27 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 guard trackedSession != nil else {
                     throw FixtureError.trackedSessionMissing
                 }
-                let deadline = ContinuousClock.now + .seconds(5)
-                while ContinuousClock.now < deadline {
-                    observeFirstAgentTaskIfNeeded()
-                    if FileManager.default.fileExists(atPath: socketURL.path) {
-                        let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
+                do {
+                    try await AsyncTestWait.waitUntilThrowing(
+                        "acceptedSubmitAndAwaitOwnedSocket",
+                        timeout: 5.0,
+                        initialDelayNanoseconds: 10_000_000,
+                        maximumDelayNanoseconds: 100_000_000
+                    ) {
+                        self.observeFirstAgentTaskIfNeeded()
+                        guard FileManager.default.fileExists(atPath: self.socketURL.path) else {
+                            return false
+                        }
+                        let attributes = try FileManager.default.attributesOfItem(atPath: self.socketURL.path)
                         guard attributes[.type] as? FileAttributeType == .typeSocket else {
                             throw FixtureError.ownedPathWasNotSocket
                         }
-                        ownedSocketObserved = true
-                        return
+                        return true
                     }
-                    try await Task.sleep(for: .milliseconds(10))
+                    ownedSocketObserved = true
+                } catch is AsyncTestConditionTimeout {
+                    throw FixtureError.ownedSocketDidNotAppear
                 }
-                throw FixtureError.ownedSocketDidNotAppear
             }
 
             func cleanup(window: WindowState) async throws {
