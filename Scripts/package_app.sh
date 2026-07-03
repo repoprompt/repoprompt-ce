@@ -232,7 +232,8 @@ printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_S
 
 phase "Creating app bundle layout"
 run rm -rf "$APP_BUNDLE"
-if [[ "$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")" != "1" ]]; then
+APP_BUNDLE_MATCHES_COMPAT="$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")"
+if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     run rm -rf "$COMPAT_APP_BUNDLE"
 fi
 run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
@@ -396,7 +397,7 @@ if (( PUBLIC_UNIVERSAL_RELEASE )); then
 fi
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
 run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
-if [[ "$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")" != "1" ]]; then
+if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     phase "Updating compatibility app bundle link"
     run mkdir -p "$(dirname "$COMPAT_APP_BUNDLE")"
     if (( USE_ADHOC_SIGNING )); then

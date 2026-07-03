@@ -107,9 +107,7 @@ test:
 	swift test
 
 guardrails:
-	./Scripts/source_layout_guardrails.sh
-	./Scripts/contributor_allowlist_guardrails.sh
-	./Scripts/swiftpm_notice_guardrails.sh
+	./Scripts/guardrails.sh
 
 conductor-selftest:
 	python3 Scripts/test_debug_app_process.py

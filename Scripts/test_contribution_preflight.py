@@ -155,15 +155,19 @@ class ContributionPreflightTests(unittest.TestCase):
             self.assertIn("PR-ready preflight passed", result.stdout)
 
     def test_pr_ready_runs_conductor_selftest_for_preflight_control_plane_changes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo, preflight, env = self.create_repo(
-                Path(tmp), outgoing_path="Scripts/test_contribution_preflight.py"
-            )
+        cases = [
+            ("preflight tests", "Scripts/test_contribution_preflight.py"),
+            ("guardrails aggregator", "Scripts/guardrails.sh"),
+        ]
 
-            result = self.run_preflight(repo, preflight, env, "pr-ready")
+        for name, outgoing_path in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                repo, preflight, env = self.create_repo(Path(tmp), outgoing_path=outgoing_path)
 
-            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET])
+                result = self.run_preflight(repo, preflight, env, "pr-ready")
+
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET])
 
     def test_pr_ready_runs_ci_app_test_runner_selftest_for_hosted_ci_runner_changes(self) -> None:
         cases = [

@@ -92,36 +92,13 @@ write_range_files() {
   git diff --name-only -z "$base_ref"...HEAD -- > "$output"
 }
 
-range_contains() {
-  local files="$1"
-  local pattern="$2"
-  local file
-  while IFS= read -r -d '' file; do
-    if [[ "$file" =~ $pattern ]]; then
-      return 0
-    fi
-  done < "$files"
-  return 1
-}
-
-run_pr_ready_validation_if_range_contains() {
-  local files="$1"
-  local pattern="$2"
-  local label="$3"
-  shift 3
-  if range_contains "$files" "$pattern"; then
-    log "$label"
-    "$@"
-  fi
-}
-
 run_pr_ready_path_validations() {
   local files
   ensure_tmp_root
   files="$tmp_root/range-files.z"
   write_range_files "$files"
 
-  local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
+  local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/guardrails\.sh|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
   local ci_app_test_runner_paths_pattern='^(Scripts/ci_app_test_runner\.py|Scripts/test_ci_app_test_runner\.py|\.github/workflows/ci\.yml)$'
   local swift_paths_pattern='\.swift$'
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'
@@ -131,24 +108,65 @@ run_pr_ready_path_validations() {
   local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
   local xcode_generator_test_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|Scripts/test_xcode_workspace_generator\.py|\.github/workflows/xcode-workspace\.yml)$'
 
-  run_pr_ready_validation_if_range_contains "$files" "$control_plane_paths_pattern" "Run conductor self-tests" \
+  local has_control_plane_changes=0
+  local has_ci_app_test_runner_changes=0
+  local has_swift_changes=0
+  local has_root_test_changes=0
+  local has_provider_package_changes=0
+  local has_repoprompt_product_changes=0
+  local has_mcp_product_changes=0
+  local has_xcode_generator_test_changes=0
+  local has_xcode_full_validation_changes=0
+  local file
+
+  while IFS= read -r -d '' file; do
+    [[ "$file" =~ $control_plane_paths_pattern ]] && has_control_plane_changes=1
+    [[ "$file" =~ $ci_app_test_runner_paths_pattern ]] && has_ci_app_test_runner_changes=1
+    [[ "$file" =~ $swift_paths_pattern ]] && has_swift_changes=1
+    [[ "$file" =~ $root_test_paths_pattern ]] && has_root_test_changes=1
+    [[ "$file" =~ $provider_package_paths_pattern ]] && has_provider_package_changes=1
+    [[ "$file" =~ $repoprompt_product_paths_pattern ]] && has_repoprompt_product_changes=1
+    [[ "$file" =~ $mcp_product_paths_pattern ]] && has_mcp_product_changes=1
+    [[ "$file" =~ $xcode_generator_test_paths_pattern ]] && has_xcode_generator_test_changes=1
+    [[ "$file" =~ $xcode_full_validation_paths_pattern ]] && has_xcode_full_validation_changes=1
+  done < "$files"
+
+  if (( has_control_plane_changes )); then
+    log "Run conductor self-tests"
     make conductor-selftest
-  run_pr_ready_validation_if_range_contains "$files" "$ci_app_test_runner_paths_pattern" "Run CI app-test runner self-tests" \
+  fi
+  if (( has_ci_app_test_runner_changes )); then
+    log "Run CI app-test runner self-tests"
     make ci-app-test-runner-selftest
-  run_pr_ready_validation_if_range_contains "$files" "$swift_paths_pattern" "Run coordinated Swift lint" \
+  fi
+  if (( has_swift_changes )); then
+    log "Run coordinated Swift lint"
     make dev-lint
-  run_pr_ready_validation_if_range_contains "$files" "$root_test_paths_pattern" "Run coordinated root tests" \
+  fi
+  if (( has_root_test_changes )); then
+    log "Run coordinated root tests"
     make dev-test
-  run_pr_ready_validation_if_range_contains "$files" "$provider_package_paths_pattern" "Run coordinated provider tests" \
+  fi
+  if (( has_provider_package_changes )); then
+    log "Run coordinated provider tests"
     make dev-provider-test
-  run_pr_ready_validation_if_range_contains "$files" "$repoprompt_product_paths_pattern" "Build RepoPrompt product" \
+  fi
+  if (( has_repoprompt_product_changes )); then
+    log "Build RepoPrompt product"
     make dev-swift-build PRODUCT=RepoPrompt
-  run_pr_ready_validation_if_range_contains "$files" "$mcp_product_paths_pattern" "Build repoprompt-mcp product" \
+  fi
+  if (( has_mcp_product_changes )); then
+    log "Build repoprompt-mcp product"
     make dev-swift-build PRODUCT=repoprompt-mcp
-  run_pr_ready_validation_if_range_contains "$files" "$xcode_generator_test_paths_pattern" "Run Xcode workspace generator tests" \
+  fi
+  if (( has_xcode_generator_test_changes )); then
+    log "Run Xcode workspace generator tests"
     make xcode-generator-test
-  run_pr_ready_validation_if_range_contains "$files" "$xcode_full_validation_paths_pattern" "Validate generated Xcode workspace" \
+  fi
+  if (( has_xcode_full_validation_changes )); then
+    log "Validate generated Xcode workspace"
     make xcode-validate
+  fi
 }
 
 push_success() {
