@@ -66,6 +66,15 @@ private final class TemplateRepository: @unchecked Sendable {
     private enum GitEnvironment {
         case reviewFixture
         case receiptFixture
+
+        var commandRunnerEnvironment: TestGitCommandRunner.Environment {
+            switch self {
+            case .reviewFixture:
+                .hermetic
+            case .receiptFixture:
+                .inheritedGlobalConfig
+            }
+        }
     }
 
     private let kind: ImmutableGitRepositoryTemplate.Kind
@@ -408,35 +417,12 @@ private final class TemplateRepository: @unchecked Sendable {
 
     @discardableResult
     private static func runGit(_ arguments: [String], cwd: URL, environment: GitEnvironment) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = cwd
-        var processEnvironment = ProcessInfo.processInfo.environment
-        processEnvironment["GIT_CONFIG_NOSYSTEM"] = "1"
-        if environment == .reviewFixture {
-            processEnvironment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        }
-        processEnvironment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = processEnvironment
-
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard process.terminationStatus == 0 else {
-            throw NSError(
-                domain: "ImmutableGitRepositoryTemplate.git",
-                code: Int(process.terminationStatus),
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "git \(arguments.joined(separator: " ")) failed in \(cwd.path): \(text)"
-                ]
-            )
-        }
-        return text
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: cwd,
+            environment: environment.commandRunnerEnvironment,
+            failureDomain: "ImmutableGitRepositoryTemplate.git"
+        )
     }
 
     private static func write(_ contents: String, to relativePath: String, at root: URL) throws {

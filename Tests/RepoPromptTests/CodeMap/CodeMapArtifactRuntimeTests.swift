@@ -399,7 +399,7 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         XCTAssertTrue(runtime.locatorStore === locatorStore)
         XCTAssertTrue(runtime.coordinator === coordinator)
 
-        let input = try makeLocatorInput(root: root)
+        let input = try await makeLocatorInput(root: root)
         let result = try await coordinator.resolve(
             CodeMapArtifactBuildRequest(
                 ownerID: UUID(),
@@ -630,9 +630,9 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         return URL(fileURLWithPath: resolvedPath, isDirectory: true)
     }
 
-    private func makeLocatorInput(root: URL) throws -> CodeMapArtifactBuildInput {
+    private func makeLocatorInput(root: URL) async throws -> CodeMapArtifactBuildInput {
         let bytes = Data("runtime ownership".utf8)
-        let source = try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+        let source = try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
             bytes: bytes,
             objectFormat: .sha1,
             namespaceScope: root.path

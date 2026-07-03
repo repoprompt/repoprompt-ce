@@ -64,421 +64,421 @@
         }
 
         #if RPCE_BENCHMARK_TESTS
-        func testLongActiveCrawlFinalTurnRefreshBenchmarkReport() async throws {
-            try XCTSkipUnless(
-                ProcessInfo.processInfo.environment["RP_RUN_TRANSCRIPT_METRICS"] == "1"
-                    || ProcessInfo.processInfo.environment["RP_CE_TRANSCRIPT_CRAWL_REFRESH_REPORT_PATH"] != nil
-                    || FileManager.default.fileExists(atPath: crawlTranscriptRefreshOptInFlagURL().path),
-                "CE crawl transcript refresh benchmark is opt-in. Set RP_RUN_TRANSCRIPT_METRICS=1, RP_CE_TRANSCRIPT_CRAWL_REFRESH_REPORT_PATH, or create /tmp/RepoPromptCE-crawl-transcript-refresh-opt-in."
-            )
-
-            let recorder = TranscriptInstrumentationRecorder()
-            AgentTranscriptDebugInstrumentation.reset()
-            AgentTranscriptDebugInstrumentation.isEnabled = true
-            AgentTranscriptDebugInstrumentation.protectedTailScanHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.compactionHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.workingSourceItemsHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.rebuildHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.projectionBuildHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.refreshAttemptHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.presentationPublishHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler = { recorder.record($0) }
-            AgentTranscriptDebugInstrumentation.projectionIdentityHandler = { recorder.record($0) }
-            defer { AgentTranscriptDebugInstrumentation.reset() }
-
-            var aggregates: [CrawlRefreshBenchmarkAggregate] = []
-            for config in CrawlRefreshScenarioConfig.matrix {
-                let aggregate = try await runCrawlRefreshBenchmark(config: config, recorder: recorder)
-                XCTAssertEqual(aggregate.actualItemCount, config.targetItemCount, config.scenarioName)
-                XCTAssertTrue(aggregate.measured.allSatisfy { $0.itemCount == config.targetItemCount }, config.scenarioName)
-                XCTAssertEqual(aggregate.peakRetainedPayloadEntryCount, config.toolResultPairCount, config.scenarioName)
-                XCTAssertLessThanOrEqual(
-                    abs(aggregate.peakRetainedPayloadBytes - aggregate.aggregatePayloadBytes),
-                    config.payloadBytesPerResult,
-                    config.scenarioName
+            func testLongActiveCrawlFinalTurnRefreshBenchmarkReport() async throws {
+                try XCTSkipUnless(
+                    ProcessInfo.processInfo.environment["RP_RUN_TRANSCRIPT_METRICS"] == "1"
+                        || ProcessInfo.processInfo.environment["RP_CE_TRANSCRIPT_CRAWL_REFRESH_REPORT_PATH"] != nil
+                        || FileManager.default.fileExists(atPath: crawlTranscriptRefreshOptInFlagURL().path),
+                    "CE crawl transcript refresh benchmark is opt-in. Set RP_RUN_TRANSCRIPT_METRICS=1, RP_CE_TRANSCRIPT_CRAWL_REFRESH_REPORT_PATH, or create /tmp/RepoPromptCE-crawl-transcript-refresh-opt-in."
                 )
-                aggregates.append(aggregate)
-            }
 
-            let retained500 = try XCTUnwrap(aggregates.first { $0.config.targetItemCount == 500 })
-            let retained2000 = try XCTUnwrap(aggregates.first { $0.config.targetItemCount == 2000 })
-            let retainedGrowthRatio = retained2000.trimmedP95RefreshMS / max(0.001, retained500.trimmedP95RefreshMS)
-            XCTAssertTrue(retainedGrowthRatio.isFinite)
-            XCTAssertGreaterThan(retainedGrowthRatio, 0)
+                let recorder = TranscriptInstrumentationRecorder()
+                AgentTranscriptDebugInstrumentation.reset()
+                AgentTranscriptDebugInstrumentation.isEnabled = true
+                AgentTranscriptDebugInstrumentation.protectedTailScanHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.compactionHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.workingSourceItemsHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.rebuildHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.projectionBuildHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.refreshAttemptHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.presentationPublishHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.projectionIdentityHandler = { recorder.record($0) }
+                defer { AgentTranscriptDebugInstrumentation.reset() }
 
-            let reportURL = crawlTranscriptRefreshReportURL()
-            let benchmarkJSON = try crawlRefreshBenchmarkJSON(aggregates, reportURL: reportURL)
-            let reportText = formatCrawlRefreshBenchmarkReport(aggregates, reportURL: reportURL, benchmarkJSON: benchmarkJSON)
-
-            try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try reportText.write(to: reportURL, atomically: true, encoding: .utf8)
-            print(reportText)
-            print("REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_JSON=\(benchmarkJSON)")
-        }
-
-        private struct CrawlRefreshScenarioConfig {
-            let scenarioName: String
-            let targetItemCount: Int
-            let toolResultPairCount: Int
-            let payloadBytesPerResult: Int
-            let measuredSampleCount: Int
-            let warmupSampleCount: Int
-
-            static let aggregatePayloadBudgetBytes = 1024 * 1024
-            static let matrix: [CrawlRefreshScenarioConfig] = [
-                CrawlRefreshScenarioConfig(
-                    scenarioName: "long_active_final_turn_replace_tail_40x24KiB_raw_tools",
-                    targetItemCount: 82,
-                    toolResultPairCount: 40,
-                    payloadBytesPerResult: 24 * 1024
-                ),
-                retainedItemScenario(targetItemCount: 50),
-                retainedItemScenario(targetItemCount: 500),
-                retainedItemScenario(targetItemCount: 2000)
-            ]
-
-            init(
-                scenarioName: String,
-                targetItemCount: Int,
-                toolResultPairCount: Int,
-                payloadBytesPerResult: Int,
-                measuredSampleCount: Int = 9,
-                warmupSampleCount: Int = 1
-            ) {
-                self.scenarioName = scenarioName
-                self.targetItemCount = targetItemCount
-                self.toolResultPairCount = toolResultPairCount
-                self.payloadBytesPerResult = payloadBytesPerResult
-                self.measuredSampleCount = measuredSampleCount
-                self.warmupSampleCount = warmupSampleCount
-            }
-
-            private static func retainedItemScenario(targetItemCount: Int) -> CrawlRefreshScenarioConfig {
-                let pairCount = (targetItemCount - 2) / 2
-                let payloadBytes = min(24 * 1024, max(1024, aggregatePayloadBudgetBytes / pairCount))
-                return CrawlRefreshScenarioConfig(
-                    scenarioName: "long_active_final_turn_retained_items_\(targetItemCount)",
-                    targetItemCount: targetItemCount,
-                    toolResultPairCount: pairCount,
-                    payloadBytesPerResult: payloadBytes
-                )
-            }
-        }
-
-        private struct CrawlRefreshSeed {
-            let items: [AgentChatItem]
-            let representativeToolResultID: UUID
-            let representativeMarker: String
-            let aggregatePayloadBytes: Int
-        }
-
-        private struct CrawlRefreshBenchmarkSample {
-            let ordinal: Int
-            let phase: String
-            let mutationWallClockMS: Double
-            let refreshMS: Double
-            let importMS: Double?
-            let incrementalImportMS: Double?
-            let sanitizeMS: Double?
-            let projectionMS: Double?
-            let payloadCaptureMS: Double?
-            let sanitizedActivityCount: Int?
-            let sourceItemsRevision: Int
-            let itemCount: Int
-            let transcriptTurnCount: Int
-            let rawToolResultBytesInItems: Int
-            let ephemeralPayloadBytes: Int
-            let retainedPayloadEntryCount: Int
-            let retainedPayloadBytesFromSnapshot: Int
-            let toolProcessingMetrics: AgentToolResultProcessingMetrics
-            let incrementalImportAttempts: Int
-            let incrementalImportSuccesses: Int
-            let incrementalImportFallbacks: Int
-            let refreshAttemptCount: Int
-            let rebuildCount: Int
-            let projectionBuildCount: Int
-            let sessionItemReplacementCount: Int
-            let compactionCount: Int
-            let presentationPublishCount: Int
-        }
-
-        private struct CrawlRefreshBenchmarkAggregate {
-            let scenario: String
-            let config: CrawlRefreshScenarioConfig
-            let actualItemCount: Int
-            let aggregatePayloadBytes: Int
-            let peakRetainedPayloadEntryCount: Int
-            let peakRetainedPayloadBytes: Int
-            let warmup: CrawlRefreshBenchmarkSample
-            let measured: [CrawlRefreshBenchmarkSample]
-            let trimmedRefreshMS: [Double]
-            let trimmedMedianRefreshMS: Double
-            let trimmedP95RefreshMS: Double
-            let trimmedMutationMedianMS: Double
-            let trimmedMutationP95MS: Double
-        }
-
-        private struct TranscriptPerformanceDelta {
-            let incrementalImportAttemptCount: Int
-            let incrementalImportSuccessCount: Int
-            let incrementalImportFallbackCount: Int
-        }
-
-        @MainActor
-        private func runCrawlRefreshBenchmark(
-            config: CrawlRefreshScenarioConfig,
-            recorder: TranscriptInstrumentationRecorder
-        ) async throws -> CrawlRefreshBenchmarkAggregate {
-            let viewModel = makeViewModel()
-            let tabID = UUID()
-            viewModel.test_setCurrentTabIDOverride(tabID)
-            defer { viewModel.test_setCurrentTabIDOverride(nil) }
-
-            let session = await viewModel.ensureSessionReady(tabID: tabID)
-            let seed = try makeLongActiveCrawlFinalTurnItems(config: config)
-            defer {
-                session.saveDebounceTask?.cancel()
-                session.saveDebounceTask = nil
-                session.derivedTranscriptRefreshTask?.cancel()
-                session.derivedTranscriptRefreshTask = nil
-            }
-
-            session.selectedAgent = .codexExec
-            session.runState = .running
-            session.setItemsSilently(seed.items, reason: .testOverride)
-            viewModel.refreshDerivedTranscriptState(for: session)
-            viewModel.applySessionToBindings(session)
-            await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
-
-            XCTAssertEqual(session.runState, .running)
-            XCTAssertEqual(session.items.count, seed.items.count)
-            XCTAssertFalse(session.transcriptProjection.workingRows.isEmpty)
-            let initialRawPayload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: seed.representativeToolResultID))
-            XCTAssertTrue(initialRawPayload.contains(seed.representativeMarker))
-            let representativeSourceItem = try XCTUnwrap(session.items.first(where: { $0.id == seed.representativeToolResultID }))
-            XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: representativeSourceItem.toolResultJSON ?? ""))
-
-            let presentationMark = recorder.mark()
-            let fullBindingSyncCount = viewModel.test_updateBindingsCallCount
-            viewModel.enqueueAssistantDelta("\nCE_CRAWL_PRESENTATION_ONLY_PREFLIGHT", session: session)
-            viewModel.flushPendingAssistantDelta(session)
-            viewModel.test_flushPendingUIRefresh()
-            let presentationMetrics = recorder.slice(since: presentationMark)
-            XCTAssertEqual(presentationMetrics.presentationPublishes.count, 1)
-            XCTAssertEqual(viewModel.test_updateBindingsCallCount, fullBindingSyncCount)
-
-            session.setItemsSilently(seed.items, reason: .testOverride)
-            viewModel.refreshDerivedTranscriptState(for: session)
-            viewModel.applySessionToBindings(session)
-            await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
-
-            var warmups: [CrawlRefreshBenchmarkSample] = []
-            for ordinal in 1 ... config.warmupSampleCount {
-                try await warmups.append(runCrawlRefreshBenchmarkSample(
-                    viewModel: viewModel,
-                    session: session,
-                    seed: seed,
-                    expectedItemCount: seed.items.count,
-                    ordinal: ordinal,
-                    phase: "warmup",
-                    recorder: recorder
-                ))
-            }
-
-            var measured: [CrawlRefreshBenchmarkSample] = []
-            for ordinal in 1 ... config.measuredSampleCount {
-                try await measured.append(runCrawlRefreshBenchmarkSample(
-                    viewModel: viewModel,
-                    session: session,
-                    seed: seed,
-                    expectedItemCount: seed.items.count,
-                    ordinal: ordinal,
-                    phase: "measured",
-                    recorder: recorder
-                ))
-            }
-
-            let trimmedSamples = trimmedRefreshSamples(measured)
-            let trimmedRefreshMS = trimmedSamples.map(\.refreshMS)
-            let trimmedMutationMS = trimmedSamples.map(\.mutationWallClockMS)
-            return try CrawlRefreshBenchmarkAggregate(
-                scenario: config.scenarioName,
-                config: config,
-                actualItemCount: seed.items.count,
-                aggregatePayloadBytes: seed.aggregatePayloadBytes,
-                peakRetainedPayloadEntryCount: measured.map(\.retainedPayloadEntryCount).max() ?? 0,
-                peakRetainedPayloadBytes: measured.map(\.retainedPayloadBytesFromSnapshot).max() ?? 0,
-                warmup: XCTUnwrap(warmups.first),
-                measured: measured,
-                trimmedRefreshMS: trimmedRefreshMS,
-                trimmedMedianRefreshMS: median(trimmedRefreshMS),
-                trimmedP95RefreshMS: nearestRankP95(trimmedRefreshMS),
-                trimmedMutationMedianMS: median(trimmedMutationMS),
-                trimmedMutationP95MS: nearestRankP95(trimmedMutationMS)
-            )
-        }
-
-        @MainActor
-        private func runCrawlRefreshBenchmarkSample(
-            viewModel: AgentModeViewModel,
-            session: AgentModeViewModel.TabSession,
-            seed: CrawlRefreshSeed,
-            expectedItemCount: Int,
-            ordinal: Int,
-            phase: String,
-            recorder: TranscriptInstrumentationRecorder
-        ) async throws -> CrawlRefreshBenchmarkSample {
-            let trailingIndex = expectedItemCount - 1
-            let previousAssistant = try XCTUnwrap(session.items.indices.contains(trailingIndex) ? session.items[trailingIndex] : nil)
-            let replacementText = "CE_CRAWL_REFRESH_REPLACEMENT_\(phase)_\(ordinal)"
-            let replacement = AgentChatItem(
-                id: previousAssistant.id,
-                timestamp: previousAssistant.timestamp,
-                kind: .assistant,
-                text: replacementText,
-                sequenceIndex: previousAssistant.sequenceIndex
-            )
-            let beforePerformance = session.transcriptPerformanceSnapshot
-            let mark = recorder.mark()
-            let start = DispatchTime.now().uptimeNanoseconds
-            session.replaceItem(at: trailingIndex, with: replacement)
-            await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: session.tabID)
-            let elapsedMS = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-            let metrics = recorder.slice(since: mark)
-            let snapshot = session.transcriptPerformanceSnapshot
-            let refreshMS = try XCTUnwrap(snapshot.lastRefreshTotalDurationMS)
-
-            XCTAssertEqual(session.runState, .running)
-            XCTAssertEqual(session.items.count, expectedItemCount)
-            XCTAssertTrue(session.transcriptProjection.workingRows.contains { $0.id == replacement.id && $0.text.contains(replacementText) })
-            let rawPayload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: seed.representativeToolResultID))
-            XCTAssertTrue(rawPayload.contains(seed.representativeMarker))
-            XCTAssertNil(session.derivedTranscriptRefreshTask)
-            XCTAssertFalse(session.transcriptProjection.workingRows.isEmpty)
-
-            let representativeSourceItem = try XCTUnwrap(session.items.first(where: { $0.id == seed.representativeToolResultID }))
-            XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: representativeSourceItem.toolResultJSON ?? ""))
-            XCTAssertFalse(representativeSourceItem.toolResultJSON?.contains(seed.representativeMarker) ?? false)
-
-            let delta = performanceDelta(from: beforePerformance, to: snapshot)
-            return CrawlRefreshBenchmarkSample(
-                ordinal: ordinal,
-                phase: phase,
-                mutationWallClockMS: elapsedMS,
-                refreshMS: refreshMS,
-                importMS: snapshot.lastImportDurationMS,
-                incrementalImportMS: snapshot.lastIncrementalImportDurationMS,
-                sanitizeMS: snapshot.lastSanitizeDurationMS,
-                projectionMS: snapshot.lastProjectionBuildDurationMS,
-                payloadCaptureMS: snapshot.lastPayloadCaptureDurationMS,
-                sanitizedActivityCount: snapshot.lastSanitizedActivityCount,
-                sourceItemsRevision: session.sourceItemsRevision,
-                itemCount: session.items.count,
-                transcriptTurnCount: session.transcript.turns.count,
-                rawToolResultBytesInItems: rawToolResultBytes(in: session.items),
-                ephemeralPayloadBytes: ephemeralPayloadBytes(in: session),
-                retainedPayloadEntryCount: snapshot.retainedRawPayloadEntryCount,
-                retainedPayloadBytesFromSnapshot: snapshot.retainedRawPayloadTotalBytes,
-                toolProcessingMetrics: snapshot.lastToolProcessingMetrics,
-                incrementalImportAttempts: delta.incrementalImportAttemptCount,
-                incrementalImportSuccesses: delta.incrementalImportSuccessCount,
-                incrementalImportFallbacks: delta.incrementalImportFallbackCount,
-                refreshAttemptCount: metrics.refreshAttempts.count,
-                rebuildCount: metrics.rebuilds.count,
-                projectionBuildCount: metrics.projectionBuilds.count,
-                sessionItemReplacementCount: metrics.sessionItemsReplacements.count,
-                compactionCount: metrics.compactions.count,
-                presentationPublishCount: metrics.presentationPublishes.count
-            )
-        }
-
-        private func makeLongActiveCrawlFinalTurnItems(config: CrawlRefreshScenarioConfig) throws -> CrawlRefreshSeed {
-            var sequenceIndex = 0
-            var items: [AgentChatItem] = [AgentChatItem.user("Run a long active crawl and keep refreshing the transcript.", sequenceIndex: sequenceIndex)]
-            sequenceIndex += 1
-            let toolCycle = ["apply_patch", "apply_edits", "bash"]
-            var representativeID: UUID?
-            var representativeMarker: String?
-            for ordinal in 0 ..< config.toolResultPairCount {
-                let toolName = toolCycle[ordinal % toolCycle.count]
-                let marker = "CE_CRAWL_REFRESH_RAW_PAYLOAD_MARKER_\(ordinal)"
-                let invocationID = UUID()
-                items.append(AgentChatItem.toolCall(
-                    name: toolName,
-                    invocationID: invocationID,
-                    argsJSON: crawlRefreshToolArgsJSON(toolName: toolName, ordinal: ordinal),
-                    sequenceIndex: sequenceIndex
-                ))
-                sequenceIndex += 1
-                let payload = try crawlRefreshToolResultJSON(
-                    toolName: toolName,
-                    ordinal: ordinal,
-                    marker: marker,
-                    minimumPayloadBytes: config.payloadBytesPerResult
-                )
-                let result = AgentChatItem.toolResult(
-                    name: toolName,
-                    invocationID: invocationID,
-                    resultJSON: payload,
-                    isError: false,
-                    sequenceIndex: sequenceIndex
-                )
-                if representativeID == nil {
-                    representativeID = result.id
-                    representativeMarker = marker
+                var aggregates: [CrawlRefreshBenchmarkAggregate] = []
+                for config in CrawlRefreshScenarioConfig.matrix {
+                    let aggregate = try await runCrawlRefreshBenchmark(config: config, recorder: recorder)
+                    XCTAssertEqual(aggregate.actualItemCount, config.targetItemCount, config.scenarioName)
+                    XCTAssertTrue(aggregate.measured.allSatisfy { $0.itemCount == config.targetItemCount }, config.scenarioName)
+                    XCTAssertEqual(aggregate.peakRetainedPayloadEntryCount, config.toolResultPairCount, config.scenarioName)
+                    XCTAssertLessThanOrEqual(
+                        abs(aggregate.peakRetainedPayloadBytes - aggregate.aggregatePayloadBytes),
+                        config.payloadBytesPerResult,
+                        config.scenarioName
+                    )
+                    aggregates.append(aggregate)
                 }
-                items.append(result)
-                sequenceIndex += 1
-            }
-            items.append(AgentChatItem.assistant("CE_CRAWL_REFRESH_INITIAL_TAIL", sequenceIndex: sequenceIndex))
-            return try CrawlRefreshSeed(
-                items: items,
-                representativeToolResultID: XCTUnwrap(representativeID),
-                representativeMarker: XCTUnwrap(representativeMarker),
-                aggregatePayloadBytes: rawToolResultBytes(in: items)
-            )
-        }
 
-        private func crawlRefreshToolArgsJSON(toolName: String, ordinal: Int) -> String {
-            switch toolName {
-            case "apply_patch":
-                #"{"patch":"*** Begin Patch\n*** Update File: Crawl.swift\n@@\n- old\n+ new\n*** End Patch"}"#
-            case "apply_edits":
-                #"{"path":"Crawl.swift","edits":[{"search":"old","replace":"new"}]}"#
-            case "bash":
-                #"{"cmd":"printf crawl-refresh"}"#
-            default:
-                #"{"ordinal":\#(ordinal)}"#
-            }
-        }
+                let retained500 = try XCTUnwrap(aggregates.first { $0.config.targetItemCount == 500 })
+                let retained2000 = try XCTUnwrap(aggregates.first { $0.config.targetItemCount == 2000 })
+                let retainedGrowthRatio = retained2000.trimmedP95RefreshMS / max(0.001, retained500.trimmedP95RefreshMS)
+                XCTAssertTrue(retainedGrowthRatio.isFinite)
+                XCTAssertGreaterThan(retainedGrowthRatio, 0)
 
-        private func crawlRefreshToolResultJSON(
-            toolName: String,
-            ordinal: Int,
-            marker: String,
-            minimumPayloadBytes: Int
-        ) throws -> String {
-            let diff = "@@ -1,3 +1,3 @@\n- old crawl line \(ordinal)\n+ new crawl line \(ordinal) \(marker)\n"
-            var payload: [String: Any] = switch toolName {
-            case "apply_patch":
-                ["status": "success", "marker": marker, "changes": [["path": "Sources/Crawl\(ordinal).swift", "diff": diff]]]
-            case "apply_edits":
-                ["status": "success", "marker": marker, "path": "Sources/Crawl\(ordinal).swift", "card_unified_diff": diff, "edits": [["path": "Sources/Crawl\(ordinal).swift", "card_unified_diff": diff]]]
-            case "bash":
-                ["status": "success", "marker": marker, "stdout": "crawl bash output \(marker)\n", "stderr": "", "metadata": ["exit_code": 0, "duration_ms": 12, "command": "printf crawl-refresh"]]
-            default:
-                ["status": "success", "marker": marker]
+                let reportURL = crawlTranscriptRefreshReportURL()
+                let benchmarkJSON = try crawlRefreshBenchmarkJSON(aggregates, reportURL: reportURL)
+                let reportText = formatCrawlRefreshBenchmarkReport(aggregates, reportURL: reportURL, benchmarkJSON: benchmarkJSON)
+
+                try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try reportText.write(to: reportURL, atomically: true, encoding: .utf8)
+                print(reportText)
+                print("REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_JSON=\(benchmarkJSON)")
             }
-            var paddingBytes = minimumPayloadBytes
-            while true {
-                payload["padding"] = String(repeating: "\(marker)-payload-line-\(ordinal)\n", count: max(1, paddingBytes / 48))
-                let json = try jsonString(payload)
-                if json.utf8.count >= minimumPayloadBytes {
-                    return json
+
+            private struct CrawlRefreshScenarioConfig {
+                let scenarioName: String
+                let targetItemCount: Int
+                let toolResultPairCount: Int
+                let payloadBytesPerResult: Int
+                let measuredSampleCount: Int
+                let warmupSampleCount: Int
+
+                static let aggregatePayloadBudgetBytes = 1024 * 1024
+                static let matrix: [CrawlRefreshScenarioConfig] = [
+                    CrawlRefreshScenarioConfig(
+                        scenarioName: "long_active_final_turn_replace_tail_40x24KiB_raw_tools",
+                        targetItemCount: 82,
+                        toolResultPairCount: 40,
+                        payloadBytesPerResult: 24 * 1024
+                    ),
+                    retainedItemScenario(targetItemCount: 50),
+                    retainedItemScenario(targetItemCount: 500),
+                    retainedItemScenario(targetItemCount: 2000)
+                ]
+
+                init(
+                    scenarioName: String,
+                    targetItemCount: Int,
+                    toolResultPairCount: Int,
+                    payloadBytesPerResult: Int,
+                    measuredSampleCount: Int = 9,
+                    warmupSampleCount: Int = 1
+                ) {
+                    self.scenarioName = scenarioName
+                    self.targetItemCount = targetItemCount
+                    self.toolResultPairCount = toolResultPairCount
+                    self.payloadBytesPerResult = payloadBytesPerResult
+                    self.measuredSampleCount = measuredSampleCount
+                    self.warmupSampleCount = warmupSampleCount
                 }
-                paddingBytes += minimumPayloadBytes / 2
+
+                private static func retainedItemScenario(targetItemCount: Int) -> CrawlRefreshScenarioConfig {
+                    let pairCount = (targetItemCount - 2) / 2
+                    let payloadBytes = min(24 * 1024, max(1024, aggregatePayloadBudgetBytes / pairCount))
+                    return CrawlRefreshScenarioConfig(
+                        scenarioName: "long_active_final_turn_retained_items_\(targetItemCount)",
+                        targetItemCount: targetItemCount,
+                        toolResultPairCount: pairCount,
+                        payloadBytesPerResult: payloadBytes
+                    )
+                }
             }
-        }
+
+            private struct CrawlRefreshSeed {
+                let items: [AgentChatItem]
+                let representativeToolResultID: UUID
+                let representativeMarker: String
+                let aggregatePayloadBytes: Int
+            }
+
+            private struct CrawlRefreshBenchmarkSample {
+                let ordinal: Int
+                let phase: String
+                let mutationWallClockMS: Double
+                let refreshMS: Double
+                let importMS: Double?
+                let incrementalImportMS: Double?
+                let sanitizeMS: Double?
+                let projectionMS: Double?
+                let payloadCaptureMS: Double?
+                let sanitizedActivityCount: Int?
+                let sourceItemsRevision: Int
+                let itemCount: Int
+                let transcriptTurnCount: Int
+                let rawToolResultBytesInItems: Int
+                let ephemeralPayloadBytes: Int
+                let retainedPayloadEntryCount: Int
+                let retainedPayloadBytesFromSnapshot: Int
+                let toolProcessingMetrics: AgentToolResultProcessingMetrics
+                let incrementalImportAttempts: Int
+                let incrementalImportSuccesses: Int
+                let incrementalImportFallbacks: Int
+                let refreshAttemptCount: Int
+                let rebuildCount: Int
+                let projectionBuildCount: Int
+                let sessionItemReplacementCount: Int
+                let compactionCount: Int
+                let presentationPublishCount: Int
+            }
+
+            private struct CrawlRefreshBenchmarkAggregate {
+                let scenario: String
+                let config: CrawlRefreshScenarioConfig
+                let actualItemCount: Int
+                let aggregatePayloadBytes: Int
+                let peakRetainedPayloadEntryCount: Int
+                let peakRetainedPayloadBytes: Int
+                let warmup: CrawlRefreshBenchmarkSample
+                let measured: [CrawlRefreshBenchmarkSample]
+                let trimmedRefreshMS: [Double]
+                let trimmedMedianRefreshMS: Double
+                let trimmedP95RefreshMS: Double
+                let trimmedMutationMedianMS: Double
+                let trimmedMutationP95MS: Double
+            }
+
+            private struct TranscriptPerformanceDelta {
+                let incrementalImportAttemptCount: Int
+                let incrementalImportSuccessCount: Int
+                let incrementalImportFallbackCount: Int
+            }
+
+            @MainActor
+            private func runCrawlRefreshBenchmark(
+                config: CrawlRefreshScenarioConfig,
+                recorder: TranscriptInstrumentationRecorder
+            ) async throws -> CrawlRefreshBenchmarkAggregate {
+                let viewModel = makeViewModel()
+                let tabID = UUID()
+                viewModel.test_setCurrentTabIDOverride(tabID)
+                defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+                let session = await viewModel.ensureSessionReady(tabID: tabID)
+                let seed = try makeLongActiveCrawlFinalTurnItems(config: config)
+                defer {
+                    session.saveDebounceTask?.cancel()
+                    session.saveDebounceTask = nil
+                    session.derivedTranscriptRefreshTask?.cancel()
+                    session.derivedTranscriptRefreshTask = nil
+                }
+
+                session.selectedAgent = .codexExec
+                session.runState = .running
+                session.setItemsSilently(seed.items, reason: .testOverride)
+                viewModel.refreshDerivedTranscriptState(for: session)
+                viewModel.applySessionToBindings(session)
+                await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+
+                XCTAssertEqual(session.runState, .running)
+                XCTAssertEqual(session.items.count, seed.items.count)
+                XCTAssertFalse(session.transcriptProjection.workingRows.isEmpty)
+                let initialRawPayload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: seed.representativeToolResultID))
+                XCTAssertTrue(initialRawPayload.contains(seed.representativeMarker))
+                let representativeSourceItem = try XCTUnwrap(session.items.first(where: { $0.id == seed.representativeToolResultID }))
+                XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: representativeSourceItem.toolResultJSON ?? ""))
+
+                let presentationMark = recorder.mark()
+                let fullBindingSyncCount = viewModel.test_updateBindingsCallCount
+                viewModel.enqueueAssistantDelta("\nCE_CRAWL_PRESENTATION_ONLY_PREFLIGHT", session: session)
+                viewModel.flushPendingAssistantDelta(session)
+                viewModel.test_flushPendingUIRefresh()
+                let presentationMetrics = recorder.slice(since: presentationMark)
+                XCTAssertEqual(presentationMetrics.presentationPublishes.count, 1)
+                XCTAssertEqual(viewModel.test_updateBindingsCallCount, fullBindingSyncCount)
+
+                session.setItemsSilently(seed.items, reason: .testOverride)
+                viewModel.refreshDerivedTranscriptState(for: session)
+                viewModel.applySessionToBindings(session)
+                await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+
+                var warmups: [CrawlRefreshBenchmarkSample] = []
+                for ordinal in 1 ... config.warmupSampleCount {
+                    try await warmups.append(runCrawlRefreshBenchmarkSample(
+                        viewModel: viewModel,
+                        session: session,
+                        seed: seed,
+                        expectedItemCount: seed.items.count,
+                        ordinal: ordinal,
+                        phase: "warmup",
+                        recorder: recorder
+                    ))
+                }
+
+                var measured: [CrawlRefreshBenchmarkSample] = []
+                for ordinal in 1 ... config.measuredSampleCount {
+                    try await measured.append(runCrawlRefreshBenchmarkSample(
+                        viewModel: viewModel,
+                        session: session,
+                        seed: seed,
+                        expectedItemCount: seed.items.count,
+                        ordinal: ordinal,
+                        phase: "measured",
+                        recorder: recorder
+                    ))
+                }
+
+                let trimmedSamples = trimmedRefreshSamples(measured)
+                let trimmedRefreshMS = trimmedSamples.map(\.refreshMS)
+                let trimmedMutationMS = trimmedSamples.map(\.mutationWallClockMS)
+                return try CrawlRefreshBenchmarkAggregate(
+                    scenario: config.scenarioName,
+                    config: config,
+                    actualItemCount: seed.items.count,
+                    aggregatePayloadBytes: seed.aggregatePayloadBytes,
+                    peakRetainedPayloadEntryCount: measured.map(\.retainedPayloadEntryCount).max() ?? 0,
+                    peakRetainedPayloadBytes: measured.map(\.retainedPayloadBytesFromSnapshot).max() ?? 0,
+                    warmup: XCTUnwrap(warmups.first),
+                    measured: measured,
+                    trimmedRefreshMS: trimmedRefreshMS,
+                    trimmedMedianRefreshMS: median(trimmedRefreshMS),
+                    trimmedP95RefreshMS: nearestRankP95(trimmedRefreshMS),
+                    trimmedMutationMedianMS: median(trimmedMutationMS),
+                    trimmedMutationP95MS: nearestRankP95(trimmedMutationMS)
+                )
+            }
+
+            @MainActor
+            private func runCrawlRefreshBenchmarkSample(
+                viewModel: AgentModeViewModel,
+                session: AgentModeViewModel.TabSession,
+                seed: CrawlRefreshSeed,
+                expectedItemCount: Int,
+                ordinal: Int,
+                phase: String,
+                recorder: TranscriptInstrumentationRecorder
+            ) async throws -> CrawlRefreshBenchmarkSample {
+                let trailingIndex = expectedItemCount - 1
+                let previousAssistant = try XCTUnwrap(session.items.indices.contains(trailingIndex) ? session.items[trailingIndex] : nil)
+                let replacementText = "CE_CRAWL_REFRESH_REPLACEMENT_\(phase)_\(ordinal)"
+                let replacement = AgentChatItem(
+                    id: previousAssistant.id,
+                    timestamp: previousAssistant.timestamp,
+                    kind: .assistant,
+                    text: replacementText,
+                    sequenceIndex: previousAssistant.sequenceIndex
+                )
+                let beforePerformance = session.transcriptPerformanceSnapshot
+                let mark = recorder.mark()
+                let start = DispatchTime.now().uptimeNanoseconds
+                session.replaceItem(at: trailingIndex, with: replacement)
+                await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: session.tabID)
+                let elapsedMS = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                let metrics = recorder.slice(since: mark)
+                let snapshot = session.transcriptPerformanceSnapshot
+                let refreshMS = try XCTUnwrap(snapshot.lastRefreshTotalDurationMS)
+
+                XCTAssertEqual(session.runState, .running)
+                XCTAssertEqual(session.items.count, expectedItemCount)
+                XCTAssertTrue(session.transcriptProjection.workingRows.contains { $0.id == replacement.id && $0.text.contains(replacementText) })
+                let rawPayload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: seed.representativeToolResultID))
+                XCTAssertTrue(rawPayload.contains(seed.representativeMarker))
+                XCTAssertNil(session.derivedTranscriptRefreshTask)
+                XCTAssertFalse(session.transcriptProjection.workingRows.isEmpty)
+
+                let representativeSourceItem = try XCTUnwrap(session.items.first(where: { $0.id == seed.representativeToolResultID }))
+                XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: representativeSourceItem.toolResultJSON ?? ""))
+                XCTAssertFalse(representativeSourceItem.toolResultJSON?.contains(seed.representativeMarker) ?? false)
+
+                let delta = performanceDelta(from: beforePerformance, to: snapshot)
+                return CrawlRefreshBenchmarkSample(
+                    ordinal: ordinal,
+                    phase: phase,
+                    mutationWallClockMS: elapsedMS,
+                    refreshMS: refreshMS,
+                    importMS: snapshot.lastImportDurationMS,
+                    incrementalImportMS: snapshot.lastIncrementalImportDurationMS,
+                    sanitizeMS: snapshot.lastSanitizeDurationMS,
+                    projectionMS: snapshot.lastProjectionBuildDurationMS,
+                    payloadCaptureMS: snapshot.lastPayloadCaptureDurationMS,
+                    sanitizedActivityCount: snapshot.lastSanitizedActivityCount,
+                    sourceItemsRevision: session.sourceItemsRevision,
+                    itemCount: session.items.count,
+                    transcriptTurnCount: session.transcript.turns.count,
+                    rawToolResultBytesInItems: rawToolResultBytes(in: session.items),
+                    ephemeralPayloadBytes: ephemeralPayloadBytes(in: session),
+                    retainedPayloadEntryCount: snapshot.retainedRawPayloadEntryCount,
+                    retainedPayloadBytesFromSnapshot: snapshot.retainedRawPayloadTotalBytes,
+                    toolProcessingMetrics: snapshot.lastToolProcessingMetrics,
+                    incrementalImportAttempts: delta.incrementalImportAttemptCount,
+                    incrementalImportSuccesses: delta.incrementalImportSuccessCount,
+                    incrementalImportFallbacks: delta.incrementalImportFallbackCount,
+                    refreshAttemptCount: metrics.refreshAttempts.count,
+                    rebuildCount: metrics.rebuilds.count,
+                    projectionBuildCount: metrics.projectionBuilds.count,
+                    sessionItemReplacementCount: metrics.sessionItemsReplacements.count,
+                    compactionCount: metrics.compactions.count,
+                    presentationPublishCount: metrics.presentationPublishes.count
+                )
+            }
+
+            private func makeLongActiveCrawlFinalTurnItems(config: CrawlRefreshScenarioConfig) throws -> CrawlRefreshSeed {
+                var sequenceIndex = 0
+                var items: [AgentChatItem] = [AgentChatItem.user("Run a long active crawl and keep refreshing the transcript.", sequenceIndex: sequenceIndex)]
+                sequenceIndex += 1
+                let toolCycle = ["apply_patch", "apply_edits", "bash"]
+                var representativeID: UUID?
+                var representativeMarker: String?
+                for ordinal in 0 ..< config.toolResultPairCount {
+                    let toolName = toolCycle[ordinal % toolCycle.count]
+                    let marker = "CE_CRAWL_REFRESH_RAW_PAYLOAD_MARKER_\(ordinal)"
+                    let invocationID = UUID()
+                    items.append(AgentChatItem.toolCall(
+                        name: toolName,
+                        invocationID: invocationID,
+                        argsJSON: crawlRefreshToolArgsJSON(toolName: toolName, ordinal: ordinal),
+                        sequenceIndex: sequenceIndex
+                    ))
+                    sequenceIndex += 1
+                    let payload = try crawlRefreshToolResultJSON(
+                        toolName: toolName,
+                        ordinal: ordinal,
+                        marker: marker,
+                        minimumPayloadBytes: config.payloadBytesPerResult
+                    )
+                    let result = AgentChatItem.toolResult(
+                        name: toolName,
+                        invocationID: invocationID,
+                        resultJSON: payload,
+                        isError: false,
+                        sequenceIndex: sequenceIndex
+                    )
+                    if representativeID == nil {
+                        representativeID = result.id
+                        representativeMarker = marker
+                    }
+                    items.append(result)
+                    sequenceIndex += 1
+                }
+                items.append(AgentChatItem.assistant("CE_CRAWL_REFRESH_INITIAL_TAIL", sequenceIndex: sequenceIndex))
+                return try CrawlRefreshSeed(
+                    items: items,
+                    representativeToolResultID: XCTUnwrap(representativeID),
+                    representativeMarker: XCTUnwrap(representativeMarker),
+                    aggregatePayloadBytes: rawToolResultBytes(in: items)
+                )
+            }
+
+            private func crawlRefreshToolArgsJSON(toolName: String, ordinal: Int) -> String {
+                switch toolName {
+                case "apply_patch":
+                    #"{"patch":"*** Begin Patch\n*** Update File: Crawl.swift\n@@\n- old\n+ new\n*** End Patch"}"#
+                case "apply_edits":
+                    #"{"path":"Crawl.swift","edits":[{"search":"old","replace":"new"}]}"#
+                case "bash":
+                    #"{"cmd":"printf crawl-refresh"}"#
+                default:
+                    #"{"ordinal":\#(ordinal)}"#
+                }
+            }
+
+            private func crawlRefreshToolResultJSON(
+                toolName: String,
+                ordinal: Int,
+                marker: String,
+                minimumPayloadBytes: Int
+            ) throws -> String {
+                let diff = "@@ -1,3 +1,3 @@\n- old crawl line \(ordinal)\n+ new crawl line \(ordinal) \(marker)\n"
+                var payload: [String: Any] = switch toolName {
+                case "apply_patch":
+                    ["status": "success", "marker": marker, "changes": [["path": "Sources/Crawl\(ordinal).swift", "diff": diff]]]
+                case "apply_edits":
+                    ["status": "success", "marker": marker, "path": "Sources/Crawl\(ordinal).swift", "card_unified_diff": diff, "edits": [["path": "Sources/Crawl\(ordinal).swift", "card_unified_diff": diff]]]
+                case "bash":
+                    ["status": "success", "marker": marker, "stdout": "crawl bash output \(marker)\n", "stderr": "", "metadata": ["exit_code": 0, "duration_ms": 12, "command": "printf crawl-refresh"]]
+                default:
+                    ["status": "success", "marker": marker]
+                }
+                var paddingBytes = minimumPayloadBytes
+                while true {
+                    payload["padding"] = String(repeating: "\(marker)-payload-line-\(ordinal)\n", count: max(1, paddingBytes / 48))
+                    let json = try jsonString(payload)
+                    if json.utf8.count >= minimumPayloadBytes {
+                        return json
+                    }
+                    paddingBytes += minimumPayloadBytes / 2
+                }
+            }
 
         #endif
 
@@ -493,259 +493,261 @@
             return viewModel
         }
 
-        private func jsonString(_ payload: [String: Any]) throws -> String {
-            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-            return String(data: data, encoding: .utf8) ?? "{}"
-        }
-
-        private func rawToolResultBytes(in items: [AgentChatItem]) -> Int {
-            items.reduce(0) { partial, item in
-                guard item.kind == .toolResult else { return partial }
-                return partial + (item.toolResultJSON?.utf8.count ?? 0)
+        #if RPCE_BENCHMARK_TESTS
+            private func jsonString(_ payload: [String: Any]) throws -> String {
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                return String(data: data, encoding: .utf8) ?? "{}"
             }
-        }
 
-        @MainActor
-        private func ephemeralPayloadBytes(in session: AgentModeViewModel.TabSession) -> Int {
-            session.ephemeralToolResultPayloadByItemID.values.reduce(0) { $0 + $1.utf8.count }
-        }
-
-        private func trimmedRefreshSamples(_ samples: [CrawlRefreshBenchmarkSample]) -> [CrawlRefreshBenchmarkSample] {
-            let sorted = samples.sorted { $0.refreshMS < $1.refreshMS }
-            guard sorted.count > 2 else { return sorted }
-            return Array(sorted.dropFirst().dropLast())
-        }
-
-        private func median(_ values: [Double]) -> Double {
-            let sorted = values.sorted()
-            guard !sorted.isEmpty else { return 0 }
-            let midpoint = sorted.count / 2
-            if sorted.count.isMultiple(of: 2) {
-                return (sorted[midpoint - 1] + sorted[midpoint]) / 2
+            private func rawToolResultBytes(in items: [AgentChatItem]) -> Int {
+                items.reduce(0) { partial, item in
+                    guard item.kind == .toolResult else { return partial }
+                    return partial + (item.toolResultJSON?.utf8.count ?? 0)
+                }
             }
-            return sorted[midpoint]
-        }
 
-        private func nearestRankP95(_ values: [Double]) -> Double {
-            let sorted = values.sorted()
-            guard !sorted.isEmpty else { return 0 }
-            let rank = max(1, Int(ceil(Double(sorted.count) * 0.95)))
-            return sorted[min(sorted.count - 1, rank - 1)]
-        }
+            @MainActor
+            private func ephemeralPayloadBytes(in session: AgentModeViewModel.TabSession) -> Int {
+                session.ephemeralToolResultPayloadByItemID.values.reduce(0) { $0 + $1.utf8.count }
+            }
 
-        private func performanceDelta(
-            from before: AgentTranscriptPerformanceSnapshot,
-            to after: AgentTranscriptPerformanceSnapshot
-        ) -> TranscriptPerformanceDelta {
-            TranscriptPerformanceDelta(
-                incrementalImportAttemptCount: after.incrementalImportAttemptCount - before.incrementalImportAttemptCount,
-                incrementalImportSuccessCount: after.incrementalImportSuccessCount - before.incrementalImportSuccessCount,
-                incrementalImportFallbackCount: after.incrementalImportFallbackCount - before.incrementalImportFallbackCount
-            )
-        }
+            private func trimmedRefreshSamples(_ samples: [CrawlRefreshBenchmarkSample]) -> [CrawlRefreshBenchmarkSample] {
+                let sorted = samples.sorted { $0.refreshMS < $1.refreshMS }
+                guard sorted.count > 2 else { return sorted }
+                return Array(sorted.dropFirst().dropLast())
+            }
 
-        private func formatMS(_ value: Double?) -> String {
-            guard let value else { return "nil" }
-            return String(format: "%.3f", value)
-        }
+            private func median(_ values: [Double]) -> Double {
+                let sorted = values.sorted()
+                guard !sorted.isEmpty else { return 0 }
+                let midpoint = sorted.count / 2
+                if sorted.count.isMultiple(of: 2) {
+                    return (sorted[midpoint - 1] + sorted[midpoint]) / 2
+                }
+                return sorted[midpoint]
+            }
 
-        private func formatCrawlRefreshBenchmarkReport(
-            _ aggregates: [CrawlRefreshBenchmarkAggregate],
-            reportURL: URL,
-            benchmarkJSON: String
-        ) -> String {
-            var lines = [
-                "REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_BEGIN",
-                "reportPath=\(reportURL.path)",
-                "scenarioCount=\(aggregates.count)",
-                formatCrawlRefreshGrowthOracle(aggregates)
-            ]
-            for aggregate in aggregates {
+            private func nearestRankP95(_ values: [Double]) -> Double {
+                let sorted = values.sorted()
+                guard !sorted.isEmpty else { return 0 }
+                let rank = max(1, Int(ceil(Double(sorted.count) * 0.95)))
+                return sorted[min(sorted.count - 1, rank - 1)]
+            }
+
+            private func performanceDelta(
+                from before: AgentTranscriptPerformanceSnapshot,
+                to after: AgentTranscriptPerformanceSnapshot
+            ) -> TranscriptPerformanceDelta {
+                TranscriptPerformanceDelta(
+                    incrementalImportAttemptCount: after.incrementalImportAttemptCount - before.incrementalImportAttemptCount,
+                    incrementalImportSuccessCount: after.incrementalImportSuccessCount - before.incrementalImportSuccessCount,
+                    incrementalImportFallbackCount: after.incrementalImportFallbackCount - before.incrementalImportFallbackCount
+                )
+            }
+
+            private func formatMS(_ value: Double?) -> String {
+                guard let value else { return "nil" }
+                return String(format: "%.3f", value)
+            }
+
+            private func formatCrawlRefreshBenchmarkReport(
+                _ aggregates: [CrawlRefreshBenchmarkAggregate],
+                reportURL: URL,
+                benchmarkJSON: String
+            ) -> String {
+                var lines = [
+                    "REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_BEGIN",
+                    "reportPath=\(reportURL.path)",
+                    "scenarioCount=\(aggregates.count)",
+                    formatCrawlRefreshGrowthOracle(aggregates)
+                ]
+                for aggregate in aggregates {
+                    lines.append(contentsOf: [
+                        "",
+                        "scenario=\(aggregate.scenario)",
+                        "shape=targetItems:\(aggregate.config.targetItemCount) actualItems:\(aggregate.actualItemCount) toolPairs:\(aggregate.config.toolResultPairCount) payloadBytesPerResult:\(aggregate.config.payloadBytesPerResult) aggregatePayloadBytes:\(aggregate.aggregatePayloadBytes) warmup:\(aggregate.config.warmupSampleCount) measured:\(aggregate.config.measuredSampleCount)",
+                        "retainedPeak=entries:\(aggregate.peakRetainedPayloadEntryCount) bytes:\(aggregate.peakRetainedPayloadBytes)",
+                        "trimmedRefreshMS=\(aggregate.trimmedRefreshMS.map { formatMS($0) }.joined(separator: ","))",
+                        "trimmedMedianRefreshMS=\(formatMS(aggregate.trimmedMedianRefreshMS)) trimmedP95RefreshMS=\(formatMS(aggregate.trimmedP95RefreshMS)) trimmedMutationMedianMS=\(formatMS(aggregate.trimmedMutationMedianMS)) trimmedMutationP95MS=\(formatMS(aggregate.trimmedMutationP95MS))",
+                        "",
+                        "| Phase | Sample | Refresh ms | Mutation wall ms | Import ms | Sanitize ms | Projection ms | Payload ms | Items | Retained entries/bytes | Raw item bytes | Ephemeral bytes | JSON parse bytes | JSON misses | Regex calls | Incremental a/s/f | Refresh/Rebuild/Projection |",
+                        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"
+                    ])
+                    lines.append(formatCrawlRefreshSampleRow(aggregate.warmup))
+                    lines.append(contentsOf: aggregate.measured.map(formatCrawlRefreshSampleRow))
+                }
                 lines.append(contentsOf: [
                     "",
-                    "scenario=\(aggregate.scenario)",
-                    "shape=targetItems:\(aggregate.config.targetItemCount) actualItems:\(aggregate.actualItemCount) toolPairs:\(aggregate.config.toolResultPairCount) payloadBytesPerResult:\(aggregate.config.payloadBytesPerResult) aggregatePayloadBytes:\(aggregate.aggregatePayloadBytes) warmup:\(aggregate.config.warmupSampleCount) measured:\(aggregate.config.measuredSampleCount)",
-                    "retainedPeak=entries:\(aggregate.peakRetainedPayloadEntryCount) bytes:\(aggregate.peakRetainedPayloadBytes)",
-                    "trimmedRefreshMS=\(aggregate.trimmedRefreshMS.map { formatMS($0) }.joined(separator: ","))",
-                    "trimmedMedianRefreshMS=\(formatMS(aggregate.trimmedMedianRefreshMS)) trimmedP95RefreshMS=\(formatMS(aggregate.trimmedP95RefreshMS)) trimmedMutationMedianMS=\(formatMS(aggregate.trimmedMutationMedianMS)) trimmedMutationP95MS=\(formatMS(aggregate.trimmedMutationP95MS))",
-                    "",
-                    "| Phase | Sample | Refresh ms | Mutation wall ms | Import ms | Sanitize ms | Projection ms | Payload ms | Items | Retained entries/bytes | Raw item bytes | Ephemeral bytes | JSON parse bytes | JSON misses | Regex calls | Incremental a/s/f | Refresh/Rebuild/Projection |",
-                    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"
+                    "REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_JSON=\(benchmarkJSON)",
+                    "REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_END"
                 ])
-                lines.append(formatCrawlRefreshSampleRow(aggregate.warmup))
-                lines.append(contentsOf: aggregate.measured.map(formatCrawlRefreshSampleRow))
+                return lines.joined(separator: "\n")
             }
-            lines.append(contentsOf: [
-                "",
-                "REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_JSON=\(benchmarkJSON)",
-                "REPOPROMPT_CE_CRAWL_TRANSCRIPT_REFRESH_BENCHMARK_END"
-            ])
-            return lines.joined(separator: "\n")
-        }
 
-        private func formatCrawlRefreshGrowthOracle(_ aggregates: [CrawlRefreshBenchmarkAggregate]) -> String {
-            guard let retained500 = aggregates.first(where: { $0.config.targetItemCount == 500 }),
-                  let retained2000 = aggregates.first(where: { $0.config.targetItemCount == 2000 })
-            else { return "growthOracle=unavailable" }
-            let ratio = retained2000.trimmedP95RefreshMS / max(0.001, retained500.trimmedP95RefreshMS)
-            let formattedRatio = String(format: "%.3f", ratio)
-            let status = ratio <= 4.4 ? "passed" : "exceeded"
-            return "growthOracle=retained2000To500P95Ratio:\(formattedRatio) maximum:4.400 status:\(status)"
-        }
+            private func formatCrawlRefreshGrowthOracle(_ aggregates: [CrawlRefreshBenchmarkAggregate]) -> String {
+                guard let retained500 = aggregates.first(where: { $0.config.targetItemCount == 500 }),
+                      let retained2000 = aggregates.first(where: { $0.config.targetItemCount == 2000 })
+                else { return "growthOracle=unavailable" }
+                let ratio = retained2000.trimmedP95RefreshMS / max(0.001, retained500.trimmedP95RefreshMS)
+                let formattedRatio = String(format: "%.3f", ratio)
+                let status = ratio <= 4.4 ? "passed" : "exceeded"
+                return "growthOracle=retained2000To500P95Ratio:\(formattedRatio) maximum:4.400 status:\(status)"
+            }
 
-        private func formatCrawlRefreshSampleRow(_ sample: CrawlRefreshBenchmarkSample) -> String {
-            let metrics = sample.toolProcessingMetrics
-            return [
-                "| \(sample.phase)",
-                "\(sample.ordinal)",
-                formatMS(sample.refreshMS),
-                formatMS(sample.mutationWallClockMS),
-                formatMS(sample.importMS),
-                formatMS(sample.sanitizeMS),
-                formatMS(sample.projectionMS),
-                formatMS(sample.payloadCaptureMS),
-                "\(sample.itemCount)",
-                "\(sample.retainedPayloadEntryCount)/\(sample.retainedPayloadBytesFromSnapshot)",
-                "\(sample.rawToolResultBytesInItems)",
-                "\(sample.ephemeralPayloadBytes)",
-                "\(metrics.jsonParseByteCount)",
-                "\(metrics.jsonParseCacheMissCount)",
-                "\(metrics.regexCaptureCallCount)",
-                "\(sample.incrementalImportAttempts)/\(sample.incrementalImportSuccesses)/\(sample.incrementalImportFallbacks)",
-                "\(sample.refreshAttemptCount)/\(sample.rebuildCount)/\(sample.projectionBuildCount) |"
-            ].joined(separator: " | ")
-        }
-
-        private func crawlRefreshBenchmarkJSON(
-            _ aggregates: [CrawlRefreshBenchmarkAggregate],
-            reportURL: URL
-        ) throws -> String {
-            let payload: [String: Any] = [
-                "reportPath": reportURL.path,
-                "scenarioCount": aggregates.count,
-                "aggregatePayloadBudgetBytes": CrawlRefreshScenarioConfig.aggregatePayloadBudgetBytes,
-                "scenarios": aggregates.map { aggregate in
-                    [
-                        "scenario": aggregate.scenario,
-                        "targetItemCount": aggregate.config.targetItemCount,
-                        "actualItemCount": aggregate.actualItemCount,
-                        "toolResultPairCount": aggregate.config.toolResultPairCount,
-                        "payloadBytesPerResult": aggregate.config.payloadBytesPerResult,
-                        "aggregatePayloadBytes": aggregate.aggregatePayloadBytes,
-                        "peakRetainedPayloadEntryCount": aggregate.peakRetainedPayloadEntryCount,
-                        "peakRetainedPayloadBytes": aggregate.peakRetainedPayloadBytes,
-                        "warmupSampleCount": aggregate.config.warmupSampleCount,
-                        "measuredSampleCount": aggregate.config.measuredSampleCount,
-                        "rawMeasuredRefreshMS": aggregate.measured.map(\.refreshMS),
-                        "trimmedRefreshMS": aggregate.trimmedRefreshMS,
-                        "trimmedMedianRefreshMS": aggregate.trimmedMedianRefreshMS,
-                        "trimmedP95RefreshMS": aggregate.trimmedP95RefreshMS,
-                        "trimmedMutationMedianMS": aggregate.trimmedMutationMedianMS,
-                        "trimmedMutationP95MS": aggregate.trimmedMutationP95MS,
-                        "warmup": crawlRefreshSampleDictionary(aggregate.warmup),
-                        "measured": aggregate.measured.map(crawlRefreshSampleDictionary),
-                        "correctnessStatus": "passed"
-                    ] as [String: Any]
-                },
-                "growthOracle": crawlRefreshGrowthOracleDictionary(aggregates),
-                "correctnessStatus": "passed"
-            ]
-            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-            return String(data: data, encoding: .utf8) ?? "{}"
-        }
-
-        private func crawlRefreshGrowthOracleDictionary(
-            _ aggregates: [CrawlRefreshBenchmarkAggregate]
-        ) -> [String: Any] {
-            guard let retained500 = aggregates.first(where: { $0.config.targetItemCount == 500 }),
-                  let retained2000 = aggregates.first(where: { $0.config.targetItemCount == 2000 })
-            else {
+            private func formatCrawlRefreshSampleRow(_ sample: CrawlRefreshBenchmarkSample) -> String {
+                let metrics = sample.toolProcessingMetrics
                 return [
+                    "| \(sample.phase)",
+                    "\(sample.ordinal)",
+                    formatMS(sample.refreshMS),
+                    formatMS(sample.mutationWallClockMS),
+                    formatMS(sample.importMS),
+                    formatMS(sample.sanitizeMS),
+                    formatMS(sample.projectionMS),
+                    formatMS(sample.payloadCaptureMS),
+                    "\(sample.itemCount)",
+                    "\(sample.retainedPayloadEntryCount)/\(sample.retainedPayloadBytesFromSnapshot)",
+                    "\(sample.rawToolResultBytesInItems)",
+                    "\(sample.ephemeralPayloadBytes)",
+                    "\(metrics.jsonParseByteCount)",
+                    "\(metrics.jsonParseCacheMissCount)",
+                    "\(metrics.regexCaptureCallCount)",
+                    "\(sample.incrementalImportAttempts)/\(sample.incrementalImportSuccesses)/\(sample.incrementalImportFallbacks)",
+                    "\(sample.refreshAttemptCount)/\(sample.rebuildCount)/\(sample.projectionBuildCount) |"
+                ].joined(separator: " | ")
+            }
+
+            private func crawlRefreshBenchmarkJSON(
+                _ aggregates: [CrawlRefreshBenchmarkAggregate],
+                reportURL: URL
+            ) throws -> String {
+                let payload: [String: Any] = [
+                    "reportPath": reportURL.path,
+                    "scenarioCount": aggregates.count,
+                    "aggregatePayloadBudgetBytes": CrawlRefreshScenarioConfig.aggregatePayloadBudgetBytes,
+                    "scenarios": aggregates.map { aggregate in
+                        [
+                            "scenario": aggregate.scenario,
+                            "targetItemCount": aggregate.config.targetItemCount,
+                            "actualItemCount": aggregate.actualItemCount,
+                            "toolResultPairCount": aggregate.config.toolResultPairCount,
+                            "payloadBytesPerResult": aggregate.config.payloadBytesPerResult,
+                            "aggregatePayloadBytes": aggregate.aggregatePayloadBytes,
+                            "peakRetainedPayloadEntryCount": aggregate.peakRetainedPayloadEntryCount,
+                            "peakRetainedPayloadBytes": aggregate.peakRetainedPayloadBytes,
+                            "warmupSampleCount": aggregate.config.warmupSampleCount,
+                            "measuredSampleCount": aggregate.config.measuredSampleCount,
+                            "rawMeasuredRefreshMS": aggregate.measured.map(\.refreshMS),
+                            "trimmedRefreshMS": aggregate.trimmedRefreshMS,
+                            "trimmedMedianRefreshMS": aggregate.trimmedMedianRefreshMS,
+                            "trimmedP95RefreshMS": aggregate.trimmedP95RefreshMS,
+                            "trimmedMutationMedianMS": aggregate.trimmedMutationMedianMS,
+                            "trimmedMutationP95MS": aggregate.trimmedMutationP95MS,
+                            "warmup": crawlRefreshSampleDictionary(aggregate.warmup),
+                            "measured": aggregate.measured.map(crawlRefreshSampleDictionary),
+                            "correctnessStatus": "passed"
+                        ] as [String: Any]
+                    },
+                    "growthOracle": crawlRefreshGrowthOracleDictionary(aggregates),
+                    "correctnessStatus": "passed"
+                ]
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                return String(data: data, encoding: .utf8) ?? "{}"
+            }
+
+            private func crawlRefreshGrowthOracleDictionary(
+                _ aggregates: [CrawlRefreshBenchmarkAggregate]
+            ) -> [String: Any] {
+                guard let retained500 = aggregates.first(where: { $0.config.targetItemCount == 500 }),
+                      let retained2000 = aggregates.first(where: { $0.config.targetItemCount == 2000 })
+                else {
+                    return [
+                        "retained2000To500P95MaximumRatio": 4.4,
+                        "status": "unavailable"
+                    ]
+                }
+                let ratio = retained2000.trimmedP95RefreshMS / max(0.001, retained500.trimmedP95RefreshMS)
+                return [
+                    "retained2000To500P95Ratio": ratio,
                     "retained2000To500P95MaximumRatio": 4.4,
-                    "status": "unavailable"
+                    "status": ratio <= 4.4 ? "passed" : "exceeded"
                 ]
             }
-            let ratio = retained2000.trimmedP95RefreshMS / max(0.001, retained500.trimmedP95RefreshMS)
-            return [
-                "retained2000To500P95Ratio": ratio,
-                "retained2000To500P95MaximumRatio": 4.4,
-                "status": ratio <= 4.4 ? "passed" : "exceeded"
-            ]
-        }
 
-        private func crawlRefreshSampleDictionary(_ sample: CrawlRefreshBenchmarkSample) -> [String: Any] {
-            let metrics = sample.toolProcessingMetrics
-            return [
-                "ordinal": sample.ordinal,
-                "phase": sample.phase,
-                "mutationWallClockMS": sample.mutationWallClockMS,
-                "refreshMS": sample.refreshMS,
-                "importMS": optionalJSONValue(sample.importMS),
-                "incrementalImportMS": optionalJSONValue(sample.incrementalImportMS),
-                "sanitizeMS": optionalJSONValue(sample.sanitizeMS),
-                "projectionMS": optionalJSONValue(sample.projectionMS),
-                "payloadCaptureMS": optionalJSONValue(sample.payloadCaptureMS),
-                "sanitizedActivityCount": optionalJSONValue(sample.sanitizedActivityCount),
-                "sourceItemsRevision": sample.sourceItemsRevision,
-                "itemCount": sample.itemCount,
-                "transcriptTurnCount": sample.transcriptTurnCount,
-                "rawToolResultBytesInItems": sample.rawToolResultBytesInItems,
-                "ephemeralPayloadBytes": sample.ephemeralPayloadBytes,
-                "retainedPayloadEntryCount": sample.retainedPayloadEntryCount,
-                "retainedPayloadBytesFromSnapshot": sample.retainedPayloadBytesFromSnapshot,
-                "incrementalImportAttempts": sample.incrementalImportAttempts,
-                "incrementalImportSuccesses": sample.incrementalImportSuccesses,
-                "incrementalImportFallbacks": sample.incrementalImportFallbacks,
-                "refreshAttemptCount": sample.refreshAttemptCount,
-                "rebuildCount": sample.rebuildCount,
-                "projectionBuildCount": sample.projectionBuildCount,
-                "sessionItemReplacementCount": sample.sessionItemReplacementCount,
-                "compactionCount": sample.compactionCount,
-                "presentationPublishCount": sample.presentationPublishCount,
-                "toolProcessingMetrics": [
-                    "jsonParseAttemptCount": metrics.jsonParseAttemptCount,
-                    "jsonParseCacheHitCount": metrics.jsonParseCacheHitCount,
-                    "jsonParseCacheMissCount": metrics.jsonParseCacheMissCount,
-                    "jsonParseSuccessCount": metrics.jsonParseSuccessCount,
-                    "jsonParseFailureCount": metrics.jsonParseFailureCount,
-                    "jsonParseByteCount": metrics.jsonParseByteCount,
-                    "toolExecutionCacheHitCount": metrics.toolExecutionCacheHitCount,
-                    "toolExecutionCacheMissCount": metrics.toolExecutionCacheMissCount,
-                    "bashMetadataCacheHitCount": metrics.bashMetadataCacheHitCount,
-                    "bashMetadataCacheMissCount": metrics.bashMetadataCacheMissCount,
-                    "regexCaptureCallCount": metrics.regexCaptureCallCount
+            private func crawlRefreshSampleDictionary(_ sample: CrawlRefreshBenchmarkSample) -> [String: Any] {
+                let metrics = sample.toolProcessingMetrics
+                return [
+                    "ordinal": sample.ordinal,
+                    "phase": sample.phase,
+                    "mutationWallClockMS": sample.mutationWallClockMS,
+                    "refreshMS": sample.refreshMS,
+                    "importMS": optionalJSONValue(sample.importMS),
+                    "incrementalImportMS": optionalJSONValue(sample.incrementalImportMS),
+                    "sanitizeMS": optionalJSONValue(sample.sanitizeMS),
+                    "projectionMS": optionalJSONValue(sample.projectionMS),
+                    "payloadCaptureMS": optionalJSONValue(sample.payloadCaptureMS),
+                    "sanitizedActivityCount": optionalJSONValue(sample.sanitizedActivityCount),
+                    "sourceItemsRevision": sample.sourceItemsRevision,
+                    "itemCount": sample.itemCount,
+                    "transcriptTurnCount": sample.transcriptTurnCount,
+                    "rawToolResultBytesInItems": sample.rawToolResultBytesInItems,
+                    "ephemeralPayloadBytes": sample.ephemeralPayloadBytes,
+                    "retainedPayloadEntryCount": sample.retainedPayloadEntryCount,
+                    "retainedPayloadBytesFromSnapshot": sample.retainedPayloadBytesFromSnapshot,
+                    "incrementalImportAttempts": sample.incrementalImportAttempts,
+                    "incrementalImportSuccesses": sample.incrementalImportSuccesses,
+                    "incrementalImportFallbacks": sample.incrementalImportFallbacks,
+                    "refreshAttemptCount": sample.refreshAttemptCount,
+                    "rebuildCount": sample.rebuildCount,
+                    "projectionBuildCount": sample.projectionBuildCount,
+                    "sessionItemReplacementCount": sample.sessionItemReplacementCount,
+                    "compactionCount": sample.compactionCount,
+                    "presentationPublishCount": sample.presentationPublishCount,
+                    "toolProcessingMetrics": [
+                        "jsonParseAttemptCount": metrics.jsonParseAttemptCount,
+                        "jsonParseCacheHitCount": metrics.jsonParseCacheHitCount,
+                        "jsonParseCacheMissCount": metrics.jsonParseCacheMissCount,
+                        "jsonParseSuccessCount": metrics.jsonParseSuccessCount,
+                        "jsonParseFailureCount": metrics.jsonParseFailureCount,
+                        "jsonParseByteCount": metrics.jsonParseByteCount,
+                        "toolExecutionCacheHitCount": metrics.toolExecutionCacheHitCount,
+                        "toolExecutionCacheMissCount": metrics.toolExecutionCacheMissCount,
+                        "bashMetadataCacheHitCount": metrics.bashMetadataCacheHitCount,
+                        "bashMetadataCacheMissCount": metrics.bashMetadataCacheMissCount,
+                        "regexCaptureCallCount": metrics.regexCaptureCallCount
+                    ]
                 ]
-            ]
-        }
-
-        private func optionalJSONValue(_ value: Double?) -> Any {
-            value ?? NSNull()
-        }
-
-        private func optionalJSONValue(_ value: Int?) -> Any {
-            value ?? NSNull()
-        }
-
-        private func crawlTranscriptRefreshReportURL() -> URL {
-            if let overridePath = ProcessInfo.processInfo.environment["RP_CE_TRANSCRIPT_CRAWL_REFRESH_REPORT_PATH"], !overridePath.isEmpty {
-                return URL(fileURLWithPath: overridePath)
             }
-            if let overridePath = try? String(contentsOf: crawlTranscriptRefreshReportPathFlagURL(), encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                !overridePath.isEmpty
-            {
-                return URL(fileURLWithPath: overridePath)
+
+            private func optionalJSONValue(_ value: Double?) -> Any {
+                value ?? NSNull()
             }
-            return FileManager.default.temporaryDirectory.appendingPathComponent("RepoPromptCE-crawl-transcript-refresh-latest.md")
-        }
 
-        private func crawlTranscriptRefreshOptInFlagURL() -> URL {
-            URL(fileURLWithPath: "/tmp/RepoPromptCE-crawl-transcript-refresh-opt-in")
-        }
+            private func optionalJSONValue(_ value: Int?) -> Any {
+                value ?? NSNull()
+            }
 
-        private func crawlTranscriptRefreshReportPathFlagURL() -> URL {
-            URL(fileURLWithPath: "/tmp/RepoPromptCE-crawl-transcript-refresh-report-path")
-        }
+            private func crawlTranscriptRefreshReportURL() -> URL {
+                if let overridePath = ProcessInfo.processInfo.environment["RP_CE_TRANSCRIPT_CRAWL_REFRESH_REPORT_PATH"], !overridePath.isEmpty {
+                    return URL(fileURLWithPath: overridePath)
+                }
+                if let overridePath = try? String(contentsOf: crawlTranscriptRefreshReportPathFlagURL(), encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                    !overridePath.isEmpty
+                {
+                    return URL(fileURLWithPath: overridePath)
+                }
+                return FileManager.default.temporaryDirectory.appendingPathComponent("RepoPromptCE-crawl-transcript-refresh-latest.md")
+            }
+
+            private func crawlTranscriptRefreshOptInFlagURL() -> URL {
+                URL(fileURLWithPath: "/tmp/RepoPromptCE-crawl-transcript-refresh-opt-in")
+            }
+
+            private func crawlTranscriptRefreshReportPathFlagURL() -> URL {
+                URL(fileURLWithPath: "/tmp/RepoPromptCE-crawl-transcript-refresh-report-path")
+            }
+        #endif
     }
 
     private struct TranscriptInstrumentationMark {

@@ -2298,7 +2298,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         repositoryBindingEpoch: String = "repository-binding-1",
         worktreeBindingEpoch: String? = nil
     ) async throws -> ManifestFixture {
-        let source = try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+        let source = try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
             bytes: Data(text.utf8),
             objectFormat: objectFormat,
             namespaceScope: namespaceScope
@@ -2355,7 +2355,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         text: String,
         bindingGeneration: UInt64
     ) async throws -> CodeMapRootManifestRecord {
-        let source = try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+        let source = try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
             bytes: Data(text.utf8),
             objectFormat: namespace.objectFormat,
             namespaceScope: namespaceScope
@@ -2434,7 +2434,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         outcome: CodeMapSyntaxArtifactOutcome
     ) async throws -> ManifestAssociationFixture {
         let bytes = Data(text.utf8)
-        let source = try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+        let source = try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
             bytes: bytes,
             objectFormat: objectFormat,
             namespaceScope: namespaceScope

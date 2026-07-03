@@ -165,7 +165,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let pipeline = try pipelineIdentity(.swift)
         let rawBytes = Data("struct Proven {}".utf8)
-        let source = try makeCleanSource(rawBytes: rawBytes, format: .sha1)
+        let source = try await makeCleanSource(rawBytes: rawBytes, format: .sha1)
         guard case let .cleanGitBlob(repositoryNamespace, blobOID) = source.provenance else {
             return XCTFail("expected clean Git blob provenance")
         }
@@ -899,7 +899,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         artifactStore: CodeMapArtifactStore
     ) async throws -> VerifiedGitBlobCodeMapLocatorAssociation {
         let rawBytes = Data(text.utf8)
-        let source = try makeCleanSource(rawBytes: rawBytes, format: format)
+        let source = try await makeCleanSource(rawBytes: rawBytes, format: format)
         guard case let .cleanGitBlob(repositoryNamespace, blobOID) = source.provenance else {
             throw WorkspaceCodemapProvenanceTestSupportError.capabilityUnavailable
         }
@@ -922,8 +922,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
     private func makeCleanSource(
         rawBytes: Data,
         format: GitObjectFormat
-    ) throws -> CodeMapSourceSnapshot {
-        try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+    ) async throws -> CodeMapSourceSnapshot {
+        try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
             bytes: rawBytes,
             objectFormat: format
         )

@@ -151,31 +151,14 @@ final class ReviewGitRepositoryFixture {
 
     @discardableResult
     func runGit(_ arguments: [String], at root: URL) throws -> String {
-        let result = try runGitResult(arguments, at: root)
-        guard result.terminationStatus == 0 else {
-            throw NSError(
-                domain: "ReviewGitRepositoryFixture.git",
-                code: Int(result.terminationStatus),
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "git \(arguments.joined(separator: " ")) failed in \(root.path): \(result.outputText)"
-                ]
-            )
-        }
-        return result.outputText
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: root,
+            failureDomain: "ReviewGitRepositoryFixture.git"
+        )
     }
 
     func runGitResult(_ arguments: [String], at root: URL) throws -> TestProcessResult {
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-
-        return try TestProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
-            arguments: arguments,
-            currentDirectoryURL: root,
-            environment: environment
-        )
+        try TestGitCommandRunner.runResult(arguments, cwd: root)
     }
 }

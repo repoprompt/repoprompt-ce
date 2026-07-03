@@ -433,7 +433,7 @@
             let constructionStart = DispatchTime.now()
             let runtime = try CodeMapArtifactRuntime(rootURL: root, coordinatorHooks: hooks)
             wallValues[.runtimeConstruction] = phase5ElapsedMS(constructionStart)
-            let input = try phase5Input(phase5RealSwiftSource(ordinal), root: root, discriminator: ordinal, locator: true)
+            let input = try await phase5LocatorInput(phase5RealSwiftSource(ordinal), root: root, discriminator: ordinal)
 
             let coldStart = DispatchTime.now()
             let cold = try await phase5Ready(runtime.coordinator.resolve(phase5Request(input)))
@@ -837,9 +837,8 @@
 
         private func phase5Input(
             _ text: String,
-            root: URL,
-            discriminator: Int,
-            locator: Bool = false
+            root _: URL,
+            discriminator: Int
         ) throws -> CodeMapArtifactBuildInput {
             let bytes = Data(text.utf8)
             let fingerprint = FileContentFingerprint(
@@ -851,20 +850,25 @@
                 statusChangeSeconds: 8,
                 statusChangeNanoseconds: 0
             )
-            let source = if locator {
-                try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
-                    bytes: bytes,
-                    objectFormat: .sha1,
-                    namespaceScope: root.path
-                )
-            } else {
-                CodeMapSourceSnapshot(validatedContent: .init(
-                    data: bytes,
-                    modificationDate: fingerprint.modificationDate,
-                    fingerprint: fingerprint
-                ))
-            }
-            guard locator else { return try CodeMapArtifactBuildInput(source: source, language: .swift) }
+            let source = CodeMapSourceSnapshot(validatedContent: .init(
+                data: bytes,
+                modificationDate: fingerprint.modificationDate,
+                fingerprint: fingerprint
+            ))
+            return try CodeMapArtifactBuildInput(source: source, language: .swift)
+        }
+
+        private func phase5LocatorInput(
+            _ text: String,
+            root: URL,
+            discriminator _: Int
+        ) async throws -> CodeMapArtifactBuildInput {
+            let bytes = Data(text.utf8)
+            let source = try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+                bytes: bytes,
+                objectFormat: .sha1,
+                namespaceScope: root.path
+            )
             let pipeline = try SyntaxManager.shared.pipelineIdentity(for: .swift, decoderPolicy: source.decoderPolicy)
             guard case let .cleanGitBlob(repositoryNamespace, blobOID) = source.provenance else {
                 throw WorkspaceCodeMapPhase5BenchmarkError.invalid("expected clean Git blob provenance")

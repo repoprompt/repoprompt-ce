@@ -6,7 +6,6 @@ enum WorkspaceCodemapProvenanceTestSupportError: Error {
     case capabilityUnavailable
     case sourceAuthorityUnavailable
     case bindingIdentityUnavailable
-    case missingResult
 }
 
 final class WorkspaceCodemapAuthorityTestFixture: @unchecked Sendable {
@@ -170,25 +169,23 @@ enum WorkspaceCodemapValidatedSnapshotTestSupport {
         bytes: Data,
         objectFormat: GitObjectFormat,
         namespaceScope: String = "shared"
-    ) throws -> CodeMapSourceSnapshot {
-        let capability = try WorkspaceCodemapCapabilityTestPool.capability(
+    ) async throws -> CodeMapSourceSnapshot {
+        let capability = try await WorkspaceCodemapCapabilityTestPool.capability(
             objectFormat: objectFormat,
             namespaceScope: namespaceScope
         )
-        return try WorkspaceCodemapBlockingAwait.run {
-            let blobOID = GitBlobOID.blob(bytes: bytes, objectFormat: objectFormat)
-            let materializer = GitBlobSourceMaterializationService(
-                client: GitBlobSourceMaterializationClient(
-                    size: { _, _ in UInt64(bytes.count) },
-                    bytes: { _, _, _ in bytes }
-                )
+        let blobOID = GitBlobOID.blob(bytes: bytes, objectFormat: objectFormat)
+        let materializer = GitBlobSourceMaterializationService(
+            client: GitBlobSourceMaterializationClient(
+                size: { _, _ in UInt64(bytes.count) },
+                bytes: { _, _, _ in bytes }
             )
-            let validated = try await materializer.materialize(
-                capability: capability,
-                blobOID: blobOID
-            )
-            return CodeMapSourceSnapshot(validatedGitBlob: validated)
-        }
+        )
+        let validated = try await materializer.materialize(
+            capability: capability,
+            blobOID: blobOID
+        )
+        return CodeMapSourceSnapshot(validatedGitBlob: validated)
     }
 }
 
@@ -206,90 +203,78 @@ private enum WorkspaceCodemapCapabilityTestPool {
         }
     }
 
-    private static let lock = NSLock()
-    private nonisolated(unsafe) static var contexts: [String: Context] = [:]
+    private actor Cache {
+        private var contexts: [String: Context] = [:]
+        private var inFlight: [String: Task<Context, Error>] = [:]
+
+        func capability(
+            objectFormat: GitObjectFormat,
+            namespaceScope: String
+        ) async throws -> GitCodemapRootCapability {
+            let key = objectFormat.rawValue + "|" + namespaceScope
+            if let context = contexts[key] {
+                return context.capability
+            }
+            if let task = inFlight[key] {
+                return try await task.value.capability
+            }
+
+            let task = Task<Context, Error> {
+                try await WorkspaceCodemapCapabilityTestPool.makeContext(objectFormat: objectFormat)
+            }
+            inFlight[key] = task
+            do {
+                let context = try await task.value
+                contexts[key] = context
+                inFlight[key] = nil
+                return context.capability
+            } catch {
+                inFlight[key] = nil
+                throw error
+            }
+        }
+    }
+
+    private static let cache = Cache()
 
     static func capability(
         objectFormat: GitObjectFormat,
         namespaceScope: String
-    ) throws -> GitCodemapRootCapability {
-        let key = objectFormat.rawValue + "|" + namespaceScope
-        lock.lock()
-        defer { lock.unlock() }
-        if let context = contexts[key] {
-            return context.capability
-        }
-
-        let context: Context = try WorkspaceCodemapBlockingAwait.run {
-            let fixture = try ReviewGitRepositoryFixture(
-                name: "WorkspaceCodemapCapabilityTestPool-\(objectFormat.rawValue)-\(UUID().uuidString)"
-            )
-            let root = try fixture.makeRepository(
-                named: "repository",
-                files: ["Sources/Fixture.swift": "struct Fixture {}\n"],
-                objectFormat: objectFormat
-            )
-            let service = WorkspaceCodemapGitCapabilityService(
-                namespaceSalt: Data(
-                    repeating: 0x6B,
-                    count: GitBlobRepositoryNamespace.saltByteCount
-                )
-            )
-            let state = await service.resolve(
-                root: WorkspaceCodemapGitCapabilityRequest(
-                    rootID: UUID(),
-                    rootLifetimeID: UUID(),
-                    loadedRootURL: root
-                )
-            )
-            guard case let .eligible(capability) = state else {
-                throw WorkspaceCodemapProvenanceTestSupportError.capabilityUnavailable
-            }
-            return Context(
-                repositoryFixture: fixture,
-                capability: capability
-            )
-        }
-        contexts[key] = context
-        return context.capability
-    }
-}
-
-private enum WorkspaceCodemapBlockingAwait {
-    private final class ResultBox<Value>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage: Result<Value, Error>?
-
-        func store(_ result: Result<Value, Error>) {
-            lock.lock()
-            storage = result
-            lock.unlock()
-        }
-
-        func take() throws -> Value {
-            lock.lock()
-            defer { lock.unlock() }
-            guard let storage else {
-                throw WorkspaceCodemapProvenanceTestSupportError.missingResult
-            }
-            return try storage.get()
-        }
+    ) async throws -> GitCodemapRootCapability {
+        try await cache.capability(
+            objectFormat: objectFormat,
+            namespaceScope: namespaceScope
+        )
     }
 
-    static func run<Value>(
-        _ operation: @escaping @Sendable () async throws -> Value
-    ) throws -> Value {
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = ResultBox<Value>()
-        Task.detached {
-            do {
-                try await box.store(.success(operation()))
-            } catch {
-                box.store(.failure(error))
-            }
-            semaphore.signal()
+    private static func makeContext(objectFormat: GitObjectFormat) async throws -> Context {
+        let fixture = try ReviewGitRepositoryFixture(
+            name: "WorkspaceCodemapCapabilityTestPool-\(objectFormat.rawValue)-\(UUID().uuidString)"
+        )
+        let root = try fixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Fixture.swift": "struct Fixture {}\n"],
+            objectFormat: objectFormat
+        )
+        let service = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: Data(
+                repeating: 0x6B,
+                count: GitBlobRepositoryNamespace.saltByteCount
+            )
+        )
+        let state = await service.resolve(
+            root: WorkspaceCodemapGitCapabilityRequest(
+                rootID: UUID(),
+                rootLifetimeID: UUID(),
+                loadedRootURL: root
+            )
+        )
+        guard case let .eligible(capability) = state else {
+            throw WorkspaceCodemapProvenanceTestSupportError.capabilityUnavailable
         }
-        semaphore.wait()
-        return try box.take()
+        return Context(
+            repositoryFixture: fixture,
+            capability: capability
+        )
     }
 }
