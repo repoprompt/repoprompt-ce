@@ -1578,13 +1578,6 @@ extension MCPServerViewModel {
             )
         }
 
-        func build(
-            for files: [WorkspaceFileRecord],
-            presentation: WorkspaceCodemapOperationPresentation
-        ) async -> ToolResultDTOs.SelectedCodeStructureDTO? {
-            await build(rendering: files, diagnostics: files, presentation: presentation)
-        }
-
         private func build(
             rendering renderingFiles: [WorkspaceFileRecord],
             diagnostics diagnosticFiles: [WorkspaceFileRecord],

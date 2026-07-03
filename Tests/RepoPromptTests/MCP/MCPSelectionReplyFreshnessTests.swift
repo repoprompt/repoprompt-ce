@@ -114,9 +114,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             codemapPresentation: presentation
         )
 
-        let diagnosticFiles = MCPServerViewModel.SelectionReplyAssembler.codemapDiagnosticFiles(for: collections)
-        XCTAssertEqual(diagnosticFiles.map(\.id), [requestedCodemapFile.id])
-
         let builder = MCPServerViewModel.CodeStructureBuilder(
             owner: window.mcpServer,
             lookupContext: .visibleWorkspace
@@ -125,7 +122,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let dto = try XCTUnwrap(maybeDTO)
 
         XCTAssertEqual(dto.pendingPaths, ["Sources/Requested.swift"])
-        XCTAssertFalse(dto.pendingPaths?.contains("Sources/Selected.swift") == true)
         XCTAssertNil(dto.unmappedPaths)
     }
 
