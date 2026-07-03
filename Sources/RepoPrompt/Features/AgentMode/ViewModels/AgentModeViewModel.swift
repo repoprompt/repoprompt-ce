@@ -6375,7 +6375,9 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
         }
         if requireInactiveRunState, session.runState.isActive {
-            throw MCPError.invalidParams("The requested agent run became active before MCP control activation.")
+            throw MCPError.invalidParams(
+                "The requested agent session is already running and cannot be reactivated for inactive MCP control."
+            )
         }
         // A new control activation owns a new launch lifecycle. Never retain review state from a
         // prior activation, including direct/source-equals-target starts that do not stage anew.
@@ -6403,11 +6405,16 @@ final class AgentModeViewModel: ObservableObject {
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress,
-              session.mcpControlActivationGeneration == activationGeneration,
-              !requireInactiveRunState || !session.runState.isActive
+              session.mcpControlActivationGeneration == activationGeneration
         else {
             await AgentRunSessionStore.cleanup(registration: registration)
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
+        }
+        if requireInactiveRunState, session.runState.isActive {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw MCPError.invalidParams(
+                "The requested agent session became active before MCP control activation."
+            )
         }
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
@@ -6431,9 +6438,8 @@ final class AgentModeViewModel: ObservableObject {
         )
         session.mcpFollowUpRunPending = startPending
         mcpControlledTabIDs.insert(tabID)
-        // Mark MCP-created sessions so cleanup can scope to MCP sessions only.
-        // Reactivating an existing user-owned session for steer must preserve its origin.
         if markSessionAsMCPOriginated {
+            // Mark session as MCP-originated so cleanup can scope to MCP sessions only.
             session.isMCPOriginated = true
         }
         // MCP-controlled sessions use the sub-agent permission policy, even when
@@ -6446,6 +6452,8 @@ final class AgentModeViewModel: ObservableObject {
                 "originatingConnectionID": originatingConnectionID?.uuidString ?? "nil",
                 "taskLabel": taskLabelKind?.rawValue ?? "nil",
                 "startPending": String(startPending),
+                "markSessionAsMCPOriginated": String(markSessionAsMCPOriginated),
+                "requireInactiveRunState": String(requireInactiveRunState),
                 "activationID": activationID.uuidString,
                 "permissionProfile": String(describing: session.permissionProfile),
                 "selectedAgent": session.selectedAgent.rawValue,
@@ -6467,8 +6475,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Discard a session target created by `mcpResolveOrCreateSessionTarget` when a later step
-    /// in start/create/resume/steer fails before the target becomes a real session. Only targets with
-    /// origin `.createdNewTab` or `.createdForSessionResume` are eligible for discard.
+    /// in start/create/resume/steer fails before the target becomes a real session. Only targets
+    /// with origin `.createdNewTab` or `.createdForSessionResume` are eligible for discard.
     func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async {
         switch target.origin {
         case .existingSession, .existingTab:
@@ -6537,6 +6545,28 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    func mcpCleanupReactivatedControlContextIfCurrent(
+        sessionID: UUID,
+        activationID: UUID,
+        registration: AgentRunSessionStore.Registration,
+        reactivatedTarget: MCPSessionTarget?
+    ) async -> Bool {
+        guard let session = mcpControlledSession(sessionID: sessionID),
+              let context = session.mcpControlContext,
+              context.sessionID == sessionID,
+              context.activationID == activationID,
+              context.registration == registration
+        else {
+            return false
+        }
+        await mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        if let reactivatedTarget {
+            await mcpDiscardSessionTarget(reactivatedTarget)
+        }
+        return true
+    }
+
     private func withMCPWorkflowOverride<T>(
         session: TabSession,
         workflow: AgentWorkflowDefinition?,
@@ -6569,28 +6599,60 @@ final class AgentModeViewModel: ObservableObject {
             return .queuedFollowUp
         case .steerAccepted, .startAccepted, .controlAccepted:
             return .dispatchedCodexTurn
-        case let .failed(message):
-            throw MCPError.internalError(
-                message.isEmpty
-                    ? "Codex steer failed before reaching the active run."
-                    : message
-            )
         case .cancelled:
             if Task.isCancelled {
                 throw CancellationError()
             }
-            throw MCPError.invalidParams("Codex steer was cancelled before it reached the active run.")
-        case let .stale(reason):
-            throw MCPError.internalError(
-                reason.isEmpty
-                    ? "Codex steer was dropped because the active run changed before delivery."
-                    : reason
+            throw MCPError.invalidParams(
+                state.failureDescriptionForMCP ?? "Codex steer was cancelled before it reached the active run."
             )
-        case .timedOut:
+        case .failed, .stale, .timedOut:
             throw MCPError.internalError(
-                "Timed out waiting for Codex to acknowledge the steer message. The run may have changed state."
+                state.failureDescriptionForMCP ?? "Codex steer was not confirmed by the provider."
             )
         }
+    }
+
+    private struct MCPActiveDispatchWakeIdentity: Equatable {
+        let sessionID: UUID
+        let activationID: UUID
+        let registration: AgentRunSessionStore.Registration
+        let runID: UUID?
+        let runAttemptID: UUID?
+        let codexControllerInstanceID: ObjectIdentifier?
+        let codexControllerGeneration: UUID?
+    }
+
+    private func mcpActiveDispatchWakeIdentity(
+        for session: TabSession,
+        sessionID: UUID
+    ) -> MCPActiveDispatchWakeIdentity? {
+        guard let context = session.mcpControlContext,
+              context.sessionID == sessionID
+        else { return nil }
+        return MCPActiveDispatchWakeIdentity(
+            sessionID: sessionID,
+            activationID: context.activationID,
+            registration: context.registration,
+            runID: session.runID,
+            runAttemptID: session.activeRunAttemptID,
+            codexControllerInstanceID: session.codexController.map(ObjectIdentifier.init),
+            codexControllerGeneration: session.codexControllerGeneration
+        )
+    }
+
+    private func mcpActiveDispatchWakeIdentityMatches(
+        _ identity: MCPActiveDispatchWakeIdentity,
+        session: TabSession
+    ) -> Bool {
+        guard let context = session.mcpControlContext else { return false }
+        return context.sessionID == identity.sessionID
+            && context.activationID == identity.activationID
+            && context.registration == identity.registration
+            && session.runID == identity.runID
+            && session.activeRunAttemptID == identity.runAttemptID
+            && session.codexController.map(ObjectIdentifier.init) == identity.codexControllerInstanceID
+            && session.codexControllerGeneration == identity.codexControllerGeneration
     }
 
     private func mcpActiveInstructionDispatchPlan(for session: TabSession) -> MCPActiveInstructionDispatchPlan {
@@ -6627,10 +6689,18 @@ final class AgentModeViewModel: ObservableObject {
     private func wakeMCPWaitersForActiveDispatch(
         delivery: MCPInstructionDispatch,
         session: TabSession,
-        sessionID: UUID
-    ) async {
-        guard delivery.isActiveRunDispatch else { return }
-        if let runID = session.runID,
+        sessionID: UUID,
+        expectedIdentity: MCPActiveDispatchWakeIdentity? = nil
+    ) async -> Bool {
+        guard delivery.isActiveRunDispatch else { return false }
+        if let expectedIdentity,
+           !mcpActiveDispatchWakeIdentityMatches(expectedIdentity, session: session)
+        {
+            Self.steeringDebugLog("[AgentRunSteeringWake] skip wake: active dispatch identity changed before wake sessionID=\(sessionID)")
+            return false
+        }
+        let runIDToWake = expectedIdentity?.runID ?? session.runID
+        if let runID = runIDToWake,
            let mcpServer
         {
             await mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
@@ -6641,9 +6711,30 @@ final class AgentModeViewModel: ObservableObject {
                 }
             )
         }
+        if let expectedIdentity,
+           !mcpActiveDispatchWakeIdentityMatches(expectedIdentity, session: session)
+        {
+            Self.steeringDebugLog("[AgentRunSteeringWake] skip current wake: active dispatch identity changed after parent wake sessionID=\(sessionID)")
+            return false
+        }
         await wakeCurrentMCPWaitersForSteeringRequest(for: session)
         await Task.yield()
         Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch yielded after steering wake sessionID=\(sessionID)")
+        return true
+    }
+
+    private func signalMCPInstructionDeliveredIfIdentityMatches(
+        for session: TabSession,
+        expectedIdentity: MCPActiveDispatchWakeIdentity?
+    ) async -> Bool {
+        if let expectedIdentity,
+           !mcpActiveDispatchWakeIdentityMatches(expectedIdentity, session: session)
+        {
+            Self.steeringDebugLog("[AgentRunSteeringWake] skip instruction-delivered signal: active dispatch identity changed sessionID=\(expectedIdentity.sessionID)")
+            return false
+        }
+        await signalMCPInstructionDelivered(for: session)
+        return true
     }
 
     private func startQueuedProviderSteeringForMCPDispatch(
@@ -6713,6 +6804,9 @@ final class AgentModeViewModel: ObservableObject {
             signalsDeliveryAfterDispatch = false
         }
 
+        let activeDispatchWakeIdentity = codexAttemptID == nil
+            ? nil
+            : mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
         let ackCancellationTarget = codexAttemptID.map {
             (tracker: session.codexSteerAckTracker, attemptID: $0)
         }
@@ -6750,19 +6844,39 @@ final class AgentModeViewModel: ObservableObject {
             switch submission {
             case .submitted:
                 Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
-                if delivery == .queuedClaudeInterrupt {
-                    await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
-                }
-                try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
-                if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
-                    await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
-                }
                 if let codexAttemptID {
+                    try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
                     session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
                     delivery = try await awaitCodexSteerAck(session: session, attemptID: codexAttemptID)
-                }
-                if signalsDeliveryAfterDispatch {
-                    await signalMCPInstructionDelivered(for: session)
+                    let didWake: Bool
+                    if let activeDispatchWakeIdentity {
+                        didWake = await wakeMCPWaitersForActiveDispatch(
+                            delivery: delivery,
+                            session: session,
+                            sessionID: sessionID,
+                            expectedIdentity: activeDispatchWakeIdentity
+                        )
+                    } else {
+                        Self.steeringDebugLog("[AgentRunSteeringWake] skip wake: active Codex dispatch had no captured identity sessionID=\(sessionID)")
+                        didWake = false
+                    }
+                    if didWake, delivery.signalsMCPDeliveryAfterDispatch {
+                        _ = await signalMCPInstructionDeliveredIfIdentityMatches(
+                            for: session,
+                            expectedIdentity: activeDispatchWakeIdentity
+                        )
+                    }
+                } else {
+                    if delivery == .queuedClaudeInterrupt {
+                        _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                    }
+                    try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
+                    if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
+                        _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                    }
+                    if signalsDeliveryAfterDispatch {
+                        await signalMCPInstructionDelivered(for: session)
+                    }
                 }
                 handleObservedMCPStateChange(for: session)
                 return delivery
@@ -8706,16 +8820,34 @@ final class AgentModeViewModel: ObservableObject {
 
     nonisolated static func rebuildEphemeralToolResultPayloadMap(
         from items: [AgentChatItem],
-        context: AgentToolResultProcessingContext? = nil
+        context: AgentToolResultProcessingContext? = nil,
+        diagnosticContext: String? = nil
     ) -> [UUID: String] {
-        Dictionary(
-            uniqueKeysWithValues: items.compactMap { item in
-                guard let retainedPayload = AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: item, context: context) else {
-                    return nil
-                }
-                return (item.id, retainedPayload)
+        var payloadByItemID: [UUID: String] = [:]
+        var firstRetainedItemByID: [UUID: (index: Int, item: AgentChatItem)] = [:]
+        for (index, item) in items.enumerated() {
+            guard let retainedPayload = AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: item, context: context) else {
+                continue
             }
-        )
+            if let firstPayload = payloadByItemID[item.id] {
+                let first = firstRetainedItemByID[item.id] ?? (index: index, item: item)
+                AgentSourceItemIDRepair.logDuplicateRetainedToolResultPayload(
+                    duplicateID: item.id,
+                    firstIndex: first.index,
+                    duplicateIndex: index,
+                    firstItem: first.item,
+                    duplicateItem: item,
+                    firstPayload: firstPayload,
+                    duplicatePayload: retainedPayload,
+                    context: diagnosticContext,
+                    toolResultContext: context
+                )
+                continue
+            }
+            payloadByItemID[item.id] = retainedPayload
+            firstRetainedItemByID[item.id] = (index, item)
+        }
+        return payloadByItemID
     }
 
     private nonisolated static func visibleToolResultIDs(in projection: AgentTranscriptProjection) -> Set<UUID> {
@@ -11679,6 +11811,23 @@ final class AgentModeViewModel: ObservableObject {
         }
     #endif
 
+    private func removeUnconfirmedMCPOptimisticCodexUserItem(
+        session: TabSession,
+        tabID: UUID,
+        itemID: UUID?,
+        reason: String
+    ) {
+        guard let itemID,
+              let index = session.items.firstIndex(where: { $0.id == itemID })
+        else { return }
+        guard session.removeItem(at: index) != nil else { return }
+        Self.steeringDebugLog(
+            "[AgentRunSteeringWake] removed unconfirmed MCP Codex optimistic item tab=\(tabID) itemID=\(itemID) reason=\(reason)"
+        )
+        requestUIRefresh(tabID: tabID, urgent: true)
+        scheduleSave(for: tabID)
+    }
+
     @discardableResult
     private func submitPreparedUserTurn(
         tabID: UUID,
@@ -11831,7 +11980,15 @@ final class AgentModeViewModel: ObservableObject {
                 if let codexAttemptID {
                     guard await session.codexSteerAckTracker.awaitDispatchAuthorization(
                         attemptID: codexAttemptID
-                    ) else { return }
+                    ) else {
+                        self.removeUnconfirmedMCPOptimisticCodexUserItem(
+                            session: session,
+                            tabID: tabID,
+                            itemID: userItem.id,
+                            reason: "dispatch authorization did not complete"
+                        )
+                        return
+                    }
                 }
                 handedOffToSerialDispatch = true
                 let sendOutcome = await self.startAgentRun(
@@ -11846,6 +12003,14 @@ final class AgentModeViewModel: ObservableObject {
                         session: session,
                         activationID: stagedCodexComputerUseActivationID
                     )
+                    if codexAttemptID != nil {
+                        self.removeUnconfirmedMCPOptimisticCodexUserItem(
+                            session: session,
+                            tabID: tabID,
+                            itemID: userItem.id,
+                            reason: "send outcome was not accepted or durably queued"
+                        )
+                    }
                 }
                 guard let codexAttemptID else { return }
                 let terminalState: CodexSteerAckTracker.TerminalState = switch sendOutcome {

@@ -262,6 +262,30 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     }
 }
 
+extension AgentChatItem {
+    func replacingID(_ newID: UUID) -> AgentChatItem {
+        AgentChatItem(
+            id: newID,
+            timestamp: timestamp,
+            kind: kind,
+            text: text,
+            attachments: attachments,
+            taggedFileAttachments: taggedFileAttachments,
+            toolName: toolName,
+            toolInvocationID: toolInvocationID,
+            toolArgsJSON: toolArgsJSON,
+            toolResultJSON: toolResultJSON,
+            toolIsError: toolIsError,
+            reasoning: reasoning,
+            sequenceIndex: sequenceIndex,
+            isStreaming: isStreaming,
+            workflow: workflow,
+            codexGoalMode: codexGoalMode,
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+        )
+    }
+}
+
 // MARK: - Persistence Model
 
 /// Persisted version of AgentChatItem for storage

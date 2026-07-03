@@ -237,6 +237,38 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testScopedSteeringWithNilCurrentEpochCreatesSteeringEpoch() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true,
+            markSessionAsMCPOriginated: false,
+            requireInactiveRunState: true
+        )
+        let initialContext = try XCTUnwrap(session.mcpControlContext)
+        XCTAssertNil(initialContext.currentEpoch)
+        XCTAssertFalse(session.isMCPOriginated)
+
+        try await viewModel.withMCPRunEpochTransition(sessionID: sessionID, kind: .steering) {
+            await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        }
+
+        let steeringContext = try XCTUnwrap(session.mcpControlContext)
+        let steeringEpoch = try XCTUnwrap(steeringContext.currentEpoch)
+        XCTAssertEqual(steeringContext.activationID, initialContext.activationID)
+        XCTAssertEqual(steeringContext.registration, initialContext.registration)
+        XCTAssertEqual(steeringEpoch.ordinal, 1)
+        XCTAssertEqual(steeringEpoch.transitionKind, .steering)
+        XCTAssertNil(steeringContext.pendingEpochTransition)
+        XCTAssertFalse(session.isMCPOriginated)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
     func testInactiveSteeringReRegistersWaitTrackingAfterTerminalRecordExpires() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
