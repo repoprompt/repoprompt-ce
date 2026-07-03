@@ -28,7 +28,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         XCTAssertEqual(resolutions[0].recommended.agent, .codexExec)
         XCTAssertEqual(resolutions[0].recommended.modelRaw, AgentModel.gpt55CodexLow.rawValue)
         XCTAssertEqual(resolutions[1].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[1].recommended.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+        XCTAssertEqual(resolutions[1].recommended.modelRaw, AgentModel.gpt55CodexMedium.rawValue)
         XCTAssertEqual(resolutions[2].recommended.agent, .codexExec)
         XCTAssertEqual(resolutions[2].recommended.modelRaw, AgentModel.gpt55CodexHigh.rawValue)
         XCTAssertEqual(resolutions[3].recommended.agent, .codexExec)

@@ -140,8 +140,8 @@ enum AgentModel: String, CaseIterable, Codable {
     var description: String {
         switch self {
         case .codexMini: "Ultra-fast. Good for quick lookups, simple edits, and surface-level exploration."
-        case .gpt55CodexLow: "Fast GPT-5.5 reasoning through Codex. Recommended for explore, discovery, and default implementation."
-        case .gpt55CodexMedium: "Balanced GPT-5.5 reasoning through Codex. Good when you want more reasoning than Low without jumping to High."
+        case .gpt55CodexLow: "Fast GPT-5.5 reasoning through Codex. Recommended for explore, discovery, and lightweight implementation."
+        case .gpt55CodexMedium: "Balanced GPT-5.5 reasoning through Codex. Good for Engineer defaults when you want more reasoning than Low without jumping to High."
         case .gpt55CodexHigh: "Deep GPT-5.5 reasoning through Codex. Recommended for planning, review, and pair-agent work."
         case .gpt55CodexXHigh: "Maximum GPT-5.5 reasoning through Codex. Use selectively for the hardest agentic tasks."
         case .codexLow: "Fast agentic coding. Good for well-scoped, straightforward tasks."

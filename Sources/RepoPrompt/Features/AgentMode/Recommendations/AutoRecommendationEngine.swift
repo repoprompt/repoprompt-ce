@@ -492,7 +492,7 @@ final class AutoRecommendationEngine {
         // Suggest upgrade if only some CLIs are available
         let upgradeHint: String? = {
             if recommendedStatus.codexCLI != .ready {
-                return "Connect Codex CLI for GPT-5.5 Low (explore/discovery/engineer/default implementation), GPT-5.5 High (pair/Oracle), and GPT-5.5 Medium (design fallback)."
+                return "Connect Codex CLI for GPT-5.5 Low (explore/discovery), GPT-5.5 Medium (engineer and design fallback), and GPT-5.5 High (pair/Oracle)."
             }
             if recommendedStatus.claudeCodeCLI != .ready {
                 return "Connect Claude Code for Claude Opus (design/pair). Best for architecture and creative work."

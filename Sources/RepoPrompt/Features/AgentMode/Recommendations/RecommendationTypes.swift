@@ -261,14 +261,14 @@ struct RecommendationSet {
     }
 }
 
-// MARK: - Best Practice Profiles (May 2026)
+// MARK: - Best Practice Profiles (July 2026)
 
 /// Canonical best practice recommendations, versioned by date.
 /// Update `versionCode` when recommendations change significantly.
 enum BestPracticeProfiles {
     /// Bump when the table changes (used for gating mutes/badge).
     /// Format: YYYYMM
-    static let versionCode: Int = 202_606
+    static let versionCode: Int = 202_607
     static let tableTitle = "Best Models by Use Case (GPT-5.5)"
 
     struct UseCase {
@@ -297,7 +297,7 @@ enum BestPracticeProfiles {
         agentKind: .codexExec,
         agentModel: .gpt55CodexLow,
         strengths: [
-            "Fast default for explore, discovery, and implementation",
+            "Fast default for explore, discovery, and lightweight implementation",
             "Strong reasoning during agentic tool use",
             "Lower usage burn than higher GPT-5.5 efforts",
             "Codex-only GPT-5.5 via Codex CLI"
@@ -363,12 +363,12 @@ enum BestPracticeProfiles {
 
     static let claudeStrengths = """
     Claude Opus 4.6 remains great for editing-heavy work and careful file modifications. \
-    GPT-5.5 Low via Codex CLI is now our default recommendation for explore, discovery, and general agentic work.
+    GPT-5.5 Low via Codex CLI is now our default recommendation for explore, discovery, and lightweight agentic work.
     """
 
     static let gpt5HighStrengths = """
     GPT-5.5 Low/High via Codex CLI provides strong reasoning without extended wait times. \
-    Low is recommended for explore, discovery, and default implementation; High is recommended for Oracle, review, and pair agents. \
+    Low is recommended for explore and discovery; Medium is recommended for Engineer/default implementation; High is recommended for Oracle, review, and pair agents. \
     XHigh offers maximum reasoning but can exhaust usage limits quickly.
     """
 
@@ -382,8 +382,8 @@ enum BestPracticeProfiles {
     static let codexVsOpenAIExplanation = """
     GPT-5.5 is available to RepoPrompt through Codex CLI; do not configure it as an OpenAI API/OpenRouter model.
 
-    Use GPT‑5.5 Low via Codex CLI for Context Builder discovery, explore, and default agentic implementation, \
-    and GPT‑5.5 High via Codex CLI for Oracle, review, and pair-agent work. Use GPT‑5.5 Pro for ChatGPT Pro export/planning.
+    Use GPT‑5.5 Low via Codex CLI for Context Builder discovery and explore, \
+    GPT‑5.5 Medium for Engineer/default implementation, and GPT‑5.5 High for Oracle, review, and pair-agent work. Use GPT‑5.5 Pro for ChatGPT Pro export/planning.
     """
 
     static let contextBuilderRationale = "Codex with GPT-5.5 Low provides the best Context Builder/discovery default – strong codebase exploration with practical usage burn."

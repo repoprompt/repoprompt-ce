@@ -1825,7 +1825,7 @@ enum AgentModelCatalog {
             ]
         case .engineer:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexLow.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexMedium.rawValue),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
