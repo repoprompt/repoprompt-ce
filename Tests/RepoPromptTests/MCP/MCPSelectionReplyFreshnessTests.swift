@@ -85,44 +85,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         XCTAssertEqual(diagnostics.unmappedPaths, ["README.txt"])
     }
 
-    func testAutoModeOnlyDiagnosesRequestedCodemapFiles() async {
-        let selectedFile = makeFileRecord(relativePath: "Sources/Selected.swift")
-        let requestedCodemapFile = makeFileRecord(relativePath: "Sources/Requested.swift")
-        let selectedEntry = MCPServerViewModel.SelectionReplyAssembler.SelectedEntry(
-            entry: ResolvedPromptFileEntry(file: selectedFile)
-        )
-        let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
-        let presentation = WorkspaceCodemapOperationPresentation(
-            orderedEntries: [],
-            coverage: .pending([issue]),
-            issues: [issue],
-            publicationReceipt: nil
-        )
-        let collections = MCPServerViewModel.SelectionReplyAssembler.SelectionCollections(
-            selected: [selectedEntry],
-            codemap: [],
-            requestedCodemapFiles: [requestedCodemapFile],
-            codemapAutoEnabled: false,
-            codeMapUsage: .auto,
-            invalid: [],
-            codemapPresentation: presentation
-        )
-
-        let diagnosticFiles = MCPServerViewModel.SelectionReplyAssembler.codemapDiagnosticFiles(
-            for: collections
-        )
-        XCTAssertEqual(diagnosticFiles.map(\.id), [requestedCodemapFile.id])
-
-        let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
-            for: diagnosticFiles,
-            presentation: presentation
-        ) { file in
-            file.standardizedRelativePath
-        }
-        XCTAssertEqual(diagnostics.pendingPaths, ["Sources/Requested.swift"])
-        XCTAssertEqual(diagnostics.unmappedPaths, [])
-    }
-
     func testWorkspaceContextCodeStructureUsesUsageAwareAutoDiagnostics() async throws {
         let root = try makeTemporaryRoot(name: "WorkspaceCodeDiagnostics")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -151,6 +113,9 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             invalid: [],
             codemapPresentation: presentation
         )
+
+        let diagnosticFiles = MCPServerViewModel.SelectionReplyAssembler.codemapDiagnosticFiles(for: collections)
+        XCTAssertEqual(diagnosticFiles.map(\.id), [requestedCodemapFile.id])
 
         let builder = MCPServerViewModel.CodeStructureBuilder(
             owner: window.mcpServer,

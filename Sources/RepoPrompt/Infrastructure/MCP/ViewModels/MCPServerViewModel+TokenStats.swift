@@ -124,18 +124,12 @@ extension MCPServerViewModel {
                 scheduleRefreshIfNeeded: allowActivePublishedSnapshotRefresh
             )
 
-            var incompleteComponents = Set<String>()
-            if !published.isComplete {
-                incompleteComponents.insert("published_snapshot")
-            }
-            if Self.hasMissingFileTokenInputs(
+            var incompleteComponents = Self.virtualSnapshotIncompleteComponents(
                 collections: collections,
                 reliableFileIDs: publishedOverlay.reliableFileIDs
-            ) {
-                incompleteComponents.insert("files")
-            }
-            if Self.hasPendingCodemapPresentationGaps(collections: collections) {
-                incompleteComponents.insert("codemap_presentation")
+            )
+            if !published.isComplete {
+                incompleteComponents.insert("published_snapshot")
             }
 
             let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
@@ -195,16 +189,10 @@ extension MCPServerViewModel {
         if allowVirtualTokenRefresh,
            let cachedSnapshot = mcpVirtualTokenSnapshotsByTabID[context.tabID]?[signature]
         {
-            var incompleteComponents = Set<String>()
-            if Self.hasMissingFileTokenInputs(
+            var incompleteComponents = Self.virtualSnapshotIncompleteComponents(
                 collections: collections,
                 reliableFileIDs: Set(cachedSnapshot.entryResultsByFileID.keys)
-            ) {
-                incompleteComponents.insert("files")
-            }
-            if Self.hasPendingCodemapPresentationGaps(collections: collections) {
-                incompleteComponents.insert("codemap_presentation")
-            }
+            )
             incompleteComponents.formUnion(cachedSnapshot.incompleteComponents ?? [])
             let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
             if !incompleteComponents.isEmpty {
@@ -230,16 +218,10 @@ extension MCPServerViewModel {
             )
         }
 
-        var incompleteComponents = Set<String>()
-        if Self.hasMissingFileTokenInputs(
+        var incompleteComponents = Self.virtualSnapshotIncompleteComponents(
             collections: collections,
             reliableFileIDs: publishedOverlay.reliableFileIDs
-        ) {
-            incompleteComponents.insert("files")
-        }
-        if Self.hasPendingCodemapPresentationGaps(collections: collections) {
-            incompleteComponents.insert("codemap_presentation")
-        }
+        )
         if resolvedContext.rendersFileTree {
             incompleteComponents.insert("file_tree")
         }
