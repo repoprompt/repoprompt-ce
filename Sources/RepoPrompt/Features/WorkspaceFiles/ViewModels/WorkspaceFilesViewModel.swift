@@ -2245,6 +2245,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             return false
         }
 
+        var needsIndexRebuild = useCanonicalSnapshotMetadata
         var topologyChanged = false
         var dirtyFolders: [UUID: FolderViewModel] = [:]
         var removedSubtrees: [RemovedFolderSubtree] = []
@@ -2315,10 +2316,33 @@ class WorkspaceFilesViewModel: ObservableObject {
                 if let parent = removed.formerParentFolder ?? parentFolderForRelativePath(path, under: targetRootVM) {
                     dirtyFolders[parent.id] = parent
                 }
+            } else {
+                let fullPath = StandardizedPath.join(
+                    standardizedRoot: rootKey,
+                    standardizedRelativePath: path
+                )
+                let matcher = RemovedFolderPathMatcher(removedFolderPaths: [fullPath])
+                let standardizedRootKey = StandardizedPath.absolute(rootKey)
+                let hasIndexedDescendantFiles = if let ownedFilePaths = fileHierarchyIndex.filePathsByRoot[standardizedRootKey] {
+                    ownedFilePaths.contains {
+                        matcher.containsPathEqualToOrInsideRemovedFolder($0)
+                    }
+                } else {
+                    fileHierarchyIndex.filesByFullPath.values.contains { file in
+                        file.standardizedRootFolderPath == standardizedRootKey
+                            && matcher.containsPathEqualToOrInsideRemovedFolder(file.standardizedFullPath)
+                    }
+                }
+                if fileHierarchyIndex.foldersByFullPath[fullPath] != nil || hasIndexedDescendantFiles {
+                    needsIndexRebuild = true
+                }
             }
         }
         if !removedSubtrees.isEmpty {
-            _ = performBatchedIncrementalRemovedSubtreeCleanup(removedSubtrees, rootKey: rootKey)
+            let cleanupOutcome = performBatchedIncrementalRemovedSubtreeCleanup(removedSubtrees, rootKey: rootKey)
+            if !cleanupOutcome.succeeded {
+                needsIndexRebuild = true
+            }
         }
 
         for fileID in event.modifiedFileIDs {
@@ -2372,6 +2396,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             } else {
                 recomputeAncestorStates(startingAtFolders: Array(dirtyFolders.values))
             }
+        }
+        if needsIndexRebuild {
             rebuildFileHierarchyIndex(for: targetRootVM)
         }
         publishRootFoldersChanged()
@@ -8874,6 +8900,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         @MainActor
         func injectIndexedFileForTesting(_ file: FileViewModel) {
             fileHierarchyIndex.insertFile(file, rootKey: file.standardizedRootFolderPath)
+        }
+
+        @MainActor
+        func injectIndexedFolderForTesting(_ folder: FolderViewModel) {
+            fileHierarchyIndex.insertFolder(folder, rootKey: StandardizedPath.absolute(folder.rootPath))
         }
 
         /// Attach the selection callback and toggle a file into `selectedFiles`

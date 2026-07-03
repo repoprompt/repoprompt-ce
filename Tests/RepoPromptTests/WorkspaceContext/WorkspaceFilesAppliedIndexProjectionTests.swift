@@ -11,6 +11,257 @@ import XCTest
             try super.tearDownWithError()
         }
 
+        func testIncrementalTopologyDeltasMaintainIndexWithoutHierarchyRebuild() async throws {
+            let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexIncrementalTopology")
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            _ = try manager.attachRootShell(for: root, workspaceID: UUID())
+
+            var folderIDs: [String: UUID] = [:]
+            func folderRecord(_ relativePath: String) -> WorkspaceFolderRecord {
+                let id = UUID()
+                folderIDs[relativePath] = id
+                let parentRelativePath = StandardizedPath.relative(
+                    (relativePath as NSString).deletingLastPathComponent
+                )
+                return WorkspaceFolderRecord(
+                    id: id,
+                    rootID: root.id,
+                    name: (relativePath as NSString).lastPathComponent,
+                    relativePath: relativePath,
+                    fullPath: rootURL.appendingPathComponent(relativePath, isDirectory: true).path,
+                    parentFolderID: parentRelativePath.isEmpty ? root.id : folderIDs[parentRelativePath],
+                    modificationDate: Date(timeIntervalSince1970: 100)
+                )
+            }
+            func fileRecord(_ relativePath: String, parentRelativePath: String) -> WorkspaceFileRecord {
+                WorkspaceFileRecord(
+                    id: UUID(),
+                    rootID: root.id,
+                    name: (relativePath as NSString).lastPathComponent,
+                    relativePath: relativePath,
+                    fullPath: rootURL.appendingPathComponent(relativePath).path,
+                    parentFolderID: folderIDs[parentRelativePath] ?? root.id,
+                    modificationDate: Date(timeIntervalSince1970: 200)
+                )
+            }
+
+            var folders: [WorkspaceFolderRecord] = []
+            var files: [WorkspaceFileRecord] = []
+            for moduleIndex in 0 ..< 24 {
+                let module = "Module\(moduleIndex)"
+                folders.append(folderRecord(module))
+                for fileIndex in 0 ..< 4 {
+                    files.append(fileRecord("\(module)/File\(fileIndex).swift", parentRelativePath: module))
+                }
+            }
+            let removedFolder = folderRecord("RemoveMe")
+            folders.append(removedFolder)
+            let removedFolderFile = fileRecord("RemoveMe/Old.swift", parentRelativePath: "RemoveMe")
+            files.append(removedFolderFile)
+            let removedFile = files[3]
+            let retainedFile = files[8]
+
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 1,
+                upsertedFiles: files,
+                upsertedFolders: folders
+            ))
+            let baselineRebuildCount = manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount
+
+            let addedFolder = folderRecord("Added")
+            let addedFile = fileRecord("Added/New.swift", parentRelativePath: "Added")
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 2,
+                upsertedFiles: [addedFile],
+                upsertedFolders: [addedFolder],
+                removedFilePaths: [removedFile.standardizedRelativePath],
+                removedFolderPaths: [removedFolder.standardizedRelativePath]
+            ))
+
+            var index = manager.appliedIndexProjectionIndexSnapshotForTesting()
+            XCTAssertEqual(
+                manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount,
+                baselineRebuildCount
+            )
+            XCTAssertEqual(index.filePathsByID[addedFile.id], addedFile.standardizedFullPath)
+            XCTAssertEqual(index.fileIDsByPath[addedFile.standardizedFullPath], addedFile.id)
+            XCTAssertEqual(index.filePathsByID[retainedFile.id], retainedFile.standardizedFullPath)
+            XCTAssertEqual(index.fileIDsByPath[retainedFile.standardizedFullPath], retainedFile.id)
+            XCTAssertNil(index.filePathsByID[removedFile.id])
+            XCTAssertNil(index.fileIDsByPath[removedFile.standardizedFullPath])
+            XCTAssertNil(index.folderPathsByID[removedFolder.id])
+            XCTAssertNil(index.folderIDsByPath[removedFolder.standardizedFullPath])
+            XCTAssertNil(index.filePathsByID[removedFolderFile.id])
+            XCTAssertNil(index.fileIDsByPath[removedFolderFile.standardizedFullPath])
+
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 3,
+                modifiedFileIDs: [retainedFile.id]
+            ))
+            index = manager.appliedIndexProjectionIndexSnapshotForTesting()
+            XCTAssertEqual(
+                manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount,
+                baselineRebuildCount
+            )
+            XCTAssertEqual(index.filePathsByID[retainedFile.id], retainedFile.standardizedFullPath)
+            XCTAssertEqual(index.fileIDsByPath[retainedFile.standardizedFullPath], retainedFile.id)
+
+            await manager.unloadAllRootFolders()
+        }
+
+        func testRemovedSubtreeCleanupMismatchFallsBackToHierarchyRebuild() async throws {
+            let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexCleanupMismatch")
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            _ = try manager.attachRootShell(for: root, workspaceID: UUID())
+
+            let folderID = UUID()
+            let folder = WorkspaceFolderRecord(
+                id: folderID,
+                rootID: root.id,
+                name: "Victim",
+                relativePath: "Victim",
+                fullPath: rootURL.appendingPathComponent("Victim", isDirectory: true).path,
+                parentFolderID: root.id
+            )
+            let file = WorkspaceFileRecord(
+                id: UUID(),
+                rootID: root.id,
+                name: "KeptOnlyInTree.swift",
+                relativePath: "Victim/KeptOnlyInTree.swift",
+                fullPath: rootURL.appendingPathComponent("Victim/KeptOnlyInTree.swift").path,
+                parentFolderID: folderID
+            )
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 1,
+                upsertedFiles: [file],
+                upsertedFolders: [folder]
+            ))
+            let baselineRebuildCount = manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount
+
+            let stalePath = rootURL.appendingPathComponent("Victim/StaleIndexedOnly.swift").path
+            let staleFile = FileViewModel(
+                file: File(name: "StaleIndexedOnly.swift", path: stalePath, modificationDate: Date()),
+                rootPath: root.standardizedFullPath,
+                rootIdentifier: root.id,
+                rootFolderPath: root.standardizedFullPath,
+                fileSystemService: nil
+            )
+            manager.injectIndexedFileForTesting(staleFile)
+
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 2,
+                removedFolderPaths: [folder.standardizedRelativePath]
+            ))
+
+            let index = manager.appliedIndexProjectionIndexSnapshotForTesting()
+            XCTAssertEqual(
+                manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount,
+                baselineRebuildCount + 1
+            )
+            XCTAssertNil(index.folderPathsByID[folderID])
+            XCTAssertNil(index.folderIDsByPath[folder.standardizedFullPath])
+            XCTAssertNil(index.filePathsByID[file.id])
+            XCTAssertNil(index.fileIDsByPath[file.standardizedFullPath])
+            XCTAssertNil(index.fileIDsByPath[staleFile.standardizedFullPath])
+
+            await manager.unloadAllRootFolders()
+        }
+
+        func testRemovedFolderIndexMismatchFallsBackToHierarchyRebuild() async throws {
+            let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexMissingSubtreeMismatch")
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            _ = try manager.attachRootShell(for: root, workspaceID: UUID())
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 1
+            ))
+            let baselineRebuildCount = manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount
+
+            let staleFolderPath = rootURL.appendingPathComponent("IndexedOnly", isDirectory: true).path
+            let staleFolder = FolderViewModel(
+                folder: Folder(name: "IndexedOnly", path: staleFolderPath, modificationDate: Date()),
+                rootPath: root.standardizedFullPath
+            )
+            manager.injectIndexedFolderForTesting(staleFolder)
+
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 2,
+                removedFolderPaths: ["IndexedOnly"]
+            ))
+
+            let index = manager.appliedIndexProjectionIndexSnapshotForTesting()
+            XCTAssertEqual(
+                manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount,
+                baselineRebuildCount + 1
+            )
+            XCTAssertNil(index.folderPathsByID[staleFolder.id])
+            XCTAssertNil(index.folderIDsByPath[staleFolder.standardizedFullPath])
+            XCTAssertEqual(index.folderPathsByID[root.id], root.standardizedFullPath)
+
+            await manager.unloadAllRootFolders()
+        }
+
+        func testRemovedFolderDescendantFileIndexMismatchFallsBackToHierarchyRebuild() async throws {
+            let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexDescendantFileMismatch")
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            _ = try manager.attachRootShell(for: root, workspaceID: UUID())
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 1
+            ))
+            let baselineRebuildCount = manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount
+
+            let staleFilePath = rootURL.appendingPathComponent("IndexedOnly/Stale.swift").path
+            let staleFile = FileViewModel(
+                file: File(name: "Stale.swift", path: staleFilePath, modificationDate: Date()),
+                rootPath: root.standardizedFullPath,
+                rootIdentifier: root.id,
+                rootFolderPath: root.standardizedFullPath,
+                fileSystemService: nil
+            )
+            manager.injectIndexedFileForTesting(staleFile)
+
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 2,
+                removedFolderPaths: ["IndexedOnly"]
+            ))
+
+            let index = manager.appliedIndexProjectionIndexSnapshotForTesting()
+            XCTAssertEqual(
+                manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount,
+                baselineRebuildCount + 1
+            )
+            XCTAssertNil(index.filePathsByID[staleFile.id])
+            XCTAssertNil(index.fileIDsByPath[staleFile.standardizedFullPath])
+            XCTAssertEqual(index.folderPathsByID[root.id], root.standardizedFullPath)
+
+            await manager.unloadAllRootFolders()
+        }
+
         func testModifiedIDsUseDirectIndexesAndTopologyRemovalClearsUUIDMaps() async throws {
             let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexDirectIDs")
             let store = WorkspaceFileContextStore()
@@ -419,6 +670,7 @@ import XCTest
                     )
                 ]
             ))
+            let baselineRebuildCount = manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount
 
             await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
                 rootID: root.id,
@@ -442,6 +694,7 @@ import XCTest
             }
             var diagnostics = manager.appliedIndexProjectionDiagnosticsSnapshot()
             XCTAssertEqual(diagnostics.canonicalResyncCount, 1)
+            XCTAssertGreaterThan(diagnostics.indexRebuildCount, baselineRebuildCount)
             XCTAssertEqual(diagnostics.handledEventCount, 2)
             XCTAssertEqual(diagnostics.handledGenerationByRootID[root.id], canonical.generation)
 
@@ -485,6 +738,7 @@ import XCTest
                 rootPath: root.standardizedFullPath,
                 generation: 1
             ))
+            let baselineRebuildCount = manager.appliedIndexProjectionDiagnosticsSnapshot().indexRebuildCount
             await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
                 rootID: root.id,
                 rootPath: root.standardizedFullPath,
@@ -497,6 +751,7 @@ import XCTest
             }
             let diagnostics = manager.appliedIndexProjectionDiagnosticsSnapshot()
             XCTAssertEqual(diagnostics.canonicalResyncCount, 1)
+            XCTAssertGreaterThan(diagnostics.indexRebuildCount, baselineRebuildCount)
             XCTAssertEqual(diagnostics.handledEventCount, 2)
             XCTAssertEqual(diagnostics.handledGenerationByRootID[root.id], 3)
 
