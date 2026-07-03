@@ -1165,6 +1165,37 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         )
         self.assertIsNone(job.xctest_progress_deadline)
 
+    def test_test_cli_forwards_test_product_for_focused_split_targets(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(
+                state.paths,
+                "test",
+                ["--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            enqueue.call_args.args[2],
+            {"filter": "WorkspaceTests", "testProduct": "RepoPromptWorkspaceTests"},
+        )
+
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        root_argv, root_lanes, root_cwd, _env, _timeout = registry.prepare(
+            {
+                "operation": "test",
+                "args": {"filter": "WorkspaceTests", "testProduct": "RepoPromptWorkspaceTests"},
+            }
+        )
+
+        self.assertEqual(
+            root_argv,
+            ["swift", "test", "--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
+        )
+        self.assertEqual(root_lanes, ["build"])
+        self.assertEqual(root_cwd, state.paths.repo_root)
+
     def test_test_list_cli_preserves_build_lane_and_package_roots(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -1202,6 +1233,12 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 state.paths,
                 "provider-test",
                 ["--list", "--xctest-stall-seconds", "10"],
+            )
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined"):
+            conductor.handle_real_operation(
+                state.paths,
+                "test",
+                ["--list", "--test-product", "RepoPromptWorkspaceTests"],
             )
 
         registry = conductor.OperationRegistry(state.paths.repo_root)

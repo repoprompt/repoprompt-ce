@@ -174,13 +174,13 @@ dev-run:
 	./conductor run
 
 dev-test:
-	./conductor test$(if $(FILTER), --filter $(FILTER))
+	./conductor test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
 
 dev-test-list:
 	./conductor test --list
 
 dev-provider-test:
-	./conductor provider-test$(if $(FILTER), --filter $(FILTER))
+	./conductor provider-test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
 
 dev-provider-test-list:
 	./conductor provider-test --list
