@@ -14,6 +14,62 @@ struct AgentOracleOpenContext {
     }
 }
 
+struct AgentOracleLatestPopoverRoute: Equatable {
+    let windowID: Int
+    let workspaceID: UUID
+    let tabID: UUID
+
+    init?(
+        openContext: AgentOracleOpenContext?,
+        tabID: UUID? = nil
+    ) {
+        guard let openContext,
+              let workspaceID = openContext.workspaceID,
+              let tabID = tabID ?? openContext.tabID
+        else { return nil }
+        windowID = openContext.windowID
+        self.workspaceID = workspaceID
+        self.tabID = tabID
+    }
+
+    init?(notificationUserInfo userInfo: [AnyHashable: Any]?) {
+        guard let userInfo,
+              userInfo[Key.chatID] == nil,
+              userInfo[Key.route] as? String == Key.latestRoute,
+              let windowID = userInfo[Key.windowID] as? Int,
+              let workspaceID = Self.uuid(from: userInfo[Key.workspaceID]),
+              let tabID = Self.uuid(from: userInfo[Key.tabID])
+        else { return nil }
+        self.windowID = windowID
+        self.workspaceID = workspaceID
+        self.tabID = tabID
+    }
+
+    var notificationUserInfo: [AnyHashable: Any] {
+        [
+            Key.windowID: windowID,
+            Key.workspaceID: workspaceID,
+            Key.tabID: tabID,
+            Key.route: Key.latestRoute
+        ]
+    }
+
+    private enum Key {
+        static let windowID = "windowID"
+        static let workspaceID = "workspaceID"
+        static let tabID = "tabID"
+        static let chatID = "chatID"
+        static let route = "route"
+        static let latestRoute = "latest"
+    }
+
+    private static func uuid(from value: Any?) -> UUID? {
+        if let value = value as? UUID { return value }
+        if let value = value as? String { return UUID(uuidString: value) }
+        return nil
+    }
+}
+
 struct AgentOraclePopoverRoute: Equatable {
     let windowID: Int
     let workspaceID: UUID

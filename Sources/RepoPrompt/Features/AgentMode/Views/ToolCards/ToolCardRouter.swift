@@ -49,6 +49,16 @@ enum AgentOracleToolRouting {
             tabID: tabID
         )?.notificationUserInfo
     }
+
+    static func latestPopoverUserInfo(
+        openContext: AgentOracleOpenContext?,
+        tabID: UUID? = nil
+    ) -> [AnyHashable: Any]? {
+        AgentOracleLatestPopoverRoute(
+            openContext: openContext,
+            tabID: tabID
+        )?.notificationUserInfo
+    }
 }
 
 struct ContextBuilderCardContext {
@@ -733,11 +743,25 @@ func oracleToolCallPopoverUserInfo(
     guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
           toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send"
     else { return nil }
-    let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
-    return AgentOracleToolRouting.operationPopoverUserInfo(
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
-        chatID: chatID
-    )
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolResultJSON)
+    ) {
+        return exact
+    }
+    guard item.toolResultJSON == nil, item.toolIsError == nil else { return nil }
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
+    ) {
+        return exact
+    }
+    guard AgentOracleAuthoritativeChatIDPolicy.allowsLatestFallback(fromSerializedJSON: item.toolArgsJSON) else {
+        return nil
+    }
+    return AgentOracleToolRouting.latestPopoverUserInfo(openContext: openContext)
 }
 
 enum ToolCallCardStateResolver {

@@ -65,6 +65,8 @@ extension Notification.Name {
     static let showMCPServerPopover = Notification.Name("showMCPServerPopover")
     /// Posted when Agent Mode should open the Oracle pill popover.
     /// userInfo: ["windowID": Int, "workspaceID": UUID, "tabID": UUID, "chatID": String]
+    /// Running Oracle tool calls may instead use ["route": "latest"] without chatID to open
+    /// the latest eligible tab/run-scoped Oracle chat.
     static let showAgentOraclePopover = Notification.Name("showAgentOraclePopover")
     /// Posted when Agent Mode should open the Workflow pill popover.
     /// userInfo: ["windowID": Int]
