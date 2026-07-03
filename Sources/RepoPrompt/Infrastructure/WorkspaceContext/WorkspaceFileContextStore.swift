@@ -2302,6 +2302,9 @@ actor WorkspaceFileContextStore {
     private var codemapMarkerReadinessContinuations: [
         UUID: AsyncStream<WorkspaceCodemapMarkerReadinessEvent>.Continuation
     ] = [:]
+    private var codemapRootProjectionProgressContinuations: [
+        UUID: AsyncStream<WorkspaceCodemapRootProjectionProgressEvent>.Continuation
+    ] = [:]
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
@@ -2531,6 +2534,9 @@ actor WorkspaceFileContextStore {
             continuation.finish()
         }
         for continuation in codemapMarkerReadinessContinuations.values {
+            continuation.finish()
+        }
+        for continuation in codemapRootProjectionProgressContinuations.values {
             continuation.finish()
         }
         for continuation in fileSystemDeltaContinuations.values {
@@ -8909,6 +8915,23 @@ actor WorkspaceFileContextStore {
 
     private func removeCodemapMarkerReadinessContinuation(_ id: UUID) {
         codemapMarkerReadinessContinuations.removeValue(forKey: id)
+    }
+
+    /// Production observation stream of accepted per-root codemap projection
+    /// progress. Events are only emitted for accepted projection snapshots
+    /// (segments and coverage seals); observers never create codemap demand.
+    func codemapRootProjectionProgressUpdates() -> AsyncStream<WorkspaceCodemapRootProjectionProgressEvent> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            codemapRootProjectionProgressContinuations[id] = continuation
+            continuation.onTermination = { _ in
+                Task { await self.removeCodemapRootProjectionProgressContinuation(id) }
+            }
+        }
+    }
+
+    private func removeCodemapRootProjectionProgressContinuation(_ id: UUID) {
+        codemapRootProjectionProgressContinuations.removeValue(forKey: id)
     }
 
     @discardableResult
@@ -17225,6 +17248,14 @@ actor WorkspaceFileContextStore {
         {
             yieldCodemapSelectionGraphReadiness(rootEpoch: authority.rootEpoch)
         }
+        if case let .accepted(acceptedProgress) = disposition {
+            let isSealed = if case .seal = snapshot { true } else { false }
+            yieldCodemapRootProjectionProgress(WorkspaceCodemapRootProjectionProgressEvent(
+                rootEpoch: authority.rootEpoch,
+                progress: acceptedProgress,
+                isSealed: isSealed
+            ))
+        }
         return disposition
     }
 
@@ -21372,6 +21403,12 @@ actor WorkspaceFileContextStore {
 
     private func yieldCodemapMarkerReadiness(_ event: WorkspaceCodemapMarkerReadinessEvent) {
         for continuation in codemapMarkerReadinessContinuations.values {
+            continuation.yield(event)
+        }
+    }
+
+    private func yieldCodemapRootProjectionProgress(_ event: WorkspaceCodemapRootProjectionProgressEvent) {
+        for continuation in codemapRootProjectionProgressContinuations.values {
             continuation.yield(event)
         }
     }

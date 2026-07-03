@@ -44,6 +44,18 @@ struct WorkspaceCodemapSelectionGraphReadinessEvent: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
 }
 
+/// Production observation event describing accepted per-root codemap projection
+/// progress. Yielded by `WorkspaceFileContextStore` whenever a projection
+/// snapshot (segment or seal) is accepted for a root, so UI surfaces can render
+/// lightweight per-root scanning progress without creating codemap demand.
+struct WorkspaceCodemapRootProjectionProgressEvent: Hashable {
+    let rootEpoch: WorkspaceCodemapRootEpoch
+    /// Cumulative accepted progress for the root's current projection generation.
+    let progress: WorkspaceCodemapProjectionProgress
+    /// True when the accepted snapshot was a coverage seal (projection complete).
+    let isSealed: Bool
+}
+
 struct WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy: Hashable {
     static let initial = Self(
         maximumTargetCount: 100_000,

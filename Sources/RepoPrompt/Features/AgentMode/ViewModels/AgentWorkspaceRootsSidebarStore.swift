@@ -1,6 +1,43 @@
 import Combine
 import Foundation
 
+/// Subtle per-root codemap scanning/loading state rendered under the root
+/// identity line in the Agent Mode workspace roots sidebar.
+enum AgentRootCodemapProgressDisplayState: Equatable {
+    /// Projection scan in flight; determinate when `total` is known.
+    case scanning(processed: UInt64, total: UInt64?)
+    /// Projection coverage complete for the root's current generation.
+    case ready
+    /// The global code maps kill-switch is on; overrides any activity.
+    case disabledGlobally
+
+    var displayText: String {
+        switch self {
+        case let .scanning(processed, total?):
+            "Codemaps \(processed)/\(total)"
+        case .scanning:
+            "Codemaps scanning…"
+        case .ready:
+            "Codemaps ready"
+        case .disabledGlobally:
+            "Codemaps disabled globally"
+        }
+    }
+
+    var accessibilityText: String {
+        switch self {
+        case let .scanning(processed, total?):
+            "Codemaps scanning, \(processed) of \(total) files processed"
+        case let .scanning(processed, nil):
+            "Codemaps scanning, \(processed) files processed"
+        case .ready:
+            "Codemaps ready"
+        case .disabledGlobally:
+            "Codemaps disabled globally"
+        }
+    }
+}
+
 struct AgentWorkspaceRootRow: Identifiable, Equatable {
     let id: UUID
     let name: String
@@ -54,17 +91,26 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
     @Published private(set) var rootRows: [AgentWorkspaceRootRow] = []
     @Published private(set) var workspaceLabel = "No Workspace"
     @Published private(set) var isExitDisabled = true
+    /// Per-root codemap progress display states keyed by root UUID
+    /// (`AgentWorkspaceRootRow.id`). Published separately from `rootRows` so
+    /// progress ticks never rebuild rows or disturb row identity/ordering.
+    @Published private(set) var codemapProgressByRootID: [UUID: AgentRootCodemapProgressDisplayState] = [:]
 
     private let rootProjections: @MainActor () -> [WorkspaceRootShellProjection]
     private let rootChanges: AnyPublisher<Void, Never>
     private let gitContextLookup: @MainActor (String) -> GitWorktreeContextSummary?
     private let gitContextChanges: AnyPublisher<Void, Never>
+    private let codemapActivityLookup: @MainActor () -> [UUID: WorkspaceRootCodemapActivity]
+    private let codemapActivityChanges: AnyPublisher<Void, Never>
+    private let codemapsGloballyDisabled: AnyPublisher<Bool, Never>
+    private let codemapActivityThrottleMilliseconds: Int
     private let workspaceManager: WorkspaceManagerViewModel
     let windowID: Int
 
     private var cancellables: Set<AnyCancellable> = []
     private var rootRowsResnapshotTask: Task<Void, Never>?
     private var workspaceMetadataResnapshotTask: Task<Void, Never>?
+    private var isCodemapsGloballyDisabled = false
 
     var workspaceManagerForPicker: WorkspaceManagerViewModel {
         workspaceManager
@@ -75,6 +121,11 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         rootChanges: AnyPublisher<Void, Never>,
         gitContextLookup: @escaping @MainActor (String) -> GitWorktreeContextSummary? = { _ in nil },
         gitContextChanges: AnyPublisher<Void, Never> = Empty<Void, Never>().eraseToAnyPublisher(),
+        codemapActivityLookup: @escaping @MainActor () -> [UUID: WorkspaceRootCodemapActivity] = { [:] },
+        codemapActivityChanges: AnyPublisher<Void, Never> = Empty<Void, Never>().eraseToAnyPublisher(),
+        codemapsGloballyDisabled: AnyPublisher<Bool, Never>? = nil,
+        initialCodemapsGloballyDisabled: Bool? = nil,
+        codemapActivityThrottleMilliseconds: Int = 150,
         workspaceManager: WorkspaceManagerViewModel,
         windowID: Int
     ) {
@@ -82,6 +133,13 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         self.rootChanges = rootChanges
         self.gitContextLookup = gitContextLookup
         self.gitContextChanges = gitContextChanges
+        self.codemapActivityLookup = codemapActivityLookup
+        self.codemapActivityChanges = codemapActivityChanges
+        self.codemapsGloballyDisabled = codemapsGloballyDisabled
+            ?? GlobalSettingsStore.shared.$codeMapsGloballyDisabled.eraseToAnyPublisher()
+        isCodemapsGloballyDisabled = initialCodemapsGloballyDisabled
+            ?? (codemapsGloballyDisabled == nil ? GlobalSettingsStore.shared.globalCodeMapsDisabled() : false)
+        self.codemapActivityThrottleMilliseconds = max(0, codemapActivityThrottleMilliseconds)
         self.workspaceManager = workspaceManager
         self.windowID = windowID
 
@@ -93,6 +151,32 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
     deinit {
         rootRowsResnapshotTask?.cancel()
         workspaceMetadataResnapshotTask?.cancel()
+    }
+
+    /// Pure mapping from visible root projections + per-root activity to
+    /// display states. Progress is joined strictly by root UUID; activity
+    /// entries whose IDs do not match a visible projection (for example hidden
+    /// physical worktree session roots) are dropped. Global disable wins.
+    static func codemapProgressStates(
+        for projections: [WorkspaceRootShellProjection],
+        activityByRootID: [UUID: WorkspaceRootCodemapActivity],
+        globallyDisabled: Bool
+    ) -> [UUID: AgentRootCodemapProgressDisplayState] {
+        if globallyDisabled {
+            return Dictionary(uniqueKeysWithValues: projections.map { ($0.id, .disabledGlobally) })
+        }
+        var states: [UUID: AgentRootCodemapProgressDisplayState] = [:]
+        for projection in projections {
+            switch activityByRootID[projection.id] {
+            case let .scanning(processed, total):
+                states[projection.id] = .scanning(processed: processed, total: total)
+            case .ready:
+                states[projection.id] = .ready
+            case nil:
+                break
+            }
+        }
+        return states
     }
 
     static func rows(
@@ -174,6 +258,30 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
             }
             .store(in: &cancellables)
 
+        codemapActivityChanges
+            .throttle(
+                for: .milliseconds(codemapActivityThrottleMilliseconds),
+                scheduler: DispatchQueue.main,
+                latest: true
+            )
+            .sink { [weak self] in
+                Task { @MainActor in
+                    self?.resnapshotCodemapProgress()
+                }
+            }
+            .store(in: &cancellables)
+
+        codemapsGloballyDisabled
+            .removeDuplicates()
+            .sink { [weak self] disabled in
+                Task { @MainActor in
+                    guard let self, self.isCodemapsGloballyDisabled != disabled else { return }
+                    self.isCodemapsGloballyDisabled = disabled
+                    self.resnapshotCodemapProgress()
+                }
+            }
+            .store(in: &cancellables)
+
         workspaceManager.objectWillChange
             .sink { [weak self] _ in
                 Task { @MainActor in
@@ -213,6 +321,18 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
 
         if rootRows != nextRootRows {
             rootRows = nextRootRows
+        }
+        resnapshotCodemapProgress()
+    }
+
+    private func resnapshotCodemapProgress() {
+        let next = Self.codemapProgressStates(
+            for: rootProjections(),
+            activityByRootID: codemapActivityLookup(),
+            globallyDisabled: isCodemapsGloballyDisabled
+        )
+        if codemapProgressByRootID != next {
+            codemapProgressByRootID = next
         }
     }
 

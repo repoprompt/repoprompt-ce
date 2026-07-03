@@ -38,6 +38,8 @@ struct AgentModeView: View {
             rootChanges: windowState.workspaceFilesViewModel.rootShellProjectionsChangedPublisher,
             gitContextLookup: { promptManager.gitViewModel.gitWorktreeContext(forStandardizedRootPath: $0) },
             gitContextChanges: promptManager.gitViewModel.gitWorktreeContextChanges,
+            codemapActivityLookup: { windowState.workspaceFilesViewModel.codemapRootActivityByRootID },
+            codemapActivityChanges: windowState.workspaceFilesViewModel.codemapRootActivityChangedPublisher,
             workspaceManager: windowState.workspaceManager,
             windowID: windowState.windowID
         ))
