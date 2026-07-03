@@ -282,6 +282,7 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
                 return true
             }
             await Task.yield()
+            try? await Task.sleep(for: .milliseconds(1))
         }
         let state = await store.codemapGraphPublicationRecoveryStateForTesting(
             rootEpoch: rootEpoch
@@ -1190,7 +1191,9 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             await fixture.shutdown()
         }
         var sourceFiles: [String: String] = [:]
-        for index in 0 ..< 2048 {
+        let firstPageEntryLimit = 4
+        let fileCountCrossingFirstPage = firstPageEntryLimit + 1
+        for index in 0 ..< fileCountCrossingFirstPage {
             sourceFiles[String(format: "Sources/File%04d.swift", index)] =
                 "struct File\(index) {}\n"
         }
@@ -1221,7 +1224,7 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
                 rootEpoch: ticket.rootEpoch,
                 token: nil,
                 cursor: nil,
-                maximumEntryCount: 4,
+                maximumEntryCount: firstPageEntryLimit,
                 maximumPathByteCount: 4096
             ))
         }
@@ -1259,7 +1262,7 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         XCTAssertEqual(responsiveness.2, sourceFiles[file.standardizedRelativePath])
 
         let page = try await projectionPage(pageTask.value)
-        XCTAssertEqual(page.entries.count, 4)
+        XCTAssertEqual(page.entries.count, firstPageEntryLimit)
         XCTAssertEqual(page.entries.first?.identity.standardizedRelativePath, "Sources/File0000.swift")
         let diagnostics = await store.storeWorkDiagnosticsSnapshot()
         let shard = try XCTUnwrap(diagnostics.rootCatalogShards.roots.first { $0.rootID == loaded.id })

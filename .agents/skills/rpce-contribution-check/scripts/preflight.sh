@@ -124,7 +124,7 @@ run_pr_ready_path_validations() {
   local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
   local ci_app_test_runner_paths_pattern='^(Scripts/ci_app_test_runner\.py|Scripts/test_ci_app_test_runner\.py|\.github/workflows/ci\.yml)$'
   local swift_paths_pattern='\.swift$'
-  local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPromptTests/)'
+  local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
   local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
   local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'

@@ -271,6 +271,11 @@ class ContributionPreflightTests(unittest.TestCase):
                 [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, ROOT_TEST_TARGET],
             ),
             (
+                "split root test Swift path",
+                "Tests/RepoPromptWorkspaceTests/ExampleTests.swift",
+                [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, ROOT_TEST_TARGET],
+            ),
+            (
                 "MCP Swift path",
                 "Sources/RepoPromptMCP/Example.swift",
                 [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, MCP_BUILD_TARGET],

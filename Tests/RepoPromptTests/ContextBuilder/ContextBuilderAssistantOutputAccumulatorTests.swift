@@ -59,18 +59,18 @@ final class ContextBuilderAssistantOutputAccumulatorTests: XCTestCase {
 
     func testLargeOutputStaysChunkedUntilOneTerminalMaterialization() {
         var accumulator = ContextBuilderAssistantOutputAccumulator()
-        let chunkCount = 20000
+        let chunkCountExceedingPreview = ContextBuilderAssistantOutputAccumulator.previewLimit * 2 + 1
 
-        for _ in 0 ..< chunkCount {
+        for _ in 0 ..< chunkCountExceedingPreview {
             accumulator.append("x")
         }
 
-        XCTAssertEqual(accumulator.accumulatedCharacterCount, chunkCount)
+        XCTAssertEqual(accumulator.accumulatedCharacterCount, chunkCountExceedingPreview)
         XCTAssertEqual(accumulator.fullOutputMaterializationCount, 0)
         XCTAssertEqual(accumulator.preview?.count, 160)
 
         let output = accumulator.fullOutput()
-        XCTAssertEqual(output?.count, chunkCount)
+        XCTAssertEqual(output?.count, chunkCountExceedingPreview)
         XCTAssertEqual(accumulator.fullOutputMaterializationCount, 1)
     }
 
