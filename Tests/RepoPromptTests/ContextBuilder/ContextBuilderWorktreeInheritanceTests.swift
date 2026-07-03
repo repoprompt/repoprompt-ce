@@ -218,10 +218,12 @@ import XCTest
                             )
                         }
 
+                    let runCodemapE2E = CodemapE2ETestGate.isEnabled
                     factory.configure(
                         networkManager: fixture.networkManager,
                         logicalFilePath: logicalFile.path,
-                        searchPattern: worktreeSentinel
+                        searchPattern: worktreeSentinel,
+                        probeCodeStructure: runCodemapE2E
                     )
 
                     fixture.contextA.window.mcpServer.setContextBuilderSelectionReplyObserverForTesting {
@@ -357,13 +359,17 @@ import XCTest
                         XCTAssertTrue(run.tree.contains("BranchOnly.swift"), run.tree)
                         XCTAssertTrue(run.read.contains(worktreeSentinel), run.read)
                         XCTAssertTrue(run.search.contains(worktreeSentinel), run.search)
-                        if run.codeStructure.contains("- **Status**: `pending`") {
-                            XCTAssertTrue(run.codeStructure.contains("`artifact_pending`"), run.codeStructure)
-                            assertLogicalPath(logicalRelativeFilePath, in: run.codeStructure)
-                            XCTAssertFalse(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                        if runCodemapE2E {
+                            if run.codeStructure.contains("- **Status**: `pending`") {
+                                XCTAssertTrue(run.codeStructure.contains("`artifact_pending`"), run.codeStructure)
+                                assertLogicalPath(logicalRelativeFilePath, in: run.codeStructure)
+                                XCTAssertFalse(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                            } else {
+                                XCTAssertFalse(run.codeStructure.contains("Without codemap"), run.codeStructure)
+                                XCTAssertTrue(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                            }
                         } else {
-                            XCTAssertFalse(run.codeStructure.contains("Without codemap"), run.codeStructure)
-                            XCTAssertTrue(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                            XCTAssertTrue(run.codeStructure.isEmpty, run.codeStructure)
                         }
                         XCTAssertTrue(run.selection.contains(logicalFile.lastPathComponent), run.selection)
                         XCTAssertTrue(run.workspaceContext.contains(logicalFile.lastPathComponent), run.workspaceContext)
@@ -1321,39 +1327,25 @@ import XCTest
                     XCTAssertEqual(run.workspacePath, fixture.contextA.rootURL.standardizedFileURL.path)
                     XCTAssertTrue(run.read.contains(canonicalSentinel), run.read)
                     XCTAssertTrue(run.search.contains(canonicalSentinel), run.search)
-                    let codeStructure = run.codeStructure
-                    let codeStructureHasCanonicalPath = codeStructure.contains(relativePath)
-                        || (
-                            codeStructure.contains("- **Sources**")
-                                && codeStructure.contains("  - `\(fixture.contextA.fileURL.lastPathComponent)`")
-                        )
-                    XCTAssertTrue(codeStructureHasCanonicalPath, codeStructure)
-                    for leakageMarker in [
-                        "session-bound worktree",
-                        "WorktreeContextBuilderType",
-                        "BranchOnlyContextBuilderType",
-                        "worktreeOnly"
-                    ] {
-                        XCTAssertFalse(codeStructure.contains(leakageMarker), codeStructure)
-                    }
-                    let codeStructureNotReadyMarkers = [
-                        "**Status**: `pending`",
-                        "**Status**: `timeout`",
-                        "**Status**: `unavailable`",
-                        "artifact_pending",
-                        "artifact_unavailable",
-                        "codemap_busy",
-                        "readiness_timeout",
-                        "registration"
-                    ]
-                    let codeStructureLooksNotReady = codeStructureNotReadyMarkers.contains {
-                        codeStructure.range(of: $0, options: .caseInsensitive) != nil
-                    }
                     if runCodemapE2E {
+                        let codeStructure = run.codeStructure
+                        let codeStructureHasCanonicalPath = codeStructure.contains(relativePath)
+                            || (
+                                codeStructure.contains("- **Sources**")
+                                    && codeStructure.contains("  - `\(fixture.contextA.fileURL.lastPathComponent)`")
+                            )
+                        XCTAssertTrue(codeStructureHasCanonicalPath, codeStructure)
+                        for leakageMarker in [
+                            "session-bound worktree",
+                            "WorktreeContextBuilderType",
+                            "BranchOnlyContextBuilderType",
+                            "worktreeOnly"
+                        ] {
+                            XCTAssertFalse(codeStructure.contains(leakageMarker), codeStructure)
+                        }
                         XCTAssertTrue(codeStructure.contains(canonicalSentinel), codeStructure)
-                    } else if !codeStructureLooksNotReady {
-                        XCTAssertFalse(codeStructure.contains("Without codemap"), codeStructure)
-                        XCTAssertTrue(codeStructure.contains(canonicalSentinel), codeStructure)
+                    } else {
+                        XCTAssertTrue(run.codeStructure.isEmpty, run.codeStructure)
                     }
 
                     let followUp = try XCTUnwrap(state.followUps.first)
@@ -1907,7 +1899,7 @@ import XCTest
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool = false,
-            probeCodeStructure: Bool = true
+            probeCodeStructure: Bool = CodemapE2ETestGate.isEnabled
         ) {
             configuration = Configuration(
                 networkManager: networkManager,

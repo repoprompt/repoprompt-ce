@@ -29,16 +29,44 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         }
     }
 
-    private actor InvocationCounter {
-        private var value = 0
-
-        func increment() -> Int {
-            value += 1
-            return value
+    private actor FinalPackagingRetryTrace {
+        struct Snapshot: Equatable {
+            let operationCount: Int
+            let revalidationCount: Int
+            let operationCountAtFirstRevalidation: Int?
+            let firstRevalidationUnloadedRoot: Bool
         }
 
-        func count() -> Int {
-            value
+        private var operationCount = 0
+        private var revalidationCount = 0
+        private var operationCountAtFirstRevalidation: Int?
+        private var firstRevalidationUnloadedRoot = false
+
+        func recordOperation() -> Int {
+            operationCount += 1
+            return operationCount
+        }
+
+        func recordPublicationRevalidationBegan() -> Bool {
+            revalidationCount += 1
+            if revalidationCount == 1 {
+                operationCountAtFirstRevalidation = operationCount
+                return true
+            }
+            return false
+        }
+
+        func recordFirstRevalidationDidUnloadRoot() {
+            firstRevalidationUnloadedRoot = true
+        }
+
+        func snapshot() -> Snapshot {
+            Snapshot(
+                operationCount: operationCount,
+                revalidationCount: revalidationCount,
+                operationCountAtFirstRevalidation: operationCountAtFirstRevalidation,
+                firstRevalidationUnloadedRoot: firstRevalidationUnloadedRoot
+            )
         }
     }
 
@@ -267,7 +295,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                     codemapPresentation: frozenPresentation
                 )
             }
-            await gate.waitUntilStarted()
+            try await gate.waitUntilStarted()
             _ = try await store.editFile(
                 rootID: rootRecord.id,
                 relativePath: "Target.swift",
@@ -351,8 +379,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
             completeGitDiffProvider: { nil }
         )
-        let publicationCount = InvocationCounter()
-        let operationCount = InvocationCounter()
+        let retryTrace = FinalPackagingRetryTrace()
         let coordinator = WorkspaceCodemapPresentationCoordinator(
             store: store,
             policy: WorkspaceCodemapPresentationRequestPolicy(
@@ -360,8 +387,9 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 maximumTotalWait: .seconds(10)
             ),
             beforePublicationRevalidation: { _ in
-                if await publicationCount.increment() == 1 {
+                if await retryTrace.recordPublicationRevalidationBegan() {
                     await store.unloadRoot(id: physicalRootID)
+                    await retryTrace.recordFirstRevalidationDidUnloadRoot()
                 }
             }
         )
@@ -370,7 +398,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             request,
             presentationCoordinator: coordinator
         ) { preAssembly in
-            _ = await operationCount.increment()
+            _ = await retryTrace.recordOperation()
             let blocks = PromptPackagingService.generatePartitionedFileBlocks(
                 preAssembly.entries,
                 filePathDisplay: .relative,
@@ -380,10 +408,11 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             return (blocks.codemapBlocks + blocks.contentBlocks).joined(separator: "\n")
         }
 
-        let finalPublicationCount = await publicationCount.count()
-        let finalOperationCount = await operationCount.count()
-        XCTAssertEqual(finalPublicationCount, 1)
-        XCTAssertEqual(finalOperationCount, 2)
+        let retrySnapshot = await retryTrace.snapshot()
+        XCTAssertEqual(retrySnapshot.revalidationCount, 1)
+        XCTAssertEqual(retrySnapshot.operationCount, 2)
+        XCTAssertEqual(retrySnapshot.operationCountAtFirstRevalidation, 1)
+        XCTAssertTrue(retrySnapshot.firstRevalidationUnloadedRoot)
         XCTAssertFalse(packaged.contains("RevokedPromptSentinel"))
     }
 
@@ -414,7 +443,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 }
             }
 
-            await gate.waitUntilStarted()
+            try await gate.waitUntilStarted()
             task.cancel()
             await gate.release()
             do {
@@ -1210,35 +1239,38 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
 }
 
 #if DEBUG
-    private actor PreAssemblyContentReadGate {
-        private var started = false
-        private var released = false
-        private var startWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private struct PreAssemblyContentReadGateState: Equatable {
+        var started = false
+        var released = false
+    }
+
+    private final class PreAssemblyContentReadGate: @unchecked Sendable {
+        private let condition = AsyncTestCondition(PreAssemblyContentReadGateState())
 
         func markStartedAndWaitForRelease() async {
-            started = true
-            let waiters = startWaiters
-            startWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
+            condition.update { $0.started = true }
+            do {
+                try await condition.waitUntil(
+                    "preassembly content read gate release",
+                    timeout: 5
+                ) { $0.released }
+            } catch is CancellationError {
+                // Cancellation is the contract for the cancellation-path test; the
+                // caller checks cancellation immediately after this wait returns.
+            } catch {
+                XCTFail("Timed out waiting for preassembly content read gate release: \(error)")
             }
         }
 
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                startWaiters.append(continuation)
-            }
+        func waitUntilStarted() async throws {
+            try await condition.waitUntil(
+                "preassembly content read gate start",
+                timeout: 5
+            ) { $0.started }
         }
 
         func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            waiters.forEach { $0.resume() }
+            condition.update { $0.released = true }
         }
     }
 #endif
