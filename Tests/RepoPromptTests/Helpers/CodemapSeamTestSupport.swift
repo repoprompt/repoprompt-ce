@@ -868,6 +868,20 @@ enum CodemapStoreTestError: Error {
     case timedOut
 }
 
+final class CodemapRuntimeTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var runtimes: [CodeMapArtifactRuntime] = []
+
+    func record(_ runtime: CodeMapArtifactRuntime) -> CodeMapArtifactRuntime {
+        lock.withLock { runtimes.append(runtime) }
+        return runtime
+    }
+
+    func snapshot() -> [CodeMapArtifactRuntime] {
+        lock.withLock { runtimes }
+    }
+}
+
 final class CodemapStoreFixture: @unchecked Sendable {
     enum ProjectionAuthority: Equatable {
         case engine
@@ -886,6 +900,7 @@ final class CodemapStoreFixture: @unchecked Sendable {
 
     private let sandbox: URL
     private let artifactRoot: URL
+    private let runtimeTracker: CodemapRuntimeTracker
     private let freshRuntimeFactory: @Sendable () throws -> CodeMapArtifactRuntime
     private let runtimeProvider: CodeMapArtifactRuntimeProvider
 
@@ -908,9 +923,10 @@ final class CodemapStoreFixture: @unchecked Sendable {
         let buildCount = buildCount
         let buildPriorities = buildPriorities
         let defaultBuilder = CodeMapArtifactBuilderClient()
+        let runtimeTracker = CodemapRuntimeTracker()
         let freshRuntimeFactory: @Sendable () throws -> CodeMapArtifactRuntime = {
             runtimeFactoryCount.increment()
-            return try CodeMapArtifactRuntime(
+            return try runtimeTracker.record(CodeMapArtifactRuntime(
                 rootURL: artifactRoot,
                 manifestStoreHooks: CodeMapRootManifestStoreHooks(
                     afterReadAdmission: {
@@ -953,12 +969,13 @@ final class CodemapStoreFixture: @unchecked Sendable {
                         policy: bindingEnginePolicy
                     )
                 }
-            )
+            ))
         }
         runtimeProvider = CodeMapArtifactRuntimeProvider(factory: freshRuntimeFactory)
         self.projectionAuthority = projectionAuthority
         self.sandbox = sandbox
         self.artifactRoot = artifactRoot
+        self.runtimeTracker = runtimeTracker
         self.freshRuntimeFactory = freshRuntimeFactory
     }
 
@@ -1090,10 +1107,10 @@ final class CodemapStoreFixture: @unchecked Sendable {
     }
 
     func shutdown() async {
-        if let runtime = try? runtimeProvider.runtime(),
-           let engine = try? runtime.bindingEngine()
-        {
-            await engine.shutdown()
+        for runtime in runtimeTracker.snapshot() {
+            if let engine = try? runtime.bindingEngine() {
+                await engine.shutdown()
+            }
         }
     }
 

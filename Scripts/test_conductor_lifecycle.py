@@ -1260,6 +1260,46 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     "args": {"list": True, "filter": "ExampleTests"},
                 }
             )
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined with --test-product"):
+            registry.prepare(
+                {
+                    "operation": "test",
+                    "args": {"list": True, "testProduct": "RepoPromptWorkspaceTests"},
+                }
+            )
+
+    def test_test_gate_environment_survives_client_snapshot_and_job_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RPCE_ENABLE_BENCHMARK_TESTS": "1",
+                    "RPCE_RUN_CODEMAP_E2E": "1",
+                    "RPCE_RUN_SCALE_TESTS": "1",
+                    "RPCE_UNRELATED_TEST_GATE": "1",
+                },
+                clear=False,
+            ):
+                snapshot = conductor.OperationRegistry.client_env_snapshot()
+
+            self.assertEqual(snapshot["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+            self.assertEqual(snapshot["RPCE_RUN_CODEMAP_E2E"], "1")
+            self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
+            self.assertNotIn("RPCE_UNRELATED_TEST_GATE", snapshot)
+
+            _argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                {
+                    "operation": "test",
+                    "args": {"filter": "CodemapBindingEngineProjectionTests"},
+                    "env": snapshot,
+                }
+            )
+
+        self.assertEqual(env["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+        self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
+        self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
+        self.assertNotIn("RPCE_UNRELATED_TEST_GATE", env)
 
     def test_test_cli_forwards_watchdog_options_and_requires_threshold(self) -> None:
         tmp, state = self.make_state()

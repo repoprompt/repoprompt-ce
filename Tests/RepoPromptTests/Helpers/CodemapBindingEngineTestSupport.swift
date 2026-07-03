@@ -277,6 +277,9 @@ class CodemapBindingEngineTestCase: XCTestCase {
     func makeRepositoryFixture(name: String) throws -> ReviewGitRepositoryFixture {
         let fixture = try ReviewGitRepositoryFixture(name: name)
         retainedRepositoryFixtures.append(fixture)
+        addTeardownBlock { [fixture] in
+            fixture.cleanup()
+        }
         return fixture
     }
 
@@ -665,7 +668,12 @@ actor EngineBuildGate {
     func enter() async {
         entered = true
         if released { return }
-        await withCheckedContinuation { continuation = $0 }
+        await withCheckedContinuation {
+            if continuation != nil {
+                preconditionFailure("EngineBuildGate supports exactly one waiter")
+            }
+            continuation = $0
+        }
     }
 
     func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
@@ -773,6 +781,9 @@ final class EngineAsyncGate: @unchecked Sendable {
             condition.unlock()
             continuation.resume()
         } else {
+            if self.continuation != nil {
+                preconditionFailure("EngineAsyncGate supports exactly one waiter")
+            }
             self.continuation = continuation
             condition.unlock()
         }
@@ -861,7 +872,12 @@ actor EngineFirstResolutionGate {
         guard resolutionCount == 1 else { return }
         firstResolutionEntered = true
         if firstResolutionReleased { return }
-        await withCheckedContinuation { continuation = $0 }
+        await withCheckedContinuation {
+            if continuation != nil {
+                preconditionFailure("EngineFirstResolutionGate supports exactly one waiter")
+            }
+            continuation = $0
+        }
     }
 
     func waitUntilFirstResolution(timeout: Duration = .seconds(10)) async -> Bool {

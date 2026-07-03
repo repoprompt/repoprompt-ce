@@ -589,6 +589,9 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         XCTAssertEqual(segment.progress.counts, proof.counts)
     }
 
+    /// Extraction note: this preserves the missing-envelope preload coverage from the former
+    /// monolithic WorkspaceCodemapBindingEngineTests suite. The explicit ready-demand path is
+    /// represented by this clean locator/CAS reuse assertion after the manifest envelope is empty.
     func testProjectionPreloadMissingEnvelopeClassifiesThenReusesLocatorAndCAS() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
@@ -928,6 +931,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         XCTAssertTrue(fullyDrained)
     }
 
+    /// Extraction note: this covers transient projection redundancy by ensuring a replacement
+    /// projection does not resolve while the same root's superseded active batch is draining.
     func testProjectionRescheduleWaitsForSameRootDrainingBatchAdmission() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(

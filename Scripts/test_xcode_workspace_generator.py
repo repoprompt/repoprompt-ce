@@ -228,6 +228,12 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         })
         generator.validate_manifest(moved_resources, generator.REPO_ROOT)
 
+        extra_resources = deepcopy(moved_resources)
+        for target in extra_resources["targets"]:
+            if target["name"] == "RepoPromptWorkspaceTests":
+                target["resources"].append({"path": "Extra/Fixtures", "rule": {"copy": {}}})
+        generator.validate_manifest(extra_resources, generator.REPO_ROOT)
+
     def test_generation_does_not_modify_package_authority(self) -> None:
         before = {name: digest(generator.REPO_ROOT / name) for name in ("Package.swift", "Package.resolved")}
         temporary, _ = self.generate_in_temporary_directory()

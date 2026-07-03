@@ -599,6 +599,24 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("cannot run suites from other targets", output.getvalue())
 
+    def test_main_rejects_missing_explicit_bundle_name(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                ci_app_test_runner,
+                "list_suites",
+                return_value=["RepoPromptWorkspaceTests.A"],
+            ),
+            mock.patch.object(ci_app_test_runner, "discover_test_bundle", return_value=None),
+            mock.patch.object(ci_app_test_runner, "run_all_suites") as run_all_suites,
+            mock.patch("sys.stdout", output),
+        ):
+            exit_code = ci_app_test_runner.main(["--test-bundle-name", "RepoPromptWorkspaceTests"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("did not match any built XCTest bundle", output.getvalue())
+        run_all_suites.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

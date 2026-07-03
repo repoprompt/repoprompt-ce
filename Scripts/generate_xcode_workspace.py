@@ -123,16 +123,16 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "RepoPrompt must retain the Objective-C bridging-header unsafe flags"
         )
 
-    expected_resources = [("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)]
+    expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}
     test_targets_with_codemap_resources = []
     for target in targets.values():
         if target.get("type") != "test":
             continue
-        resources = [
+        resources = {
             (resource.get("path"), "copy" in resource.get("rule", {}))
             for resource in target.get("resources", [])
-        ]
-        if resources == expected_resources:
+        }
+        if expected_resources.issubset(resources):
             test_targets_with_codemap_resources.append(target.get("name"))
     if len(test_targets_with_codemap_resources) != 1:
         raise GeneratorError(

@@ -1025,7 +1025,14 @@ class OperationRegistry:
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_CACHE",
     ]
-    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
+    TEST_ENV_KEYS = [
+        "RPCE_ENABLE_BENCHMARK_TESTS",
+        "RPCE_RUN_CODEMAP_E2E",
+        "RPCE_RUN_SCALE_TESTS",
+    ]
+    PASSTHROUGH_ENV_KEYS = sorted(
+        set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS + TEST_ENV_KEYS)
+    )
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
@@ -1179,6 +1186,8 @@ class OperationRegistry:
             raise ConductorError("test list mode cannot be combined with a filter")
         if list_mode and (raw_seconds is not None or wake_probe):
             raise ConductorError("test list mode cannot be combined with XCTest stall diagnostics")
+        if list_mode and args.get("testProduct"):
+            raise ConductorError("test list mode cannot be combined with --test-product")
         if raw_seconds is None:
             if wake_probe:
                 raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")

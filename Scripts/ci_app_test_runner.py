@@ -665,6 +665,12 @@ def main(argv: list[str]) -> int:
                 )
                 return 1
             test_bundle = discover_test_bundle(args.swift_binary, args.cwd, args.test_bundle_name)
+            if test_bundle is None:
+                print(
+                    f"::error::--test-bundle-name {args.test_bundle_name} did not match any built XCTest bundle",
+                    flush=True,
+                )
+                return 1
         else:
             discovered = discover_test_bundles(args.swift_binary, args.cwd)
             if len(discovered) == 1:
