@@ -1165,6 +1165,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             }
             XCTAssertEqual(window.mcpServer.virtualTokenRefreshTaskCountForTesting(), 0)
 
+            let startsBeforeCacheHits = window.mcpServer.virtualTokenRefreshStartCountForTesting()
             let firstCachedReply = await window.mcpServer.buildCurrentSelectionReply(
                 includeBlocks: false,
                 display: .relative,
@@ -1178,7 +1179,12 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 lookupContext: .visibleWorkspace
             )
             XCTAssertEqual(firstCachedReply.tokenAccounting?.source, "bound_tab_cache")
+            XCTAssertEqual(firstCachedReply.tokenAccounting?.status, "stale")
+            XCTAssertTrue(firstCachedReply.tokenAccounting?.refreshPending == true)
             XCTAssertEqual(secondCachedReply.tokenAccounting?.source, "bound_tab_cache")
+            XCTAssertEqual(secondCachedReply.tokenAccounting?.status, "stale")
+            XCTAssertTrue(secondCachedReply.tokenAccounting?.refreshPending == true)
+            XCTAssertEqual(window.mcpServer.virtualTokenRefreshStartCountForTesting(), startsBeforeCacheHits + 2)
         }
     #endif
 

@@ -195,23 +195,25 @@ extension MCPServerViewModel {
             )
             incompleteComponents.formUnion(cachedSnapshot.incompleteComponents ?? [])
             let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
-            if !incompleteComponents.isEmpty {
-                enqueueVirtualTokenRefresh(
-                    signature: signature,
-                    context: context,
-                    effectiveSelection: effectiveSelection,
-                    resolvedContext: resolvedContext,
-                    collections: collections,
-                    lookupContext: lookupContext
-                )
-            }
+            // The virtual-token signature intentionally captures logical selection and prompt
+            // shape, but not file-content, search-catalog, or codemap-authority generations.
+            // Treat every cache hit as a stale lower-bound and refresh in the background so
+            // bound agent tabs cannot permanently report obsolete token totals as fresh.
+            enqueueVirtualTokenRefresh(
+                signature: signature,
+                context: context,
+                effectiveSelection: effectiveSelection,
+                resolvedContext: resolvedContext,
+                collections: collections,
+                lookupContext: lookupContext
+            )
             return MCPPreparedTokenAccounting(
                 entryResultsByFileID: cachedSnapshot.entryResultsByFileID,
                 breakdown: cachedSnapshot.breakdown,
                 tokenAccounting: .init(
-                    status: incompleteComponents.isEmpty ? "fresh" : "stale",
+                    status: "stale",
                     source: "bound_tab_cache",
-                    refreshPending: !incompleteComponents.isEmpty,
+                    refreshPending: true,
                     incompleteComponents: orderedIncomplete
                 ),
                 activePublishedSnapshot: nil
