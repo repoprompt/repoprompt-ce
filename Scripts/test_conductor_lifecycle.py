@@ -1956,6 +1956,35 @@ class SmokeOperationTests(unittest.TestCase):
             ],
         )
 
+    def test_execution_location_ui_smoke_runs_after_worktree_readiness_stages(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+
+        def record_command(name: str, argv: list[str], *_args: object, **_kwargs: object) -> tuple[int, str, str]:
+            calls.append((name, argv))
+            return 0, "", ""
+
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "run_operation_command", side_effect=record_command
+        ):
+            code = conductor.operation_smoke(
+                Path("/tmp/repo"),
+                {"windowId": "7", "workspace": "test-workspace", "executionLocationUI": True},
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual([name for name, _argv in calls], [
+            "windows",
+            "workspace switch",
+            "tree roots",
+            "manage_worktree list",
+            "agent_manage roles",
+            "execution location UI smoke",
+        ])
+        self.assertEqual(
+            calls[-1][1],
+            ["/tmp/repo/Scripts/smoke_agent_execution_location_popover.sh", "RepoPrompt"],
+        )
+
     def test_structured_smoke_calls_route_to_requested_window_with_fake_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

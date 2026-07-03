@@ -27,10 +27,6 @@ struct AgentExecutionLocationPill: View {
         fontPreset.scaledClamped(170, max: 220)
     }
 
-    private var existingWorktreeRowEstimatedHeight: CGFloat {
-        fontPreset.scaledClamped(48, min: 42, max: 62)
-    }
-
     private var existingWorktreeRowsMaxHeight: CGFloat {
         fontPreset.scaledClamped(288, min: 220, max: 360)
     }
@@ -41,13 +37,6 @@ struct AgentExecutionLocationPill: View {
 
     private var optionRowContentWidth: CGFloat {
         optionRowWidth - 16
-    }
-
-    private func existingWorktreeRowsViewportHeight(rowCount: Int) -> CGFloat {
-        let visibleRowCount = min(CGFloat(rowCount), 6)
-        let interRowSpacing = max(0, visibleRowCount - 1) * 2
-        let estimatedHeight = visibleRowCount * existingWorktreeRowEstimatedHeight + interRowSpacing
-        return min(existingWorktreeRowsMaxHeight, estimatedHeight)
     }
 
     private var accentColor: Color {
@@ -145,32 +134,7 @@ struct AgentExecutionLocationPill: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
 
-                if isLoadingExistingWorktrees {
-                    ProgressView().controlSize(.small).padding(.horizontal, 8).padding(.vertical, 6)
-                } else if let optionError {
-                    Text(optionError)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 8)
-                } else if existingWorktrees.isEmpty {
-                    Text("No other worktrees available")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                } else {
-                    ScrollView(.vertical) {
-                        LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(existingWorktrees) { selection in
-                                existingWorktreeOption(ExistingWorktreePickerRow(selection: selection))
-                            }
-                        }
-                        .frame(width: optionRowWidth, alignment: .leading)
-                    }
-                    .frame(width: optionRowWidth, height: existingWorktreeRowsViewportHeight(rowCount: existingWorktrees.count))
-                    .scrollIndicators(.automatic)
-                }
+                existingWorktreePicker
 
                 if props.isInitialSelection {
                     Text("Worktrees are applied when you first send.")
@@ -221,6 +185,40 @@ struct AgentExecutionLocationPill: View {
         } message: {
             Text(confirmationMessage)
         }
+    }
+
+    private var existingWorktreePicker: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if isLoadingExistingWorktrees {
+                ProgressView().controlSize(.small).padding(.horizontal, 8).padding(.vertical, 6)
+            } else if let optionError {
+                Text(optionError)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 8)
+            } else if existingWorktrees.isEmpty {
+                Text("No other worktrees available")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+            } else {
+                ScrollView(.vertical) {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(existingWorktrees) { selection in
+                            existingWorktreeOption(ExistingWorktreePickerRow(selection: selection))
+                        }
+                    }
+                    .frame(width: optionRowWidth, alignment: .leading)
+                }
+                .frame(width: optionRowWidth, height: existingWorktreeRowsMaxHeight)
+                .scrollIndicators(.automatic)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(width: optionRowWidth, height: existingWorktreeRowsMaxHeight, alignment: .topLeading)
+        .clipped()
     }
 
     private struct ExistingWorktreePickerRow: Identifiable {
