@@ -225,13 +225,18 @@ extension AgentModeViewModel.TabSession {
         }
     }
 
-    func teardownACPControllerIfPresent() async {
+    func detachACPControllerForShutdown() -> ACPAgentSessionController? {
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
         pendingACPSteeringInstructions.removeAll()
-        guard let controller = acpController else { return }
+        guard let controller = acpController else { return nil }
         acpController = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: self)
+        return controller
+    }
+
+    func teardownACPControllerIfPresent() async {
+        guard let controller = detachACPControllerForShutdown() else { return }
         await controller.cancelPrompt()
         await controller.shutdown()
     }

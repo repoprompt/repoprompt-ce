@@ -800,7 +800,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
-    func testACPIdleShutdownCancelsOnNewRun() async throws {
+    func testACPIdleShutdownTearsDownWhenNewRunCannotReuseController() async throws {
         let fixture = try await makeRetainedACPFixture(
             processIDFileName: "idle-new-run-acp-process-id.txt",
             acpIdleShutdownDelayNanos: 1_000_000
@@ -817,15 +817,72 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let outcome = await fixture.service.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
-            initialUserMessage: "new run cancels idle cleanup",
-            initialMessageForRun: "new run cancels idle cleanup",
+            initialUserMessage: "new run tears down stale ACP cleanup",
+            initialMessageForRun: "new run tears down stale ACP cleanup",
             attachments: []
         )
         XCTAssertEqual(outcome, .sent)
-        try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertTrue(Self.processIsRunning(fixture.processID))
-        XCTAssertTrue(fixture.session.acpController === fixture.controller)
-        await fixture.session.teardownACPControllerIfPresent()
+        XCTAssertNil(fixture.session.acpController)
+        try await waitUntilProcessExits(fixture.processID, "Non-ACP run should terminate stale retained ACP process")
+        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+    }
+
+    func testACPStartupFailureRetiresRetainedControllerAndPreservesProviderSessionID() async throws {
+        let fixture = try await makeRetainedACPFixture(
+            processIDFileName: "startup-failure-retained-acp-process-id.txt",
+            workspacePathProvider: { _ in throw LifecycleTestError.workspaceMissing },
+            acpIdleShutdownDelayNanos: 1_000_000
+        )
+        fixture.session.providerSessionID = "existing-acp-session"
+        fixture.service.scheduleACPIdleShutdownIfNeeded(
+            for: fixture.session,
+            completedRunID: fixture.session.runID,
+            retainedController: fixture.controller,
+            agent: .openCode,
+            reason: "test"
+        )
+
+        let outcome = await fixture.service.startRun(
+            tabID: fixture.session.tabID,
+            session: fixture.session,
+            initialUserMessage: "startup fails",
+            initialMessageForRun: "startup fails",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        XCTAssertEqual(fixture.session.runState, .failed)
+        XCTAssertNil(fixture.session.acpController)
+        XCTAssertEqual(fixture.session.providerSessionID, "existing-acp-session")
+        try await waitUntilProcessExits(fixture.processID, "ACP startup failure should terminate retained process")
+        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+    }
+
+    func testSelectedAgentSwitchTearsDownRetainedACPController() async throws {
+        let fixture = try await makeRetainedACPFixture(
+            processIDFileName: "selected-agent-switch-retained-acp-process-id.txt",
+            acpIdleShutdownDelayNanos: 1_000_000
+        )
+        fixture.host.ensureSession(for: fixture.session.tabID)
+        let session = try XCTUnwrap(fixture.host.sessions[fixture.session.tabID])
+        session.selectedAgent = .openCode
+        session.runID = fixture.session.runID
+        session.runState = .completed
+        session.acpController = fixture.controller
+        fixture.host.test_setCurrentTabIDOverride(session.tabID)
+        defer { fixture.host.test_setCurrentTabIDOverride(nil) }
+        fixture.service.scheduleACPIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: fixture.controller,
+            agent: .openCode,
+            reason: "test"
+        )
+
+        fixture.host.selectedAgent = .codexExec
+
+        XCTAssertNil(session.acpController)
+        try await waitUntilProcessExits(fixture.processID, "Selected-agent switch should terminate stale retained ACP process")
         acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
     }
 
@@ -2190,6 +2247,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     private func makeRetainedACPFixture(
         processIDFileName: String,
+        workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in nil },
         acpIdleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos
     ) async throws -> RetainedACPFixture {
         let recorder = LifecycleRecorder()
@@ -2215,7 +2273,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let processID = try XCTUnwrap(pid_t(processIDText))
         let harness = makeHarness(
             recorder: recorder,
-            workspacePathProvider: { _ in workspace.path },
+            workspacePathProvider: { session in
+                if let overridePath = try workspacePathProvider(session) {
+                    return overridePath
+                }
+                return workspace.path
+            },
             acpIdleShutdownDelayNanos: acpIdleShutdownDelayNanos
         )
         let session = AgentModeViewModel.TabSession(tabID: UUID())

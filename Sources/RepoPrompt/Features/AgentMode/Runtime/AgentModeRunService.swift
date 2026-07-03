@@ -204,6 +204,9 @@ final class AgentModeRunService {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         cancelACPIdleShutdown(for: tabID)
         let selectedAgent = session.selectedAgent
+        if selectedAgent.acpProviderID == nil, session.acpController != nil {
+            await session.teardownACPControllerIfPresent()
+        }
         let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
             ? nil
             : session.selectedModelRaw
@@ -216,6 +219,9 @@ final class AgentModeRunService {
             if selectedAgent.usesClaudeNativeRuntime, session.claudeController != nil {
                 cancelClaudeIdleShutdown(for: tabID)
                 await dependencies.claudeCoordinator.shutdownClaudeSession(session)
+            }
+            if selectedAgent.acpProviderID != nil, session.acpController != nil {
+                await session.teardownACPControllerIfPresent()
             }
             await failBeforeProviderStartup(session: session, message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil

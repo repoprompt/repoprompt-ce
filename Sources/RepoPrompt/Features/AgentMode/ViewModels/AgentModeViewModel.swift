@@ -304,6 +304,15 @@ final class AgentModeViewModel: ObservableObject {
                 if previousAgent != selectedAgent {
                     runService.cancelACPIdleShutdown(for: session.tabID)
                     runService.cancelClaudeIdleShutdown(for: session.tabID)
+                    if previousAgent.acpProviderID != nil,
+                       previousAgent.acpProviderID != selectedAgent.acpProviderID,
+                       let controller = session.detachACPControllerForShutdown()
+                    {
+                        Task {
+                            await controller.cancelPrompt()
+                            await controller.shutdown()
+                        }
+                    }
                     codexCoordinator.handleProviderSwitch(from: previousAgent, to: selectedAgent, session: session)
                     claudeCoordinator.handleProviderIdentityTransitionSync(
                         session: session,
@@ -6124,6 +6133,11 @@ final class AgentModeViewModel: ObservableObject {
         if previousAgent != normalized.agent {
             runService.cancelACPIdleShutdown(for: session.tabID)
             runService.cancelClaudeIdleShutdown(for: session.tabID)
+            if previousAgent.acpProviderID != nil,
+               previousAgent.acpProviderID != normalized.agent.acpProviderID
+            {
+                await session.teardownACPControllerIfPresent()
+            }
             codexCoordinator.handleProviderSwitch(from: previousAgent, to: normalized.agent, session: session)
             await claudeCoordinator.handleProviderIdentityTransition(
                 session: session,
