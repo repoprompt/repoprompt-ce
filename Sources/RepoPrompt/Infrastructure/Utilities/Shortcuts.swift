@@ -39,6 +39,14 @@ extension KeyboardShortcuts.Name {
     static let agentNewChat = Self("agentNewChat", default: .init(.n, modifiers: [.command, .option]))
     /// Toggle the Agent session sidebar.
     static let toggleNavigationSidebar = Self("toggleNavigationSidebar", default: .init(.b, modifiers: [.command, .option]))
+    /// Show the current-window Agent navigation HUD.
+    static let showCurrentWindowAgentNavigationHUD = Self("showCurrentWindowAgentNavigationHUD", default: .init(.k, modifiers: [.command]))
+    /// Show the all-active/recent Agents navigation HUD.
+    static let showAllAgentsNavigationHUD = Self("showAllAgentsNavigationHUD", default: .init(.k, modifiers: [.command, .shift]))
+    /// Cycle to the previous root Agent session row.
+    static let previousParentAgentSession = Self("previousParentAgentSession", default: .init(.leftBracket, modifiers: [.command, .option]))
+    /// Cycle to the next root Agent session row.
+    static let nextParentAgentSession = Self("nextParentAgentSession", default: .init(.rightBracket, modifiers: [.command, .option]))
 
     // Switch to Agent session tabs with Cmd+1..9
     static let switchToComposeTab1 = Self("swComposeTab1", default: .init(.one, modifiers: [.command]))

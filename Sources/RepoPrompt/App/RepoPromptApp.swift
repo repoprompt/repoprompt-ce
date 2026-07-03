@@ -147,6 +147,7 @@ struct RepoPromptApp: App {
 
             // ➜ New File-menu commands (Save Workspace / Exit Workspace)
             WorkspaceCommands(windowStatesManager: windowStatesManager)
+            AgentNavigationCommands(windowStatesManager: windowStatesManager)
 
             CommandGroup(before: .saveItem) {
                 Button("Close Window") {

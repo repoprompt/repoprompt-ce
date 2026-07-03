@@ -82,4 +82,8 @@ extension Notification.Name {
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.
     static let toggleRepoPromptNavigationSidebar = Notification.Name("toggleRepoPromptNavigationSidebar")
+
+    /// Show the Agent navigation HUD for the target window.
+    /// userInfo: ["windowID": Int, "mode": AgentNavigationHUDMode.rawValue]
+    static let showAgentNavigationHUD = Notification.Name("showAgentNavigationHUD")
 }

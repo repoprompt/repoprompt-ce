@@ -11,6 +11,9 @@ struct AgentSessionSidebarSnapshot: Equatable {
     /// badge on that row. Persists across sidebar re-renders but never to
     /// disk; ephemeral per `AgentModeViewModel` instance.
     var attentionRunStateByTabID: [UUID: AgentSessionRunState] = [:]
+    /// Deterministic mark time for each unseen-attention badge. Kept in lockstep
+    /// with `attentionRunStateByTabID` and intentionally not persisted.
+    var attentionMarkedAtByTabID: [UUID: Date] = [:]
     var revision: Int = 0
 }
 
@@ -72,18 +75,25 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         snapshot.attentionRunStateByTabID[tabID]
     }
 
+    /// Time when the current unseen-attention state was first marked.
+    func attentionMarkedAt(for tabID: UUID) -> Date? {
+        snapshot.attentionMarkedAtByTabID[tabID]
+    }
+
     /// Mark a tab as having unseen attention-worthy run state. No-op for
     /// states that are not attention-eligible, or when the stored state is
     /// already identical.
     @discardableResult
     func markRunStateAttention(
         tabID: UUID,
-        state: AgentSessionRunState
+        state: AgentSessionRunState,
+        markedAt: Date = Date()
     ) -> Bool {
         guard Self.isAttentionEligible(state) else { return false }
         if snapshot.attentionRunStateByTabID[tabID] == state { return false }
         var next = snapshot
         next.attentionRunStateByTabID[tabID] = state
+        next.attentionMarkedAtByTabID[tabID] = markedAt
         return publish(next, eventName: "sessionSidebar.attention.mark", force: false)
     }
 
@@ -93,6 +103,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         guard snapshot.attentionRunStateByTabID[tabID] != nil else { return false }
         var next = snapshot
         next.attentionRunStateByTabID.removeValue(forKey: tabID)
+        next.attentionMarkedAtByTabID.removeValue(forKey: tabID)
         return publish(next, eventName: "sessionSidebar.attention.clear", force: false)
     }
 
@@ -104,6 +115,9 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var changed = false
         for tabID in tabIDs {
             if next.attentionRunStateByTabID.removeValue(forKey: tabID) != nil {
+                changed = true
+            }
+            if next.attentionMarkedAtByTabID.removeValue(forKey: tabID) != nil {
                 changed = true
             }
         }

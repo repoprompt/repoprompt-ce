@@ -765,6 +765,47 @@ extension AgentModeViewModel {
         return pagedSessions[index].tabID
     }
 
+    func adjacentParentSidebarSessionTabID(
+        from activeTabID: UUID?,
+        forward: Bool,
+        in tabs: [ComposeTabState]
+    ) -> UUID? {
+        Self.adjacentParentSidebarSessionTabID(
+            from: activeTabID,
+            forward: forward,
+            rows: sidebarSessions(for: tabs)
+        )
+    }
+
+    static func adjacentParentSidebarSessionTabID(
+        from activeTabID: UUID?,
+        forward: Bool,
+        rows: [SidebarSession]
+    ) -> UUID? {
+        let rootIndices = rows.indices.filter { rows[$0].depth == 0 }
+        guard !rootIndices.isEmpty else { return nil }
+        guard rootIndices.count > 1 else {
+            let rootIndex = rootIndices[0]
+            let rootTabID = rows[rootIndex].tabID
+            guard let activeTabID,
+                  let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
+            else {
+                return rootTabID
+            }
+            return activeIndex == rootIndex ? nil : rootTabID
+        }
+        guard let activeTabID,
+              let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
+        else {
+            return rows[forward ? rootIndices[0] : rootIndices[rootIndices.count - 1]].tabID
+        }
+
+        let currentRootOrdinal = rootIndices.lastIndex(where: { $0 <= activeIndex }) ?? 0
+        let offset = forward ? 1 : -1
+        let nextRootOrdinal = (currentRootOrdinal + offset + rootIndices.count) % rootIndices.count
+        return rows[rootIndices[nextRootOrdinal]].tabID
+    }
+
     /// Deterministic ordering for the Agent Mode tab sidebar fallback.
     func sortTabsForSessionSidebar(_ tabs: [ComposeTabState]) -> [ComposeTabState] {
         let sortDates = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, sessionListSortDate(for: $0.id)) })

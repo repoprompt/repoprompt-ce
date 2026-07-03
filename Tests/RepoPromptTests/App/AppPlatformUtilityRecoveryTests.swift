@@ -70,6 +70,30 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertEqual(manager.pendingURLs, [route.url])
     }
 
+    @MainActor
+    func testInAppAgentSessionRouteReturnsResultWithoutQueueingURL() async throws {
+        let manager = WindowStatesManager.shared
+        let originalWindows = manager.allWindows
+        let originalPendingURLs = manager.pendingURLs
+        manager.allWindows = []
+        manager.pendingURLs = []
+        defer {
+            manager.allWindows = originalWindows
+            manager.pendingURLs = originalPendingURLs
+        }
+
+        let route = try AgentSessionDeepLinkRoute(
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            sessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333"))
+        )
+
+        let result = await AppDeepLinkRouter(windowStatesManager: manager).route(agentSession: route)
+
+        XCTAssertEqual(result, .workspaceUnavailable)
+        XCTAssertEqual(manager.pendingURLs, [])
+    }
+
     func testAppcastParserSelectsHighestInlineVersionAndKeepsMetadata() throws {
         let xml = """
         <?xml version="1.0" encoding="utf-8"?>
