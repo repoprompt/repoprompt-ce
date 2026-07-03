@@ -336,7 +336,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
         activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in true },
         leaseRoutingTimeoutMs: Int = 2000,
-        idleShutdownDelayNanos: UInt64 = 300_000_000_000,
+        idleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos,
         stallWatchdogPollIntervalNanos: UInt64 = 5_000_000_000,
         stallWatchdogProbeThreshold: TimeInterval = 0,
         stallWatchdogRecoveryThreshold: TimeInterval = 0,
@@ -356,7 +356,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.activeAgentRunWaitQuery = activeAgentRunWaitQuery
         self.activeAgentRunWaitDrain = activeAgentRunWaitDrain
         codexLeaseRoutingTimeoutMs = max(500, leaseRoutingTimeoutMs)
-        codexIdleShutdownDelayNanos = max(1_000_000, idleShutdownDelayNanos)
+        codexIdleShutdownDelayNanos = AgentModeIdleShutdownPolicy.normalizedDelayNanos(idleShutdownDelayNanos)
         codexStallWatchdogPollIntervalNanos = max(10_000_000, stallWatchdogPollIntervalNanos)
         let normalizedProbeThreshold = max(0, stallWatchdogProbeThreshold)
         let normalizedRecoveryThreshold = max(0, stallWatchdogRecoveryThreshold)

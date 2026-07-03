@@ -302,6 +302,8 @@ final class AgentModeViewModel: ObservableObject {
             if let session = activeSession {
                 let previousAgent = session.selectedAgent
                 if previousAgent != selectedAgent {
+                    runService.cancelACPIdleShutdown(for: session.tabID)
+                    runService.cancelClaudeIdleShutdown(for: session.tabID)
                     codexCoordinator.handleProviderSwitch(from: previousAgent, to: selectedAgent, session: session)
                     claudeCoordinator.handleProviderIdentityTransitionSync(
                         session: session,
@@ -2023,7 +2025,9 @@ final class AgentModeViewModel: ObservableObject {
             activeAgentRunWaitQuery: { [weak self] runID in
                 self?.mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
             },
-            childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
+            childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
+            acpIdleShutdownDelayNanos: AgentModeIdleShutdownPolicy.defaultDelayNanos,
+            claudeIdleShutdownDelayNanos: AgentModeIdleShutdownPolicy.defaultDelayNanos
         )
         let hooks = AgentModeRunService.Hooks(
             estimateRuntimeTokens: { text in
@@ -2728,6 +2732,8 @@ final class AgentModeViewModel: ObservableObject {
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
         unregisterObserverRegistrations()
+        runService.cancelAllACPIdleShutdowns()
+        runService.cancelAllClaudeIdleShutdowns()
         stopOpenCodeModelsSubscription()
         stopCursorModelsSubscription()
         sidebarAutoArchiveTask?.cancel()
@@ -5882,6 +5888,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
+        runService.cancelACPIdleShutdown(for: session.tabID)
+        runService.cancelClaudeIdleShutdown(for: session.tabID)
         await session.disposeProviderIfPresent()
         if let controller = session.acpController {
             session.acpController = nil
@@ -6114,6 +6122,8 @@ final class AgentModeViewModel: ObservableObject {
 
         let previousAgent = session.selectedAgent
         if previousAgent != normalized.agent {
+            runService.cancelACPIdleShutdown(for: session.tabID)
+            runService.cancelClaudeIdleShutdown(for: session.tabID)
             codexCoordinator.handleProviderSwitch(from: previousAgent, to: normalized.agent, session: session)
             await claudeCoordinator.handleProviderIdentityTransition(
                 session: session,
@@ -9861,6 +9871,8 @@ final class AgentModeViewModel: ObservableObject {
             runID: session.runID
         )
         removePendingUIRefresh(for: session.tabID)
+        runService.cancelACPIdleShutdown(for: session.tabID)
+        runService.cancelClaudeIdleShutdown(for: session.tabID)
         cancelPersistedLoad(for: session)
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
         // graceful cancelAgentRun() call in handleWorkspaceSwitch. See
@@ -9917,6 +9929,8 @@ final class AgentModeViewModel: ObservableObject {
         }
         stopOpenCodeModelsSubscription()
         stopCursorModelsSubscription()
+        runService.cancelAllACPIdleShutdowns()
+        runService.cancelAllClaudeIdleShutdowns()
         sidebarAutoArchiveTask?.cancel()
         sidebarAutoArchiveTask = nil
         uiRefreshTask?.cancel()
@@ -10557,6 +10571,8 @@ final class AgentModeViewModel: ObservableObject {
             if let session = sessions[tabID] {
                 removePendingUIRefresh(for: tabID)
                 cancelPersistedLoad(for: session)
+                runService.cancelACPIdleShutdown(for: tabID)
+                runService.cancelClaudeIdleShutdown(for: tabID)
                 session.cancelEphemeralRuntimeState()
                 // Cancel pending question
                 cancelPendingQuestion(for: session)
@@ -15510,6 +15526,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cleanupACPStateForDeletedSession(_ session: TabSession) async {
+        runService.cancelACPIdleShutdown(for: session.tabID)
+        runService.cancelClaudeIdleShutdown(for: session.tabID)
         await session.teardownACPControllerIfPresent()
     }
 

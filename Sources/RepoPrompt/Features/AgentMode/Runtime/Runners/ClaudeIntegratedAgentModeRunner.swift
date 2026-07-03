@@ -11,6 +11,7 @@ final class ClaudeIntegratedAgentModeRunner {
     private let claudeCoordinator: ClaudeAgentModeCoordinator
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
+    private let scheduleIdleShutdown: (AgentModeViewModel.TabSession, UUID?, any NativeAgentRuntimeControlling, AgentProviderKind) -> Void
 
     #if DEBUG
         private func reasoningDebug(_ message: @autoclosure () -> String) {
@@ -35,11 +36,13 @@ final class ClaudeIntegratedAgentModeRunner {
     init(
         claudeCoordinator: ClaudeAgentModeCoordinator,
         hooks: AgentModeRunService.Hooks,
-        terminalCommitBarrier: AgentRunTerminalCommitBarrier
+        terminalCommitBarrier: AgentRunTerminalCommitBarrier,
+        scheduleIdleShutdown: @escaping (AgentModeViewModel.TabSession, UUID?, any NativeAgentRuntimeControlling, AgentProviderKind) -> Void
     ) {
         self.claudeCoordinator = claudeCoordinator
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
+        self.scheduleIdleShutdown = scheduleIdleShutdown
     }
 
     func startRun(
@@ -339,6 +342,8 @@ final class ClaudeIntegratedAgentModeRunner {
         notifyTurnComplete: Bool,
         shouldShutdownSession: Bool = false
     ) async {
+        let retainedCompletedController = (!shouldShutdownSession && terminalState == .completed) ? session.claudeController : nil
+        let retainedCompletedAgent = session.selectedAgent
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -363,6 +368,11 @@ final class ClaudeIntegratedAgentModeRunner {
                         oldController: oldController
                     )
                     await claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                }
+            },
+            postCommit: { [self] in
+                if let retainedCompletedController {
+                    scheduleIdleShutdown(session, runID, retainedCompletedController, retainedCompletedAgent)
                 }
             }
         ))

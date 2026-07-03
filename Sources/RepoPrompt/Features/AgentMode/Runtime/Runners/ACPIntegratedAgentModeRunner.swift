@@ -13,6 +13,7 @@ final class ACPIntegratedAgentModeRunner {
     private let toolTrackingHooks: AgentToolTrackingHooks
     private let providerFactory: AgentModeViewModel.ACPProviderFactory
     private let controllerFactory: AgentModeViewModel.ACPControllerFactory
+    private let scheduleIdleShutdown: (AgentModeViewModel.TabSession, UUID?, ACPAgentSessionController, AgentProviderKind) -> Void
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
     private var acpProviderInvocationByTrackerInvocationIDByTabID: [UUID: [UUID: UUID]] = [:]
@@ -73,13 +74,15 @@ final class ACPIntegratedAgentModeRunner {
         terminalCommitBarrier: AgentRunTerminalCommitBarrier,
         toolTrackingHooks: AgentToolTrackingHooks,
         providerFactory: @escaping AgentModeViewModel.ACPProviderFactory,
-        controllerFactory: @escaping AgentModeViewModel.ACPControllerFactory
+        controllerFactory: @escaping AgentModeViewModel.ACPControllerFactory,
+        scheduleIdleShutdown: @escaping (AgentModeViewModel.TabSession, UUID?, ACPAgentSessionController, AgentProviderKind) -> Void
     ) {
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
         self.toolTrackingHooks = toolTrackingHooks
         self.providerFactory = providerFactory
         self.controllerFactory = controllerFactory
+        self.scheduleIdleShutdown = scheduleIdleShutdown
     }
 
     func startRun(
@@ -956,6 +959,8 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
         let supportsSessionResume = terminalState == .completed && controller != nil
+        let retainedCompletedController = (!shouldShutdownController && terminalState == .completed) ? controller : nil
+        let retainedCompletedAgent = session.selectedAgent
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -982,6 +987,11 @@ final class ACPIntegratedAgentModeRunner {
                     if shouldShutdownController, let controller {
                         await controller.shutdown()
                     }
+                }
+            },
+            postCommit: { [self] in
+                if let retainedCompletedController {
+                    scheduleIdleShutdown(session, runID, retainedCompletedController, retainedCompletedAgent)
                 }
             }
         ))

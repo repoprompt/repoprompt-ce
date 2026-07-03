@@ -26,6 +26,10 @@ final class AgentModeRunService {
         let activeAgentRunWaitQuery: (_ runID: UUID) -> Bool
         /// Bounded wait for child `agent_run.wait` scopes to drain before Claude native interrupt.
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
+        /// Delay before tearing down retained ACP/OpenCode controllers after accepted completion.
+        let acpIdleShutdownDelayNanos: UInt64
+        /// Delay before tearing down retained Claude-compatible controllers after accepted completion.
+        let claudeIdleShutdownDelayNanos: UInt64
     }
 
     enum CancellationIntent {
@@ -113,6 +117,8 @@ final class AgentModeRunService {
     private let claudeRunner: ClaudeIntegratedAgentModeRunner
     private let acpRunner: ACPIntegratedAgentModeRunner
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
+    private let acpIdleShutdownScheduler: AgentModeACPIdleShutdownScheduler
+    private let claudeIdleShutdownScheduler: AgentModeClaudeIdleShutdownScheduler
 
     private static let enableSteeringDebugLogging = false
 
@@ -132,6 +138,17 @@ final class AgentModeRunService {
         self.hooks = hooks
         let terminalCommitBarrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         self.terminalCommitBarrier = terminalCommitBarrier
+        let acpIdleShutdownScheduler = AgentModeACPIdleShutdownScheduler(
+            hooks: hooks,
+            delayNanos: dependencies.acpIdleShutdownDelayNanos
+        )
+        self.acpIdleShutdownScheduler = acpIdleShutdownScheduler
+        let claudeIdleShutdownScheduler = AgentModeClaudeIdleShutdownScheduler(
+            hooks: hooks,
+            claudeCoordinator: dependencies.claudeCoordinator,
+            delayNanos: dependencies.claudeIdleShutdownDelayNanos
+        )
+        self.claudeIdleShutdownScheduler = claudeIdleShutdownScheduler
         dependencies.codexCoordinator.installTerminalCommitBarrier(terminalCommitBarrier)
         headlessRunner = HeadlessAgentModeRunner(
             headlessProviderFactory: dependencies.headlessProviderFactory,
@@ -146,14 +163,32 @@ final class AgentModeRunService {
         claudeRunner = ClaudeIntegratedAgentModeRunner(
             claudeCoordinator: dependencies.claudeCoordinator,
             hooks: hooks,
-            terminalCommitBarrier: terminalCommitBarrier
+            terminalCommitBarrier: terminalCommitBarrier,
+            scheduleIdleShutdown: { [claudeIdleShutdownScheduler] session, runID, controller, agent in
+                claudeIdleShutdownScheduler.scheduleIfNeeded(
+                    for: session,
+                    completedRunID: runID,
+                    retainedController: controller,
+                    agent: agent,
+                    reason: "accepted-terminal-completion"
+                )
+            }
         )
         acpRunner = ACPIntegratedAgentModeRunner(
             hooks: hooks,
             terminalCommitBarrier: terminalCommitBarrier,
             toolTrackingHooks: toolTrackingHooks,
             providerFactory: dependencies.acpProviderFactory,
-            controllerFactory: dependencies.acpControllerFactory
+            controllerFactory: dependencies.acpControllerFactory,
+            scheduleIdleShutdown: { [acpIdleShutdownScheduler] session, runID, controller, agent in
+                acpIdleShutdownScheduler.scheduleIfNeeded(
+                    for: session,
+                    completedRunID: runID,
+                    retainedController: controller,
+                    agent: agent,
+                    reason: "accepted-terminal-completion"
+                )
+            }
         )
     }
 
@@ -167,6 +202,7 @@ final class AgentModeRunService {
         codexFallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
+        cancelACPIdleShutdown(for: tabID)
         let selectedAgent = session.selectedAgent
         let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
             ? nil
@@ -177,9 +213,14 @@ final class AgentModeRunService {
             workspacePath = try dependencies.workspacePathProvider(session)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
+            if selectedAgent.usesClaudeNativeRuntime, session.claudeController != nil {
+                cancelClaudeIdleShutdown(for: tabID)
+                await dependencies.claudeCoordinator.shutdownClaudeSession(session)
+            }
             await failBeforeProviderStartup(session: session, message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
+        cancelClaudeIdleShutdown(for: tabID)
 
         if selectedAgent == .codexExec {
             return await codexRunner.startRun(
@@ -322,6 +363,7 @@ final class AgentModeRunService {
 
     @discardableResult
     func submitQueuedACPSteeringIfSupported(session: AgentModeViewModel.TabSession) async -> Bool {
+        cancelACPIdleShutdown(for: session.tabID)
         guard session.selectedAgent.acpProviderID != nil,
               session.runState == .running
         else {
@@ -708,6 +750,7 @@ final class AgentModeRunService {
 
     @discardableResult
     func submitQueuedClaudeSteeringIfSupported(session: AgentModeViewModel.TabSession) async -> Bool {
+        cancelClaudeIdleShutdown(for: session.tabID)
         guard session.selectedAgent.usesClaudeNativeRuntime,
               session.runState == .running
         else {
@@ -954,12 +997,66 @@ final class AgentModeRunService {
         )
     }
 
+    // MARK: - ACP Idle Shutdown
+
+    func scheduleACPIdleShutdownIfNeeded(
+        for session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        retainedController: ACPAgentSessionController,
+        agent: AgentProviderKind,
+        reason: String
+    ) {
+        acpIdleShutdownScheduler.scheduleIfNeeded(
+            for: session,
+            completedRunID: completedRunID,
+            retainedController: retainedController,
+            agent: agent,
+            reason: reason
+        )
+    }
+
+    func cancelACPIdleShutdown(for tabID: UUID) {
+        acpIdleShutdownScheduler.cancel(for: tabID)
+    }
+
+    func cancelAllACPIdleShutdowns() {
+        acpIdleShutdownScheduler.cancelAll()
+    }
+
+    // MARK: - Claude-compatible Idle Shutdown
+
+    func scheduleClaudeIdleShutdownIfNeeded(
+        for session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        retainedController: any NativeAgentRuntimeControlling,
+        agent: AgentProviderKind,
+        reason: String
+    ) {
+        claudeIdleShutdownScheduler.scheduleIfNeeded(
+            for: session,
+            completedRunID: completedRunID,
+            retainedController: retainedController,
+            agent: agent,
+            reason: reason
+        )
+    }
+
+    func cancelClaudeIdleShutdown(for tabID: UUID) {
+        claudeIdleShutdownScheduler.cancel(for: tabID)
+    }
+
+    func cancelAllClaudeIdleShutdowns() {
+        claudeIdleShutdownScheduler.cancelAll()
+    }
+
     func cancelRun(
         tabID: UUID,
         session: AgentModeViewModel.TabSession,
         intent: CancellationIntent = .userStop,
         completion: CancellationCompletion = .terminalPublished
     ) async {
+        cancelACPIdleShutdown(for: tabID)
+        cancelClaudeIdleShutdown(for: tabID)
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
@@ -1123,5 +1220,214 @@ final class AgentModeRunService {
             return dependencies.claudeCoordinator.handleToolStreamEvent(event, session: session)
         }
         return false
+    }
+}
+
+@MainActor
+private final class AgentModeClaudeIdleShutdownScheduler {
+    private let hooks: AgentModeRunService.Hooks
+    private let claudeCoordinator: ClaudeAgentModeCoordinator
+    private let delayNanos: UInt64
+    private let tasksByTabID = PerKeyTaskStore<UUID>()
+
+    init(
+        hooks: AgentModeRunService.Hooks,
+        claudeCoordinator: ClaudeAgentModeCoordinator,
+        delayNanos: UInt64
+    ) {
+        self.hooks = hooks
+        self.claudeCoordinator = claudeCoordinator
+        self.delayNanos = AgentModeIdleShutdownPolicy.normalizedDelayNanos(delayNanos)
+    }
+
+    func scheduleIfNeeded(
+        for session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        retainedController: any NativeAgentRuntimeControlling,
+        agent: AgentProviderKind,
+        reason _: String
+    ) {
+        guard isSafeToTeardown(
+            session: session,
+            completedRunID: completedRunID,
+            retainedController: retainedController,
+            agent: agent
+        ) else {
+            cancel(for: session.tabID)
+            return
+        }
+
+        let tabID = session.tabID
+        let shutdownDelayNanos = delayNanos
+        tasksByTabID.set(
+            tabID,
+            task: Task { [weak self, weak session, retainedController] in
+                guard let self else { return }
+                try? await Task.sleep(nanoseconds: shutdownDelayNanos)
+                defer { self.tasksByTabID.remove(tabID) }
+                guard !Task.isCancelled else { return }
+                guard let session else { return }
+                guard isSafeToTeardown(
+                    session: session,
+                    completedRunID: completedRunID,
+                    retainedController: retainedController,
+                    agent: agent
+                ) else {
+                    return
+                }
+                let didTeardown = await claudeCoordinator.shutdownIdleClaudeControllerIfCurrent(
+                    session,
+                    completedRunID: completedRunID,
+                    retainedController: retainedController
+                )
+                guard didTeardown else { return }
+                hooks.updateBindings(session)
+                hooks.requestUIRefresh(tabID, true)
+                hooks.scheduleSave(tabID)
+            }
+        )
+    }
+
+    func cancel(for tabID: UUID) {
+        tasksByTabID.cancel(tabID)
+    }
+
+    func cancelAll() {
+        tasksByTabID.cancelAll()
+    }
+
+    private func isSafeToTeardown(
+        session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        retainedController: any NativeAgentRuntimeControlling,
+        agent: AgentProviderKind
+    ) -> Bool {
+        guard agent.usesClaudeNativeRuntime,
+              session.selectedAgent == agent,
+              session.selectedAgent.usesClaudeNativeRuntime,
+              let currentController = session.claudeController,
+              ObjectIdentifier(currentController as AnyObject) == ObjectIdentifier(retainedController as AnyObject),
+              session.runID == completedRunID,
+              session.runState == .completed,
+              session.pendingApproval == nil,
+              session.pendingPermissionsRequest == nil,
+              session.pendingApplyEditsReview == nil,
+              session.pendingWorktreeMergeReview == nil,
+              !session.hasPendingQuestionUI,
+              session.queuedUserInputRequests.isEmpty,
+              session.queuedMCPElicitationRequests.isEmpty,
+              session.waitingPrompt == nil,
+              session.instructionContinuation == nil,
+              session.pendingInstructions.isEmpty,
+              !session.mcpFollowUpRunPending,
+              session.pendingClaudeSteeringInstructions.isEmpty,
+              session.claudeSteeringFlushTask == nil,
+              !session.isMCPInstructionDispatchInProgress,
+              !session.isChangingExecutionLocation,
+              !session.worktreeBindingTransitionInProgress,
+              !session.bindingTransitionInProgress,
+              !claudeCoordinator.hasPendingResumeTransfer(for: session)
+        else {
+            return false
+        }
+        return true
+    }
+}
+
+@MainActor
+private final class AgentModeACPIdleShutdownScheduler {
+    private let hooks: AgentModeRunService.Hooks
+    private let delayNanos: UInt64
+    private let tasksByTabID = PerKeyTaskStore<UUID>()
+
+    init(hooks: AgentModeRunService.Hooks, delayNanos: UInt64) {
+        self.hooks = hooks
+        self.delayNanos = AgentModeIdleShutdownPolicy.normalizedDelayNanos(delayNanos)
+    }
+
+    func scheduleIfNeeded(
+        for session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        retainedController: ACPAgentSessionController,
+        agent: AgentProviderKind,
+        reason _: String
+    ) {
+        guard isSafeToTeardown(
+            session: session,
+            completedRunID: completedRunID,
+            retainedController: retainedController,
+            agent: agent
+        ) else {
+            cancel(for: session.tabID)
+            return
+        }
+
+        let tabID = session.tabID
+        let shutdownDelayNanos = delayNanos
+        tasksByTabID.set(
+            tabID,
+            task: Task { [weak self, weak session, retainedController] in
+                guard let self else { return }
+                try? await Task.sleep(nanoseconds: shutdownDelayNanos)
+                defer { self.tasksByTabID.remove(tabID) }
+                guard !Task.isCancelled else { return }
+                guard let session else { return }
+                guard isSafeToTeardown(
+                    session: session,
+                    completedRunID: completedRunID,
+                    retainedController: retainedController,
+                    agent: agent
+                ) else {
+                    return
+                }
+                await session.teardownACPControllerIfPresent()
+                hooks.updateBindings(session)
+                hooks.requestUIRefresh(tabID, true)
+                hooks.scheduleSave(tabID)
+            }
+        )
+    }
+
+    func cancel(for tabID: UUID) {
+        tasksByTabID.cancel(tabID)
+    }
+
+    func cancelAll() {
+        tasksByTabID.cancelAll()
+    }
+
+    private func isSafeToTeardown(
+        session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        retainedController: ACPAgentSessionController,
+        agent: AgentProviderKind
+    ) -> Bool {
+        guard agent.acpProviderID != nil,
+              session.selectedAgent == agent,
+              session.selectedAgent.acpProviderID != nil,
+              session.acpController === retainedController,
+              session.runID == completedRunID,
+              session.runState == .completed,
+              session.pendingApproval == nil,
+              session.pendingPermissionsRequest == nil,
+              session.pendingApplyEditsReview == nil,
+              session.pendingWorktreeMergeReview == nil,
+              !session.hasPendingQuestionUI,
+              session.queuedUserInputRequests.isEmpty,
+              session.queuedMCPElicitationRequests.isEmpty,
+              session.waitingPrompt == nil,
+              session.instructionContinuation == nil,
+              session.pendingInstructions.isEmpty,
+              !session.mcpFollowUpRunPending,
+              session.pendingACPSteeringInstructions.isEmpty,
+              session.acpSteeringFlushTask == nil,
+              !session.isMCPInstructionDispatchInProgress,
+              !session.isChangingExecutionLocation,
+              !session.worktreeBindingTransitionInProgress,
+              !session.bindingTransitionInProgress
+        else {
+            return false
+        }
+        return true
     }
 }

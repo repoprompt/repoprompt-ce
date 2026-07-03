@@ -501,6 +501,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let eventsStreamReadyGate: LifecycleAsyncGate?
     private let sendUserMessageGate: LifecycleAsyncGate?
     private let sessionRef = NativeAgentRuntimeSessionRef(sessionID: "lifecycle-claude-session")
+    private let sendTurnID: UUID
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
     init(
@@ -510,7 +511,9 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         failSend: Bool = false,
         currentSessionRefGate: LifecycleAsyncGate? = nil,
         eventsStreamReadyGate: LifecycleAsyncGate? = nil,
-        sendUserMessageGate: LifecycleAsyncGate? = nil
+        sendUserMessageGate: LifecycleAsyncGate? = nil,
+        sendTurnID: UUID = UUID(),
+        events: [NativeAgentRuntimeEvent] = []
     ) {
         self.recorder = recorder
         self.label = label
@@ -519,7 +522,15 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.currentSessionRefGate = currentSessionRefGate
         self.eventsStreamReadyGate = eventsStreamReadyGate
         self.sendUserMessageGate = sendUserMessageGate
-        stream = AsyncStream { _ in }
+        self.sendTurnID = sendTurnID
+        stream = AsyncStream { continuation in
+            for event in events {
+                continuation.yield(event)
+            }
+            if !events.isEmpty {
+                continuation.finish()
+            }
+        }
     }
 
     var hasActiveSession: Bool {
@@ -554,8 +565,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef {
+        recorder.record("\(label):current-ref")
         if let currentSessionRefGate {
-            recorder.record("\(label):current-ref")
             await currentSessionRefGate.arriveAndWait()
         }
         return sessionRef
@@ -571,7 +582,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         if failSend {
             throw LifecycleTestError.expectedClaudeSendFailure
         }
-        return UUID()
+        return sendTurnID
     }
 
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
