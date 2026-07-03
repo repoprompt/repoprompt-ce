@@ -434,21 +434,33 @@ extension MCPServerViewModel {
             _ = await promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
         }
         let effectiveSelection = lookupContext.physicalizeSelection(selection)
-        let reviewGitContext = if let reviewGitContextOverride {
-            reviewGitContextOverride
+        let selectionHasGitArtifactCandidates = !SelectedGitArtifactSelectionClassifier
+            .artifactCandidatePaths(from: effectiveSelection, capability: nil)
+            .isEmpty
+        let artifactAuthorization: SelectedGitArtifactAuthorizationResult
+        if selectionHasGitArtifactCandidates {
+            let reviewGitContext = if let reviewGitContextOverride {
+                reviewGitContextOverride
+            } else {
+                await promptVM.freezePromptGitReviewContext(
+                    workspaceID: virtualContext?.workspaceID,
+                    tabID: virtualContext?.tabID,
+                    sessionID: virtualContext?.activeAgentSessionID,
+                    bindings: virtualContext?.worktreeBindings ?? [],
+                    base: "HEAD"
+                )
+            }
+            artifactAuthorization = await authorizeSelectedGitArtifacts(
+                selection: effectiveSelection,
+                reviewGitContext: reviewGitContext
+            )
         } else {
-            await promptVM.freezePromptGitReviewContext(
-                workspaceID: virtualContext?.workspaceID,
-                tabID: virtualContext?.tabID,
-                sessionID: virtualContext?.activeAgentSessionID,
-                bindings: virtualContext?.worktreeBindings ?? [],
-                base: "HEAD"
+            artifactAuthorization = SelectedGitArtifactAuthorizationResult(
+                entries: [],
+                consumedSelectionPaths: [],
+                dispositions: []
             )
         }
-        let artifactAuthorization = await authorizeSelectedGitArtifacts(
-            selection: effectiveSelection,
-            reviewGitContext: reviewGitContext
-        )
         let ordinarySelection = selectionExcludingArtifacts(
             effectiveSelection,
             excluding: artifactAuthorization.consumedSelectionPaths

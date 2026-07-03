@@ -104,11 +104,7 @@ extension MCPServerViewModel {
         var codeStructDTO: ToolResultDTOs.SelectedCodeStructureDTO? = nil
         if include.contains("code"), !promptVM.codeMapsGloballyDisabled, let coll = collections {
             let builder = CodeStructureBuilder(owner: self, lookupContext: lookupContext)
-            let combined = coll.selected.map(\.file) + coll.codemap.map(\.file)
-            codeStructDTO = await builder.build(
-                for: combined,
-                presentation: coll.codemapPresentation
-            )
+            codeStructDTO = await builder.build(for: coll)
         }
 
         var fileTreeDTO: ToolResultDTOs.FileTreeDTO? = nil
