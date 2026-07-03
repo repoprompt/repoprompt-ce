@@ -328,8 +328,20 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
     private static let glmAutoCompactWindow = "1000000"
 
     public static func removedEnvironmentKeys(config: ClaudeCompatibleBackendConfig) -> Set<String> {
-        let configuredAuthKey = config.normalized.auth.environmentVariableName
-        return Set(["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].filter { $0 != configuredAuthKey })
+        let normalizedConfig = config.normalized
+        let configuredAuthKey = normalizedConfig.auth.environmentVariableName
+        var removed = Set(["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].filter { $0 != configuredAuthKey })
+        if case .noModel = normalizedConfig.modelBehavior {
+            removed.formUnion([
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+                "CLAUDE_CODE_SUBAGENT_MODEL"
+            ])
+        }
+        return removed
     }
 
     public static func environment(
@@ -342,19 +354,34 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
             "ANTHROPIC_BASE_URL": normalizedConfig.normalizedBaseURL ?? normalizedConfig.baseURL,
             normalizedConfig.auth.environmentVariableName: apiKey
         ]
+        let normalizedSelectedBackendModelID = selectedBackendModelID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveSlotBackendModelID: String? = if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {
+            if let normalizedSelectedBackendModelID, !normalizedSelectedBackendModelID.isEmpty {
+                normalizedSelectedBackendModelID
+            } else {
+                mapping.normalized.sonnet
+            }
+        } else {
+            nil
+        }
 
         if normalizedConfig.id == .glmZAI {
             environment["API_TIMEOUT_MS"] = glmTimeoutMilliseconds
-            if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: selectedBackendModelID) == 1_000_000 {
+            if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: effectiveSlotBackendModelID) == 1_000_000 {
                 environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = glmAutoCompactWindow
             }
         }
 
         if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {
             let normalizedMapping = mapping.normalized
+            let defaultBackendModelID = effectiveSlotBackendModelID ?? normalizedMapping.sonnet
+            environment["ANTHROPIC_MODEL"] = defaultBackendModelID
             environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = normalizedMapping.haiku
             environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] = normalizedMapping.sonnet
             environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] = normalizedMapping.opus
+            environment["ANTHROPIC_SMALL_FAST_MODEL"] = normalizedMapping.haiku
+            environment["CLAUDE_CODE_SUBAGENT_MODEL"] = normalizedMapping.haiku
         }
 
         return environment
@@ -738,6 +765,10 @@ public enum ClaudeCompatibleHeadlessRuntime {
 
         if let sessionID = request.resumeSessionID {
             args.append(contentsOf: ["--resume", sessionID])
+        }
+        if request.runtimeConfig.pluginID != .claudeCode {
+            args.append("--bare")
+            args.append(contentsOf: ["--setting-sources", "project,local"])
         }
         if let model = runtimeModelParam(request.launchEnvironment?.effectiveModel) {
             args.append(contentsOf: ["--model", model])

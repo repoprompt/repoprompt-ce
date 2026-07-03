@@ -51,6 +51,56 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(requestedModels, ["glm-5-turbo:xhigh"])
     }
 
+    func testNativeLaunchEnvironmentIncludesEffortEnvironment() async {
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .agentMode(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .standard,
+                effortLevel: .max
+            )
+        )
+
+        let environment = await controller.test_effectiveLaunchEnvironment(
+            base: [:],
+            resolverOverrides: [
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]"
+            ]
+        )
+
+        XCTAssertEqual(environment["ANTHROPIC_MODEL"], "deepseek-v4-pro[1m]")
+        XCTAssertEqual(environment["CLAUDE_CODE_EFFORT_LEVEL"], "max")
+    }
+
+    func testNativeLaunchEnvironmentOmitsEffortEnvironmentWhenSuppressed() async {
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .agentMode(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .glm,
+                effortLevel: .max
+            )
+        )
+
+        let environment = await controller.test_effectiveLaunchEnvironment(
+            base: ["CLAUDE_CODE_EFFORT_LEVEL": "low"],
+            resolverOverrides: [
+                "ANTHROPIC_MODEL": "glm-4.7"
+            ],
+            suppressesEffortSettings: true
+        )
+
+        XCTAssertEqual(environment["ANTHROPIC_MODEL"], "glm-4.7")
+        XCTAssertNil(environment["CLAUDE_CODE_EFFORT_LEVEL"])
+    }
+
     func testNativeLiveModelSwitchRequiresRestartWhenLaunchEnvironmentChanges() async {
         let controller = ClaudeNativeProcessSessionController(
             runID: UUID(),
@@ -66,7 +116,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             effectiveModel: "sonnet",
             environmentOverrides: [
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5-turbo",
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5-turbo"
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5-turbo",
+                "ANTHROPIC_MODEL": "glm-5-turbo"
             ],
             backend: .compatible(.glmZAI),
             suppressesEffortSettings: true
@@ -75,14 +126,17 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             effectiveModel: "sonnet",
             environmentOverrides: [
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7",
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7"
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
+                "ANTHROPIC_MODEL": "glm-4.7"
             ],
             backend: .compatible(.glmZAI),
             suppressesEffortSettings: true
         )
+        var selectedModelOnlyEnvironment = directGLM.environmentOverrides
+        selectedModelOnlyEnvironment["ANTHROPIC_MODEL"] = "glm-4.7"
         let sameEnvironmentDifferentFlagModel = ClaudeCodeLaunchEnvironment(
             effectiveModel: "opus",
-            environmentOverrides: directGLM.environmentOverrides,
+            environmentOverrides: selectedModelOnlyEnvironment,
             backend: .compatible(.glmZAI),
             suppressesEffortSettings: true
         )

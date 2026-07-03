@@ -65,4 +65,34 @@ final class ClaudeNativeIdentityPreambleTests: XCTestCase {
             )
         }
     }
+
+    func testBuildArgumentsIncludesResolvedModelFlag() async throws {
+        let controller = makeController(variant: .customCompatible)
+        let args = await controller.test_buildArguments(existingSessionID: nil, model: " sonnet ")
+        let modelFlagIndex = try XCTUnwrap(args.firstIndex(of: "--model"), "expected --model, got: \(args)")
+        XCTAssertEqual(args[args.index(after: modelFlagIndex)], "sonnet")
+    }
+
+    func testCompatibleBackendsUseBareModeToAvoidUserSettingsEnvLeakage() async throws {
+        for variant in [ClaudeCodeRuntimeVariant.glm, .kimi, .customCompatible] {
+            let controller = makeController(variant: variant)
+            let args = await controller.test_buildArguments(existingSessionID: nil, model: "sonnet")
+            XCTAssertTrue(args.contains("--bare"), "\(variant) must isolate ~/.claude/settings.json env, got: \(args)")
+            let settingSourcesIndex = try XCTUnwrap(args.firstIndex(of: "--setting-sources"), "\(variant) must restrict user settings sources, got: \(args)")
+            XCTAssertEqual(args[args.index(after: settingSourcesIndex)], "project,local")
+        }
+    }
+
+    func testStandardClaudeDoesNotUseBareMode() async {
+        let controller = makeController(variant: .standard)
+        let args = await controller.test_buildArguments(existingSessionID: nil, model: "sonnet")
+        XCTAssertFalse(args.contains("--bare"), "standard Claude Code should preserve normal user configuration, got: \(args)")
+        XCTAssertFalse(args.contains("--setting-sources"), "standard Claude Code should preserve normal user settings sources, got: \(args)")
+    }
+
+    func testBuildArgumentsOmitsModelFlagForNoModelBackends() async {
+        let controller = makeController(variant: .kimi)
+        let args = await controller.test_buildArguments(existingSessionID: nil, model: nil)
+        XCTAssertFalse(args.contains("--model"), "no-model backends must not pass --model, got: \(args)")
+    }
 }
