@@ -5405,6 +5405,75 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         await store.unloadRoot(id: loaded.id)
     }
 
+    func testAcceptedProjectionSnapshotsYieldRootProgressStreamEvents() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Survivor.swift": "struct Survivor {}\n"]
+        )
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            projectionAuthority: .manual
+        )
+        let buildGate = CodemapSelectionGraphBuildGate()
+        let graphProbe = CodemapSelectionGraphProbe(buildGate: buildGate)
+        addTeardownBlock {
+            buildGate.releaseAll()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let survivor = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Survivor.swift" })
+
+        let progressStream = await store.codemapRootProjectionProgressUpdates()
+        let collector = Task { () -> [WorkspaceCodemapRootProjectionProgressEvent] in
+            var events: [WorkspaceCodemapRootProjectionProgressEvent] = []
+            for await event in progressStream {
+                events.append(event)
+                if event.isSealed { break }
+            }
+            return events
+        }
+
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: survivor.id))
+        let ready = try await readyResult(settledResult(store: store, ticket: ticket))
+        let initialGeneration = try XCTUnwrap(buildGate.waitUntilFirstBlocked())
+        buildGate.release(generation: initialGeneration)
+        let initialGraphPublished = await graphProbe.waitUntilPublished(
+            rootEpoch: ticket.rootEpoch,
+            minimumNodeCount: 1
+        )
+        XCTAssertTrue(initialGraphPublished)
+        _ = try await publishCompleteAutomaticSelectionProjection(
+            fixture: fixture,
+            graphProbe: graphProbe,
+            ticket: ticket,
+            contributionsByFileID: [
+                survivor.id: CodeMapSelectionGraphContribution(
+                    artifactKey: ready.snapshot.artifactKey,
+                    definitions: ["Survivor"],
+                    references: []
+                )
+            ]
+        )
+
+        let events = await collector.value
+        XCTAssertGreaterThanOrEqual(events.count, 2)
+        XCTAssertTrue(events.allSatisfy { $0.rootEpoch.rootID == loaded.id })
+        let segmentEvent = try XCTUnwrap(events.first)
+        XCTAssertFalse(segmentEvent.isSealed)
+        XCTAssertEqual(segmentEvent.progress.counts.processedCandidateCount, 1)
+        XCTAssertEqual(segmentEvent.progress.catalogCompletion?.supportedCandidateCount, 1)
+        let sealedEvent = try XCTUnwrap(events.last)
+        XCTAssertTrue(sealedEvent.isSealed)
+        XCTAssertEqual(sealedEvent.progress.phase, .complete)
+        XCTAssertEqual(sealedEvent.progress.counts.processedCandidateCount, 1)
+        XCTAssertEqual(sealedEvent.progress.catalogCompletion?.supportedCandidateCount, 1)
+        await store.unloadRoot(id: loaded.id)
+    }
+
     func testPathRepairPublishesReadyContributionCompletedDuringRebuild() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(

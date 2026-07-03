@@ -211,6 +211,13 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private func rowHasContextLine(_ row: AgentWorkspaceRootRow) -> Bool {
         row.gitContext != nil || row.worktree != nil || mergeAttention(for: row) != nil
+            || codemapProgress(for: row) != nil
+    }
+
+    /// Resolves the subtle per-root codemap scanning/loading state for `row`
+    /// by root UUID. Absent (idle) roots render nothing.
+    private func codemapProgress(for row: AgentWorkspaceRootRow) -> AgentRootCodemapProgressDisplayState? {
+        rootsStore.codemapProgressByRootID[row.id]
     }
 
     private var shouldScrollFolderList: Bool {
@@ -477,7 +484,34 @@ struct AgentWorkspaceRootsSectionView: View {
                     .layoutPriority(0)
             }
 
+            if let codemapState = codemapProgress(for: row) {
+                codemapProgressLabel(codemapState)
+                    .layoutPriority(-1)
+            }
+
             Spacer(minLength: 0)
+        }
+    }
+
+    // MARK: - Codemap Progress Label
+
+    /// Subtle per-root codemap scanning/loading indicator rendered under the
+    /// root identity line. Deliberately quiet: small secondary text, no
+    /// spinner, truncates before capsules at narrow widths.
+    private func codemapProgressLabel(_ state: AgentRootCodemapProgressDisplayState) -> some View {
+        Text(state.displayText)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 9))
+            .foregroundColor(.secondary)
+            .opacity(codemapProgressOpacity(state))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .accessibilityLabel(state.accessibilityText)
+    }
+
+    private func codemapProgressOpacity(_ state: AgentRootCodemapProgressDisplayState) -> Double {
+        switch state {
+        case .scanning: 0.9
+        case .ready, .disabledGlobally: 0.55
         }
     }
 

@@ -737,6 +737,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         rootShellProjectionsChangedSubject.eraseToAnyPublisher()
     }
 
+    /// Latest accepted codemap projection activity per visible logical root UUID.
+    /// Consumed by the Agent Mode roots sidebar; not `@Published` so progress
+    /// ticks never trigger whole-view-model invalidation.
+    private(set) var codemapRootActivityByRootID: [UUID: WorkspaceRootCodemapActivity] = [:]
+    private let codemapRootActivityChangedSubject = PassthroughSubject<Void, Never>()
+
+    var codemapRootActivityChangedPublisher: AnyPublisher<Void, Never> {
+        codemapRootActivityChangedSubject.eraseToAnyPublisher()
+    }
+
     @MainActor
     func beginRootShellProjectionChangeBatch() {
         rootShellProjectionChangeBatchDepth += 1
@@ -762,6 +772,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             hasPendingRootShellProjectionChange = true
             return
         }
+        pruneCodemapRootActivityToVisibleRoots()
         publishRootFoldersChanged()
         rootShellProjectionsChangedSubject.send(())
     }
@@ -1222,6 +1233,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
     private var codemapSelectionGraphReadinessTask: Task<Void, Never>?
     private var codemapMarkerReadinessTask: Task<Void, Never>?
+    private var codemapRootProjectionProgressTask: Task<Void, Never>?
     private let alwaysReadableHomeDirectoryURL: URL
     private let automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
@@ -1250,6 +1262,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         subscribeToWorkspaceStoreDeltaEvents()
         subscribeToCodemapSelectionGraphReadinessUpdates()
         subscribeToCodemapMarkerReadinessUpdates()
+        subscribeToCodemapRootProjectionProgressUpdates()
         subscribeToPartitionStoreSaves()
         subscribeToFileSystemPreferenceChanges()
     }
@@ -1268,6 +1281,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspaceStoreDeltaBridgeTask?.cancel()
         codemapSelectionGraphReadinessTask?.cancel()
         codemapMarkerReadinessTask?.cancel()
+        codemapRootProjectionProgressTask?.cancel()
         autoCodemapSyncTask?.cancel()
         for task in sliceRebaseTasksByFullPath.values {
             task.cancel()
@@ -1461,6 +1475,16 @@ class WorkspaceFilesViewModel: ObservableObject {
             let stream = await workspaceFileContextStore.codemapMarkerReadinessUpdates()
             for await event in stream {
                 handleCodemapMarkerReadiness(event)
+            }
+        }
+    }
+
+    private func subscribeToCodemapRootProjectionProgressUpdates() {
+        codemapRootProjectionProgressTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await workspaceFileContextStore.codemapRootProjectionProgressUpdates()
+            for await event in stream {
+                handleCodemapRootProjectionProgress(event)
             }
         }
     }
@@ -2421,6 +2445,33 @@ class WorkspaceFilesViewModel: ObservableObject {
     ) {
         guard visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID }) else { return }
         codemapMarkerReadinessRevision &+= 1
+    }
+
+    @MainActor
+    private func handleCodemapRootProjectionProgress(
+        _ event: WorkspaceCodemapRootProjectionProgressEvent
+    ) {
+        // Progress is keyed strictly by visible logical root UUID. Hidden
+        // physical worktree session roots have distinct root IDs and are
+        // filtered out here; paths are never consulted.
+        let visibleRootIDs = Set(visibleRootFolders.map(\.id))
+        guard visibleRootIDs.contains(event.rootEpoch.rootID) else { return }
+        var next = codemapRootActivityByRootID.filter { visibleRootIDs.contains($0.key) }
+        next[event.rootEpoch.rootID] = WorkspaceRootCodemapActivity(event: event)
+        publishCodemapRootActivity(next)
+    }
+
+    @MainActor
+    private func pruneCodemapRootActivityToVisibleRoots() {
+        let visibleRootIDs = Set(visibleRootFolders.map(\.id))
+        publishCodemapRootActivity(codemapRootActivityByRootID.filter { visibleRootIDs.contains($0.key) })
+    }
+
+    @MainActor
+    private func publishCodemapRootActivity(_ next: [UUID: WorkspaceRootCodemapActivity]) {
+        guard next != codemapRootActivityByRootID else { return }
+        codemapRootActivityByRootID = next
+        codemapRootActivityChangedSubject.send(())
     }
 
     func cancelAllLoadingTasks() {

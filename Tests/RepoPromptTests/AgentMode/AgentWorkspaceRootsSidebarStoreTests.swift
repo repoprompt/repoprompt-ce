@@ -108,6 +108,229 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(store.rootRows.map(\.id), [rootB.id])
     }
 
+    // MARK: - Codemap progress (per-root scanning indicator)
+
+    func testWorkspaceRootCodemapActivityMapsAcceptedProgressEvents() {
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+
+        let determinate = WorkspaceRootCodemapActivity(event: WorkspaceCodemapRootProjectionProgressEvent(
+            rootEpoch: rootEpoch,
+            progress: makeProjectionProgress(
+                rootEpoch: rootEpoch,
+                phase: .publishingProjectionSegment,
+                processed: 42,
+                total: 120
+            ),
+            isSealed: false
+        ))
+        XCTAssertEqual(determinate, .scanning(processed: 42, total: 120))
+
+        let indeterminate = WorkspaceRootCodemapActivity(event: WorkspaceCodemapRootProjectionProgressEvent(
+            rootEpoch: rootEpoch,
+            progress: makeProjectionProgress(
+                rootEpoch: rootEpoch,
+                phase: .publishingProjectionSegment,
+                processed: 7,
+                total: nil
+            ),
+            isSealed: false
+        ))
+        XCTAssertEqual(indeterminate, .scanning(processed: 7, total: nil))
+
+        let sealed = WorkspaceRootCodemapActivity(event: WorkspaceCodemapRootProjectionProgressEvent(
+            rootEpoch: rootEpoch,
+            progress: makeProjectionProgress(
+                rootEpoch: rootEpoch,
+                phase: .publishingProjectionSegment,
+                processed: 120,
+                total: 120
+            ),
+            isSealed: true
+        ))
+        XCTAssertEqual(sealed, .ready(processed: 120))
+
+        let completePhase = WorkspaceRootCodemapActivity(event: WorkspaceCodemapRootProjectionProgressEvent(
+            rootEpoch: rootEpoch,
+            progress: makeProjectionProgress(
+                rootEpoch: rootEpoch,
+                phase: .complete,
+                processed: 120,
+                total: 120
+            ),
+            isSealed: false
+        ))
+        XCTAssertEqual(completePhase, .ready(processed: 120))
+    }
+
+    func testCodemapProgressStatesJoinActivityByRootUUIDOnlyAndDescribeStates() {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+        // Activity for a hidden physical worktree session root: distinct UUID,
+        // must never cross-wire onto a visible logical root row.
+        let hiddenPhysicalRootID = UUID()
+
+        let states = AgentWorkspaceRootsSidebarStore.codemapProgressStates(
+            for: [rootA, rootB],
+            activityByRootID: [
+                rootA.id: .scanning(processed: 42, total: 120),
+                hiddenPhysicalRootID: .ready(processed: 9)
+            ],
+            globallyDisabled: false
+        )
+
+        XCTAssertEqual(states, [rootA.id: .scanning(processed: 42, total: 120)])
+        XCTAssertNil(states[rootB.id], "Idle roots render nothing")
+        XCTAssertNil(states[hiddenPhysicalRootID])
+
+        XCTAssertEqual(
+            AgentRootCodemapProgressDisplayState.scanning(processed: 42, total: 120).displayText,
+            "Codemaps 42/120"
+        )
+        XCTAssertEqual(
+            AgentRootCodemapProgressDisplayState.scanning(processed: 7, total: nil).displayText,
+            "Codemaps scanning…"
+        )
+        XCTAssertEqual(AgentRootCodemapProgressDisplayState.ready.displayText, "Codemaps ready")
+        XCTAssertEqual(
+            AgentRootCodemapProgressDisplayState.disabledGlobally.displayText,
+            "Codemaps disabled globally"
+        )
+        XCTAssertEqual(
+            AgentRootCodemapProgressDisplayState.scanning(processed: 42, total: 120).accessibilityText,
+            "Codemaps scanning, 42 of 120 files processed"
+        )
+    }
+
+    func testCodemapProgressStatesGlobalDisableOverridesActivity() {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+
+        let states = AgentWorkspaceRootsSidebarStore.codemapProgressStates(
+            for: [rootA, rootB],
+            activityByRootID: [
+                rootA.id: .scanning(processed: 1, total: 10)
+            ],
+            globallyDisabled: true
+        )
+
+        XCTAssertEqual(states, [
+            rootA.id: .disabledGlobally,
+            rootB.id: .disabledGlobally
+        ])
+    }
+
+    func testCodemapProgressInitialGlobalDisableSuppressesActivitySynchronously() {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let manager = makeWorkspaceManager()
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { [rootA] },
+            rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+            codemapActivityLookup: { [rootA.id: .scanning(processed: 1, total: 10)] },
+            codemapsGloballyDisabled: CurrentValueSubject<Bool, Never>(true).eraseToAnyPublisher(),
+            initialCodemapsGloballyDisabled: true,
+            codemapActivityThrottleMilliseconds: 1,
+            workspaceManager: manager,
+            windowID: -1
+        )
+
+        XCTAssertEqual(store.codemapProgressByRootID, [rootA.id: .disabledGlobally])
+    }
+
+    func testCodemapActivityUpdatesPreserveRowIdentityAndGlobalDisableRoundTrips() async {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+        var activity: [UUID: WorkspaceRootCodemapActivity] = [:]
+        let activityChanges = PassthroughSubject<Void, Never>()
+        let globallyDisabled = CurrentValueSubject<Bool, Never>(false)
+        let manager = makeWorkspaceManager()
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { [rootA, rootB] },
+            rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+            codemapActivityLookup: { activity },
+            codemapActivityChanges: activityChanges.eraseToAnyPublisher(),
+            codemapsGloballyDisabled: globallyDisabled.eraseToAnyPublisher(),
+            codemapActivityThrottleMilliseconds: 1,
+            workspaceManager: manager,
+            windowID: -1
+        )
+        let rowsBefore = store.rootRows
+        XCTAssertEqual(rowsBefore.map(\.id), [rootA.id, rootB.id])
+        XCTAssertEqual(store.codemapProgressByRootID, [:])
+
+        activity[rootA.id] = .scanning(processed: 3, total: nil)
+        activityChanges.send(())
+        await waitUntil { store.codemapProgressByRootID == [rootA.id: .scanning(processed: 3, total: nil)] }
+
+        activity[rootA.id] = .scanning(processed: 42, total: 120)
+        activity[rootB.id] = .ready(processed: 12)
+        activityChanges.send(())
+        await waitUntil {
+            store.codemapProgressByRootID == [
+                rootA.id: .scanning(processed: 42, total: 120),
+                rootB.id: .ready
+            ]
+        }
+
+        // Progress ticks must not rebuild rows or disturb identity/ordering.
+        XCTAssertEqual(store.rootRows, rowsBefore)
+
+        globallyDisabled.send(true)
+        await waitUntil {
+            store.codemapProgressByRootID == [
+                rootA.id: .disabledGlobally,
+                rootB.id: .disabledGlobally
+            ]
+        }
+
+        globallyDisabled.send(false)
+        await waitUntil {
+            store.codemapProgressByRootID == [
+                rootA.id: .scanning(processed: 42, total: 120),
+                rootB.id: .ready
+            ]
+        }
+        XCTAssertEqual(store.rootRows, rowsBefore)
+    }
+
+    private func makeProjectionProgress(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        phase: WorkspaceCodemapProjectionPreloadPhase,
+        processed: UInt64,
+        total: UInt64?
+    ) -> WorkspaceCodemapProjectionProgress {
+        let completion = total.map { total in
+            WorkspaceCodemapProjectionCatalogCompletion(
+                token: WorkspaceCodemapProjectionCatalogToken(
+                    rootEpoch: rootEpoch,
+                    topologyGeneration: 1,
+                    appliedIndexGeneration: 1,
+                    catalogGeneration: 1,
+                    ingressGeneration: 1,
+                    projectionInvalidationGeneration: 0
+                ),
+                finalCursor: nil,
+                supportedCandidateCount: total
+            )
+        }
+        return WorkspaceCodemapProjectionProgress(
+            phase: phase,
+            counts: WorkspaceCodemapProjectionCounts(
+                supportedCandidateCount: total ?? processed,
+                processedCandidateCount: processed,
+                contributedCount: processed,
+                emptyCount: 0,
+                terminalArtifactCount: 0,
+                terminalExcludedCount: 0,
+                transientCount: 0
+            ),
+            catalogPageCount: 1,
+            catalogPathByteCount: 1,
+            publishedSegmentCount: 1,
+            publishedSegmentByteCount: 1,
+            catalogCompletion: completion
+        )
+    }
+
     // MARK: - Root context actions
 
     func testRootContextActionCopiesRawBranchInsteadOfDisplayText() {
