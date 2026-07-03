@@ -300,6 +300,7 @@ class WindowState: ObservableObject {
     }
 
     private var pendingRestoreEntry: WindowSessionEntry?
+    private var pendingRestoreCompletion: (() -> Void)?
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
 
@@ -841,9 +842,18 @@ class WindowState: ObservableObject {
         }
     }
 
-    func applyWindowRestoreEntry(_ entry: WindowSessionEntry) {
-        guard !entry.isEphemeral else { return }
+    /// Applies a restore entry to this window. `completion` is invoked exactly once,
+    /// after the restore attempt finished (successfully or not) or when the entry is
+    /// skipped, so callers can release restore-in-progress guards.
+    func applyWindowRestoreEntry(_ entry: WindowSessionEntry, completion: (() -> Void)? = nil) {
+        guard !entry.isEphemeral else {
+            completion?()
+            return
+        }
+        // Never drop a previously pending completion if the entry is replaced.
+        pendingRestoreCompletion?()
         pendingRestoreEntry = entry
+        pendingRestoreCompletion = completion
         applyPendingRestoreEntryIfPossible()
     }
 
@@ -851,9 +861,12 @@ class WindowState: ObservableObject {
         guard workspaceManager.isInitialized else { return }
         guard let entry = pendingRestoreEntry else { return }
         pendingRestoreEntry = nil
+        let completion = pendingRestoreCompletion
+        pendingRestoreCompletion = nil
 
         Task {
             await restoreWorkspace(from: entry)
+            completion?()
         }
     }
 

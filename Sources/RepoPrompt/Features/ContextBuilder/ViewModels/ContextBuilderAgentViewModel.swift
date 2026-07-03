@@ -1217,14 +1217,20 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // This ensures consistent behavior across all workspaces and tabs
         let normalizedAgentSelection = resolvedPersistedContextBuilderSelection()
 
-        // Load workspace-scoped settings (tokenBudget, enhancementMode, etc.)
-        let workspaceSettings = settingsManager.chatSettings(for: manager.activeWorkspace?.id ?? currentWorkspaceID ?? UUID())
+        // Load workspace-scoped settings (tokenBudget, enhancementMode, etc.).
+        // Reading settings for a workspace ID seeds-and-saves defaults for unseen IDs,
+        // so never synthesize a placeholder UUID here: during startup/restore races with
+        // no active workspace that would write garbage entries into globalSettings.json.
+        let workspaceSettings: ChatGlobalSettings? = {
+            guard let workspaceID = manager.activeWorkspace?.id ?? currentWorkspaceID else { return nil }
+            return settingsManager.chatSettings(for: workspaceID)
+        }()
 
         // Token budget: workspace setting
-        tokenBudget = workspaceSettings.discoveryTokenBudget ?? ContextBuilderDefaults.discoveryTokenBudget
+        tokenBudget = workspaceSettings?.discoveryTokenBudget ?? ContextBuilderDefaults.discoveryTokenBudget
 
         // Enhancement mode: workspace setting
-        if let modeString = workspaceSettings.discoveryEnhancementMode,
+        if let modeString = workspaceSettings?.discoveryEnhancementMode,
            let mode = PromptEnhancementMode(rawValue: modeString)
         {
             enhancementMode = mode
@@ -1233,7 +1239,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         // Auto-generate plan: tab setting, falling back to workspace default
-        let workspaceAutoGenerate = workspaceSettings.discoveryAutoGeneratePlan ?? ContextBuilderDefaults.autoGeneratePlan
+        let workspaceAutoGenerate = workspaceSettings?.discoveryAutoGeneratePlan ?? ContextBuilderDefaults.autoGeneratePlan
         let tabAutoGenerate = tabState.contextBuilder.autoGeneratePlan ?? workspaceAutoGenerate
         session.autoGeneratePlan = tabAutoGenerate
         autoGeneratePlan = tabAutoGenerate
@@ -1250,13 +1256,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         selectedFollowUpType = tabFollowUpType
 
         // Allow clarifying questions: workspace setting only (not tab-specific), defaults to true for UI
-        allowClarifyingQuestions = workspaceSettings.discoveryAllowClarifyingQuestions ?? true
+        allowClarifyingQuestions = workspaceSettings?.discoveryAllowClarifyingQuestions ?? true
         // Allow clarifying questions for MCP: workspace setting only, defaults to false
-        allowClarifyingQuestionsForMCP = workspaceSettings.discoveryAllowClarifyingQuestionsForMCP ?? false
+        allowClarifyingQuestionsForMCP = workspaceSettings?.discoveryAllowClarifyingQuestionsForMCP ?? false
         // Question timeout: workspace setting only
-        questionTimeoutSeconds = workspaceSettings.discoveryQuestionTimeoutSeconds ?? ContextBuilderDefaults.questionTimeoutSeconds
+        questionTimeoutSeconds = workspaceSettings?.discoveryQuestionTimeoutSeconds ?? ContextBuilderDefaults.questionTimeoutSeconds
         // Plan token budget: workspace setting only, defaults to 120k
-        planTokenBudget = workspaceSettings.discoveryPlanTokenBudget ?? 120_000
+        planTokenBudget = workspaceSettings?.discoveryPlanTokenBudget ?? 120_000
 
         // Apply agent/model from global settings when a configured provider is currently available.
         if let normalizedAgentSelection {
