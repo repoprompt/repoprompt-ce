@@ -414,6 +414,39 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertTrue(recorder.contains("claude:shutdown"))
     }
 
+    func testClaudeControllerLaunchSettingsIdentityIgnoresLiveModelAndEffort() {
+        let base = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .customCompatible,
+            workspacePath: "/workspace",
+            permissionMode: "default",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            modelString: "sonnet",
+            effortLevel: .low
+        )
+        let liveFlagChange = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .customCompatible,
+            workspacePath: "/workspace",
+            permissionMode: "default",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            modelString: "opus",
+            effortLevel: .max
+        )
+        let permissionChange = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .customCompatible,
+            workspacePath: "/workspace",
+            permissionMode: "acceptEdits",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            modelString: "opus",
+            effortLevel: .max
+        )
+
+        XCTAssertEqual(base, liveFlagChange)
+        XCTAssertNotEqual(base, permissionChange)
+    }
+
     private func resolvedClaudeLaunchPolicy(
         profile: AgentProviderPermissionProfile,
         harness: LifecycleHarness
@@ -448,7 +481,9 @@ extension AgentModeRunServiceLifecycleTests {
                 workspacePath: workspacePath,
                 permissionMode: permissionMode,
                 allowNativeBashTool: allowNativeBashTool,
-                mcpStrictMode: mcpStrictMode
+                mcpStrictMode: mcpStrictMode,
+                modelString: nil,
+                effortLevel: nil
             ),
             for: session
         )

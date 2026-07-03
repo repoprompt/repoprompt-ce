@@ -33,22 +33,32 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             modelBehavior: .claudeSlotMapping(.init(haiku: " h ", sonnet: " s ", opus: " o "))
         )
         let environment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "secret")
+        let defaultGLMEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
+            config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
+            apiKey: "secret"
+        )
         XCTAssertEqual(config.normalizedDisplayName, "Claude Code GLM")
         XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic")
         XCTAssertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "secret")
         XCTAssertEqual(environment["API_TIMEOUT_MS"], "3000000")
         XCTAssertNil(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+        XCTAssertEqual(environment["ANTHROPIC_MODEL"], "s")
         XCTAssertEqual(environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "h")
         XCTAssertEqual(environment["ANTHROPIC_DEFAULT_SONNET_MODEL"], "s")
         XCTAssertEqual(environment["ANTHROPIC_DEFAULT_OPUS_MODEL"], "o")
+        XCTAssertEqual(environment["ANTHROPIC_SMALL_FAST_MODEL"], "h")
+        XCTAssertEqual(environment["CLAUDE_CODE_SUBAGENT_MODEL"], "h")
         XCTAssertEqual(ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(config: config), ["ANTHROPIC_API_KEY"])
+        XCTAssertEqual(defaultGLMEnvironment["ANTHROPIC_MODEL"], "glm-5.2[1m]")
+        XCTAssertEqual(defaultGLMEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
 
         let oneMillionEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
             apiKey: "secret",
-            selectedBackendModelID: "glm-5.2[1m]"
+            selectedBackendModelID: " glm-5.2[1m] "
         )
         XCTAssertEqual(oneMillionEnvironment["API_TIMEOUT_MS"], "3000000")
+        XCTAssertEqual(oneMillionEnvironment["ANTHROPIC_MODEL"], "glm-5.2[1m]")
         XCTAssertEqual(oneMillionEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
         let haikuEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
@@ -56,6 +66,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             selectedBackendModelID: "glm-4.5-air"
         )
         XCTAssertEqual(haikuEnvironment["API_TIMEOUT_MS"], "3000000")
+        XCTAssertEqual(haikuEnvironment["ANTHROPIC_MODEL"], "glm-4.5-air")
         XCTAssertNil(haikuEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
 
         let resolver = ClaudeCompatibleLaunchEnvironmentResolver(
@@ -94,13 +105,60 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(glm.backendID, .glmZAI)
         XCTAssertEqual(glm.effectiveModel, "opus")
         XCTAssertEqual(glm.environmentOverrides["ANTHROPIC_AUTH_TOKEN"], "zai-secret")
+        XCTAssertEqual(glm.environmentOverrides["ANTHROPIC_MODEL"], "glm-opus")
         XCTAssertFalse(glm.suppressesEffortSettings)
 
         let kimi = try await resolver.resolve(variant: .kimi, requestedModel: "kimi-code")
         XCTAssertEqual(kimi.backendID, .kimi)
         XCTAssertNil(kimi.effectiveModel)
         XCTAssertEqual(kimi.environmentOverrides["ANTHROPIC_API_KEY"], "kimi-secret")
+        XCTAssertNil(kimi.environmentOverrides["ANTHROPIC_MODEL"])
+        XCTAssertNil(kimi.environmentOverrides["ANTHROPIC_DEFAULT_HAIKU_MODEL"])
+        XCTAssertNil(kimi.environmentOverrides["ANTHROPIC_SMALL_FAST_MODEL"])
+        XCTAssertNil(kimi.environmentOverrides["CLAUDE_CODE_SUBAGENT_MODEL"])
+        XCTAssertTrue(kimi.removedEnvironmentKeys.isSuperset(of: [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL"
+        ]))
         XCTAssertTrue(kimi.suppressesEffortSettings)
+
+        let deepSeekConfig = ClaudeCompatibleBackendConfig(
+            id: .custom,
+            isEnabled: true,
+            displayName: "CC DS",
+            baseURL: "https://api.deepseek.com/anthropic",
+            auth: .anthropicAuthToken,
+            modelBehavior: .claudeSlotMapping(.init(
+                haiku: "deepseek-v4-flash",
+                sonnet: "deepseek-v4-pro[1m]",
+                opus: "deepseek-v4-pro[1m]"
+            ))
+        )
+        let deepSeekResolver = ClaudeCompatibleLaunchEnvironmentResolver(
+            backendConfigProvider: { id in id == .custom ? deepSeekConfig : id.defaultPreset },
+            zaiSecretProvider: { nil },
+            backendSecretProvider: { id in
+                XCTAssertEqual(id, .custom)
+                return " deepseek-secret "
+            }
+        )
+        let deepSeekHaiku = try await deepSeekResolver.resolve(variant: .customCompatible, requestedModel: "haiku:low")
+        XCTAssertEqual(deepSeekHaiku.backendID, .custom)
+        XCTAssertEqual(deepSeekHaiku.effectiveModel, "haiku")
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_AUTH_TOKEN"], "deepseek-secret")
+        XCTAssertNil(deepSeekHaiku.environmentOverrides["ANTHROPIC_API_KEY"])
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_MODEL"], "deepseek-v4-flash")
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "deepseek-v4-flash")
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_DEFAULT_SONNET_MODEL"], "deepseek-v4-pro[1m]")
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_DEFAULT_OPUS_MODEL"], "deepseek-v4-pro[1m]")
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_SMALL_FAST_MODEL"], "deepseek-v4-flash")
+        XCTAssertEqual(deepSeekHaiku.environmentOverrides["CLAUDE_CODE_SUBAGENT_MODEL"], "deepseek-v4-flash")
 
         let runtimeConfig = ClaudeCompatibleRuntimeConfig(
             pluginID: .claudeCode,
@@ -146,6 +204,39 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             "--strict-mcp-config",
             "--disallowedTools", "Bash,Edit"
         ])
+
+        let compatibleRuntimeConfig = ClaudeCompatibleRuntimeConfig(
+            pluginID: .customClaudeCompatible,
+            mode: .discovery,
+            commandName: "claude",
+            additionalPathHints: [],
+            modelString: "sonnet",
+            enableDebugLogging: false,
+            sdkConnectTimeoutSeconds: 10,
+            sdkRelaunchMaxAttempts: 1,
+            permissionMode: "bypassPermissions",
+            allowNativeBashTool: false,
+            toolContext: .discoverRun,
+            disallowedBuiltInTools: [],
+            mcpStrictMode: false,
+            toolSearchEnabled: false,
+            effortLevel: nil,
+            processEnvironmentOverrides: [:],
+            effortEnvironmentOverrides: [:],
+            backendConfig: nil
+        )
+        let compatibleArgs = ClaudeCompatibleHeadlessRuntime.buildArguments(.init(
+            runtimeConfig: compatibleRuntimeConfig,
+            mcpConfigPath: nil,
+            launchEnvironment: .init(
+                effectiveModel: "sonnet",
+                environmentOverrides: [:],
+                backendID: .custom
+            )
+        ))
+        XCTAssertTrue(compatibleArgs.contains("--bare"), "compatible backends must not inherit user settings env: \(compatibleArgs)")
+        let settingSourcesIndex = try XCTUnwrap(compatibleArgs.firstIndex(of: "--setting-sources"), "compatible backends must restrict user settings sources: \(compatibleArgs)")
+        XCTAssertEqual(compatibleArgs[compatibleArgs.index(after: settingSourcesIndex)], "project,local")
     }
 
     func testProviderCatalogDefaultsExposeStableRawValues() throws {
