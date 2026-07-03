@@ -3209,6 +3209,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    #if DEBUG
+        /// Test support: awaits completion of any pending post-switch git-data load.
+        /// Returns immediately if no task is active (already completed or not scheduled).
+        func waitUntilPostSwitchGitDataLoadComplete() async {
+            await postSwitchGitDataLoadTask?.value
+        }
+    #endif
+
     private func schedulePostSwitchGitDataLoad(for workspace: WorkspaceModel, reason: String) {
         let token = UUID()
         postSwitchGitDataLoadToken = token

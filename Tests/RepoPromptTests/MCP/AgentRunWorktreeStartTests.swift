@@ -871,10 +871,9 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         composeTab.selection = storedSelection
         composeTab.activeAgentSessionID = parentSessionID
         window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
-        // The fixture's asynchronous Git-data maintenance may publish one final canonical
-        // selection revision after workspace setup. Freeze only after that launch boundary has
-        // settled; production capture must continue to reject any later revision change.
-        try await Task.sleep(for: .seconds(2))
+        // Wait for post-switch git-data root load to complete so any selection revision
+        // published by the async git-data load settles before we diverge the UI selection.
+        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
         let divergentUISelection = window.workspaceFilesViewModel.snapshotSelection()
         XCTAssertTrue(divergentUISelection.selectedPaths.isEmpty)
