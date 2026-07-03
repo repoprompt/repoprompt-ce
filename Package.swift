@@ -9,6 +9,7 @@ let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().pa
 // the same gate for intentional Sentry testing.
 let environment = ProcessInfo.processInfo.environment
 let sentryEnabled = environment["REPOPROMPT_ENABLE_SENTRY"] == "1"
+let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
 
 var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
@@ -85,10 +86,18 @@ var repoPromptSwiftSettings: [SwiftSetting] = [
     ])
 ]
 
+var repoPromptTestSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
+]
+
 if sentryEnabled {
     packageDependencies.append(.package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"))
     repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))
     repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
+}
+
+if benchmarkTestsEnabled {
+    repoPromptTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
 
 let package = Package(
@@ -130,7 +139,8 @@ let package = Package(
             resources: [
                 .copy("CodeMap/Fixtures"),
                 .copy("CodeMap/Goldens")
-            ]
+            ],
+            swiftSettings: repoPromptTestSwiftSettings
         )
     ],
     swiftLanguageModes: [.v5]

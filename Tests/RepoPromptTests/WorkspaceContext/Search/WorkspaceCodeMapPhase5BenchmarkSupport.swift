@@ -1,4 +1,4 @@
-#if DEBUG
+#if DEBUG && RPCE_BENCHMARK_TESTS
     import Darwin
     import Foundation
     @testable import RepoPrompt

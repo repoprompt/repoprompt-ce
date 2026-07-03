@@ -63,6 +63,7 @@ import XCTest
             )
         }
 
+        #if RPCE_BENCHMARK_TESTS
         func testLargeRepositoryTimeToReadyBenchmark() async throws {
             let metricsEnabled = WorkspaceFileSearchIndexBenchmarkRuntimeConfiguration.isEnabled(
                 environmentKey: "RP_RUN_FILE_SEARCH_INDEX_METRICS",
@@ -1116,5 +1117,6 @@ import XCTest
             let rootIDs = await store.roots().map(\.id)
             await store.unloadRoots(ids: rootIDs)
         }
+        #endif
     }
 #endif

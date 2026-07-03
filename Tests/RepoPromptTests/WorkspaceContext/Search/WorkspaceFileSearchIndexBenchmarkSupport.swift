@@ -3,6 +3,7 @@
     import Foundation
     @testable import RepoPrompt
 
+    #if RPCE_BENCHMARK_TESTS
     enum WorkspaceFileSearchIndexBenchmarkRuntimeConfiguration {
         static let fileURL = URL(fileURLWithPath: "/tmp/RepoPromptCE-file-search-index-run-config.json")
 
@@ -95,6 +96,7 @@
             "// RepoPrompt CE file-search benchmark fixture\nlet benchmarkValue = 1234567890\n".utf8
         )
     }
+    #endif
 
     struct WorkspaceFileSearchIndexBenchmarkCounters: Equatable {
         typealias FallbackReason = WorkspaceFileContextStore.RootCatalogShardFallbackReason
@@ -135,6 +137,7 @@
         }
     }
 
+    #if RPCE_BENCHMARK_TESTS
     struct WorkspaceFileSearchIndexBenchmarkCounterMark {
         typealias FallbackReason = WorkspaceFileContextStore.RootCatalogShardFallbackReason
 
@@ -1467,4 +1470,5 @@
     func workspaceFileSearchIndexElapsedMilliseconds(from start: DispatchTime, to end: DispatchTime) -> Double {
         Double(end.uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
     }
+    #endif
 #endif

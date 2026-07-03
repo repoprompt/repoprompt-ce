@@ -63,6 +63,7 @@
             return try XCTUnwrap(recorder.snapshot())
         }
 
+        #if RPCE_BENCHMARK_TESTS
         func testLongActiveCrawlFinalTurnRefreshBenchmarkReport() async throws {
             try XCTSkipUnless(
                 ProcessInfo.processInfo.environment["RP_RUN_TRANSCRIPT_METRICS"] == "1"
@@ -478,6 +479,8 @@
                 paddingBytes += minimumPayloadBytes / 2
             }
         }
+
+        #endif
 
         @MainActor
         private func makeViewModel() -> AgentModeViewModel {
