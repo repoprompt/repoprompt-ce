@@ -1190,9 +1190,10 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             await registrationGate.release()
             await fixture.shutdown()
         }
-        var sourceFiles: [String: String] = [:]
         let firstPageEntryLimit = 4
         let fileCountCrossingFirstPage = firstPageEntryLimit + 1
+        var sourceFiles: [String: String] = [:]
+        sourceFiles.reserveCapacity(fileCountCrossingFirstPage)
         for index in 0 ..< fileCountCrossingFirstPage {
             sourceFiles[String(format: "Sources/File%04d.swift", index)] =
                 "struct File\(index) {}\n"

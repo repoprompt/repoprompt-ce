@@ -3306,3 +3306,74 @@ Primary metric eligible: yes
 - Result: `2 valid + 0 invalid`; raw executionSeconds `722.434, 739.581`; median `731.007s`; observed p95 `739.581s`; relative MAD `0.0117` (`stable`).
 - Sample logs: `14b4d209-ffe3-460b-a7fe-d98b4e2c9bac` → `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/14b4d209-ffe3-460b-a7fe-d98b4e2c9bac.log`; `a3eb2072-669f-46f1-8172-5ea788fcf983` → `/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a3eb2072-669f-46f1-8172-5ea788fcf983.log`.
 - No failures, invalid samples, focused fixes, commits, or pushes in this pass; raw logs remain local/uncommitted, and optimizer JSON artifacts are retained under `docs/test-suite-optimizer/artifacts/` for orchestrator handling.
+### Focused cost diagnostic: 2026-07-03T11:25:03+00:00 — root — test-suite-opt-focused-smoke-20260703
+
+Command: `/Users/will/Desktop/repoprompt-ce/conductor test --filter RepoPromptTests.ModelPickerStringOrderingTests --json`
+Artifact: `docs/test-suite-optimizer/artifacts/test-suite-focused-cost-test-suite-opt-focused-smoke-20260703.json`
+Filter: `RepoPromptTests.ModelPickerStringOrderingTests`
+Source-change guard: `metadata`
+Primary metric eligible: no
+
+| Sample | Valid | Total execution seconds | Parsed XCTest seconds | Inferred overhead seconds | Queue wait | Max RSS bytes | State | Exit | Log | Invalid reason |
+|---:|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| 1 | yes | 39.438 | 0.007 | 39.431 | 0.002 |  | completed | 0 | `/Users/will/Library/Application Support/RepoPrompt CE/Conductor/2bcdc314d9078a2ad06206b142533c70d50fcdf5b417ba4f48b6a895f8b4c282/jobs/89a3c9ae-4304-421d-8174-5d982516cca8.log` |  |
+
+Summary:
+
+| Valid | Invalid | Median total execution seconds | Observed p95 total execution seconds | Relative MAD | Noise | Median parsed XCTest seconds | Median inferred overhead seconds | Max RSS bytes | Diagnostic only | Primary metric eligible |
+|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|
+| 1 | 0 | 39.438 | 39.438 | 0.0000 | stable | 0.007 | 39.431 |  | yes | no |
+
+### Focused cost diagnostic: 2026-07-03T11:29:51+00:00 — root — test-suite-opt-focused-contextbuilder-worktree-20260703
+
+Command: `/Users/will/Desktop/repoprompt-ce/conductor test --filter RepoPromptTests.ContextBuilderWorktreeInheritanceTests --json`
+Artifact: `docs/test-suite-optimizer/artifacts/test-suite-focused-cost-test-suite-opt-focused-contextbuilder-worktree-20260703.json`
+Filter: `RepoPromptTests.ContextBuilderWorktreeInheritanceTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Total execution seconds | Parsed XCTest seconds | Inferred overhead seconds | Queue wait | Max RSS bytes | State | Exit | Log | Invalid reason |
+|---:|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| 1 | yes | 48.493 | 9.525 | 38.968 | 0.003 |  | completed | 0 | `/Users/will/Library/Application Support/RepoPrompt CE/Conductor/2bcdc314d9078a2ad06206b142533c70d50fcdf5b417ba4f48b6a895f8b4c282/jobs/eae197eb-8559-4e1f-a0bd-d9f6abef1322.log` |  |
+
+Summary:
+
+| Valid | Invalid | Median total execution seconds | Observed p95 total execution seconds | Relative MAD | Noise | Median parsed XCTest seconds | Median inferred overhead seconds | Max RSS bytes | Diagnostic only | Primary metric eligible |
+|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|
+| 1 | 0 | 48.493 | 48.493 | 0.0000 | stable | 9.525 | 38.968 |  | yes | no |
+
+### Focused cost diagnostic: 2026-07-03T11:30:56+00:00 — root — test-suite-opt-focused-workspace-file-context-codemap-seam-20260703
+
+Command: `/Users/will/Desktop/repoprompt-ce/conductor test --filter RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests --json`
+Artifact: `docs/test-suite-optimizer/artifacts/test-suite-focused-cost-test-suite-opt-focused-workspace-file-context-codemap-seam-20260703.json`
+Filter: `RepoPromptTests.WorkspaceFileContextStoreCodemapSeamTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Total execution seconds | Parsed XCTest seconds | Inferred overhead seconds | Queue wait | Max RSS bytes | State | Exit | Log | Invalid reason |
+|---:|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| 1 | yes | 37.327 | 36.659 | 0.668 | 0.004 |  | completed | 0 | `/Users/will/Library/Application Support/RepoPrompt CE/Conductor/2bcdc314d9078a2ad06206b142533c70d50fcdf5b417ba4f48b6a895f8b4c282/jobs/66751804-f6fc-4815-8425-704e23a77a21.log` |  |
+
+Summary:
+
+| Valid | Invalid | Median total execution seconds | Observed p95 total execution seconds | Relative MAD | Noise | Median parsed XCTest seconds | Median inferred overhead seconds | Max RSS bytes | Diagnostic only | Primary metric eligible |
+|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|
+| 1 | 0 | 37.327 | 37.327 | 0.0000 | stable | 36.659 | 0.668 |  | yes | no |
+
+### Focused cost diagnostic: 2026-07-03T11:32:04+00:00 — root — test-suite-opt-focused-workspace-codemap-binding-20260703
+
+Command: `/Users/will/Desktop/repoprompt-ce/conductor test --filter RepoPromptTests.WorkspaceCodemapBindingEngineTests --json`
+Artifact: `docs/test-suite-optimizer/artifacts/test-suite-focused-cost-test-suite-opt-focused-workspace-codemap-binding-20260703.json`
+Filter: `RepoPromptTests.WorkspaceCodemapBindingEngineTests`
+Source-change guard: `content`
+Primary metric eligible: no
+
+| Sample | Valid | Total execution seconds | Parsed XCTest seconds | Inferred overhead seconds | Queue wait | Max RSS bytes | State | Exit | Log | Invalid reason |
+|---:|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| 1 | yes | 39.086 | 38.363 | 0.723 | 0.003 |  | completed | 0 | `/Users/will/Library/Application Support/RepoPrompt CE/Conductor/2bcdc314d9078a2ad06206b142533c70d50fcdf5b417ba4f48b6a895f8b4c282/jobs/2a26e334-9d3c-45d9-a1df-80f7f9fe141d.log` |  |
+
+Summary:
+
+| Valid | Invalid | Median total execution seconds | Observed p95 total execution seconds | Relative MAD | Noise | Median parsed XCTest seconds | Median inferred overhead seconds | Max RSS bytes | Diagnostic only | Primary metric eligible |
+|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|
+| 1 | 0 | 39.086 | 39.086 | 0.0000 | stable | 38.363 | 0.723 |  | yes | no |

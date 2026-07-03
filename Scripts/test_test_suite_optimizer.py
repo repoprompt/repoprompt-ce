@@ -787,6 +787,216 @@ class BaselineProgressTests(unittest.TestCase):
         self.assertEqual(events, [])
 
 
+class FocusedCostTests(unittest.TestCase):
+    def make_run(
+        self,
+        root: Path,
+        index: int,
+        *,
+        exit_code: int = 0,
+        log_text: str | None = None,
+        result_extra: dict[str, object] | None = None,
+    ) -> optimizer.ConductorRun:
+        log_path = root / f"focused-{index}.log"
+        if log_text is None:
+            log_text = "Test Case 'RepoPromptTests.ExampleTests.testOne' passed after 1.500 seconds.\n"
+        log_path.write_text(log_text, encoding="utf-8")
+        result = {
+            "state": "completed",
+            "exitCode": exit_code,
+            "queueWaitSeconds": 0.5,
+            "executionSeconds": 12.0 + index,
+            "timedOut": False,
+            "measurementInvalid": False,
+            "logPath": str(log_path),
+        }
+        if result_extra:
+            result.update(result_extra)
+        return optimizer.ConductorRun(
+            command=["/repo/conductor", "test", "--filter", "RepoPromptTests.ExampleTests", "--json"],
+            process_exit_code=0,
+            stdout=json.dumps({"result": result}),
+            stderr="",
+            result=result,
+            log_text=log_text,
+            ticket=f"ticket-{index}",
+        )
+
+    def test_focused_cost_records_diagnostic_artifact_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filter_value = "RepoPromptTests.ExampleTests"
+            output = root / "focused-cost.json"
+            scoreboard = root / "scoreboard.md"
+            events: list[dict[str, object]] = []
+            runs = [
+                self.make_run(root, 1, result_extra={"diagnostics": [{"swiftFrontendMaxRSSBytes": 42_000}]}),
+                self.make_run(root, 2, exit_code=1, log_text=""),
+            ]
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+            ) -> optimizer.ConductorRun:
+                self.assertEqual(repo_root, root)
+                self.assertEqual(target, "root")
+                self.assertFalse(list_mode)
+                self.assertEqual(filter_value, "RepoPromptTests.ExampleTests")
+                return runs.pop(0)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "b" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-03T00:00:00+00:00"),
+            ):
+                payload = optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value=filter_value,
+                    samples_requested=2,
+                    label="unit-focused",
+                    scoreboard=scoreboard,
+                    output=output,
+                    source_change_guard=optimizer.SOURCE_GUARD_METADATA,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+            artifact = json.loads(output.read_text(encoding="utf-8"))
+            scoreboard_text = scoreboard.read_text(encoding="utf-8")
+
+        self.assertEqual(payload, artifact)
+        self.assertEqual(artifact["diagnostic_kind"], "focused-cost")
+        self.assertEqual(artifact["command"], optimizer.conductor_command(root, "root", filter_value=filter_value))
+        self.assertFalse(artifact["primary_metric_eligible"])
+        self.assertEqual(artifact["source_guard"], {"kind": optimizer.SOURCE_GUARD_METADATA})
+        self.assertEqual(artifact["samples"][0]["queue_wait_seconds"], 0.5)
+        self.assertEqual(artifact["samples"][0]["total_execution_seconds"], 13.0)
+        self.assertEqual(artifact["samples"][0]["parsed_xctest_seconds"], 1.5)
+        self.assertEqual(artifact["samples"][0]["inferred_overhead_seconds"], 11.5)
+        self.assertEqual(artifact["samples"][0]["max_rss_bytes"], 42_000)
+        self.assertFalse(artifact["samples"][0]["source_changed"])
+        self.assertEqual(artifact["samples"][0]["invalid_reasons"], [])
+        self.assertIn("test exit 1", artifact["samples"][1]["invalid_reasons"])
+        self.assertIn("filtered baseline produced no parsed XCTest timings", artifact["samples"][1]["invalid_reasons"])
+        self.assertEqual(artifact["summary"]["valid_samples"], 1)
+        self.assertEqual(artifact["summary"]["median_total_execution_seconds"], 13.0)
+        self.assertEqual(artifact["summary"]["median_parsed_xctest_seconds"], 1.5)
+        self.assertEqual(artifact["summary"]["median_inferred_overhead_seconds"], 11.5)
+        self.assertEqual(artifact["summary"]["max_rss_bytes"], 42_000)
+        self.assertFalse(artifact["summary"]["reliable"])
+        self.assertTrue(artifact["summary"]["diagnostic_only"])
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "focused_cost_sample_start",
+                "focused_cost_sample_end",
+                "focused_cost_sample_start",
+                "focused_cost_sample_end",
+            ],
+        )
+        self.assertIn("Focused cost diagnostic", scoreboard_text)
+        self.assertIn("Primary metric eligible: no", scoreboard_text)
+        self.assertIn("unit-focused", scoreboard_text)
+        self.assertIn("Summary:", scoreboard_text)
+        self.assertIn("| Valid | Invalid | Median total execution seconds |", scoreboard_text)
+        self.assertIn("| 1 | 1 | 13.000 | 13.000 | 0.0000 | stable | 1.500 | 11.500 | 42000 | yes | no |", scoreboard_text)
+
+    def test_focused_cost_rejects_zero_valid_samples_without_writing_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "focused-cost.json"
+            scoreboard = root / "scoreboard.md"
+            runs = [
+                self.make_run(root, 1, exit_code=1, log_text=""),
+                self.make_run(root, 2, exit_code=2, log_text=""),
+            ]
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+            ) -> optimizer.ConductorRun:
+                self.assertEqual(repo_root, root)
+                self.assertEqual(target, "root")
+                self.assertFalse(list_mode)
+                self.assertEqual(filter_value, "RepoPromptTests.ExampleTests")
+                return runs.pop(0)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "c" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-03T00:00:00+00:00"),
+                self.assertRaisesRegex(optimizer.OptimizerError, "focused-cost produced no valid samples") as raised,
+            ):
+                optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value="RepoPromptTests.ExampleTests",
+                    samples_requested=2,
+                    label="zero-valid",
+                    scoreboard=scoreboard,
+                    output=output,
+                    progress_sink=None,
+                )
+
+            message = str(raised.exception)
+            self.assertIn("sample 1: test exit 1", message)
+            self.assertIn("filtered baseline produced no parsed XCTest timings", message)
+            self.assertIn("sample 2: test exit 2", message)
+            self.assertFalse(output.exists())
+            self.assertFalse(scoreboard.exists())
+
+    def test_focused_cost_requires_filter_and_positive_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(optimizer.OptimizerError, "--filter is required"):
+                optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value="",
+                    samples_requested=1,
+                    label="missing-filter",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "out.json",
+                    progress_sink=None,
+                )
+            with self.assertRaisesRegex(optimizer.OptimizerError, "--samples must be greater than zero"):
+                optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value="RepoPromptTests.ExampleTests",
+                    samples_requested=0,
+                    label="zero-samples",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "out.json",
+                    progress_sink=None,
+                )
+
+    def test_parser_exposes_focused_cost_options(self) -> None:
+        help_text = io.StringIO()
+        parser = optimizer.build_parser()
+        with contextlib.redirect_stdout(help_text), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(["focused-cost", "--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        text = help_text.getvalue()
+        for option in (
+            "--target",
+            "--filter",
+            "--samples",
+            "--label",
+            "--scoreboard",
+            "--output",
+            "--source-change-guard",
+        ):
+            self.assertIn(option, text)
+
+
 class CombinedBaselineTests(unittest.TestCase):
     def test_combine_baselines_marks_fewer_than_three_valid_samples_unreliable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

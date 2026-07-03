@@ -744,6 +744,132 @@ def sample_to_dict(sample: Sample) -> dict[str, Any]:
     }
 
 
+def parsed_xctest_seconds(sample: Sample) -> float | None:
+    if not sample.timings:
+        return None
+    return sum(timing.seconds for timing in sample.timings)
+
+
+def inferred_overhead_seconds(sample: Sample) -> float | None:
+    parsed_seconds = parsed_xctest_seconds(sample)
+    if sample.execution_seconds is None or parsed_seconds is None:
+        return None
+    return max(0.0, float(sample.execution_seconds) - parsed_seconds)
+
+
+def rss_bytes_from_value(value: Any, key: str) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric < 0:
+        return None
+    normalized = key.lower().replace("-", "_")
+    if normalized.endswith("_kb") or normalized.endswith("kb"):
+        numeric *= 1024
+    elif normalized.endswith("_mb") or normalized.endswith("mb"):
+        numeric *= 1024 * 1024
+    return int(numeric)
+
+
+def extract_max_rss_bytes(value: Any) -> int | None:
+    candidates: list[int] = []
+
+    def visit(node: Any, key: str = "") -> None:
+        if isinstance(node, dict):
+            for child_key, child_value in node.items():
+                visit(child_value, str(child_key))
+            return
+        if isinstance(node, list):
+            for child in node:
+                visit(child, key)
+            return
+        normalized = key.lower().replace("-", "_")
+        if "rss" not in normalized:
+            return
+        candidate = rss_bytes_from_value(node, normalized)
+        if candidate is not None:
+            candidates.append(candidate)
+
+    visit(value)
+    return max(candidates) if candidates else None
+
+
+def focused_cost_sample_to_dict(sample: Sample, run_result: dict[str, Any]) -> dict[str, Any]:
+    parsed_seconds = parsed_xctest_seconds(sample)
+    return {
+        "index": sample.index,
+        "target": sample.target,
+        "command": sample.command,
+        "process_exit_code": sample.process_exit_code,
+        "state": sample.state,
+        "exit_code": sample.exit_code,
+        "queue_wait_seconds": sample.queue_wait_seconds,
+        "total_execution_seconds": sample.execution_seconds,
+        "parsed_xctest_seconds": parsed_seconds,
+        "parsed_test_case_timings": len(sample.timings),
+        "inferred_overhead_seconds": inferred_overhead_seconds(sample),
+        "max_rss_bytes": extract_max_rss_bytes(run_result),
+        "timed_out": sample.timed_out,
+        "measurement_invalid": sample.measurement_invalid,
+        "diagnostic_paths": sample.diagnostic_paths,
+        "log_path": sample.log_path,
+        "valid": sample.valid,
+        "invalid_reasons": sample.invalid_reasons,
+        "source_guard_kind": sample.source_guard_kind,
+        "source_changed": sample.source_changed,
+    }
+
+
+def focused_cost_zero_valid_message(samples: Sequence[dict[str, Any]]) -> str:
+    details: list[str] = []
+    for sample in samples:
+        reasons = "; ".join(str(reason) for reason in sample.get("invalid_reasons") or [])
+        log_path = str(sample.get("log_path") or "")
+        detail = f"sample {sample.get('index')}: {reasons or 'invalid'}"
+        if log_path:
+            detail += f"; log={log_path}"
+        details.append(detail)
+    suffix = "; ".join(details[:5])
+    if len(details) > 5:
+        suffix += f"; ... {len(details) - 5} more"
+    return f"focused-cost produced no valid samples{': ' + suffix if suffix else ''}"
+
+
+def focused_cost_summary(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    valid = [sample for sample in samples if sample.get("valid")]
+    total_values = [float(sample["total_execution_seconds"]) for sample in valid if sample.get("total_execution_seconds") is not None]
+    if not total_values:
+        raise OptimizerError(focused_cost_zero_valid_message(samples))
+    parsed_values = [float(sample["parsed_xctest_seconds"]) for sample in valid if sample.get("parsed_xctest_seconds") is not None]
+    overhead_values = [
+        float(sample["inferred_overhead_seconds"])
+        for sample in valid
+        if sample.get("inferred_overhead_seconds") is not None
+    ]
+    rss_values = [int(sample["max_rss_bytes"]) for sample in valid if sample.get("max_rss_bytes") is not None]
+    rel_mad = relative_mad(total_values)
+    return {
+        "attempts": len(samples),
+        "valid_samples": len(valid),
+        "invalid_samples": len(samples) - len(valid),
+        "raw_total_execution_seconds": total_values,
+        "median_total_execution_seconds": statistics.median(total_values),
+        "observed_p95_total_execution_seconds": nearest_rank_p95(total_values),
+        "relative_mad_total_execution_seconds": rel_mad,
+        "noise_classification": noise_classification(rel_mad),
+        "raw_parsed_xctest_seconds": parsed_values,
+        "median_parsed_xctest_seconds": statistics.median(parsed_values) if parsed_values else None,
+        "raw_inferred_overhead_seconds": overhead_values,
+        "median_inferred_overhead_seconds": statistics.median(overhead_values) if overhead_values else None,
+        "max_rss_bytes": max(rss_values) if rss_values else None,
+        "reliable": False,
+        "diagnostic_only": True,
+    }
+
+
 def baseline_summary(samples: Sequence[Sample]) -> dict[str, Any]:
     valid = [sample for sample in samples if sample.valid and sample.execution_seconds is not None]
     values = [float(sample.execution_seconds) for sample in valid]
@@ -870,6 +996,67 @@ def ensure_scoreboard(path: Path) -> None:
 
 def format_seconds(value: float | None) -> str:
     return "" if value is None else f"{value:.3f}"
+
+
+def append_focused_cost_scoreboard(path: Path, payload: dict[str, Any]) -> None:
+    ensure_scoreboard(path)
+    source_guard = (payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT
+    lines = [
+        f"### Focused cost diagnostic: {payload['timestamp']} — {payload['target']} — {payload['label']}",
+        "",
+        f"Command: `{' '.join(payload['command'])}`",
+        f"Artifact: `{payload.get('artifact') or ''}`",
+        f"Filter: `{payload.get('filter') or ''}`",
+        f"Source-change guard: `{source_guard}`",
+        "Primary metric eligible: no",
+        "",
+        "| Sample | Valid | Total execution seconds | Parsed XCTest seconds | Inferred overhead seconds | Queue wait | Max RSS bytes | State | Exit | Log | Invalid reason |",
+        "|---:|---|---:|---:|---:|---:|---:|---|---:|---|---|",
+    ]
+    for sample in payload["samples"]:
+        reasons = "; ".join(sample["invalid_reasons"])
+        lines.append(
+            "| {index} | {valid} | {total} | {parsed} | {overhead} | {queue} | {rss} | {state} | {exit_code} | `{log}` | {reasons} |".format(
+                index=sample["index"],
+                valid="yes" if sample["valid"] else "no",
+                total=format_seconds(sample["total_execution_seconds"]),
+                parsed=format_seconds(sample["parsed_xctest_seconds"]),
+                overhead=format_seconds(sample["inferred_overhead_seconds"]),
+                queue=format_seconds(sample["queue_wait_seconds"]),
+                rss=sample["max_rss_bytes"] if sample["max_rss_bytes"] is not None else "",
+                state=sample["state"],
+                exit_code=sample["exit_code"],
+                log=sample["log_path"],
+                reasons=reasons,
+            )
+        )
+    summary = payload["summary"]
+    lines.extend(
+        [
+            "",
+            "Summary:",
+            "",
+            "| Valid | Invalid | Median total execution seconds | Observed p95 total execution seconds | Relative MAD | Noise | Median parsed XCTest seconds | Median inferred overhead seconds | Max RSS bytes | Diagnostic only | Primary metric eligible |",
+            "|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|",
+            "| {valid} | {invalid} | {median_total} | {p95_total} | {mad} | {noise} | {median_parsed} | {median_overhead} | {rss} | {diagnostic} | {primary} |".format(
+                valid=summary["valid_samples"],
+                invalid=summary["invalid_samples"],
+                median_total=format_seconds(summary["median_total_execution_seconds"]),
+                p95_total=format_seconds(summary["observed_p95_total_execution_seconds"]),
+                mad="" if summary["relative_mad_total_execution_seconds"] is None else f"{summary['relative_mad_total_execution_seconds']:.4f}",
+                noise=summary["noise_classification"],
+                median_parsed=format_seconds(summary["median_parsed_xctest_seconds"]),
+                median_overhead=format_seconds(summary["median_inferred_overhead_seconds"]),
+                rss=summary["max_rss_bytes"] if summary["max_rss_bytes"] is not None else "",
+                diagnostic="yes" if summary.get("diagnostic_only") else "no",
+                primary="yes" if payload.get("primary_metric_eligible") else "no",
+            ),
+            "",
+        ]
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
 
 
 def append_baseline_scoreboard(
@@ -1265,6 +1452,98 @@ def baseline(
     return payload
 
 
+def focused_cost(
+    repo_root: Path,
+    target: str,
+    filter_value: str,
+    samples_requested: int,
+    label: str,
+    scoreboard: Path,
+    output: Path,
+    source_change_guard: str = SOURCE_GUARD_CONTENT,
+    progress_sink: ProgressSink | None = emit_progress_event,
+) -> dict[str, Any]:
+    if samples_requested <= 0:
+        raise OptimizerError("--samples must be greater than zero")
+    if not filter_value:
+        raise OptimizerError("--filter is required for focused-cost diagnostics")
+    samples: list[dict[str, Any]] = []
+    command = conductor_command(repo_root, target, filter_value=filter_value)
+    for index in range(1, samples_requested + 1):
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "focused_cost_sample_start",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "command": command,
+                    "ticket": None,
+                    "log_path": None,
+                }
+            )
+        before = measurement_source_guard_fingerprint(repo_root, source_change_guard)
+        run = run_conductor(repo_root, target, list_mode=False, filter_value=filter_value)
+        after = measurement_source_guard_fingerprint(repo_root, source_change_guard)
+        sample = sample_from_run(
+            index,
+            target,
+            run,
+            source_changed=before != after,
+            source_guard_kind=source_change_guard,
+            require_timings=True,
+        )
+        sample_payload = focused_cost_sample_to_dict(sample, run.result)
+        samples.append(sample_payload)
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "focused_cost_sample_end",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "ticket": run.ticket,
+                    "log_path": sample.log_path or None,
+                    "process_exit_code": sample.process_exit_code,
+                    "state": sample.state,
+                    "exit_code": sample.exit_code,
+                    "total_execution_seconds": sample.execution_seconds,
+                    "parsed_xctest_seconds": sample_payload["parsed_xctest_seconds"],
+                    "inferred_overhead_seconds": sample_payload["inferred_overhead_seconds"],
+                    "max_rss_bytes": sample_payload["max_rss_bytes"],
+                    "measurement_invalid": sample.measurement_invalid,
+                    "source_changed": sample.source_changed,
+                    "valid": sample.valid,
+                    "invalid_reasons": sample.invalid_reasons,
+                }
+            )
+    payload = {
+        "timestamp": utc_now(),
+        "diagnostic_kind": "focused-cost",
+        "target": target,
+        "label": label,
+        "artifact": str(output),
+        "scope": "filtered",
+        "filter": filter_value,
+        "primary_metric_eligible": False,
+        "source_guard": {"kind": source_change_guard},
+        "command": command,
+        "git": git_metadata(repo_root),
+        "samples": samples,
+        "summary": focused_cost_summary(samples),
+    }
+    write_json_new(output, payload)
+    append_focused_cost_scoreboard(scoreboard, payload)
+    return payload
+
+
+
 def load_counts(path: Path | None) -> dict[str, int] | None:
     if path is None:
         return None
@@ -1451,6 +1730,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="run a coordinated build before each test sample and record build/test cost separately",
     )
 
+    focused_cost_parser = subparsers.add_parser(
+        "focused-cost",
+        help="collect filtered compile/link/runtime overhead diagnostics without primary metric eligibility",
+    )
+    focused_cost_parser.add_argument("--target", choices=["root", "provider"], required=True)
+    focused_cost_parser.add_argument("--filter", required=True, help="XCTest filter for the focused diagnostic run")
+    focused_cost_parser.add_argument("--samples", type=int, required=True)
+    focused_cost_parser.add_argument("--label", required=True)
+    focused_cost_parser.add_argument("--scoreboard", type=Path, required=True)
+    focused_cost_parser.add_argument("--output", type=Path, required=True)
+    focused_cost_parser.add_argument(
+        "--source-change-guard",
+        choices=[SOURCE_GUARD_CONTENT, SOURCE_GUARD_METADATA],
+        default=SOURCE_GUARD_CONTENT,
+        help="source mutation guard used before/after each sample",
+    )
+
     combine_parser = subparsers.add_parser("combine-baselines", help="combine append-only baseline artifacts")
     combine_parser.add_argument("--input", action="append", type=Path, required=True)
     combine_parser.add_argument("--output", type=Path, required=True)
@@ -1495,6 +1791,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 filter_value=args.filter,
                 test_product=args.test_product,
                 build_before_samples=args.build_before_samples,
+            )
+        elif args.command == "focused-cost":
+            payload = focused_cost(
+                repo_root=repo_root,
+                target=args.target,
+                filter_value=args.filter,
+                samples_requested=args.samples,
+                label=args.label,
+                scoreboard=args.scoreboard,
+                output=args.output,
+                source_change_guard=args.source_change_guard,
             )
         elif args.command == "combine-baselines":
             payload = combine_baselines(args.input, args.top)
