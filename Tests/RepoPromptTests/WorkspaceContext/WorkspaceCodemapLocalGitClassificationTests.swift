@@ -294,33 +294,28 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         gitPreflightCount: AsyncCounter,
         root: URL,
         file: WorkspaceFileRecord,
-        timeout: TimeInterval = 15
+        timeout: Duration = .seconds(15)
     ) async throws -> WorkspaceCodemapArtifactDemandReady {
-        let result: WorkspaceCodemapArtifactDemandResult
-        if case let .pending(ticket) = initial {
-            do {
-                try await AsyncTestWait.waitUntil(
-                    "codemap demand to settle after Git layout conversion",
-                    timeout: timeout,
-                    maximumDelayNanoseconds: 50_000_000
-                ) {
-                    let current = await store.codemapArtifactDemandStatus(ticket)
-                    guard case .pending = current else { return true }
-                    return false
+        var result = initial
+        if case let .pending(ticket) = result {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var delayNanoseconds: UInt64 = 1_000_000
+            while true {
+                result = await store.codemapArtifactDemandStatus(ticket)
+                guard case .pending = result else { break }
+                guard clock.now < deadline else {
+                    let preflightCount = await gitPreflightCount.value
+                    XCTFail(
+                        "Timed out waiting for ready codemap demand after Git layout conversion; " +
+                            "lastDemand=\(result), gitPreflightCount=\(preflightCount), " +
+                            "root=\(root.path), fileID=\(file.id)"
+                    )
+                    throw LocalGitClassificationTestError.expectedReady
                 }
-            } catch {
-                let current = await store.codemapArtifactDemandStatus(ticket)
-                let preflightCount = await gitPreflightCount.value
-                XCTFail(
-                    "Timed out waiting for ready codemap demand after Git layout conversion; " +
-                        "lastDemand=\(current), gitPreflightCount=\(preflightCount), " +
-                        "root=\(root.path), fileID=\(file.id)"
-                )
-                throw error
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+                delayNanoseconds = min(delayNanoseconds * 2, 50_000_000)
             }
-            result = await store.codemapArtifactDemandStatus(ticket)
-        } else {
-            result = initial
         }
 
         guard case let .ready(ready) = result else {
