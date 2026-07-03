@@ -260,6 +260,11 @@ extension MCPServerViewModel {
     }
 
     enum SelectionReplyAssembler {
+        private static let codemapPresentationPolicy = WorkspaceCodemapPresentationRequestPolicy(
+            maximumReadinessRounds: 1,
+            maximumTotalWait: .zero
+        )
+
         struct SelectedEntry {
             let entry: ResolvedPromptFileEntry
             var ranges: [LineRange]? {
@@ -789,7 +794,10 @@ extension MCPServerViewModel {
                 rootScope: rootScope,
                 profile: .uiAssisted
             )
-            return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+            return try await WorkspaceCodemapPresentationCoordinator(
+                store: store,
+                policy: codemapPresentationPolicy
+            ).withPresentation(
                 for: plan.intent,
                 rootScope: rootScope,
                 logicalRootDisplayNamesByRootID: rootDisplayNames
@@ -1561,18 +1569,29 @@ extension MCPServerViewModel {
         let lookupContext: WorkspaceLookupContext
 
         func build(
-            for files: [WorkspaceFileRecord],
+            for collections: SelectionReplyAssembler.SelectionCollections
+        ) async -> ToolResultDTOs.SelectedCodeStructureDTO? {
+            await build(
+                rendering: collections.selected.map(\.file) + collections.codemap.map(\.file),
+                diagnostics: SelectionReplyAssembler.codemapDiagnosticFiles(for: collections),
+                presentation: collections.codemapPresentation
+            )
+        }
+
+        private func build(
+            rendering renderingFiles: [WorkspaceFileRecord],
+            diagnostics diagnosticFiles: [WorkspaceFileRecord],
             presentation: WorkspaceCodemapOperationPresentation
         ) async -> ToolResultDTOs.SelectedCodeStructureDTO? {
-            guard !files.isEmpty else { return nil }
+            guard !renderingFiles.isEmpty || !diagnosticFiles.isEmpty else { return nil }
             let disabled = await MainActor.run { owner.promptVM.codeMapsGloballyDisabled }
             guard !disabled else { return nil }
 
-            let fileIDs = Set(files.map(\.id))
+            let fileIDs = Set(renderingFiles.map(\.id))
             let rendered = presentation.orderedEntries.filter { fileIDs.contains($0.fileID) }
             let included = Array(rendered.prefix(25))
             let diagnostics = await SelectionReplyAssembler.missingCodemapDiagnostics(
-                for: files,
+                for: diagnosticFiles,
                 presentation: presentation
             ) { file in
                 if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(

@@ -85,7 +85,13 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         XCTAssertEqual(diagnostics.unmappedPaths, ["README.txt"])
     }
 
-    func testAutoModeOnlyDiagnosesRequestedCodemapFiles() async {
+    func testWorkspaceContextCodeStructureUsesUsageAwareAutoDiagnostics() async throws {
+        let root = try makeTemporaryRoot(name: "WorkspaceCodeDiagnostics")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let tabID = UUID()
+        let (window, _) = await makeWindow(root: root, tabID: tabID, selection: StoredSelection())
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
         let selectedFile = makeFileRecord(relativePath: "Sources/Selected.swift")
         let requestedCodemapFile = makeFileRecord(relativePath: "Sources/Requested.swift")
         let selectedEntry = MCPServerViewModel.SelectionReplyAssembler.SelectedEntry(
@@ -102,25 +108,21 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             selected: [selectedEntry],
             codemap: [],
             requestedCodemapFiles: [requestedCodemapFile],
-            codemapAutoEnabled: false,
+            codemapAutoEnabled: true,
             codeMapUsage: .auto,
             invalid: [],
             codemapPresentation: presentation
         )
 
-        let diagnosticFiles = MCPServerViewModel.SelectionReplyAssembler.codemapDiagnosticFiles(
-            for: collections
+        let builder = MCPServerViewModel.CodeStructureBuilder(
+            owner: window.mcpServer,
+            lookupContext: .visibleWorkspace
         )
-        XCTAssertEqual(diagnosticFiles.map(\.id), [requestedCodemapFile.id])
+        let maybeDTO = await builder.build(for: collections)
+        let dto = try XCTUnwrap(maybeDTO)
 
-        let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
-            for: diagnosticFiles,
-            presentation: presentation
-        ) { file in
-            file.standardizedRelativePath
-        }
-        XCTAssertEqual(diagnostics.pendingPaths, ["Sources/Requested.swift"])
-        XCTAssertEqual(diagnostics.unmappedPaths, [])
+        XCTAssertEqual(dto.pendingPaths, ["Sources/Requested.swift"])
+        XCTAssertNil(dto.unmappedPaths)
     }
 
     func testTerminalCodemapDispositionOverridesPendingRegardlessOfIssueOrder() async {
@@ -745,7 +747,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             firstLogicalRoot.appendingPathComponent(firstRelativePath).path,
             secondLogicalRoot.appendingPathComponent(secondRelativePath).path
         ])
-        let (window, workspaceID) = await makeWindow(
+        let (window, _) = await makeWindow(
             roots: [firstLogicalRoot, secondLogicalRoot],
             tabID: tabID,
             selection: logicalSelection
@@ -932,7 +934,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let selection = StoredSelection(selectedPaths: [fileURL.path])
             let (window, workspaceID) = await makeWindow(root: root, tabID: tabID, selection: selection)
             defer { WindowStatesManager.shared.unregisterWindowState(window) }
-            let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
                 in: window,
                 path: root.path
             )
@@ -1005,15 +1007,15 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             XCTAssertEqual(resolvedFirstReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedFirstReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedFirstReply.tokenAccounting?.refreshPending == true)
-            XCTAssertTrue(resolvedFirstReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+            XCTAssertFalse(resolvedFirstReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(resolvedSecondReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedSecondReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedSecondReply.tokenAccounting?.refreshPending == true)
-            XCTAssertTrue(resolvedSecondReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+            XCTAssertFalse(resolvedSecondReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(resolvedWorkspaceReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedWorkspaceReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedWorkspaceReply.tokenAccounting?.refreshPending == true)
-            XCTAssertTrue(resolvedWorkspaceReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+            XCTAssertFalse(resolvedWorkspaceReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(window.mcpServer.virtualTokenRefreshStartCountForTesting(), baselineStarts + 1)
             let refreshStartCount = await refreshGate.startCount()
             // Identical bound selection and workspace token requests share one signature,
@@ -1022,6 +1024,67 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
 
             await refreshGate.release()
             window.mcpServer.setBeforeVirtualTokenRefreshForTesting(nil)
+        }
+
+        func testBoundReplyUsesPublishedFileTokensWhileCodemapPresentationIsPending() async throws {
+            let root = try makeTemporaryRoot(name: "BoundPublishedPendingCodemap")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let source = root.appendingPathComponent("Source.swift")
+            let target = root.appendingPathComponent("Target.swift")
+            try write("struct SourceForPublishedTokens { func selected() {} }\n", to: source)
+            try write("struct TargetForPendingCodemap { func related() {} }\n", to: target)
+
+            let tabID = UUID()
+            let selection = StoredSelection(
+                selectedPaths: [source.path],
+                codemapAutoEnabled: true
+            )
+            let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: root.path
+            )
+            await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
+            let targetRecordCandidate = await window.promptManager.workspaceFileContextStore.file(
+                rootID: loadedRoot.id,
+                relativePath: "Target.swift"
+            )
+            let targetRecord = try XCTUnwrap(targetRecordCandidate)
+            let rootEpoch = makeRootEpoch(rootID: targetRecord.rootID)
+            let issue = WorkspaceCodemapOperationIssue.automatic(.pending([
+                .candidateDemand(
+                    rootEpoch: rootEpoch,
+                    fileID: targetRecord.id,
+                    ticket: makeCodemapTicket(fileID: targetRecord.id, rootID: targetRecord.rootID)
+                )
+            ]))
+            let presentation = WorkspaceCodemapOperationPresentation(
+                orderedEntries: [],
+                coverage: .pending([issue]),
+                issues: [issue],
+                publicationReceipt: nil
+            )
+            let baselineStarts = window.mcpServer.virtualTokenRefreshStartCountForTesting()
+
+            let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+                codemapPresentation: presentation,
+                from: selection,
+                includeBlocks: false,
+                display: .full,
+                lookupContext: .visibleWorkspace
+            )
+
+            XCTAssertEqual(reply.files?.map(\.path), [source.path])
+            XCTAssertGreaterThan(reply.totalTokens ?? 0, 0)
+            XCTAssertEqual(reply.summary?.fullCount, 1)
+            XCTAssertGreaterThan(reply.summary?.fullTokens ?? 0, 0)
+            XCTAssertEqual(reply.tokenAccounting?.source, "bound_tab_cached_state")
+            XCTAssertEqual(reply.tokenAccounting?.status, "incomplete")
+            XCTAssertTrue(reply.tokenAccounting?.refreshPending == false)
+            XCTAssertFalse(reply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+            XCTAssertTrue(reply.tokenAccounting?.incompleteComponents?.contains("codemap_presentation") == true)
+            XCTAssertEqual(window.mcpServer.virtualTokenRefreshStartCountForTesting(), baselineStarts)
         }
 
         func testBoundMCPTokenRefreshesForDistinctSignaturesDoNotCancelEachOther() async throws {
@@ -1638,10 +1701,13 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             in: window,
             path: workspaceRoot.path
         )
-        _ = try await window.workspaceFileContextStore.loadRoot(
+        let loadedSessionWorktreeRoot = try await window.workspaceFileContextStore.loadRoot(
             path: worktreeRoot.path,
             kind: .sessionWorktree
         )
+        addTeardownBlock {
+            await window.workspaceFileContextStore.unloadRoot(id: loadedSessionWorktreeRoot.id)
+        }
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: nil,
             clientName: "selection-reply-compatibility-test",

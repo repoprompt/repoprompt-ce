@@ -373,6 +373,7 @@ final class MCPServerViewModel: ObservableObject {
         let signature: MCPVirtualTokenSignature
         let entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult]
         let breakdown: TokenComponentBreakdown
+        let incompleteComponents: [String]?
     }
 
     var mcpVirtualTokenSnapshotsByTabID: [UUID: [MCPVirtualTokenSignature: MCPVirtualTokenSnapshot]] = [:]
