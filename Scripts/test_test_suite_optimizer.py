@@ -312,8 +312,213 @@ class SourceAndLedgerTests(unittest.TestCase):
 
         self.assertEqual(locations[tests[0].method_id].file, "Tests/RepoPromptTests/MCP/ExampleTests.swift")
         self.assertEqual(rows[0]["domain"], "MCP")
+        self.assertEqual(rows[0]["execution_tier"], "routine")
         self.assertEqual(rows[0]["scenario_count"], "1")
         self.assertEqual(rows[0]["current_disposition"], "retain_pending_review")
+
+    def write_ledger(self, path: Path, rows: list[dict[str, str]]) -> None:
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=optimizer.LEDGER_COLUMNS,
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for partial in rows:
+                row = {column: "" for column in optimizer.LEDGER_COLUMNS}
+                row.update(partial)
+                if not row.get("execution_tier"):
+                    row["execution_tier"] = "routine"
+                writer.writerow(row)
+
+    def test_read_ledger_rows_rejects_unknown_execution_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "execution_tier": "sometimes",
+                }],
+            )
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "unsupported execution_tier"):
+                optimizer.read_ledger_rows(ledger)
+
+    def test_impacted_tests_selects_test_file_smoke_floor_and_skips_heavy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                        "target": "root",
+                        "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                        "suite": "RepoPromptTests.ExampleTests",
+                        "method": "testOne",
+                        "domain": "MCP",
+                        "layer": "root_swiftpm",
+                        "execution_tier": "routine",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.SmokeTests/testSmoke",
+                        "target": "root",
+                        "file": "Tests/RepoPromptTests/SmokeTests.swift",
+                        "suite": "RepoPromptTests.SmokeTests",
+                        "method": "testSmoke",
+                        "domain": "Root",
+                        "layer": "root_swiftpm",
+                        "execution_tier": "fast",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.ScaleTests/testScale",
+                        "target": "root",
+                        "file": "Tests/RepoPromptTests/MCP/ScaleTests.swift",
+                        "suite": "RepoPromptTests.ScaleTests",
+                        "method": "testScale",
+                        "domain": "MCP",
+                        "layer": "root_swiftpm",
+                        "execution_tier": "scale",
+                    },
+                ],
+            )
+
+            with mock.patch.object(
+                optimizer,
+                "changed_files_for_range",
+                return_value=[
+                    "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "Sources/RepoPrompt/Infrastructure/MCP/Router.swift",
+                ],
+            ):
+                payload = optimizer.impacted_tests(
+                    root,
+                    ledger,
+                    "origin/main...HEAD",
+                    smoke_floor_suites=["RepoPromptTests.SmokeTests"],
+                    validate_live_list=False,
+                )
+
+        self.assertFalse(payload["full_root_required"])
+        self.assertEqual(payload["selected_count"], 2)
+        self.assertEqual(
+            [entry["method_id"] for entry in payload["selected"]],
+            [
+                "root/RepoPromptTests.ExampleTests/testOne",
+                "root/RepoPromptTests.SmokeTests/testSmoke",
+            ],
+        )
+        self.assertEqual(payload["skipped_heavy_or_opt_in"][0]["method_id"], "root/RepoPromptTests.ScaleTests/testScale")
+        self.assertIn(r"RepoPromptTests\.ExampleTests/testOne", payload["filter"])
+
+    def test_impacted_tests_uses_full_root_for_broad_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "execution_tier": "routine",
+                }],
+            )
+
+            with mock.patch.object(optimizer, "changed_files_for_range", return_value=["Package.swift"]):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD", validate_live_list=False)
+
+        self.assertTrue(payload["full_root_required"])
+        self.assertIsNone(payload["filter"])
+
+    def test_impacted_tests_validates_against_live_root_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\n",
+                ticket="list-ticket",
+            )
+
+            with (
+                mock.patch.object(optimizer, "run_conductor", return_value=run),
+                mock.patch.object(
+                    optimizer,
+                    "changed_files_for_range",
+                    return_value=["Tests/RepoPromptTests/MCP/ExampleTests.swift"],
+                ),
+            ):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD")
+
+        self.assertEqual(payload["live_root_test_count"], 1)
+        self.assertEqual(payload["list_log_path"], "/tmp/root-list.log")
+        self.assertEqual(payload["selected_count"], 1)
+
+    def test_shard_root_tests_balances_by_runtime_and_excludes_heavy_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.A/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.A",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "9",
+                        "shared_state_tags": "TempDirectory",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.B/testTwo",
+                        "target": "root",
+                        "suite": "RepoPromptTests.B",
+                        "method": "testTwo",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "1",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.C/testScale",
+                        "target": "root",
+                        "suite": "RepoPromptTests.C",
+                        "method": "testScale",
+                        "execution_tier": "scale",
+                        "runtime_seconds": "100",
+                    },
+                ],
+            )
+
+            payload = optimizer.shard_root_tests(ledger, 2)
+
+        self.assertEqual(payload["shard_count"], 2)
+        self.assertEqual(sum(shard["method_count"] for shard in payload["shards"]), 2)
+        self.assertNotIn("RepoPromptTests.C/testScale", json.dumps(payload))
+        self.assertIn("shared_state_tag_counts", payload["shards"][0])
+        self.assertIn("parallelization_warning", payload)
 
     def test_source_mapping_supports_multiple_root_test_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -395,7 +600,13 @@ class SourceAndLedgerTests(unittest.TestCase):
                     ),
                 ]:
                     row = {column: "" for column in optimizer.LEDGER_COLUMNS}
-                    row.update({"method_id": method_id, "target": target, "suite": suite, "method": method})
+                    row.update({
+                        "method_id": method_id,
+                        "target": target,
+                        "suite": suite,
+                        "method": method,
+                        "execution_tier": "routine" if target == "root" else "fast",
+                    })
                     writer.writerow(row)
             runs = {
                 "root": optimizer.ConductorRun(

@@ -31,6 +31,26 @@ make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTes
 
 Use the narrowest relevant filter, then broaden only for the affected boundary.
 
+### Impacted local feedback lane
+
+For ordinary iteration, prefer the impacted lane over a full root run:
+
+```bash
+make dev-test-impacted RANGE=origin/main...HEAD
+```
+
+This calls `Scripts/test_suite_optimizer.py impacted` with the curated ledger, obtains changed files from `git diff --name-only`, prints exact selected XCTest IDs with reasons, includes a small smoke-floor suite set, reports heavy/opt-in tests skipped by `execution_tier`, and then invokes conductor with an exact XCTest filter. The selector is conservative: broad build/tooling/package/ledger boundaries report `full_root_required=true` instead of pretending a narrow subset is sufficient. Set `INCLUDE_HEAVY=1` only when intentionally running selected `codemap_e2e`, `scale`, `diagnostic`, `live_smoke`, or `release` rows and after setting any required environment gate.
+
+Full root `make dev-test` remains the explicit PR-ready/full local lane, nightly/merge/release lane, or fallback for broad changes. Do not use a green impacted run as evidence that broad package, build graph, conductor, ledger-schema, or generated-workspace changes are fully validated.
+
+For planning the remaining full root lane, generate runtime-balanced shards from ledger timing metadata:
+
+```bash
+make dev-test-shard-plan SHARDS=4
+```
+
+Shard plans use estimated `runtime_seconds`, not method count. Rows with heavy/opt-in tiers are excluded unless `INCLUDE_HEAVY=1` is supplied, and tests with shared-state tags still need isolation review before parallel execution.
+
 ### Codemap-sensitive changes
 
 Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
@@ -88,7 +108,18 @@ Treat these strings as exact, case-sensitive identifiers.
 
 Every executable add, rename, consolidation, or removal requires an atomic, surgical update to `Scripts/Fixtures/test-suite-contract-ledger.tsv`. Never regenerate or overwrite the curated ledger. In particular, do not point `inventory --force` at it.
 
-The TSV header order is fixed. Every live row carries identity/location fields (`method_id`, `target`, `file`, `suite`, `method`, `domain`, `layer`), contract fields (`primary_contract_id`, `secondary_contract_tags`, `validation_class`, `scenario_count`, `fixture_ids`, `observable_oracle`, `failure_risk`), cost/ownership fields (`runtime_seconds`, `resource_cost_tags`, `shared_state_tags`, `lifecycle_owner`), and disposition fields (`current_disposition`, `replacement_method_id`, `preserved_scenario_delta`, `notes`).
+The TSV header order is fixed. Every live row carries identity/location fields (`method_id`, `target`, `file`, `suite`, `method`, `domain`, `layer`, `execution_tier`), contract fields (`primary_contract_id`, `secondary_contract_tags`, `validation_class`, `scenario_count`, `fixture_ids`, `observable_oracle`, `failure_risk`), cost/ownership fields (`runtime_seconds`, `resource_cost_tags`, `shared_state_tags`, `lifecycle_owner`), and disposition fields (`current_disposition`, `replacement_method_id`, `preserved_scenario_delta`, `notes`).
+
+`execution_tier` is one of:
+
+- `fast` — cheap deterministic checks suitable for every impacted run;
+- `routine` — ordinary root SwiftPM checks selected by changed files/domains plus the smoke floor;
+- `integration` — higher-cost in-process integration checks, selected when directly impacted or explicitly requested;
+- `codemap_e2e` — strict codemap generation/ready-state coverage that requires the local codemap E2E opt-in gate;
+- `scale` — 100K/million or otherwise high-cardinality contracts that require explicit scale env gates;
+- `diagnostic` — benchmark, report-only, wake-probe, or investigative checks, never routine timing evidence;
+- `live_smoke` — packaged/running-app smoke coverage;
+- `release` — release/signing/artifact-sensitive validation.
 
 For every new or touched row:
 

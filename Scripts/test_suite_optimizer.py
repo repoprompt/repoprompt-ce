@@ -29,6 +29,7 @@ LEDGER_COLUMNS = [
     "secondary_contract_tags",
     "validation_class",
     "layer",
+    "execution_tier",
     "scenario_count",
     "fixture_ids",
     "observable_oracle",
@@ -42,6 +43,31 @@ LEDGER_COLUMNS = [
     "preserved_scenario_delta",
     "notes",
 ]
+TEST_EXECUTION_TIERS = {
+    "fast",
+    "routine",
+    "integration",
+    "codemap_e2e",
+    "scale",
+    "diagnostic",
+    "live_smoke",
+    "release",
+}
+HEAVY_TEST_EXECUTION_TIERS = {"codemap_e2e", "scale", "diagnostic", "live_smoke", "release"}
+DEFAULT_SMOKE_FLOOR_SUITES = [
+    "RepoPromptTests.CodeMapArtifactKeyTests",
+    "RepoPromptTests.CodexIntegrationConfigurationTests",
+    "RepoPromptTests.WorkspaceFileContextStoreTests",
+]
+BROAD_IMPACT_PATH_PREFIXES = (
+    ".github/",
+    "Package.swift",
+    "Package.resolved",
+    "Makefile",
+    "Scripts/conductor.py",
+    "Scripts/test_suite_optimizer.py",
+    "Scripts/Fixtures/test-suite-contract-ledger.tsv",
+)
 
 LISTED_TEST_RE = re.compile(
     r"^(?P<suite>[A-Za-z_][A-Za-z0-9_.]*)/(?P<method>test[A-Za-z0-9_]+)$"
@@ -94,6 +120,21 @@ class TestCaseTiming:
     method: str
     status: str
     seconds: float
+
+
+@dataclasses.dataclass(frozen=True)
+class LedgerTest:
+    method_id: str
+    target: str
+    file: str
+    suite: str
+    method: str
+    domain: str
+    layer: str
+    execution_tier: str
+    runtime_seconds: float | None
+    resource_cost_tags: frozenset[str]
+    shared_state_tags: frozenset[str]
 
 
 @dataclasses.dataclass
@@ -451,6 +492,7 @@ def ledger_rows(
                 "secondary_contract_tags": "",
                 "validation_class": "unreviewed",
                 "layer": "root_swiftpm" if test.target == "root" else "provider_package",
+                "execution_tier": "routine" if test.target == "root" else "fast",
                 "scenario_count": "1",
                 "fixture_ids": "",
                 "observable_oracle": "unreviewed",
@@ -479,14 +521,279 @@ def write_tsv(path: Path, rows: Sequence[dict[str, str]], force: bool = False) -
 
 
 def read_ledger_ids(path: Path) -> list[str]:
+    return [row.method_id for row in read_ledger_rows(path)]
+
+
+def split_tags(value: str) -> frozenset[str]:
+    return frozenset(tag.strip() for tag in re.split(r"[,; ]+", value or "") if tag.strip())
+
+
+def parse_runtime_seconds(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise OptimizerError(f"invalid runtime_seconds value: {value!r}") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise OptimizerError(f"invalid runtime_seconds value: {value!r}")
+    return seconds
+
+
+def read_ledger_rows(path: Path) -> list[LedgerTest]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         if reader.fieldnames != LEDGER_COLUMNS:
             raise OptimizerError("ledger columns do not match the required schema")
-        ids = [str(row.get("method_id") or "") for row in reader]
+        rows = [
+            LedgerTest(
+                method_id=str(row.get("method_id") or ""),
+                target=str(row.get("target") or ""),
+                file=str(row.get("file") or ""),
+                suite=str(row.get("suite") or ""),
+                method=str(row.get("method") or ""),
+                domain=str(row.get("domain") or ""),
+                layer=str(row.get("layer") or ""),
+                execution_tier=str(row.get("execution_tier") or ""),
+                runtime_seconds=parse_runtime_seconds(str(row.get("runtime_seconds") or "")),
+                resource_cost_tags=split_tags(str(row.get("resource_cost_tags") or "")),
+                shared_state_tags=split_tags(str(row.get("shared_state_tags") or "")),
+            )
+            for row in reader
+        ]
+    ids = [row.method_id for row in rows]
     if len(ids) != len(set(ids)):
         raise OptimizerError("ledger contains duplicate method_id rows")
-    return ids
+    invalid_tiers = sorted({row.execution_tier for row in rows if row.execution_tier not in TEST_EXECUTION_TIERS})
+    if invalid_tiers:
+        raise OptimizerError(f"ledger contains unsupported execution_tier values: {invalid_tiers}")
+    return rows
+
+
+def source_domains_for_changed_path(path: str) -> set[str]:
+    parts = Path(path).parts
+    if len(parts) >= 4 and parts[0] == "Sources" and parts[1] == "RepoPrompt":
+        if parts[2] == "Features":
+            feature = parts[3]
+            if feature == "AgentMode":
+                return {"AgentMode", "MCP", "ContextBuilder"}
+            if feature == "CodeMap":
+                return {"CodeMap", "WorkspaceContext/CodeMap", "WorkspaceContext"}
+            if feature == "ContextBuilder":
+                return {"ContextBuilder", "AgentMode", "MCP"}
+            if feature == "WorkspaceFiles":
+                return {"WorkspaceContext", "FileSystem", "Services"}
+            if feature == "Workspaces":
+                return {"Workspaces", "WorkspaceContext"}
+            return {feature}
+        if parts[2] == "Infrastructure" and len(parts) >= 4:
+            area = parts[3]
+            if area == "MCP":
+                return {"MCP", "AgentMode"}
+            if area == "VCS":
+                return {"VCS", "Services/VCS", "MCP"}
+            if area == "FileSystem":
+                return {"FileSystem", "Services", "WorkspaceContext"}
+            if area == "WorkspaceContext":
+                return {"WorkspaceContext", "WorkspaceContext/CodeMap", "CodeMap"}
+            return {area, "Services"}
+        if parts[2] == "App":
+            return {"App", "Root"}
+    if len(parts) >= 2 and parts[0] == "Sources" and parts[1] in {"RepoPromptMCP", "RepoPromptShared"}:
+        return {"MCP"}
+    if len(parts) >= 2 and parts[0] == "Sources" and parts[1] == "TreeSitterScannerSupport":
+        return {"CodeMap", "WorkspaceContext/CodeMap"}
+    if len(parts) >= 3 and parts[0] == "Packages" and parts[1] == "RepoPromptAgentProviders":
+        return {"Provider/Runtime", "Provider/SDK"}
+    return set()
+
+
+def changed_files_for_range(repo_root: Path, range_spec: str) -> list[str]:
+    completed = run_command(
+        ["git", "diff", "--name-only", "--diff-filter=ACMRT", range_spec, "--"],
+        repo_root,
+    )
+    if completed.returncode != 0:
+        raise OptimizerError(f"git diff failed for {range_spec}: {completed.stderr.strip()}")
+    return sorted(path for path in completed.stdout.splitlines() if path)
+
+
+def listed_root_test_ids(repo_root: Path) -> tuple[set[str], str]:
+    run = run_conductor(repo_root, "root", list_mode=True)
+    if (
+        run.process_exit_code != 0
+        or run.result.get("state") != "completed"
+        or run.result.get("exitCode") != 0
+    ):
+        raise OptimizerError(
+            f"root test list failed: process_exit={run.process_exit_code} "
+            f"state={run.result.get('state')} exit={run.result.get('exitCode')} "
+            f"ticket={run.ticket} log={run.result.get('logPath')} stderr={run.stderr[-500:]}"
+        )
+    if not run.log_text:
+        raise OptimizerError(f"root test list log missing or empty: {run.result.get('logPath')}")
+    return {test.method_id for test in parse_test_list(run.log_text, "root")}, str(run.result.get("logPath") or "")
+
+
+def exact_xctest_filter(method_ids: Sequence[str]) -> str:
+    if not method_ids:
+        raise OptimizerError("cannot build an XCTest filter without selected methods")
+    return "^(?:" + "|".join(re.escape(method_id.split("/", 1)[1]) for method_id in sorted(method_ids)) + ")$"
+
+
+def impacted_tests(
+    repo_root: Path,
+    ledger: Path,
+    range_spec: str,
+    include_heavy: bool = False,
+    smoke_floor_suites: Sequence[str] = DEFAULT_SMOKE_FLOOR_SUITES,
+    run_selected: bool = False,
+    validate_live_list: bool = True,
+) -> dict[str, Any]:
+    rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
+    live_ids: set[str] | None = None
+    list_log_path: str | None = None
+    if validate_live_list:
+        live_ids, list_log_path = listed_root_test_ids(repo_root)
+        ledger_ids = {row.method_id for row in rows}
+        stale = sorted(ledger_ids - live_ids)
+        if stale:
+            raise OptimizerError(
+                f"ledger contains {len(stale)} root rows absent from live dev-test-list; "
+                f"examples={stale[:5]} list_log={list_log_path}"
+            )
+    changed = changed_files_for_range(repo_root, range_spec)
+    selected: dict[str, set[str]] = defaultdict(set)
+    skipped: dict[str, set[str]] = defaultdict(set)
+    broad_reasons: list[str] = []
+    domains: set[str] = set()
+    files = set(changed)
+    for path in changed:
+        if path.startswith(BROAD_IMPACT_PATH_PREFIXES):
+            broad_reasons.append(f"{path}: broad test/build/tooling boundary")
+        if path.startswith("Tests/RepoPromptTests/") and path.endswith(".swift"):
+            for row in rows:
+                if row.file == path:
+                    selected[row.method_id].add(f"{path}: changed test file")
+        for domain in source_domains_for_changed_path(path):
+            domains.add(domain)
+    if broad_reasons:
+        full_count = len(rows)
+        return {
+            "range": range_spec,
+            "changed_files": changed,
+            "list_log_path": list_log_path,
+            "live_root_test_count": len(live_ids) if live_ids is not None else None,
+            "selection_mode": "full_root_required",
+            "full_root_required": True,
+            "full_root_reasons": broad_reasons,
+            "selected": [],
+            "selected_count": full_count,
+            "filter": None,
+            "smoke_floor_suites": list(smoke_floor_suites),
+            "skipped_heavy_or_opt_in": [],
+            "command": [str(repo_root / "conductor"), "test"],
+            "run": None,
+        }
+    for row in rows:
+        if row.suite in smoke_floor_suites:
+            selected[row.method_id].add(f"smoke floor suite {row.suite}")
+        if row.domain in domains or any(row.domain.startswith(f"{domain}/") for domain in domains):
+            selected[row.method_id].add(f"domain impacted by changed sources: {row.domain}")
+        if row.file in files:
+            selected[row.method_id].add(f"{row.file}: changed ledger test file")
+    selected_rows = {row.method_id: row for row in rows if row.method_id in selected}
+    for method_id, row in list(selected_rows.items()):
+        if row.execution_tier in HEAVY_TEST_EXECUTION_TIERS and not include_heavy:
+            skipped[method_id].update(selected.pop(method_id))
+            skipped[method_id].add(f"execution_tier={row.execution_tier} requires explicit opt-in")
+    selected_ids = sorted(selected)
+    filter_value = exact_xctest_filter(selected_ids) if selected_ids else None
+    run_payload: dict[str, Any] | None = None
+    if run_selected and filter_value:
+        run = run_conductor(repo_root, "root", filter_value=filter_value)
+        run_payload = {
+            "command": run.command,
+            "process_exit_code": run.process_exit_code,
+            "state": run.result.get("state"),
+            "exit_code": run.result.get("exitCode"),
+            "ticket": run.ticket,
+            "log_path": run.result.get("logPath"),
+        }
+    return {
+        "range": range_spec,
+        "changed_files": changed,
+        "list_log_path": list_log_path,
+        "live_root_test_count": len(live_ids) if live_ids is not None else None,
+        "selection_mode": "impacted",
+        "full_root_required": False,
+        "impacted_domains": sorted(domains),
+        "smoke_floor_suites": list(smoke_floor_suites),
+        "selected_count": len(selected_ids),
+        "selected": [
+            {
+                "method_id": method_id,
+                "suite": selected_rows[method_id].suite,
+                "execution_tier": selected_rows[method_id].execution_tier,
+                "reasons": sorted(selected[method_id]),
+            }
+            for method_id in selected_ids
+        ],
+        "filter": filter_value,
+        "command": conductor_command(repo_root, "root", filter_value=filter_value) if filter_value else None,
+        "skipped_heavy_or_opt_in": [
+            {
+                "method_id": method_id,
+                "suite": next(row.suite for row in rows if row.method_id == method_id),
+                "execution_tier": next(row.execution_tier for row in rows if row.method_id == method_id),
+                "reasons": sorted(reasons),
+            }
+            for method_id, reasons in sorted(skipped.items())
+        ],
+        "run": run_payload,
+    }
+
+
+def shard_root_tests(ledger: Path, shard_count: int, include_heavy: bool = False) -> dict[str, Any]:
+    if shard_count <= 0:
+        raise OptimizerError("--shards must be greater than zero")
+    rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
+    if not include_heavy:
+        rows = [row for row in rows if row.execution_tier not in HEAVY_TEST_EXECUTION_TIERS]
+    shards: list[dict[str, Any]] = [
+        {"index": index + 1, "estimated_seconds": 0.0, "method_ids": []}
+        for index in range(shard_count)
+    ]
+    for row in sorted(rows, key=lambda item: (-(item.runtime_seconds or 1.0), item.method_id)):
+        shard = min(shards, key=lambda item: (item["estimated_seconds"], item["index"]))
+        weight = row.runtime_seconds or 1.0
+        shard["estimated_seconds"] += weight
+        shard["method_ids"].append(row.method_id)
+    for shard in shards:
+        shard["method_count"] = len(shard["method_ids"])
+        shard["filter"] = exact_xctest_filter(shard["method_ids"]) if shard["method_ids"] else None
+        shard["command"] = (
+            conductor_command(repo_root_from_script(), "root", filter_value=shard["filter"])
+            if shard["filter"]
+            else None
+        )
+        shard_rows = [row for row in rows if row.method_id in set(shard["method_ids"])]
+        shared_tags: dict[str, int] = defaultdict(int)
+        for row in shard_rows:
+            for tag in row.shared_state_tags:
+                shared_tags[tag] += 1
+        shard["shared_state_tag_counts"] = dict(sorted(shared_tags.items()))
+    return {
+        "target": "root",
+        "shard_count": shard_count,
+        "include_heavy": include_heavy,
+        "excluded_heavy_tiers": sorted(HEAVY_TEST_EXECUTION_TIERS if not include_heavy else []),
+        "parallelization_warning": (
+            "Shard filters are weighted by historical runtime; review shared_state_tag_counts "
+            "before running shards concurrently."
+        ),
+        "shards": shards,
+    }
 
 
 def git_metadata(repo_root: Path) -> dict[str, str]:
@@ -1760,6 +2067,42 @@ def build_parser() -> argparse.ArgumentParser:
     rank_parser.add_argument("--log", action="append", type=Path, required=True)
     rank_parser.add_argument("--top", type=int, default=20)
 
+    impacted_parser = subparsers.add_parser(
+        "impacted",
+        help="select and optionally run impacted root XCTest methods from git diff and the contract ledger",
+    )
+    impacted_parser.add_argument("--ledger", type=Path, required=True)
+    impacted_parser.add_argument("--range", dest="range_spec", default="HEAD", help="git diff range/spec")
+    impacted_parser.add_argument(
+        "--include-heavy",
+        action="store_true",
+        help="include codemap_e2e/scale/diagnostic/live/release tiers when selected",
+    )
+    impacted_parser.add_argument(
+        "--smoke-suite",
+        action="append",
+        default=[],
+        help="suite to always include; defaults to the repository smoke floor",
+    )
+    impacted_parser.add_argument(
+        "--run",
+        action="store_true",
+        help="run the selected exact filters through conductor after printing the plan",
+    )
+    impacted_parser.add_argument(
+        "--skip-live-list-validation",
+        action="store_true",
+        help="do not run conductor test --list before selecting impacted rows",
+    )
+
+    shard_parser = subparsers.add_parser(
+        "shard-plan",
+        help="partition root XCTest methods into weighted conductor filters",
+    )
+    shard_parser.add_argument("--ledger", type=Path, required=True)
+    shard_parser.add_argument("--shards", type=int, required=True)
+    shard_parser.add_argument("--include-heavy", action="store_true")
+
     verify_parser = subparsers.add_parser("verify-ledger", help="re-list tests and reconcile ledger rows")
     verify_parser.add_argument("--ledger", type=Path, required=True)
     verify_parser.add_argument(
@@ -1810,6 +2153,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = compare_baselines(args.before, args.after)
         elif args.command == "rank":
             payload = rank_logs(args.log, args.top)
+        elif args.command == "impacted":
+            smoke_floor = args.smoke_suite or DEFAULT_SMOKE_FLOOR_SUITES
+            payload = impacted_tests(
+                repo_root=repo_root,
+                ledger=args.ledger,
+                range_spec=args.range_spec,
+                include_heavy=args.include_heavy,
+                smoke_floor_suites=smoke_floor,
+                run_selected=args.run,
+                validate_live_list=not args.skip_live_list_validation,
+            )
+        elif args.command == "shard-plan":
+            payload = shard_root_tests(args.ledger, args.shards, include_heavy=args.include_heavy)
         elif args.command == "verify-ledger":
             payload = verify_ledger(repo_root, args.ledger, args.list_timeout_seconds)
         else:
