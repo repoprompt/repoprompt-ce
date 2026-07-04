@@ -26,7 +26,8 @@ enum KeyboardShortcutCatalog {
                     name: .toggleContextComposer
                 ),
                 .init(id: "agent-nav-current", title: "Show Agent Session Switcher", detail: "Jump between Agent sessions in the focused window.", name: .showCurrentWindowAgentNavigationHUD),
-                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD)
+                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD),
+                .init(id: "agent-model-picker", title: "Open Agent/Model picker", detail: "Open the model picker for the focused Agent session.", name: .showAgentModelPicker)
             ]
         ),
         KeyboardShortcutCatalogSection(

@@ -95,4 +95,8 @@ extension Notification.Name {
     /// ⌘1–⌘9 handlers before they fall through to regular compose-tab switching.
     /// userInfo: ["windowID": Int, "resultIndex": Int, "handledRequest": AgentNavigationHUDHandledRequest]
     static let selectAgentNavigationHUDResult = Notification.Name("selectAgentNavigationHUDResult")
+
+    /// Request that Agent Mode open the Agent/Model picker for the target window.
+    /// userInfo: ["windowID": Int]
+    static let showAgentModelPicker = Notification.Name("showAgentModelPicker")
 }
