@@ -101,7 +101,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Requested.swift": "struct Requested {}\n"]
+            files: ["Sources/Requested.swift": SwiftFixtureSource.emptyStruct("Requested")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -163,7 +163,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Requested.swift": "struct Requested {}\n"]
+            files: ["Sources/Requested.swift": SwiftFixtureSource.emptyStruct("Requested")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -441,7 +441,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
             named: "repository",
             files: [
                 "README.md": "# Foreground fairness\n",
-                "Sources/Foreground.swift": "struct Foreground {}\n"
+                "Sources/Foreground.swift": SwiftFixtureSource.emptyStruct("Foreground")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -520,7 +520,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+            files: ["Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -596,7 +596,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+            files: ["Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -685,7 +685,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Oversize.swift": "struct Oversize {}\n"]
+            files: ["Sources/Oversize.swift": SwiftFixtureSource.emptyStruct("Oversize")]
         )
         let buildCounter = EngineAsyncCounter()
         let runtime = try CodeMapArtifactRuntime(
@@ -747,7 +747,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let path = "Sources/Oversize.swift"
         let root = try repository.makeRepository(
             named: "repository",
-            files: [path: "struct Oversize {}\n"]
+            files: [path: SwiftFixtureSource.emptyStruct("Oversize")]
         )
         try repository.write("struct Oversize { let dirty = true }\n", to: path, at: root)
         let buildCounter = EngineAsyncCounter()
@@ -810,9 +810,9 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Preload.swift": "struct Preload {}\n",
-                "Sources/Foreground.swift": "struct Foreground {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Preload.swift": SwiftFixtureSource.emptyStruct("Preload"),
+                "Sources/Foreground.swift": SwiftFixtureSource.emptyStruct("Foreground"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let gate = EngineMultiEntryGate()
@@ -938,8 +938,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Preload.swift": "struct Preload {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Preload.swift": SwiftFixtureSource.emptyStruct("Preload"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let gate = EngineMultiEntryGate()
@@ -1021,8 +1021,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Preload.swift": "struct Preload {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Preload.swift": SwiftFixtureSource.emptyStruct("Preload"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let gate = EngineMultiEntryGate()
@@ -1109,8 +1109,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let canonical = try repository.makeRepository(
             named: "canonical",
             files: [
-                "Sources/Unchanged.swift": "struct Unchanged {}\n",
-                "Sources/Changed.swift": "struct Changed {}\n"
+                "Sources/Unchanged.swift": SwiftFixtureSource.emptyStruct("Unchanged"),
+                "Sources/Changed.swift": SwiftFixtureSource.emptyStruct("Changed")
             ]
         )
         let linked = try repository.makeLinkedWorktree(
@@ -1226,7 +1226,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let submoduleSource = try repository.makeRepository(
             named: "submodule-source",
-            files: ["Sources/Submodule.swift": "struct Submodule {}\n"]
+            files: ["Sources/Submodule.swift": SwiftFixtureSource.emptyStruct("Submodule")]
         )
         let root = try repository.makeRepository(
             named: "repository",
@@ -1236,7 +1236,7 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
                 "Sources/Conflict.swift": "struct Conflict { let value = 0 }\n",
                 "Sources/Assume.swift": "struct Assume { let value = 1 }\n",
                 "Sources/Skip.swift": "struct Skip { let value = 1 }\n",
-                "Sources/Real.swift": "struct Real {}\n"
+                "Sources/Real.swift": SwiftFixtureSource.emptyStruct("Real")
             ]
         )
         try FileManager.default.createSymbolicLink(

@@ -253,7 +253,7 @@ private enum WorkspaceCodemapCapabilityTestPool {
         )
         let root = try fixture.makeRepository(
             named: "repository",
-            files: ["Sources/Fixture.swift": "struct Fixture {}\n"],
+            files: ["Sources/Fixture.swift": SwiftFixtureSource.emptyStruct("Fixture")],
             objectFormat: objectFormat
         )
         let service = WorkspaceCodemapGitCapabilityService(

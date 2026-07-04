@@ -246,7 +246,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             let selectedURL = root.appendingPathComponent("Selected.swift")
             let targetURL = root.appendingPathComponent("Target.swift")
             try FileSystemTestSupport.write("let selected = true\n", to: selectedURL)
-            try FileSystemTestSupport.write("struct Target {}\n", to: targetURL)
+            try FileSystemTestSupport.write(SwiftFixtureSource.emptyStruct("Target"), to: targetURL)
 
             let store = WorkspaceFileContextStore()
             let rootRecord = try await store.loadRoot(path: root.path)
@@ -299,7 +299,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             _ = try await store.editFile(
                 rootID: rootRecord.id,
                 relativePath: "Target.swift",
-                newContent: "struct TargetV2 {}\n"
+                newContent: SwiftFixtureSource.emptyStruct("TargetV2")
             )
             await gate.release()
             let result = await resolveTask.value
@@ -333,7 +333,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let logicalRoot = try repositoryFixture.makeRepository(
             named: "prompt-revoked-logical",
-            files: ["Sources/App.swift": "struct LogicalPromptSentinel {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("LogicalPromptSentinel")]
         )
         let worktreeRoot = try repositoryFixture.makeRepository(
             named: "prompt-revoked-worktree",
@@ -421,7 +421,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
             let root = try repositoryFixture.makeRepository(
                 named: "repository",
-                files: ["Sources/App.swift": "struct CancelledPromptSentinel {}\n"]
+                files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CancelledPromptSentinel")]
             )
             addTeardownBlock { repositoryFixture.cleanup() }
             let store = WorkspaceFileContextStore()

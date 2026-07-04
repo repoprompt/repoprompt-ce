@@ -12,8 +12,8 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
             await fixture.shutdown()
         }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Zeta.swift": "struct Zeta {}\n",
-            "Sources/Alpha.swift": "struct Alpha {}\n",
+            "Sources/Zeta.swift": SwiftFixtureSource.emptyStruct("Zeta"),
+            "Sources/Alpha.swift": SwiftFixtureSource.emptyStruct("Alpha"),
             "Sources/Unsupported.txt": "unsupported\n",
             "Sources/Beta.py": "class Beta:\n    pass\n"
         ])
@@ -203,7 +203,7 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         _ = try await store.editFile(
             rootID: loaded.id,
             relativePath: alpha.standardizedRelativePath,
-            newContent: "struct AlphaChanged {}\n"
+            newContent: SwiftFixtureSource.emptyStruct("AlphaChanged")
         )
 
         let staleToken = await catalog.revalidateProjectionCatalogToken(
@@ -540,7 +540,7 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Stale.swift": "struct Stale {}\n"]
+            files: ["Sources/Stale.swift": SwiftFixtureSource.emptyStruct("Stale")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         addTeardownBlock {
@@ -586,8 +586,8 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Two.swift": "struct Two {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two")
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function)
@@ -655,11 +655,11 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let allowedRootURL = try repositoryFixture.makeRepository(
             named: "allowed",
-            files: ["Sources/Allowed.swift": "struct Allowed {}\n"]
+            files: ["Sources/Allowed.swift": SwiftFixtureSource.emptyStruct("Allowed")]
         )
         let outsideRootURL = try repositoryFixture.makeRepository(
             named: "outside",
-            files: ["Sources/Outside.swift": "struct Outside {}\n"]
+            files: ["Sources/Outside.swift": SwiftFixtureSource.emptyStruct("Outside")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         addTeardownBlock {
@@ -1031,7 +1031,7 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let resolutionGate = CodemapResolutionGate()
         let waiterGate = CodemapSuspensionGate()
@@ -1165,7 +1165,7 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let resolutionGate = CodemapResolutionGate()
         let fixture = try CodemapStoreFixture(name: #function, resolutionGate: resolutionGate)

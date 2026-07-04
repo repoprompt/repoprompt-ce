@@ -9,11 +9,11 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let firstRoot = try repositoryFixture.makeRepository(
             named: "first",
-            files: ["Sources/First.swift": "struct First {}\n"]
+            files: ["Sources/First.swift": SwiftFixtureSource.emptyStruct("First")]
         )
         let secondRoot = try repositoryFixture.makeRepository(
             named: "second",
-            files: ["Sources/Second.swift": "struct Second {}\n"]
+            files: ["Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -107,7 +107,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         )
 
         let plainRoot = try fixture.makePlainRoot(files: [
-            "Sources/Plain.swift": "struct Plain {}\n"
+            "Sources/Plain.swift": SwiftFixtureSource.emptyStruct("Plain")
         ])
         let plainLoaded = try await store.loadRoot(path: plainRoot.path)
         let plainFiles = await store.files(inRoot: plainLoaded.id)
@@ -145,17 +145,17 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let cancellationRoot = try repositoryFixture.makeRepository(
             named: "cancellation",
             files: [
-                "Sources/First.swift": "struct First {}\n",
-                "Sources/Second.swift": "struct Second {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")
             ]
         )
         let catalogRoot = try repositoryFixture.makeRepository(
             named: "catalog",
-            files: ["Sources/Catalog.swift": "struct Catalog {}\n"]
+            files: ["Sources/Catalog.swift": SwiftFixtureSource.emptyStruct("Catalog")]
         )
         let unloadRoot = try repositoryFixture.makeRepository(
             named: "unload",
-            files: ["Sources/Unload.swift": "struct Unload {}\n"]
+            files: ["Sources/Unload.swift": SwiftFixtureSource.emptyStruct("Unload")]
         )
         let cancellationGate = CodemapSuspensionGate()
         let fixture = try CodemapStoreFixture(name: #function)
@@ -247,7 +247,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         )
 
         try Self.write(
-            "struct Added {}\n",
+            SwiftFixtureSource.emptyStruct("Added"),
             to: catalogRoot.appendingPathComponent("Sources/Added.swift")
         )
         _ = await store.ensureIndexedFiles(paths: [
@@ -291,8 +291,8 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/First.swift": "struct First {}\n",
-                "Sources/Second.swift": "struct Second {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -355,7 +355,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -397,7 +397,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Target {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Target")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -480,7 +480,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let resolutionGate = CodemapResolutionGate()
         let fixture = try CodemapStoreFixture(
@@ -695,7 +695,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -751,7 +751,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let manifestFailureCount = CodemapLockedCounter()
         let fixture = try CodemapStoreFixture(
@@ -800,8 +800,8 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
     func testProjectionManifestFailureRecoveredByLaterBatchPublishesAllMarkers() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let repositoryFiles = [
-            "File000.swift": "struct Target000 {}\n",
-            "File010.swift": "struct Target010 {}\n"
+            "File000.swift": SwiftFixtureSource.emptyStruct("Target000"),
+            "File010.swift": SwiftFixtureSource.emptyStruct("Target010")
         ]
         let root = try repositoryFixture.makeRepository(
             named: "repository",
@@ -912,8 +912,8 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Changed.swift": "struct Changed {}\n",
-                "Sources/Stable.swift": "struct Stable {}\n"
+                "Sources/Changed.swift": SwiftFixtureSource.emptyStruct("Changed"),
+                "Sources/Stable.swift": SwiftFixtureSource.emptyStruct("Stable")
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
@@ -963,11 +963,11 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let firstRootURL = try repositoryFixture.makeRepository(
             named: "first",
-            files: ["Sources/First.swift": "struct First {}\n"]
+            files: ["Sources/First.swift": SwiftFixtureSource.emptyStruct("First")]
         )
         let secondRootURL = try repositoryFixture.makeRepository(
             named: "second",
-            files: ["Sources/Second.swift": "struct Second {}\n"]
+            files: ["Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
         addTeardownBlock {
@@ -1050,8 +1050,8 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n",
-                "Sources/Pending.swift": "struct Pending {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target"),
+                "Sources/Pending.swift": SwiftFixtureSource.emptyStruct("Pending")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -1166,7 +1166,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         _ = try await readyResult(settledResult(store: store, ticket: pendingTicket))
 
         try Self.write(
-            "struct CatalogAdvance {}\n",
+            SwiftFixtureSource.emptyStruct("CatalogAdvance"),
             to: root.appendingPathComponent("Sources/CatalogAdvance.swift")
         )
         _ = await store.ensureIndexedFiles(paths: [
@@ -1186,7 +1186,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -1342,7 +1342,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let secondRoot = try secondRepository.makeRepository(
             named: "same-name",
             files: [
-                "Sources/SharedDefinition.swift": "struct SharedDefinition {}\n"
+                "Sources/SharedDefinition.swift": SwiftFixtureSource.emptyStruct("SharedDefinition")
             ]
         )
         XCTAssertEqual(firstRoot.lastPathComponent, secondRoot.lastPathComponent)
@@ -1607,7 +1607,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/First.swift": "struct First {}\n",
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
                 "Sources/Second.swift": "struct Second { let first: First }\n"
             ]
         )
@@ -1764,12 +1764,12 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let blockerRoot = try repositoryFixture.makeRepository(
             named: "blocker",
-            files: ["Sources/Blocker.swift": "struct Blocker {}\n"]
+            files: ["Sources/Blocker.swift": SwiftFixtureSource.emptyStruct("Blocker")]
         )
         let selectionRoot = try repositoryFixture.makeRepository(
             named: "selection",
             files: [
-                "Sources/First.swift": "struct First {}\n",
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
                 "Sources/Second.swift": "struct Second { let first: First }\n"
             ]
         )
@@ -1870,7 +1870,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         )
         addTeardownBlock { await fixture.shutdown() }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let graphProbe = CodemapSelectionGraphProbe()
         let preflightCount = CodemapLockedCounter()
@@ -1920,7 +1920,7 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let fixture = try CodemapStoreFixture(name: #function)
         addTeardownBlock { await fixture.shutdown() }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore(codemapGitEligibilityProbe: .production())
         _ = try await store.loadRoot(path: root.path)

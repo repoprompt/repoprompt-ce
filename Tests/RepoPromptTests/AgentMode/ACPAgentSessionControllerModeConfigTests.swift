@@ -5,16 +5,6 @@ import Foundation
 import XCTest
 
 final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
-    private var temporaryURLs: [URL] = []
-
-    override func tearDown() {
-        for url in temporaryURLs {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryURLs.removeAll()
-        super.tearDown()
-    }
-
     func testSessionOpenRoutesInjectMCPAndUseModernModeConfiguration() async throws {
         let cases = [
             SessionOpenRouteCase(
@@ -999,7 +989,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     /// phase acknowledgements to `ACP_SYNC_EVENTS_PATH` when it receives requests or
     /// blocks on a named release barrier. Release barriers are owner-only FIFOs; the
     /// child opens the FIFO for reading and Swift writes one byte to release it.
-    /// The XCTest fixture owns cleanup through `temporaryURLs`, while this object
+    /// The XCTest fixture owns cleanup through per-allocation teardown blocks, while this object
     /// owns the file-event source used to wake Swift waiters without sleep polling.
     private final class ACPFixtureSync: @unchecked Sendable {
         enum ReleaseGate: String, CaseIterable {
@@ -1286,11 +1276,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ACPAgentSessionControllerModeConfigTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryURLs.append(url)
-        return url
+        try makeTestDirectory(name: "ACPAgentSessionControllerModeConfigTests")
     }
 
     private func makeFakeACPServerScript() throws -> URL {

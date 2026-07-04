@@ -9,9 +9,9 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/AlreadyCancelled.swift": "struct AlreadyCancelled {}\n",
-                "Sources/Active.swift": "struct Active {}\n",
-                "Sources/Queued.swift": "struct Queued {}\n"
+                "Sources/AlreadyCancelled.swift": SwiftFixtureSource.emptyStruct("AlreadyCancelled"),
+                "Sources/Active.swift": SwiftFixtureSource.emptyStruct("Active"),
+                "Sources/Queued.swift": SwiftFixtureSource.emptyStruct("Queued")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -132,7 +132,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Fenced.swift": "struct Fenced {}\n"]
+            files: ["Sources/Fenced.swift": SwiftFixtureSource.emptyStruct("Fenced")]
         )
         let fixture = try await makeEngineFixture(
             root: root,
@@ -179,7 +179,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Fenced.swift": "struct Fenced {}\n"]
+            files: ["Sources/Fenced.swift": SwiftFixtureSource.emptyStruct("Fenced")]
         )
         let fixture = try await makeEngineFixture(
             root: root,
@@ -221,8 +221,8 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Failure.swift": "struct Failure {}\n",
-                "Sources/Recovery.swift": "struct Recovery {}\n"
+                "Sources/Failure.swift": SwiftFixtureSource.emptyStruct("Failure"),
+                "Sources/Recovery.swift": SwiftFixtureSource.emptyStruct("Recovery")
             ]
         )
         let fault = EngineManifestFaultOnce()
@@ -338,11 +338,11 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let firstRoot = try repository.makeRepository(
             named: "one",
-            files: ["One.swift": "struct One {}\n"]
+            files: ["One.swift": SwiftFixtureSource.emptyStruct("One")]
         )
         let secondRoot = try repository.makeRepository(
             named: "two",
-            files: ["Two.swift": "struct Two {}\n"]
+            files: ["Two.swift": SwiftFixtureSource.emptyStruct("Two")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -377,7 +377,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Saturating.swift": "struct Saturating {}\n"]
+            files: ["Sources/Saturating.swift": SwiftFixtureSource.emptyStruct("Saturating")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -401,11 +401,11 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let firstRoot = try repository.makeRepository(
             named: "one",
-            files: ["One.swift": "struct One {}\n"]
+            files: ["One.swift": SwiftFixtureSource.emptyStruct("One")]
         )
         let secondRoot = try repository.makeRepository(
             named: "two",
-            files: ["Two.swift": "struct Two {}\n"]
+            files: ["Two.swift": SwiftFixtureSource.emptyStruct("Two")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
@@ -446,7 +446,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Fenced.swift": "struct Fenced {}\n"]
+            files: ["Sources/Fenced.swift": SwiftFixtureSource.emptyStruct("Fenced")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -504,7 +504,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Root.swift": "struct Root {}\n"]
+            files: ["Sources/Root.swift": SwiftFixtureSource.emptyStruct("Root")]
         )
         let gate = EngineFirstResolutionGate()
         let fixture = try await makeEngineFixture(
@@ -560,8 +560,8 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Dirty.swift": "struct Dirty {}\n",
-                "Sources/Queued.swift": "struct Queued {}\n"
+                "Sources/Dirty.swift": SwiftFixtureSource.emptyStruct("Dirty"),
+                "Sources/Queued.swift": SwiftFixtureSource.emptyStruct("Queued")
             ]
         )
         let readGate = EngineBuildGate()
@@ -629,7 +629,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Failure.swift": "struct Failure {}\n"]
+            files: ["Sources/Failure.swift": SwiftFixtureSource.emptyStruct("Failure")]
         )
         try repository.write(
             "struct Failure { let dirty = true }\n",
@@ -666,7 +666,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Race.swift": "struct Race {}\n"]
+            files: ["Sources/Race.swift": SwiftFixtureSource.emptyStruct("Race")]
         )
         let buildGate = EngineBuildGate()
         let runtime = try CodeMapArtifactRuntime(
@@ -705,8 +705,8 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Invalidated.swift": "struct Invalidated {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Invalidated.swift": SwiftFixtureSource.emptyStruct("Invalidated"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let sourceGate = EngineMultiEntryGate()
@@ -790,7 +790,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Unload.swift": "struct Unload {}\n"]
+            files: ["Sources/Unload.swift": SwiftFixtureSource.emptyStruct("Unload")]
         )
         let buildGate = EngineBuildGate()
         let fixture = try await makeEngineFixture(

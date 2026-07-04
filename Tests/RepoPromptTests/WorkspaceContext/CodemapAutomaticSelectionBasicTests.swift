@@ -10,7 +10,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -148,7 +148,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -235,8 +235,8 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "repository",
             files: [
                 "Sources/Source.swift": "protocol SourceProtocol { var target: Target { get } }\n",
-                "Sources/Target.swift": "struct Target {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -378,7 +378,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -492,7 +492,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -573,7 +573,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         let secondRoot = try secondRepository.makeRepository(
             named: "second",
             files: [
-                "Sources/ForeignDefinition.swift": "struct ForeignDefinition {}\n"
+                "Sources/ForeignDefinition.swift": SwiftFixtureSource.emptyStruct("ForeignDefinition")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -663,7 +663,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
                     func value() -> FirstTarget
                 }
                 """,
-                "Sources/Target.swift": "struct FirstTarget {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("FirstTarget")
             ]
         )
         let secondRoot = try secondRepository.makeRepository(
@@ -674,7 +674,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
                     func value() -> SecondTarget
                 }
                 """,
-                "Sources/Target.swift": "struct SecondTarget {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("SecondTarget")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -755,7 +755,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Pending.swift": "struct Pending {}\n"]
+            files: ["Sources/Pending.swift": SwiftFixtureSource.emptyStruct("Pending")]
         )
         let graphProbe = CodemapSelectionGraphProbe()
         addTeardownBlock {
@@ -820,7 +820,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         _ = try await settledResult(store: store, ticket: pending)
 
         let plainRoot = try fixture.makePlainRoot(files: [
-            "Sources/Unavailable.swift": "struct Unavailable {}\n"
+            "Sources/Unavailable.swift": SwiftFixtureSource.emptyStruct("Unavailable")
         ])
         let plainLoaded = try await store.loadRoot(path: plainRoot.path)
         let plainFiles = await store.files(inRoot: plainLoaded.id)
@@ -852,11 +852,11 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         let secondRepository = try ReviewGitRepositoryFixture(name: #function + "-second")
         let firstRoot = try firstRepository.makeRepository(
             named: "first",
-            files: ["Sources/First.swift": "struct First {}\n"]
+            files: ["Sources/First.swift": SwiftFixtureSource.emptyStruct("First")]
         )
         let secondRoot = try secondRepository.makeRepository(
             named: "second",
-            files: ["Sources/Second.swift": "struct Second {}\n"]
+            files: ["Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         let graphProbe = CodemapSelectionGraphProbe()
@@ -904,7 +904,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
                     func target() -> Target
                 }
                 """,
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -985,7 +985,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
                     func target() -> Target
                 }
                 """,
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -1079,7 +1079,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
@@ -1136,7 +1136,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "repository",
             files: [
                 "Sources/Ready.swift": "struct Ready { let missing: Missing }\n",
-                "Sources/Pending.swift": "struct Pending {}\n"
+                "Sources/Pending.swift": SwiftFixtureSource.emptyStruct("Pending")
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function)
@@ -1214,14 +1214,14 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "first",
             files: [
                 "Sources/Source.swift": "struct FirstSource { let target: FirstTarget }\n",
-                "Sources/Target.swift": "struct FirstTarget {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("FirstTarget")
             ]
         )
         let secondRoot = try secondRepository.makeRepository(
             named: "second",
             files: [
                 "Sources/Source.swift": "struct SecondSource { let target: SecondTarget }\n",
-                "Sources/Target.swift": "struct SecondTarget {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("SecondTarget")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -1337,14 +1337,14 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             named: "first",
             files: [
                 "Sources/Source.swift": "protocol FirstSource { var target: FirstTarget { get } }\n",
-                "Sources/Target.swift": "struct FirstTarget {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("FirstTarget")
             ]
         )
         let secondRootURL = try secondRepository.makeRepository(
             named: "second",
             files: [
                 "Sources/Source.swift": "protocol SecondSource { var target: SecondTarget { get } }\n",
-                "Sources/Target.swift": "struct SecondTarget {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("SecondTarget")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -1438,8 +1438,8 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
                     func second() -> SecondTarget
                 }
                 """,
-                "Sources/First.swift": "struct FirstTarget {}\n",
-                "Sources/Second.swift": "struct SecondTarget {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("FirstTarget"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("SecondTarget")
             ]
         )
         let fixture = try CodemapStoreFixture(

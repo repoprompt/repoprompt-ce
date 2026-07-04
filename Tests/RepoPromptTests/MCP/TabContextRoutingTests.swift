@@ -1354,7 +1354,7 @@ final class TabContextRoutingTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try "VERSION=1\n".write(to: versionFile, atomically: true, encoding: .utf8)
-        try "struct MCPBootstrapLease {}\n".write(to: bootstrapLease, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("MCPBootstrapLease").write(to: bootstrapLease, atomically: true, encoding: .utf8)
 
         let controllerTabID = UUID()
         let agentTabID = UUID()
@@ -1640,7 +1640,7 @@ final class TabContextRoutingTests: XCTestCase {
         let sources = root.appendingPathComponent("Sources", isDirectory: true)
         try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
         let selectedFile = sources.appendingPathComponent("App.swift")
-        try "struct App {}\n".write(to: selectedFile, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("App").write(to: selectedFile, atomically: true, encoding: .utf8)
 
         let activeTabID = UUID()
         let tabID = UUID()

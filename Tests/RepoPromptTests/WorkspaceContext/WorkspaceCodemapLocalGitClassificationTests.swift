@@ -267,7 +267,7 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
             at: file.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try "struct Feature {}\n".write(to: file, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("Feature").write(to: file, atomically: true, encoding: .utf8)
     }
 
     private func firstFile(

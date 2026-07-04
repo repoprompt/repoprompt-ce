@@ -12,7 +12,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
             await fixture.shutdown()
         }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore()
         let loaded = try await store.loadRoot(path: root.path)
@@ -28,7 +28,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
             .resolveManifestBinding(ticket.rootEpoch, file.standardizedRelativePath)
         XCTAssertEqual(routed?.identity.fileID, file.id)
 
-        try Self.write("struct Added {}\n", to: root.appendingPathComponent("Sources/Added.swift"))
+        try Self.write(SwiftFixtureSource.emptyStruct("Added"), to: root.appendingPathComponent("Sources/Added.swift"))
         let replayTask = Task {
             await store.ensureIndexedFiles(paths: [
                 root.appendingPathComponent("Sources/Added.swift").path
@@ -73,7 +73,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
         addTeardownBlock {
@@ -142,7 +142,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
             await fixture.shutdown()
         }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore()
         let firstRoot = try await store.loadRoot(path: root.path)
@@ -188,8 +188,8 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/First.swift": "struct First {}\n",
-                "Sources/Second.swift": "struct Second {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function)
@@ -258,7 +258,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -328,7 +328,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         addTeardownBlock {
@@ -371,7 +371,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -502,7 +502,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Old.swift": "struct Old {}\n",
+                "Sources/Old.swift": SwiftFixtureSource.emptyStruct("Old"),
                 "Sources/Unrelated.swift": "func unrelated() {}\n"
             ]
         )
@@ -585,9 +585,9 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Affected.swift": "struct Affected {}\n",
+                "Sources/Affected.swift": SwiftFixtureSource.emptyStruct("Affected"),
                 "Sources/Late.swift": "struct Late { let survivor: Survivor }\n",
-                "Sources/Survivor.swift": "struct Survivor {}\n"
+                "Sources/Survivor.swift": SwiftFixtureSource.emptyStruct("Survivor")
             ]
         )
         let fixture = try CodemapStoreFixture(

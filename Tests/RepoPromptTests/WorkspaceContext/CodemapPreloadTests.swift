@@ -9,7 +9,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         defer { try? FileManager.default.removeItem(at: sandbox) }
         let root = sandbox.appendingPathComponent("plain", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try Self.write("struct Feature {}\n", to: root.appendingPathComponent("Sources/Feature.swift"))
+        try Self.write(SwiftFixtureSource.emptyStruct("Feature"), to: root.appendingPathComponent("Sources/Feature.swift"))
 
         let providerInvocations = CodemapLockedCounter()
         let graphProbe = CodemapSelectionGraphProbe()
@@ -34,7 +34,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
 
         XCTAssertEqual(snapshot.files.map(\.standardizedRelativePath), ["Sources/Feature.swift"])
         XCTAssertEqual(searchResult.results.map(\.standardizedRelativePath), ["Sources/Feature.swift"])
-        XCTAssertEqual(content, "struct Feature {}\n")
+        XCTAssertEqual(content, SwiftFixtureSource.emptyStruct("Feature"))
         XCTAssertEqual(providerInvocations.value, 0)
         XCTAssertEqual(graphProbe.factoryCount, 0)
         await store.unloadRoot(id: loaded.id)
@@ -50,7 +50,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
             await fixture.shutdown()
         }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore()
         await store.setCodemapProjectionPreloadStartHandlerForTesting { rootEpoch in
@@ -70,7 +70,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         XCTAssertEqual(blockedEpoch.rootID, loaded.id)
         XCTAssertEqual(files.map(\.standardizedRelativePath), ["Sources/Feature.swift"])
         XCTAssertEqual(searchSnapshot.files.map(\.standardizedRelativePath), ["Sources/Feature.swift"])
-        XCTAssertEqual(contents, "struct Feature {}\n")
+        XCTAssertEqual(contents, SwiftFixtureSource.emptyStruct("Feature"))
         XCTAssertEqual(fixture.providerAccessCount.value, 0)
         let beforeStart = await store.codemapProjectionPreloadStoreEventsForTesting(rootID: loaded.id)
         XCTAssertEqual(beforeStart.map(\.kind), [
@@ -98,7 +98,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let fixture = try CodemapStoreFixture(name: #function)
         addTeardownBlock { await fixture.shutdown() }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let preflightCount = CodemapLockedCounter()
         let graphProbe = CodemapSelectionGraphProbe()
@@ -137,7 +137,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         let eligibilityGate = CodemapSuspensionGate()
@@ -189,7 +189,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let fixture = try CodemapStoreFixture(name: #function)
         addTeardownBlock { await fixture.shutdown() }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let preflightCount = CodemapLockedCounter()
         let store = fixture.makeStore(
@@ -273,7 +273,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
             await fixture.shutdown()
         }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .enabled)
         await store.setCodemapProjectionPreloadStartHandlerForTesting { rootEpoch in
@@ -307,7 +307,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
             await fixture.shutdown()
         }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore()
         let loaded = try await store.loadRoot(path: root.path)
@@ -458,7 +458,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
             sleep: { delay in try await sleepGate.sleep(delay) }
         )
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore(
             codemapGitEligibilityProbe: .init { _ in
@@ -525,7 +525,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
             sleep: { delay in try await sleepGate.sleep(delay) }
         )
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore(
             codemapGitEligibilityProbe: .init { _ in
@@ -550,7 +550,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         let clock = CodemapRetryTestClock(nowNanoseconds: 5000)
@@ -607,7 +607,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let preflightCount = CodemapLockedCounter()
         addTeardownBlock { await fixture.shutdown() }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore(
             codemapGitEligibilityProbe: .init { _ in
@@ -643,7 +643,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         XCTAssertTrue(restoredAfterFailedMove)
 
         let external = root.appendingPathComponent("Sources/External.swift")
-        try Self.write("struct External {}\n", to: external)
+        try Self.write(SwiftFixtureSource.emptyStruct("External"), to: external)
         let materialized = try await store.materializeExplicitlyRequestedFile(
             external.path,
             rootScope: .allLoaded
@@ -662,7 +662,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         _ = try await store.createFile(
             rootID: loaded.id,
             relativePath: "Sources/Created.swift",
-            content: "struct Created {}\n"
+            content: SwiftFixtureSource.emptyStruct("Created")
         )
         let createRescheduled = await waitForCodemapPreloadEventCount(
             store: store,
@@ -701,7 +701,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         let preflightCount = CodemapLockedCounter()
@@ -762,7 +762,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         let preflightCount = CodemapLockedCounter()
@@ -812,7 +812,7 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
             await fixture.shutdown()
         }
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Feature.swift": "struct Feature {}\n"
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
         ])
         let store = fixture.makeStore()
         let loaded = try await store.loadRoot(path: root.path)

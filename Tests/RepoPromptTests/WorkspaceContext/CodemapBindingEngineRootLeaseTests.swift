@@ -8,11 +8,11 @@ final class CodemapBindingEngineRootLeaseTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let firstRoot = try repository.makeRepository(
             named: "first",
-            files: ["Sources/A.swift": "struct A {}\n"]
+            files: ["Sources/A.swift": SwiftFixtureSource.emptyStruct("A")]
         )
         let secondRoot = try repository.makeRepository(
             named: "second",
-            files: ["Sources/B.swift": "struct B {}\n"]
+            files: ["Sources/B.swift": SwiftFixtureSource.emptyStruct("B")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
@@ -167,7 +167,7 @@ final class CodemapBindingEngineRootLeaseTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Unload.swift": "struct Unload {}\n"]
+            files: ["Sources/Unload.swift": SwiftFixtureSource.emptyStruct("Unload")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
@@ -231,7 +231,7 @@ final class CodemapBindingEngineRootLeaseTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Race.swift": "struct Race {}\n"]
+            files: ["Sources/Race.swift": SwiftFixtureSource.emptyStruct("Race")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)

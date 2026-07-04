@@ -9,7 +9,7 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
         let supportedCandidateCount = manifestAdoptionLimit + 1
         var repositoryFiles = [
             "Sources/Source.swift": "struct Source { let target: Target }\n",
-            "Sources/Target.swift": "struct Target {}\n"
+            "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
         ]
         let extraSupportedCandidateCount = supportedCandidateCount - repositoryFiles.count
         for index in 0 ..< extraSupportedCandidateCount {
@@ -90,7 +90,7 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
         let selectionQueryCount = CodemapLockedCounter()
         let repositoryFiles = [
             "Sources/Source.swift": "struct Source { let target: Target }\n",
-            "Sources/Target.swift": "struct Target {}\n"
+            "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
         ]
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         addTeardownBlock {
@@ -203,8 +203,8 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "protocol SourceProtocol { var first: FirstTarget { get }; var second: SecondTarget { get } }\n",
-                "Sources/First.swift": "struct FirstTarget {}\n",
-                "Sources/Second.swift": "struct SecondTarget {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("FirstTarget"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("SecondTarget")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -276,7 +276,7 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -350,7 +350,7 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
         )
         let secondRootURL = try secondRepository.makeRepository(
             named: "second",
-            files: ["Sources/Target.swift": "struct Target {}\n"]
+            files: ["Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -420,8 +420,8 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "protocol SourceProtocol { var target: Target { get } }\n",
-                "Sources/Target.swift": "struct Target {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -559,7 +559,7 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "protocol SourceProtocol { var target: Target { get } }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -658,8 +658,8 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "protocol SourceProtocol { var target: Target { get } }\n",
-                "Sources/Target.swift": "struct Target {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let fixture = try CodemapStoreFixture(

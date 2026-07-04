@@ -8,7 +8,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Shutdown.swift": "struct Shutdown {}\n"]
+            files: ["Sources/Shutdown.swift": SwiftFixtureSource.emptyStruct("Shutdown")]
         )
         let writeGate = EngineBlockingGate()
         let fixture = try await makeEngineFixture(
@@ -49,8 +49,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Two.swift": "struct Two {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two")
             ]
         )
         let writeGate = EngineBlockingGate()
@@ -92,8 +92,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/First.swift": "struct First {}\n",
-                "Sources/Second.swift": "struct Second {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")
             ]
         )
         let writerGate = EngineAsyncGate()
@@ -278,7 +278,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let writeGate = EngineBlockingGate()
         let runtime = try CodeMapArtifactRuntime(
@@ -315,8 +315,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/First.swift": "struct First {}\n",
-                "Sources/Second.swift": "struct Second {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")
             ]
         )
         let gate = EngineBuildGate()

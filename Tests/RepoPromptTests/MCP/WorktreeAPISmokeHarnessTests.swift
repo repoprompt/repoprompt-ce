@@ -173,7 +173,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
         let worktreeOnlyFile = URL(fileURLWithPath: worktreePath)
             .appendingPathComponent("WorktreeOnly.swift")
-        try "struct WorktreeOnly {}\n".write(to: worktreeOnlyFile, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("WorktreeOnly").write(to: worktreeOnlyFile, atomically: true, encoding: .utf8)
 
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)

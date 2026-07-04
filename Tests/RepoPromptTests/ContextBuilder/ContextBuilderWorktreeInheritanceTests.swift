@@ -46,7 +46,7 @@ import XCTest
                         to: worktreeFile
                     )
                     try write(
-                        "struct BranchOnlyContextBuilderType {}\n",
+                        SwiftFixtureSource.emptyStruct("BranchOnlyContextBuilderType"),
                         to: worktreeRoot.appendingPathComponent("Sources/BranchOnly.swift")
                     )
 
@@ -518,7 +518,7 @@ import XCTest
                     )
                     let logicalBranchOnly = logicalRoot.appendingPathComponent("Sources/DeferredOnly.swift")
                     let worktreeBranchOnly = worktreeRoot.appendingPathComponent("Sources/DeferredOnly.swift")
-                    try write("struct DeferredOnlyAgentRoute {}\n", to: worktreeBranchOnly)
+                    try write(SwiftFixtureSource.emptyStruct("DeferredOnlyAgentRoute"), to: worktreeBranchOnly)
                     XCTAssertFalse(FileManager.default.fileExists(atPath: logicalBranchOnly.path))
 
                     let selectionIdentity = WorkspaceSelectionIdentity(

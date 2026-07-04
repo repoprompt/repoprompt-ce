@@ -21,7 +21,7 @@ import XCTest
             let folderURL = rootURL.appendingPathComponent("Sources", isDirectory: true)
             let fileURL = folderURL.appendingPathComponent("A.swift")
             try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-            try "struct A {}".write(to: fileURL, atomically: true, encoding: .utf8)
+            try SwiftFixtureSource.emptyStruct("A", trailingNewline: false).write(to: fileURL, atomically: true, encoding: .utf8)
 
             let folderID = UUID()
             let fileID = UUID()

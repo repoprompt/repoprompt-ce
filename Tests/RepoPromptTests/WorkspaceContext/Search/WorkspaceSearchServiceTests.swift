@@ -2,16 +2,6 @@
 import XCTest
 
 final class WorkspaceSearchServiceTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testSearchCatalogGenerationChangesOnRootLoadDeltaAndUnload() async throws {
         let root = try makeTemporaryRoot(name: "CatalogGeneration")
         try write("alpha", to: root.appendingPathComponent("A.swift"))
@@ -374,12 +364,7 @@ final class WorkspaceSearchServiceTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

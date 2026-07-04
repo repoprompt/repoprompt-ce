@@ -8,7 +8,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Clean.swift": "struct Clean {}\n"]
+            files: ["Sources/Clean.swift": SwiftFixtureSource.emptyStruct("Clean")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -65,7 +65,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+            files: ["Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
@@ -189,7 +189,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+            files: ["Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let runtime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
@@ -221,7 +221,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+            files: ["Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -376,8 +376,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Warm.swift": "struct Warm {}\n",
-                "Sources/Background.swift": "struct Background {}\n"
+                "Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm"),
+                "Sources/Background.swift": SwiftFixtureSource.emptyStruct("Background")
             ]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -431,7 +431,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+            files: ["Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let runtime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
@@ -474,9 +474,9 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Warm.swift": "struct Warm {}\n",
-                "Sources/Trigger.swift": "struct Trigger {}\n",
-                "Sources/Other.swift": "struct Other {}\n"
+                "Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm"),
+                "Sources/Trigger.swift": SwiftFixtureSource.emptyStruct("Trigger"),
+                "Sources/Other.swift": SwiftFixtureSource.emptyStruct("Other")
             ]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -544,7 +544,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+            files: ["Sources/Warm.swift": SwiftFixtureSource.emptyStruct("Warm")]
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
@@ -632,8 +632,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Blocked.swift": "struct Blocked {}\n",
-                "Sources/Replacement.swift": "struct Replacement {}\n"
+                "Sources/Blocked.swift": SwiftFixtureSource.emptyStruct("Blocked"),
+                "Sources/Replacement.swift": SwiftFixtureSource.emptyStruct("Replacement")
             ]
         )
         let gate = EngineFirstResolutionGate()
@@ -732,8 +732,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Clean.swift": "struct Clean {}\n",
-                "Sources/Dirty.swift": "struct Dirty {}\n"
+                "Sources/Clean.swift": SwiftFixtureSource.emptyStruct("Clean"),
+                "Sources/Dirty.swift": SwiftFixtureSource.emptyStruct("Dirty")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -784,8 +784,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Race.swift": "struct Race {}\n",
-                "Sources/Trigger.swift": "struct Trigger {}\n"
+                "Sources/Race.swift": SwiftFixtureSource.emptyStruct("Race"),
+                "Sources/Trigger.swift": SwiftFixtureSource.emptyStruct("Trigger")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -845,8 +845,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Race.swift": "struct Race {}\n",
-                "Sources/Trigger.swift": "struct Trigger {}\n"
+                "Sources/Race.swift": SwiftFixtureSource.emptyStruct("Race"),
+                "Sources/Trigger.swift": SwiftFixtureSource.emptyStruct("Trigger")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -907,8 +907,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Race.swift": "struct Race {}\n",
-                "Sources/Trigger.swift": "struct Trigger {}\n"
+                "Sources/Race.swift": SwiftFixtureSource.emptyStruct("Race"),
+                "Sources/Trigger.swift": SwiftFixtureSource.emptyStruct("Trigger")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -970,8 +970,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
             let root = try repository.makeRepository(
                 named: "repository",
                 files: [
-                    path: "struct Candidate {}\n",
-                    triggerPath: "struct Trigger {}\n"
+                    path: SwiftFixtureSource.emptyStruct("Candidate"),
+                    triggerPath: SwiftFixtureSource.emptyStruct("Trigger")
                 ]
             )
             let runtime = try CodeMapArtifactRuntime(
@@ -1076,7 +1076,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let canonical = try repository.makeRepository(
             named: "canonical",
-            files: ["Sources/Shared.swift": "struct Shared {}\n"]
+            files: ["Sources/Shared.swift": SwiftFixtureSource.emptyStruct("Shared")]
         )
         let linked = try repository.makeLinkedWorktree(
             from: canonical,
@@ -1129,8 +1129,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
             files: [
                 ".gitattributes": "Sources/Transformed.swift text eol=crlf\n",
                 "Notes.txt": "not a supported codemap source\n",
-                "Sources/Dirty.swift": "struct Dirty {}\n",
-                "Sources/Transformed.swift": "struct Transformed {}\n"
+                "Sources/Dirty.swift": SwiftFixtureSource.emptyStruct("Dirty"),
+                "Sources/Transformed.swift": SwiftFixtureSource.emptyStruct("Transformed")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -1139,7 +1139,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let fixture = try await makeEngineFixture(root: root, runtime: runtime)
         _ = await fixture.engine.registerRoot(fixture.registration)
         try repository.write("struct Dirty { let changed = true }\n", to: "Sources/Dirty.swift", at: root)
-        try repository.write("struct Untracked {}\n", to: "Sources/Untracked.swift", at: root)
+        try repository.write(SwiftFixtureSource.emptyStruct("Untracked"), to: "Sources/Untracked.swift", at: root)
 
         for path in ["Sources/Dirty.swift", "Sources/Untracked.swift", "Sources/Transformed.swift"] {
             guard case .ready = await fixture.engine.demand(fixture.demand(path: path)) else {
@@ -1170,7 +1170,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/FanIn.swift": "struct FanIn {}\n"]
+            files: ["Sources/FanIn.swift": SwiftFixtureSource.emptyStruct("FanIn")]
         )
         let gate = EngineBuildGate()
         let buildCounter = EngineAsyncCounter()
@@ -1217,7 +1217,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Duplicate.swift": "struct Duplicate {}\n"]
+            files: ["Sources/Duplicate.swift": SwiftFixtureSource.emptyStruct("Duplicate")]
         )
         let gate = EngineBuildGate()
         let events = EngineHookEvents()

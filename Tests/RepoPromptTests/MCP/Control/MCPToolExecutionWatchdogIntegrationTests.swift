@@ -1321,7 +1321,7 @@ import XCTest
                             arguments: [
                                 "action": "create",
                                 "path": createdURL.path,
-                                "content": "struct CreatedAfterWatchdog {}\n"
+                                "content": SwiftFixtureSource.emptyStruct("CreatedAfterWatchdog")
                             ]
                         )
                     }
@@ -1521,7 +1521,7 @@ import XCTest
                 _ = try await store.createFile(
                     rootID: fixture.contextA.rootID,
                     relativePath: secondRelativePath,
-                    content: "struct ImmediateOwnership {}\n"
+                    content: SwiftFixtureSource.emptyStruct("ImmediateOwnership")
                 )
                 server.setReadFileAutoSelectionCanonicalApplyGateForTesting {
                     await gate.enterAndWait()

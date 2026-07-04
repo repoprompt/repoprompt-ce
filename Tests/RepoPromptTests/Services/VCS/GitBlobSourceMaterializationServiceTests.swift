@@ -5,7 +5,7 @@ import XCTest
 final class GitBlobSourceMaterializationServiceTests: XCTestCase {
     func testRealGitObjectMaterializationDoesNotReadWorktreeFallback() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
-        let sourceText = "struct ObjectOnly {}\n"
+        let sourceText = SwiftFixtureSource.emptyStruct("ObjectOnly")
         let root = try fixture.makeRepository(
             named: "repository",
             files: ["Sources/ObjectOnly.swift": sourceText]

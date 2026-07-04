@@ -1757,7 +1757,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let validSecondaryRoot = try makeTemporaryDirectory(named: "transition-valid-secondary-root")
         let missingSecondaryWorktree = missingSecondaryRoot.appendingPathComponent("missing-worktree")
         let validSecondaryWorktree = try makeTemporaryDirectory(named: "transition-valid-secondary-worktree")
-        try "struct SecondaryWorktreeType {}\n".write(
+        try SwiftFixtureSource.emptyStruct("SecondaryWorktreeType").write(
             to: validSecondaryWorktree.appendingPathComponent("Secondary.swift"),
             atomically: true,
             encoding: .utf8

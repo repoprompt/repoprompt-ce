@@ -199,8 +199,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let source = root.appendingPathComponent("Source.swift")
         let target = root.appendingPathComponent("Target.swift")
-        try write("struct Source {}\n", to: source)
-        try write("struct Target {}\n", to: target)
+        try write(SwiftFixtureSource.emptyStruct("Source"), to: source)
+        try write(SwiftFixtureSource.emptyStruct("Target"), to: target)
 
         let tabID = UUID()
         let selection = StoredSelection(
@@ -254,8 +254,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let oldFile = root.appendingPathComponent("Old.swift")
         let newFile = root.appendingPathComponent("New.swift")
-        try write("struct OldTokenBaseline {}\n", to: oldFile)
-        try write("struct NewVisibleSelection {}\n", to: newFile)
+        try write(SwiftFixtureSource.emptyStruct("OldTokenBaseline"), to: oldFile)
+        try write(SwiftFixtureSource.emptyStruct("NewVisibleSelection"), to: newFile)
 
         let tabID = UUID()
         let oldSelection = StoredSelection(selectedPaths: [oldFile.path])
@@ -305,8 +305,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let staleFile = root.appendingPathComponent("Stale.swift")
         let freshFile = root.appendingPathComponent("Fresh.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct Fresh {}\n", to: freshFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("Fresh"), to: freshFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(selectedPaths: [staleFile.path])
@@ -350,8 +350,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let staleFile = root.appendingPathComponent("Stale.swift")
         let freshFile = root.appendingPathComponent("Fresh.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct Fresh {}\n", to: freshFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("Fresh"), to: freshFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(selectedPaths: [staleFile.path])
@@ -398,8 +398,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let staleFile = root.appendingPathComponent("Stale.swift")
         let freshFile = root.appendingPathComponent("Fresh.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct Fresh {}\n", to: freshFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("Fresh"), to: freshFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(selectedPaths: [staleFile.path])
@@ -445,11 +445,11 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let slicedFile = root.appendingPathComponent("FreshSlice.swift")
         let codemapFile = root.appendingPathComponent("FreshCodemap.swift")
         let laterFile = root.appendingPathComponent("Later.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct FreshFull {}\n", to: fullFile)
-        try write("struct FreshSlice {}\n", to: slicedFile)
-        try write("struct FreshCodemap {}\n", to: codemapFile)
-        try write("struct Later {}\n", to: laterFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("FreshFull"), to: fullFile)
+        try write(SwiftFixtureSource.emptyStruct("FreshSlice"), to: slicedFile)
+        try write(SwiftFixtureSource.emptyStruct("FreshCodemap"), to: codemapFile)
+        try write(SwiftFixtureSource.emptyStruct("Later"), to: laterFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(
@@ -623,9 +623,9 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
         }
-        try write("struct WorkspacePlaceholder {}\n", to: workspaceRoot.appendingPathComponent("Placeholder.swift"))
+        try write(SwiftFixtureSource.emptyStruct("WorkspacePlaceholder"), to: workspaceRoot.appendingPathComponent("Placeholder.swift"))
         let worktreeFile = worktreeRoot.appendingPathComponent("WorktreeOnly.swift")
-        try write("struct WorktreeOnly {}\n", to: worktreeFile)
+        try write(SwiftFixtureSource.emptyStruct("WorktreeOnly"), to: worktreeFile)
 
         let tabID = UUID()
         let logicalFile = workspaceRoot.appendingPathComponent(worktreeFile.lastPathComponent)
@@ -735,12 +735,12 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             try? FileManager.default.removeItem(at: firstWorktreeRoot.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: secondWorktreeRoot.deletingLastPathComponent())
         }
-        try write("struct FirstLogicalPlaceholder {}\n", to: firstLogicalRoot.appendingPathComponent("Placeholder.swift"))
-        try write("struct SecondLogicalPlaceholder {}\n", to: secondLogicalRoot.appendingPathComponent("Placeholder.swift"))
+        try write(SwiftFixtureSource.emptyStruct("FirstLogicalPlaceholder"), to: firstLogicalRoot.appendingPathComponent("Placeholder.swift"))
+        try write(SwiftFixtureSource.emptyStruct("SecondLogicalPlaceholder"), to: secondLogicalRoot.appendingPathComponent("Placeholder.swift"))
         let firstRelativePath = "Sources/First.swift"
         let secondRelativePath = "Sources/Second.swift"
-        try write("struct FirstWorktreeOnly {}\n", to: firstWorktreeRoot.appendingPathComponent(firstRelativePath))
-        try write("struct SecondWorktreeOnly {}\n", to: secondWorktreeRoot.appendingPathComponent(secondRelativePath))
+        try write(SwiftFixtureSource.emptyStruct("FirstWorktreeOnly"), to: firstWorktreeRoot.appendingPathComponent(firstRelativePath))
+        try write(SwiftFixtureSource.emptyStruct("SecondWorktreeOnly"), to: secondWorktreeRoot.appendingPathComponent(secondRelativePath))
 
         let tabID = UUID()
         let logicalSelection = StoredSelection(selectedPaths: [
@@ -849,7 +849,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let root = try makeTemporaryRoot(name: "ActiveTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
             let fileURL = root.appendingPathComponent("Cached.swift")
-            try write("struct ActiveCachedTokenType {}\n", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("ActiveCachedTokenType"), to: fileURL)
 
             let tabID = UUID()
             let selection = StoredSelection(selectedPaths: [fileURL.path])
@@ -928,7 +928,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let root = try makeTemporaryRoot(name: "BoundTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
             let fileURL = root.appendingPathComponent("Bound.swift")
-            try write("struct BoundCachedTokenType {}\n", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("BoundCachedTokenType"), to: fileURL)
 
             let tabID = UUID()
             let selection = StoredSelection(selectedPaths: [fileURL.path])
@@ -1091,7 +1091,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let root = try makeTemporaryRoot(name: "BoundTokenSignatures")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
             let fileURL = root.appendingPathComponent("Bound.swift")
-            try write("struct BoundDistinctSignatureType {}\n", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("BoundDistinctSignatureType"), to: fileURL)
 
             let tabID = UUID()
             let selection = StoredSelection(selectedPaths: [fileURL.path])
@@ -1192,8 +1192,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             }
             let logicalFile = workspaceRoot.appendingPathComponent("Shared.swift")
             let physicalFile = worktreeRoot.appendingPathComponent("Shared.swift")
-            try write("struct Canonical {}\n", to: logicalFile)
-            try write("struct Worktree {}\n", to: physicalFile)
+            try write(SwiftFixtureSource.emptyStruct("Canonical"), to: logicalFile)
+            try write(SwiftFixtureSource.emptyStruct("Worktree"), to: physicalFile)
 
             let tabID = UUID()
             let sessionID = UUID()
@@ -1302,8 +1302,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
             }
             let logicalFile = workspaceRoot.appendingPathComponent("Shared.swift")
-            try write("struct Canonical {}\n", to: logicalFile)
-            try write("struct Worktree {}\n", to: worktreeRoot.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("Canonical"), to: logicalFile)
+            try write(SwiftFixtureSource.emptyStruct("Worktree"), to: worktreeRoot.appendingPathComponent("Shared.swift"))
 
             let tabID = UUID()
             let sessionID = UUID()
@@ -1460,10 +1460,10 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 try? FileManager.default.removeItem(at: worktreeA.deletingLastPathComponent())
                 try? FileManager.default.removeItem(at: worktreeB.deletingLastPathComponent())
             }
-            try write("struct CanonicalA {}\n", to: workspaceRoot.appendingPathComponent("Shared.swift"))
-            try write("struct CanonicalB {}\n", to: replacementWorkspaceRoot.appendingPathComponent("Shared.swift"))
-            try write("struct WorktreeA {}\n", to: worktreeA.appendingPathComponent("Shared.swift"))
-            try write("struct WorktreeB {}\n", to: worktreeB.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("CanonicalA"), to: workspaceRoot.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("CanonicalB"), to: replacementWorkspaceRoot.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("WorktreeA"), to: worktreeA.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("WorktreeB"), to: worktreeB.appendingPathComponent("Shared.swift"))
 
             let tabID = UUID()
             let sessionID = UUID()
@@ -1608,7 +1608,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let afterWorktreeDeletion = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
             XCTAssertEqual(afterWorktreeDeletion, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
             try FileManager.default.createDirectory(at: worktreeB, withIntermediateDirectories: true)
-            try write("struct WorktreeBRestored {}\n", to: worktreeB.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("WorktreeBRestored"), to: worktreeB.appendingPathComponent("Shared.swift"))
             let afterWorktreeRestore = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
             XCTAssertEqual(
                 afterWorktreeRestore.translateInputPath(workspaceRoot.appendingPathComponent("Shared.swift").path),
@@ -1686,8 +1686,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
         }
-        try write("struct WorkspaceFile {}\n", to: workspaceRoot.appendingPathComponent("WorkspaceFile.swift"))
-        try write("struct WorktreeFile {}\n", to: worktreeRoot.appendingPathComponent("WorktreeFile.swift"))
+        try write(SwiftFixtureSource.emptyStruct("WorkspaceFile"), to: workspaceRoot.appendingPathComponent("WorkspaceFile.swift"))
+        try write(SwiftFixtureSource.emptyStruct("WorktreeFile"), to: worktreeRoot.appendingPathComponent("WorktreeFile.swift"))
 
         let tabID = UUID()
         let sessionID = UUID()

@@ -8,7 +8,7 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Source.swift": "struct Source {}\n"]
+            files: ["Sources/Source.swift": SwiftFixtureSource.emptyStruct("Source")]
         )
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -91,7 +91,7 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -181,7 +181,7 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -263,7 +263,7 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -386,8 +386,8 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
                     func second() -> SecondTarget
                 }
                 """,
-                "Sources/First.swift": "struct FirstTarget {}\n",
-                "Sources/Second.swift": "struct SecondTarget {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("FirstTarget"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("SecondTarget")
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
@@ -437,7 +437,7 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
     func testAutomaticSelectionWithoutExistingDemandPerformsNoIOOrArtifactWork() async throws {
         let fixture = try CodemapStoreFixture(name: #function)
         let root = try fixture.makePlainRoot(files: [
-            "Sources/Source.swift": "struct Source {}\n"
+            "Sources/Source.swift": SwiftFixtureSource.emptyStruct("Source")
         ])
         let graphProbe = CodemapSelectionGraphProbe()
         addTeardownBlock { await fixture.shutdown() }
@@ -475,7 +475,7 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Setup.swift": "struct Target {}\n",
+                "Sources/Setup.swift": SwiftFixtureSource.emptyStruct("Target"),
                 "Sources/Source.swift": "struct Source { let target: Target }\n"
             ]
         )
@@ -648,8 +648,8 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Setup.swift": "struct Setup {}\n",
-                "Sources/Source.swift": "struct Source {}\n"
+                "Sources/Setup.swift": SwiftFixtureSource.emptyStruct("Setup"),
+                "Sources/Source.swift": SwiftFixtureSource.emptyStruct("Source")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -796,8 +796,8 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Setup.swift": "struct Setup {}\n",
-                "Sources/Source.swift": "struct Source {}\n"
+                "Sources/Setup.swift": SwiftFixtureSource.emptyStruct("Setup"),
+                "Sources/Source.swift": SwiftFixtureSource.emptyStruct("Source")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -898,9 +898,9 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
     func testAutomaticSelectionSourceDemandLimitAllowsNAndRejectsNPlusOneBeforeFanout() async throws {
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
         let root = try fixture.makePlainRoot(files: [
-            "Sources/First.swift": "struct First {}\n",
-            "Sources/Second.swift": "struct Second {}\n",
-            "Sources/Third.swift": "struct Third {}\n"
+            "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+            "Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second"),
+            "Sources/Third.swift": SwiftFixtureSource.emptyStruct("Third")
         ])
         addTeardownBlock { await fixture.shutdown() }
         let store = fixture.makeStore(
@@ -946,12 +946,12 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
             named: "repository",
             files: [
                 "Sources/Source.swift": "struct Source { let target: Target }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
         let plainRoot = try fixture.makePlainRoot(files: [
-            "Sources/Plain.swift": "struct Plain {}\n"
+            "Sources/Plain.swift": SwiftFixtureSource.emptyStruct("Plain")
         ])
         addTeardownBlock {
             await fixture.shutdown()
@@ -990,8 +990,8 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/First.swift": "struct First {}\n",
-                "Sources/Second.swift": "struct Second {}\n"
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+                "Sources/Second.swift": SwiftFixtureSource.emptyStruct("Second")
             ]
         )
         let fanoutGate = CodemapSuspensionGate()

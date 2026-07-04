@@ -2,16 +2,6 @@
 import XCTest
 
 final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testReadFileSourceOrderingPreservesRootCaptureResolutionAndProviderTranslation() throws {
         do {
             let caseLabel = "testReadFileCapturesRootsOnceBeforeFreshnessAndConsolidatedResolution"
@@ -392,12 +382,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

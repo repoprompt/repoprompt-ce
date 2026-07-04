@@ -9,7 +9,7 @@ final class CodemapBindingEnginePipelineTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Feature.swift": "struct Feature {}\n",
+                "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature"),
                 "Sources/Feature.ts": "export interface Feature {}\n"
             ]
         )
@@ -44,7 +44,7 @@ final class CodemapBindingEnginePipelineTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Feature.swift": "struct Feature {}\n",
+                "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature"),
                 "Sources/Feature.ts": "export interface Feature {}\n"
             ]
         )
@@ -103,7 +103,7 @@ final class CodemapBindingEnginePipelineTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Feature.swift": "struct Feature {}\n",
+                "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature"),
                 "Sources/Feature.ts": "export interface Feature {}\n"
             ]
         )

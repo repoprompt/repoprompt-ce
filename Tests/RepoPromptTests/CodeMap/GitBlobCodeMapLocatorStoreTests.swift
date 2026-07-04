@@ -136,7 +136,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
 
         for format in [GitObjectFormat.sha1, .sha256] {
             let association = try await makeVerifiedAssociation(
-                text: "struct Located {}",
+                text: SwiftFixtureSource.emptyStruct("Located", trailingNewline: false),
                 namespace: namespace,
                 format: format,
                 pipeline: pipeline,
@@ -164,12 +164,12 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let root = try makeSecureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let pipeline = try pipelineIdentity(.swift)
-        let rawBytes = Data("struct Proven {}".utf8)
+        let rawBytes = Data(SwiftFixtureSource.emptyStruct("Proven", trailingNewline: false).utf8)
         let source = try await makeCleanSource(rawBytes: rawBytes, format: .sha1)
         guard case let .cleanGitBlob(repositoryNamespace, blobOID) = source.provenance else {
             return XCTFail("expected clean Git blob provenance")
         }
-        let key = makeArtifactKey(text: "struct Proven {}", pipeline: pipeline)
+        let key = makeArtifactKey(text: SwiftFixtureSource.emptyStruct("Proven", trailingNewline: false), pipeline: pipeline)
         let identity = GitBlobCodeMapLocatorIdentity(
             repositoryNamespace: repositoryNamespace,
             blobOID: blobOID,
@@ -201,7 +201,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             XCTAssertEqual($0 as? VerifiedGitBlobCodeMapLocatorAssociationError, .rawByteCountMismatch)
         }
 
-        let wrongDigestKey = makeArtifactKey(text: "struct Pr0ven {}", pipeline: pipeline)
+        let wrongDigestKey = makeArtifactKey(text: SwiftFixtureSource.emptyStruct("Pr0ven", trailingNewline: false), pipeline: pipeline)
         XCTAssertEqual(wrongDigestKey.rawByteCount, key.rawByteCount)
         XCTAssertThrowsError(try VerifiedGitBlobCodeMapLocatorAssociation.verify(
             source: source,
@@ -229,7 +229,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
 
         let worktreeFixture = try await WorkspaceCodemapAuthorityTestFixture.make(
             name: #function,
-            files: ["Sources/Proven.swift": "struct Proven {}"]
+            files: ["Sources/Proven.swift": SwiftFixtureSource.emptyStruct("Proven", trailingNewline: false)]
         )
         let worktreeSource = try await worktreeFixture.validatedWorktreeSource(
             loadedRootRelativePath: "Sources/Proven.swift"
@@ -289,7 +289,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             XCTAssertEqual($0 as? VerifiedGitBlobCodeMapLocatorAssociationError, .gitBlobOIDMismatch)
         }
 
-        let otherKey = makeArtifactKey(text: "struct Other {}", pipeline: pipeline)
+        let otherKey = makeArtifactKey(text: SwiftFixtureSource.emptyStruct("Other", trailingNewline: false), pipeline: pipeline)
         _ = try await artifactStore.insert(key: otherKey, deterministicOutcome: .readyNoSymbols)
         let otherHandle = try await requireHandle(artifactStore, key: otherKey)
         XCTAssertThrowsError(try VerifiedGitBlobCodeMapLocatorAssociation.verify(
@@ -339,7 +339,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let store = try GitBlobCodeMapLocatorStore(rootURL: root)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Valid {}",
+            text: SwiftFixtureSource.emptyStruct("Valid", trailingNewline: false),
             namespace: namespace,
             format: .sha1,
             pipeline: swiftPipeline,
@@ -449,7 +449,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Concurrent {}",
+            text: SwiftFixtureSource.emptyStruct("Concurrent", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,
@@ -496,7 +496,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: artifactRoot)
         let association = try await makeVerifiedAssociation(
-            text: "struct ReplacedRoot {}",
+            text: SwiftFixtureSource.emptyStruct("ReplacedRoot", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,
@@ -539,7 +539,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         )
         let artifactStore = try CodeMapArtifactStore(rootURL: artifactRoot)
         var associations: [VerifiedGitBlobCodeMapLocatorAssociation] = []
-        for text in ["struct First {}", "struct Second {}"] {
+        for text in [SwiftFixtureSource.emptyStruct("First", trailingNewline: false), SwiftFixtureSource.emptyStruct("Second", trailingNewline: false)] {
             try await associations.append(makeVerifiedAssociation(
                 text: text,
                 namespace: namespace,
@@ -713,7 +713,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Race {}",
+            text: SwiftFixtureSource.emptyStruct("Race", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,
@@ -773,7 +773,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Secure {}",
+            text: SwiftFixtureSource.emptyStruct("Secure", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,

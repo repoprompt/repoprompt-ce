@@ -90,7 +90,7 @@ final class GitBlobIdentityServiceTests: XCTestCase {
 
     func testNestedRepositoryMarkersBlockOuterBlobIdentityWhileNestedRootRemainsEligible() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
-        let contents = "struct BoundaryOwned {}\n"
+        let contents = SwiftFixtureSource.emptyStruct("BoundaryOwned")
         let repository = try fixture.makeRepository(
             named: "outer",
             files: [
@@ -149,8 +149,8 @@ final class GitBlobIdentityServiceTests: XCTestCase {
         let repository = try fixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Included.swift": "struct Included {}\n",
-                "Excluded/Absent.swift": "struct Absent {}\n"
+                "Sources/Included.swift": SwiftFixtureSource.emptyStruct("Included"),
+                "Excluded/Absent.swift": SwiftFixtureSource.emptyStruct("Absent")
             ]
         )
         _ = try fixture.runGit(["sparse-checkout", "init", "--cone"], at: repository)

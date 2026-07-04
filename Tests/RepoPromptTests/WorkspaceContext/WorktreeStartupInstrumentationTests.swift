@@ -54,7 +54,7 @@ import XCTest
             let repositories = try ReviewGitRepositoryFixture(name: #function)
             let root = try repositories.makeRepository(
                 named: "repository",
-                files: ["Sources/App.swift": "struct ScopedControl {}\n"]
+                files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("ScopedControl")]
             )
             defer { repositories.cleanup() }
 
@@ -173,7 +173,7 @@ import XCTest
             let physicalURL = sandbox.appendingPathComponent("physical", isDirectory: true)
             try FileManager.default.createDirectory(at: logicalURL, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: physicalURL, withIntermediateDirectories: true)
-            try "struct PlainRoot {}\n".write(
+            try SwiftFixtureSource.emptyStruct("PlainRoot").write(
                 to: physicalURL.appendingPathComponent("Plain.swift"),
                 atomically: true,
                 encoding: .utf8

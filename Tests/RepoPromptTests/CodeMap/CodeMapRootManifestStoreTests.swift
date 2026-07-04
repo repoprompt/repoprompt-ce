@@ -16,7 +16,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x11,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct Canonical {}"
+            text: SwiftFixtureSource.emptyStruct("Canonical", trailingNewline: false)
         )
         let linked = try await makeFixture(
             root: root,
@@ -25,7 +25,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x22,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct Linked {}"
+            text: SwiftFixtureSource.emptyStruct("Linked", trailingNewline: false)
         )
         let subdirectory = try await makeFixture(
             root: root,
@@ -34,7 +34,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x11,
             prefix: "Sources",
             path: "Sources/App.swift",
-            text: "struct Subdirectory {}"
+            text: SwiftFixtureSource.emptyStruct("Subdirectory", trailingNewline: false)
         )
         let python = try await makeFixture(
             root: root,
@@ -53,7 +53,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x11,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct OtherRepository {}"
+            text: SwiftFixtureSource.emptyStruct("OtherRepository", trailingNewline: false)
         )
         XCTAssertEqual(canonical.namespace.repositoryNamespace, linked.namespace.repositoryNamespace)
         XCTAssertNotEqual(canonical.namespace.repositoryNamespace, otherRepository.namespace.repositoryNamespace)
@@ -91,7 +91,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x12,
             prefix: "Sources",
             path: "Sources/App.swift",
-            text: "struct CanonicalPath {}"
+            text: SwiftFixtureSource.emptyStruct("CanonicalPath", trailingNewline: false)
         )
 
         for path in ["Sources/App.swift", "Sources/Nested/App.swift"] {
@@ -209,7 +209,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x32,
             prefix: "",
             path: "Sources/Baseline.swift",
-            text: "struct Baseline {}"
+            text: SwiftFixtureSource.emptyStruct("Baseline", trailingNewline: false)
         )
         let readyArtifact = makeArtifact(name: "ReadySymbol")
         let outcomes: [(CodeMapSyntaxArtifactOutcome, CodeMapRootManifestOutcome)] = [
@@ -276,7 +276,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         let ready = try await makeAssociation(
             artifactStore: artifactStore,
             namespaceScope: #function,
-            text: "struct ReadyMismatch {}",
+            text: SwiftFixtureSource.emptyStruct("ReadyMismatch", trailingNewline: false),
             pipeline: fixture.namespace.pipelineIdentity,
             objectFormat: fixture.namespace.objectFormat,
             outcome: .ready(readyArtifact)
@@ -310,7 +310,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x41,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct Authority {}"
+            text: SwiftFixtureSource.emptyStruct("Authority", trailingNewline: false)
         )
         let store = try CodeMapRootManifestStore(rootURL: root)
         _ = try await store.replaceCurrentManifest(
@@ -367,7 +367,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x51,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct Corrupt {}"
+            text: SwiftFixtureSource.emptyStruct("Corrupt", trailingNewline: false)
         )
         let policy = CodeMapRootManifestStorePolicy(
             maximumRecordCountPerManifest: 10,
@@ -429,7 +429,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x61,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct Secure {}"
+            text: SwiftFixtureSource.emptyStruct("Secure", trailingNewline: false)
         )
         let store = try CodeMapRootManifestStore(rootURL: root)
         _ = try await store.replaceCurrentManifest(
@@ -524,7 +524,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x71,
             prefix: "",
             path: "Sources/First.swift",
-            text: "struct First {}"
+            text: SwiftFixtureSource.emptyStruct("First", trailingNewline: false)
         )
         let secondRecord = try await makeRecord(
             root: root,
@@ -533,7 +533,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: first.namespace,
             authority: first.authority,
             path: "Sources/Second.swift",
-            text: "struct Second {}",
+            text: SwiftFixtureSource.emptyStruct("Second", trailingNewline: false),
             bindingGeneration: 2
         )
         let alternativeFirst = try await makeRecord(
@@ -543,7 +543,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: first.namespace,
             authority: first.authority,
             path: "Sources/Third.swift",
-            text: "struct Third {}",
+            text: SwiftFixtureSource.emptyStruct("Third", trailingNewline: false),
             bindingGeneration: 3
         )
         let alternativeSecond = try await makeRecord(
@@ -553,7 +553,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: first.namespace,
             authority: first.authority,
             path: "Sources/XFourth.swift",
-            text: "struct Fourth {}",
+            text: SwiftFixtureSource.emptyStruct("Fourth", trailingNewline: false),
             bindingGeneration: 4
         )
         let firstSnapshot = [first.record, secondRecord]
@@ -614,7 +614,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x72,
             prefix: "",
             path: "Sources/First.swift",
-            text: "struct First {}"
+            text: SwiftFixtureSource.emptyStruct("First", trailingNewline: false)
         )
         let second = try await makeRecord(
             root: root,
@@ -623,7 +623,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: first.namespace,
             authority: first.authority,
             path: "Sources/Second.swift",
-            text: "struct Second {}",
+            text: SwiftFixtureSource.emptyStruct("Second", trailingNewline: false),
             bindingGeneration: 2
         )
         let gate = ManifestLockedMergeGate()
@@ -692,7 +692,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x73,
             prefix: "",
             path: "Sources/Original.swift",
-            text: "struct Original {}"
+            text: SwiftFixtureSource.emptyStruct("Original", trailingNewline: false)
         )
         let newerAuthority = try authorityLike(
             original.authority,
@@ -706,7 +706,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: original.namespace,
             authority: original.authority,
             path: "Sources/Delayed.swift",
-            text: "struct Delayed {}",
+            text: SwiftFixtureSource.emptyStruct("Delayed", trailingNewline: false),
             bindingGeneration: 2
         )
         let newerRecord = try await makeRecord(
@@ -716,7 +716,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: original.namespace,
             authority: newerAuthority,
             path: "Sources/Newer.swift",
-            text: "struct Newer {}",
+            text: SwiftFixtureSource.emptyStruct("Newer", trailingNewline: false),
             bindingGeneration: 3
         )
         let baseline = try CodeMapRootManifestStore(rootURL: root)
@@ -789,7 +789,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x74,
             prefix: "",
             path: "Sources/Stale.swift",
-            text: "struct Stale {}"
+            text: SwiftFixtureSource.emptyStruct("Stale", trailingNewline: false)
         )
         let currentAuthority = try authorityLike(
             stale.authority,
@@ -803,7 +803,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: stale.namespace,
             authority: currentAuthority,
             path: "Sources/Current.swift",
-            text: "struct Current {}",
+            text: SwiftFixtureSource.emptyStruct("Current", trailingNewline: false),
             bindingGeneration: 2
         )
         let store = try CodeMapRootManifestStore(rootURL: root)
@@ -867,7 +867,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x75,
             prefix: "",
             path: "Sources/Predecessor.swift",
-            text: "struct Predecessor {}"
+            text: SwiftFixtureSource.emptyStruct("Predecessor", trailingNewline: false)
         )
         let targetAuthority = try authorityLike(
             predecessor.authority,
@@ -881,7 +881,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: predecessor.namespace,
             authority: targetAuthority,
             path: "Sources/Target.swift",
-            text: "struct Target {}",
+            text: SwiftFixtureSource.emptyStruct("Target", trailingNewline: false),
             bindingGeneration: 2
         )
         let store = try CodeMapRootManifestStore(rootURL: root)
@@ -957,7 +957,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x81,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct Temporary {}"
+            text: SwiftFixtureSource.emptyStruct("Temporary", trailingNewline: false)
         )
         let store = try CodeMapRootManifestStore(rootURL: root)
         _ = try await store.replaceCurrentManifest(
@@ -1133,7 +1133,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x93,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct ConcurrentTouch {}"
+            text: SwiftFixtureSource.emptyStruct("ConcurrentTouch", trailingNewline: false)
         )
         let clock = ManifestAccessClock(500)
         let policy = CodeMapRootManifestStorePolicy(
@@ -1316,7 +1316,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: tieFixtures[0].namespace,
             authority: tieFixtures[0].authority,
             path: "Sources/Second.swift",
-            text: "struct TieBreakSecond {}",
+            text: SwiftFixtureSource.emptyStruct("TieBreakSecond", trailingNewline: false),
             bindingGeneration: 2
         )
         _ = try await tieStore.replaceCurrentManifest(
@@ -1364,7 +1364,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x97,
             prefix: "",
             path: "Sources/Old.swift",
-            text: "struct StaleTouchOld {}"
+            text: SwiftFixtureSource.emptyStruct("StaleTouchOld", trailingNewline: false)
         )
         let replacement = try await makeRecord(
             root: staleRoot,
@@ -1373,7 +1373,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: fixture.namespace,
             authority: fixture.authority,
             path: "Sources/New.swift",
-            text: "struct StaleTouchNew {}",
+            text: SwiftFixtureSource.emptyStruct("StaleTouchNew", trailingNewline: false),
             bindingGeneration: 2
         )
         let baseline = try CodeMapRootManifestStore(rootURL: staleRoot, accessEpochSeconds: { 0 })
@@ -1425,7 +1425,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                 worktreeByte: point == .afterTemporaryWrite ? 0x98 : 0x99,
                 prefix: "",
                 path: "Sources/App.swift",
-                text: "struct InterruptedTouch {}"
+                text: SwiftFixtureSource.emptyStruct("InterruptedTouch", trailingNewline: false)
             )
             let writer = try CodeMapRootManifestStore(rootURL: root, accessEpochSeconds: { 0 })
             _ = try await writer.replaceCurrentManifest(
@@ -1476,7 +1476,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x94,
             prefix: "",
             path: "Sources/Target.swift",
-            text: "struct Target {}"
+            text: SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)
         )
         let resident = try await makeFixture(
             root: root,
@@ -1485,7 +1485,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x95,
             prefix: "",
             path: "Sources/Resident.swift",
-            text: "struct Resident {}"
+            text: SwiftFixtureSource.emptyStruct("Resident", trailingNewline: false)
         )
         let permissive = try CodeMapRootManifestStore(rootURL: root)
         for fixture in [target, resident] {
@@ -1574,7 +1574,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x96,
             prefix: "",
             path: "Sources/First.swift",
-            text: "struct FirstLockDomain {}"
+            text: SwiftFixtureSource.emptyStruct("FirstLockDomain", trailingNewline: false)
         )
         let second = try await makeRecord(
             root: root,
@@ -1583,7 +1583,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: fixture.namespace,
             authority: fixture.authority,
             path: "Sources/Second.swift",
-            text: "struct SecondLockDomain {}",
+            text: SwiftFixtureSource.emptyStruct("SecondLockDomain", trailingNewline: false),
             bindingGeneration: 2
         )
         let baseline = try CodeMapRootManifestStore(rootURL: root)
@@ -1648,7 +1648,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x97,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct ReplacementAuthority {}"
+            text: SwiftFixtureSource.emptyStruct("ReplacementAuthority", trailingNewline: false)
         )
         let replacementRecord = try await makeRecord(
             root: root,
@@ -1657,7 +1657,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: fixture.namespace,
             authority: fixture.authority,
             path: "Sources/Replacement.swift",
-            text: "struct ReplacementCommit {}",
+            text: SwiftFixtureSource.emptyStruct("ReplacementCommit", trailingNewline: false),
             bindingGeneration: 2
         )
         let baseline = try CodeMapRootManifestStore(rootURL: root)
@@ -1778,7 +1778,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0x98,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct DetachedRead {}"
+            text: SwiftFixtureSource.emptyStruct("DetachedRead", trailingNewline: false)
         )
         let baseline = try CodeMapRootManifestStore(rootURL: root)
         _ = try await baseline.replaceCurrentManifest(
@@ -1815,7 +1815,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                 worktreeByte: UInt8(0xA0 + CodeMapRootManifestStoreFaultPoint.allCasesForTesting.firstIndex(of: point)!),
                 prefix: "",
                 path: "Sources/Old.swift",
-                text: "struct OldCrashBoundary {}"
+                text: SwiftFixtureSource.emptyStruct("OldCrashBoundary", trailingNewline: false)
             )
             let replacement = try await makeRecord(
                 root: root,
@@ -1824,7 +1824,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                 namespace: fixture.namespace,
                 authority: fixture.authority,
                 path: "Sources/New.swift",
-                text: "struct NewCrashBoundary {}",
+                text: SwiftFixtureSource.emptyStruct("NewCrashBoundary", trailingNewline: false),
                 bindingGeneration: 2
             )
             let baseline = try CodeMapRootManifestStore(rootURL: root)
@@ -1886,7 +1886,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0xA4,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct HostileCodec {}"
+            text: SwiftFixtureSource.emptyStruct("HostileCodec", trailingNewline: false)
         )
         let second = try await makeRecord(
             root: root,
@@ -1895,7 +1895,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: fixture.namespace,
             authority: fixture.authority,
             path: "Sources/Bpp.swift",
-            text: "struct HostileCodecSecond {}",
+            text: SwiftFixtureSource.emptyStruct("HostileCodecSecond", trailingNewline: false),
             bindingGeneration: 2
         )
         let snapshot = try CodeMapRootManifestSnapshot(
@@ -1978,7 +1978,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: fixture.namespace,
             authority: changedAuthority,
             path: "Sources/App.swift",
-            text: "struct HostileCodec {}",
+            text: SwiftFixtureSource.emptyStruct("HostileCodec", trailingNewline: false),
             bindingGeneration: 1
         )
         let changedAuthorityData = try CodeMapRootManifestCodec.encode(
@@ -2047,7 +2047,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0xA5,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct RemoveTerminalAuthority {}"
+            text: SwiftFixtureSource.emptyStruct("RemoveTerminalAuthority", trailingNewline: false)
         )
         let baseline = try CodeMapRootManifestStore(rootURL: root)
         _ = try await baseline.replaceCurrentManifest(
@@ -2087,7 +2087,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0xA6,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct AccountingTerminalAuthority {}"
+            text: SwiftFixtureSource.emptyStruct("AccountingTerminalAuthority", trailingNewline: false)
         )
         let baseline = try CodeMapRootManifestStore(rootURL: root)
         _ = try await baseline.replaceCurrentManifest(
@@ -2126,7 +2126,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             worktreeByte: 0xA7,
             prefix: "",
             path: "Sources/App.swift",
-            text: "struct MaintenanceTerminalAuthority {}"
+            text: SwiftFixtureSource.emptyStruct("MaintenanceTerminalAuthority", trailingNewline: false)
         )
         let baseline = try CodeMapRootManifestStore(rootURL: root)
         _ = try await baseline.replaceCurrentManifest(
@@ -2185,7 +2185,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                     worktreeByte: UInt8(0xB0 + operationIndex * 4 + entryIndex),
                     prefix: "",
                     path: "Sources/Baseline.swift",
-                    text: "struct TerminalBaseline {}"
+                    text: SwiftFixtureSource.emptyStruct("TerminalBaseline", trailingNewline: false)
                 )
                 let injected = try await makeFixture(
                     root: root,
@@ -2194,7 +2194,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                     worktreeByte: UInt8(0xC0 + operationIndex * 4 + entryIndex),
                     prefix: "",
                     path: "Sources/Injected.swift",
-                    text: "struct TerminalInjected {}"
+                    text: SwiftFixtureSource.emptyStruct("TerminalInjected", trailingNewline: false)
                 )
                 let target = try await makeFixture(
                     root: root,
@@ -2203,7 +2203,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                     worktreeByte: UInt8(0xD0 + operationIndex * 4 + entryIndex),
                     prefix: "",
                     path: "Sources/Target.swift",
-                    text: "struct TerminalTarget {}"
+                    text: SwiftFixtureSource.emptyStruct("TerminalTarget", trailingNewline: false)
                 )
                 let baselineStore = try CodeMapRootManifestStore(
                     rootURL: root,

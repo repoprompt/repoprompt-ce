@@ -9,16 +9,6 @@ import XCTest
         private static let cappedMatchCount = 5
         private static let kValues = [1, 6, 12]
 
-        private var temporaryRoots: [URL] = []
-
-        override func tearDownWithError() throws {
-            for root in temporaryRoots {
-                try? FileManager.default.removeItem(at: root)
-            }
-            temporaryRoots.removeAll()
-            try super.tearDownWithError()
-        }
-
         func testConcurrentSameStoreAndSeparateStoreMatrixPreservesOrderingIsolationAndCleanup() async throws {
             for topology in SearchTopology.allCases {
                 for k in Self.kValues {
@@ -119,7 +109,9 @@ import XCTest
                     .appendingPathComponent("RepoPromptTests", isDirectory: true)
                     .appendingPathComponent("SearchMatrix-\(label)-s\(storeIndex)-\(UUID().uuidString)", isDirectory: true)
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-                temporaryRoots.append(root)
+                addTeardownBlock {
+                    try? FileManager.default.removeItem(at: root)
+                }
 
                 var orderedFilePaths: [String] = []
                 for fileIndex in (0 ..< Self.corpusFileCount).reversed() {

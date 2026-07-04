@@ -9,9 +9,9 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         let selectedA = root.appendingPathComponent("A.swift")
         let selectedB = root.appendingPathComponent("B.swift")
         let manual = root.appendingPathComponent("Manual.swift")
-        try write("struct A {}", to: selectedA)
-        try write("struct B {}", to: selectedB)
-        try write("struct Manual {}", to: manual)
+        try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: selectedA)
+        try write(SwiftFixtureSource.emptyStruct("B", trailingNewline: false), to: selectedB)
+        try write(SwiftFixtureSource.emptyStruct("Manual", trailingNewline: false), to: manual)
 
         let store = WorkspaceFileContextStore()
         let loaded = try await store.loadRoot(path: root.path)
@@ -54,7 +54,7 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         let root = try makeRoot(named: #function)
         defer { try? FileManager.default.removeItem(at: root) }
         let file = root.appendingPathComponent("Selected.swift")
-        try write("struct Selected {}", to: file)
+        try write(SwiftFixtureSource.emptyStruct("Selected", trailingNewline: false), to: file)
 
         let store = WorkspaceFileContextStore()
         let loaded = try await store.loadRoot(path: root.path)

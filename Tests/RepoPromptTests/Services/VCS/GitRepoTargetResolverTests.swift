@@ -2,16 +2,6 @@
 import XCTest
 
 final class GitRepoTargetResolverTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for root in temporaryRoots {
-            try? FileManager.default.removeItem(at: root)
-        }
-        temporaryRoots = []
-        try super.tearDownWithError()
-    }
-
     func testResolvesSupportedRepositorySelectorSyntax() async throws {
         let fixture = ResolverFixture()
         let scenarios = [
@@ -183,7 +173,9 @@ final class GitRepoTargetResolverTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("GitRepoTargetResolverSeparateGitDirTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        temporaryRoots.append(root)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
 
         let repo = root.appendingPathComponent("repo", isDirectory: true)
         let gitDir = root.appendingPathComponent("repo-git", isDirectory: true)

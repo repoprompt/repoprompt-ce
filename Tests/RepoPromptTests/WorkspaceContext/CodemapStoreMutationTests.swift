@@ -9,8 +9,8 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
         let root = try repositoryFixture.makeRepository(
             named: "repository",
             files: [
-                "Sources/Mutable.swift": "struct Mutable {}\n",
-                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+                "Sources/Mutable.swift": SwiftFixtureSource.emptyStruct("Mutable"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
             ]
         )
         let fixture = try CodemapStoreFixture(
@@ -71,7 +71,7 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         let graphProbe = CodemapSelectionGraphProbe()
@@ -128,7 +128,7 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
         _ = try await store.createFile(
             rootID: loaded.id,
             relativePath: "Sources/CatalogReplacement.swift",
-            content: "struct CatalogReplacement {}\n"
+            content: SwiftFixtureSource.emptyStruct("CatalogReplacement")
         )
         await assertStale(store.codemapArtifactDemandStatus(successorTicket))
         try await assertEngineRootCount(1, fixture: fixture)
@@ -139,7 +139,7 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
-            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
         let graphProbe = CodemapSelectionGraphProbe()

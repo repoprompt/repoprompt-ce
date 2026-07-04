@@ -9,8 +9,8 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Preload.swift": "struct Preload {}\n",
-                "Sources/Live.swift": "struct Live {}\n"
+                "Sources/Preload.swift": SwiftFixtureSource.emptyStruct("Preload"),
+                "Sources/Live.swift": SwiftFixtureSource.emptyStruct("Live")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -96,8 +96,8 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Preload.swift": "struct Preload {}\n",
-                "Sources/Live.swift": "struct Live {}\n"
+                "Sources/Preload.swift": SwiftFixtureSource.emptyStruct("Preload"),
+                "Sources/Live.swift": SwiftFixtureSource.emptyStruct("Live")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -186,8 +186,8 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Preload.swift": "struct Preload {}\n",
-                "Sources/Live.swift": "struct Live {}\n"
+                "Sources/Preload.swift": SwiftFixtureSource.emptyStruct("Preload"),
+                "Sources/Live.swift": SwiftFixtureSource.emptyStruct("Live")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(
@@ -288,7 +288,7 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Budget.swift": "struct Budget {}\n"]
+            files: ["Sources/Budget.swift": SwiftFixtureSource.emptyStruct("Budget")]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
@@ -361,7 +361,7 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let paths = ["Sources/One.swift", "Sources/Two.swift"]
         let root = try repository.makeRepository(
             named: "repository",
-            files: Dictionary(uniqueKeysWithValues: paths.map { ($0, "struct Value {}\n") })
+            files: Dictionary(uniqueKeysWithValues: paths.map { ($0, SwiftFixtureSource.emptyStruct("Value")) })
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
@@ -452,8 +452,8 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let root = try repository.makeRepository(
             named: "repository",
             files: [
-                "Sources/Source.swift": "struct Source {}\n",
-                "Sources/Candidate.swift": "struct Candidate {}\n"
+                "Sources/Source.swift": SwiftFixtureSource.emptyStruct("Source"),
+                "Sources/Candidate.swift": SwiftFixtureSource.emptyStruct("Candidate")
             ]
         )
         let runtime = try CodeMapArtifactRuntime(

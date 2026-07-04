@@ -56,7 +56,7 @@ final class CodeMapArtifactKeyTests: XCTestCase {
         XCTAssertEqual(try CodeMapPipelineIdentity(canonicalBytes: referencePipeline), identity)
         XCTAssertEqual(try CodeMapPipelineIdentity(canonicalBytes: referencePipeline).canonicalBytes, referencePipeline)
 
-        let source = makeSource(data: Data("struct ReferenceEncoder {}".utf8))
+        let source = makeSource(data: Data(SwiftFixtureSource.emptyStruct("ReferenceEncoder", trailingNewline: false).utf8))
         let key = try CodeMapArtifactKey(source: source, pipelineIdentity: identity)
         let referenceKey = referenceKeyBytes(
             rawDigest: source.rawSHA256.bytes,

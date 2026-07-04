@@ -752,7 +752,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try "VERSION=1\n".write(to: versionFile, atomically: true, encoding: .utf8)
-        try "struct MCPBootstrapLease {}\n".write(
+        try SwiftFixtureSource.emptyStruct("MCPBootstrapLease").write(
             to: bootstrapLease,
             atomically: true,
             encoding: .utf8
@@ -1293,7 +1293,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let selected = sources.appendingPathComponent("Selected.swift")
         let dependency = sources.appendingPathComponent("Dependency.swift")
         try "one\ntwo\nthree\n".write(to: selected, atomically: true, encoding: .utf8)
-        try "struct Dependency {}\n".write(to: dependency, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("Dependency").write(to: dependency, atomically: true, encoding: .utf8)
 
         let selection = StoredSelection(
             selectedPaths: [selected.path],
