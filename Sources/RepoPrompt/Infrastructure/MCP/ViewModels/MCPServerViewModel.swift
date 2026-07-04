@@ -3317,6 +3317,16 @@ final class MCPServerViewModel: ObservableObject {
         else {
             return
         }
+        // Explicit bind_context / _tabID pins are senior to the agent-run spawn rebind:
+        // starting a session must not displace the caller's explicitly chosen tab.
+        // Run routing is unaffected — poll/wait/steer resolve by session_id.
+        if let bound = tabContextByConnectionID[connectionID],
+           bound.explicitlyBound,
+           bound.tabID != tabID
+        {
+            mcpServerViewModelDebugLog("bindCurrentRequestToTabIfPossible preserved explicit binding connectionID=\(connectionID) boundTab=\(bound.tabID) targetTab=\(tabID)")
+            return
+        }
         if await shouldPreserveAgentRunSourceBinding(connectionID: connectionID, metadata: metadata) {
             mcpServerViewModelDebugLog("bindCurrentRequestToTabIfPossible preserved agent-run source binding connectionID=\(connectionID) targetTab=\(tabID)")
             return
