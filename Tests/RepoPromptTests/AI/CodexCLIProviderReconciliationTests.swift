@@ -116,7 +116,9 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
         _ = try await drain(stream)
 
         XCTAssertEqual(spy.setThreadNameCalls.count, 1)
-        XCTAssertLessThanOrEqual(spy.setThreadNameCalls.first?.name.count ?? 0, 80)
+        let expectedPrefix = String(longLine.prefix(80))
+        XCTAssertEqual(spy.setThreadNameCalls.first?.name, expectedPrefix)
+        XCTAssertEqual(spy.setThreadNameCalls.first?.name.count, 80)
     }
 
     func testMultiLineMessageUsesOnlyFirstLine() async throws {
@@ -174,6 +176,58 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
 
         XCTAssertEqual(spy.setThreadNameCalls.count, 1)
         XCTAssertEqual(spy.setThreadNameCalls.first?.name, "Agent Session")
+    }
+
+    func testSetThreadNameOccursBetweenStartOrResumeAndStartUserTurn() async throws {
+        let scope = CodexNativeSessionController.ItemScope(turnID: "turn", itemID: "assistant")
+        let (provider, spy) = makeProviderWithSpy(events: [
+            .canonicalAssistantDelta(text: "hel", scope: scope),
+            .assistantCompleted(.init(scope: scope, text: "hello")),
+            .turnCompleted(turnID: "turn", status: .completed)
+        ])
+
+        let stream = try await provider.streamMessage(
+            AIMessage(systemPrompt: "", userMessage: "Refactor the login flow"),
+            model: .codexCustom(name: "test-model")
+        )
+        _ = try await drain(stream)
+
+        // Title is applied after the thread is created and before the user turn starts.
+        XCTAssertEqual(spy.recordedEvents, [
+            .startOrResume(threadID: "thread"),
+            .setThreadName(name: "Refactor the login flow", threadID: "thread"),
+            .startUserTurn
+        ])
+    }
+
+    /// Regression guard: through the production packaging path (`buildAIMessage`, which
+    /// wraps the last user entry in `<user_instructions>`), the title must still be the raw
+    /// user text — not the `<user_instructions>` envelope line.
+    func testTitleSourcedFromRawUserMessageThroughProductionPackaging() async throws {
+        let scope = CodexNativeSessionController.ItemScope(turnID: "turn", itemID: "assistant")
+        let (provider, spy) = makeProviderWithSpy(events: [
+            .canonicalAssistantDelta(text: "hel", scope: scope),
+            .assistantCompleted(.init(scope: scope, text: "hello")),
+            .turnCompleted(turnID: "turn", status: .completed)
+        ])
+
+        let packaged = PromptPackagingService.buildAIMessage(
+            systemPrompt: "",
+            metaInstructions: [],
+            fileTree: "",
+            fileContents: [],
+            gitDiff: nil,
+            conversation: [ConversationEntry(role: .user, content: "Refactor the login flow")],
+            temperature: nil,
+            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+            disabledPromptSections: []
+        )
+        let stream = try await provider.streamMessage(packaged, model: .codexCustom(name: "test-model"))
+        _ = try await drain(stream)
+
+        XCTAssertEqual(spy.setThreadNameCalls.count, 1)
+        XCTAssertEqual(spy.setThreadNameCalls.first?.name, "Refactor the login flow")
+        XCTAssertNotEqual(spy.setThreadNameCalls.first?.name, "<user_instructions>")
     }
 
     private func makeProvider(
@@ -238,14 +292,22 @@ private final class ScriptedCodexProviderController: CodexSessionControlling {
         true
     }
 
-    // Captures `setThreadName` calls instead of relying on the protocol-extension
-    // no-op. Production does not yet call `setThreadName`, so the assertions below
-    // fail RED with zero captured calls; an implementer wiring the call turns them green.
+    /// Captures `setThreadName` calls (instead of the protocol-extension no-op) plus a
+    /// unified lifecycle event log, so tests can assert ordering across the
+    /// startOrResume → setThreadName → startUserTurn sequence.
+    enum SpyEvent: Equatable {
+        case startOrResume(threadID: String?)
+        case setThreadName(name: String, threadID: String?)
+        case startUserTurn
+    }
+
+    var recordedEvents: [SpyEvent] = []
     var setThreadNameCalls: [(name: String, threadID: String?)] = []
     var setThreadNameShouldThrow: Bool = false
 
     func setThreadName(_ name: String, threadID: String?) async throws {
         setThreadNameCalls.append((name, threadID))
+        recordedEvents.append(.setThreadName(name: name, threadID: threadID))
         if setThreadNameShouldThrow {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
@@ -257,17 +319,19 @@ private final class ScriptedCodexProviderController: CodexSessionControlling {
         existing _: CodexNativeSessionController.SessionRef?,
         baseInstructions _: String
     ) async throws -> CodexNativeSessionController.SessionRef {
-        .init(conversationID: "thread", rolloutPath: nil, model: nil, reasoningEffort: nil)
+        recordedEvents.append(.startOrResume(threadID: "thread"))
+        return .init(conversationID: "thread", rolloutPath: nil, model: nil, reasoningEffort: nil)
     }
 
     func startUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        images: [AgentImageAttachment],
         model _: String?,
         reasoningEffort _: String?,
         serviceTier _: String?
     ) async throws -> CodexTurnStartReceipt {
-        .init(provisionalSubmissionID: "turn")
+        recordedEvents.append(.startUserTurn)
+        return .init(provisionalSubmissionID: "turn")
     }
 
     func steerUserTurn(

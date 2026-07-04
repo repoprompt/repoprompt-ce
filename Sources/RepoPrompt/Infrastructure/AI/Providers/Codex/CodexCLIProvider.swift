@@ -897,12 +897,10 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private static func freshThreadTitle(from aiMessage: AIMessage) -> String {
-        let lastUser = aiMessage.conversationMessages.last { $0.role == .user }?.content ?? ""
-        let firstLine = lastUser
-            .split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline })
-            .first
-            .map { String($0) }
-            ?? ""
+        // Source the title from the raw, pre-packaging last user message — not
+        // `conversationMessages`, whose last user entry is wrapped in `<user_instructions>`
+        // by `PromptPackagingService.buildAIMessage` on the production Chat path.
+        let firstLine = aiMessage.rawLastUserMessage.prefix { !$0.isNewline }
         return AgentSession.validatedName(String(firstLine.prefix(80)))
     }
 
