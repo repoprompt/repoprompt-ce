@@ -1,0 +1,6 @@
+interface:
+  display_name: "SwiftUI Specialist (Apple)"
+  short_description: "Apple's authoritative SwiftUI best practices, vendored from Xcode 27."
+  default_prompt: "Consult .agents/skills/swiftui-specialist/SKILL.md and the topic-relevant files in .agents/skills/swiftui-specialist/references/ before implementing or reviewing SwiftUI code."
+policy:
+  allow_implicit_invocation: false
