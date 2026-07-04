@@ -174,6 +174,47 @@ struct AgentInputBar: View {
     }
 }
 
+enum AgentModelPickerOpenRequestGuard {
+    static func shouldOpen(
+        notification: Notification,
+        composerWindowID: Int,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool,
+        modelControlsDisabled: Bool
+    ) -> Bool {
+        shouldOpen(
+            requestWindowID: windowID(from: notification.userInfo),
+            composerWindowID: composerWindowID,
+            composerCurrentTabID: composerCurrentTabID,
+            propsCurrentTabID: propsCurrentTabID,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            modelControlsDisabled: modelControlsDisabled
+        )
+    }
+
+    static func shouldOpen(
+        requestWindowID: Int?,
+        composerWindowID: Int,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool,
+        modelControlsDisabled: Bool
+    ) -> Bool {
+        guard requestWindowID == composerWindowID else { return false }
+        guard let composerCurrentTabID, composerCurrentTabID == propsCurrentTabID else { return false }
+        guard hasAvailableAgentProviders else { return false }
+        guard !modelControlsDisabled else { return false }
+        // Locked provider pickers still open on click to show the lock message;
+        // shortcut requests intentionally match that behavior.
+        return true
+    }
+
+    private static func windowID(from userInfo: [AnyHashable: Any]?) -> Int? {
+        userInfo?["windowID"] as? Int
+    }
+}
+
 enum AgentFileMentionText {
     static func attachmentDisplayName(for suggestion: MentionSuggestion) -> String {
         let trimmedPath = suggestion.relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -263,6 +304,7 @@ struct AgentComposerView: View, Equatable {
     @State private var showClaudeToolsPopover: Bool = false
     @State private var steeringUnsupportedMessage: String? = nil
     @State private var steeringUnsupportedDismissTask: Task<Void, Never>?
+    @State private var modelPickerOpenRequestCount: Int = 0
     @State private var modelMenuSnapshotByAgent: [AgentProviderKind: [AgentModelOption]]? = nil
     @State private var modelMenuSnapshotReleaseTask: Task<Void, Never>? = nil
 
@@ -523,6 +565,17 @@ struct AgentComposerView: View, Equatable {
             if !event.message.isEmpty {
                 showSteeringUnsupportedNotice(event.message)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showAgentModelPicker)) { notification in
+            guard AgentModelPickerOpenRequestGuard.shouldOpen(
+                notification: notification,
+                composerWindowID: windowID,
+                composerCurrentTabID: currentTabID,
+                propsCurrentTabID: props.currentTabID,
+                hasAvailableAgentProviders: props.hasAvailableAgentProviders,
+                modelControlsDisabled: modelControlsDisabled
+            ) else { return }
+            modelPickerOpenRequestCount += 1
         }
         .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: $isImageDropTargeted, perform: handleImageDrop(providers:))
         .overlay(imageDropOutline)
@@ -790,6 +843,7 @@ struct AgentComposerView: View, Equatable {
         StableMenuButton(
             items: agentProviderModelMenuItems,
             triggerStyle: .plain,
+            openRequestCount: modelPickerOpenRequestCount,
             onOpen: captureModelMenuSnapshot
         ) {
             HStack(spacing: 4) {
