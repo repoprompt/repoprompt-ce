@@ -720,9 +720,12 @@ struct AgentMCPStartWorktreeCoordinator {
     }
 
     private func fallbackLabel(for worktree: GitWorktreeDescriptor) -> String? {
-        if let name = worktree.name, !name.isEmpty { return name }
-        if let branch = worktree.branch, !branch.isEmpty { return branch }
-        return worktree.isMain ? "main" : nil
+        GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+            sessionName: nil,
+            worktreeName: worktree.name,
+            branch: worktree.branch,
+            isMain: worktree.isMain
+        )
     }
 
     private func standardizedPath(_ path: String) -> String {

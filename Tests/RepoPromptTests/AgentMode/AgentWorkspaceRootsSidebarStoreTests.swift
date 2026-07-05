@@ -339,6 +339,74 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertNil(indicator.missingWorktreePath)
     }
 
+    func testWorktreeDisplayLabelHumanizesAppManagedAgentNames() {
+        let cases: [(raw: String, expected: String)] = [
+            ("rp-agent-1a98df1a-agent", "1a98df1a"),
+            ("rp-agent-1a98df1a-fix-login", "fix-login"),
+            ("rp-agent-1a98df1a-fix-login-abcdef12", "fix-login"),
+            ("rp-agent-1a98df1a-fix-login-abcdef12-2", "fix-login"),
+            ("rp/agent/1a98df1a-fix-login", "fix-login"),
+            ("team-feature-worktree", "team-feature-worktree")
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                GitWorktreeDisplayLabelHumanizer.displayLabel(for: testCase.raw),
+                testCase.expected,
+                testCase.raw
+            )
+        }
+    }
+
+    func testIndicatorHumanizesMachineFallbackWhileKeepingRawNameAccessible() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(
+                visualLabel: nil,
+                visualColorHex: nil,
+                worktreeName: "rp-agent-1a98df1a-agent",
+                branch: nil
+            ),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#112233"),
+            isAvailable: true
+        )
+
+        XCTAssertEqual(indicator.label, "1a98df1a")
+        XCTAssertEqual(indicator.rawLabel, "rp-agent-1a98df1a-agent")
+        XCTAssertEqual(indicator.capsuleText, "WT 1a98df1a")
+        XCTAssertTrue(indicator.tooltipText.contains("rp-agent-1a98df1a-agent"))
+        XCTAssertTrue(indicator.accessibilityText.contains("rp-agent-1a98df1a-agent"))
+    }
+
+    func testWorktreeVisualIdentitySeedPrefersMeaningfulSessionNameThenHumanizedWorktreeFallback() {
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: "  Implement login polish for sidebar  ",
+                worktreeName: "rp-agent-1a98df1a-agent",
+                branch: nil,
+                isMain: false
+            ),
+            "Implement login polish"
+        )
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: "New Chat",
+                worktreeName: "rp-agent-1a98df1a-fix-login-abcdef12-3",
+                branch: nil,
+                isMain: false
+            ),
+            "fix-login"
+        )
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: nil,
+                worktreeName: nil,
+                branch: "rp/agent/1a98df1a-agent",
+                isMain: false
+            ),
+            "1a98df1a"
+        )
+    }
+
     private func makeSummary(
         visualLabel: String? = "feature-x",
         visualColorHex: String? = "#123456",

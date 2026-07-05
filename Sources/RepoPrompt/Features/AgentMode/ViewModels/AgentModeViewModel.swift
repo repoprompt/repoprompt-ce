@@ -5824,7 +5824,12 @@ final class AgentModeViewModel: ObservableObject {
             guard sessions[session.tabID] === session, session.worktreeBindings == previousBindings else {
                 throw ExecutionLocationTransitionError.stale
             }
-            let fallbackLabel = worktree.name ?? worktree.branch ?? (worktree.isMain ? "main" : nil)
+            let fallbackLabel = GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: resolvedSessionDisplayName(for: session.tabID),
+                worktreeName: worktree.name,
+                branch: worktree.branch,
+                isMain: worktree.isMain
+            )
             let identity = try GlobalSettingsStore.shared.ensureWorktreeVisualIdentity(
                 repositoryID: worktree.repository.repositoryID,
                 worktreeID: worktree.worktreeID,
@@ -11562,7 +11567,12 @@ final class AgentModeViewModel: ObservableObject {
             else {
                 throw locationBindingFailure(Self.staleComposerSubmitTargetMessage)
             }
-            let label = worktree.name ?? worktree.branch ?? (worktree.isMain ? "main" : nil)
+            let label = GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: resolvedSessionDisplayName(for: session.tabID),
+                worktreeName: worktree.name,
+                branch: worktree.branch,
+                isMain: worktree.isMain
+            )
             let identity = try GlobalSettingsStore.shared.ensureWorktreeVisualIdentity(
                 repositoryID: worktree.repository.repositoryID,
                 worktreeID: worktree.worktreeID,
