@@ -584,26 +584,44 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(captured["test_bundles"], bundles)
         self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
 
-    def test_main_rejects_single_discovered_bundle_for_mismatched_suite_targets(self) -> None:
-        output = io.StringIO()
+    def test_main_uses_single_discovered_bundle_for_all_suite_targets(self) -> None:
+        # SwiftPM emits one combined ``<PackageName>PackageTests.xctest`` bundle
+        # whose name does not match any individual test target, so a single
+        # discovered bundle must be used for every suite regardless of name.
+        captured: dict[str, object] = {}
+
+        def fake_run_all_suites(suites, **kwargs):
+            captured["suites"] = list(suites)
+            captured["test_bundle"] = kwargs["test_bundle"]
+            captured["test_bundles"] = kwargs["test_bundles"]
+            captured["xctest_binary"] = kwargs["xctest_binary"]
+            return 0
+
         with (
             mock.patch.object(
                 ci_app_test_runner,
                 "list_suites",
-                return_value=["RepoPromptWorkspaceTests.B"],
+                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
             ),
             mock.patch.object(
                 ci_app_test_runner,
                 "discover_test_bundles",
-                return_value={"RepoPromptTests": Path("/fake/RepoPromptTests.xctest")},
+                return_value={"RepoPromptCEPackageTests": Path("/fake/RepoPromptCEPackageTests.xctest")},
             ),
             mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
-            mock.patch("sys.stdout", output),
+            mock.patch.object(ci_app_test_runner, "run_all_suites", side_effect=fake_run_all_suites),
         ):
             exit_code = ci_app_test_runner.main([])
 
-        self.assertEqual(exit_code, 1)
-        self.assertIn("No XCTest bundle found for suite target RepoPromptWorkspaceTests", output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            captured["suites"], ["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"]
+        )
+        self.assertEqual(
+            captured["test_bundle"], Path("/fake/RepoPromptCEPackageTests.xctest")
+        )
+        self.assertIsNone(captured["test_bundles"])
+        self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
 
     def test_main_rejects_bundle_name_when_list_contains_other_targets(self) -> None:
         output = io.StringIO()

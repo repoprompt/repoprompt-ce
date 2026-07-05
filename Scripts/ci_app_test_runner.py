@@ -674,12 +674,13 @@ def main(argv: list[str]) -> int:
         else:
             discovered = discover_test_bundles(args.swift_binary, args.cwd)
             if len(discovered) == 1:
-                suite_targets = {test_target_for_suite(suite) for suite in suites}
-                discovered_target = next(iter(discovered))
-                if suite_targets == {discovered_target}:
-                    test_bundle = next(iter(discovered.values()))
-                else:
-                    test_bundles = discovered
+                # SwiftPM emits a single combined XCTest bundle named
+                # ``<PackageName>PackageTests.xctest`` that contains every test
+                # target's compiled tests, so the bundle filename does not match
+                # any individual test target name. Use the single bundle for all
+                # suites directly; per-target routing only matters when multiple
+                # bundles are discovered.
+                test_bundle = next(iter(discovered.values()))
             elif discovered:
                 test_bundles = discovered
     xctest_binary = xctest_binary_path() if test_bundle is not None or test_bundles else None
