@@ -5,8 +5,10 @@ import XCTest
 
 final class FileSystemServiceRecoveryTests: XCTestCase {
     private var temporaryRoots = FileSystemTemporaryRoots()
+    private var cancellables = Set<AnyCancellable>()
 
     override func tearDownWithError() throws {
+        cancellables.removeAll()
         temporaryRoots.removeAll()
         try super.tearDownWithError()
     }
@@ -83,7 +85,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertNil(state.lastScannedEventIdByFolder["Sources/Nested"])
             XCTAssertNil(state.lastVerifiedAtByFolder["Sources/Nested"])
             XCTAssertNil(state.fileEventCountSinceLastScan["Sources/Nested"])
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         func testFolderScanCapSchedulesQuietFollowUpBatchesThroughAcceptedWatermark() async throws {
@@ -211,7 +213,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertEqual(fullResyncPublication.source, .recoveryFullResync)
             XCTAssertEqual(fullResyncPublication.watcherAcceptedWatermark, accepted)
             XCTAssertTrue(fullResyncPublication.deltas.contains(.fileAdded("A/recovered.txt")))
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         func testParallelScanFailureRestoresStateBeforeSerialFallback() async throws {
@@ -501,7 +503,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
                 }
                 XCTAssertTrue(publications.snapshot().isEmpty)
                 await service.abortSeededPreparation(initializationID: initializationID)
-                withExtendedLifetime(cancellable) {}
+                cancellables.insert(cancellable)
             }
         }
 
@@ -553,7 +555,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertEqual(publication.lastServicePublicationSequence, 0)
             XCTAssertEqual(publication.lastPublishedWatcherAcceptedWatermark, .zero)
             await service.abortSeededPreparation(initializationID: initializationID)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         private final class LockedPublications: @unchecked Sendable {

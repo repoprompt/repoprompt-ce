@@ -5,8 +5,10 @@ import XCTest
 
 final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
     private var temporaryRoots = FileSystemTemporaryRoots()
+    private var cancellables = Set<AnyCancellable>()
 
     override func tearDownWithError() throws {
+        cancellables.removeAll()
         temporaryRoots.removeAll()
         try super.tearDownWithError()
     }
@@ -48,7 +50,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertTrue(snapshot[1].deltas.isEmpty)
         let queuedAfterSecondCut = await service.watcherIngressMailboxSnapshotForTesting()
         XCTAssertEqual(queuedAfterSecondCut.queuedRawEntryCount, 0)
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testNoDeltaAcceptedPayloadAdvancesPublishedWatcherWatermark() async throws {
@@ -71,7 +73,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertEqual(publication.watcherAcceptedWatermark, accepted)
         XCTAssertTrue(publication.deltas.isEmpty)
         XCTAssertEqual(serviceState.lastPublishedWatcherAcceptedWatermark, accepted)
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testIgnoredEventsBeyondMailboxCapAreFilteredBeforeOverflow() async throws {
@@ -203,7 +205,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertEqual(publication.watcherAcceptedWatermark, highest)
         let serviceState = await service.publicationStateForTesting()
         XCTAssertEqual(serviceState.lastPublishedWatcherAcceptedWatermark, highest)
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testFlushWaitsForInFlightWatcherBatchBeforePublishingAcceptedCut() async throws {
@@ -240,7 +242,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertGreaterThan(sequence, 0)
         XCTAssertEqual(publication.watcherAcceptedWatermark, accepted)
         await service.setWatcherBatchWillProcessHandlerForTesting(nil)
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testMailboxOverflowPreservesIgnoreChangeAlreadyBufferedOnActor() async throws {
@@ -321,7 +323,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertEqual(publication.source, .syntheticMutation)
         XCTAssertNil(publication.watcherAcceptedWatermark)
         XCTAssertEqual(publication.servicePublicationSequence, sequence)
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testPausedMailboxAcceptsMonotonicRangeWithoutSchedulingUntilResume() async throws {
@@ -438,7 +440,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let serviceState = await service.publicationStateForTesting()
         XCTAssertGreaterThanOrEqual(serviceState.lastPublishedWatcherAcceptedWatermark, postCutDrainTarget)
         await service.stopWatchingForChanges()
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testSeedReplayRejectsCollapsedMailboxRangeBeforePublication() async throws {
@@ -477,7 +479,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let cleaned = await service.watcherIngressMailboxSnapshotForTesting()
         XCTAssertFalse(cleaned.isAutomaticDrainPaused)
         XCTAssertEqual(cleaned.queuedPayloadCount, 0)
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testSeedReplayTeardownCannotSynthesizeSuccessfulBarrier() async throws {
@@ -510,7 +512,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
             XCTAssertEqual(error, .initializationNotCurrent)
         }
         XCTAssertTrue(publications.snapshot().isEmpty)
-        withExtendedLifetime(cancellable) {}
+        cancellables.insert(cancellable)
     }
 
     func testSyntheticPathReplayUsesBoundedSpillWorkingSet() throws {

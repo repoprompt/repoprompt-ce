@@ -4004,6 +4004,49 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
     }
 
+    private final class SocketPairResponseWaiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String, Error>?
+
+        init(_ continuation: CheckedContinuation<String, Error>) {
+            self.continuation = continuation
+        }
+
+        func resume(returning value: String) {
+            take()?.resume(returning: value)
+        }
+
+        func resume(throwing error: Error) {
+            take()?.resume(throwing: error)
+        }
+
+        private func take() -> CheckedContinuation<String, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            defer { continuation = nil }
+            return continuation
+        }
+    }
+
+    private final class SocketPairResponseWaiterHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var waiter: SocketPairResponseWaiter?
+
+        func install(_ waiter: SocketPairResponseWaiter) {
+            lock.lock()
+            self.waiter = waiter
+            lock.unlock()
+        }
+
+        func resume(throwing error: Error) {
+            lock.lock()
+            let waiter = waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume(throwing: error)
+        }
+    }
+
     private final class SocketPairJSONRPCClient: @unchecked Sendable {
         enum ClientError: Error {
             case closed
@@ -4060,37 +4103,45 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         private func response(matching expectedID: Int) async throws -> String {
-            try await withCheckedThrowingContinuation { continuation in
-                queue.async {
-                    do {
-                        while true {
-                            let line = try self.readLine()
-                            let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
-                            guard let object else { throw ClientError.invalidResponse }
-                            if let rawID = object["id"] {
-                                guard let responseID = (rawID as? NSNumber)?.intValue else {
+            let waiterHolder = SocketPairResponseWaiterHolder()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    let responseWaiter = SocketPairResponseWaiter(continuation)
+                    waiterHolder.install(responseWaiter)
+                    queue.async {
+                        do {
+                            while true {
+                                let line = try self.readLine()
+                                let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
+                                guard let object else { throw ClientError.invalidResponse }
+                                if let rawID = object["id"] {
+                                    guard let responseID = (rawID as? NSNumber)?.intValue else {
+                                        throw ClientError.invalidResponse
+                                    }
+                                    guard responseID == expectedID else {
+                                        throw ClientError.invalidResponse
+                                    }
+                                    guard let rawJSON = String(data: line, encoding: .utf8) else {
+                                        throw ClientError.invalidResponse
+                                    }
+                                    responseWaiter.resume(returning: rawJSON)
+                                    return
+                                }
+                                guard object["method"] as? String != nil,
+                                      let rawJSON = String(data: line, encoding: .utf8)
+                                else {
                                     throw ClientError.invalidResponse
                                 }
-                                guard responseID == expectedID else {
-                                    throw ClientError.invalidResponse
-                                }
-                                guard let rawJSON = String(data: line, encoding: .utf8) else {
-                                    throw ClientError.invalidResponse
-                                }
-                                continuation.resume(returning: rawJSON)
-                                return
+                                self.nonMatchingFrames.append(rawJSON)
                             }
-                            guard object["method"] as? String != nil,
-                                  let rawJSON = String(data: line, encoding: .utf8)
-                            else {
-                                throw ClientError.invalidResponse
-                            }
-                            self.nonMatchingFrames.append(rawJSON)
+                        } catch {
+                            responseWaiter.resume(throwing: error)
                         }
-                    } catch {
-                        continuation.resume(throwing: error)
                     }
                 }
+            } onCancel: {
+                waiterHolder.resume(throwing: CancellationError())
+                close()
             }
         }
 

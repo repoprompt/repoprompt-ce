@@ -23,6 +23,8 @@ private actor UUIDRecorder {
 }
 
 final class WorkspaceFileContextStoreTests: XCTestCase {
+    private var cancellables = Set<AnyCancellable>()
+
     func testRootLoadIndexesFilesFoldersReadsContentAndLooksUpPaths() async throws {
         let rootA = try makeTemporaryRoot(name: "RootA")
         let rootB = try makeTemporaryRoot(name: "RootB")
@@ -720,7 +722,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await service.setMutationIOWillBeginHandlerForTesting(nil)
             await store.stopWatchingRoot(id: record.id)
-            withExtendedLifetime(publicationCancellable) {}
+            cancellables.insert(publicationCancellable)
 
             let postTokenRoot = try makeTemporaryRoot(name: "CancelledOverwriteAfterDeferredToken")
             let postTokenFileURL = postTokenRoot.appendingPathComponent("PostToken.swift")
@@ -776,7 +778,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await postTokenStore.setStoreEditDeferredPublicationDidRegisterHandlerForTesting(nil)
             await postTokenStore.stopWatchingRoot(id: postTokenRecord.id)
-            withExtendedLifetime(postTokenCancellable) {}
+            cancellables.insert(postTokenCancellable)
         }
 
         func testCancelledMoveDeleteAndTrashSettleBeforeIOAndReconcileAfterCompletion() async throws {
@@ -5218,7 +5220,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(directPublications.flatMap(\.deltas).count, 1, caseLabel)
             let pendingAfterDirectEdit = await serviceB.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterDirectEdit, 0, caseLabel)
-            withExtendedLifetime((cancellableA, cancellableB)) {}
+            cancellables.insert(cancellableA)
+            cancellables.insert(cancellableB)
         }
 
         do {
@@ -5244,7 +5247,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(publications.snapshot().isEmpty, caseLabel)
             let pendingAfterMissingEdit = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterMissingEdit, 0, caseLabel)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         do {
@@ -5275,7 +5278,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(managedOnlyPublications.flatMap(\.deltas).count, 1, caseLabel)
             let pendingAfterManagedOnlyEdit = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterManagedOnlyEdit, 0, caseLabel)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         do {
@@ -5322,7 +5325,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let pendingAfterStaleLifetime = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterStaleLifetime, 0, caseLabel)
             await service.setMutationIOWillBeginHandlerForTesting(nil)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
     }
 

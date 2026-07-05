@@ -25,6 +25,7 @@ import XCTest
                     let logicalRoot = fixture.contextA.rootURL
                     let logicalFile = fixture.contextA.fileURL
                     let gitFixture = try ReviewGitRepositoryFixture(name: "ContextBuilderPublishedWorktree")
+                    defer { gitFixture.cleanup() }
                     try initializeGitRepository(at: logicalRoot, using: gitFixture)
                     await markGitDirectoryObserved(fixture.contextA)
                     let worktreeRoot = try gitFixture.makeLinkedWorktree(
