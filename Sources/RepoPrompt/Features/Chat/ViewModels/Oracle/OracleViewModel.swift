@@ -499,34 +499,41 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     private func updateUpcomingInputTokenText() {
-        // Cancel any previous run
-        upcomingTokenEstimateTask?.cancel()
+        if upcomingTokenEstimateTask != nil {
+            upcomingTokenEstimatePending = true
+            return
+        }
 
-        // Quick snapshot
-        let inputTextSnap = inputText
-        let promptTextTokensSnap = TokenCalculationService.estimateTokens(for: promptViewModel.promptText)
-        let duplicateFactorSnap = promptViewModel.duplicateUserInstructionsAtTop ? 2 : 1
+        let task = Task.detached { [weak self] in
+            // Coalesce restore/message bursts before snapshotting conversation state.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
 
-        // Capture conversation entries on the MainActor so we avoid hops later
-        let entriesSnap = currentSessionID.map { buildConversationEntries(for: $0) } ?? []
-
-        let task = Task.detached { [weak self, entriesSnap] in
-            guard let self else { return }
-
-            // Use chat preset's configuration for accurate token count
-            let basePromptTokensSnap = await promptViewModel.calculateTokensForChatContext()
+            let snapshot = await MainActor.run { [weak self] in
+                guard let self else { return nil as UpcomingTokenEstimateSnapshot? }
+                return UpcomingTokenEstimateSnapshot(
+                    inputText: inputText,
+                    promptTextTokens: TokenCalculationService.estimateTokens(for: promptViewModel.promptText),
+                    duplicateFactor: promptViewModel.duplicateUserInstructionsAtTop ? 2 : 1,
+                    basePromptTokens: promptViewModel.totalTokenCount,
+                    entries: currentSessionID.map { self.buildConversationEntries(for: $0) } ?? []
+                )
+            }
+            guard let snapshot else { return }
 
             // History tokens (only the portion that will be re-sent)
-            let historyTokens = entriesSnap.reduce(0) {
+            let historyTokens = snapshot.entries.reduce(0) {
                 $0 + TokenCalculationService.estimateTokens(for: $1.content)
             }
 
             // User input
-            let inputTokens = TokenCalculationService.estimateTokens(for: inputTextSnap)
+            let inputTokens = TokenCalculationService.estimateTokens(for: snapshot.inputText)
 
-            // Base prompt minus duplicated user-instruction section(s)
-            var basePrompt = basePromptTokensSnap
-            basePrompt -= promptTextTokensSnap * duplicateFactorSnap
+            // Base prompt minus duplicated user-instruction section(s). Use the prompt view
+            // model's cached token count: this estimate runs often while typing/restoring
+            // sessions and must not rebuild clipboard/context from scratch.
+            var basePrompt = snapshot.basePromptTokens
+            basePrompt -= snapshot.promptTextTokens * snapshot.duplicateFactor
             basePrompt = max(basePrompt, 0)
 
             // Grand total
@@ -540,18 +547,31 @@ class OracleViewModel: ObservableObject {
             }
             let display = "Next msg: ~\(fmt(total))k tokens"
 
-            await MainActor.run {
-                self.upcomingInputTokenText = display
-                // done
-                self.upcomingTokenEstimateTask = nil
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                upcomingInputTokenText = display
+                upcomingTokenEstimateTask = nil
+                if upcomingTokenEstimatePending {
+                    upcomingTokenEstimatePending = false
+                    updateUpcomingInputTokenText()
+                }
             }
         }
         upcomingTokenEstimateTask = task
     }
 
+    private struct UpcomingTokenEstimateSnapshot {
+        let inputText: String
+        let promptTextTokens: Int
+        let duplicateFactor: Int
+        let basePromptTokens: Int
+        let entries: [ConversationEntry]
+    }
+
     // NEW: keep references to background calculations so we can cancel them
     private var latestTokenCountsTask: Task<Void, Never>?
     private var upcomingTokenEstimateTask: Task<Void, Never>?
+    private var upcomingTokenEstimatePending = false
 
     /// Store Combine cancellables
     private var cancellables = Set<AnyCancellable>()
@@ -1045,7 +1065,8 @@ class OracleViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Refresh estimate when promptVM finishes heavy token recomputation
+        // Refresh estimate when promptVM finishes heavy token recomputation. The estimate uses
+        // cached prompt totals, so this no longer feeds back into a full clipboard rebuild.
         promptViewModel.tokenCalculationCompletedPublisher
             .sink { [weak self] _ in
                 self?.updateUpcomingInputTokenText()
