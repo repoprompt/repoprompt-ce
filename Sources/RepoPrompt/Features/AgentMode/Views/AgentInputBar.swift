@@ -1117,12 +1117,13 @@ struct AgentComposerView: View, Equatable {
                 HStack(spacing: 4) {
                     Text(props.selectedReasoningEffortDisplayName)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    Image(systemName: "chevron.down")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+                        .foregroundColor(.secondary)
                 }
-                .foregroundColor(.secondary)
+                .foregroundColor(.primary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(pickerChipColor)
-                .cornerRadius(4)
             }
             .disabled(efforts.isEmpty || modelControlsDisabled)
             .opacity(modelControlsDisabled ? 0.55 : 1.0)
@@ -1156,12 +1157,13 @@ struct AgentComposerView: View, Equatable {
                 HStack(spacing: 4) {
                     Text(claudeTools.effortLevel.displayName)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    Image(systemName: "chevron.down")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+                        .foregroundColor(.secondary)
                 }
-                .foregroundColor(.secondary)
+                .foregroundColor(.primary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(pickerChipColor)
-                .cornerRadius(4)
             }
             .disabled(modelControlsDisabled || efforts.isEmpty)
             .opacity(modelControlsDisabled ? 0.55 : 1.0)
