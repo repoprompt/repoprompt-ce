@@ -783,19 +783,9 @@ final class CodexNativeSessionController {
         notificationTask?.cancel()
         serverRequestTask?.cancel()
         finishEventsStreamIfNeeded()
-        if clientShutdownBehavior == .stopOnShutdown || expectedMCPClientName != nil {
-            let ownedClient = client
-            let shouldStopClient = clientShutdownBehavior == .stopOnShutdown
-            let shouldClearExpectedPID = expectedMCPClientName != nil
-            Task {
-                if shouldClearExpectedPID {
-                    await ownedClient.clearExpectedAgentPIDRegistration()
-                }
-                if shouldStopClient {
-                    await ownedClient.stop()
-                }
-            }
-        }
+        // Deterministic cleanup is performed by shutdown(). If a controller is
+        // dropped without shutdown, CodexAppServerClient owns the last-resort
+        // transport cleanup in its deinit without retaining this controller.
     }
 
     private func withEventsStateLock<T>(_ body: () -> T) -> T {

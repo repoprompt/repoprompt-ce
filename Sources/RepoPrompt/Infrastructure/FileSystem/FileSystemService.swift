@@ -26,6 +26,14 @@ struct FileSystemMutationWaiter {
     let continuation: CheckedContinuation<Void, any Error>
 }
 
+final class FileSystemServiceFSEventCallbackContext {
+    weak var service: FileSystemService?
+
+    init(service: FileSystemService) {
+        self.service = service
+    }
+}
+
 actor FileSystemService {
     // Internal for FileSystemService same-target extensions only.
     // These are not public API; preserve actor isolation when accessing them.
@@ -219,8 +227,9 @@ actor FileSystemService {
         var freshnessMaxWatcherBatchSize = 0
     #endif
 
-    /// Retained pointer to self (to avoid deallocation while FSEvent stream is active)
-    var selfPointer: UnsafeMutableRawPointer?
+    /// Retained FSEvent callback context. The context holds the service weakly so an
+    /// un-stopped stream cannot keep the actor alive forever.
+    var fseventCallbackContextPointer: UnsafeMutableRawPointer?
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules
@@ -242,6 +251,10 @@ actor FileSystemService {
 
     var standardizedRootPath: String {
         rootURL.path
+    }
+
+    deinit {
+        stopFSEventStream()
     }
 
     var respectRepoIgnore: Bool

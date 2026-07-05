@@ -337,11 +337,13 @@ extension FileSystemService {
         guard fseventStreamRef == nil else { return }
 
         watcherIngressMailbox.startAccepting()
-        selfPointer = Unmanaged.passRetained(self).toOpaque()
+        fseventCallbackContextPointer = Unmanaged.passRetained(
+            FileSystemServiceFSEventCallbackContext(service: self)
+        ).toOpaque()
 
         var streamContext = FSEventStreamContext(
             version: 0,
-            info: selfPointer,
+            info: fseventCallbackContextPointer,
             retain: nil,
             release: nil,
             copyDescription: nil
@@ -380,11 +382,7 @@ extension FileSystemService {
         #endif
 
         guard let stream = fseventStreamRef else {
-            // Release the retained self if creation failed to avoid leaks
-            if let ptr = selfPointer {
-                Unmanaged<FileSystemService>.fromOpaque(ptr).release()
-                selfPointer = nil
-            }
+            releaseFSEventCallbackContext()
             resetWatcherIngressState()
             throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
         }
@@ -400,10 +398,7 @@ extension FileSystemService {
             FSEventStreamInvalidate(stream)
             FSEventStreamRelease(stream)
             fseventStreamRef = nil
-            if let ptr = selfPointer {
-                Unmanaged<FileSystemService>.fromOpaque(ptr).release()
-                selfPointer = nil
-            }
+            releaseFSEventCallbackContext()
             resetWatcherIngressState()
             throw FileSystemWatcherActivationError.streamStartFailed(path: path)
         }
@@ -422,10 +417,7 @@ extension FileSystemService {
             FSEventStreamRelease(stream)
             fseventStreamRef = nil
 
-            if let ptr = selfPointer {
-                Unmanaged<FileSystemService>.fromOpaque(ptr).release()
-                selfPointer = nil
-            }
+            releaseFSEventCallbackContext()
 
             fileSystemDebugLog("FSEventStream stopped for path: \(path)")
         } else {
@@ -433,6 +425,12 @@ extension FileSystemService {
         }
 
         resetWatcherIngressState()
+    }
+
+    private func releaseFSEventCallbackContext() {
+        guard let ptr = fseventCallbackContextPointer else { return }
+        fseventCallbackContextPointer = nil
+        Unmanaged<FileSystemServiceFSEventCallbackContext>.fromOpaque(ptr).release()
     }
 
     nonisolated static func deepCopySwiftString(_ source: String) -> String {
@@ -515,7 +513,10 @@ extension FileSystemService {
         _, context, numEvents, eventPaths, eventFlags, eventIds in
         // Context must be valid
         guard let context else { return }
-        let service = Unmanaged<FileSystemService>.fromOpaque(context).takeUnretainedValue()
+        let callbackContext = Unmanaged<FileSystemServiceFSEventCallbackContext>
+            .fromOpaque(context)
+            .takeUnretainedValue()
+        guard let service = callbackContext.service else { return }
 
         let count = Int(numEvents)
         guard count > 0 else { return }

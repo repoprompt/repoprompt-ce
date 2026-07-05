@@ -326,6 +326,10 @@ actor CodexAppServerClient {
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
 
+    deinit {
+        emergencyTerminateTransportForDeinit()
+    }
+
     init(
         writeFrameHandler: @escaping @Sendable (Int32, Data) throws -> Void = { descriptor, frame in
             try FDWriteSupport.writeAll(frame, to: descriptor)
@@ -618,6 +622,58 @@ actor CodexAppServerClient {
         guard let terminatingTransport else { return }
         Task {
             await self.finishTransportTermination(terminatingTransport)
+        }
+    }
+
+    private func emergencyTerminateTransportForDeinit() {
+        startupTask?.task.cancel()
+        startupTask = nil
+        stdoutChunkChannel?.finish()
+        stderrChunkChannel?.finish()
+        stdoutConsumerTask?.cancel()
+        stderrConsumerTask?.cancel()
+        stdoutChunkChannel = nil
+        stderrChunkChannel = nil
+        stdoutConsumerTask = nil
+        stderrConsumerTask = nil
+        for task in timeoutTasks.values {
+            task.cancel()
+        }
+        timeoutTasks.removeAll()
+        let requests = pendingRequests
+        pendingRequests.removeAll()
+        pendingRequestMetadata.removeAll()
+        for continuation in requests.values {
+            continuation.resume(throwing: ClientError.processNotRunning)
+        }
+        for continuation in notificationContinuations.values {
+            continuation.finish()
+        }
+        notificationContinuations.removeAll()
+        for continuation in serverRequestContinuations.values {
+            continuation.finish()
+        }
+        serverRequestContinuations.removeAll()
+        let expectedAgentPIDToClear = registeredExpectedAgentPID
+        registeredExpectedAgentPID = nil
+        if let expectedAgentPIDToClear {
+            let registrar = expectedAgentPIDRegistrar
+            Task.detached {
+                await registrar.clear(
+                    expectedAgentPIDToClear.pid,
+                    expectedAgentPIDToClear.clientName,
+                    expectedAgentPIDToClear.runID
+                )
+            }
+        }
+        guard let process else { return }
+        self.process = nil
+        process.stdout.readabilityHandler = nil
+        process.stderr.readabilityHandler = nil
+        process.stdin?.closeFile()
+        let pid = process.pid
+        Task.detached {
+            _ = await ProcessTermination.terminateAndReap(pid: pid)
         }
     }
 
