@@ -671,6 +671,7 @@ struct AgentWorkspaceRootsSectionView: View {
         .overlay(
             Capsule().strokeBorder(tint.opacity(worktree.isAvailable ? 0.55 : 0.7), lineWidth: 0.75)
         )
+        .fixedSize(horizontal: true, vertical: true)
     }
 
     // MARK: - Merge Attention Capsule
