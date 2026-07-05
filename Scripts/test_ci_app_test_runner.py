@@ -318,6 +318,35 @@ class CIAppTestRunnerTests(unittest.TestCase):
         )
         self.assertIsNone(ci_app_test_runner.bundle_for_suite("MissingTarget.Tests", bundles))
 
+    def test_target_bundles_for_suites_ignores_stale_bundles_when_targets_covered(self) -> None:
+        bundles = {
+            "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
+            "RepoPromptCEPackageTests": Path("/fake/RepoPromptCEPackageTests.xctest"),
+            "StaleTests": Path("/fake/StaleTests.xctest"),
+        }
+
+        self.assertEqual(
+            ci_app_test_runner.target_bundles_for_suites(
+                bundles,
+                ["RepoPromptTests.A", "RepoPromptTests.B"],
+            ),
+            {"RepoPromptTests": Path("/fake/RepoPromptTests.xctest")},
+        )
+
+    def test_package_test_bundle_selects_unambiguous_combined_swiftpm_bundle(self) -> None:
+        bundle = Path("/fake/RepoPromptCEPackageTests.xctest")
+        self.assertEqual(
+            ci_app_test_runner.package_test_bundle({
+                "RepoPromptCEPackageTests": bundle,
+                "StaleTests": Path("/fake/StaleTests.xctest"),
+            }),
+            bundle,
+        )
+        self.assertIsNone(ci_app_test_runner.package_test_bundle({
+            "OnePackageTests": Path("/fake/OnePackageTests.xctest"),
+            "TwoPackageTests": Path("/fake/TwoPackageTests.xctest"),
+        }))
+
     def test_create_suite_process_uses_xctest_when_bundle_provided(self) -> None:
         captured_args: list[list[str]] = []
 
@@ -585,6 +614,45 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(captured["test_bundles"], bundles)
         self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
 
+    def test_main_prefers_combined_package_bundle_when_cache_contains_stale_bundle(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run_all_suites(suites, **kwargs):
+            captured["suites"] = list(suites)
+            captured["test_bundle"] = kwargs["test_bundle"]
+            captured["test_bundles"] = kwargs["test_bundles"]
+            captured["xctest_binary"] = kwargs["xctest_binary"]
+            return 0
+
+        with (
+            mock.patch.object(
+                ci_app_test_runner,
+                "list_suites",
+                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+            ),
+            mock.patch.object(
+                ci_app_test_runner,
+                "discover_test_bundles",
+                return_value={
+                    "RepoPromptCEPackageTests": Path("/fake/RepoPromptCEPackageTests.xctest"),
+                    "RepoPromptTests": Path("/fake/stale/RepoPromptTests.xctest"),
+                    "RepoPromptWorkspaceTests": Path("/fake/stale/RepoPromptWorkspaceTests.xctest"),
+                    "StaleTests": Path("/fake/StaleTests.xctest"),
+                },
+            ),
+            mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
+            mock.patch.object(ci_app_test_runner, "run_all_suites", side_effect=fake_run_all_suites),
+        ):
+            exit_code = ci_app_test_runner.main([])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["suites"], ["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"])
+        self.assertEqual(
+            captured["test_bundle"], Path("/fake/RepoPromptCEPackageTests.xctest")
+        )
+        self.assertIsNone(captured["test_bundles"])
+        self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
+
     def test_main_uses_single_discovered_bundle_for_all_suite_targets(self) -> None:
         # SwiftPM emits one combined ``<PackageName>PackageTests.xctest`` bundle
         # whose name does not match any individual test target, so a single
@@ -751,6 +819,31 @@ class CIAppTestRunnerTests(unittest.TestCase):
                     require_runtime_for_batching=True,
                 )
 
+    def test_non_strict_ledger_includes_missing_discovered_suite_with_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self.write_ledger(Path(tmp), [
+                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
+            ])
+            selected, plan = ci_app_test_runner.plan_selected_suites(
+                ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
+                ledger=ledger,
+                shard_count=1,
+                shard_index=1,
+                strict_ledger=False,
+                slow_first=False,
+                batch_max_seconds=5.0,
+                require_runtime_for_batching=True,
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            [entry.suite for entry in selected],
+            ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
+        )
+        missing = next(entry for entry in selected if entry.suite == "RepoPromptTests.Unknown")
+        self.assertEqual(missing.estimated_seconds, 1.0)
+        self.assertFalse(missing.batch_eligible)
+
     def test_batch_suite_entries_groups_only_adjacent_eligible_same_bundle(self) -> None:
         entries = [
             ci_app_test_runner.SuitePlanEntry("RepoPromptTests.A", 1.0, True),
@@ -810,6 +903,55 @@ class CIAppTestRunnerTests(unittest.TestCase):
                 str(bundle),
             ],
         )
+
+    def test_run_all_suites_batches_multiple_xctest_filters_through_one_process(self) -> None:
+        launched: list[tuple[tuple[str, ...], Path | None]] = []
+
+        def fake_create_suite_group_process(suites, **kwargs):
+            launched.append((tuple(suites), kwargs["test_bundle"]))
+            return FakeProcess([
+                "Test Case '-[RepoPromptTests.A testOne]' started.\n",
+                "Test Case '-[RepoPromptTests.B testOne]' started.\n",
+            ], returncode=0)
+
+        entries = [
+            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.A", 1.0, True),
+            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.B", 1.0, True),
+        ]
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                ci_app_test_runner,
+                "plan_selected_suites",
+                return_value=(entries, None),
+            ),
+            mock.patch.object(
+                ci_app_test_runner,
+                "create_suite_group_process",
+                side_effect=fake_create_suite_group_process,
+            ),
+        ):
+            exit_code = ci_app_test_runner.run_all_suites(
+                ["RepoPromptTests.A", "RepoPromptTests.B"],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=output,
+                test_bundle=Path("/fake/RepoPromptCEPackageTests.xctest"),
+                xctest_binary=["/usr/bin/xctest"],
+                batch_fast_suites=True,
+                batch_max_suites=4,
+                batch_max_seconds=5.0,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            launched,
+            [(("RepoPromptTests.A", "RepoPromptTests.B"), Path("/fake/RepoPromptCEPackageTests.xctest"))],
+        )
+        self.assertIn("::group::RepoPromptTests.A+RepoPromptTests.B", output.getvalue())
+        self.assertIn("RepoPromptTests.B testOne", output.getvalue())
 
     def test_create_suite_group_process_uses_anchored_swift_filter_without_bundle(self) -> None:
         captured_args: list[list[str]] = []

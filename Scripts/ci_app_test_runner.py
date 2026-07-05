@@ -200,6 +200,31 @@ def discover_test_bundles(swift_binary: str, cwd: Path | None) -> dict[str, Path
     }
 
 
+def package_test_bundle(discovered: dict[str, Path]) -> Path | None:
+    """Return SwiftPM's combined package XCTest bundle when it is unambiguous."""
+    package_bundles = [
+        path
+        for name, path in discovered.items()
+        if name.endswith("PackageTests")
+    ]
+    if len(package_bundles) == 1:
+        return package_bundles[0]
+    return None
+
+
+def target_bundles_for_suites(discovered: dict[str, Path], suites: Sequence[str]) -> dict[str, Path] | None:
+    """Return exact target bundles when every selected suite target is covered.
+
+    Stale bundles from restored SwiftPM caches are ignored; only bundle names
+    matching the currently selected suite targets are routed per-target.
+    """
+    targets = {test_target_for_suite(suite) for suite in suites}
+    matching = {target: discovered[target] for target in sorted(targets) if target in discovered}
+    if targets and set(matching) == targets:
+        return matching
+    return None
+
+
 def test_target_for_suite(suite: str) -> str:
     return suite.split(".", 1)[0]
 
@@ -647,6 +672,22 @@ def plan_selected_suites(
     missing = list(plan.get("missing_suites") or [])
     if strict_ledger and missing:
         raise ValueError(f"ledger is missing discovered suites: {missing[:10]}")
+    if missing:
+        for suite in missing:
+            entry = {
+                "suite": suite,
+                "estimated_seconds": 1.0,
+                "method_count": 0,
+                "missing_runtime_count": 1,
+                "execution_tiers": [],
+                "resource_cost_tags": [],
+                "shared_state_tags": [],
+                "batch_eligible": False,
+            }
+            shard = min(plan["shards"], key=lambda item: (item["estimated_seconds"], item["index"]))
+            shard["estimated_seconds"] += entry["estimated_seconds"]
+            shard["suites"].append(entry)
+            shard["suite_count"] = len(shard["suites"])
     entries_by_suite: dict[str, SuitePlanEntry] = {}
     for shard in plan["shards"]:
         for entry in shard["suites"]:
@@ -910,7 +951,11 @@ def main(argv: list[str]) -> int:
                 # bundles are discovered.
                 test_bundle = next(iter(discovered.values()))
             elif discovered:
-                test_bundles = discovered
+                test_bundle = package_test_bundle(discovered)
+                if test_bundle is None:
+                    test_bundles = target_bundles_for_suites(discovered, suites)
+                if test_bundle is None and test_bundles is None:
+                    test_bundles = discovered
     xctest_binary = xctest_binary_path() if test_bundle is not None or test_bundles else None
 
     return run_all_suites(
