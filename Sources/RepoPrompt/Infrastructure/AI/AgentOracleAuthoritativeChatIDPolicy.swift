@@ -20,6 +20,16 @@ enum AgentOracleAuthoritativeChatIDPolicy {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    static func allowsLatestFallback(fromSerializedJSON json: String?) -> Bool {
+        guard let json else { return false }
+        let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
+        else { return false }
+        return !containsChatID(in: object)
+    }
+
     private static func containsChatID(in value: Any, excludingAuthoritativeRoot: Bool = false) -> Bool {
         if let dictionary = value as? [String: Any] {
             for (key, nested) in dictionary {

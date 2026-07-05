@@ -356,8 +356,7 @@ struct StaticToolCardContainer<Content: View>: View {
                 }
                 .buttonStyle(.plain)
             } else if let onTap {
-                cardBody
-                    .onTapGesture(perform: onTap)
+                cardBodyWithLeadingTap(onTap)
             } else {
                 cardBody
             }
@@ -366,20 +365,64 @@ struct StaticToolCardContainer<Content: View>: View {
 
     private var cardBody: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 6) {
+            cardContent {
                 standardHeaderRow
-                content()
             }
-            .padding(10)
-            .background(backgroundColor)
-            .cornerRadius(12)
-            .contentShape(Rectangle())
 
             Spacer(minLength: 40)
         }
     }
 
+    private func cardBodyWithLeadingTap(_ onTap: @escaping () -> Void) -> some View {
+        HStack {
+            cardContent {
+                standardHeaderRow(tappableLeadingAction: onTap)
+            }
+
+            Spacer(minLength: 40)
+        }
+    }
+
+    private func cardContent(@ViewBuilder header: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            header()
+            content()
+        }
+        .padding(10)
+        .background(backgroundColor)
+        .cornerRadius(12)
+        .contentShape(Rectangle())
+    }
+
     private var standardHeaderRow: some View {
+        standardHeaderRow(tappableLeadingAction: nil)
+    }
+
+    private func standardHeaderRow(tappableLeadingAction: (() -> Void)?) -> some View {
+        HStack(spacing: 6) {
+            if let tappableLeadingAction {
+                HStack(spacing: 6) {
+                    headerLeadingContent
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+                .onTapGesture(perform: tappableLeadingAction)
+            } else {
+                headerLeadingContent
+                Spacer()
+            }
+
+            if let headerTrailingView {
+                headerTrailingView
+            } else if showsTimestamp, let timestamp {
+                MessageTimestampText(date: timestamp)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
+        }
+    }
+
+    private var headerLeadingContent: some View {
         HStack(spacing: 6) {
             Image(systemName: iconName)
                 .font(.system(size: 11))
@@ -398,16 +441,6 @@ struct StaticToolCardContainer<Content: View>: View {
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-            }
-
-            Spacer()
-
-            if let headerTrailingView {
-                headerTrailingView
-            } else if showsTimestamp, let timestamp {
-                MessageTimestampText(date: timestamp)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary.opacity(0.7))
             }
         }
     }
