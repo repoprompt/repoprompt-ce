@@ -374,7 +374,7 @@ class SourceAndLedgerTests(unittest.TestCase):
         )
         self.assertEqual(
             calls[1],
-            ["git", "diff", "--name-only", "--diff-filter=ACMRT", "--"],
+            ["git", "diff", "--name-only", "--diff-filter=ACMRT", "HEAD", "--"],
         )
 
     def test_impacted_tests_selects_test_file_smoke_floor_and_skips_heavy(self) -> None:
@@ -465,6 +465,147 @@ class SourceAndLedgerTests(unittest.TestCase):
 
         self.assertTrue(payload["full_root_required"])
         self.assertIsNone(payload["filter"])
+        self.assertEqual(payload["selected_count"], 0)
+        self.assertEqual(payload["full_root_total_count"], 1)
+
+    def test_impacted_tests_broad_boundary_with_run_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "execution_tier": "routine",
+                }],
+            )
+
+            with mock.patch.object(optimizer, "changed_files_for_range", return_value=["Package.swift"]):
+                with self.assertRaises(optimizer.OptimizerError) as ctx:
+                    optimizer.impacted_tests(
+                        root,
+                        ledger,
+                        "HEAD",
+                        run_selected=True,
+                        validate_live_list=False,
+                    )
+
+        self.assertIn("full root suite", str(ctx.exception))
+        self.assertIn("Package.swift", str(ctx.exception))
+
+    def test_impacted_tests_focused_run_failure_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            list_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\n",
+                ticket="list-ticket",
+            )
+            failed_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--filter", "x", "--json"],
+                process_exit_code=1,
+                stdout="{}",
+                stderr="boom",
+                result={"state": "completed", "exitCode": 1, "logPath": "/tmp/run.log"},
+                log_text="",
+                ticket="run-ticket",
+            )
+
+            with (
+                mock.patch.object(
+                    optimizer,
+                    "run_conductor",
+                    side_effect=[list_run, failed_run],
+                ),
+                mock.patch.object(
+                    optimizer,
+                    "changed_files_for_range",
+                    return_value=["Tests/RepoPromptTests/MCP/ExampleTests.swift"],
+                ),
+            ):
+                with self.assertRaises(optimizer.OptimizerError) as ctx:
+                    optimizer.impacted_tests(root, ledger, "HEAD", run_selected=True)
+
+        message = str(ctx.exception)
+        self.assertIn("impacted test run failed", message)
+        self.assertIn("process_exit=1", message)
+        self.assertIn("exit=1", message)
+        self.assertIn("run-ticket", message)
+
+    def test_impacted_tests_focused_run_success_attaches_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            list_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\n",
+                ticket="list-ticket",
+            )
+            ok_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--filter", "x", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/run.log"},
+                log_text="",
+                ticket="run-ticket",
+            )
+
+            with (
+                mock.patch.object(
+                    optimizer,
+                    "run_conductor",
+                    side_effect=[list_run, ok_run],
+                ),
+                mock.patch.object(
+                    optimizer,
+                    "changed_files_for_range",
+                    return_value=["Tests/RepoPromptTests/MCP/ExampleTests.swift"],
+                ),
+            ):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD", run_selected=True)
+
+        self.assertIsNotNone(payload["run"])
+        self.assertEqual(payload["run"]["process_exit_code"], 0)
+        self.assertEqual(payload["run"]["state"], "completed")
+        self.assertEqual(payload["run"]["exit_code"], 0)
+        self.assertEqual(payload["run"]["ticket"], "run-ticket")
 
     def test_impacted_tests_validates_against_live_root_list(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

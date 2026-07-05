@@ -629,7 +629,13 @@ def changed_files_for_range(repo_root: Path, range_spec: str) -> list[str]:
             [DEFAULT_IMPACTED_BRANCH_RANGE],
             DEFAULT_IMPACTED_BRANCH_RANGE,
         )
-        worktree_changed = changed_files_for_git_diff(repo_root, [], "worktree")
+        # Diff against HEAD so staged-but-uncommitted changes (index-vs-HEAD)
+        # are captured alongside unstaged worktree changes. A plain worktree-vs-
+        # index diff would hide staged changes, which breaks the usual
+        # stage-intended-changes-then-validate pre-commit flow. Untracked files
+        # are intentionally excluded; they include scratch artifacts and local
+        # investigation docs that will never be committed.
+        worktree_changed = changed_files_for_git_diff(repo_root, ["HEAD"], "worktree")
         return sorted(set(branch_changed).union(worktree_changed))
     return sorted(set(changed_files_for_git_diff(repo_root, [range_spec], range_spec)))
 
@@ -654,6 +660,10 @@ def listed_root_test_ids(repo_root: Path) -> tuple[set[str], str]:
 def exact_xctest_filter(method_ids: Sequence[str]) -> str:
     if not method_ids:
         raise OptimizerError("cannot build an XCTest filter without selected methods")
+    # Builds a single anchored alternation regex passed to conductor via --filter.
+    # Current ledger scale keeps this well under macOS ARG_MAX, but very large
+    # impacted/shard selections could approach shell argv limits in the future;
+    # consider a guard or chunked invocation if selected_count grows past ~1k.
     return "^(?:" + "|".join(re.escape(method_id.split("/", 1)[1]) for method_id in sorted(method_ids)) + ")$"
 
 
@@ -692,6 +702,12 @@ def impacted_tests(
             domains.add(domain)
     if broad_reasons:
         full_count = len(rows)
+        if run_selected:
+            raise OptimizerError(
+                "impacted selection requires the full root suite; rerun as "
+                "`make dev-test` (or `conductor test`). broad boundaries: "
+                + ", ".join(broad_reasons)
+            )
         return {
             "range": range_spec,
             "changed_files": changed,
@@ -701,7 +717,8 @@ def impacted_tests(
             "full_root_required": True,
             "full_root_reasons": broad_reasons,
             "selected": [],
-            "selected_count": full_count,
+            "selected_count": 0,
+            "full_root_total_count": full_count,
             "filter": None,
             "smoke_floor_suites": list(smoke_floor_suites),
             "skipped_heavy_or_opt_in": [],
@@ -733,6 +750,18 @@ def impacted_tests(
             "ticket": run.ticket,
             "log_path": run.result.get("logPath"),
         }
+        if (
+            run.process_exit_code != 0
+            or run.result.get("state") != "completed"
+            or run.result.get("exitCode") != 0
+        ):
+            raise OptimizerError(
+                "impacted test run failed: "
+                f"process_exit={run.process_exit_code} "
+                f"state={run.result.get('state')} "
+                f"exit={run.result.get('exitCode')} "
+                f"ticket={run.ticket} log={run.result.get('logPath')}"
+            )
     return {
         "range": range_spec,
         "changed_files": changed,
