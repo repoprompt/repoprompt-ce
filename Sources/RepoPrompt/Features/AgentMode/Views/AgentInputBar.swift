@@ -25,7 +25,6 @@ struct AgentComposerActions {
     let modelOptions: (_ agent: AgentProviderKind, _ includeClaudeEffortVariants: Bool) -> [AgentModelOption]
     let canSelectAgentInCurrentChat: (_ agent: AgentProviderKind) -> Bool
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
-    let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
@@ -135,7 +134,6 @@ struct AgentInputBar: View {
                 agentModeVM.selectedAgent = agent
                 agentModeVM.selectModel(rawModel: rawModel)
             },
-            reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
@@ -174,25 +172,7 @@ struct AgentInputBar: View {
     }
 }
 
-enum AgentModelPickerOpenRequestGuard {
-    static func shouldOpen(
-        notification: Notification,
-        composerWindowID: Int,
-        composerCurrentTabID: UUID?,
-        propsCurrentTabID: UUID?,
-        hasAvailableAgentProviders: Bool,
-        modelControlsDisabled: Bool
-    ) -> Bool {
-        shouldOpen(
-            requestWindowID: windowID(from: notification.userInfo),
-            composerWindowID: composerWindowID,
-            composerCurrentTabID: composerCurrentTabID,
-            propsCurrentTabID: propsCurrentTabID,
-            hasAvailableAgentProviders: hasAvailableAgentProviders,
-            modelControlsDisabled: modelControlsDisabled
-        )
-    }
-
+enum AgentPickerOpenRequestWindowGuard {
     static func shouldOpen(
         requestWindowID: Int?,
         composerWindowID: Int,
@@ -210,8 +190,106 @@ enum AgentModelPickerOpenRequestGuard {
         return true
     }
 
-    private static func windowID(from userInfo: [AnyHashable: Any]?) -> Int? {
+    static func windowID(from userInfo: [AnyHashable: Any]?) -> Int? {
         userInfo?["windowID"] as? Int
+    }
+}
+
+enum AgentModelPickerOpenRequestGuard {
+    static func shouldOpen(
+        notification: Notification,
+        composerWindowID: Int,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool,
+        modelControlsDisabled: Bool
+    ) -> Bool {
+        shouldOpen(
+            requestWindowID: AgentPickerOpenRequestWindowGuard.windowID(from: notification.userInfo),
+            composerWindowID: composerWindowID,
+            composerCurrentTabID: composerCurrentTabID,
+            propsCurrentTabID: propsCurrentTabID,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            modelControlsDisabled: modelControlsDisabled
+        )
+    }
+
+    static func shouldOpen(
+        requestWindowID: Int?,
+        composerWindowID: Int,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool,
+        modelControlsDisabled: Bool
+    ) -> Bool {
+        AgentPickerOpenRequestWindowGuard.shouldOpen(
+            requestWindowID: requestWindowID,
+            composerWindowID: composerWindowID,
+            composerCurrentTabID: composerCurrentTabID,
+            propsCurrentTabID: propsCurrentTabID,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            modelControlsDisabled: modelControlsDisabled
+        )
+    }
+}
+
+enum AgentEffortPickerOpenTarget: Equatable {
+    case codexReasoningEffort
+    case claudeEffortLevel
+}
+
+enum AgentEffortPickerOpenRequestGuard {
+    static func target(
+        notification: Notification,
+        composerWindowID: Int,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool,
+        modelControlsDisabled: Bool,
+        selectedAgent: AgentProviderKind,
+        codexEffortsAvailable: Bool,
+        claudeEffortsAvailable: Bool
+    ) -> AgentEffortPickerOpenTarget? {
+        target(
+            requestWindowID: AgentPickerOpenRequestWindowGuard.windowID(from: notification.userInfo),
+            composerWindowID: composerWindowID,
+            composerCurrentTabID: composerCurrentTabID,
+            propsCurrentTabID: propsCurrentTabID,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            modelControlsDisabled: modelControlsDisabled,
+            selectedAgent: selectedAgent,
+            codexEffortsAvailable: codexEffortsAvailable,
+            claudeEffortsAvailable: claudeEffortsAvailable
+        )
+    }
+
+    static func target(
+        requestWindowID: Int?,
+        composerWindowID: Int,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool,
+        modelControlsDisabled: Bool,
+        selectedAgent: AgentProviderKind,
+        codexEffortsAvailable: Bool,
+        claudeEffortsAvailable: Bool
+    ) -> AgentEffortPickerOpenTarget? {
+        guard AgentPickerOpenRequestWindowGuard.shouldOpen(
+            requestWindowID: requestWindowID,
+            composerWindowID: composerWindowID,
+            composerCurrentTabID: composerCurrentTabID,
+            propsCurrentTabID: propsCurrentTabID,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            modelControlsDisabled: modelControlsDisabled
+        ) else { return nil }
+
+        if selectedAgent == .codexExec, codexEffortsAvailable {
+            return .codexReasoningEffort
+        }
+        if selectedAgent.usesClaudeTooling, claudeEffortsAvailable {
+            return .claudeEffortLevel
+        }
+        return nil
     }
 }
 
@@ -305,6 +383,8 @@ struct AgentComposerView: View, Equatable {
     @State private var steeringUnsupportedMessage: String? = nil
     @State private var steeringUnsupportedDismissTask: Task<Void, Never>?
     @State private var modelPickerOpenRequestCount: Int = 0
+    @State private var codexEffortPickerOpenRequestCount: Int = 0
+    @State private var claudeEffortPickerOpenRequestCount: Int = 0
     @State private var modelMenuSnapshotByAgent: [AgentProviderKind: [AgentModelOption]]? = nil
     @State private var modelMenuSnapshotReleaseTask: Task<Void, Never>? = nil
 
@@ -392,6 +472,16 @@ struct AgentComposerView: View, Equatable {
 
     private var modelControlsDisabled: Bool {
         props.areModelControlsDisabled
+    }
+
+    private var codexEffortsAreAvailable: Bool {
+        props.selectedAgent == .codexExec && !props.codexReasoningEffortOptions.isEmpty
+    }
+
+    private var claudeEffortsAreAvailable: Bool {
+        props.selectedAgent.usesClaudeTooling
+            && props.providerControls?.claudeTools != nil
+            && !supportedClaudeEffortsForCurrentSelection().isEmpty
     }
 
     private var modelControlsDisabledTooltip: String {
@@ -576,6 +666,25 @@ struct AgentComposerView: View, Equatable {
                 modelControlsDisabled: modelControlsDisabled
             ) else { return }
             modelPickerOpenRequestCount += 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showAgentEffortPicker)) { notification in
+            guard let target = AgentEffortPickerOpenRequestGuard.target(
+                notification: notification,
+                composerWindowID: windowID,
+                composerCurrentTabID: currentTabID,
+                propsCurrentTabID: props.currentTabID,
+                hasAvailableAgentProviders: props.hasAvailableAgentProviders,
+                modelControlsDisabled: modelControlsDisabled,
+                selectedAgent: props.selectedAgent,
+                codexEffortsAvailable: codexEffortsAreAvailable,
+                claudeEffortsAvailable: claudeEffortsAreAvailable
+            ) else { return }
+            switch target {
+            case .codexReasoningEffort:
+                codexEffortPickerOpenRequestCount += 1
+            case .claudeEffortLevel:
+                claudeEffortPickerOpenRequestCount += 1
+            }
         }
         .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: $isImageDropTargeted, perform: handleImageDrop(providers:))
         .overlay(imageDropOutline)
@@ -985,22 +1094,12 @@ struct AgentComposerView: View, Equatable {
     @ViewBuilder
     private var reasoningEffortPicker: some View {
         if props.selectedAgent == .codexExec {
-            let efforts = actions.reasoningEffortOptionsForCurrentSelection()
-            Menu {
-                ForEach(efforts, id: \.rawValue) { effort in
-                    Button {
-                        actions.selectReasoningEffort(effort)
-                    } label: {
-                        HStack {
-                            Text(effort.displayName)
-                            if props.selectedReasoningEffortRaw == effort.rawValue {
-                                Spacer()
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            } label: {
+            let efforts = props.codexReasoningEffortOptions
+            StableMenuButton(
+                items: { reasoningEffortMenuItems(efforts: efforts) },
+                triggerStyle: .plain,
+                openRequestCount: codexEffortPickerOpenRequestCount
+            ) {
                 HStack(spacing: 4) {
                     Text(props.selectedReasoningEffortDisplayName)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -1011,11 +1110,21 @@ struct AgentComposerView: View, Equatable {
                 .background(pickerChipColor)
                 .cornerRadius(4)
             }
-            .menuStyle(.borderlessButton)
             .disabled(efforts.isEmpty || modelControlsDisabled)
             .opacity(modelControlsDisabled ? 0.55 : 1.0)
             .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : "Codex reasoning effort")
             .fixedSize()
+        }
+    }
+
+    private func reasoningEffortMenuItems(efforts: [CodexReasoningEffort]) -> [StableMenuItem] {
+        efforts.map { effort in
+            StableMenuItem.action(
+                effort.displayName,
+                isSelected: props.selectedReasoningEffortRaw == effort.rawValue
+            ) {
+                actions.selectReasoningEffort(effort)
+            }
         }
     }
 
@@ -1024,25 +1133,12 @@ struct AgentComposerView: View, Equatable {
         if props.selectedAgent.usesClaudeTooling,
            let claudeTools = props.providerControls?.claudeTools
         {
-            let efforts = AgentModelCatalog.supportedClaudeEfforts(
-                forSelectedModelRaw: props.selectedModelRaw,
-                agentKind: props.selectedAgent
-            )
-            Menu {
-                ForEach(efforts, id: \.rawValue) { level in
-                    Button {
-                        actions.setClaudeEffortLevel(level)
-                    } label: {
-                        HStack {
-                            Text(level.displayName)
-                            if claudeTools.effortLevel == level {
-                                Spacer()
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            } label: {
+            let efforts = supportedClaudeEffortsForCurrentSelection()
+            StableMenuButton(
+                items: { claudeEffortMenuItems(efforts: efforts, selectedLevel: claudeTools.effortLevel) },
+                triggerStyle: .plain,
+                openRequestCount: claudeEffortPickerOpenRequestCount
+            ) {
                 HStack(spacing: 4) {
                     Text(claudeTools.effortLevel.displayName)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -1053,12 +1149,32 @@ struct AgentComposerView: View, Equatable {
                 .background(pickerChipColor)
                 .cornerRadius(4)
             }
-            .menuStyle(.borderlessButton)
             .disabled(modelControlsDisabled || efforts.isEmpty)
             .opacity(modelControlsDisabled ? 0.55 : 1.0)
             .fixedSize()
             .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : "Claude effort level")
         }
+    }
+
+    private func claudeEffortMenuItems(
+        efforts: [ClaudeCodeEffortLevel],
+        selectedLevel: ClaudeCodeEffortLevel
+    ) -> [StableMenuItem] {
+        efforts.map { level in
+            StableMenuItem.action(
+                level.displayName,
+                isSelected: selectedLevel == level
+            ) {
+                actions.setClaudeEffortLevel(level)
+            }
+        }
+    }
+
+    private func supportedClaudeEffortsForCurrentSelection() -> [ClaudeCodeEffortLevel] {
+        AgentModelCatalog.supportedClaudeEfforts(
+            forSelectedModelRaw: props.selectedModelRaw,
+            agentKind: props.selectedAgent
+        )
     }
 
     @ViewBuilder

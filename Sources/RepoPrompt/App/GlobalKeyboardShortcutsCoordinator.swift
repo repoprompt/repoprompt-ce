@@ -189,6 +189,7 @@ final class GlobalKeyboardShortcutsCoordinator {
         register(.showCurrentWindowAgentNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .currentWindow) }
         register(.showAllAgentsNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .allAgents) }
         register(.showAgentModelPicker) { [weak self] in self?.showAgentModelPicker() }
+        register(.showAgentEffortPicker) { [weak self] in self?.showAgentEffortPicker() }
     }
 
     private func startNewAgentSessionFromShortcut() {
@@ -235,6 +236,15 @@ final class GlobalKeyboardShortcutsCoordinator {
         guard let win = guardedFocusedWindowState() else { return }
         NotificationCenter.default.post(
             name: .showAgentModelPicker,
+            object: nil,
+            userInfo: ["windowID": win.windowID]
+        )
+    }
+
+    private func showAgentEffortPicker() {
+        guard let win = guardedFocusedWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .showAgentEffortPicker,
             object: nil,
             userInfo: ["windowID": win.windowID]
         )
