@@ -845,6 +845,34 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
     }
 
     #if DEBUG
+        func testSelectionConsistencyRetryDebounceBacksOffOnlyForRetrySelectionRecounts() {
+            let tokenCounter = TokenCountingViewModel()
+
+            XCTAssertEqual(tokenCounter.tokenCountUpdateDebounceNanosecondsForTesting(), 500_000_000)
+
+            tokenCounter.recordSelectionConsistencyRetryForTesting()
+            XCTAssertEqual(tokenCounter.selectionConsistencyRetryCountForTesting(), 1)
+            XCTAssertTrue(tokenCounter.selectionConsistencyRetryBackoffPendingForTesting())
+            XCTAssertEqual(
+                tokenCounter.tokenCountUpdateDebounceNanosecondsForTesting(
+                    useSelectionConsistencyRetryBackoff: false
+                ),
+                500_000_000
+            )
+            XCTAssertEqual(tokenCounter.tokenCountUpdateDebounceNanosecondsForTesting(), 1_000_000_000)
+
+            for _ in 0 ..< 6 {
+                tokenCounter.recordSelectionConsistencyRetryForTesting()
+            }
+            XCTAssertEqual(tokenCounter.selectionConsistencyRetryCountForTesting(), 5)
+            XCTAssertEqual(tokenCounter.tokenCountUpdateDebounceNanosecondsForTesting(), 5_000_000_000)
+
+            tokenCounter.recordSelectionProjectionChangedForTesting()
+            XCTAssertEqual(tokenCounter.selectionConsistencyRetryCountForTesting(), 0)
+            XCTAssertFalse(tokenCounter.selectionConsistencyRetryBackoffPendingForTesting())
+            XCTAssertEqual(tokenCounter.tokenCountUpdateDebounceNanosecondsForTesting(), 500_000_000)
+        }
+
         func testActiveMCPTokenRepliesCompleteWhileBackgroundRecountIsBlockedAndCoalesce() async throws {
             let root = try makeTemporaryRoot(name: "ActiveTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
