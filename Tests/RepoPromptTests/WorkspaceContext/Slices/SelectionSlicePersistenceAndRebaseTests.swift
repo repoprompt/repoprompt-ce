@@ -304,6 +304,44 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
         XCTAssertFalse(result.isStale)
     }
 
+    func testPlannedTabSliceRebaseIsIdempotentAndFailsClosed() throws {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let editedPath = "/tmp/Selected.swift"
+        let unrelatedPath = "/tmp/Unrelated.swift"
+        let expectedRanges = [LineRange(start: 10, end: 12, description: "edited")]
+        let rebasedRanges = [LineRange(start: 15, end: 17, description: "edited")]
+        let selection = StoredSelection(
+            selectedPaths: [editedPath, unrelatedPath],
+            slices: [
+                editedPath: expectedRanges,
+                unrelatedPath: [LineRange(start: 30, end: 35, description: "unrelated")]
+            ],
+            codemapAutoEnabled: false
+        )
+        let plan = try XCTUnwrap(WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan(
+            identity: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+            fullPath: editedPath,
+            expectedRanges: expectedRanges,
+            rebasedRanges: rebasedRanges
+        ))
+
+        let applied = try XCTUnwrap(WorkspaceManagerViewModel.rebasedStoredSelectionSlices(selection, applying: plan))
+        XCTAssertEqual(applied.slices[editedPath], rebasedRanges)
+        XCTAssertEqual(applied.slices[unrelatedPath], selection.slices[unrelatedPath])
+        XCTAssertNil(WorkspaceManagerViewModel.rebasedStoredSelectionSlices(applied, applying: plan))
+
+        let independentlyChanged = StoredSelection(
+            selectedPaths: selection.selectedPaths,
+            slices: [
+                editedPath: [LineRange(start: 40, end: 42, description: "manual")],
+                unrelatedPath: [LineRange(start: 30, end: 35, description: "unrelated")]
+            ],
+            codemapAutoEnabled: false
+        )
+        XCTAssertNil(WorkspaceManagerViewModel.rebasedStoredSelectionSlices(independentlyChanged, applying: plan))
+    }
+
     func testSliceRebaseTransformsOverlapMatrixWithStableAffinity() {
         struct Case {
             let name: String
