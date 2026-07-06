@@ -428,6 +428,18 @@ private struct SlicePartitionRebaseCommit {
     }
 }
 
+private struct TabSliceRebasePlanInput {
+    let identity: WorkspaceSelectionIdentity
+    let fullPath: String
+    let expectedRanges: [LineRange]
+}
+
+private struct HiddenSessionTabSliceRebasePlan {
+    let target: HiddenSessionSliceRebaseTarget
+    let expectedLogicalRanges: [LineRange]
+    let plan: WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan
+}
+
 private struct ReplayRootPassAccumulator {
     let rootKey: String
     var processedDigests: [WorkspaceFilesViewModel.FileSystemDeltaDigest] = []
@@ -1144,6 +1156,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var appliedIndexProjectionIndexRebuildVisitedFileCount = 0
         private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
         private var hiddenSessionSliceRebaseWillCommitHandler: (@Sendable (String) async -> Void)?
+        private var hiddenSessionSliceRebaseWillApplyTabPlansHandler: (@Sendable (String) async -> Void)?
         private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
 
         func setAppliedIndexProjectionWillHandleHandlerForTesting(
@@ -1156,6 +1169,12 @@ class WorkspaceFilesViewModel: ObservableObject {
             _ handler: (@Sendable (String) async -> Void)?
         ) {
             hiddenSessionSliceRebaseWillCommitHandler = handler
+        }
+
+        func setHiddenSessionSliceRebaseWillApplyTabPlansHandlerForTesting(
+            _ handler: (@Sendable (String) async -> Void)?
+        ) {
+            hiddenSessionSliceRebaseWillApplyTabPlansHandler = handler
         }
 
         func setAppliedIndexProjectionStateObserverForTesting(
@@ -1608,6 +1627,22 @@ class WorkspaceFilesViewModel: ObservableObject {
         return true
     }
 
+    private nonisolated static func tabSliceRebaseDedupeKey(
+        identity: WorkspaceSelectionIdentity,
+        fullPath: String
+    ) -> String? {
+        guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath) else {
+            return nil
+        }
+        return "\(identity.workspaceID.uuidString):\(identity.tabID.uuidString):\(standardizedFullPath)"
+    }
+
+    private nonisolated static func tabSliceRebaseDedupeKey(
+        for plan: WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan
+    ) -> String {
+        "\(plan.identity.workspaceID.uuidString):\(plan.identity.tabID.uuidString):\(plan.fullPath)"
+    }
+
     @MainActor
     private func hiddenSessionSliceRebaseTargets(
         physicalRootPath: String,
@@ -1748,6 +1783,8 @@ class WorkspaceFilesViewModel: ObservableObject {
                     taskID: taskID,
                     registrationGeneration: registrationGeneration
                 ) else { return }
+                var tabPlans: [HiddenSessionTabSliceRebasePlan] = []
+                var plannedTargetKeys = Set<String>()
                 for commit in partitionCommits {
                     guard await isHiddenSessionSliceRebaseCurrent(
                         request,
@@ -1777,52 +1814,69 @@ class WorkspaceFilesViewModel: ObservableObject {
                         ) != nil else {
                             return
                         }
+                        if let target = commit.hiddenSessionTarget,
+                           let expectedLogicalRanges = commit.expectedLogicalRanges,
+                           let plan = WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan(
+                               identity: target.identity,
+                               fullPath: target.logicalFullPath,
+                               expectedRanges: expectedLogicalRanges,
+                               rebasedRanges: commit.ranges
+                           )
+                        {
+                            tabPlans.append(HiddenSessionTabSliceRebasePlan(
+                                target: target,
+                                expectedLogicalRanges: expectedLogicalRanges,
+                                plan: plan
+                            ))
+                            plannedTargetKeys.insert(Self.tabSliceRebaseDedupeKey(for: plan))
+                        }
                     } catch {
                         return
                     }
                 }
-                var stillCurrentTargets: [HiddenSessionSliceRebaseTarget] = []
-                for target in currentTargets where await isHiddenSessionSliceRebaseTargetCurrent(target) {
-                    stillCurrentTargets.append(target)
-                }
-                guard !stillCurrentTargets.isEmpty else { return }
-                let targets = stillCurrentTargets.map { (identity: $0.identity, fullPath: $0.logicalFullPath) }
-                await workspaceManager?.rebaseSlicesForFilesAcrossTabs(
-                    targets: targets,
-                    asyncTransform: { identity, logicalFullPath, currentRanges in
-                        if let commit = partitionCommits.first(where: { commit in
-                            guard let target = commit.hiddenSessionTarget else { return false }
-                            return target.identity == identity && target.logicalFullPath == logicalFullPath
-                        }), let expectedLogicalRanges = commit.expectedLogicalRanges {
-                            let normalizedCurrent = SliceRangeMath.normalize(currentRanges)
-                            let normalizedCommitted = SliceRangeMath.normalize(commit.ranges)
-                            if normalizedCurrent == normalizedCommitted {
-                                return normalizedCurrent
-                            }
-                            if normalizedCurrent == SliceRangeMath.normalize(expectedLogicalRanges) {
-                                return normalizedCommitted
-                            }
-                        }
-
-                        return await Task.detached(priority: .utility) {
-                            let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
-                            let result = SliceRebaseEngine.rebase(
-                                oldText: sourceSnapshot.text,
-                                newText: loadedSnapshot.text,
-                                oldRanges: currentRanges,
-                                anchors: nil
-                            )
-                            #if DEBUG
-                                MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
-                                    fullPath: logicalFullPath,
-                                    durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
-                                    scope: "hidden-tab"
-                                )
-                            #endif
-                            return result.isStale ? currentRanges : result.rebased
-                        }.value
+                for target in currentTargets {
+                    guard let targetKey = Self.tabSliceRebaseDedupeKey(
+                        identity: target.identity,
+                        fullPath: target.logicalFullPath
+                    ), !plannedTargetKeys.contains(targetKey),
+                    await isHiddenSessionSliceRebaseTargetCurrent(target),
+                    let expectedLogicalRanges = await hiddenSessionSliceRangesIfTargetCurrent(target)
+                    else { continue }
+                    let input = TabSliceRebasePlanInput(
+                        identity: target.identity,
+                        fullPath: target.logicalFullPath,
+                        expectedRanges: expectedLogicalRanges
+                    )
+                    if let plan = await Self.computeTabSliceRebasePlan(
+                        input: input,
+                        oldText: sourceSnapshot.text,
+                        newText: loadedSnapshot.text,
+                        debugFullPath: target.logicalFullPath,
+                        debugScope: "hidden-tab"
+                    ) {
+                        tabPlans.append(HiddenSessionTabSliceRebasePlan(
+                            target: target,
+                            expectedLogicalRanges: expectedLogicalRanges,
+                            plan: plan
+                        ))
+                        plannedTargetKeys.insert(Self.tabSliceRebaseDedupeKey(for: plan))
                     }
-                )
+                }
+                #if DEBUG
+                    if let hiddenSessionSliceRebaseWillApplyTabPlansHandler {
+                        await hiddenSessionSliceRebaseWillApplyTabPlansHandler(fullPath)
+                    }
+                #endif
+                var applicablePlans: [WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan] = []
+                for tabPlan in tabPlans {
+                    guard await isHiddenSessionSliceRebaseTargetCurrent(tabPlan.target),
+                          await hiddenSessionSliceRangesIfTargetCurrent(tabPlan.target) == tabPlan.expectedLogicalRanges
+                    else { continue }
+                    applicablePlans.append(tabPlan.plan)
+                }
+                if !applicablePlans.isEmpty {
+                    await workspaceManager?.applyPlannedSliceRebasesAcrossTabs(applicablePlans)
+                }
                 guard await isHiddenSessionSliceRebaseCurrent(
                     request,
                     taskID: taskID,
@@ -12507,6 +12561,111 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
+    private func captureTabSliceRebasePlanInputs(
+        workspaceID: UUID,
+        fullPath: String
+    ) -> [TabSliceRebasePlanInput] {
+        guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath),
+              let tabs = workspaceManager?.activeWorkspace?.composeTabs
+        else { return [] }
+
+        var inputs: [TabSliceRebasePlanInput] = []
+        var seen = Set<UUID>()
+        for tab in tabs where seen.insert(tab.id).inserted {
+            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
+            guard let ranges = slices[standardizedFullPath] else { continue }
+            let normalizedRanges = SliceRangeMath.normalize(ranges)
+            guard !normalizedRanges.isEmpty else { continue }
+            inputs.append(TabSliceRebasePlanInput(
+                identity: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tab.id),
+                fullPath: standardizedFullPath,
+                expectedRanges: normalizedRanges
+            ))
+        }
+        return inputs
+    }
+
+    private nonisolated static func matchingTabPartitionCommit(
+        for input: TabSliceRebasePlanInput,
+        in commits: [SlicePartitionRebaseCommit]
+    ) -> SlicePartitionRebaseCommit? {
+        commits.first { commit in
+            guard commit.scope.workspaceID == input.identity.workspaceID,
+                  commit.scope.tabID == input.identity.tabID
+            else { return false }
+            return SliceRangeMath.normalize(commit.expectedStoredSlices.ranges) == input.expectedRanges
+        }
+    }
+
+    private nonisolated static func computeTabSliceRebasePlan(
+        input: TabSliceRebasePlanInput,
+        oldText: String,
+        newText: String,
+        debugFullPath: String,
+        debugScope: String
+    ) async -> WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan? {
+        guard oldText != newText else { return nil }
+        let computed = await Task.detached(priority: .utility) {
+            let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+            let result = SliceRebaseEngine.rebase(
+                oldText: oldText,
+                newText: newText,
+                oldRanges: input.expectedRanges,
+                anchors: nil
+            )
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
+                    fullPath: debugFullPath,
+                    durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
+                    scope: debugScope
+                )
+            #endif
+            return result.isStale ? nil : result.rebased
+        }.value
+        guard let computed else { return nil }
+        return WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan(
+            identity: input.identity,
+            fullPath: input.fullPath,
+            expectedRanges: input.expectedRanges,
+            rebasedRanges: computed
+        )
+    }
+
+    private nonisolated static func computeTabSliceRebasePlans(
+        inputs: [TabSliceRebasePlanInput],
+        partitionCommits: [SlicePartitionRebaseCommit],
+        oldText: String,
+        newText: String,
+        fullPath: String
+    ) async -> [WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan] {
+        var plans: [WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan] = []
+        for input in inputs {
+            if let commit = matchingTabPartitionCommit(for: input, in: partitionCommits),
+               let plan = WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan(
+                   identity: input.identity,
+                   fullPath: input.fullPath,
+                   expectedRanges: input.expectedRanges,
+                   rebasedRanges: commit.ranges
+               )
+            {
+                plans.append(plan)
+                continue
+            }
+
+            if let plan = await computeTabSliceRebasePlan(
+                input: input,
+                oldText: oldText,
+                newText: newText,
+                debugFullPath: fullPath,
+                debugScope: "tab"
+            ) {
+                plans.append(plan)
+            }
+        }
+        return plans
+    }
+
+    @MainActor
     private func rebaseSlicesForModifiedFile(
         _ file: FileViewModel,
         relativePath: String,
@@ -12555,6 +12714,7 @@ extension WorkspaceFilesViewModel {
               )
         else { return }
 
+        let tabPlanInputs = captureTabSliceRebasePlanInputs(workspaceID: workspaceID, fullPath: fullPath)
         var partitionCommits: [SlicePartitionRebaseCommit] = []
         var encounteredStalePartition = false
 
@@ -12608,6 +12768,14 @@ extension WorkspaceFilesViewModel {
             ))
         }
 
+        let tabPlans = await Self.computeTabSliceRebasePlans(
+            inputs: tabPlanInputs,
+            partitionCommits: partitionCommits,
+            oldText: sourceSnapshot?.text ?? loadedSnapshot.text,
+            newText: loadedSnapshot.text,
+            fullPath: fullPath
+        )
+
         await beginSliceRebaseCommit(
             workspaceID: workspaceID,
             rootID: workspaceRoot.id,
@@ -12619,6 +12787,7 @@ extension WorkspaceFilesViewModel {
             relativePath: relKey,
             activeScope: activeScope,
             partitionCommits: partitionCommits,
+            tabPlans: tabPlans,
             sourceSnapshot: sourceSnapshot,
             loadedSnapshot: loadedSnapshot,
             encounteredStalePartition: encounteredStalePartition
@@ -12712,6 +12881,7 @@ extension WorkspaceFilesViewModel {
         relativePath: String,
         activeScope: PartitionScope?,
         partitionCommits: [SlicePartitionRebaseCommit],
+        tabPlans: [WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan],
         sourceSnapshot: SliceRebaseSourceSnapshot?,
         loadedSnapshot: SliceRebaseSourceSnapshot,
         encounteredStalePartition: Bool
@@ -12737,6 +12907,7 @@ extension WorkspaceFilesViewModel {
                 relativePath: relativePath,
                 activeScope: activeScope,
                 partitionCommits: partitionCommits,
+                tabPlans: tabPlans,
                 sourceSnapshot: sourceSnapshot,
                 loadedSnapshot: loadedSnapshot,
                 encounteredStalePartition: encounteredStalePartition
@@ -12758,6 +12929,7 @@ extension WorkspaceFilesViewModel {
         relativePath: String,
         activeScope: PartitionScope?,
         partitionCommits: [SlicePartitionRebaseCommit],
+        tabPlans: [WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan],
         sourceSnapshot: SliceRebaseSourceSnapshot?,
         loadedSnapshot: SliceRebaseSourceSnapshot,
         encounteredStalePartition: Bool
@@ -12837,29 +13009,7 @@ extension WorkspaceFilesViewModel {
               )
         else { return }
 
-        let tabOldText = sourceSnapshot?.text ?? loadedSnapshot.text
-        await workspaceManager?.rebaseSlicesForFileAcrossTabs(
-            fullPath: fullPath,
-            asyncTransform: { _, current in
-                await Task.detached(priority: .utility) {
-                    let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
-                    let result = SliceRebaseEngine.rebase(
-                        oldText: tabOldText,
-                        newText: loadedSnapshot.text,
-                        oldRanges: current,
-                        anchors: nil
-                    )
-                    #if DEBUG
-                        MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
-                            fullPath: fullPath,
-                            durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
-                            scope: "tab"
-                        )
-                    #endif
-                    return result.isStale ? current : result.rebased
-                }.value
-            }
-        )
+        await workspaceManager?.applyPlannedSliceRebasesAcrossTabs(tabPlans)
 
         guard persistenceSucceeded,
               !encounteredStalePartition,
