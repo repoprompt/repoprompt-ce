@@ -3194,6 +3194,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try write("seed", to: fileURL)
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
+            let rootRef = WorkspaceRootRef(id: record.id, name: record.name, fullPath: record.standardizedFullPath)
             await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
@@ -3208,7 +3209,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                     let service = WorkspaceReadableFileService(store: store)
                     try await service.awaitFreshnessForExplicitRequest(
                         fileURL.path,
-                        fallbackScope: .visibleWorkspace,
+                        rootRefs: [rootRef],
                         timeout: .milliseconds(25)
                     )
                     observedError = nil
@@ -3231,7 +3232,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await flushGate.release()
             let error = await request.value
-            XCTAssertEqual(error, .timedOut)
+            XCTAssertEqual(error, WorkspaceAppliedIngressWaitError.timedOut)
             let settled = await waitForAsyncCondition {
                 let roots = await store.readSearchRootDiagnosticsSnapshot()
                 return roots.first { $0.rootID == record.id }?.barrier.active == nil
@@ -3246,12 +3247,13 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try write("seed", to: fileURL)
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
+            let rootRef = WorkspaceRootRef(id: record.id, name: record.name, fullPath: record.standardizedFullPath)
             await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
             let service = WorkspaceReadableFileService(store: store)
 
             try await service.awaitFreshnessForExplicitRequest(
                 fileURL.path,
-                fallbackScope: .visibleWorkspace,
+                rootRefs: [rootRef],
                 timeout: .seconds(1)
             )
             let stats = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)

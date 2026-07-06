@@ -8030,19 +8030,6 @@ actor WorkspaceFileContextStore {
 
     func awaitAppliedIngressForExplicitRequest(
         userPath: String,
-        fallbackScope: WorkspaceLookupRootScope,
-        timeout: Duration
-    ) async throws -> [WorkspaceIngressBarrierSample] {
-        try await awaitAppliedIngressWithTimeout(timeout) { [self] in
-            await awaitAppliedIngressForExplicitRequest(
-                userPath: userPath,
-                fallbackScope: fallbackScope
-            )
-        }
-    }
-
-    func awaitAppliedIngressForExplicitRequest(
-        userPath: String,
         fallbackRootRefs: [WorkspaceRootRef]
     ) async -> [WorkspaceIngressBarrierSample] {
         let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -21,22 +21,13 @@ struct WorkspaceReadableFileService {
 
     func awaitFreshnessForExplicitRequest(
         _ userPath: String,
-        fallbackScope: WorkspaceLookupRootScope,
-        timeout: Duration? = nil
+        fallbackScope: WorkspaceLookupRootScope
     ) async throws {
         try await awaitFreshnessForExplicitRequest {
-            if let timeout {
-                try await store.awaitAppliedIngressForExplicitRequest(
-                    userPath: userPath,
-                    fallbackScope: fallbackScope,
-                    timeout: timeout
-                )
-            } else {
-                await store.awaitAppliedIngressForExplicitRequest(
-                    userPath: userPath,
-                    fallbackScope: fallbackScope
-                )
-            }
+            await store.awaitAppliedIngressForExplicitRequest(
+                userPath: userPath,
+                fallbackScope: fallbackScope
+            )
         }
     }
 

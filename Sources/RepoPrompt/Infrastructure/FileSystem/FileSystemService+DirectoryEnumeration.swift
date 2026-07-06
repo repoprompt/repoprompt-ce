@@ -94,7 +94,7 @@ extension FileSystemService {
         #endif
 
         let originalVisitedInventory = visitedInventory.captureState()
-        let originalPathCompsCache = pathCompsCache
+        let originalPathComponentsCache = pathCompsCache
 
         var missingFolderDeltas: [FileSystemDelta] = []
         var existingFolders: [String] = []
@@ -114,34 +114,32 @@ extension FileSystemService {
         // In test mode, use the same cap but scan serially to avoid SpyFS thread-safety issues.
         #if DEBUG
             if isTestMode {
-                do {
+                return try await withScanStateRestore(
+                    inventory: originalVisitedInventory,
+                    pathCompsCache: originalPathComponentsCache
+                ) {
                     var deltas: [FileSystemDelta] = []
                     for folder in existingFolders {
                         let folderDeltas = try await scanOneLevelAndDiff(folder)
                         deltas.append(contentsOf: folderDeltas)
                     }
                     return FolderScanBatchResult(deltas: missingFolderDeltas + deltas, scannedFolders: scannedFolders)
-                } catch {
-                    visitedInventory.restore(originalVisitedInventory)
-                    pathCompsCache = originalPathCompsCache
-                    throw error
                 }
             }
         #endif
 
         // For small sets, just use serial scanning
         if existingFolders.count <= 2 {
-            do {
+            return try await withScanStateRestore(
+                inventory: originalVisitedInventory,
+                pathCompsCache: originalPathComponentsCache
+            ) {
                 var deltas: [FileSystemDelta] = []
                 for folder in existingFolders {
                     let folderDeltas = try await scanOneLevelAndDiff(folder)
                     deltas.append(contentsOf: folderDeltas)
                 }
                 return FolderScanBatchResult(deltas: missingFolderDeltas + deltas, scannedFolders: scannedFolders)
-            } catch {
-                visitedInventory.restore(originalVisitedInventory)
-                pathCompsCache = originalPathCompsCache
-                throw error
             }
         }
 
@@ -258,12 +256,29 @@ extension FileSystemService {
                 }
             }
         } catch {
-            visitedInventory.restore(originalVisitedInventory)
-            pathCompsCache = originalPathCompsCache
+            restoreScanState(inventory: originalVisitedInventory, pathCompsCache: originalPathComponentsCache)
             throw error
         }
 
         return FolderScanBatchResult(deltas: missingFolderDeltas + aggregatedDeltas, scannedFolders: scannedFolders)
+    }
+
+    private func withScanStateRestore<T>(
+        inventory: FileSystemVisitedInventory.State,
+        pathCompsCache: PathComponentsCache,
+        operation: () async throws -> T
+    ) async throws -> T {
+        do {
+            return try await operation()
+        } catch {
+            restoreScanState(inventory: inventory, pathCompsCache: pathCompsCache)
+            throw error
+        }
+    }
+
+    private func restoreScanState(inventory: FileSystemVisitedInventory.State, pathCompsCache: PathComponentsCache) {
+        visitedInventory.restore(inventory)
+        self.pathCompsCache = pathCompsCache
     }
 
     // MARK: - Single-level scanning & removal
@@ -291,7 +306,6 @@ extension FileSystemService {
                 )
             }
         #endif
-        let fm = fm // Cache for multiple calls in this method
         let absFolder = fullPath(forRelativePath: folderRelPath)
 
         // 1) If missing or not a directory => remove entire subtree
@@ -301,7 +315,7 @@ extension FileSystemService {
 
         // 2) Single-level listing using POSIX directory scanning
         #if DEBUG
-            let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder, fm: self.fm)
+            let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder, fm: fm)
         #else
             let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder)
         #endif
