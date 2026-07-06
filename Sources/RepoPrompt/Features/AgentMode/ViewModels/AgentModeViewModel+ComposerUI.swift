@@ -44,6 +44,7 @@ extension AgentModeViewModel {
             selectedModelDisplayName: selectedModelDisplayName,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
+            codexReasoningEffortOptions: reasoningEffortOptionsForCurrentSelection(),
             availableAgents: availableAgents,
             isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
             lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),

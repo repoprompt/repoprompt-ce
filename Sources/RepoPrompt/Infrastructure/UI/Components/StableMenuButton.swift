@@ -15,6 +15,7 @@ struct StableMenuButton<Label: View>: View {
 
     let items: () -> [StableMenuItem]
     let triggerStyle: TriggerStyle
+    let openRequestCount: Int
     let onOpen: @MainActor () -> Void
     @ViewBuilder let label: () -> Label
 
@@ -23,11 +24,13 @@ struct StableMenuButton<Label: View>: View {
     init(
         items: @escaping () -> [StableMenuItem],
         triggerStyle: TriggerStyle = .automatic,
+        openRequestCount: Int = 0,
         onOpen: @escaping @MainActor () -> Void = {},
         @ViewBuilder label: @escaping () -> Label
     ) {
         self.items = items
         self.triggerStyle = triggerStyle
+        self.openRequestCount = openRequestCount
         self.onOpen = onOpen
         self.label = label
     }
@@ -45,8 +48,7 @@ struct StableMenuButton<Label: View>: View {
 
     private var button: some View {
         Button {
-            onOpen()
-            presenter.present(items())
+            presentMenu()
         } label: {
             label()
         }
@@ -54,6 +56,16 @@ struct StableMenuButton<Label: View>: View {
             StableMenuAnchorView(presenter: presenter)
                 .allowsHitTesting(false)
         )
+        .onChange(of: openRequestCount) {
+            DispatchQueue.main.async {
+                presentMenu()
+            }
+        }
+    }
+
+    private func presentMenu() {
+        onOpen()
+        presenter.present(items())
     }
 }
 
@@ -209,7 +221,7 @@ private final class StableMenuPresenter: NSObject, ObservableObject, NSMenuDeleg
 
     func present(_ items: [StableMenuItem]) {
         guard !items.isEmpty else { return }
-        guard let anchorView else { return }
+        guard let anchorView, anchorView.window != nil else { return }
 
         retainedMenu?.cancelTracking()
         let menu = NSMenu.stableMenu(from: items, fontPreset: FontScalePreset.current)

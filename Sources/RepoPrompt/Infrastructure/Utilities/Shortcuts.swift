@@ -43,6 +43,10 @@ extension KeyboardShortcuts.Name {
     static let showCurrentWindowAgentNavigationHUD = Self("showCurrentWindowAgentNavigationHUD", default: .init(.k, modifiers: [.command]))
     /// Show the all-active/recent Agents navigation HUD.
     static let showAllAgentsNavigationHUD = Self("showAllAgentsNavigationHUD", default: .init(.k, modifiers: [.command, .shift]))
+    /// Open the focused Agent session's Agent/Model picker.
+    static let showAgentModelPicker = Self("showAgentModelPicker", default: .init(.m, modifiers: [.command, .shift]))
+    /// Open the focused Agent session's active effort picker. Unbound by default.
+    static let showAgentEffortPicker = Self("showAgentEffortPicker")
     /// Cycle to the previous root Agent session row.
     static let previousParentAgentSession = Self("previousParentAgentSession", default: .init(.leftBracket, modifiers: [.command, .option]))
     /// Cycle to the next root Agent session row.

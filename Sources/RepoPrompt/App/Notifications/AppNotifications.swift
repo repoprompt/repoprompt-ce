@@ -86,4 +86,12 @@ extension Notification.Name {
     /// Show the Agent navigation HUD for the target window.
     /// userInfo: ["windowID": Int, "mode": AgentNavigationHUDMode.rawValue]
     static let showAgentNavigationHUD = Notification.Name("showAgentNavigationHUD")
+
+    /// Request that Agent Mode open the Agent/Model picker for the target window.
+    /// userInfo: ["windowID": Int]
+    static let showAgentModelPicker = Notification.Name("showAgentModelPicker")
+
+    /// Request that Agent Mode open the active provider's effort picker for the target window.
+    /// userInfo: ["windowID": Int]
+    static let showAgentEffortPicker = Notification.Name("showAgentEffortPicker")
 }
