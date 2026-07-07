@@ -262,10 +262,88 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual((source as? ACPRequestTimeoutError), timeout)
     }
 
-    private func makeProviderForNormalization() -> OpenCodeACPAgentProvider {
+    func testSessionNewTimeoutIncludesRecursiveMCPConfigGuidanceWhenDetected() {
+        let provider = makeProviderForNormalization(
+            recursiveMCPConfigGuidance: {
+                "OpenCode may be loading RepoPrompt MCP server entries from its global config at `/tmp/opencode.json` (`RepoPromptCE`). Remove or disable those OpenCode MCP entries."
+            }
+        )
+        let timeout = ACPRequestTimeoutError(
+            method: "session/new",
+            timeoutSeconds: 30,
+            launchDescription: "opencode acp",
+            diagnosticHint: "The process did not write ACP stdout before timing out, but it wrote stderr. Last stderr line: `server unavailable key=RepoPromptCE`.",
+            agentIdentity: "OpenCode 1.17.14"
+        )
+
+        let normalized = provider.normalizeError(timeout)
+
+        guard case let AIProviderError.invalidConfiguration(detail) = normalized else {
+            return XCTFail("Unexpected normalized error: \(normalized)")
+        }
+        XCTAssertTrue(detail.contains("global config"))
+        XCTAssertTrue(detail.contains("RepoPromptCE"))
+        XCTAssertTrue(detail.contains("Remove or disable"))
+        XCTAssertTrue(detail.contains("server unavailable key=RepoPromptCE"))
+        XCTAssertFalse(detail.contains("opencode upgrade"))
+    }
+
+    func testOpenCodeGlobalMCPConfigDiagnosticDetectsRepoPromptServerInGlobalConfig() throws {
+        let directory = try makeTemporaryDirectory()
+        let xdgConfigHome = directory.appendingPathComponent("xdg", isDirectory: true)
+        let openCodeConfigDirectory = xdgConfigHome.appendingPathComponent("opencode", isDirectory: true)
+        try FileManager.default.createDirectory(at: openCodeConfigDirectory, withIntermediateDirectories: true)
+        let configPath = openCodeConfigDirectory.appendingPathComponent("opencode.json")
+        try """
+        {
+          "$schema": "https://opencode.ai/config.json",
+          "mcp": {
+            "RepoPromptCE": {
+              "type": "local",
+              "command": ["/Applications/RepoPrompt.app/Contents/MacOS/repoprompt-mcp"]
+            },
+            "unrelated": {
+              "type": "local",
+              "command": ["node", "server.js"]
+            }
+          }
+        }
+        """.write(to: configPath, atomically: true, encoding: .utf8)
+
+        let diagnostic = try XCTUnwrap(OpenCodeGlobalMCPConfigDiagnostic.detect(environment: [
+            "XDG_CONFIG_HOME": xdgConfigHome.path,
+            "HOME": directory.appendingPathComponent("home", isDirectory: true).path
+        ]))
+
+        XCTAssertEqual(diagnostic.path, configPath.path)
+        XCTAssertEqual(diagnostic.suspiciousKeys, ["RepoPromptCE"])
+        XCTAssertTrue(diagnostic.guidanceMessage.contains("`RepoPromptCE`"))
+        XCTAssertTrue(diagnostic.guidanceMessage.contains("recursively launch RepoPrompt CE"))
+        XCTAssertTrue(diagnostic.guidanceMessage.contains("\"mcp\": {}"))
+    }
+
+    func testOpenCodeGlobalMCPConfigDiagnosticIgnoresEmptyAndUnrelatedMCPConfig() {
+        XCTAssertNil(OpenCodeGlobalMCPConfigDiagnostic.diagnostic(in: ["mcp": [:]], path: "/tmp/opencode.json"))
+        XCTAssertNil(OpenCodeGlobalMCPConfigDiagnostic.diagnostic(
+            in: [
+                "mcp": [
+                    "filesystem": [
+                        "type": "local",
+                        "command": ["node", "server.js"]
+                    ]
+                ]
+            ],
+            path: "/tmp/opencode.json"
+        ))
+    }
+
+    private func makeProviderForNormalization(
+        recursiveMCPConfigGuidance: @escaping @Sendable () -> String? = { nil }
+    ) -> OpenCodeACPAgentProvider {
         OpenCodeACPAgentProvider(
             config: OpenCodeAgentConfig(commandName: "opencode"),
-            launchResolver: OpenCodeACPLaunchResolver()
+            launchResolver: OpenCodeACPLaunchResolver(),
+            recursiveMCPConfigGuidance: recursiveMCPConfigGuidance
         )
     }
 
