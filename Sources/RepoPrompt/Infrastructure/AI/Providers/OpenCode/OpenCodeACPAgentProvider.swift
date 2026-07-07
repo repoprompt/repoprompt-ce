@@ -128,10 +128,24 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         if error is OpenCodeACPLaunchResolutionError || error is ExecutableFileIdentityError {
             return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
         }
+        if let guidance = Self.openCodeACPStartupGuidance(for: error) {
+            return AIProviderError.invalidConfiguration(detail: guidance)
+        }
         if (error as NSError).domain == NSCocoaErrorDomain {
             return AIProviderError.invalidConfiguration(detail: "Unable to prepare OpenCode ACP config: \(error.localizedDescription)")
         }
         return AIProviderError.apiError(source: error)
+    }
+
+    private static func openCodeACPStartupGuidance(for error: Error) -> String? {
+        guard let timeout = error as? ACPRequestTimeoutError,
+              ["initialize", "authenticate", "session/new", "session/load"].contains(timeout.method)
+        else {
+            return nil
+        }
+
+        let message = timeout.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "OpenCode ACP did not finish session startup. Update OpenCode with `opencode upgrade`, then verify `opencode --version` and `opencode acp --help` return promptly before retrying. Original error: \(message)"
     }
 
     private func standardizedWorkingDirectory(from workspacePath: String?) -> String {

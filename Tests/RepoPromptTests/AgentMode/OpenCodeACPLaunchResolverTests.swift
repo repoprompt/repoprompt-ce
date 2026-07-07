@@ -222,6 +222,53 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         }
     }
 
+    func testSessionNewTimeoutNormalizesToOpenCodeRecoveryGuidance() {
+        let provider = makeProviderForNormalization()
+        let timeout = ACPRequestTimeoutError(
+            method: "session/new",
+            timeoutSeconds: 30,
+            launchDescription: "/Users/me/.opencode/bin/opencode acp",
+            diagnosticHint: "The process wrote stdout, but no matching ACP response arrived for this request.",
+            agentIdentity: "OpenCode 1.17.11"
+        )
+
+        let normalized = provider.normalizeError(timeout)
+
+        guard case let AIProviderError.invalidConfiguration(detail) = normalized else {
+            return XCTFail("Unexpected normalized error: \(normalized)")
+        }
+        XCTAssertTrue(detail.contains("OpenCode ACP did not finish session startup"))
+        XCTAssertTrue(detail.contains("opencode upgrade"))
+        XCTAssertTrue(detail.contains("opencode acp --help"))
+        XCTAssertTrue(detail.contains("OpenCode 1.17.11"))
+        XCTAssertTrue(detail.contains("session/new timed out"))
+    }
+
+    func testPromptTimeoutDoesNotUseOpenCodeStartupGuidance() {
+        let provider = makeProviderForNormalization()
+        let timeout = ACPRequestTimeoutError(
+            method: "session/prompt",
+            timeoutSeconds: 30,
+            launchDescription: "opencode acp",
+            diagnosticHint: nil,
+            agentIdentity: "OpenCode 1.17.14"
+        )
+
+        let normalized = provider.normalizeError(timeout)
+
+        guard case let AIProviderError.apiError(source) = normalized else {
+            return XCTFail("Unexpected normalized error: \(normalized)")
+        }
+        XCTAssertEqual((source as? ACPRequestTimeoutError), timeout)
+    }
+
+    private func makeProviderForNormalization() -> OpenCodeACPAgentProvider {
+        OpenCodeACPAgentProvider(
+            config: OpenCodeAgentConfig(commandName: "opencode"),
+            launchResolver: OpenCodeACPLaunchResolver()
+        )
+    }
+
     private func makeRunRequest(workspacePath: String) -> ACPRunRequest {
         ACPRunRequest(
             agentKind: .openCode,
