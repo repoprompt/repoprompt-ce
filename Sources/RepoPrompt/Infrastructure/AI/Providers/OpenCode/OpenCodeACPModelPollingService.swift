@@ -58,6 +58,9 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
             let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .openCode)
             await controller.shutdown()
             return snapshot
+        } catch is CancellationError {
+            await controller.shutdown()
+            throw CancellationError()
         } catch {
             await controller.shutdown()
             throw provider.normalizeError(error)
