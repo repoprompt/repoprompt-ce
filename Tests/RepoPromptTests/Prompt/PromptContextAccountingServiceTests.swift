@@ -2,16 +2,6 @@
 import XCTest
 
 final class PromptContextAccountingServiceTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testExactSelectedFilesPreserveStoredSelectionOrderAfterBatchLookupAndConcurrentReads() async throws {
         let root = try makeTemporaryRoot(name: "AccountingOrder")
         let fileA = root.appendingPathComponent("A.swift")
@@ -358,7 +348,7 @@ final class PromptContextAccountingServiceTests: XCTestCase {
     func testCodemapAccountingCountsExactRenderedHeaderAndImports() async throws {
         let root = try makeTemporaryRoot(name: "AccountingRenderedCodemapTokens")
         let fileURL = root.appendingPathComponent("Nested/Target.swift")
-        try write("struct Target {}", to: fileURL)
+        try write(SwiftFixtureSource.emptyStruct("Target", trailingNewline: false), to: fileURL)
 
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: root.path)
@@ -397,7 +387,7 @@ final class PromptContextAccountingServiceTests: XCTestCase {
     func testAccountingAndPackagingShareExactPresentationArtifactAndRenderedText() async throws {
         let root = try makeTemporaryRoot(name: "AccountingPackagingIdentity")
         let fileURL = root.appendingPathComponent("Target.swift")
-        try write("struct Target {}", to: fileURL)
+        try write(SwiftFixtureSource.emptyStruct("Target", trailingNewline: false), to: fileURL)
 
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: root.path)
@@ -434,7 +424,7 @@ final class PromptContextAccountingServiceTests: XCTestCase {
     func testNonGitSelectedCodemapIsTypedUnavailableAndFallsBackToContent() async throws {
         let root = try makeTemporaryRoot(name: "AccountingNonGitFallback")
         let fileURL = root.appendingPathComponent("A.swift")
-        let content = "struct NonGitFallback {}"
+        let content = SwiftFixtureSource.emptyStruct("NonGitFallback", trailingNewline: false)
         try write(content, to: fileURL)
 
         let store = WorkspaceFileContextStore()
@@ -485,12 +475,7 @@ final class PromptContextAccountingServiceTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

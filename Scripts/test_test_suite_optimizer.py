@@ -148,6 +148,26 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(sample.source_guard_kind, optimizer.SOURCE_GUARD_METADATA)
         self.assertIn("filtered baseline produced no parsed XCTest timings", sample.invalid_reasons)
 
+    def test_baseline_summary_separates_build_and_test_seconds(self) -> None:
+        samples = [
+            self.make_sample(1, []),
+            self.make_sample(2, []),
+            self.make_sample(3, []),
+        ]
+        samples[0].execution_seconds = 10.0
+        samples[1].execution_seconds = 12.0
+        samples[2].execution_seconds = 14.0
+        samples[0].build = {"execution_seconds": 3.0}
+        samples[1].build = {"execution_seconds": 5.0}
+        samples[2].build = {"execution_seconds": 7.0}
+
+        summary = optimizer.baseline_summary(samples)
+
+        self.assertEqual(summary["median_seconds"], 12.0)
+        self.assertEqual(summary["median_build_execution_seconds"], 5.0)
+        self.assertEqual(summary["observed_p95_build_execution_seconds"], 7.0)
+        self.assertEqual(summary["median_total_build_plus_test_seconds"], 17.0)
+
     def test_suite_ranking_uses_median_aggregate_seconds(self) -> None:
         ranking = optimizer.suite_ranking([
             self.make_sample(
@@ -230,6 +250,34 @@ class SourceAndLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(optimizer.OptimizerError, "--filter cannot be used with list mode"):
             optimizer.conductor_command(Path("/repo"), "provider", list_mode=True, filter_value="Suite")
 
+    def test_conductor_command_adds_test_product_before_filter(self) -> None:
+        command = optimizer.conductor_command(
+            Path("/repo"),
+            "root",
+            filter_value="WorkspaceTests",
+            test_product="RepoPromptWorkspaceTests",
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/repo/conductor",
+                "test",
+                "--test-product",
+                "RepoPromptWorkspaceTests",
+                "--filter",
+                "WorkspaceTests",
+                "--json",
+            ],
+        )
+        with self.assertRaisesRegex(optimizer.OptimizerError, "--test-product cannot be used with list mode"):
+            optimizer.conductor_command(
+                Path("/repo"),
+                "root",
+                list_mode=True,
+                test_product="RepoPromptWorkspaceTests",
+            )
+
     def test_metadata_source_guard_changes_on_add_modify_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -264,8 +312,619 @@ class SourceAndLedgerTests(unittest.TestCase):
 
         self.assertEqual(locations[tests[0].method_id].file, "Tests/RepoPromptTests/MCP/ExampleTests.swift")
         self.assertEqual(rows[0]["domain"], "MCP")
+        self.assertEqual(rows[0]["execution_tier"], "routine")
         self.assertEqual(rows[0]["scenario_count"], "1")
         self.assertEqual(rows[0]["current_disposition"], "retain_pending_review")
+
+    def write_ledger(self, path: Path, rows: list[dict[str, str]]) -> None:
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=optimizer.LEDGER_COLUMNS,
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for partial in rows:
+                row = {column: "" for column in optimizer.LEDGER_COLUMNS}
+                row.update(partial)
+                if not row.get("execution_tier"):
+                    row["execution_tier"] = "routine"
+                writer.writerow(row)
+
+    def test_read_ledger_rows_rejects_unknown_execution_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "execution_tier": "sometimes",
+                }],
+            )
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "unsupported execution_tier"):
+                optimizer.read_ledger_rows(ledger)
+
+    def test_default_impacted_range_unions_branch_and_worktree_changes(self) -> None:
+        calls: list[list[str]] = []
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.returncode = 0
+                self.stdout = stdout
+                self.stderr = ""
+
+        def fake_run_command(command, cwd, timeout_seconds=None):
+            calls.append(list(command))
+            if optimizer.DEFAULT_IMPACTED_BRANCH_RANGE in command:
+                return FakeCompletedProcess("Sources/Branch.swift\nShared.swift\n")
+            return FakeCompletedProcess("Shared.swift\nTests/WorktreeTests.swift\n")
+
+        with mock.patch.object(optimizer, "run_command", side_effect=fake_run_command):
+            changed = optimizer.changed_files_for_range(Path("/repo"), optimizer.DEFAULT_IMPACTED_RANGE)
+
+        self.assertEqual(changed, ["Shared.swift", "Sources/Branch.swift", "Tests/WorktreeTests.swift"])
+        self.assertEqual(
+            calls[0],
+            ["git", "diff", "--name-only", "--diff-filter=ACMRT", "origin/main...HEAD", "--"],
+        )
+        self.assertEqual(
+            calls[1],
+            ["git", "diff", "--name-only", "--diff-filter=ACMRT", "HEAD", "--"],
+        )
+
+    def test_impacted_tests_selects_test_file_smoke_floor_and_skips_heavy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                        "target": "root",
+                        "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                        "suite": "RepoPromptTests.ExampleTests",
+                        "method": "testOne",
+                        "domain": "MCP",
+                        "layer": "root_swiftpm",
+                        "execution_tier": "routine",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.SmokeTests/testSmoke",
+                        "target": "root",
+                        "file": "Tests/RepoPromptTests/SmokeTests.swift",
+                        "suite": "RepoPromptTests.SmokeTests",
+                        "method": "testSmoke",
+                        "domain": "Root",
+                        "layer": "root_swiftpm",
+                        "execution_tier": "fast",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.ScaleTests/testScale",
+                        "target": "root",
+                        "file": "Tests/RepoPromptTests/MCP/ScaleTests.swift",
+                        "suite": "RepoPromptTests.ScaleTests",
+                        "method": "testScale",
+                        "domain": "MCP",
+                        "layer": "root_swiftpm",
+                        "execution_tier": "scale",
+                    },
+                ],
+            )
+
+            with mock.patch.object(
+                optimizer,
+                "changed_files_for_range",
+                return_value=[
+                    "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "Sources/RepoPrompt/Infrastructure/MCP/Router.swift",
+                ],
+            ):
+                payload = optimizer.impacted_tests(
+                    root,
+                    ledger,
+                    "origin/main...HEAD",
+                    smoke_floor_suites=["RepoPromptTests.SmokeTests"],
+                    validate_live_list=False,
+                )
+
+        self.assertFalse(payload["full_root_required"])
+        self.assertEqual(payload["selected_count"], 2)
+        self.assertEqual(
+            [entry["method_id"] for entry in payload["selected"]],
+            [
+                "root/RepoPromptTests.ExampleTests/testOne",
+                "root/RepoPromptTests.SmokeTests/testSmoke",
+            ],
+        )
+        self.assertEqual(payload["skipped_heavy_or_opt_in"][0]["method_id"], "root/RepoPromptTests.ScaleTests/testScale")
+        self.assertIn(r"RepoPromptTests\.ExampleTests/testOne", payload["filter"])
+
+    def test_impacted_tests_uses_full_root_for_broad_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "execution_tier": "routine",
+                }],
+            )
+
+            with mock.patch.object(optimizer, "changed_files_for_range", return_value=["Package.swift"]):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD", validate_live_list=False)
+
+        self.assertTrue(payload["full_root_required"])
+        self.assertIsNone(payload["filter"])
+        self.assertEqual(payload["selected_count"], 0)
+        self.assertEqual(payload["full_root_total_count"], 1)
+
+    def test_impacted_tests_broad_boundary_with_run_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "execution_tier": "routine",
+                }],
+            )
+
+            with mock.patch.object(optimizer, "changed_files_for_range", return_value=["Package.swift"]):
+                with self.assertRaises(optimizer.OptimizerError) as ctx:
+                    optimizer.impacted_tests(
+                        root,
+                        ledger,
+                        "HEAD",
+                        run_selected=True,
+                        validate_live_list=False,
+                    )
+
+        self.assertIn("full root suite", str(ctx.exception))
+        self.assertIn("Package.swift", str(ctx.exception))
+
+    def test_impacted_tests_focused_run_failure_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            list_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\n",
+                ticket="list-ticket",
+            )
+            failed_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--filter", "x", "--json"],
+                process_exit_code=1,
+                stdout="{}",
+                stderr="boom",
+                result={"state": "completed", "exitCode": 1, "logPath": "/tmp/run.log"},
+                log_text="",
+                ticket="run-ticket",
+            )
+
+            with (
+                mock.patch.object(
+                    optimizer,
+                    "run_conductor",
+                    side_effect=[list_run, failed_run],
+                ),
+                mock.patch.object(
+                    optimizer,
+                    "changed_files_for_range",
+                    return_value=["Tests/RepoPromptTests/MCP/ExampleTests.swift"],
+                ),
+            ):
+                with self.assertRaises(optimizer.OptimizerError) as ctx:
+                    optimizer.impacted_tests(root, ledger, "HEAD", run_selected=True)
+
+        message = str(ctx.exception)
+        self.assertIn("impacted test run failed", message)
+        self.assertIn("process_exit=1", message)
+        self.assertIn("exit=1", message)
+        self.assertIn("run-ticket", message)
+
+    def test_impacted_tests_focused_run_success_attaches_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            list_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\n",
+                ticket="list-ticket",
+            )
+            ok_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--filter", "x", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/run.log"},
+                log_text="",
+                ticket="run-ticket",
+            )
+
+            with (
+                mock.patch.object(
+                    optimizer,
+                    "run_conductor",
+                    side_effect=[list_run, ok_run],
+                ),
+                mock.patch.object(
+                    optimizer,
+                    "changed_files_for_range",
+                    return_value=["Tests/RepoPromptTests/MCP/ExampleTests.swift"],
+                ),
+            ):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD", run_selected=True)
+
+        self.assertIsNotNone(payload["run"])
+        self.assertEqual(payload["run"]["process_exit_code"], 0)
+        self.assertEqual(payload["run"]["state"], "completed")
+        self.assertEqual(payload["run"]["exit_code"], 0)
+        self.assertEqual(payload["run"]["ticket"], "run-ticket")
+
+    def test_impacted_tests_validates_against_live_root_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\n",
+                ticket="list-ticket",
+            )
+
+            with (
+                mock.patch.object(optimizer, "run_conductor", return_value=run),
+                mock.patch.object(
+                    optimizer,
+                    "changed_files_for_range",
+                    return_value=["Tests/RepoPromptTests/MCP/ExampleTests.swift"],
+                ),
+            ):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD")
+
+        self.assertEqual(payload["live_root_test_count"], 1)
+        self.assertEqual(payload["list_log_path"], "/tmp/root-list.log")
+        self.assertEqual(payload["selected_count"], 1)
+
+    def test_impacted_tests_rejects_live_root_methods_missing_from_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\nRepoPromptWorkspaceTests.SplitTests/testTwo\n",
+                ticket="list-ticket",
+            )
+
+            with (
+                mock.patch.object(optimizer, "run_conductor", return_value=run),
+                mock.patch.object(optimizer, "changed_files_for_range", return_value=[]),
+            ):
+                with self.assertRaisesRegex(optimizer.OptimizerError, "missing=1 stale=0"):
+                    optimizer.impacted_tests(root, ledger, "HEAD")
+
+    def test_impacted_tests_selects_changed_split_root_test_file_by_ledger_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptWorkspaceTests.SplitTests/testTwo",
+                    "target": "root",
+                    "file": "Tests/RepoPromptWorkspaceTests/SplitTests.swift",
+                    "suite": "RepoPromptWorkspaceTests.SplitTests",
+                    "method": "testTwo",
+                    "domain": "Workspace",
+                    "execution_tier": "routine",
+                }],
+            )
+
+            with mock.patch.object(
+                optimizer,
+                "changed_files_for_range",
+                return_value=["Tests/RepoPromptWorkspaceTests/SplitTests.swift"],
+            ):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD", validate_live_list=False)
+
+        self.assertEqual(payload["selected_count"], 1)
+        self.assertEqual(payload["selected"][0]["method_id"], "root/RepoPromptWorkspaceTests.SplitTests/testTwo")
+        self.assertIn(
+            "Tests/RepoPromptWorkspaceTests/SplitTests.swift: changed test file",
+            payload["selected"][0]["reasons"],
+        )
+
+    def test_shard_root_tests_balances_by_runtime_and_excludes_heavy_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.A/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.A",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "9",
+                        "shared_state_tags": "TempDirectory",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.B/testTwo",
+                        "target": "root",
+                        "suite": "RepoPromptTests.B",
+                        "method": "testTwo",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "1",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.C/testScale",
+                        "target": "root",
+                        "suite": "RepoPromptTests.C",
+                        "method": "testScale",
+                        "execution_tier": "scale",
+                        "runtime_seconds": "100",
+                    },
+                ],
+            )
+
+            payload = optimizer.shard_root_tests(ledger, 2)
+
+        self.assertEqual(payload["shard_count"], 2)
+        self.assertEqual(sum(shard["method_count"] for shard in payload["shards"]), 2)
+        self.assertNotIn("RepoPromptTests.C/testScale", json.dumps(payload))
+        self.assertIn("shared_state_tag_counts", payload["shards"][0])
+        self.assertIn("parallelization_warning", payload)
+
+    def test_runtime_import_updates_matching_rows_and_preserves_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            output = root / "candidate.tsv"
+            baseline = root / "baseline.json"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.A/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.A",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.B/testTwo",
+                        "target": "root",
+                        "suite": "RepoPromptTests.B",
+                        "method": "testTwo",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "1.000000",
+                    },
+                ],
+            )
+            baseline.write_text(
+                json.dumps({
+                    "target": "root",
+                    "slowest_tests": [
+                        {"suite": "RepoPromptTests.A", "method": "testOne", "median_seconds": 2.5},
+                        {"suite": "RepoPromptTests.C", "method": "testMissing", "median_seconds": 9.0},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
+            summary = optimizer.runtime_import(ledger, baseline, output)
+
+            self.assertEqual(summary["rows_updated"], 1)
+            self.assertEqual(summary["rows_unchanged"], 1)
+            self.assertEqual(summary["artifact_methods_missing_from_ledger"], ["root/RepoPromptTests.C/testMissing"])
+            self.assertEqual(summary["ledger_methods_missing_from_artifact"], ["root/RepoPromptTests.B/testTwo"])
+            with output.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["method_id"] for row in rows], [
+                "root/RepoPromptTests.A/testOne",
+                "root/RepoPromptTests.B/testTwo",
+            ])
+            self.assertEqual(rows[0]["runtime_seconds"], "2.500000")
+            self.assertEqual(rows[1]["runtime_seconds"], "1.000000")
+
+    def test_runtime_import_refuses_to_overwrite_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            output = root / "candidate.tsv"
+            baseline = root / "baseline.json"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.A/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.A",
+                    "method": "testOne",
+                    "execution_tier": "routine",
+                }],
+            )
+            baseline.write_text(json.dumps({"target": "root", "slowest_tests": []}), encoding="utf-8")
+            output.write_text("existing", encoding="utf-8")
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "refusing to overwrite"):
+                optimizer.runtime_import(ledger, baseline, output)
+
+    def test_ci_suite_plan_balances_suites_and_marks_batch_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.Slow/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Slow",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "8",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.Fast/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Fast",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                        "runtime_seconds": "1.5",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.MissingRuntime/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.MissingRuntime",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.Shared/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Shared",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                        "runtime_seconds": "1",
+                        "shared_state_tags": "UserDefaults",
+                    },
+                    {
+                        "method_id": "provider/ProviderTests.Ignored/testOne",
+                        "target": "provider",
+                        "suite": "ProviderTests.Ignored",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                        "runtime_seconds": "100",
+                    },
+                ],
+            )
+
+            plan = optimizer.ci_suite_plan(ledger, 2, suites=[
+                "RepoPromptTests.Slow",
+                "RepoPromptTests.Fast",
+                "RepoPromptTests.MissingRuntime",
+                "RepoPromptTests.Shared",
+                "RepoPromptTests.NotLive",
+            ])
+
+        self.assertEqual(plan["shard_count"], 2)
+        self.assertEqual(plan["missing_suites"], ["RepoPromptTests.NotLive"])
+        all_suites = {entry["suite"]: entry for shard in plan["shards"] for entry in shard["suites"]}
+        self.assertEqual(set(all_suites), {
+            "RepoPromptTests.Slow",
+            "RepoPromptTests.Fast",
+            "RepoPromptTests.MissingRuntime",
+            "RepoPromptTests.Shared",
+        })
+        self.assertEqual(all_suites["RepoPromptTests.MissingRuntime"]["missing_runtime_count"], 1)
+        self.assertTrue(all_suites["RepoPromptTests.Fast"]["batch_eligible"])
+        self.assertFalse(all_suites["RepoPromptTests.MissingRuntime"]["batch_eligible"])
+        self.assertFalse(all_suites["RepoPromptTests.Shared"]["batch_eligible"])
+        self.assertGreaterEqual(plan["shards"][0]["estimated_seconds"], plan["shards"][1]["estimated_seconds"])
+
+    def test_source_mapping_supports_multiple_root_test_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "Tests" / "RepoPromptTests" / "MCP"
+            second = root / "Tests" / "RepoPromptWorkspaceTests" / "WorkspaceContext"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            (first / "ExampleTests.swift").write_text(
+                "final class ExampleTests { func testOne() {} }\n",
+                encoding="utf-8",
+            )
+            (second / "WorkspaceExampleTests.swift").write_text(
+                "final class WorkspaceExampleTests { func testTwo() {} }\n",
+                encoding="utf-8",
+            )
+            tests = [
+                optimizer.ListedTest("root", "RepoPromptWorkspaceTests.WorkspaceExampleTests", "testTwo")
+            ]
+
+            locations = optimizer.map_test_sources(root, tests)
+
+        self.assertEqual(
+            locations[tests[0].method_id].file,
+            "Tests/RepoPromptWorkspaceTests/WorkspaceContext/WorkspaceExampleTests.swift",
+        )
+        self.assertEqual(locations[tests[0].method_id].domain, "WorkspaceContext")
 
     def test_source_mapping_rejects_ambiguous_method_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -297,6 +956,120 @@ class SourceAndLedgerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(optimizer.OptimizerError, "duplicate method_id"):
                 optimizer.read_ledger_ids(path)
+
+    def test_verify_ledger_emits_progress_and_checks_completed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            with ledger.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=optimizer.LEDGER_COLUMNS,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                for method_id, target, suite, method in [
+                    ("root/RepoPromptTests.ExampleTests/testOne", "root", "RepoPromptTests.ExampleTests", "testOne"),
+                    (
+                        "provider/RepoPromptClaudeCompatibleProviderTests.CodecTests/testRoundTrip",
+                        "provider",
+                        "RepoPromptClaudeCompatibleProviderTests.CodecTests",
+                        "testRoundTrip",
+                    ),
+                ]:
+                    row = {column: "" for column in optimizer.LEDGER_COLUMNS}
+                    row.update({
+                        "method_id": method_id,
+                        "target": target,
+                        "suite": suite,
+                        "method": method,
+                        "execution_tier": "routine" if target == "root" else "fast",
+                    })
+                    writer.writerow(row)
+            runs = {
+                "root": optimizer.ConductorRun(
+                    command=["/repo/conductor", "test", "--list", "--json"],
+                    process_exit_code=0,
+                    stdout="{}",
+                    stderr="",
+                    result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root.log"},
+                    log_text="RepoPromptTests.ExampleTests/testOne\n",
+                    ticket="root-ticket",
+                ),
+                "provider": optimizer.ConductorRun(
+                    command=["/repo/conductor", "provider-test", "--list", "--json"],
+                    process_exit_code=0,
+                    stdout="{}",
+                    stderr="",
+                    result={"state": "completed", "exitCode": 0, "logPath": "/tmp/provider.log"},
+                    log_text="RepoPromptClaudeCompatibleProviderTests.CodecTests/testRoundTrip\n",
+                    ticket="provider-ticket",
+                ),
+            }
+            events: list[dict[str, object]] = []
+
+            def fake_run_conductor(repo_root, target, list_mode=False, filter_value=None, timeout_seconds=None):
+                self.assertTrue(list_mode)
+                self.assertEqual(timeout_seconds, 12)
+                return runs[target]
+
+            with mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor):
+                payload = optimizer.verify_ledger_with_progress(
+                    root,
+                    ledger,
+                    lambda event: events.append(dict(event)),
+                    list_timeout_seconds=12,
+                )
+
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "verify_ledger_list_start",
+                "verify_ledger_list_end",
+                "verify_ledger_list_start",
+                "verify_ledger_list_end",
+            ],
+        )
+        self.assertEqual(events[0]["timeout_seconds"], 12)
+        self.assertEqual(events[1]["ticket"], "root-ticket")
+        self.assertEqual(events[3]["ticket"], "provider-ticket")
+
+    def test_verify_ledger_rejects_missing_list_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            with ledger.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=optimizer.LEDGER_COLUMNS,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+            run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/missing/root.log"},
+                log_text="",
+                ticket="root-ticket",
+            )
+
+            with mock.patch.object(optimizer, "run_conductor", return_value=run):
+                with self.assertRaisesRegex(optimizer.OptimizerError, "list log missing or empty"):
+                    optimizer.verify_ledger_with_progress(root, ledger, None)
+
+    def test_verify_ledger_rejects_non_positive_list_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            ledger.write_text("\t".join(optimizer.LEDGER_COLUMNS) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "must be greater than zero"):
+                optimizer.verify_ledger_with_progress(root, ledger, None, list_timeout_seconds=0)
 
 
 class ProgressOutputTests(unittest.TestCase):
@@ -376,11 +1149,13 @@ class BaselineProgressTests(unittest.TestCase):
                 target: str,
                 list_mode: bool = False,
                 filter_value: str | None = None,
+                test_product: str | None = None,
             ) -> optimizer.ConductorRun:
                 nonlocal run_count
                 run_count += 1
                 self.assertFalse(list_mode)
                 self.assertEqual((target, filter_value), ("root", "RepoPromptTests.ExampleTests"))
+                self.assertIsNone(test_product)
                 operations.append(("run", run_count))
                 return runs.pop(0)
 
@@ -422,6 +1197,7 @@ class BaselineProgressTests(unittest.TestCase):
         self.assertEqual(start["target"], "root")
         self.assertEqual(start["scope"], "filtered")
         self.assertEqual(start["filter"], filter_value)
+        self.assertIsNone(start["test_product"])
         self.assertEqual(start["source_guard"], optimizer.SOURCE_GUARD_METADATA)
         self.assertEqual(start["sample_index"], 1)
         self.assertEqual(start["sample_count"], 2)
@@ -441,6 +1217,374 @@ class BaselineProgressTests(unittest.TestCase):
         self.assertEqual(invalid_end["invalid_reasons"], ["test exit 1"])
         self.assertEqual(events[3]["valid"], True)
         self.assertEqual(events[3]["invalid_reasons"], [])
+
+    def test_baseline_build_before_samples_emits_build_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events: list[dict[str, object]] = []
+            operations: list[str] = []
+            build_result = {
+                "state": "completed",
+                "exitCode": 0,
+                "queueWaitSeconds": 0.1,
+                "executionSeconds": 3.0,
+                "measurementInvalid": False,
+                "logPath": "/tmp/build.log",
+            }
+            build_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "swift-build", "--product", "all", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result=build_result,
+                log_text="",
+                ticket="build-ticket",
+            )
+
+            def fake_build(repo_root: Path, target: str) -> optimizer.ConductorRun:
+                operations.append("build")
+                return build_run
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+                test_product: str | None = None,
+            ) -> optimizer.ConductorRun:
+                operations.append("test")
+                self.assertIsNone(test_product)
+                return self.make_run(1)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "b" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor_build", side_effect=fake_build),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-01T00:00:00+00:00"),
+            ):
+                payload = optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=1,
+                    label="build-progress-test",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    build_before_samples=True,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+        self.assertEqual(operations, ["build", "test"])
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "baseline_sample_start",
+                "baseline_build_start",
+                "baseline_build_end",
+                "baseline_sample_end",
+            ],
+        )
+        self.assertEqual(events[2]["ticket"], "build-ticket")
+        self.assertEqual(events[2]["execution_seconds"], 3.0)
+        self.assertEqual(payload["summary"]["median_build_execution_seconds"], 3.0)
+
+    def test_baseline_records_test_product_and_keeps_primary_metric_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected_product = "RepoPromptWorkspaceTests"
+            expected_command = optimizer.conductor_command(root, "root", test_product=expected_product)
+            events: list[dict[str, object]] = []
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+                test_product: str | None = None,
+            ) -> optimizer.ConductorRun:
+                self.assertEqual((target, list_mode, filter_value, test_product), ("root", False, None, expected_product))
+                return self.make_run(1)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "c" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-01T00:00:00+00:00"),
+            ):
+                payload = optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=1,
+                    label="workspace-product",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    test_product=expected_product,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+                scoreboard = (root / "scoreboard.md").read_text(encoding="utf-8")
+
+        self.assertEqual(payload["command"], expected_command)
+        self.assertEqual(payload["test_product"], expected_product)
+        self.assertEqual(payload["scope"], "test-product")
+        self.assertFalse(payload["primary_metric_eligible"])
+        self.assertEqual(events[0]["test_product"], expected_product)
+        self.assertEqual(events[0]["scope"], "test-product")
+        self.assertEqual(events[1]["test_product"], expected_product)
+        self.assertEqual(events[1]["scope"], "test-product")
+        self.assertIn("### Focused:", scoreboard)
+        self.assertIn("Scope/filter: test-product", scoreboard)
+        self.assertIn(f"Test product: `{expected_product}`", scoreboard)
+
+    def test_baseline_rejects_provider_build_before_samples_before_progress(self) -> None:
+        events: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(optimizer.OptimizerError, "supports only --target root"):
+                optimizer.baseline(
+                    repo_root=root,
+                    target="provider",
+                    samples_requested=1,
+                    label="provider-build",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    build_before_samples=True,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+        self.assertEqual(events, [])
+
+    def test_baseline_rejects_test_product_build_before_samples_before_progress(self) -> None:
+        events: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(optimizer.OptimizerError, "cannot be combined with --test-product"):
+                optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=1,
+                    label="product-build",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    test_product="RepoPromptWorkspaceTests",
+                    build_before_samples=True,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+        self.assertEqual(events, [])
+
+
+class FocusedCostTests(unittest.TestCase):
+    def make_run(
+        self,
+        root: Path,
+        index: int,
+        *,
+        exit_code: int = 0,
+        log_text: str | None = None,
+        result_extra: dict[str, object] | None = None,
+    ) -> optimizer.ConductorRun:
+        log_path = root / f"focused-{index}.log"
+        if log_text is None:
+            log_text = "Test Case 'RepoPromptTests.ExampleTests.testOne' passed after 1.500 seconds.\n"
+        log_path.write_text(log_text, encoding="utf-8")
+        result = {
+            "state": "completed",
+            "exitCode": exit_code,
+            "queueWaitSeconds": 0.5,
+            "executionSeconds": 12.0 + index,
+            "timedOut": False,
+            "measurementInvalid": False,
+            "logPath": str(log_path),
+        }
+        if result_extra:
+            result.update(result_extra)
+        return optimizer.ConductorRun(
+            command=["/repo/conductor", "test", "--filter", "RepoPromptTests.ExampleTests", "--json"],
+            process_exit_code=0,
+            stdout=json.dumps({"result": result}),
+            stderr="",
+            result=result,
+            log_text=log_text,
+            ticket=f"ticket-{index}",
+        )
+
+    def test_focused_cost_records_diagnostic_artifact_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filter_value = "RepoPromptTests.ExampleTests"
+            output = root / "focused-cost.json"
+            scoreboard = root / "scoreboard.md"
+            events: list[dict[str, object]] = []
+            runs = [
+                self.make_run(root, 1, result_extra={"diagnostics": [{"swiftFrontendMaxRSSBytes": 42_000}]}),
+                self.make_run(root, 2, exit_code=1, log_text=""),
+            ]
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+            ) -> optimizer.ConductorRun:
+                self.assertEqual(repo_root, root)
+                self.assertEqual(target, "root")
+                self.assertFalse(list_mode)
+                self.assertEqual(filter_value, "RepoPromptTests.ExampleTests")
+                return runs.pop(0)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "b" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-03T00:00:00+00:00"),
+            ):
+                payload = optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value=filter_value,
+                    samples_requested=2,
+                    label="unit-focused",
+                    scoreboard=scoreboard,
+                    output=output,
+                    source_change_guard=optimizer.SOURCE_GUARD_METADATA,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+            artifact = json.loads(output.read_text(encoding="utf-8"))
+            scoreboard_text = scoreboard.read_text(encoding="utf-8")
+
+        self.assertEqual(payload, artifact)
+        self.assertEqual(artifact["diagnostic_kind"], "focused-cost")
+        self.assertEqual(artifact["command"], optimizer.conductor_command(root, "root", filter_value=filter_value))
+        self.assertFalse(artifact["primary_metric_eligible"])
+        self.assertEqual(artifact["source_guard"], {"kind": optimizer.SOURCE_GUARD_METADATA})
+        self.assertEqual(artifact["samples"][0]["queue_wait_seconds"], 0.5)
+        self.assertEqual(artifact["samples"][0]["total_execution_seconds"], 13.0)
+        self.assertEqual(artifact["samples"][0]["parsed_xctest_seconds"], 1.5)
+        self.assertEqual(artifact["samples"][0]["inferred_overhead_seconds"], 11.5)
+        self.assertEqual(artifact["samples"][0]["max_rss_bytes"], 42_000)
+        self.assertFalse(artifact["samples"][0]["source_changed"])
+        self.assertEqual(artifact["samples"][0]["invalid_reasons"], [])
+        self.assertIn("test exit 1", artifact["samples"][1]["invalid_reasons"])
+        self.assertIn("filtered baseline produced no parsed XCTest timings", artifact["samples"][1]["invalid_reasons"])
+        self.assertEqual(artifact["summary"]["valid_samples"], 1)
+        self.assertEqual(artifact["summary"]["median_total_execution_seconds"], 13.0)
+        self.assertEqual(artifact["summary"]["median_parsed_xctest_seconds"], 1.5)
+        self.assertEqual(artifact["summary"]["median_inferred_overhead_seconds"], 11.5)
+        self.assertEqual(artifact["summary"]["max_rss_bytes"], 42_000)
+        self.assertFalse(artifact["summary"]["reliable"])
+        self.assertTrue(artifact["summary"]["diagnostic_only"])
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "focused_cost_sample_start",
+                "focused_cost_sample_end",
+                "focused_cost_sample_start",
+                "focused_cost_sample_end",
+            ],
+        )
+        self.assertIn("Focused cost diagnostic", scoreboard_text)
+        self.assertIn("Primary metric eligible: no", scoreboard_text)
+        self.assertIn("unit-focused", scoreboard_text)
+        self.assertIn("Summary:", scoreboard_text)
+        self.assertIn("| Valid | Invalid | Median total execution seconds |", scoreboard_text)
+        self.assertIn("| 1 | 1 | 13.000 | 13.000 | 0.0000 | stable | 1.500 | 11.500 | 42000 | yes | no |", scoreboard_text)
+
+    def test_focused_cost_rejects_zero_valid_samples_without_writing_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "focused-cost.json"
+            scoreboard = root / "scoreboard.md"
+            runs = [
+                self.make_run(root, 1, exit_code=1, log_text=""),
+                self.make_run(root, 2, exit_code=2, log_text=""),
+            ]
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+            ) -> optimizer.ConductorRun:
+                self.assertEqual(repo_root, root)
+                self.assertEqual(target, "root")
+                self.assertFalse(list_mode)
+                self.assertEqual(filter_value, "RepoPromptTests.ExampleTests")
+                return runs.pop(0)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "c" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-03T00:00:00+00:00"),
+                self.assertRaisesRegex(optimizer.OptimizerError, "focused-cost produced no valid samples") as raised,
+            ):
+                optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value="RepoPromptTests.ExampleTests",
+                    samples_requested=2,
+                    label="zero-valid",
+                    scoreboard=scoreboard,
+                    output=output,
+                    progress_sink=None,
+                )
+
+            message = str(raised.exception)
+            self.assertIn("sample 1: test exit 1", message)
+            self.assertIn("filtered baseline produced no parsed XCTest timings", message)
+            self.assertIn("sample 2: test exit 2", message)
+            self.assertFalse(output.exists())
+            self.assertFalse(scoreboard.exists())
+
+    def test_focused_cost_requires_filter_and_positive_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(optimizer.OptimizerError, "--filter is required"):
+                optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value="",
+                    samples_requested=1,
+                    label="missing-filter",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "out.json",
+                    progress_sink=None,
+                )
+            with self.assertRaisesRegex(optimizer.OptimizerError, "--samples must be greater than zero"):
+                optimizer.focused_cost(
+                    repo_root=root,
+                    target="root",
+                    filter_value="RepoPromptTests.ExampleTests",
+                    samples_requested=0,
+                    label="zero-samples",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "out.json",
+                    progress_sink=None,
+                )
+
+    def test_parser_exposes_focused_cost_options(self) -> None:
+        help_text = io.StringIO()
+        parser = optimizer.build_parser()
+        with contextlib.redirect_stdout(help_text), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(["focused-cost", "--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        text = help_text.getvalue()
+        for option in (
+            "--target",
+            "--filter",
+            "--samples",
+            "--label",
+            "--scoreboard",
+            "--output",
+            "--source-change-guard",
+        ):
+            self.assertIn(option, text)
 
 
 class CombinedBaselineTests(unittest.TestCase):
@@ -499,6 +1643,7 @@ class CombinedBaselineTests(unittest.TestCase):
             *,
             scope: str = "complete",
             filter_value: str | None = None,
+            test_product: str | None = None,
             guard: str = optimizer.SOURCE_GUARD_CONTENT,
         ) -> Path:
             path = root / f"{name}.json"
@@ -508,6 +1653,7 @@ class CombinedBaselineTests(unittest.TestCase):
                         "target": "root",
                         "scope": scope,
                         "filter": filter_value,
+                        "test_product": test_product,
                         "source_guard": {"kind": guard},
                         "samples": [
                             {
@@ -532,12 +1678,16 @@ class CombinedBaselineTests(unittest.TestCase):
             complete = artifact(root, "complete")
             focused = artifact(root, "focused", scope="filtered", filter_value="RepoPromptTests.A")
             focused_other = artifact(root, "focused-other", scope="filtered", filter_value="RepoPromptTests.B")
+            workspace_product = artifact(root, "workspace-product", test_product="RepoPromptWorkspaceTests")
+            mcp_product = artifact(root, "mcp-product", test_product="RepoPromptMCPTests")
             metadata = artifact(root, "metadata", guard=optimizer.SOURCE_GUARD_METADATA)
 
             with self.assertRaisesRegex(optimizer.OptimizerError, "one scope"):
                 optimizer.combine_baselines([complete, focused])
             with self.assertRaisesRegex(optimizer.OptimizerError, "one filter"):
                 optimizer.combine_baselines([focused, focused_other])
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one test product"):
+                optimizer.combine_baselines([workspace_product, mcp_product])
             with self.assertRaisesRegex(optimizer.OptimizerError, "one source change guard"):
                 optimizer.combine_baselines([complete, metadata])
 
@@ -566,6 +1716,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
             "inventory": "/tmp/inventory.json",
             "scope": "complete",
             "filter": None,
+            "build_before_samples": False,
             "primary_metric_eligible": False,
             "source_guard": {"kind": optimizer.SOURCE_GUARD_METADATA},
             "command": ["./conductor", "provider-test", "--json"],
@@ -575,6 +1726,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
                     "index": 1,
                     "valid": True,
                     "execution_seconds": 1.0,
+                    "build": None,
                     "queue_wait_seconds": 0.1,
                     "state": "completed",
                     "exit_code": 0,
@@ -607,6 +1759,9 @@ class AppendOnlyArtifactTests(unittest.TestCase):
         self.assertIn("/one.log", second)
         self.assertIn("/two.log", second)
         self.assertIn("Source-change guard: `metadata`", second)
+        self.assertIn("Test product: ``", second)
+        self.assertIn("Build before samples: no", second)
+        self.assertIn("| Sample | Valid | Build seconds | Test execution seconds |", second)
         self.assertIn("Primary metric eligible: no", second)
 
     def test_json_artifacts_refuse_overwrite(self) -> None:

@@ -3,16 +3,6 @@ import Foundation
 import XCTest
 
 final class ACPSynchronousMCPStartupTests: XCTestCase {
-    private var temporaryURLs: [URL] = []
-
-    override func tearDown() {
-        for url in temporaryURLs {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryURLs.removeAll()
-        super.tearDown()
-    }
-
     func testOpenCodeStyleSessionNewWaitsForMCPInitializeAndToolsList() async throws {
         let workspace = try makeTemporaryDirectory()
         let recordURL = workspace.appendingPathComponent("opencode-startup.jsonl")
@@ -166,11 +156,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ACPSynchronousMCPStartupTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryURLs.append(url)
-        return url
+        try makeTestDirectory(name: "ACPSynchronousMCPStartupTests")
     }
 
     private func makeACPServerScript() throws -> URL {

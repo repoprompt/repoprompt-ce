@@ -713,6 +713,10 @@ enum ToolResultDTOs {
         let message: String?
         let displayPath: String?
         let worktreeScope: WorktreeScopeDTO?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
 
         init(
             content: String,
@@ -721,7 +725,11 @@ enum ToolResultDTOs {
             lastLine: Int,
             message: String? = nil,
             displayPath: String? = nil,
-            worktreeScope: WorktreeScopeDTO? = nil
+            worktreeScope: WorktreeScopeDTO? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil
         ) {
             self.content = content
             self.totalLines = totalLines
@@ -730,6 +738,10 @@ enum ToolResultDTOs {
             self.message = message
             self.displayPath = displayPath
             self.worktreeScope = worktreeScope
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -740,6 +752,10 @@ enum ToolResultDTOs {
             case message
             case displayPath = "display_path"
             case worktreeScope = "worktree_scope"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
         }
     }
 
@@ -768,6 +784,57 @@ enum ToolResultDTOs {
         let reviewStatus: String?
         let rejectionReason: String?
         let requiresUserApproval: Bool?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
+        let suggestion: String?
+
+        init(
+            status: String,
+            editsRequested: Int,
+            editsApplied: Int,
+            addedLines: Int?,
+            deletedLines: Int?,
+            totalLinesChanged: Int?,
+            totalChunks: Int?,
+            results: [EditOutcome]?,
+            unifiedDiff: String?,
+            cardUnifiedDiff: String?,
+            note: String?,
+            fileCreated: Bool?,
+            fileOverwritten: Bool?,
+            reviewStatus: String?,
+            rejectionReason: String?,
+            requiresUserApproval: Bool?,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil,
+            suggestion: String? = nil
+        ) {
+            self.status = status
+            self.editsRequested = editsRequested
+            self.editsApplied = editsApplied
+            self.addedLines = addedLines
+            self.deletedLines = deletedLines
+            self.totalLinesChanged = totalLinesChanged
+            self.totalChunks = totalChunks
+            self.results = results
+            self.unifiedDiff = unifiedDiff
+            self.cardUnifiedDiff = cardUnifiedDiff
+            self.note = note
+            self.fileCreated = fileCreated
+            self.fileOverwritten = fileOverwritten
+            self.reviewStatus = reviewStatus
+            self.rejectionReason = rejectionReason
+            self.requiresUserApproval = requiresUserApproval
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
+            self.suggestion = suggestion
+        }
 
         private enum CodingKeys: String, CodingKey {
             case status
@@ -786,6 +853,11 @@ enum ToolResultDTOs {
             case reviewStatus = "review_status"
             case rejectionReason = "rejection_reason"
             case requiresUserApproval = "requires_user_approval"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
+            case suggestion
         }
     }
 
@@ -1035,19 +1107,34 @@ enum ToolResultDTOs {
         let path: String
         let newPath: String? // present for move/rename
         let warning: String?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
+        let suggestion: String?
 
         init(
             status: String,
             action: String,
             path: String,
             newPath: String?,
-            warning: String? = nil
+            warning: String? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil,
+            suggestion: String? = nil
         ) {
             self.status = status
             self.action = action
             self.path = path
             self.newPath = newPath
             self.warning = warning
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
+            self.suggestion = suggestion
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -1056,6 +1143,11 @@ enum ToolResultDTOs {
             case path
             case newPath = "new_path"
             case warning
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
+            case suggestion
         }
     }
 

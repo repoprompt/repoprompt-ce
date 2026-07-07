@@ -129,6 +129,38 @@ final class MCPFileSearchBackpressureFormattingTests: XCTestCase {
         }
     }
 
+    func testReadFileFreshnessTimeoutPreservesTypedDTOAndWarningFormatting() throws {
+        let caseLabel = "testReadFileFreshnessTimeoutPreservesTypedDTOAndWarningFormatting"
+        let dto = ToolResultDTOs.ReadFileReply(
+            content: "",
+            totalLines: 0,
+            firstLine: 0,
+            lastLine: 0,
+            message: "Workspace freshness timed out before read_file could read 'Sources/App.swift'.",
+            displayPath: "Sources/App.swift",
+            errorMessage: "Workspace freshness timed out before pending file-system ingress was applied.",
+            errorCode: "workspace_freshness_timeout",
+            retryable: true,
+            retryAfterMilliseconds: 1000
+        )
+
+        let object = try XCTUnwrap(Self.value(dto).objectValue, caseLabel)
+        XCTAssertEqual(object["error_code"]?.stringValue, "workspace_freshness_timeout", caseLabel)
+        XCTAssertEqual(object["retryable"]?.boolValue, true, caseLabel)
+        XCTAssertEqual(object["retry_after_ms"]?.intValue, 1000, caseLabel)
+
+        let text = try Self.onlyText(
+            ToolOutputFormatter.formatReadFile(args: ["path": Self.value("Sources/App.swift")], value: Self.value(dto)),
+            label: caseLabel
+        )
+        XCTAssertTrue(text.contains("## File Read ⚠️"), caseLabel + ": " + text)
+        XCTAssertTrue(text.contains("**Status**: Workspace freshness timed out"), caseLabel + ": " + text)
+        XCTAssertTrue(text.contains("**Code**: workspace_freshness_timeout"), caseLabel + ": " + text)
+        XCTAssertTrue(text.contains("**Retryable**: yes"), caseLabel + ": " + text)
+        XCTAssertTrue(text.contains("**Retry after**: 1000 ms"), caseLabel + ": " + text)
+        XCTAssertFalse(text.contains("```swift"), caseLabel + ": " + text)
+    }
+
     func testNonRetryableAndNormalSearchFormattingOmitBackpressureSemantics() throws {
         do {
             let caseLabel = "testPatternFailureFormattingRemainsNonRetryable"

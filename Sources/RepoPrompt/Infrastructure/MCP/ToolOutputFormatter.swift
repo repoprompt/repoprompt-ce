@@ -1724,6 +1724,16 @@ extension ToolOutputFormatter {
         // Preferred DTO decoding
         if let dto = value.decode(ToolResultDTOs.ReadFileReply.self) {
             let displayPath = dto.displayPath ?? path
+            if let errorCode = dto.errorCode, dto.retryable == true {
+                let text = readFileRetryableFailure(
+                    path: displayPath,
+                    error: dto.errorMessage ?? dto.message ?? "Read failed with a retryable workspace error.",
+                    errorCode: errorCode,
+                    retryAfterMilliseconds: dto.retryAfterMilliseconds,
+                    worktreeScope: dto.worktreeScope
+                )
+                return [.text(text)]
+            }
             let text = readFile(
                 path: displayPath,
                 first: dto.firstLine,
@@ -1776,6 +1786,33 @@ extension ToolOutputFormatter {
         }
         // Final fallback: present JSON
         return formatGeneric(value: value)
+    }
+
+    private static func readFileRetryableFailure(
+        path: String,
+        error: String,
+        errorCode: String,
+        retryAfterMilliseconds: Int?,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
+    ) -> String {
+        let status = switch errorCode {
+        case "workspace_freshness_timeout":
+            "Workspace freshness timed out"
+        default:
+            "Retryable read failure"
+        }
+        var out: [String] = []
+        out.append("## File Read ⚠️")
+        out.append("- **Path**: `\(path)`")
+        out.append("- **Status**: \(status)")
+        out.append("- **Code**: \(errorCode)")
+        out.append("- **Retryable**: yes")
+        if let retryAfterMilliseconds {
+            out.append("- **Retry after**: \(retryAfterMilliseconds) ms")
+        }
+        out.append("- **Message**: \(error)")
+        out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
+        return out.joined(separator: "\n")
     }
 
     static func formatChatLog(value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
@@ -1979,6 +2016,28 @@ extension ToolOutputFormatter {
                 }
                 reviewLines.append("- User approval was required.")
                 outBlocks.append(reviewLines.joined(separator: "\n"))
+            }
+            if dto.status.lowercased() == "failed" || dto.errorMessage != nil || dto.errorCode != nil {
+                var errorLines: [String] = []
+                errorLines.append("### Error")
+                if let message = dto.errorMessage, !message.isEmpty {
+                    errorLines.append("- \(message)")
+                }
+                if let code = dto.errorCode, !code.isEmpty {
+                    errorLines.append("- **Code**: \(code)")
+                }
+                if dto.retryable == true {
+                    errorLines.append("- Retryable: yes")
+                }
+                if let retryAfter = dto.retryAfterMilliseconds {
+                    errorLines.append("- Retry after: \(retryAfter) ms")
+                }
+                if let suggestion = dto.suggestion, !suggestion.isEmpty {
+                    errorLines.append("- Suggestion: \(suggestion)")
+                }
+                if errorLines.count > 1 {
+                    outBlocks.append(errorLines.joined(separator: "\n"))
+                }
             }
             var blocks: [MCP.Tool.Content] = [.text(outBlocks.joined(separator: "\n\n"))]
             // Optionally emit an extra diff block as a separate text content (safe textual "resource")
@@ -3755,8 +3814,13 @@ extension ToolOutputFormatter {
             out.append("- Action: \(dto.action)")
             out.append("- Path: `\(dto.path)`")
             if let np = dto.newPath { out.append("- New path: `\(np)`") }
-            if dto.action.lowercased() == "delete" { out.append("- Result: Moved to macOS Trash") }
+            if dto.action.lowercased() == "delete", ok { out.append("- Result: Moved to macOS Trash") }
             if let warning = dto.warning, !warning.isEmpty { out.append("- Warning: \(warning)") }
+            if let message = dto.errorMessage, !message.isEmpty { out.append("- Error: \(message)") }
+            if let code = dto.errorCode, !code.isEmpty { out.append("- **Code**: \(code)") }
+            if dto.retryable == true { out.append("- Retryable: yes") }
+            if let retryAfter = dto.retryAfterMilliseconds { out.append("- Retry after: \(retryAfter) ms") }
+            if let suggestion = dto.suggestion, !suggestion.isEmpty { out.append("- Suggestion: \(suggestion)") }
             return [.text(out.joined(separator: "\n"))]
         }
         if case let .object(obj) = value {

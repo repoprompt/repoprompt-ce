@@ -129,8 +129,8 @@ Operation commands:
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
   ./conductor build
   ./conductor package debug|release
-  ./conductor test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
-  ./conductor provider-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor provider-test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
   ./conductor run [-- <app args...>]                  # FIFO coordinated run
@@ -1025,7 +1025,14 @@ class OperationRegistry:
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_CACHE",
     ]
-    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
+    TEST_ENV_KEYS = [
+        "RPCE_ENABLE_BENCHMARK_TESTS",
+        "RPCE_RUN_CODEMAP_E2E",
+        "RPCE_RUN_SCALE_TESTS",
+    ]
+    PASSTHROUGH_ENV_KEYS = sorted(
+        set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS + TEST_ENV_KEYS)
+    )
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
@@ -1083,7 +1090,7 @@ class OperationRegistry:
         if operation == "doctor":
             return [script("doctor.sh")], lanes, cwd, env, effective_timeout
         if operation == "guardrails":
-            return [script("source_layout_guardrails.sh")], lanes, cwd, env, effective_timeout
+            return [script("guardrails.sh")], lanes, cwd, env, effective_timeout
         if operation == "format":
             return [script("swift_style.sh"), "format"], ["style", "build"], cwd, env, effective_timeout
         if operation == "format-check":
@@ -1110,6 +1117,8 @@ class OperationRegistry:
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
             argv = ["swift", "test"]
+            if args.get("testProduct"):
+                argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
                 argv.append("list")
             elif args.get("filter"):
@@ -1117,6 +1126,8 @@ class OperationRegistry:
             return argv, ["build"], cwd, env, effective_timeout
         if operation == "provider-test":
             argv = ["swift", "test"]
+            if args.get("testProduct"):
+                argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
                 argv.append("list")
             elif args.get("filter"):
@@ -1175,6 +1186,8 @@ class OperationRegistry:
             raise ConductorError("test list mode cannot be combined with a filter")
         if list_mode and (raw_seconds is not None or wake_probe):
             raise ConductorError("test list mode cannot be combined with XCTest stall diagnostics")
+        if list_mode and args.get("testProduct"):
+            raise ConductorError("test list mode cannot be combined with --test-product")
         if raw_seconds is None:
             if wake_probe:
                 raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
@@ -3719,6 +3732,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--list", action="store_true")
         mode.add_argument("--filter")
+        parser.add_argument("--test-product")
         parser.add_argument("--xctest-stall-seconds", type=float)
         parser.add_argument("--xctest-stall-wake-probe", action="store_true")
         ns = parser.parse_args(rest)
@@ -3730,10 +3744,14 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
         if ns.list and (ns.xctest_stall_seconds is not None or ns.xctest_stall_wake_probe):
             raise ConductorError("--list cannot be combined with XCTest stall diagnostics")
+        if ns.list and ns.test_product:
+            raise ConductorError("--list cannot be combined with --test-product")
         if ns.list:
             args["list"] = True
         if ns.filter:
             args["filter"] = ns.filter
+        if ns.test_product:
+            args["testProduct"] = ns.test_product
         if ns.xctest_stall_seconds is not None:
             args["xctestStallSeconds"] = ns.xctest_stall_seconds
         if ns.xctest_stall_wake_probe:

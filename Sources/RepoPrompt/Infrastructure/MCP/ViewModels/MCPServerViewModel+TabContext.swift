@@ -2194,6 +2194,9 @@ extension MCPServerViewModel {
 
         let baseScope = Self.resolveFileToolLookupRootScope(purpose: purpose, resolvedContext: resolved)
         guard let resolved else {
+            if purpose == .agentModeRun {
+                return AgentWorkspaceLookupContextResolver.failClosedLookupContext
+            }
             return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
         }
         if resolved.usesActiveTabCompatibility,

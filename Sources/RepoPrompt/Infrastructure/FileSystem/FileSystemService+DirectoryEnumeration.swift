@@ -93,37 +93,63 @@ extension FileSystemService {
             }
         #endif
 
+        let originalVisitedInventory = visitedInventory.captureState()
+        let originalPathComponentsCache = pathCompsCache
+
+        var missingFolderDeltas: [FileSystemDelta] = []
+        var existingFolders: [String] = []
+        existingFolders.reserveCapacity(cappedFolders.count)
+        for folder in cappedFolders {
+            if let deltas = removeSubtreeIfFolderMissing(folder) {
+                missingFolderDeltas.append(contentsOf: deltas)
+            } else {
+                existingFolders.append(folder)
+            }
+        }
+
+        guard !existingFolders.isEmpty else {
+            return FolderScanBatchResult(deltas: missingFolderDeltas, scannedFolders: scannedFolders)
+        }
+
         // In test mode, use the same cap but scan serially to avoid SpyFS thread-safety issues.
         #if DEBUG
             if isTestMode {
-                var deltas: [FileSystemDelta] = []
-                for folder in cappedFolders {
-                    let folderDeltas = try await scanOneLevelAndDiff(folder)
-                    deltas.append(contentsOf: folderDeltas)
+                return try await withScanStateRestore(
+                    inventory: originalVisitedInventory,
+                    pathCompsCache: originalPathComponentsCache
+                ) {
+                    var deltas: [FileSystemDelta] = []
+                    for folder in existingFolders {
+                        let folderDeltas = try await scanOneLevelAndDiff(folder)
+                        deltas.append(contentsOf: folderDeltas)
+                    }
+                    return FolderScanBatchResult(deltas: missingFolderDeltas + deltas, scannedFolders: scannedFolders)
                 }
-                return FolderScanBatchResult(deltas: deltas, scannedFolders: scannedFolders)
             }
         #endif
 
         // For small sets, just use serial scanning
-        if cappedFolders.count <= 2 {
-            var deltas: [FileSystemDelta] = []
-            for folder in cappedFolders {
-                let folderDeltas = try await scanOneLevelAndDiff(folder)
-                deltas.append(contentsOf: folderDeltas)
+        if existingFolders.count <= 2 {
+            return try await withScanStateRestore(
+                inventory: originalVisitedInventory,
+                pathCompsCache: originalPathComponentsCache
+            ) {
+                var deltas: [FileSystemDelta] = []
+                for folder in existingFolders {
+                    let folderDeltas = try await scanOneLevelAndDiff(folder)
+                    deltas.append(contentsOf: folderDeltas)
+                }
+                return FolderScanBatchResult(deltas: missingFolderDeltas + deltas, scannedFolders: scannedFolders)
             }
-            return FolderScanBatchResult(deltas: deltas, scannedFolders: scannedFolders)
         }
 
         // Use parallel scanning for larger sets with BOUNDED CONCURRENCY
         var aggregatedDeltas = [FileSystemDelta]()
-        let originalVisitedInventory = visitedInventory.captureState()
-        let originalPathCompsCache = pathCompsCache
 
         // Use configured parallelism cap (prevents CPU saturation)
-        let maxParallel = min(cappedFolders.count, maxParallelScansPerActor)
+        let maxParallel = min(existingFolders.count, maxParallelScansPerActor)
 
-        let targetParents = scannedFolders
+        let targetParents = Set(existingFolders)
         var preservedChildrenByFolder: [String: Set<String>] = [:]
         preservedChildrenByFolder.reserveCapacity(targetParents.count)
         for path in visitedPaths {
@@ -133,7 +159,7 @@ extension FileSystemService {
             }
         }
 
-        var folderIterator = cappedFolders.makeIterator()
+        var folderIterator = existingFolders.makeIterator()
         var inFlight = 0
 
         // Capture ignoreRules before entering the task group to avoid actor isolation issues
@@ -230,15 +256,40 @@ extension FileSystemService {
                 }
             }
         } catch {
-            visitedInventory.restore(originalVisitedInventory)
-            pathCompsCache = originalPathCompsCache
+            restoreScanState(inventory: originalVisitedInventory, pathCompsCache: originalPathComponentsCache)
             throw error
         }
 
-        return FolderScanBatchResult(deltas: aggregatedDeltas, scannedFolders: scannedFolders)
+        return FolderScanBatchResult(deltas: missingFolderDeltas + aggregatedDeltas, scannedFolders: scannedFolders)
+    }
+
+    private func withScanStateRestore<T>(
+        inventory: FileSystemVisitedInventory.State,
+        pathCompsCache: PathComponentsCache,
+        operation: () async throws -> T
+    ) async throws -> T {
+        do {
+            return try await operation()
+        } catch {
+            restoreScanState(inventory: inventory, pathCompsCache: pathCompsCache)
+            throw error
+        }
+    }
+
+    private func restoreScanState(inventory: FileSystemVisitedInventory.State, pathCompsCache: PathComponentsCache) {
+        visitedInventory.restore(inventory)
+        self.pathCompsCache = pathCompsCache
     }
 
     // MARK: - Single-level scanning & removal
+
+    private func removeSubtreeIfFolderMissing(_ folderRelPath: String) -> [FileSystemDelta]? {
+        let absFolder = fullPath(forRelativePath: folderRelPath)
+        var isDir: ObjCBool = false
+        let folderExists = fm.fileExists(atPath: absFolder, isDirectory: &isDir)
+        guard !folderExists || !isDir.boolValue else { return nil }
+        return removeSubtree(for: folderRelPath)
+    }
 
     func scanOneLevelAndDiff(_ folderRelPath: String) async throws -> [FileSystemDelta] {
         #if DEBUG
@@ -255,19 +306,16 @@ extension FileSystemService {
                 )
             }
         #endif
-        let fm = fm // Cache for multiple calls in this method
         let absFolder = fullPath(forRelativePath: folderRelPath)
-        var isDir: ObjCBool = false
-        let folderExists = fm.fileExists(atPath: absFolder, isDirectory: &isDir)
 
         // 1) If missing or not a directory => remove entire subtree
-        if !folderExists || !isDir.boolValue {
-            return removeSubtree(for: folderRelPath)
+        if let missingDeltas = removeSubtreeIfFolderMissing(folderRelPath) {
+            return missingDeltas
         }
 
         // 2) Single-level listing using POSIX directory scanning
         #if DEBUG
-            let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder, fm: self.fm)
+            let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder, fm: fm)
         #else
             let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder)
         #endif

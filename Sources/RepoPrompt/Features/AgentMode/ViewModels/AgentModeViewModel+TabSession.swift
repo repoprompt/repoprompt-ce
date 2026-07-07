@@ -30,6 +30,7 @@ extension AgentModeViewModel {
         var turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:]
         var archivedTranscriptSnapshot: AgentArchivedTranscriptSnapshot = .empty
         var isCompressedHistoryRevealed: Bool = false
+        var isTranscriptWindowExpanded: Bool = false
         var transcriptProjectionProtection: AgentTranscriptProjectionProtection = .none
         var transcriptCanonicalVisibleRowCount: Int = 0
         var transcriptProjectionCounts: AgentTranscriptProjectionCounts = .zero

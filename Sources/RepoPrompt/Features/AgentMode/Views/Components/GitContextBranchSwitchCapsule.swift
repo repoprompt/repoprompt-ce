@@ -94,6 +94,7 @@ struct GitContextBranchSwitchCapsule: View {
     let actions: AgentWorkspaceBranchSwitchActions
 
     @State private var showPopover = false
+    @State private var isCapsuleHovered = false
     @State private var options: GitBranchSwitchOptions?
     @State private var isLoading = false
     @State private var isSwitching = false
@@ -144,9 +145,9 @@ struct GitContextBranchSwitchCapsule: View {
         } label: {
             HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
                 Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 7, weight: .semibold))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
                 Text(capsuleLabelText)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .fixedSize(horizontal: false, vertical: true)
@@ -157,12 +158,16 @@ struct GitContextBranchSwitchCapsule: View {
             .foregroundColor(.secondary)
             .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
             .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
-            .background(Capsule().fill(Color.secondary.opacity(0.10)))
-            .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75))
+            .background(
+                Capsule()
+                    .fill(isCapsuleHovered ? Color(NSColor.quaternaryLabelColor).opacity(0.55) : Color.secondary.opacity(0.10))
+            )
+            .overlay(Capsule().strokeBorder(Color.secondary.opacity(isCapsuleHovered ? 0.45 : 0.35), lineWidth: 0.75))
             .fixedSize(horizontal: true, vertical: true)
         }
         .buttonStyle(.plain)
         .disabled(isSwitching)
+        .onHover { isCapsuleHovered = $0 }
         .hoverTooltip(context.tooltipText, .top)
         .accessibilityLabel(context.accessibilityText)
         .popover(isPresented: $showPopover, arrowEdge: .trailing) {

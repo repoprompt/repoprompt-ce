@@ -23,13 +23,37 @@ struct WorkspaceReadableFileService {
         _ userPath: String,
         fallbackScope: WorkspaceLookupRootScope
     ) async throws {
-        let roots = await store.rootRefs(scope: fallbackScope)
-        try await awaitFreshnessForExplicitRequest(userPath, rootRefs: roots)
+        try await awaitFreshnessForExplicitRequest {
+            await store.awaitAppliedIngressForExplicitRequest(
+                userPath: userPath,
+                fallbackScope: fallbackScope
+            )
+        }
     }
 
     func awaitFreshnessForExplicitRequest(
         _ userPath: String,
-        rootRefs: [WorkspaceRootRef]
+        rootRefs: [WorkspaceRootRef],
+        timeout: Duration? = nil
+    ) async throws {
+        try await awaitFreshnessForExplicitRequest {
+            if let timeout {
+                try await store.awaitAppliedIngressForExplicitRequest(
+                    userPath: userPath,
+                    fallbackRootRefs: rootRefs,
+                    timeout: timeout
+                )
+            } else {
+                await store.awaitAppliedIngressForExplicitRequest(
+                    userPath: userPath,
+                    fallbackRootRefs: rootRefs
+                )
+            }
+        }
+    }
+
+    private func awaitFreshnessForExplicitRequest(
+        samples operation: () async throws -> [WorkspaceIngressBarrierSample]
     ) async throws {
         let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
         EditFlowPerf.lifecycleEvent(
@@ -37,29 +61,56 @@ struct WorkspaceReadableFileService {
             correlation: lifecycleCorrelation
         )
         let freshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait)
-        let samples = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: userPath,
-            fallbackRootRefs: rootRefs
-        )
-        try Task.checkCancellation()
-        EditFlowPerf.end(
-            EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait,
-            freshnessState,
-            EditFlowPerf.Dimensions(
-                rootCount: samples.count,
-                pendingRootCount: samples.count(where: { $0.pendingRawEventCountBeforeFlush > 0 }),
-                pendingRawEventCount: samples.reduce(0) { $0 + $1.pendingRawEventCountBeforeFlush }
+        do {
+            let samples = try await operation()
+            try Task.checkCancellation()
+            let dimensions = freshnessDimensions(samples: samples, outcome: "success")
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait,
+                freshnessState,
+                dimensions
             )
-        )
-        EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessEnded,
-            correlation: lifecycleCorrelation,
-            EditFlowPerf.Dimensions(
-                rootCount: samples.count,
-                pendingRootCount: samples.count(where: { $0.pendingRawEventCountBeforeFlush > 0 }),
-                pendingRawEventCount: samples.reduce(0) { $0 + $1.pendingRawEventCountBeforeFlush }
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessEnded,
+                correlation: lifecycleCorrelation,
+                dimensions
             )
+        } catch {
+            let dimensions = freshnessDimensions(samples: [], outcome: freshnessOutcome(for: error))
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait,
+                freshnessState,
+                dimensions
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessEnded,
+                correlation: lifecycleCorrelation,
+                dimensions
+            )
+            throw error
+        }
+    }
+
+    private func freshnessDimensions(
+        samples: [WorkspaceIngressBarrierSample],
+        outcome: String
+    ) -> EditFlowPerf.Dimensions {
+        EditFlowPerf.Dimensions(
+            outcome: outcome,
+            rootCount: samples.count,
+            pendingRootCount: samples.count(where: { $0.pendingRawEventCountBeforeFlush > 0 }),
+            pendingRawEventCount: samples.reduce(0) { $0 + $1.pendingRawEventCountBeforeFlush }
         )
+    }
+
+    private func freshnessOutcome(for error: Error) -> String {
+        if error is CancellationError {
+            return "cancelled"
+        }
+        if (error as? WorkspaceAppliedIngressWaitError) == .timedOut {
+            return "timeout"
+        }
+        return "error"
     }
 
     static func exactAbsoluteCatalogHitInput(_ rawPath: String) -> String? {

@@ -12,8 +12,8 @@ import XCTest
                 await store.unloadRoots(ids: rootIDs)
             }
             stores.removeAll()
-            for url in temporaryRoots {
-                try? FileManager.default.removeItem(at: url)
+            for root in temporaryRoots {
+                try? FileManager.default.removeItem(at: root)
             }
             temporaryRoots.removeAll()
             try await super.tearDown()

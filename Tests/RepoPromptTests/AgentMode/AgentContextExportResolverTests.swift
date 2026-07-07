@@ -3,16 +3,6 @@ import Foundation
 import XCTest
 
 final class AgentContextExportResolverTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testDisplayFileCountUsesExplicitSelectionAndExcludesAutoCodemaps() {
         let selection = StoredSelection(
             selectedPaths: ["A.swift", "B.swift", "C.swift", "D.swift", "E.swift"],
@@ -222,7 +212,7 @@ final class AgentContextExportResolverTests: XCTestCase {
         #if DEBUG
             let root = try makeTemporaryRoot(name: "AgentExportNoBroadEnumeration")
             let selectedURL = root.appendingPathComponent("Sources/Feature/Selected.swift")
-            try write("struct Selected {}", to: selectedURL)
+            try write(SwiftFixtureSource.emptyStruct("Selected", trailingNewline: false), to: selectedURL)
             for index in 0 ..< 80 {
                 try write(
                     "struct Bystander\(index) {}",
@@ -393,7 +383,7 @@ final class AgentContextExportResolverTests: XCTestCase {
         defer { repositoryFixture.cleanup() }
         let logicalRoot = try repositoryFixture.makeRepository(
             named: "agent-export-logical",
-            files: ["App.swift": "struct LogicalBase {}\n"]
+            files: ["App.swift": SwiftFixtureSource.emptyStruct("LogicalBase")]
         )
         let worktreeRoot = try repositoryFixture.makeRepository(
             named: "agent-export-physical-secret",
@@ -470,7 +460,7 @@ final class AgentContextExportResolverTests: XCTestCase {
 
     func testSelectedUnavailableCodemapPreservesFullRowAndReportsIncompleteCoverage() async throws {
         let root = try makeTemporaryRoot(name: "AgentExportSelectedUnavailable")
-        try write("struct SelectedUnavailable {}\n", to: root.appendingPathComponent("Sources/App.swift"))
+        try write(SwiftFixtureSource.emptyStruct("SelectedUnavailable"), to: root.appendingPathComponent("Sources/App.swift"))
         let runtimeAccessCount = AgentExportLockedCounter()
         let store = WorkspaceFileContextStore(codemapRuntimeProvider: {
             runtimeAccessCount.increment()
@@ -507,7 +497,7 @@ final class AgentContextExportResolverTests: XCTestCase {
         defer { repositoryFixture.cleanup() }
         let logicalRoot = try repositoryFixture.makeRepository(
             named: "agent-export-revoked-logical",
-            files: ["Sources/Target.swift": "struct LogicalTarget {}\n"]
+            files: ["Sources/Target.swift": SwiftFixtureSource.emptyStruct("LogicalTarget")]
         )
         let worktreeRoot = try repositoryFixture.makeRepository(
             named: "agent-export-revoked-worktree",
@@ -704,8 +694,8 @@ final class AgentContextExportResolverTests: XCTestCase {
         let secondRoot = secondParent.appendingPathComponent("repo")
         let firstFile = firstRoot.appendingPathComponent("Sources/App.swift")
         let secondFile = secondRoot.appendingPathComponent("Sources/App.swift")
-        try write("struct FirstDuplicateRoot {}\n", to: firstFile)
-        try write("struct SecondDuplicateRoot {}\n", to: secondFile)
+        try write(SwiftFixtureSource.emptyStruct("FirstDuplicateRoot"), to: firstFile)
+        try write(SwiftFixtureSource.emptyStruct("SecondDuplicateRoot"), to: secondFile)
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: firstRoot.path)
         _ = try await store.loadRoot(path: secondRoot.path)
@@ -1292,12 +1282,7 @@ final class AgentContextExportResolverTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

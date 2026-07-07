@@ -157,7 +157,7 @@ final class CodeMapSyntaxArtifactTests: XCTestCase {
 
         XCTAssertThrowsError(
             try CodeMapSyntaxArtifactBuilder.build(
-                source: makeSource(text: "struct Example {}"),
+                source: makeSource(text: SwiftFixtureSource.emptyStruct("Example", trailingNewline: false)),
                 language: .swift,
                 syntaxManager: QueryStub { _, _ in throw QueryStubError.transient }
             )

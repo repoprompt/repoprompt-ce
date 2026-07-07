@@ -34,7 +34,6 @@ swift-system	1.6.4	https://github.com/apple/swift-system.git	swift-system/
 swiftanthropic	b7d030cd7453f314c780f5492385f73d704cbd5d	https://github.com/jamesrochabrun/SwiftAnthropic	swiftanthropic/
 swiftopenai	1211782eb337e7968124448a20d9260df1952012	https://github.com/provencher/SwiftOpenAI	swiftopenai/
 swifttreesitter	0.8.0	https://github.com/ChimeHQ/SwiftTreeSitter.git	../tree-sitter/README.md
-swiftyjson	5.0.2	https://github.com/SwiftyJSON/SwiftyJSON	swiftyjson/
 tree-sitter-c	3efee11f784605d44623d7dadd6cd12a0f73ea92	https://github.com/tree-sitter/tree-sitter-c	../tree-sitter/README.md
 tree-sitter-c-sharp	b27b091bfdc5f16d0ef76421ea5609c82a57dff0	https://github.com/tree-sitter/tree-sitter-c-sharp.git	../tree-sitter/README.md
 tree-sitter-cpp	e5cea0ec884c5c3d2d1e41a741a66ce13da4d945	https://github.com/tree-sitter/tree-sitter-cpp	../tree-sitter/README.md

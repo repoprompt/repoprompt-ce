@@ -62,13 +62,13 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         _ = try fixture.runGit(["config", "user.email", "repoprompt@example.test"], at: nested)
         _ = try fixture.runGit(["config", "commit.gpgSign", "false"], at: nested)
         _ = try fixture.runGit(["checkout", "-b", "nested-main"], at: nested)
-        try fixture.write("struct Nested {}\n", to: "Sources/Nested.swift", at: nested)
+        try fixture.write(SwiftFixtureSource.emptyStruct("Nested"), to: "Sources/Nested.swift", at: nested)
         _ = try fixture.runGit(["add", "."], at: nested)
         _ = try fixture.runGit(["commit", "-m", "Nested repository"], at: nested)
 
         let submoduleSource = try fixture.makeRepository(
             named: "submodule-source",
-            files: ["Sources/Submodule.swift": "struct Submodule {}\n"]
+            files: ["Sources/Submodule.swift": SwiftFixtureSource.emptyStruct("Submodule")]
         )
         _ = try fixture.runGit(
             ["-c", "protocol.file.allow=always", "submodule", "add", submoduleSource.path, "Vendor/Sub"],

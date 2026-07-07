@@ -56,6 +56,61 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         ))
     }
 
+    func testOracleLatestPopoverRouteOmitsChatIDAndPreservesScope() throws {
+        let workspaceID = UUID()
+        let contextTabID = UUID()
+        let overrideTabID = UUID()
+        let openContext = AgentOracleOpenContext(
+            windowID: 42,
+            workspaceID: workspaceID,
+            tabID: contextTabID,
+            chatID: "ambient-chat"
+        )
+        let route = try XCTUnwrap(AgentOracleLatestPopoverRoute(
+            openContext: openContext,
+            tabID: overrideTabID
+        ))
+
+        XCTAssertEqual(route.windowID, 42)
+        XCTAssertEqual(route.workspaceID, workspaceID)
+        XCTAssertEqual(route.tabID, overrideTabID)
+
+        let userInfo = route.notificationUserInfo
+        XCTAssertEqual(userInfo["windowID"] as? Int, 42)
+        XCTAssertEqual(userInfo["workspaceID"] as? UUID, workspaceID)
+        XCTAssertEqual(userInfo["tabID"] as? UUID, overrideTabID)
+        XCTAssertEqual(userInfo["route"] as? String, "latest")
+        XCTAssertNil(userInfo["chatID"])
+        XCTAssertEqual(AgentOracleLatestPopoverRoute(notificationUserInfo: userInfo), route)
+        XCTAssertNil(AgentOraclePopoverRoute(notificationUserInfo: userInfo))
+
+        XCTAssertNil(AgentOracleLatestPopoverRoute(openContext: nil))
+        XCTAssertNil(AgentOracleLatestPopoverRoute(
+            openContext: AgentOracleOpenContext(windowID: 42, workspaceID: nil, tabID: contextTabID)
+        ))
+        XCTAssertNil(AgentOracleLatestPopoverRoute(
+            openContext: AgentOracleOpenContext(windowID: 42, workspaceID: workspaceID, tabID: nil)
+        ))
+        XCTAssertNil(AgentOracleLatestPopoverRoute(notificationUserInfo: [
+            "windowID": 42,
+            "workspaceID": workspaceID,
+            "tabID": contextTabID
+        ]))
+        XCTAssertNil(AgentOracleLatestPopoverRoute(notificationUserInfo: [
+            "windowID": 42,
+            "workspaceID": workspaceID,
+            "tabID": contextTabID,
+            "route": "other"
+        ]))
+        XCTAssertNil(AgentOracleLatestPopoverRoute(notificationUserInfo: [
+            "windowID": 42,
+            "workspaceID": workspaceID,
+            "tabID": contextTabID,
+            "route": "latest",
+            "chatID": "exact-chat"
+        ]))
+    }
+
     func testOraclePopoverRoutePreservesNotificationTypesAndCompatibilityDecoding() throws {
         let workspaceID = UUID()
         let contextTabID = UUID()
@@ -233,7 +288,33 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
 
         XCTAssertEqual(exactUserInfo["chatID"] as? String, "exact-call-chat")
 
+        let completedExactUserInfo = try XCTUnwrap(oracleToolCallPopoverUserInfo(
+            item: AgentChatItem(
+                kind: .toolCall,
+                text: "",
+                toolName: "ask_oracle",
+                toolArgsJSON: jsonString(["message": "start a new chat"]),
+                toolResultJSON: jsonString(["chat_id": "  exact-result-chat  ", "mode": "review"]),
+                toolIsError: false
+            ),
+            openContext: openContext
+        ))
+        XCTAssertEqual(completedExactUserInfo["chatID"] as? String, "exact-result-chat")
+        XCTAssertNil(completedExactUserInfo["route"])
+
         XCTAssertNil(oracleToolCallPopoverUserInfo(
+            item: AgentChatItem(
+                kind: .toolCall,
+                text: "",
+                toolName: "ask_oracle",
+                toolArgsJSON: jsonString(["message": "start a new chat"]),
+                toolResultJSON: jsonString(["status": "failed"]),
+                toolIsError: true
+            ),
+            openContext: openContext
+        ))
+
+        let latestUserInfo = try XCTUnwrap(oracleToolCallPopoverUserInfo(
             item: AgentChatItem(
                 kind: .toolCall,
                 text: "",
@@ -242,12 +323,64 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             ),
             openContext: openContext
         ))
+        XCTAssertEqual(latestUserInfo["windowID"] as? Int, openContext.windowID)
+        XCTAssertEqual(latestUserInfo["workspaceID"] as? UUID, openContext.workspaceID)
+        XCTAssertEqual(latestUserInfo["tabID"] as? UUID, openContext.tabID)
+        XCTAssertEqual(latestUserInfo["route"] as? String, "latest")
+        XCTAssertNil(latestUserInfo["chatID"])
+        XCTAssertNotNil(AgentOracleLatestPopoverRoute(notificationUserInfo: latestUserInfo))
+        XCTAssertNil(AgentOraclePopoverRoute(notificationUserInfo: latestUserInfo))
         XCTAssertNil(oracleToolCallPopoverUserInfo(
             item: AgentChatItem(
                 kind: .toolCall,
                 text: "",
                 toolName: "oracle_send",
                 toolArgsJSON: jsonString(["chat_id": "\t "])
+            ),
+            openContext: openContext
+        ))
+        XCTAssertNil(oracleToolCallPopoverUserInfo(
+            item: AgentChatItem(
+                kind: .toolCall,
+                text: "",
+                toolName: "ask_oracle",
+                toolArgsJSON: jsonString(["chatID": "camel-alias"])
+            ),
+            openContext: openContext
+        ))
+        XCTAssertNil(oracleToolCallPopoverUserInfo(
+            item: AgentChatItem(
+                kind: .toolCall,
+                text: "",
+                toolName: "ask_oracle",
+                toolArgsJSON: jsonString(["message": "continue", "payload": ["chat_id": "nested"]])
+            ),
+            openContext: openContext
+        ))
+        XCTAssertNil(oracleToolCallPopoverUserInfo(
+            item: AgentChatItem(
+                kind: .toolCall,
+                text: "",
+                toolName: "ask_oracle",
+                toolArgsJSON: "{bad json"
+            ),
+            openContext: openContext
+        ))
+        XCTAssertNil(oracleToolCallPopoverUserInfo(
+            item: AgentChatItem(
+                kind: .toolCall,
+                text: "",
+                toolName: "ask_oracle",
+                toolArgsJSON: "  \n"
+            ),
+            openContext: openContext
+        ))
+        XCTAssertNil(oracleToolCallPopoverUserInfo(
+            item: AgentChatItem(
+                kind: .toolCall,
+                text: "",
+                toolName: "ask_oracle",
+                toolArgsJSON: "[]"
             ),
             openContext: openContext
         ))

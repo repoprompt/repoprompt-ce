@@ -171,8 +171,8 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
         let alternateRoot = try makeSecureRoot()
         defer { try? FileManager.default.removeItem(at: alternateRoot) }
-        let input = try makeInput("non-preemptive", root: fixture.root, withLocator: true)
-        let finalWaiterInput = try makeInput(
+        let input = try await makeInput("non-preemptive", root: fixture.root, withLocator: true)
+        let finalWaiterInput = try await makeInput(
             "non-preemptive",
             root: alternateRoot,
             withLocator: true
@@ -240,7 +240,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         try await waitUntil { await casCoordinator.accounting().activeFlightCount == 0 }
         _ = try await requireHit(fixture.artifactStore, key: casInput.artifactKey)
 
-        let locatedInput = try makeInput("cancel-during-locator", root: fixture.root, withLocator: true)
+        let locatedInput = try await makeInput("cancel-during-locator", root: fixture.root, withLocator: true)
         _ = try await fixture.artifactStore.insert(
             key: locatedInput.artifactKey,
             deterministicOutcome: .readyNoSymbols
@@ -276,12 +276,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let alternateRoot = try makeSecureRoot()
         defer { try? FileManager.default.removeItem(at: alternateRoot) }
         let nonLocatorInput = try makeInput("locator-intent-owner", root: fixture.root)
-        let cancelledLocatorInput = try makeInput(
+        let cancelledLocatorInput = try await makeInput(
             "locator-intent-owner",
             root: fixture.root,
             withLocator: true
         )
-        let replacementLocatorInput = try makeInput(
+        let replacementLocatorInput = try await makeInput(
             "locator-intent-owner",
             root: alternateRoot,
             withLocator: true
@@ -342,7 +342,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let fixture = try makeFixture()
         defer { fixture.remove() }
         let activeInput = try makeInput("same-identity-miss-corrupt", root: fixture.root)
-        let locatorInput = try makeInput(
+        let locatorInput = try await makeInput(
             "same-identity-miss-corrupt",
             root: fixture.root,
             withLocator: true
@@ -399,7 +399,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let fixture = try makeFixture()
         defer { fixture.remove() }
         let activeInput = try makeInput("same-identity-corrupt-miss", root: fixture.root)
-        let locatorInput = try makeInput(
+        let locatorInput = try await makeInput(
             "same-identity-corrupt-miss",
             root: fixture.root,
             withLocator: true
@@ -634,7 +634,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
     func testMemoryDiskAndLocatorProvenanceAreReportedSeparately() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
-        let input = try makeInput("provenance", root: fixture.root, withLocator: true)
+        let input = try await makeInput("provenance", root: fixture.root, withLocator: true)
         let coordinator = makeCoordinator(fixture: fixture) { _, _, _ in .readyNoSymbols }
 
         let builtResult = try await coordinator.resolve(request(input))
@@ -679,7 +679,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
     func testValidLocatorWithCorruptCASFailsClosedThenSourceRebuildsVerifiedArtifact() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
-        let input = try makeInput("corrupt-cas", root: fixture.root, withLocator: true)
+        let input = try await makeInput("corrupt-cas", root: fixture.root, withLocator: true)
         let identity = try XCTUnwrap(input.locatorIdentity)
         let seedCoordinator = makeCoordinator(fixture: fixture) { _, _, _ in
             .ready(self.makeArtifact(name: "seed"))
@@ -740,7 +740,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
     func testSourceAuthoritativeResolutionRepairsStaleLocatorAfterVerifiedCAS() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
-        let input = try makeInput("source-authoritative", root: fixture.root, withLocator: true)
+        let input = try await makeInput("source-authoritative", root: fixture.root, withLocator: true)
         let identity = try XCTUnwrap(input.locatorIdentity)
         let staleSource = makeSource("stale-associated-source")
         let staleKey = try CodeMapArtifactKey(
@@ -786,7 +786,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
     func testLocatorPublishesOnlyAfterVerifiedCASAndRepairsCorruptLocator() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
-        let input = try makeInput("verification-before-locator", root: fixture.root, withLocator: true)
+        let input = try await makeInput("verification-before-locator", root: fixture.root, withLocator: true)
         let writes = CoordinatorTestRecorder()
         let failingStoreClient = CodeMapArtifactStoreClient(
             lookup: { _ in .miss },
@@ -818,7 +818,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let locatorWriteCount = await writes.count
         XCTAssertEqual(locatorWriteCount, 0)
 
-        let corruptInput = try makeInput("repair-corrupt", root: fixture.root, withLocator: true)
+        let corruptInput = try await makeInput("repair-corrupt", root: fixture.root, withLocator: true)
         let corruptIdentity = try XCTUnwrap(corruptInput.locatorIdentity)
         let recordURL = fixture.locatorStore.recordURL(for: corruptIdentity)
         try FileManager.default.createDirectory(
@@ -1615,7 +1615,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
     func testEarlyLocatorReadFailureIsTypedAccountedAndRetryable() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
-        let input = try makeInput("locator-read-failure", root: fixture.root, withLocator: true)
+        let input = try await makeInput("locator-read-failure", root: fixture.root, withLocator: true)
         let failure = CoordinatorFailOnce()
         let locatorClient = GitBlobCodeMapLocatorStoreClient(
             read: { identity in
@@ -1660,7 +1660,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
     func testCancellationDuringLocatorReadIsCountedExactlyOnceWithoutDownstreamWork() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
-        let input = try makeInput("locator-cancellation-telemetry", root: fixture.root, withLocator: true)
+        let input = try await makeInput("locator-cancellation-telemetry", root: fixture.root, withLocator: true)
         let gate = CoordinatorTestGate()
         let buildCount = CoordinatorTestRecorder()
         let locatorClient = GitBlobCodeMapLocatorStoreClient(
@@ -1711,7 +1711,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let namespace = try makeNamespace(root)
 
         for format in [GitObjectFormat.sha1, .sha256] {
-            let source = try makeCleanSource("locator-validation-\(format)", root: root, format: format)
+            let source = try await makeCleanSource("locator-validation-\(format)", root: root, format: format)
             let pipeline = try SyntaxManager.shared.pipelineIdentity(
                 for: .swift,
                 decoderPolicy: source.decoderPolicy
@@ -1753,7 +1753,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             )
         }
 
-        let source = try makeCleanSource("locator-validation", root: root, format: .sha1)
+        let source = try await makeCleanSource("locator-validation", root: root, format: .sha1)
         let swiftPipeline = try SyntaxManager.shared.pipelineIdentity(
             for: .swift,
             decoderPolicy: source.decoderPolicy
@@ -1827,7 +1827,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             XCTAssertEqual($0 as? CodeMapArtifactBuildCoordinatorError, .invalidRequest(.gitBlobOIDMismatch))
         }
 
-        let otherSource = try makeCleanSource("locator-validation-other", root: root, format: .sha1)
+        let otherSource = try await makeCleanSource("locator-validation-other", root: root, format: .sha1)
         let otherKey = try CodeMapArtifactKey(source: otherSource, pipelineIdentity: swiftPipeline)
         XCTAssertThrowsError(try CodeMapArtifactBuildInput(
             source: source,
@@ -1849,7 +1849,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let fixture = try makeFixture()
         defer { fixture.remove() }
         let sentinel = "PRIVATE-WORKTREE-/Users/example/secret.swift"
-        let input = try makeInput(sentinel, root: fixture.root, withLocator: true)
+        let input = try await makeInput(sentinel, root: fixture.root, withLocator: true)
         let events = CoordinatorHookRecorder()
         let coordinator = CodeMapArtifactBuildCoordinator(
             artifactStore: CodeMapArtifactStoreClient(store: fixture.artifactStore),
@@ -1957,13 +1957,20 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
 
     private func makeInput(
         _ text: String,
-        root: URL,
-        withLocator: Bool = false
+        root: URL
     ) throws -> CodeMapArtifactBuildInput {
+        try CodeMapArtifactBuildInput(source: makeSource(text), language: .swift)
+    }
+
+    private func makeInput(
+        _ text: String,
+        root: URL,
+        withLocator: Bool
+    ) async throws -> CodeMapArtifactBuildInput {
         guard withLocator else {
-            return try CodeMapArtifactBuildInput(source: makeSource(text), language: .swift)
+            return try makeInput(text, root: root)
         }
-        let source = try makeCleanSource(text, root: root, format: .sha1)
+        let source = try await makeCleanSource(text, root: root, format: .sha1)
         let pipeline = try SyntaxManager.shared.pipelineIdentity(
             for: .swift,
             decoderPolicy: source.decoderPolicy
@@ -2007,8 +2014,8 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         _ text: String,
         root: URL,
         format: GitObjectFormat
-    ) throws -> CodeMapSourceSnapshot {
-        try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+    ) async throws -> CodeMapSourceSnapshot {
+        try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
             bytes: Data(text.utf8),
             objectFormat: format,
             namespaceScope: root.path

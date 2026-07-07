@@ -2,6 +2,8 @@ import Foundation
 import MCP
 
 struct AgentRunMCPSnapshot: Equatable {
+    static let startupPendingStatusText = "Queued to start"
+
     enum Status: String, Equatable {
         case running
         case waitingForInput = "waiting_for_input"
@@ -362,6 +364,10 @@ struct AgentRunMCPSnapshot: Equatable {
 
     var isActionableForMCPWait: Bool {
         interaction != nil || status == .waitingForInput || status.isTerminal
+    }
+
+    var isStartupPendingForMCPWait: Bool {
+        status == .running && runID == nil && statusText == Self.startupPendingStatusText
     }
 
     func asObject() -> [String: Value] {

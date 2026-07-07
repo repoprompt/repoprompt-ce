@@ -201,6 +201,17 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(guarded_env["REPOPROMPT_GUARD_DELAYED_LAUNCH"], "1")
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
 
+    def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            registry = conductor.OperationRegistry(repo_root)
+            argv, lanes, cwd, _env, _timeout = registry.prepare({"operation": "guardrails", "args": {}})
+
+        self.assertEqual(Path(argv[0]).name, "guardrails.sh")
+        self.assertEqual(Path(argv[0]).parent.name, "Scripts")
+        self.assertEqual(lanes, [])
+        self.assertEqual(cwd, repo_root)
+
     def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -1165,6 +1176,37 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         )
         self.assertIsNone(job.xctest_progress_deadline)
 
+    def test_test_cli_forwards_test_product_for_focused_split_targets(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(
+                state.paths,
+                "test",
+                ["--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            enqueue.call_args.args[2],
+            {"filter": "WorkspaceTests", "testProduct": "RepoPromptWorkspaceTests"},
+        )
+
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        root_argv, root_lanes, root_cwd, _env, _timeout = registry.prepare(
+            {
+                "operation": "test",
+                "args": {"filter": "WorkspaceTests", "testProduct": "RepoPromptWorkspaceTests"},
+            }
+        )
+
+        self.assertEqual(
+            root_argv,
+            ["swift", "test", "--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
+        )
+        self.assertEqual(root_lanes, ["build"])
+        self.assertEqual(root_cwd, state.paths.repo_root)
+
     def test_test_list_cli_preserves_build_lane_and_package_roots(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -1203,6 +1245,12 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 "provider-test",
                 ["--list", "--xctest-stall-seconds", "10"],
             )
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined"):
+            conductor.handle_real_operation(
+                state.paths,
+                "test",
+                ["--list", "--test-product", "RepoPromptWorkspaceTests"],
+            )
 
         registry = conductor.OperationRegistry(state.paths.repo_root)
         with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined with a filter"):
@@ -1212,6 +1260,46 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     "args": {"list": True, "filter": "ExampleTests"},
                 }
             )
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined with --test-product"):
+            registry.prepare(
+                {
+                    "operation": "test",
+                    "args": {"list": True, "testProduct": "RepoPromptWorkspaceTests"},
+                }
+            )
+
+    def test_test_gate_environment_survives_client_snapshot_and_job_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RPCE_ENABLE_BENCHMARK_TESTS": "1",
+                    "RPCE_RUN_CODEMAP_E2E": "1",
+                    "RPCE_RUN_SCALE_TESTS": "1",
+                    "RPCE_UNRELATED_TEST_GATE": "1",
+                },
+                clear=False,
+            ):
+                snapshot = conductor.OperationRegistry.client_env_snapshot()
+
+            self.assertEqual(snapshot["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+            self.assertEqual(snapshot["RPCE_RUN_CODEMAP_E2E"], "1")
+            self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
+            self.assertNotIn("RPCE_UNRELATED_TEST_GATE", snapshot)
+
+            _argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                {
+                    "operation": "test",
+                    "args": {"filter": "CodemapBindingEngineProjectionTests"},
+                    "env": snapshot,
+                }
+            )
+
+        self.assertEqual(env["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+        self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
+        self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
+        self.assertNotIn("RPCE_UNRELATED_TEST_GATE", env)
 
     def test_test_cli_forwards_watchdog_options_and_requires_threshold(self) -> None:
         tmp, state = self.make_state()

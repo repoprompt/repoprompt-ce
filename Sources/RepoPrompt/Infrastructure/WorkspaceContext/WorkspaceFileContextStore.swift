@@ -2869,12 +2869,13 @@ actor WorkspaceFileContextStore {
             return
         }
         guard !publication.requiresFullResync,
-              publication.source == .watcher || publication.source == .watcherBarrierNoop
+              publication.source == .watcher || publication.source == .watcherBarrierNoop ||
+              publication.source == .authorityTargetedReconcile
         else {
             pending.terminalFallbackReason = switch publication.source {
             case .overflowRootRescan: .watcherOverflow
             case .recoveryFullResync: .watcherRecoveryUncertain
-            case .watcher, .watcherBarrierNoop, .syntheticMutation: .watcherDrop
+            case .watcher, .watcherBarrierNoop, .syntheticMutation, .authorityTargetedReconcile: .watcherDrop
             }
             pendingSeededRootsByID[pendingID] = pending
             return
@@ -3571,21 +3572,16 @@ actor WorkspaceFileContextStore {
                 }
 
                 if replacement.snapshot != fence.snapshot {
-                    guard publishedSeededAuthorityStatesByRootID[rootID]?.fullCrawlAttemptedGeneration == nil
-                    else {
+                    guard await reconcilePublishedSeededAuthorityChange(
+                        rootID: rootID,
+                        state: state,
+                        base: fence,
+                        replacement: replacement,
+                        capturedGeneration: capturedGeneration
+                    ) else {
                         failPublishedSeededAuthorityReconciliation(rootID: rootID, state: state)
                         break
                     }
-                    publishedSeededAuthorityStatesByRootID[rootID]?.fullCrawlAttemptedGeneration = capturedGeneration
-                    #if DEBUG
-                        publishedSeededAuthorityFullCrawlCountsByRootID[rootID, default: 0] += 1
-                    #endif
-                    guard await state.service.reconcileEntireTreeForAuthorityChange() else {
-                        failPublishedSeededAuthorityReconciliation(rootID: rootID, state: state)
-                        break
-                    }
-                    publishedSeededAuthorityStatesByRootID[rootID]?.fullCrawlCompletedGeneration = capturedGeneration
-                    await waitForCurrentPublisherIngress(rootIDs: [rootID])
                     guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: state.lifetimeID),
                           publishedSeededAuthorityStatesByRootID[rootID]?.activeMutationDepth == 0,
                           seededAuthorityPendingGenerationByRootID[rootID].map({ $0 > capturedGeneration }) != true,
@@ -3647,6 +3643,227 @@ actor WorkspaceFileContextStore {
         authority.fullCrawlCompletedGeneration = nil
         publishedSeededAuthorityStatesByRootID[rootID] = authority
         resumePublishedSeededAuthorityWaiters(rootID: rootID, error: nil)
+    }
+
+    private enum PublishedSeededAuthorityReconcilePlan {
+        case adoptWithoutScan
+        case targetedFolders(folders: Set<String>, modifiedFiles: Set<String>)
+        case fullCrawl
+    }
+
+    private func reconcilePublishedSeededAuthorityChange(
+        rootID: UUID,
+        state: RootState,
+        base: GitWorkspacePendingInitializationAuthorityFence,
+        replacement: GitWorkspacePendingInitializationAuthorityFence,
+        capturedGeneration: UInt64
+    ) async -> Bool {
+        let plan = await publishedSeededAuthorityReconcilePlan(
+            base: base,
+            replacement: replacement
+        )
+        switch plan {
+        case .adoptWithoutScan:
+            return true
+        case let .targetedFolders(folders, modifiedFiles):
+            guard await state.service.reconcileFoldersForAuthorityChange(
+                folders: folders,
+                modifiedFiles: modifiedFiles
+            ) else {
+                return await reconcileEntireTreeForPublishedAuthorityChange(
+                    rootID: rootID,
+                    state: state,
+                    capturedGeneration: capturedGeneration
+                )
+            }
+            await waitForCurrentPublisherIngress(rootIDs: [rootID])
+            return true
+        case .fullCrawl:
+            return await reconcileEntireTreeForPublishedAuthorityChange(
+                rootID: rootID,
+                state: state,
+                capturedGeneration: capturedGeneration
+            )
+        }
+    }
+
+    private func reconcileEntireTreeForPublishedAuthorityChange(
+        rootID: UUID,
+        state: RootState,
+        capturedGeneration: UInt64
+    ) async -> Bool {
+        guard publishedSeededAuthorityStatesByRootID[rootID]?.fullCrawlAttemptedGeneration == nil else {
+            return false
+        }
+        publishedSeededAuthorityStatesByRootID[rootID]?.fullCrawlAttemptedGeneration = capturedGeneration
+        #if DEBUG
+            publishedSeededAuthorityFullCrawlCountsByRootID[rootID, default: 0] += 1
+        #endif
+        guard await state.service.reconcileEntireTreeForAuthorityChange() else { return false }
+        publishedSeededAuthorityStatesByRootID[rootID]?.fullCrawlCompletedGeneration = capturedGeneration
+        await waitForCurrentPublisherIngress(rootIDs: [rootID])
+        return true
+    }
+
+    private func publishedSeededAuthorityReconcilePlan(
+        base: GitWorkspacePendingInitializationAuthorityFence,
+        replacement: GitWorkspacePendingInitializationAuthorityFence
+    ) async -> PublishedSeededAuthorityReconcilePlan {
+        let baseSnapshot = base.snapshot
+        let replacementSnapshot = replacement.snapshot
+        guard publishedSeededAuthoritySnapshotsShareTargetedReconcileEnvelope(baseSnapshot, replacementSnapshot),
+              base.targetLayout == replacement.targetLayout,
+              base.repositoryRelativeRootPrefix == replacement.repositoryRelativeRootPrefix
+        else {
+            return .fullCrawl
+        }
+        guard baseSnapshot.treeOID != replacementSnapshot.treeOID else {
+            // Tree-identical authority churn (for example index-only invalidation) does not
+            // require filesystem reconciliation. Any same-tree working-tree writes must still
+            // arrive through the live watcher, matching ordinary edit freshness semantics.
+            return .adoptWithoutScan
+        }
+        do {
+            let deltas = try await worktreeSeedGitService.diffTrees(
+                baseTreeOID: baseSnapshot.treeOID,
+                targetTreeOID: replacementSnapshot.treeOID,
+                in: replacement.targetLayout,
+                prefix: replacement.repositoryRelativeRootPrefix
+            )
+            guard let target = targetedAuthorityReconcileTarget(
+                from: deltas,
+                prefix: replacement.repositoryRelativeRootPrefix
+            ) else {
+                return .fullCrawl
+            }
+            return target.folders.isEmpty && target.modifiedFiles.isEmpty
+                ? .adoptWithoutScan
+                : .targetedFolders(folders: target.folders, modifiedFiles: target.modifiedFiles)
+        } catch {
+            return .fullCrawl
+        }
+    }
+
+    private func publishedSeededAuthoritySnapshotsShareTargetedReconcileEnvelope(
+        _ base: GitWorkspaceAuthoritySnapshot,
+        _ target: GitWorkspaceAuthoritySnapshot
+    ) -> Bool {
+        base.repositoryKey == target.repositoryKey
+            && base.repositoryNamespace == target.repositoryNamespace
+            && base.objectFormat == target.objectFormat
+            && base.repositoryRelativeRootPrefix == target.repositoryRelativeRootPrefix
+            && base.repositoryBindingEpoch == target.repositoryBindingEpoch
+            && base.layoutGeneration == target.layoutGeneration
+            && base.checkoutConfigurationGeneration == target.checkoutConfigurationGeneration
+            && base.policyIdentity == target.policyIdentity
+    }
+
+    private func targetedAuthorityReconcileTarget(
+        from deltas: [GitTreeDeltaRecord],
+        prefix: GitRepositoryRelativeRootPrefix
+    ) -> (folders: Set<String>, modifiedFiles: Set<String>)? {
+        var folders = Set<String>()
+        var modifiedFiles = Set<String>()
+        for delta in deltas {
+            if delta.oldMode == "160000" || delta.newMode == "160000" {
+                return nil
+            }
+            switch delta.status {
+            case .added, .deleted, .renamed, .copied:
+                break
+            case .modified:
+                guard let rootRelativePath = rootRelativePath(
+                    delta.repositoryRelativePath,
+                    prefix: prefix
+                ) else { return nil }
+                if targetedAuthorityReconcileRequiresFullCrawl(rootRelativePath) {
+                    return nil
+                }
+                modifiedFiles.insert(rootRelativePath)
+            case .typeChanged, .unmerged:
+                return nil
+            }
+            guard collectTargetedAuthorityReconcileFolder(
+                repositoryRelativePath: delta.repositoryRelativePath,
+                prefix: prefix,
+                into: &folders
+            ) else {
+                return nil
+            }
+            if let source = delta.sourceRepositoryRelativePath {
+                guard collectTargetedAuthorityReconcileFolder(
+                    repositoryRelativePath: source,
+                    prefix: prefix,
+                    into: &folders
+                ) else {
+                    return nil
+                }
+            }
+        }
+        return (folders, modifiedFiles)
+    }
+
+    private func collectTargetedAuthorityReconcileFolder(
+        repositoryRelativePath: String,
+        prefix: GitRepositoryRelativeRootPrefix,
+        into folders: inout Set<String>
+    ) -> Bool {
+        guard let rootRelativePath = rootRelativePath(
+            repositoryRelativePath,
+            prefix: prefix
+        ) else {
+            return false
+        }
+        if rootRelativePath.isEmpty {
+            folders.insert("")
+            return true
+        }
+        if targetedAuthorityReconcileRequiresFullCrawl(rootRelativePath) {
+            return false
+        }
+        collectAuthorityReconcileAncestorFolders(for: rootRelativePath, into: &folders)
+        return true
+    }
+
+    private func collectAuthorityReconcileAncestorFolders(
+        for rootRelativePath: String,
+        into folders: inout Set<String>
+    ) {
+        var folder = authorityReconcileParentDirectory(of: rootRelativePath)
+        while true {
+            folders.insert(folder)
+            guard !folder.isEmpty else { return }
+            folder = authorityReconcileParentDirectory(of: folder)
+        }
+    }
+
+    private func authorityReconcileParentDirectory(of relativePath: String) -> String {
+        let parent = (relativePath as NSString).deletingLastPathComponent
+        return parent == "." ? "" : parent
+    }
+
+    private func rootRelativePath(
+        _ repositoryRelativePath: String,
+        prefix: GitRepositoryRelativeRootPrefix
+    ) -> String? {
+        let prefixValue = prefix.value
+        guard !prefixValue.isEmpty else { return repositoryRelativePath }
+        guard repositoryRelativePath == prefixValue || repositoryRelativePath.hasPrefix(prefixValue + "/") else {
+            return nil
+        }
+        if repositoryRelativePath == prefixValue { return "" }
+        return String(repositoryRelativePath.dropFirst(prefixValue.count + 1))
+    }
+
+    private func targetedAuthorityReconcileRequiresFullCrawl(_ rootRelativePath: String) -> Bool {
+        let components = rootRelativePath.split(separator: "/")
+        return components.contains { component in
+            component == ".gitignore"
+                || component == ".gitattributes"
+                || component == ".worktreeinclude"
+                || component == ".repo_ignore"
+                || component == ".cursorignore"
+        }
     }
 
     private func retirePublishedSeededAuthorityAfterUnifiedFullCrawl(
@@ -4429,6 +4646,11 @@ actor WorkspaceFileContextStore {
         }
 
         var pausedHandoffSubscriptions: [WorkspaceFileSystemIngressCoordinator.Subscription] = []
+        defer {
+            for subscription in pausedHandoffSubscriptions {
+                _ = publisherIngressCoordinator.resumeDrainAfterHandoff(subscription)
+            }
+        }
         for pending in pendingRoots {
             guard let attachment = pending.attachment else {
                 throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
@@ -7823,6 +8045,37 @@ actor WorkspaceFileContextStore {
             .id
         guard let containingRootID else { return [] }
         return await awaitAppliedIngress(rootIDs: [containingRootID])
+    }
+
+    func awaitAppliedIngressForExplicitRequest(
+        userPath: String,
+        fallbackRootRefs: [WorkspaceRootRef],
+        timeout: Duration
+    ) async throws -> [WorkspaceIngressBarrierSample] {
+        try await awaitAppliedIngressWithTimeout(timeout) { [self] in
+            await awaitAppliedIngressForExplicitRequest(
+                userPath: userPath,
+                fallbackRootRefs: fallbackRootRefs
+            )
+        }
+    }
+
+    private func awaitAppliedIngressWithTimeout(
+        _ timeout: Duration,
+        operation: @escaping @Sendable () async -> [WorkspaceIngressBarrierSample]
+    ) async throws -> [WorkspaceIngressBarrierSample] {
+        try await withThrowingTaskGroup(of: [WorkspaceIngressBarrierSample].self) { group in
+            defer { group.cancelAll() }
+            group.addTask {
+                await operation()
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw WorkspaceAppliedIngressWaitError.timedOut
+            }
+            guard let result = try await group.next() else { return [] }
+            return result
+        }
     }
 
     private func awaitAppliedIngress(rootIDs: [UUID]) async -> [WorkspaceIngressBarrierSample] {
@@ -21520,6 +21773,19 @@ actor WorkspaceFileContextStore {
         state.folderIDsByRelativePath[folder.standardizedRelativePath] = folder.id
         state.childFolderIDsByFolderID[parentID, default: []].append(folder.id)
         return folder.id
+    }
+}
+
+enum WorkspaceAppliedIngressWaitError: Error, Equatable {
+    case timedOut
+}
+
+extension WorkspaceAppliedIngressWaitError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .timedOut:
+            "Workspace freshness timed out before pending file-system ingress was applied."
+        }
     }
 }
 

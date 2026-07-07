@@ -1,18 +1,10 @@
+import Darwin
+import Dispatch
 import Foundation
 @_spi(TestSupport) @testable import RepoPrompt
 import XCTest
 
 final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
-    private var temporaryURLs: [URL] = []
-
-    override func tearDown() {
-        for url in temporaryURLs {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryURLs.removeAll()
-        super.tearDown()
-    }
-
     func testSessionOpenRoutesInjectMCPAndUseModernModeConfiguration() async throws {
         let cases = [
             SessionOpenRouteCase(
@@ -225,8 +217,8 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             normalizedUpdates: normalizedUpdates
         )
         _ = try await fixture.controller.bootstrap()
-        try await waitUntil("authoritative config update") {
-            diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
+        try await diagnostics.waitUntil("authoritative config update") {
+            $0.contains("Processed authoritative config_option_update snapshot.")
         }
 
         try await fixture.controller.setSessionMode("plan")
@@ -274,8 +266,8 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             )
             try await withBootstrappedController(fixture.controller) { controller in
                 if let expectedDiagnostic = updateCase.expectedDiagnostic {
-                    try await waitUntil("\(updateCase.label) config update rejection") {
-                        diagnostics.values.contains {
+                    try await diagnostics.waitUntil("\(updateCase.label) config update rejection") {
+                        $0.contains {
                             $0.contains("Ignoring") && $0.contains(expectedDiagnostic)
                         }
                     }
@@ -302,25 +294,31 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 "ACP_NOTIFICATION_MODE": "plan",
                 "ACP_NOTIFICATION_BEHAVIOR": "malformed"
             ]
+            let releaseGates: Set<ACPFixtureSync.ReleaseGate>
             if phase == .afterMutation {
                 environment = [
                     "ACP_AFTER_SET_NOTIFICATION_MODE": "ask",
-                    "ACP_AFTER_SET_NOTIFICATION_BEHAVIOR": "malformed",
-                    "ACP_AFTER_SET_NOTIFICATION_DELAY": "0.05"
+                    "ACP_AFTER_SET_NOTIFICATION_BEHAVIOR": "malformed"
                 ]
+                releaseGates = [.afterSetNotification]
+            } else {
+                releaseGates = []
             }
             let fixture = try makeFixture(
                 shape: "modern",
                 extraEnvironment: environment,
+                releaseGates: releaseGates,
                 diagnostics: diagnostics
             )
             _ = try await fixture.controller.bootstrap()
 
             if phase == .afterMutation {
                 try await fixture.controller.setSessionMode("plan")
+                try await fixture.sync.waitForReleaseWaiter(.afterSetNotification)
+                try fixture.sync.release(.afterSetNotification)
             }
-            try await waitUntil("\(phase.label) malformed config update invalidation") {
-                diagnostics.values.contains { $0.contains("Invalidated session mode authority") }
+            try await diagnostics.waitUntil("\(phase.label) malformed config update invalidation") {
+                $0.contains { $0.contains("Invalidated session mode authority") }
             }
             await assertThrows(
                 containing: "malformed modern session mode config option",
@@ -347,15 +345,17 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         let fixture = try makeFixture(
             shape: "modern",
             extraEnvironment: [
-                "ACP_AFTER_SET_NOTIFICATION_MODE": "ask",
-                "ACP_AFTER_SET_NOTIFICATION_DELAY": "0.05"
+                "ACP_AFTER_SET_NOTIFICATION_MODE": "ask"
             ],
+            releaseGates: [.afterSetNotification],
             diagnostics: diagnostics
         )
         _ = try await fixture.controller.bootstrap()
         try await fixture.controller.setSessionMode("plan")
-        try await waitUntil("authoritative config update") {
-            diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
+        try await fixture.sync.waitForReleaseWaiter(.afterSetNotification)
+        try fixture.sync.release(.afterSetNotification)
+        try await diagnostics.waitUntil("authoritative config update") {
+            $0.contains("Processed authoritative config_option_update snapshot.")
         }
         try await fixture.controller.setSessionMode("ask")
         await fixture.controller.shutdown()
@@ -380,11 +380,12 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             let mutation = Task {
                 try await fixture.controller.setSessionMode("Plan")
             }
-            try await waitUntilAsync("configuration mutation postcheck suspension") {
-                await fixture.controller.debugIsConfigurationMutationPostcheckSuspended()
-            }
-            try await waitUntil("newer authoritative config update") {
-                diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
+            try await waitForConfigurationMutationPostcheckSuspension(
+                fixture.controller,
+                description: "configuration mutation postcheck suspension"
+            )
+            try await diagnostics.waitUntil("newer authoritative config update") {
+                $0.contains("Processed authoritative config_option_update snapshot.")
             }
             await fixture.controller.debugResumeConfigurationMutationPostcheck()
 
@@ -514,25 +515,21 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     }
 
     func testModelAndModeMutationsAreSerializedAndModeRunsLast() async throws {
-        let releaseURL = try makeTemporaryDirectory().appendingPathComponent("release-model")
         let fixture = try makeFixture(
             shape: "modern",
             extraEnvironment: [
                 "ACP_INCLUDE_MODEL": "1",
-                "ACP_MODEL_RELEASE_PATH": releaseURL.path,
                 "ACP_MODEL_CHANGES_MODE_CONFIG_ID": "1"
             ],
+            releaseGates: [.modelResponse],
             modelString: "model-b"
         )
         _ = try await fixture.controller.bootstrap()
 
         let modelTask = Task { try await fixture.controller.setSessionModel("model-b") }
-        try await waitUntil("model mutation request") {
-            self.recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
-                .contains { $0.params["configId"] as? String == "model" }
-        }
+        try await fixture.sync.waitForReleaseWaiter(.modelResponse)
         let modeTask = Task { try await fixture.controller.setSessionMode("plan") }
-        try Data().write(to: releaseURL)
+        try fixture.sync.release(.modelResponse)
         try await modelTask.value
         try await modeTask.value
         await fixture.controller.shutdown()
@@ -664,9 +661,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
 
         _ = try await fixture.controller.bootstrap()
         try await fixture.controller.prompt(AgentMessage(userMessage: "Say hello"))
-        try await waitUntil("OpenCode empty prompt terminal event") {
-            collectedEvents.didSeeTerminal
-        }
+        try await collectedEvents.waitForTerminal("OpenCode empty prompt terminal event")
         let results = collectedEvents.values
         await fixture.controller.shutdown()
 
@@ -709,9 +704,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
 
         _ = try await fixture.controller.bootstrap()
         try await fixture.controller.prompt(AgentMessage(userMessage: "Say hello"))
-        try await waitUntil("OpenCode empty prompt terminal event") {
-            collectedEvents.didSeeTerminal
-        }
+        try await collectedEvents.waitForTerminal("OpenCode empty prompt terminal event")
         let results = collectedEvents.values
         await fixture.controller.shutdown()
 
@@ -724,27 +717,26 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     func testTransportTerminationDrainsPromptSettlementWaiters() async throws {
         #if DEBUG
             for termination in TransportTerminationKind.allCases {
-                let releaseURL = try makeTemporaryDirectory().appendingPathComponent("exit-release")
-                var environment = ["ACP_HANG_PROMPT": "1"]
-                if termination == .processExit {
-                    environment["ACP_EXIT_ON_CANCEL_RELEASE_PATH"] = releaseURL.path
-                }
+                let releaseGates: Set<ACPFixtureSync.ReleaseGate> = termination == .processExit ? [.processExit] : []
                 let fixture = try makeFixture(
                     shape: "modern",
-                    extraEnvironment: environment
+                    extraEnvironment: ["ACP_HANG_PROMPT": "1"],
+                    releaseGates: releaseGates
                 )
                 _ = try await fixture.controller.bootstrap()
                 let promptTask = Task {
                     try await fixture.controller.prompt(AgentMessage(userMessage: "hang"))
                 }
-                try await waitUntil("\(termination.label) prompt request") {
-                    self.recordedRequests(at: fixture.recordURL, method: "session/prompt").count == 1
-                }
+                try await fixture.sync.waitForRequest(method: "session/prompt", label: "\(termination.label) prompt request")
 
                 let interruptTask = Task {
                     try await fixture.controller.interruptActivePromptForSteering(timeoutSeconds: 30)
                 }
-                try await waitUntilAsync("\(termination.label) prompt settlement waiter") {
+                try await fixture.sync.waitForRequest(method: "session/cancel", label: "\(termination.label) cancel request")
+                if termination == .processExit {
+                    try await fixture.sync.waitForReleaseWaiter(.processExit)
+                }
+                try await AsyncTestWait.waitUntil("\(termination.label) prompt settlement waiter") {
                     await fixture.controller.debugPromptSettlementWaiterCount() == 1
                 }
                 let waiterCount = await fixture.controller.debugPromptSettlementWaiterCount()
@@ -754,7 +746,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 case .shutdown:
                     await fixture.controller.shutdown()
                 case .processExit:
-                    try Data().write(to: releaseURL)
+                    try fixture.sync.release(.processExit)
                 }
 
                 await assertTransportClosed(interruptTask, label: "\(termination.label) steering interrupt")
@@ -973,10 +965,160 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
+    private struct ACPPhaseAcknowledgement {
+        let phase: String
+        let method: String?
+        let configID: String?
+        let releaseName: String?
+
+        init?(line: String) {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let phase = object["phase"] as? String
+            else { return nil }
+            self.phase = phase
+            method = object["method"] as? String
+            configID = object["configId"] as? String
+            releaseName = object["name"] as? String
+        }
+    }
+
+    /// Test-only ACP synchronization protocol for this fixture.
+    ///
+    /// Swift owns a per-test temporary directory. The Python ACP child appends JSONL
+    /// phase acknowledgements to `ACP_SYNC_EVENTS_PATH` when it receives requests or
+    /// blocks on a named release barrier. Release barriers are owner-only FIFOs; the
+    /// child opens the FIFO for reading and Swift writes one byte to release it.
+    /// The XCTest fixture owns cleanup through per-allocation teardown blocks, while this object
+    /// owns the file-event source used to wake Swift waiters without sleep polling.
+    private final class ACPFixtureSync: @unchecked Sendable {
+        enum ReleaseGate: String, CaseIterable {
+            case modelResponse = "model_response"
+            case afterSetNotification = "after_set_notification"
+            case processExit = "process_exit"
+
+            var environmentKey: String {
+                switch self {
+                case .modelResponse: "ACP_MODEL_RELEASE_FIFO"
+                case .afterSetNotification: "ACP_AFTER_SET_NOTIFICATION_RELEASE_FIFO"
+                case .processExit: "ACP_EXIT_ON_CANCEL_RELEASE_FIFO"
+                }
+            }
+
+            var pathComponent: String {
+                "\(rawValue).fifo"
+            }
+        }
+
+        let environment: [String: String]
+
+        private let eventsURL: URL
+        private let condition = AsyncTestCondition<[ACPPhaseAcknowledgement]>([])
+        private let queue = DispatchQueue(label: "ACPAgentSessionControllerModeConfigTests.sync")
+        private let source: DispatchSourceFileSystemObject
+        private let fifoURLs: [ReleaseGate: URL]
+
+        init(directory: URL, releaseGates: Set<ReleaseGate>) throws {
+            eventsURL = directory.appendingPathComponent("acp-sync-events.jsonl")
+            FileManager.default.createFile(atPath: eventsURL.path, contents: nil)
+
+            var environment = ["ACP_SYNC_EVENTS_PATH": eventsURL.path]
+            var fifoURLs: [ReleaseGate: URL] = [:]
+            for gate in releaseGates {
+                let url = directory.appendingPathComponent(gate.pathComponent)
+                if Darwin.mkfifo(url.path, S_IRUSR | S_IWUSR) != 0 {
+                    throw POSIXError(Self.currentPOSIXErrorCode())
+                }
+                fifoURLs[gate] = url
+                environment[gate.environmentKey] = url.path
+            }
+            self.environment = environment
+            self.fifoURLs = fifoURLs
+
+            let descriptor = Darwin.open(eventsURL.path, O_EVTONLY)
+            guard descriptor >= 0 else {
+                throw POSIXError(Self.currentPOSIXErrorCode())
+            }
+            source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.extend, .write, .delete, .rename],
+                queue: queue
+            )
+            source.setEventHandler { [weak self] in
+                self?.refreshAcknowledgements()
+            }
+            source.setCancelHandler {
+                Darwin.close(descriptor)
+            }
+            source.resume()
+            refreshAcknowledgements()
+        }
+
+        deinit {
+            source.cancel()
+        }
+
+        func waitForRequest(method: String, configID: String? = nil, label: String? = nil) async throws {
+            refreshAcknowledgements()
+            let description = label ?? "ACP request \(method)"
+            try await condition.waitUntil(description) { acknowledgements in
+                acknowledgements.contains { acknowledgement in
+                    acknowledgement.phase == "request" &&
+                        acknowledgement.method == method &&
+                        (configID == nil || acknowledgement.configID == configID)
+                }
+            }
+        }
+
+        func waitForReleaseWaiter(_ gate: ReleaseGate) async throws {
+            refreshAcknowledgements()
+            try await condition.waitUntil("ACP release waiter \(gate.rawValue)") { acknowledgements in
+                acknowledgements.contains { acknowledgement in
+                    acknowledgement.phase == "release_waiting" && acknowledgement.releaseName == gate.rawValue
+                }
+            }
+        }
+
+        func release(_ gate: ReleaseGate) throws {
+            guard let url = fifoURLs[gate] else {
+                throw AsyncTestConditionTimeout(description: "unconfigured ACP release gate \(gate.rawValue)", timeout: 0)
+            }
+            let descriptor = Darwin.open(url.path, O_WRONLY | O_NONBLOCK)
+            guard descriptor >= 0 else {
+                throw POSIXError(Self.currentPOSIXErrorCode())
+            }
+            defer { Darwin.close(descriptor) }
+            var byte: UInt8 = 0x0A
+            let written = withUnsafePointer(to: &byte) { pointer in
+                Darwin.write(descriptor, pointer, 1)
+            }
+            guard written == 1 else {
+                throw POSIXError(Self.currentPOSIXErrorCode())
+            }
+        }
+
+        private func refreshAcknowledgements() {
+            guard let data = try? Data(contentsOf: eventsURL),
+                  let text = String(data: data, encoding: .utf8)
+            else { return }
+            let acknowledgements = text.split(whereSeparator: { $0.isNewline }).compactMap {
+                ACPPhaseAcknowledgement(line: String($0))
+            }
+            condition.update { current in
+                current = acknowledgements
+            }
+        }
+
+        private static func currentPOSIXErrorCode() -> POSIXErrorCode {
+            POSIXErrorCode(rawValue: errno) ?? .EIO
+        }
+    }
+
     private struct Fixture {
         let controller: ACPAgentSessionController
         let recordURL: URL
         let scriptURL: URL
+        let sync: ACPFixtureSync
     }
 
     private struct RecordedRequest {
@@ -1009,6 +1151,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         shape: String,
         resumeSessionID: String? = nil,
         extraEnvironment: [String: String] = [:],
+        releaseGates: Set<ACPFixtureSync.ReleaseGate> = [],
         modelString: String? = nil,
         launchArguments: [String] = [],
         mcpServers: [RepoPromptMCPServerConfiguration] = [],
@@ -1019,7 +1162,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
+        let sync = try ACPFixtureSync(directory: workspace, releaseGates: releaseGates)
         var environment = extraEnvironment
+        environment.merge(sync.environment) { _, syncValue in syncValue }
         environment["ACP_RECORD_PATH"] = recordURL.path
         environment["ACP_SHAPE"] = shape
         let request = ACPRunRequest(
@@ -1050,7 +1195,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         addTeardownBlock {
             await controller.shutdown()
         }
-        return Fixture(controller: controller, recordURL: recordURL, scriptURL: scriptURL)
+        return Fixture(controller: controller, recordURL: recordURL, scriptURL: scriptURL, sync: sync)
     }
 
     private func drain(_ stream: AsyncThrowingStream<AIStreamResult, Error>) async throws {
@@ -1097,30 +1242,14 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
-    private func waitUntil(
-        _ description: String,
-        timeout: TimeInterval = 3,
-        condition: @escaping () -> Bool
+    private func waitForConfigurationMutationPostcheckSuspension(
+        _ controller: ACPAgentSessionController,
+        description: String,
+        timeout: TimeInterval = 3
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        try await AsyncTestWait.waitUntil(description, timeout: timeout) {
+            await controller.debugIsConfigurationMutationPostcheckSuspended()
         }
-        XCTFail("Timed out waiting for \(description)")
-    }
-
-    private func waitUntilAsync(
-        _ description: String,
-        timeout: TimeInterval = 3,
-        condition: @escaping () async -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for \(description)")
     }
 
     private func recordedMutationRequests(at url: URL) -> [RecordedRequest] {
@@ -1147,11 +1276,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ACPAgentSessionControllerModeConfigTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryURLs.append(url)
-        return url
+        try makeTestDirectory(name: "ACPAgentSessionControllerModeConfigTests")
     }
 
     private func makeFakeACPServerScript() throws -> URL {
@@ -1161,9 +1286,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         #!/usr/bin/env python3
         import json
         import os
+        import select
         import sys
         import threading
-        import time
 
         record_path = os.environ.get("ACP_RECORD_PATH")
         shape = os.environ.get("ACP_SHAPE", "modern")
@@ -1172,8 +1297,35 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         current_model = "Foo" if os.environ.get("ACP_MODEL_CASE_COLLISION") == "1" else "model-a"
         mode_config_id = "permission_mode" if shape == "custom_id" else "mode"
         output_lock = threading.Lock()
+        sync_events_path = os.environ.get("ACP_SYNC_EVENTS_PATH")
+        sync_lock = threading.Lock()
+
+        def acknowledge(phase, **fields):
+            if not sync_events_path:
+                return
+            payload = {"phase": phase}
+            payload.update({key: value for key, value in fields.items() if value is not None})
+            with sync_lock:
+                with open(sync_events_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload) + "\n")
+                    handle.flush()
+
+        def wait_for_release_fifo(path, name):
+            reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            keeper = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                acknowledge("release_waiting", name=name)
+                while True:
+                    select.select([reader], [], [])
+                    if os.read(reader, 1):
+                        break
+            finally:
+                os.close(keeper)
+                os.close(reader)
+            acknowledge("released", name=name)
 
         def record(method, params):
+            acknowledge("request", method=method, configId=params.get("configId"))
             if not record_path:
                 return
             with open(record_path, "a", encoding="utf-8") as handle:
@@ -1331,9 +1483,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             return {"configOptions": config_options()}
 
         def delayed_model_response(request_id):
-            release_path = os.environ.get("ACP_MODEL_RELEASE_PATH")
-            while release_path and not os.path.exists(release_path):
-                time.sleep(0.005)
+            release_fifo = os.environ.get("ACP_MODEL_RELEASE_FIFO")
+            if release_fifo:
+                wait_for_release_fifo(release_fifo, "model_response")
             respond(request_id, {"configOptions": config_options()})
 
         for line in sys.stdin:
@@ -1378,7 +1530,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                     current_model = params.get("value")
                     if os.environ.get("ACP_MODEL_CHANGES_MODE_CONFIG_ID") == "1":
                         mode_config_id = "mode_after_model"
-                    if os.environ.get("ACP_MODEL_RELEASE_PATH"):
+                    if os.environ.get("ACP_MODEL_RELEASE_FIFO"):
                         threading.Thread(target=delayed_model_response, args=(request.get("id"),), daemon=True).start()
                         continue
                 else:
@@ -1387,11 +1539,11 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 if after_mode:
                     response_result = set_config_response()
                     current_mode = after_mode
-                    delay = float(os.environ.get("ACP_AFTER_SET_NOTIFICATION_DELAY", "0"))
                     after_behavior = os.environ.get("ACP_AFTER_SET_NOTIFICATION_BEHAVIOR")
-                    if delay > 0:
+                    release_fifo = os.environ.get("ACP_AFTER_SET_NOTIFICATION_RELEASE_FIFO")
+                    if release_fifo:
                         respond(request.get("id"), response_result)
-                        time.sleep(delay)
+                        wait_for_release_fifo(release_fifo, "after_set_notification")
                         send(notification_payload(after_mode, behavior_override=after_behavior))
                     else:
                         respond_then_notify(
@@ -1403,10 +1555,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 else:
                     respond(request.get("id"), set_config_response())
             elif method == "session/cancel":
-                exit_release_path = os.environ.get("ACP_EXIT_ON_CANCEL_RELEASE_PATH")
-                if exit_release_path:
-                    while not os.path.exists(exit_release_path):
-                        time.sleep(0.01)
+                exit_release_fifo = os.environ.get("ACP_EXIT_ON_CANCEL_RELEASE_FIFO")
+                if exit_release_fifo:
+                    wait_for_release_fifo(exit_release_fifo, "process_exit")
                     sys.exit(0)
                 continue
             elif method == "session/prompt":
@@ -1429,49 +1580,58 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
 }
 
 private final class LockedACPStreamResults: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [AIStreamResult] = []
-    private var terminal = false
+    private struct State {
+        var values: [AIStreamResult] = []
+        var didSeeTerminal = false
+    }
+
+    private let condition = AsyncTestCondition(State())
 
     var values: [AIStreamResult] {
-        lock.lock()
-        defer { lock.unlock() }
-        return storage
+        condition.snapshot().values
     }
 
     var didSeeTerminal: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return terminal
+        condition.snapshot().didSeeTerminal
     }
 
     func append(_ value: AIStreamResult) {
-        lock.lock()
-        storage.append(value)
-        lock.unlock()
+        condition.update { state in
+            state.values.append(value)
+        }
     }
 
     func markTerminal() {
-        lock.lock()
-        terminal = true
-        lock.unlock()
+        condition.update { state in
+            state.didSeeTerminal = true
+        }
+    }
+
+    func waitForTerminal(_ description: String) async throws {
+        try await condition.waitUntil(description) { state in
+            state.didSeeTerminal
+        }
     }
 }
 
 private final class LockedStrings: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [String] = []
+    private let condition = AsyncTestCondition<[String]>([])
 
     var values: [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return storage
+        condition.snapshot()
     }
 
     func append(_ value: String) {
-        lock.lock()
-        storage.append(value)
-        lock.unlock()
+        condition.update { values in
+            values.append(value)
+        }
+    }
+
+    func waitUntil(
+        _ description: String,
+        predicate: @escaping ([String]) -> Bool
+    ) async throws {
+        try await condition.waitUntil(description, predicate: predicate)
     }
 }
 

@@ -783,16 +783,17 @@ final class CodexNativeSessionController {
         notificationTask?.cancel()
         serverRequestTask?.cancel()
         finishEventsStreamIfNeeded()
-        if clientShutdownBehavior == .stopOnShutdown || expectedMCPClientName != nil {
-            let ownedClient = client
-            let shouldStopClient = clientShutdownBehavior == .stopOnShutdown
-            let shouldClearExpectedPID = expectedMCPClientName != nil
-            Task {
+
+        let client = client
+        let shouldClearExpectedPID = expectedMCPClientName != nil
+        let shouldStopClient = clientShutdownBehavior == .stopOnShutdown
+        if shouldClearExpectedPID || shouldStopClient {
+            Task.detached {
                 if shouldClearExpectedPID {
-                    await ownedClient.clearExpectedAgentPIDRegistration()
+                    await client.clearExpectedAgentPIDRegistration()
                 }
                 if shouldStopClient {
-                    await ownedClient.stop()
+                    await client.stop()
                 }
             }
         }

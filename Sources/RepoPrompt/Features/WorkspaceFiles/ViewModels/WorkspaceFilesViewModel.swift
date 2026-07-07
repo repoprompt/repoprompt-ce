@@ -1789,8 +1789,22 @@ class WorkspaceFilesViewModel: ObservableObject {
                 let targets = stillCurrentTargets.map { (identity: $0.identity, fullPath: $0.logicalFullPath) }
                 await workspaceManager?.rebaseSlicesForFilesAcrossTabs(
                     targets: targets,
-                    asyncTransform: { _, logicalFullPath, currentRanges in
-                        await Task.detached(priority: .utility) {
+                    asyncTransform: { identity, logicalFullPath, currentRanges in
+                        if let commit = partitionCommits.first(where: { commit in
+                            guard let target = commit.hiddenSessionTarget else { return false }
+                            return target.identity == identity && target.logicalFullPath == logicalFullPath
+                        }), let expectedLogicalRanges = commit.expectedLogicalRanges {
+                            let normalizedCurrent = SliceRangeMath.normalize(currentRanges)
+                            let normalizedCommitted = SliceRangeMath.normalize(commit.ranges)
+                            if normalizedCurrent == normalizedCommitted {
+                                return normalizedCurrent
+                            }
+                            if normalizedCurrent == SliceRangeMath.normalize(expectedLogicalRanges) {
+                                return normalizedCommitted
+                            }
+                        }
+
+                        return await Task.detached(priority: .utility) {
                             let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
                             let result = SliceRebaseEngine.rebase(
                                 oldText: sourceSnapshot.text,

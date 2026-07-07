@@ -5694,7 +5694,11 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
 
-        try await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)
+        try await readableService.awaitFreshnessForExplicitRequest(
+            path,
+            rootRefs: roots,
+            timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+        )
         try Task.checkCancellation()
 
         let resolution = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
@@ -5808,6 +5812,12 @@ final class MCPServerViewModel: ObservableObject {
             policy: .allowLegacyImplicitRouting
         )
         let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
+            for: lookupContext,
+            store: promptVM.workspaceFileContextStore
+        ) {
+            throw failure
+        }
         try Task.checkCancellation()
         let effectivePath = lookupContext.translateInputPath(path)
         let effectiveNewPath = newPath.map { lookupContext.translateInputPath($0) }

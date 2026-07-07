@@ -3,8 +3,6 @@ import Foundation
 import XCTest
 
 enum GitWorktreeTestSupport {
-    private static let gitExecutable = URL(fileURLWithPath: "/usr/bin/git")
-
     static func waitForStableDescriptor(
         repo: URL,
         path: URL,
@@ -135,30 +133,11 @@ enum GitWorktreeTestSupport {
     }
 
     static func runGit(_ arguments: [String], cwd: URL) throws -> String {
-        let process = Process()
-        process.executableURL = gitExecutable
-        process.arguments = arguments
-        process.currentDirectoryURL = cwd
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(decoding: data, as: UTF8.self)
-        guard process.terminationStatus == 0 else {
-            throw NSError(
-                domain: "GitWorktreeTestSupport.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed in \(cwd.path): \(text)"]
-            )
-        }
-        return text
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: cwd,
+            failureDomain: "GitWorktreeTestSupport.git"
+        )
     }
 
     private static func isStableDescriptor(

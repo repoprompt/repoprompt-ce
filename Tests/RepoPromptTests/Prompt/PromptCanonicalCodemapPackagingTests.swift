@@ -169,7 +169,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             named: "headless-logical",
             files: [
                 "Sources/Selected.swift": "let canonicalFullContentSentinel = true\n",
-                "Sources/Target.swift": "struct CanonicalTarget {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("CanonicalTarget")
             ]
         )
         let worktreeRoot = try repositoryFixture.makeRepository(

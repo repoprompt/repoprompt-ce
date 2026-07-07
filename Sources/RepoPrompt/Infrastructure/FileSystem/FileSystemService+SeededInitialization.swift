@@ -347,6 +347,56 @@ extension FileSystemService {
         seedInitializationState = nil
     }
 
+    /// Reconciles a bounded set of folders after a Git authority change without
+    /// collapsing the root into a full resync. The caller is responsible for
+    /// proving that policy/layout changes do not require an authoritative root crawl.
+    @discardableResult
+    func reconcileFoldersForAuthorityChange(
+        folders: Set<String>,
+        modifiedFiles: Set<String> = []
+    ) async -> Bool {
+        guard seedInitializationState == nil else { return false }
+        var remaining = Array(folders).sorted()
+        do {
+            while !remaining.isEmpty {
+                let result = try await scanFoldersInParallel(remaining)
+                publishFileSystemDeltas(
+                    result.deltas,
+                    source: .authorityTargetedReconcile,
+                    requiresFullResync: false
+                )
+                guard !result.scannedFolders.isEmpty else { return false }
+                let scanned = result.scannedFolders
+                remaining.removeAll { scanned.contains($0) }
+            }
+            let modificationDeltas = await authorityChangeModificationDeltas(for: modifiedFiles)
+            if !modificationDeltas.isEmpty || folders.isEmpty {
+                publishFileSystemDeltas(
+                    modificationDeltas,
+                    source: .authorityTargetedReconcile,
+                    requiresFullResync: false
+                )
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func authorityChangeModificationDeltas(for modifiedFiles: Set<String>) async -> [FileSystemDelta] {
+        var deltas: [FileSystemDelta] = []
+        for relativePath in modifiedFiles.sorted() {
+            let fullPath = fullPath(forRelativePath: relativePath)
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory), !isDirectory.boolValue else {
+                continue
+            }
+            let modificationDate = try? await getFileModificationDate(atRelativePath: relativePath)
+            deltas.append(.fileModified(relativePath, modificationDate))
+        }
+        return deltas
+    }
+
     /// Performs the existing authoritative full-tree recovery reconciliation once
     /// in response to an event-driven Git authority invalidation. This API never
     /// schedules itself and therefore cannot become a polling loop.

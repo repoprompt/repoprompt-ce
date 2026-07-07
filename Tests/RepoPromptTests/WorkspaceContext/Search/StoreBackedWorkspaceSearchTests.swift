@@ -3,16 +3,10 @@ import CoreServices
 import XCTest
 
 final class StoreBackedWorkspaceSearchTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
     override func tearDownWithError() throws {
         #if DEBUG
             EditFlowPerf.resetDebugCaptureForTesting()
         #endif
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
         try super.tearDownWithError()
     }
 
@@ -2994,19 +2988,16 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
     #endif
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func makeHomeTemporaryRoot(name: String) throws -> URL {
         let url = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".RepoPromptTests-\(name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: url)
+        }
         return url
     }
 

@@ -72,6 +72,9 @@ jobs:
           SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          # Link Sentry only in the official release binary. The protected DSN is
+          # injected later in the signing job, so the secret-free stage stays inert.
+          REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/release.sh stage-publish
 
       - name: Upload staged release source
@@ -195,6 +198,9 @@ jobs:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
+          # Protected release environment secret. sign_staged_release.sh bakes it
+          # into the signed bundle's Info.plist as RepoPromptSentryDSN.
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: ./trusted-control-plane/Scripts/release.sh publish-staged
 
       - name: Remove ephemeral keychain

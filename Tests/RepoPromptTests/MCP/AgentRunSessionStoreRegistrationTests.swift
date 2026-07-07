@@ -14,7 +14,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: firstCursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: first)
+        try await waitForAgentRunSessionStoreWaiter(registration: first)
 
         let replacement = await AgentRunSessionStore.register(sessionID: sessionID)
         let disposition = await waiter.value
@@ -49,7 +49,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let epoch = try await beginEpoch(
             registration: registration,
@@ -80,7 +80,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let terminal = makeSnapshot(sessionID: sessionID, status: .completed)
         let commitID = UUID()
@@ -132,7 +132,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: secondCursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let oldTerminal = makeSnapshot(sessionID: sessionID, status: .completed)
         let staleResult = await AgentRunSessionStore.publishTerminal(
@@ -263,7 +263,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let firstWait = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             running,
@@ -361,7 +361,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         var interactionSnapshot = makeSnapshot(sessionID: sessionID, status: .waitingForInput)
         interactionSnapshot = AgentRunMCPSnapshot(
@@ -414,7 +414,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let result = await AgentRunSessionStore.publishTerminal(
             .init(epoch: epoch, snapshot: makeSnapshot(sessionID: sessionID, status: .completed)),
@@ -452,14 +452,14 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
                 return disposition
             }
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let first = try await beginEpoch(
             registration: registration,
             activationID: activationID,
             expected: nil,
             kind: .initial
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         _ = try await beginEpoch(
             registration: registration,
             activationID: activationID,
@@ -514,16 +514,6 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
             throw TestFailure.missingEpoch
         }
         return epoch
-    }
-
-    private func waitForWaiter(registration: AgentRunSessionStore.Registration) async throws {
-        for _ in 0 ..< 200 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            await Task.yield()
-        }
-        XCTFail("Timed out waiting for waiter registration")
     }
 
     private func durationSeconds(_ duration: Duration) -> TimeInterval {

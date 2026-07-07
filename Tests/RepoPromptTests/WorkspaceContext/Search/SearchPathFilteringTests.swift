@@ -100,14 +100,35 @@ final class SearchPathFilteringTests: XCTestCase {
             clauses: [.legacyPrefix(candidateLower: "sources")]
         )
 
+        let gate = SearchCancellationGate()
         let task = Task.detached(priority: .background) {
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            await gate.wait()
             return filterPathIndicesResult(snapshots: snapshots, spec: spec)
         }
         task.cancel()
+        await gate.open()
         let result = await task.value
 
         XCTAssertTrue(result.cancelled)
-        XCTAssertLessThan(result.visitedSnapshotCount, snapshots.count)
+        XCTAssertEqual(result.visitedSnapshotCount, 0)
+    }
+}
+
+private actor SearchCancellationGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+        isOpen = true
+        let current = waiters
+        waiters.removeAll()
+        current.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
     }
 }

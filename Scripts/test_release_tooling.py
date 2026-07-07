@@ -1324,6 +1324,37 @@ SIGNING_TEAM_ID=648A27MST5
             publish_staged.index("prepare_dist"),
         )
 
+    def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
+        root = SCRIPT_DIR.parent
+        package_manifest = (root / "Package.swift").read_text(encoding="utf-8")
+        package_resolved = json.loads((root / "Package.resolved").read_text(encoding="utf-8"))
+        notice_inventory = (root / "ThirdPartyLicenses" / "swiftpm" / "inventory.tsv").read_text(encoding="utf-8")
+        release_workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        bootstrap_source = (
+            root
+            / "Sources"
+            / "RepoPrompt"
+            / "Infrastructure"
+            / "Telemetry"
+            / "SentryTelemetryBootstrap.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('.package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1")', package_manifest)
+        self.assertIn('repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
+        self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', release_workflow)
+        self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", release_workflow)
+        self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", release_script)
+        self.assertIn('if [[ -n "${SENTRY_DSN:-}" ]]; then', staged_signing_script)
+        self.assertIn('plutil -replace RepoPromptSentryDSN -string "$SENTRY_DSN"', staged_signing_script)
+        self.assertIn('Bundle.main.object(forInfoDictionaryKey: "RepoPromptSentryDSN")', bootstrap_source)
+
+        pins = {pin["identity"]: pin for pin in package_resolved["pins"]}
+        self.assertEqual(pins["sentry-cocoa"]["state"]["version"], "9.17.1")
+        self.assertIn("sentry-cocoa\t9.17.1\thttps://github.com/getsentry/sentry-cocoa", notice_inventory)
+
     def test_modern_sparkle_key_seed_derives_public_key(self) -> None:
         descriptor, key_path = tempfile.mkstemp()
         os.close(descriptor)

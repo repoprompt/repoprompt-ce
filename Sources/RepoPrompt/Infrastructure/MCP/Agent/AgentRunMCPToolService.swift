@@ -97,6 +97,7 @@ struct AgentRunWaitScopeCompletion: Equatable {
     enum Reason: String, Equatable {
         case snapshotReady = "snapshot_ready"
         case timedOut = "timed_out"
+        case startupPending = "startup_pending"
         case expired
         case superseded
         case cancelled
@@ -1160,14 +1161,16 @@ struct AgentRunMCPToolService {
                     }
                     let remaining = Self.timeInterval(from: clock.now.duration(to: deadline))
                     guard remaining > 0 else {
+                        let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        let result = Self.waitResult(from: value) ?? "timed_out"
                         completionBox.set(AgentRunWaitScopeCompletion(
-                            reason: .timedOut,
-                            result: "timed_out",
+                            reason: result == "startup_pending" ? .startupPending : .timedOut,
+                            result: result,
                             winnerSessionID: nil,
                             pendingSessionIDs: [sessionID],
                             errorDescription: nil
                         ))
-                        return await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        return value
                     }
                     let disposition = await AgentRunSessionStore.waitUntilInteresting(
                         cursor: cursor,
@@ -1220,14 +1223,16 @@ struct AgentRunMCPToolService {
                     case let .terminalPublicationRejected(_, reason):
                         throw MCPError.internalError("The agent run terminal state could not be published: \(reason)")
                     case .timedOut:
+                        let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        let result = Self.waitResult(from: value) ?? "timed_out"
                         completionBox.set(AgentRunWaitScopeCompletion(
-                            reason: .timedOut,
-                            result: "timed_out",
+                            reason: result == "startup_pending" ? .startupPending : .timedOut,
+                            result: result,
                             winnerSessionID: nil,
                             pendingSessionIDs: [sessionID],
                             errorDescription: nil
                         ))
-                        return await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        return value
                     case .expired:
                         completionBox.set(AgentRunWaitScopeCompletion(
                             reason: .expired,
@@ -1291,8 +1296,14 @@ struct AgentRunMCPToolService {
     ) async -> Value {
         let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         var object = snapshot.asObject()
-        object["_meta"] = .object(["wait_result": .string("timed_out")])
+        object["_meta"] = .object([
+            "wait_result": .string(snapshot.isStartupPendingForMCPWait ? "startup_pending" : "timed_out")
+        ])
         return .object(object)
+    }
+
+    private nonisolated static func waitResult(from value: Value) -> String? {
+        value.objectValue?["_meta"]?.objectValue?["wait_result"]?.stringValue
     }
 
     private func supersededWaitValue(
@@ -1499,10 +1510,11 @@ struct AgentRunMCPToolService {
         case let .terminalPublicationRejected(reason):
             throw MCPError.internalError("An agent run terminal state could not be published: \(reason)")
         case .timedOut:
+            let representative = snapshots.first(where: \.isStartupPendingForMCPWait) ?? snapshots.first ?? initialSnapshots[0]
             return decoratedMultiWaitValue(
-                snapshot: snapshots.first ?? initialSnapshots[0],
+                snapshot: representative,
                 sessionIDs: sessionIDs,
-                result: "timed_out",
+                result: representative.isStartupPendingForMCPWait ? "startup_pending" : "timed_out",
                 snapshots: snapshots,
                 pendingSessionIDs: pendingSessionIDs(from: snapshots)
             )
@@ -1846,6 +1858,7 @@ struct AgentRunMCPToolService {
         let pendingSessionIDs = Set(wait?["pending_session_ids"]?.arrayValue?.compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) } ?? fallbackSessionIDs)
         let reason: AgentRunWaitScopeCompletion.Reason = switch result {
         case "timed_out": .timedOut
+        case "startup_pending": .startupPending
         case "expired": .expired
         case "superseded": .superseded
         case "cancelled", "interrupted_by_steering": .cancelled
@@ -1863,12 +1876,21 @@ struct AgentRunMCPToolService {
 
     private nonisolated func singleWaitScopeCompletion(from value: Value, sessionID: UUID) -> AgentRunWaitScopeCompletion {
         let status = value.objectValue?["status"]?.stringValue.flatMap(AgentRunMCPSnapshot.Status.init(rawValue:))
-        let reason: AgentRunWaitScopeCompletion.Reason = status == .expired ? .expired : .snapshotReady
+        let waitResult = Self.waitResult(from: value)
+        let reason: AgentRunWaitScopeCompletion.Reason = if waitResult == "startup_pending" {
+            .startupPending
+        } else if waitResult == "timed_out" {
+            .timedOut
+        } else if status == .expired {
+            .expired
+        } else {
+            .snapshotReady
+        }
         return AgentRunWaitScopeCompletion(
             reason: reason,
-            result: reason.rawValue,
-            winnerSessionID: status == .expired ? nil : sessionID,
-            pendingSessionIDs: [],
+            result: waitResult ?? reason.rawValue,
+            winnerSessionID: status == .expired || reason == .timedOut || reason == .startupPending ? nil : sessionID,
+            pendingSessionIDs: reason == .timedOut || reason == .startupPending ? [sessionID] : [],
             errorDescription: nil
         )
     }
@@ -1921,7 +1943,7 @@ struct AgentRunMCPToolService {
         object["wait"] = .object([
             "mode": .string("any"),
             "result": .string(result),
-            "winner_session_id": result == "timed_out" || result == "expired" || result == "superseded"
+            "winner_session_id": result == "timed_out" || result == "startup_pending" || result == "expired" || result == "superseded"
                 ? .null : .string(snapshot.sessionID.uuidString),
             "session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
             "waited_count": .int(sessionIDs.count),

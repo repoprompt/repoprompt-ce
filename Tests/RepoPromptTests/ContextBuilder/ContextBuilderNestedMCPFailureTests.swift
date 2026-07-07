@@ -27,6 +27,7 @@ import XCTest
                 )
                 let recorder = NestedContextBuilderExecutionTraceRecorder()
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                defer { MCPToolExecutionTracer.setTestSink(nil) }
 
                 do {
                     let outerEndpoint = try fixture.endpointA()
@@ -94,6 +95,7 @@ import XCTest
                 let manager = fixture.networkManager
                 let recorder = NestedContextBuilderExecutionTraceRecorder()
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                defer { MCPToolExecutionTracer.setTestSink(nil) }
                 await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
                 await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
                     await gate.enterAndWait()
@@ -317,28 +319,79 @@ import XCTest
         private static let synchronizationTimeout: Duration = .seconds(10)
 
         private var nestedConnectionID: UUID?
+        private var nestedConnectionWaiters: [UUID: CheckedContinuation<UUID, Error>] = [:]
+        private var failedNestedConnectionWaiters: [UUID: Error] = [:]
+        private var grantedNestedConnectionWaiterIDs: Set<UUID> = []
         private var failureCount = 0
 
         func recordNestedConnectionID(_ id: UUID) {
             nestedConnectionID = id
+            failedNestedConnectionWaiters.removeAll()
+            let waiters = nestedConnectionWaiters
+            nestedConnectionWaiters.removeAll()
+            grantedNestedConnectionWaiterIDs.formUnion(waiters.keys)
+            waiters.values.forEach { $0.resume(returning: id) }
         }
 
         func requireNestedConnectionID(
             timeout: Duration = synchronizationTimeout
         ) async throws -> UUID {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while nestedConnectionID == nil {
-                try Task.checkCancellation()
-                guard clock.now < deadline else {
-                    throw NestedContextBuilderFailureError.nestedConnectionDidNotRegister
+            if let nestedConnectionID { return nestedConnectionID }
+
+            let waiterID = UUID()
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(for: timeout)
+                    await self.failNestedConnectionWaiter(
+                        id: waiterID,
+                        error: NestedContextBuilderFailureError.nestedConnectionDidNotRegister
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    return
                 }
-                try await Task.sleep(for: .milliseconds(10))
             }
-            guard let nestedConnectionID else {
-                throw NestedContextBuilderFailureError.nestedConnectionDidNotRegister
+
+            do {
+                let id = try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        registerNestedConnectionWaiter(id: waiterID, continuation: continuation)
+                    }
+                } onCancel: {
+                    Task {
+                        await self.failNestedConnectionWaiter(id: waiterID, error: CancellationError())
+                    }
+                }
+                grantedNestedConnectionWaiterIDs.remove(waiterID)
+                try Task.checkCancellation()
+                timeoutTask.cancel()
+                return id
+            } catch {
+                timeoutTask.cancel()
+                throw error
             }
-            return nestedConnectionID
+        }
+
+        private func registerNestedConnectionWaiter(
+            id: UUID,
+            continuation: CheckedContinuation<UUID, Error>
+        ) {
+            if let nestedConnectionID {
+                continuation.resume(returning: nestedConnectionID)
+            } else if let error = failedNestedConnectionWaiters.removeValue(forKey: id) {
+                continuation.resume(throwing: error)
+            } else {
+                nestedConnectionWaiters[id] = continuation
+            }
+        }
+
+        private func failNestedConnectionWaiter(id: UUID, error: Error) async {
+            if let continuation = nestedConnectionWaiters.removeValue(forKey: id) {
+                continuation.resume(throwing: error)
+            } else if nestedConnectionID == nil, !grantedNestedConnectionWaiterIDs.contains(id) {
+                failedNestedConnectionWaiters[id] = error
+            }
         }
 
         func recordProviderFailure() {

@@ -3,16 +3,6 @@ import XCTest
 
 @MainActor
 final class WorkspaceCodemapUIPresentationTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for root in temporaryRoots {
-            try? FileManager.default.removeItem(at: root)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testCurrentMarkerRequiresRenderablePresentationIdentity() throws {
         let file = makeFileViewModel(name: "Marker.swift")
         let entry = try makePresentationEntry(file: file)
@@ -48,7 +38,7 @@ final class WorkspaceCodemapUIPresentationTests: XCTestCase {
             at: sourceURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try "struct NonGitPreviewType {}\n".write(to: sourceURL, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("NonGitPreviewType").write(to: sourceURL, atomically: true, encoding: .utf8)
 
         let store = WorkspaceFileContextStore()
         let root = try await store.loadRoot(path: rootURL.path)
@@ -98,7 +88,7 @@ final class WorkspaceCodemapUIPresentationTests: XCTestCase {
                 rootLifetimeID: UUID()
             ),
             logicalPath: logicalPath,
-            text: "struct RenderedPreview {}",
+            text: SwiftFixtureSource.emptyStruct("RenderedPreview", trailingNewline: false),
             tokenCount: 7
         )
     }
@@ -108,7 +98,9 @@ final class WorkspaceCodemapUIPresentationTests: XCTestCase {
             .appendingPathComponent("RepoPromptTests", isDirectory: true)
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        temporaryRoots.append(root)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
         return root
     }
 }

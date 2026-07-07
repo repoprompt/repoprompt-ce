@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-test dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-test dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 
@@ -18,6 +18,8 @@ help:
 	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
+	@printf '  %-30s %s\n' 'dev-test-impacted' 'Run impacted root tests; default includes branch, staged, and unstaged changes; override with RANGE=...'
+	@printf '  %-30s %s\n' 'dev-test-shard-plan' 'Print weighted full-root shard filters; override with SHARDS=N'
 	@printf '  %-30s %s\n' 'dev-test-list' 'List XCTest methods through conductor'
 	@printf '  %-30s %s\n' 'dev-provider-test' 'Run provider package tests; override with FILTER=name'
 	@printf '  %-30s %s\n' 'dev-provider-test-list' 'List provider package tests'
@@ -107,9 +109,7 @@ test:
 	swift test
 
 guardrails:
-	./Scripts/source_layout_guardrails.sh
-	./Scripts/contributor_allowlist_guardrails.sh
-	./Scripts/swiftpm_notice_guardrails.sh
+	./Scripts/guardrails.sh
 
 conductor-selftest:
 	python3 Scripts/test_debug_app_process.py
@@ -174,13 +174,19 @@ dev-run:
 	./conductor run
 
 dev-test:
-	./conductor test$(if $(FILTER), --filter $(FILTER))
+	./conductor test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
+
+dev-test-impacted:
+	@python3 Scripts/test_suite_optimizer.py impacted --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --range "$(if $(RANGE),$(RANGE),default)" --run$(if $(INCLUDE_HEAVY), --include-heavy)
+
+dev-test-shard-plan:
+	@python3 Scripts/test_suite_optimizer.py shard-plan --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --shards $(if $(SHARDS),$(SHARDS),4)$(if $(INCLUDE_HEAVY), --include-heavy)
 
 dev-test-list:
 	./conductor test --list
 
 dev-provider-test:
-	./conductor provider-test$(if $(FILTER), --filter $(FILTER))
+	./conductor provider-test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
 
 dev-provider-test-list:
 	./conductor provider-test --list

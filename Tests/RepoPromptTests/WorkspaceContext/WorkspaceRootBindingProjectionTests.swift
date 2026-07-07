@@ -429,7 +429,7 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
     func testMaterializerCommitsOwnershipWithoutCodemapDemandOrBuild() async throws {
         let logicalRootURL = try makeTemporaryRoot(name: "ProjectionCommitLogical")
         let physicalRootURL = try makeTemporaryRoot(name: "ProjectionCommitPhysical")
-        try write("struct CommitOnlyType {}\n", to: physicalRootURL.appendingPathComponent("Sources/App.swift"))
+        try write(SwiftFixtureSource.emptyStruct("CommitOnlyType"), to: physicalRootURL.appendingPathComponent("Sources/App.swift"))
         let store = WorkspaceFileContextStore()
         let loadedLogicalRoot = try await store.loadRoot(path: logicalRootURL.path)
         let logicalRoot = WorkspaceRootRef(
@@ -458,7 +458,7 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
     func testMaterializationStartsZeroCodemapTasks() async throws {
         let logicalRootURL = try makeTemporaryRoot(name: "ProjectionMaterializeLogical")
         let physicalRootURL = try makeTemporaryRoot(name: "ProjectionMaterializePhysical")
-        try write("struct MaterializedWithoutCodemapType {}\n", to: physicalRootURL.appendingPathComponent("Sources/App.swift"))
+        try write(SwiftFixtureSource.emptyStruct("MaterializedWithoutCodemapType"), to: physicalRootURL.appendingPathComponent("Sources/App.swift"))
         let store = WorkspaceFileContextStore()
         let loadedLogicalRoot = try await store.loadRoot(path: logicalRootURL.path)
         let logicalRoot = WorkspaceRootRef(

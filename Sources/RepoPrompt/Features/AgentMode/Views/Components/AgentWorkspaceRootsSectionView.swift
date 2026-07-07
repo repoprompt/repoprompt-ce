@@ -172,11 +172,11 @@ struct AgentWorkspaceRootsSectionView: View {
     }
 
     private var worktreeCapsuleLabelMaxWidth: CGFloat {
-        fontPreset.scaledClamped(118, min: 62, max: 154)
+        fontPreset.scaledClamped(170, min: 72, max: 220)
     }
 
     private var mergeCapsuleLabelMaxWidth: CGFloat {
-        fontPreset.scaledClamped(92, min: 44, max: 126)
+        fontPreset.scaledClamped(130, min: 56, max: 180)
     }
 
     private var roots: [AgentWorkspaceRootRow] {
@@ -304,6 +304,7 @@ struct AgentWorkspaceRootsSectionView: View {
                 Text(rootsStore.workspaceLabel)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                     .lineLimit(1)
+                    .truncationMode(.middle)
                 Image(systemName: "chevron.down")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 9))
             }
@@ -448,7 +449,7 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private var primaryBadge: some View {
         Text("PRIMARY")
-            .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
             .foregroundColor(.secondary)
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
@@ -479,6 +480,7 @@ struct AgentWorkspaceRootsSectionView: View {
 
             Spacer(minLength: 0)
         }
+        .padding(.leading, rootFolderIconWidth + rootRowSpacing)
     }
 
     private func rootActionsOverlay(_ row: AgentWorkspaceRootRow, hasMultipleRoots: Bool) -> some View {
@@ -646,14 +648,14 @@ struct AgentWorkspaceRootsSectionView: View {
         let glyph = worktree.isAvailable ? worktree.iconName : "exclamationmark.triangle.fill"
         return HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
             Image(systemName: glyph)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 7, weight: .semibold))
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
             if isCompact {
                 Text("WT")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                     .lineLimit(1)
             } else {
                 Text(worktree.capsuleText)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .fixedSize(horizontal: false, vertical: true)
@@ -664,11 +666,12 @@ struct AgentWorkspaceRootsSectionView: View {
         .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
         .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
         .background(
-            Capsule().fill(tint.opacity(worktree.isAvailable ? 0.14 : 0.12))
+            Capsule().fill(tint.opacity(worktree.isAvailable ? 0.18 : 0.12))
         )
         .overlay(
-            Capsule().strokeBorder(tint.opacity(worktree.isAvailable ? 0.5 : 0.7), lineWidth: 0.75)
+            Capsule().strokeBorder(tint.opacity(worktree.isAvailable ? 0.55 : 0.7), lineWidth: 0.75)
         )
+        .fixedSize(horizontal: true, vertical: true)
     }
 
     // MARK: - Merge Attention Capsule
@@ -689,17 +692,17 @@ struct AgentWorkspaceRootsSectionView: View {
         }
         return HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
             Image(systemName: glyph)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 7, weight: .semibold))
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
             Text("MERGE")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
             Text("→")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
             Text(attention.targetLabel)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(maxWidth: mergeCapsuleLabelMaxWidth, alignment: .leading)

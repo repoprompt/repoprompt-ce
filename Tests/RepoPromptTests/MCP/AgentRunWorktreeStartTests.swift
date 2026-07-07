@@ -867,20 +867,34 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             ],
             codemapAutoEnabled: false
         )
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let sourceIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: sourceTabID)
         var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: sourceTabID))
-        composeTab.selection = storedSelection
         composeTab.activeAgentSessionID = parentSessionID
         window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
-        // The fixture's asynchronous Git-data maintenance may publish one final canonical
-        // selection revision after workspace setup. Freeze only after that launch boundary has
-        // settled; production capture must continue to reject any later revision change.
-        try await Task.sleep(for: .seconds(2))
-        await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
+        _ = await window.selectionCoordinator.persistSelection(
+            storedSelection,
+            for: sourceIdentity,
+            source: .runtimeMutation,
+            mirrorToUIIfActive: false
+        )
+        // Wait for post-switch git-data root load to complete so any selection revision
+        // published by the async git-data load settles before we diverge the UI selection.
+        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
+        await window.selectionCoordinator.withApplyingSelectionMirror {
+            await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
+        }
         let divergentUISelection = window.workspaceFilesViewModel.snapshotSelection()
         XCTAssertTrue(divergentUISelection.selectedPaths.isEmpty)
         XCTAssertNotEqual(divergentUISelection, storedSelection)
+        _ = await window.selectionCoordinator.persistSelection(
+            storedSelection,
+            for: sourceIdentity,
+            source: .runtimeMutation,
+            mirrorToUIIfActive: false
+        )
+        XCTAssertEqual(window.workspaceManager.composeTab(for: sourceIdentity)?.selection, storedSelection)
 
-        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let launchSnapshot = AgentRunOracleReviewLaunchSnapshot(
             route: .explicitTabContext,
             windowID: window.windowID,
@@ -986,6 +1000,92 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let pollSessionObject = try XCTUnwrap(pollObject["session"]?.objectValue)
         XCTAssertEqual(pollSessionObject["parent_session_id"]?.stringValue, parentID.uuidString)
         XCTAssertNil(pollObject["worktree_bindings"])
+    }
+
+    func testAgentRunStartInheritsRoutedWorktreeFromUIParentWithoutMCPControlContext() async throws {
+        let root = try makeTemporaryDirectory(named: "ui-routed-root")
+        let worktree = try makeTemporaryDirectory(named: "ui-routed-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentID = UUID()
+        let parentBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        let source = viewModel.session(for: sourceTabID)
+        source.testInstallPersistentSessionBinding(sessionID: parentID)
+        source.hasLoadedPersistedState = true
+        source.worktreeBindings = [parentBinding]
+        source.mcpControlContext = nil
+        source.isMCPOriginated = false
+
+        let service = makeAgentRunStartService(window: window, sourceTabID: sourceTabID)
+        let value = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("inherit routed UI worktree"),
+            "detach": .bool(true),
+            "timeout": .int(0)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        let sessionObject = try XCTUnwrap(object["session"]?.objectValue)
+        let childSessionID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(object["session_id"]?.stringValue))
+        )
+        let childTabID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(sessionObject["context_id"]?.stringValue))
+        )
+        XCTAssertEqual(sessionObject["parent_session_id"]?.stringValue, parentID.uuidString)
+        let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue)
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(bindings.first?.objectValue?["worktree_root_path"]?.stringValue, worktree.path)
+
+        let child = viewModel.session(for: childTabID)
+        XCTAssertEqual(child.activeAgentSessionID, childSessionID)
+        XCTAssertEqual(child.parentSessionID, parentID)
+        XCTAssertEqual(child.worktreeBindings, [parentBinding])
+        XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), worktree.path)
+    }
+
+    func testAgentRunStartInheritsRoutedWorktreeFromFormerMCPParentWithoutControlContext() async throws {
+        let root = try makeTemporaryDirectory(named: "former-mcp-routed-root")
+        let worktree = try makeTemporaryDirectory(named: "former-mcp-routed-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentID = UUID()
+        let parentBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        let source = viewModel.session(for: sourceTabID)
+        source.testInstallPersistentSessionBinding(sessionID: parentID)
+        source.hasLoadedPersistedState = true
+        source.worktreeBindings = [parentBinding]
+        source.mcpControlContext = nil
+        source.isMCPOriginated = true
+
+        let service = makeAgentRunStartService(window: window, sourceTabID: sourceTabID)
+        let value = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("inherit former MCP-routed worktree"),
+            "detach": .bool(true),
+            "timeout": .int(0)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        let sessionObject = try XCTUnwrap(object["session"]?.objectValue)
+        let childSessionID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(object["session_id"]?.stringValue))
+        )
+        let childTabID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(sessionObject["context_id"]?.stringValue))
+        )
+        XCTAssertEqual(sessionObject["parent_session_id"]?.stringValue, parentID.uuidString)
+        let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue)
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(bindings.first?.objectValue?["worktree_root_path"]?.stringValue, worktree.path)
+
+        let child = viewModel.session(for: childTabID)
+        XCTAssertEqual(child.activeAgentSessionID, childSessionID)
+        XCTAssertEqual(child.parentSessionID, parentID)
+        XCTAssertEqual(child.worktreeBindings, [parentBinding])
+        XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), worktree.path)
     }
 
     func testAgentRunAndExploreStartPreserveInheritanceOptOutAndTopLevelBehavior() async throws {
@@ -1758,7 +1858,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let validSecondaryRoot = try makeTemporaryDirectory(named: "transition-valid-secondary-root")
         let missingSecondaryWorktree = missingSecondaryRoot.appendingPathComponent("missing-worktree")
         let validSecondaryWorktree = try makeTemporaryDirectory(named: "transition-valid-secondary-worktree")
-        try "struct SecondaryWorktreeType {}\n".write(
+        try SwiftFixtureSource.emptyStruct("SecondaryWorktreeType").write(
             to: validSecondaryWorktree.appendingPathComponent("Secondary.swift"),
             atomically: true,
             encoding: .utf8
@@ -3260,20 +3360,27 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 guard trackedSession != nil else {
                     throw FixtureError.trackedSessionMissing
                 }
-                let deadline = ContinuousClock.now + .seconds(5)
-                while ContinuousClock.now < deadline {
-                    observeFirstAgentTaskIfNeeded()
-                    if FileManager.default.fileExists(atPath: socketURL.path) {
-                        let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
+                do {
+                    try await AsyncTestWait.waitUntilThrowing(
+                        "acceptedSubmitAndAwaitOwnedSocket",
+                        timeout: 5.0,
+                        initialDelayNanoseconds: 10_000_000,
+                        maximumDelayNanoseconds: 100_000_000
+                    ) {
+                        self.observeFirstAgentTaskIfNeeded()
+                        guard FileManager.default.fileExists(atPath: self.socketURL.path) else {
+                            return false
+                        }
+                        let attributes = try FileManager.default.attributesOfItem(atPath: self.socketURL.path)
                         guard attributes[.type] as? FileAttributeType == .typeSocket else {
                             throw FixtureError.ownedPathWasNotSocket
                         }
-                        ownedSocketObserved = true
-                        return
+                        return true
                     }
-                    try await Task.sleep(for: .milliseconds(10))
+                    ownedSocketObserved = true
+                } catch is AsyncTestConditionTimeout {
+                    throw FixtureError.ownedSocketDidNotAppear
                 }
-                throw FixtureError.ownedSocketDidNotAppear
             }
 
             func cleanup(window: WindowState) async throws {

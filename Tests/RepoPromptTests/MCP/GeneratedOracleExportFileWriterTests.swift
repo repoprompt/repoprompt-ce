@@ -3,8 +3,6 @@ import MCP
 import XCTest
 
 final class GeneratedOracleExportFileWriterTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
     func testOracleExportInstructionQuotesExactAbsolutePathLiteral() throws {
         let path = "/tmp/repo root/prompt-exports/oracle `plan`.md"
         let literal = try XCTUnwrap(String(data: JSONEncoder().encode(path), encoding: .utf8))
@@ -13,14 +11,6 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         XCTAssertTrue(instruction.contains("`read_file`"), instruction)
         XCTAssertTrue(instruction.contains("{\"path\": \(literal)}"), instruction)
         XCTAssertTrue(instruction.contains("exact absolute `path` value verbatim"), instruction)
-    }
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
     }
 
     func testGeneratedExportWriterReturnsPathImmediatelyReadableByReadFileSemantics() async throws {
@@ -226,7 +216,9 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptCE-\(name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: url)
+        }
         return url
     }
 

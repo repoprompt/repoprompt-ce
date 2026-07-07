@@ -96,11 +96,17 @@ enum AgentOraclePillLogic {
         in sessions: [ChatSession],
         streamingSessionIDs: Set<UUID>
     ) -> ChatSession? {
-        let streaming = sessions.filter { streamingSessionIDs.contains($0.id) }
-        if let latestStreaming = streaming.max(by: { $0.savedAt < $1.savedAt }) {
-            return latestStreaming
-        }
-        return sessions.max(by: { $0.savedAt < $1.savedAt })
+        latestStreamingSession(in: sessions, streamingSessionIDs: streamingSessionIDs)
+            ?? sessions.max(by: { $0.savedAt < $1.savedAt })
+    }
+
+    static func latestStreamingSession(
+        in sessions: [ChatSession],
+        streamingSessionIDs: Set<UUID>
+    ) -> ChatSession? {
+        sessions
+            .filter { streamingSessionIDs.contains($0.id) }
+            .max(by: { $0.savedAt < $1.savedAt })
     }
 
     static func selectedSessionID(
@@ -270,12 +276,20 @@ struct AgentOraclePill: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAgentOraclePopover)) { note in
-            guard let route = AgentOraclePopoverRoute(notificationUserInfo: note.userInfo),
+            if let route = AgentOraclePopoverRoute(notificationUserInfo: note.userInfo) {
+                guard route.windowID == windowID,
+                      route.tabID == currentTabID,
+                      route.workspaceID == oracleViewModel.workspaceManager.activeWorkspaceID
+                else { return }
+                openPopover(chatID: route.chatID, workspaceID: route.workspaceID)
+                return
+            }
+            guard let route = AgentOracleLatestPopoverRoute(notificationUserInfo: note.userInfo),
                   route.windowID == windowID,
                   route.tabID == currentTabID,
                   route.workspaceID == oracleViewModel.workspaceManager.activeWorkspaceID
             else { return }
-            openPopover(chatID: route.chatID, workspaceID: route.workspaceID)
+            openLatestStreamingPopover()
         }
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             oraclePopoverContent
@@ -359,6 +373,17 @@ struct AgentOraclePill: View {
             return
         }
         presentedSessionID = resolvedID
+    }
+
+    private func openLatestStreamingPopover() {
+        guard let target = AgentOraclePillLogic.latestStreamingSession(
+            in: eligibleTabSessions,
+            streamingSessionIDs: oracleViewModel.streamingSessions
+        ) else { return }
+        openRequestGeneration &+= 1
+        presentedSessionID = target.id
+        presentedSessionSource = .latest
+        showPopover = true
     }
 
     private func openPopover(chatID: String?, workspaceID: UUID? = nil) {

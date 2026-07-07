@@ -89,7 +89,7 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
         let lifetimeID = uuid("10000000-0000-0000-0000-000000000002")
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Sources/Target.swift": "struct Target {}"],
+            files: ["Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)],
             rootID: rootID,
             rootLifetimeID: lifetimeID
         )
@@ -165,7 +165,7 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
     func testEdgeStoreRejectsEveryForeignGraphKeyComponentAndConsumesBudget() async throws {
         let baseRoot = uuid("30000000-0000-0000-0000-000000000001")
         let baseLifetime = uuid("30000000-0000-0000-0000-000000000002")
-        let files = ["Target.swift": "struct Target {}"]
+        let files = ["Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         let baseAuthority = try await makeAuthority(
             name: "\(#function)-base",
             files: files,
@@ -288,9 +288,9 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
         let authority = try await makeAuthority(
             name: #function,
             files: [
-                "Z.swift": "struct Z {}",
-                "A2.swift": "struct A2 {}",
-                "A1.swift": "struct A1 {}"
+                "Z.swift": SwiftFixtureSource.emptyStruct("Z", trailingNewline: false),
+                "A2.swift": SwiftFixtureSource.emptyStruct("A2", trailingNewline: false),
+                "A1.swift": SwiftFixtureSource.emptyStruct("A1", trailingNewline: false)
             ],
             rootID: uuid("50000000-0000-0000-0000-000000000001"),
             rootLifetimeID: uuid("50000000-0000-0000-0000-000000000002")
@@ -415,7 +415,7 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
     func testContributionAcceptanceRequiresResolvedCurrentSlice1AAuthority() async throws {
         let rootID = uuid("60000000-0000-0000-0000-000000000001")
         let lifetimeID = uuid("60000000-0000-0000-0000-000000000002")
-        let files = ["Target.swift": "struct Target {}"]
+        let files = ["Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         let baseAuthority = try await makeAuthority(
             name: "\(#function)-base",
             files: files,
@@ -523,8 +523,8 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
         let authority = try await makeAuthority(
             name: #function,
             files: [
-                "Source.swift": "struct Source {}",
-                "Target.swift": "struct Target {}"
+                "Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false),
+                "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)
             ],
             rootID: uuid("70000000-0000-0000-0000-000000000001"),
             rootLifetimeID: uuid("70000000-0000-0000-0000-000000000002")
@@ -730,7 +730,7 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
 
         let foreignAuthority = try await makeAuthority(
             name: "\(#function)-foreign",
-            files: ["Foreign.swift": "struct Foreign {}"]
+            files: ["Foreign.swift": SwiftFixtureSource.emptyStruct("Foreign", trailingNewline: false)]
         )
         defer { foreignAuthority.repositoryFixture.cleanup() }
         let foreignBinding = try await makeResolvedBinding(
@@ -781,8 +781,8 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
         let authority = try await makeAuthority(
             name: #function,
             files: [
-                "Target.swift": "struct Target {}",
-                "Other.swift": "struct Other {}"
+                "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false),
+                "Other.swift": SwiftFixtureSource.emptyStruct("Other", trailingNewline: false)
             ],
             rootID: uuid("80000000-0000-0000-0000-000000000001"),
             rootLifetimeID: uuid("80000000-0000-0000-0000-000000000002")

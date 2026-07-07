@@ -129,6 +129,56 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertEqual(fixture.oracleViewModel.messagesSnapshot(for: exact.id).count, 1)
     }
 
+    func testLatestStreamingSessionDoesNotFallbackToStaleCompletedSession() {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let olderStreaming = ChatSession(
+            workspaceID: workspaceID,
+            composeTabID: tabID,
+            name: "Older Streaming",
+            savedAt: Date(timeIntervalSince1970: 100)
+        )
+        let staleCompleted = ChatSession(
+            workspaceID: workspaceID,
+            composeTabID: tabID,
+            name: "Stale Completed",
+            savedAt: Date(timeIntervalSince1970: 300)
+        )
+        let newerStreaming = ChatSession(
+            workspaceID: workspaceID,
+            composeTabID: tabID,
+            name: "Newer Streaming",
+            savedAt: Date(timeIntervalSince1970: 200)
+        )
+        let sessions = [olderStreaming, staleCompleted, newerStreaming]
+
+        XCTAssertEqual(
+            AgentOraclePillLogic.latestSession(
+                in: sessions,
+                streamingSessionIDs: [olderStreaming.id, newerStreaming.id]
+            )?.id,
+            newerStreaming.id
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.latestStreamingSession(
+                in: sessions,
+                streamingSessionIDs: [olderStreaming.id, newerStreaming.id]
+            )?.id,
+            newerStreaming.id
+        )
+        XCTAssertNil(AgentOraclePillLogic.latestStreamingSession(
+            in: sessions,
+            streamingSessionIDs: []
+        ))
+        XCTAssertEqual(
+            AgentOraclePillLogic.latestSession(
+                in: sessions,
+                streamingSessionIDs: []
+            )?.id,
+            staleCompleted.id
+        )
+    }
+
     func testExactPersistedResolutionHydratesAndRegistersUUIDAndShortID() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }

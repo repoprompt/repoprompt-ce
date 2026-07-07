@@ -428,7 +428,50 @@ import XCTest
             await materializer.release(sessionID: fixture.agentSessionID)
         }
 
-        func testCheckoutCompletionWithChangedAuthorityFullCrawlsOnceBeforeUnblockingRead() async throws {
+        func testIndexOnlyAuthorityInvalidationAdoptsFenceWithoutCrawlBeforeUnblockingRead() async throws {
+            let fixture = try PendingSeededRootFixture()
+            defer { fixture.cleanup() }
+            let prepared = try await fixture.prepareWorktree()
+            let store = WorkspaceFileContextStore()
+            let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+            let preparation = try await materializer.prepare(
+                sessionID: fixture.agentSessionID,
+                bindings: [prepared.binding],
+                startupContext: fixture.startupContext(serving: true),
+                initializationHintsByBindingID: [prepared.binding.id: prepared.hint]
+            )
+            let projectionValue = try await materializer.commit(preparation)
+            let projection = try XCTUnwrap(projectionValue)
+            let root = try XCTUnwrap(projection.physicalRootRefs.first)
+            let authority = GitWorkspaceStateAuthority.shared
+            let key = GitWorkspaceAuthorityRepositoryKey(layout: prepared.hint.creationReceipt.targetLayout)
+            let mutation = await authority.beginMutation(repositoryKey: key, kind: .branchSwitch)
+            await store.waitForPublishedSeededAuthorityMutationDepthForTesting(rootID: root.id, atLeast: 1)
+            let worktreeURL = URL(fileURLWithPath: prepared.binding.worktreeRootPath, isDirectory: true)
+            try "let stagedOnly = true\n".write(
+                to: worktreeURL.appendingPathComponent("StagedOnly.swift"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try fixture.git(["add", "StagedOnly.swift"], at: worktreeURL)
+            let read = Task { try await store.readContent(rootID: root.id, relativePath: "Tracked.swift") }
+            await store.waitForPublishedSeededAuthorityWaiterForTesting(rootID: root.id)
+
+            await authority.finishMutation(mutation, outcome: .succeeded)
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: root.id)
+            let readValue = try await read.value
+            XCTAssertEqual(readValue, "let value = 1\n")
+            let currentValue = await store.publishedSeededAuthoritySnapshotForTesting(rootID: root.id)
+            let current = try XCTUnwrap(currentValue)
+            XCTAssertFalse(current.isBlocked)
+            XCTAssertEqual(current.fullCrawlCount, 0)
+            let diagnostics = await store.readSearchRootDiagnosticsSnapshot()
+            let target = try XCTUnwrap(diagnostics.first { $0.rootID == root.id })
+            XCTAssertEqual(target.crawlCount, 0)
+            await materializer.release(sessionID: fixture.agentSessionID)
+        }
+
+        func testCheckoutCompletionWithChangedAuthorityUsesTargetedReconcileBeforeUnblockingRead() async throws {
             let fixture = try PendingSeededRootFixture()
             defer { fixture.cleanup() }
             let prepared = try await fixture.prepareWorktree()
@@ -465,7 +508,10 @@ import XCTest
             let currentValue = await store.publishedSeededAuthoritySnapshotForTesting(rootID: root.id)
             let current = try XCTUnwrap(currentValue)
             XCTAssertFalse(current.isBlocked)
-            XCTAssertEqual(current.fullCrawlCount, 1)
+            XCTAssertEqual(current.fullCrawlCount, 0)
+            let diagnostics = await store.readSearchRootDiagnosticsSnapshot()
+            let target = try XCTUnwrap(diagnostics.first { $0.rootID == root.id })
+            XCTAssertEqual(target.crawlCount, 0)
             await materializer.release(sessionID: fixture.agentSessionID)
         }
 

@@ -64,6 +64,7 @@ enum FileSystemDeltaPublicationSource: String {
     case watcherBarrierNoop
     case overflowRootRescan
     case recoveryFullResync
+    case authorityTargetedReconcile
 }
 
 enum FileSystemEditModificationPublicationPolicy: Equatable {

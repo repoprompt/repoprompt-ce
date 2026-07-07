@@ -778,16 +778,40 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
         XCTAssertEqual(observedCount, recordCount)
     }
 
-    func testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes() async throws {
+    func testSyntheticEntriesRemainWithinConfiguredBatchBytes() async throws {
+        try await exerciseSyntheticEntriesRemainWithinConfiguredBatchBytes(
+            configuredCount: 2000,
+            batchRecords: 16,
+            openRuns: 4
+        )
+    }
+
+    func testSyntheticHundredThousandEntriesWhenEnabled() async throws {
+        let configuredCount = ProcessInfo.processInfo.environment["REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT"]
+            .flatMap(Int.init)
+        if configuredCount == nil {
+            try TestScaleGate.requireEnabled("Run the 100K namespace manifest scale contract")
+        }
+        let count = configuredCount ?? 100_000
+        XCTAssertGreaterThanOrEqual(count, 100_000)
+        try await exerciseSyntheticEntriesRemainWithinConfiguredBatchBytes(
+            configuredCount: count,
+            batchRecords: 256,
+            openRuns: 8
+        )
+    }
+
+    private func exerciseSyntheticEntriesRemainWithinConfiguredBatchBytes(
+        configuredCount: Int,
+        batchRecords: Int,
+        openRuns: Int
+    ) async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-scale-root")
         let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-scale-store")
         let store = try WorkspaceRootNamespaceManifestStore(
             directoryURL: storeRoot.appendingPathComponent("manifests", isDirectory: true)
         )
-        let configuredCount = ProcessInfo.processInfo.environment["REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT"]
-            .flatMap(Int.init) ?? 100_000
-        XCTAssertGreaterThanOrEqual(configuredCount, 100_000)
-        let resourcePolicy = policy(bufferBytes: 16 * 1024, batchRecords: 256, openRuns: 8)
+        let resourcePolicy = policy(bufferBytes: 16 * 1024, batchRecords: batchRecords, openRuns: openRuns)
         let writer = try store.makeWriter(identity: identity(root), resourcePolicy: resourcePolicy)
 
         var batch: [WorkspaceRootNamespaceRecord] = []

@@ -214,29 +214,32 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
         let fixture = try GitMergeFixture()
         defer { fixture.cleanup() }
         let git = GitService()
-        let gate = AsyncGate()
-        let order = LockOrder()
+        let firstEntered = AsyncGate()
+        let releaseFirst = AsyncGate()
+        let order = AsyncTestCondition<[String]>([])
 
         let first = Task {
             try await git.withWorktreeMergeAdvisoryLock(at: fixture.source) {
-                await order.append("first-enter")
-                await gate.open()
-                try await Task.sleep(nanoseconds: 250_000_000)
-                await order.append("first-exit")
+                order.update { $0.append("first-enter") }
+                await firstEntered.open()
+                await releaseFirst.wait()
+                order.update { $0.append("first-exit") }
             }
         }
-        await gate.wait()
+        await firstEntered.wait()
         let second = Task {
             try await git.withWorktreeMergeAdvisoryLock(at: fixture.repo) {
-                await order.append("second-enter")
+                order.update { $0.append("second-enter") }
             }
         }
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let beforeRelease = await order.snapshot()
+        await Task.yield()
+        let beforeRelease = order.snapshot()
         XCTAssertEqual(beforeRelease, ["first-enter"])
+        await releaseFirst.open()
         try await first.value
+        try await order.waitUntil("second lock entry after first release") { $0.contains("second-enter") }
         try await second.value
-        let afterRelease = await order.snapshot()
+        let afterRelease = order.snapshot()
         XCTAssertEqual(afterRelease, ["first-enter", "first-exit", "second-enter"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.repo.appendingPathComponent(".git/repoprompt-mutex/worktree.lock").path))
     }
@@ -315,14 +318,14 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
         }
 
         let git = GitService()
-        let order = LockOrder()
+        let order = AsyncTestCondition<[String]>([])
         let waiter = Task {
             try await git.withWorktreeMergeAdvisoryLock(at: fixture.source) {
-                await order.append("swift-enter")
+                order.update { $0.append("swift-enter") }
             }
         }
-        try await Task.sleep(for: .milliseconds(200))
-        let beforeRelease = await order.snapshot()
+        await Task.yield()
+        let beforeRelease = order.snapshot()
         XCTAssertEqual(beforeRelease, [], "Swift lock entered while another process held the common Git dir lock")
 
         try "release\n".write(to: URL(fileURLWithPath: releasePath), atomically: true, encoding: .utf8)
@@ -349,45 +352,24 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
         let holderOutput = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         XCTAssertEqual(holder.terminationStatus, 0, holderOutput)
 
-        let waiterCompleted = try await withThrowingTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                try await waiter.value
-                return true
-            }
-            group.addTask {
-                try await Task.sleep(for: .seconds(10))
-                return false
-            }
-            let completed = try await group.next() ?? false
-            group.cancelAll()
-            return completed
-        }
-        guard waiterCompleted else {
+        do {
+            try await order.waitUntil("Swift lock waiter entry after holder release", timeout: 3) { $0 == ["swift-enter"] }
+            try await waiter.value
+        } catch {
             waiter.cancel()
-            await XCTFail("""
+            XCTFail("""
             Swift lock waiter did not enter after holder released the cross-process flock.
             lock_path: \(lockPath)
             holder_output:
             \(holderOutput)
             observed_order_before_release: \(beforeRelease)
             observed_order_after_timeout: \(order.snapshot())
+            error: \(error)
             """)
             return
         }
-        let afterRelease = await order.snapshot()
+        let afterRelease = order.snapshot()
         XCTAssertEqual(afterRelease, ["swift-enter"], holderOutput)
-    }
-}
-
-private actor LockOrder {
-    private var values: [String] = []
-
-    func append(_ value: String) {
-        values.append(value)
-    }
-
-    func snapshot() -> [String] {
-        values
     }
 }
 

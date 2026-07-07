@@ -83,7 +83,22 @@ final class WorkspaceRootTargetSeedPlanManifestTests: XCTestCase {
         XCTAssertTrue(store.activeArtifactURLs.isEmpty)
     }
 
-    func testManifestScaleStreamsOneHundredThousandByDefaultAndOneMillionOptIn() async throws {
+    func testManifestScaleStreamsAreBounded() async throws {
+        try await exerciseManifestScale(count: 10000, maximumOpenRuns: 4)
+    }
+
+    func testManifestScaleStreamsOneHundredThousandOrMillionWhenEnabled() async throws {
+        let count: Int
+        if ProcessInfo.processInfo.environment["RPCE_RUN_MILLION_ENTRY_TESTS"] == "1" {
+            count = 1_000_000
+        } else {
+            try TestScaleGate.requireEnabled("Run the 100K target seed plan manifest scale contract")
+            count = 100_000
+        }
+        try await exerciseManifestScale(count: count, maximumOpenRuns: 8)
+    }
+
+    private func exerciseManifestScale(count: Int, maximumOpenRuns: Int) async throws {
         let root = try roots.makeRoot(suiteName: "TargetSeedPlanManifest-scale-root")
         let storeRoot = try roots.makeRoot(suiteName: "TargetSeedPlanManifest-scale-store")
         let store = try WorkspaceRootTargetSeedPlanManifestStore(
@@ -95,13 +110,10 @@ final class WorkspaceRootTargetSeedPlanManifestTests: XCTestCase {
                 maximumBufferedRecordBytes: 1024 * 1024,
                 maximumRecordsPerBatch: 2048,
                 maximumRecordByteCount: 1024,
-                maximumOpenRuns: 8,
+                maximumOpenRuns: maximumOpenRuns,
                 minimumFreeDiskBytes: 0
             )
         )
-        let count = ProcessInfo.processInfo.environment["RPCE_RUN_MILLION_ENTRY_TESTS"] == "1"
-            ? 1_000_000
-            : 100_000
         var batch: [WorkspaceRootTargetSeedPlanRecord] = []
         batch.reserveCapacity(512)
         for value in 0 ..< count {
@@ -130,6 +142,8 @@ final class WorkspaceRootTargetSeedPlanManifestTests: XCTestCase {
         XCTAssertEqual(readCount, count)
         XCTAssertEqual(reader.validationState, .verified)
         XCTAssertEqual(lease.footer.overlayFileCount, UInt64(count))
+        XCTAssertGreaterThan(lease.statistics.initialRunCount, maximumOpenRuns)
+        XCTAssertGreaterThan(lease.statistics.mergePassCount, 0)
         XCTAssertLessThanOrEqual(lease.statistics.peakBufferedRecordBytes, 1024 * 1024)
 
         let seededInventory = try FileSystemSeededInventoryManifest(validating: lease)

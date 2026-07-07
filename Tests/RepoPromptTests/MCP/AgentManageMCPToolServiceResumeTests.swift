@@ -39,7 +39,7 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: initialContext.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: initialContext.registration)
 
         let service = makeService(window: window, connectionID: resumedConnectionID)
         _ = try await service.execute(args: [
@@ -76,7 +76,7 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: initialContext.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: initialContext.registration)
         let cancelled = makeSnapshot(sessionID: sessionID, status: .cancelled)
         await AgentRunSessionStore.signalSnapshot(cancelled, cursor: steeredCursor)
         let terminalDisposition = await steeredWait.value
@@ -128,20 +128,6 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in }
         )
-    }
-
-    private func waitForWaiter(
-        registration: AgentRunSessionStore.Registration,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) async throws {
-        for _ in 0 ..< 300 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        XCTFail("Timed out waiting for store waiter", file: file, line: line)
     }
 
     private func makeSnapshot(

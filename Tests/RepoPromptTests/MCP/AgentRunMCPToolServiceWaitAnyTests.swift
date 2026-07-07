@@ -26,7 +26,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeRunningSnapshot(sessionID: sessionID),
@@ -46,7 +46,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let terminal = makeSnapshot(sessionID: sessionID, status: .completed)
         _ = await AgentRunSessionStore.publishTerminal(
             .init(epoch: epoch, snapshot: terminal),
@@ -78,14 +78,14 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeRunningSnapshot(sessionID: sessionID),
             cursor: cursor,
             reason: .instructionDelivered
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let terminal = makeSnapshot(sessionID: sessionID, status: .completed)
         _ = await AgentRunSessionStore.publishTerminal(
             .init(epoch: epoch, snapshot: terminal),
@@ -124,8 +124,8 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: firstRegistration)
-        try await waitForWaiter(registration: secondRegistration)
+        try await waitForAgentRunSessionStoreWaiter(registration: firstRegistration)
+        try await waitForAgentRunSessionStoreWaiter(registration: secondRegistration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeRunningSnapshot(sessionID: secondID),
@@ -158,7 +158,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let steering = try await beginEpoch(
             registration: registration,
@@ -166,14 +166,14 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
             expected: first,
             kind: .steering
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let related = try await beginEpoch(
             registration: registration,
             activationID: activationID,
             expected: steering,
             kind: .relatedFollowUp
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         _ = await AgentRunSessionStore.beginEpoch(
             registration: registration,
             activationID: activationID,
@@ -203,14 +203,14 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 0.1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let second = try await beginEpoch(
             registration: registration,
             activationID: activationID,
             expected: first,
             kind: .steering
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         _ = try await beginEpoch(
             registration: registration,
             activationID: activationID,
@@ -378,16 +378,6 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
             throw TestFailure.missingEpoch
         }
         return epoch
-    }
-
-    private func waitForWaiter(registration: AgentRunSessionStore.Registration) async throws {
-        for _ in 0 ..< 200 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            await Task.yield()
-        }
-        XCTFail("Timed out waiting for waiter")
     }
 
     private func makeRunningSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {

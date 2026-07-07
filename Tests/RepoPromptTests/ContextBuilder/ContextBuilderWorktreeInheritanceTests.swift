@@ -25,12 +25,8 @@ import XCTest
                     let logicalRoot = fixture.contextA.rootURL
                     let logicalFile = fixture.contextA.fileURL
                     let gitFixture = try ReviewGitRepositoryFixture(name: "ContextBuilderPublishedWorktree")
-                    _ = try gitFixture.runGit(["init"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["add", "."], at: logicalRoot)
-                    _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: logicalRoot)
+                    defer { gitFixture.cleanup() }
+                    try initializeGitRepository(at: logicalRoot, using: gitFixture)
                     await markGitDirectoryObserved(fixture.contextA)
                     let worktreeRoot = try gitFixture.makeLinkedWorktree(
                         from: logicalRoot,
@@ -51,7 +47,7 @@ import XCTest
                         to: worktreeFile
                     )
                     try write(
-                        "struct BranchOnlyContextBuilderType {}\n",
+                        SwiftFixtureSource.emptyStruct("BranchOnlyContextBuilderType"),
                         to: worktreeRoot.appendingPathComponent("Sources/BranchOnly.swift")
                     )
 
@@ -218,10 +214,12 @@ import XCTest
                             )
                         }
 
+                    let runCodemapE2E = CodemapE2ETestGate.isEnabled
                     factory.configure(
                         networkManager: fixture.networkManager,
                         logicalFilePath: logicalFile.path,
-                        searchPattern: worktreeSentinel
+                        searchPattern: worktreeSentinel,
+                        probeCodeStructure: runCodemapE2E
                     )
 
                     fixture.contextA.window.mcpServer.setContextBuilderSelectionReplyObserverForTesting {
@@ -357,13 +355,17 @@ import XCTest
                         XCTAssertTrue(run.tree.contains("BranchOnly.swift"), run.tree)
                         XCTAssertTrue(run.read.contains(worktreeSentinel), run.read)
                         XCTAssertTrue(run.search.contains(worktreeSentinel), run.search)
-                        if run.codeStructure.contains("- **Status**: `pending`") {
-                            XCTAssertTrue(run.codeStructure.contains("`artifact_pending`"), run.codeStructure)
-                            assertLogicalPath(logicalRelativeFilePath, in: run.codeStructure)
-                            XCTAssertFalse(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                        if runCodemapE2E {
+                            if run.codeStructure.contains("- **Status**: `pending`") {
+                                XCTAssertTrue(run.codeStructure.contains("`artifact_pending`"), run.codeStructure)
+                                assertLogicalPath(logicalRelativeFilePath, in: run.codeStructure)
+                                XCTAssertFalse(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                            } else {
+                                XCTAssertFalse(run.codeStructure.contains("Without codemap"), run.codeStructure)
+                                XCTAssertTrue(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                            }
                         } else {
-                            XCTAssertFalse(run.codeStructure.contains("Without codemap"), run.codeStructure)
-                            XCTAssertTrue(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                            XCTAssertTrue(run.codeStructure.isEmpty, run.codeStructure)
                         }
                         XCTAssertTrue(run.selection.contains(logicalFile.lastPathComponent), run.selection)
                         XCTAssertTrue(run.workspaceContext.contains(logicalFile.lastPathComponent), run.workspaceContext)
@@ -508,12 +510,7 @@ import XCTest
                     let logicalRoot = fixture.contextA.rootURL
                     let gitFixture = try ReviewGitRepositoryFixture(name: "ContextBuilderDeferredAgentRoute")
                     defer { gitFixture.cleanup() }
-                    _ = try gitFixture.runGit(["init"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: logicalRoot)
-                    _ = try gitFixture.runGit(["add", "."], at: logicalRoot)
-                    _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: logicalRoot)
+                    try initializeGitRepository(at: logicalRoot, using: gitFixture)
                     await markGitDirectoryObserved(fixture.contextA)
                     let worktreeRoot = try gitFixture.makeLinkedWorktree(
                         from: logicalRoot,
@@ -522,7 +519,7 @@ import XCTest
                     )
                     let logicalBranchOnly = logicalRoot.appendingPathComponent("Sources/DeferredOnly.swift")
                     let worktreeBranchOnly = worktreeRoot.appendingPathComponent("Sources/DeferredOnly.swift")
-                    try write("struct DeferredOnlyAgentRoute {}\n", to: worktreeBranchOnly)
+                    try write(SwiftFixtureSource.emptyStruct("DeferredOnlyAgentRoute"), to: worktreeBranchOnly)
                     XCTAssertFalse(FileManager.default.fileExists(atPath: logicalBranchOnly.path))
 
                     let selectionIdentity = WorkspaceSelectionIdentity(
@@ -903,12 +900,11 @@ import XCTest
                     // would reproduce the wrong-root publication this regression protects against.
                     let classicRoot = fixture.contextA.rootURL
                     let classicFile = fixture.contextA.fileURL
-                    _ = try gitFixture.runGit(["init"], at: classicRoot)
-                    _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: classicRoot)
-                    _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: classicRoot)
-                    _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: classicRoot)
-                    _ = try gitFixture.runGit(["add", "."], at: classicRoot)
-                    _ = try gitFixture.runGit(["commit", "-m", "Initial Classic commit"], at: classicRoot)
+                    try initializeGitRepository(
+                        at: classicRoot,
+                        using: gitFixture,
+                        message: "Initial Classic commit"
+                    )
                     await markGitDirectoryObserved(fixture.contextA)
                     let ceRoot = try gitFixture.makeRepository(
                         named: "selected-ce",
@@ -1099,12 +1095,7 @@ import XCTest
                     let service = try XCTUnwrap(loadedService)
                     await service.stopWatchingForChanges()
                     let gitFixture = try ReviewGitRepositoryFixture(name: "ContextBuilderCanonicalPublication")
-                    _ = try gitFixture.runGit(["init"], at: fixture.contextA.rootURL)
-                    _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: fixture.contextA.rootURL)
-                    _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: fixture.contextA.rootURL)
-                    _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: fixture.contextA.rootURL)
-                    _ = try gitFixture.runGit(["add", "."], at: fixture.contextA.rootURL)
-                    _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: fixture.contextA.rootURL)
+                    try initializeGitRepository(at: fixture.contextA.rootURL, using: gitFixture)
                     await markGitDirectoryObserved(fixture.contextA)
                     let relativePath = "Sources/\(fixture.contextA.fileURL.lastPathComponent)"
                     let runCodemapE2E = CodemapE2ETestGate.isEnabled
@@ -1321,39 +1312,25 @@ import XCTest
                     XCTAssertEqual(run.workspacePath, fixture.contextA.rootURL.standardizedFileURL.path)
                     XCTAssertTrue(run.read.contains(canonicalSentinel), run.read)
                     XCTAssertTrue(run.search.contains(canonicalSentinel), run.search)
-                    let codeStructure = run.codeStructure
-                    let codeStructureHasCanonicalPath = codeStructure.contains(relativePath)
-                        || (
-                            codeStructure.contains("- **Sources**")
-                                && codeStructure.contains("  - `\(fixture.contextA.fileURL.lastPathComponent)`")
-                        )
-                    XCTAssertTrue(codeStructureHasCanonicalPath, codeStructure)
-                    for leakageMarker in [
-                        "session-bound worktree",
-                        "WorktreeContextBuilderType",
-                        "BranchOnlyContextBuilderType",
-                        "worktreeOnly"
-                    ] {
-                        XCTAssertFalse(codeStructure.contains(leakageMarker), codeStructure)
-                    }
-                    let codeStructureNotReadyMarkers = [
-                        "**Status**: `pending`",
-                        "**Status**: `timeout`",
-                        "**Status**: `unavailable`",
-                        "artifact_pending",
-                        "artifact_unavailable",
-                        "codemap_busy",
-                        "readiness_timeout",
-                        "registration"
-                    ]
-                    let codeStructureLooksNotReady = codeStructureNotReadyMarkers.contains {
-                        codeStructure.range(of: $0, options: .caseInsensitive) != nil
-                    }
                     if runCodemapE2E {
+                        let codeStructure = run.codeStructure
+                        let codeStructureHasCanonicalPath = codeStructure.contains(relativePath)
+                            || (
+                                codeStructure.contains("- **Sources**")
+                                    && codeStructure.contains("  - `\(fixture.contextA.fileURL.lastPathComponent)`")
+                            )
+                        XCTAssertTrue(codeStructureHasCanonicalPath, codeStructure)
+                        for leakageMarker in [
+                            "session-bound worktree",
+                            "WorktreeContextBuilderType",
+                            "BranchOnlyContextBuilderType",
+                            "worktreeOnly"
+                        ] {
+                            XCTAssertFalse(codeStructure.contains(leakageMarker), codeStructure)
+                        }
                         XCTAssertTrue(codeStructure.contains(canonicalSentinel), codeStructure)
-                    } else if !codeStructureLooksNotReady {
-                        XCTAssertFalse(codeStructure.contains("Without codemap"), codeStructure)
-                        XCTAssertTrue(codeStructure.contains(canonicalSentinel), codeStructure)
+                    } else {
+                        XCTAssertTrue(run.codeStructure.isEmpty, run.codeStructure)
                     }
 
                     let followUp = try XCTUnwrap(state.followUps.first)
@@ -1876,6 +1853,20 @@ import XCTest
             return url.standardizedFileURL
         }
 
+        @discardableResult
+        private func initializeGitRepository(
+            at root: URL,
+            using gitFixture: ReviewGitRepositoryFixture,
+            message: String = "Initial commit"
+        ) throws -> String {
+            _ = try gitFixture.runGit(["init"], at: root)
+            _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: root)
+            _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+            _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: root)
+            _ = try gitFixture.runGit(["add", "."], at: root)
+            return try gitFixture.runGit(["commit", "-m", message], at: root)
+        }
+
         private func write(_ content: String, to url: URL) throws {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
@@ -1907,7 +1898,7 @@ import XCTest
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool = false,
-            probeCodeStructure: Bool = true
+            probeCodeStructure: Bool = CodemapE2ETestGate.isEnabled
         ) {
             configuration = Configuration(
                 networkManager: networkManager,

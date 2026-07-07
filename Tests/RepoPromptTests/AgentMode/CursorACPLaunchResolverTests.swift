@@ -765,13 +765,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CursorACPLaunchResolverTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: directory)
-        }
-        return directory
+        try makeTestDirectory(name: "CursorACPLaunchResolverTests")
     }
 
     private func canonicalExecutablePath(_ url: URL) throws -> String {

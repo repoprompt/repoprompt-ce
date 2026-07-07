@@ -48,7 +48,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let logical = try repositories.makeRepository(
             named: "logical",
-            files: ["Sources/App.swift": "struct CanonicalOnly {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CanonicalOnly")]
         )
         let physical = try repositories.makeRepository(
             named: "physical-secret",
@@ -275,7 +275,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
     func testNonGitRootReturnsTypedUnavailableWithoutLegacySnapshotBuild() async throws {
         let root = try makeTemporaryRoot(name: "NonGit")
         let fileURL = root.appendingPathComponent("Sources/App.swift")
-        try write("struct PlainFile {}\n", to: fileURL)
+        try write(SwiftFixtureSource.emptyStruct("PlainFile"), to: fileURL)
         let window = try await makeWindow(root: root)
         let store = window.workspaceFileContextStore
         _ = try await fileRecord(at: fileURL, store: store, rootScope: .visibleWorkspace)
@@ -356,7 +356,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
     func testWaitMillisecondsParameterIsNotExposedAndIsRejected() async throws {
         let root = try makeTemporaryRoot(name: "WaitPolicy")
         let fileURL = root.appendingPathComponent("Sources/App.swift")
-        try write("struct PlainFile {}\n", to: fileURL)
+        try write(SwiftFixtureSource.emptyStruct("PlainFile"), to: fileURL)
         let window = try await makeWindow(root: root)
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         let tabID = try XCTUnwrap(workspace.activeComposeTabID)
@@ -569,9 +569,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Nested/Two.swift": "struct Two {}\n",
-                "Sources/Three.swift": "struct Three {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Nested/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
@@ -621,9 +621,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Two.swift": "struct Two {}\n",
-                "Sources/Three.swift": "struct Three {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
@@ -689,7 +689,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "CurrentParent/SelectedFolder/Only.swift": "struct Only {}\n"
+                "CurrentParent/SelectedFolder/Only.swift": SwiftFixtureSource.emptyStruct("Only")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
@@ -724,7 +724,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositories.makeRepository(
             named: "repository",
-            files: ["Sources/Shared.swift": "struct Shared {}\n"]
+            files: ["Sources/Shared.swift": SwiftFixtureSource.emptyStruct("Shared")]
         )
         addTeardownBlock { repositories.cleanup() }
         let window = try await makeWindow(root: root)
@@ -771,8 +771,8 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Two.swift": "struct Two {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
@@ -1025,7 +1025,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let logicalRootURL = try repositories.makeRepository(
             named: "logical",
-            files: ["Sources/App.swift": "struct CanonicalSwitchType {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CanonicalSwitchType")]
         )
         let worktreeAURL = try repositories.makeRepository(
             named: "switch-a",
@@ -1213,7 +1213,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let logicalRootURL = try repositories.makeRepository(
             named: "logical",
-            files: ["Sources/App.swift": "struct CanonicalUnavailableType {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CanonicalUnavailableType")]
         )
         defer { repositories.cleanup() }
         let missingWorktreeURL = logicalRootURL.deletingLastPathComponent()
@@ -1536,7 +1536,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
                     pipelineIdentity: pipeline
                 ),
                 logicalPath: logicalPath,
-                text: "struct App {}",
+                text: SwiftFixtureSource.emptyStruct("App", trailingNewline: false),
                 tokenCount: 7
             ),
             isSeed: true,

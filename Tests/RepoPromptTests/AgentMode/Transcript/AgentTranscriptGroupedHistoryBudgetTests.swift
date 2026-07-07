@@ -3,6 +3,40 @@ import Foundation
 import XCTest
 
 final class AgentTranscriptGroupedHistoryBudgetTests: XCTestCase {
+    func testProjectionCachesPreserveAnchorIndexesOnReuse() throws {
+        var sequenceIndex = 0
+        let items = makeTurnItems(label: "older", toolCount: 10, sequenceIndex: &sequenceIndex)
+            + makeTurnItems(label: "newer", toolCount: 4, sequenceIndex: &sequenceIndex)
+        let transcript = AgentTranscriptIO.buildTranscript(
+            from: items,
+            terminalState: .completed,
+            nextSequenceIndex: sequenceIndex,
+            compact: false
+        )
+        let refreshedTranscript = AgentTranscriptProjectionBuilder
+            .refreshCompletedFullTurnGroupedHistoryCaches(in: transcript)
+
+        let coldBuild = AgentTranscriptProjectionBuilder.buildWithCaches(
+            from: refreshedTranscript,
+            turnCaches: [:]
+        )
+        let cachedBuild = AgentTranscriptProjectionBuilder.buildWithCaches(
+            from: refreshedTranscript,
+            turnCaches: coldBuild.updatedTurnCaches
+        )
+
+        XCTAssertEqual(coldBuild.updatedTurnCaches.count, refreshedTranscript.turns.count)
+        for turn in refreshedTranscript.turns {
+            let cache = try XCTUnwrap(coldBuild.updatedTurnCaches[turn.id])
+            XCTAssertTrue(cache.rowAnchorIndex.values.allSatisfy { anchorTurnID($0) == turn.id })
+            XCTAssertTrue(cache.anchorBlockIndex.keys.allSatisfy { anchorTurnID($0) == turn.id })
+        }
+        XCTAssertFalse(coldBuild.projection.rowAnchorIndex.isEmpty)
+        XCTAssertFalse(coldBuild.projection.anchorBlockIndex.isEmpty)
+        XCTAssertEqual(cachedBuild.projection, coldBuild.projection)
+        XCTAssertEqual(cachedBuild.updatedTurnCaches, coldBuild.updatedTurnCaches)
+    }
+
     func testReusablePrefixCacheTightensWhenNewerTurnConsumesDetailedToolBudget() throws {
         var sequenceIndex = 0
         let olderItems = makeTurnItems(label: "older", toolCount: 10, sequenceIndex: &sequenceIndex)
@@ -53,6 +87,18 @@ final class AgentTranscriptGroupedHistoryBudgetTests: XCTestCase {
 
         XCTAssertEqual(shiftedOlderLimit, 3)
         XCTAssertEqual(refreshedUpdated.turns[0].frozenDetailedToolTailLimit, 3)
+    }
+
+    private func anchorTurnID(_ anchor: AgentTranscriptAnchor) -> UUID {
+        switch anchor {
+        case let .request(turnID),
+             let .summary(turnID):
+            turnID
+        case let .activity(turnID, _, _),
+             let .conclusion(turnID, _),
+             let .groupedHistory(turnID, _):
+            turnID
+        }
     }
 
     private func makeTurnItems(

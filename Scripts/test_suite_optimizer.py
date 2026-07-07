@@ -29,6 +29,7 @@ LEDGER_COLUMNS = [
     "secondary_contract_tags",
     "validation_class",
     "layer",
+    "execution_tier",
     "scenario_count",
     "fixture_ids",
     "observable_oracle",
@@ -42,6 +43,31 @@ LEDGER_COLUMNS = [
     "preserved_scenario_delta",
     "notes",
 ]
+TEST_EXECUTION_TIERS = {
+    "fast",
+    "routine",
+    "integration",
+    "codemap_e2e",
+    "scale",
+    "diagnostic",
+    "live_smoke",
+    "release",
+}
+HEAVY_TEST_EXECUTION_TIERS = {"codemap_e2e", "scale", "diagnostic", "live_smoke", "release"}
+DEFAULT_SMOKE_FLOOR_SUITES = [
+    "RepoPromptTests.CodeMapArtifactKeyTests",
+    "RepoPromptTests.CodexIntegrationConfigurationTests",
+    "RepoPromptTests.WorkspaceFileContextStoreTests",
+]
+BROAD_IMPACT_PATH_PREFIXES = (
+    ".github/",
+    "Package.swift",
+    "Package.resolved",
+    "Makefile",
+    "Scripts/conductor.py",
+    "Scripts/test_suite_optimizer.py",
+    "Scripts/Fixtures/test-suite-contract-ledger.tsv",
+)
 
 LISTED_TEST_RE = re.compile(
     r"^(?P<suite>[A-Za-z_][A-Za-z0-9_.]*)/(?P<method>test[A-Za-z0-9_]+)$"
@@ -62,6 +88,7 @@ MEASUREMENT_SOURCE_SUFFIXES = {".swift", ".c", ".h"}
 SOURCE_GUARD_CONTENT = "content"
 SOURCE_GUARD_METADATA = "metadata"
 PROGRESS_PREFIX = "test_suite_optimizer.progress "
+LIST_COMMAND_TIMEOUT_SECONDS = 1800
 ProgressSink = Callable[[dict[str, Any]], None]
 
 
@@ -95,6 +122,21 @@ class TestCaseTiming:
     seconds: float
 
 
+@dataclasses.dataclass(frozen=True)
+class LedgerTest:
+    method_id: str
+    target: str
+    file: str
+    suite: str
+    method: str
+    domain: str
+    layer: str
+    execution_tier: str
+    runtime_seconds: float | None
+    resource_cost_tags: frozenset[str]
+    shared_state_tags: frozenset[str]
+
+
 @dataclasses.dataclass
 class ConductorRun:
     command: list[str]
@@ -124,6 +166,8 @@ class Sample:
     timings: list[TestCaseTiming]
     source_guard_kind: str = SOURCE_GUARD_CONTENT
     source_changed: bool = False
+    build: dict[str, Any] | None = None
+    resource_usage: dict[str, Any] | None = None
 
     @property
     def valid(self) -> bool:
@@ -220,14 +264,24 @@ def repo_root_from_script() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def run_command(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def run_command(
+    command: Sequence[str],
+    cwd: Path,
+    timeout_seconds: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            list(command),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OptimizerError(
+            f"command timed out after {timeout_seconds}s: {' '.join(command)}"
+        ) from exc
 
 
 def parse_conductor_json(stdout: str) -> dict[str, Any]:
@@ -256,17 +310,28 @@ def conductor_command(
     target: str,
     list_mode: bool = False,
     filter_value: str | None = None,
+    test_product: str | None = None,
 ) -> list[str]:
     if list_mode and filter_value:
         raise OptimizerError("--filter cannot be used with list mode")
+    if list_mode and test_product:
+        raise OptimizerError("--test-product cannot be used with list mode")
     operation = "test" if target == "root" else "provider-test"
     command = [str(repo_root / "conductor"), operation]
     if list_mode:
         command.append("--list")
+    if test_product:
+        command.extend(["--test-product", test_product])
     if filter_value:
         command.extend(["--filter", filter_value])
     command.append("--json")
     return command
+
+
+def conductor_build_command(repo_root: Path, target: str) -> list[str]:
+    if target != "root":
+        raise OptimizerError("--build-before-samples currently supports only --target root")
+    return [str(repo_root / "conductor"), "swift-build", "--product", "all", "--json"]
 
 
 def run_conductor(
@@ -274,8 +339,34 @@ def run_conductor(
     target: str,
     list_mode: bool = False,
     filter_value: str | None = None,
+    test_product: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> ConductorRun:
-    command = conductor_command(repo_root, target, list_mode=list_mode, filter_value=filter_value)
+    command = conductor_command(
+        repo_root,
+        target,
+        list_mode=list_mode,
+        filter_value=filter_value,
+        test_product=test_product,
+    )
+    completed = run_command(command, repo_root, timeout_seconds=timeout_seconds)
+    payload = parse_conductor_json(completed.stdout)
+    result = payload["result"]
+    log_path = Path(str(result.get("logPath") or ""))
+    log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+    return ConductorRun(
+        command=command,
+        process_exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        result=result,
+        log_text=log_text,
+        ticket=conductor_ticket_from_payload(payload, result),
+    )
+
+
+def run_conductor_build(repo_root: Path, target: str) -> ConductorRun:
+    command = conductor_build_command(repo_root, target)
     completed = run_command(command, repo_root)
     payload = parse_conductor_json(completed.stdout)
     result = payload["result"]
@@ -294,7 +385,16 @@ def run_conductor(
 
 def source_roots(repo_root: Path, target: str) -> list[Path]:
     if target == "root":
-        return [repo_root / "Tests" / "RepoPromptTests"]
+        tests_root = repo_root / "Tests"
+        if tests_root.is_dir():
+            roots = [
+                path
+                for path in sorted(tests_root.iterdir())
+                if path.is_dir() and any(path.rglob("*.swift"))
+            ]
+        else:
+            roots = []
+        return roots or [tests_root / "RepoPromptTests"]
     return [
         repo_root
         / "Packages"
@@ -312,7 +412,10 @@ def source_files(repo_root: Path, target: str) -> list[Path]:
 
 
 def domain_for_file(repo_root: Path, target: str, path: Path) -> str:
-    root = source_roots(repo_root, target)[0]
+    roots = source_roots(repo_root, target)
+    root = next((candidate for candidate in roots if path.is_relative_to(candidate)), None)
+    if root is None:
+        raise OptimizerError(f"test source is outside known {target} roots: {path}")
     relative = path.relative_to(root)
     if target == "provider":
         return f"Provider/{relative.parts[0] if len(relative.parts) > 1 else 'General'}"
@@ -389,6 +492,7 @@ def ledger_rows(
                 "secondary_contract_tags": "",
                 "validation_class": "unreviewed",
                 "layer": "root_swiftpm" if test.target == "root" else "provider_package",
+                "execution_tier": "routine" if test.target == "root" else "fast",
                 "scenario_count": "1",
                 "fixture_ids": "",
                 "observable_oracle": "unreviewed",
@@ -417,14 +521,465 @@ def write_tsv(path: Path, rows: Sequence[dict[str, str]], force: bool = False) -
 
 
 def read_ledger_ids(path: Path) -> list[str]:
+    return [row.method_id for row in read_ledger_rows(path)]
+
+
+def split_tags(value: str) -> frozenset[str]:
+    return frozenset(tag.strip() for tag in re.split(r"[,; ]+", value or "") if tag.strip())
+
+
+def parse_runtime_seconds(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise OptimizerError(f"invalid runtime_seconds value: {value!r}") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise OptimizerError(f"invalid runtime_seconds value: {value!r}")
+    return seconds
+
+
+def read_ledger_rows(path: Path) -> list[LedgerTest]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         if reader.fieldnames != LEDGER_COLUMNS:
             raise OptimizerError("ledger columns do not match the required schema")
-        ids = [str(row.get("method_id") or "") for row in reader]
+        rows = [
+            LedgerTest(
+                method_id=str(row.get("method_id") or ""),
+                target=str(row.get("target") or ""),
+                file=str(row.get("file") or ""),
+                suite=str(row.get("suite") or ""),
+                method=str(row.get("method") or ""),
+                domain=str(row.get("domain") or ""),
+                layer=str(row.get("layer") or ""),
+                execution_tier=str(row.get("execution_tier") or ""),
+                runtime_seconds=parse_runtime_seconds(str(row.get("runtime_seconds") or "")),
+                resource_cost_tags=split_tags(str(row.get("resource_cost_tags") or "")),
+                shared_state_tags=split_tags(str(row.get("shared_state_tags") or "")),
+            )
+            for row in reader
+        ]
+    ids = [row.method_id for row in rows]
     if len(ids) != len(set(ids)):
         raise OptimizerError("ledger contains duplicate method_id rows")
-    return ids
+    invalid_tiers = sorted({row.execution_tier for row in rows if row.execution_tier not in TEST_EXECUTION_TIERS})
+    if invalid_tiers:
+        raise OptimizerError(f"ledger contains unsupported execution_tier values: {invalid_tiers}")
+    return rows
+
+
+
+
+def read_ledger_dict_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != LEDGER_COLUMNS:
+            raise OptimizerError("ledger columns do not match the required schema")
+        rows = [dict(row) for row in reader]
+    ids = [str(row.get("method_id") or "") for row in rows]
+    if len(ids) != len(set(ids)):
+        raise OptimizerError("ledger contains duplicate method_id rows")
+    # Reuse typed validation for runtime_seconds and execution_tier checks.
+    read_ledger_rows(path)
+    return rows
+
+
+def baseline_runtime_timings(path: Path) -> dict[tuple[str, str, str], float]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    target = str(payload.get("target") or "root")
+    rows = payload.get("slowest_tests")
+    if not isinstance(rows, list):
+        raise OptimizerError("baseline artifact is missing slowest_tests")
+    timings: dict[tuple[str, str, str], float] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise OptimizerError(f"slowest_tests[{index}] is not an object")
+        suite = str(row.get("suite") or "")
+        method = str(row.get("method") or "")
+        if not suite or not method:
+            raise OptimizerError(f"slowest_tests[{index}] is missing suite or method")
+        seconds_value = row.get("median_seconds")
+        if seconds_value is None:
+            seconds_value = row.get("observed_p95_seconds")
+        if seconds_value is None:
+            raise OptimizerError(f"slowest_tests[{index}] is missing median_seconds")
+        try:
+            seconds = float(seconds_value)
+        except (TypeError, ValueError) as exc:
+            raise OptimizerError(f"invalid baseline runtime for {target}/{suite}/{method}") from exc
+        if not math.isfinite(seconds) or seconds < 0:
+            raise OptimizerError(f"invalid baseline runtime for {target}/{suite}/{method}")
+        timings[(target, suite, method)] = seconds
+    return timings
+
+
+def runtime_import(ledger: Path, baseline_path: Path, output: Path) -> dict[str, Any]:
+    if output.exists():
+        raise OptimizerError(f"refusing to overwrite existing ledger: {output}")
+    rows = read_ledger_dict_rows(ledger)
+    timings = baseline_runtime_timings(baseline_path)
+    timing_keys = set(timings)
+    ledger_keys = {(row["target"], row["suite"], row["method"]) for row in rows}
+    updated = 0
+    unchanged = 0
+    for row in rows:
+        key = (row["target"], row["suite"], row["method"])
+        seconds = timings.get(key)
+        if seconds is None:
+            unchanged += 1
+            continue
+        formatted = f"{seconds:.6f}"
+        if row.get("runtime_seconds") == formatted:
+            unchanged += 1
+            continue
+        row["runtime_seconds"] = formatted
+        updated += 1
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LEDGER_COLUMNS, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    return {
+        "rows_updated": updated,
+        "rows_unchanged": unchanged,
+        "artifact_methods_missing_from_ledger": [
+            f"{target}/{suite}/{method}" for target, suite, method in sorted(timing_keys - ledger_keys)
+        ],
+        "ledger_methods_missing_from_artifact": [
+            f"{target}/{suite}/{method}" for target, suite, method in sorted(ledger_keys - timing_keys)
+        ],
+        "output": str(output),
+    }
+
+
+def ci_suite_plan(
+    ledger: Path,
+    shard_count: int,
+    suites: Sequence[str] | None = None,
+    default_runtime_seconds: float = 1.0,
+    batch_max_seconds: float = 5.0,
+    require_runtime_for_batching: bool = True,
+) -> dict[str, Any]:
+    if shard_count <= 0:
+        raise OptimizerError("--shards must be greater than zero")
+    if default_runtime_seconds <= 0:
+        raise OptimizerError("default runtime seconds must be greater than zero")
+    rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
+    suite_filter = set(suites or [])
+    if suite_filter:
+        rows = [row for row in rows if row.suite in suite_filter]
+    grouped: dict[str, list[LedgerTest]] = defaultdict(list)
+    for row in rows:
+        grouped[row.suite].append(row)
+    missing_suites = sorted(suite_filter - set(grouped))
+    suite_entries: list[dict[str, Any]] = []
+    for suite, suite_rows in sorted(grouped.items()):
+        runtime_values = [row.runtime_seconds for row in suite_rows]
+        missing_runtime_count = sum(value is None for value in runtime_values)
+        estimated = sum(value if value is not None else default_runtime_seconds for value in runtime_values)
+        execution_tiers = sorted({row.execution_tier for row in suite_rows})
+        resource_tags = sorted({tag for row in suite_rows for tag in row.resource_cost_tags})
+        shared_tags = sorted({tag for row in suite_rows for tag in row.shared_state_tags})
+        batch_eligible = (
+            (not require_runtime_for_batching or missing_runtime_count == 0)
+            and not shared_tags
+            and not resource_tags
+            and not (set(execution_tiers) & HEAVY_TEST_EXECUTION_TIERS)
+            and estimated <= batch_max_seconds
+        )
+        suite_entries.append({
+            "suite": suite,
+            "estimated_seconds": estimated,
+            "method_count": len(suite_rows),
+            "missing_runtime_count": missing_runtime_count,
+            "execution_tiers": execution_tiers,
+            "resource_cost_tags": resource_tags,
+            "shared_state_tags": shared_tags,
+            "batch_eligible": batch_eligible,
+        })
+    shards = [{"index": index + 1, "estimated_seconds": 0.0, "suites": []} for index in range(shard_count)]
+    for entry in sorted(suite_entries, key=lambda item: (-float(item["estimated_seconds"]), str(item["suite"]))):
+        shard = min(shards, key=lambda item: (item["estimated_seconds"], item["index"]))
+        shard["estimated_seconds"] += float(entry["estimated_seconds"])
+        shard["suites"].append(entry)
+    for shard in shards:
+        shard["suite_count"] = len(shard["suites"])
+    return {
+        "target": "root",
+        "shard_count": shard_count,
+        "default_runtime_seconds": default_runtime_seconds,
+        "missing_suites": missing_suites,
+        "shards": shards,
+    }
+
+def source_domains_for_changed_path(path: str) -> set[str]:
+    parts = Path(path).parts
+    if len(parts) >= 4 and parts[0] == "Sources" and parts[1] == "RepoPrompt":
+        if parts[2] == "Features":
+            feature = parts[3]
+            if feature == "AgentMode":
+                return {"AgentMode", "MCP", "ContextBuilder"}
+            if feature == "CodeMap":
+                return {"CodeMap", "WorkspaceContext/CodeMap", "WorkspaceContext"}
+            if feature == "ContextBuilder":
+                return {"ContextBuilder", "AgentMode", "MCP"}
+            if feature == "WorkspaceFiles":
+                return {"WorkspaceContext", "FileSystem", "Services"}
+            if feature == "Workspaces":
+                return {"Workspaces", "WorkspaceContext"}
+            return {feature}
+        if parts[2] == "Infrastructure" and len(parts) >= 4:
+            area = parts[3]
+            if area == "MCP":
+                return {"MCP", "AgentMode"}
+            if area == "VCS":
+                return {"VCS", "Services/VCS", "MCP"}
+            if area == "FileSystem":
+                return {"FileSystem", "Services", "WorkspaceContext"}
+            if area == "WorkspaceContext":
+                return {"WorkspaceContext", "WorkspaceContext/CodeMap", "CodeMap"}
+            return {area, "Services"}
+        if parts[2] == "App":
+            return {"App", "Root"}
+    if len(parts) >= 2 and parts[0] == "Sources" and parts[1] in {"RepoPromptMCP", "RepoPromptShared"}:
+        return {"MCP"}
+    if len(parts) >= 2 and parts[0] == "Sources" and parts[1] == "TreeSitterScannerSupport":
+        return {"CodeMap", "WorkspaceContext/CodeMap"}
+    if len(parts) >= 3 and parts[0] == "Packages" and parts[1] == "RepoPromptAgentProviders":
+        return {"Provider/Runtime", "Provider/SDK"}
+    return set()
+
+
+DEFAULT_IMPACTED_RANGE = "default"
+DEFAULT_IMPACTED_BRANCH_RANGE = "origin/main...HEAD"
+
+
+def changed_files_for_git_diff(repo_root: Path, args: Sequence[str], label: str) -> list[str]:
+    completed = run_command(
+        ["git", "diff", "--name-only", "--diff-filter=ACMRT", *args, "--"],
+        repo_root,
+    )
+    if completed.returncode != 0:
+        raise OptimizerError(f"git diff failed for {label}: {completed.stderr.strip()}")
+    return [path for path in completed.stdout.splitlines() if path]
+
+
+def changed_files_for_range(repo_root: Path, range_spec: str) -> list[str]:
+    if range_spec == DEFAULT_IMPACTED_RANGE:
+        branch_changed = changed_files_for_git_diff(
+            repo_root,
+            [DEFAULT_IMPACTED_BRANCH_RANGE],
+            DEFAULT_IMPACTED_BRANCH_RANGE,
+        )
+        # Diff against HEAD so staged-but-uncommitted changes (index-vs-HEAD)
+        # are captured alongside unstaged worktree changes. A plain worktree-vs-
+        # index diff would hide staged changes, which breaks the usual
+        # stage-intended-changes-then-validate pre-commit flow. Untracked files
+        # are intentionally excluded; they include scratch artifacts and local
+        # investigation docs that will never be committed.
+        worktree_changed = changed_files_for_git_diff(repo_root, ["HEAD"], "worktree")
+        return sorted(set(branch_changed).union(worktree_changed))
+    return sorted(set(changed_files_for_git_diff(repo_root, [range_spec], range_spec)))
+
+
+def listed_root_test_ids(repo_root: Path) -> tuple[set[str], str]:
+    run = run_conductor(repo_root, "root", list_mode=True)
+    if (
+        run.process_exit_code != 0
+        or run.result.get("state") != "completed"
+        or run.result.get("exitCode") != 0
+    ):
+        raise OptimizerError(
+            f"root test list failed: process_exit={run.process_exit_code} "
+            f"state={run.result.get('state')} exit={run.result.get('exitCode')} "
+            f"ticket={run.ticket} log={run.result.get('logPath')} stderr={run.stderr[-500:]}"
+        )
+    if not run.log_text:
+        raise OptimizerError(f"root test list log missing or empty: {run.result.get('logPath')}")
+    return {test.method_id for test in parse_test_list(run.log_text, "root")}, str(run.result.get("logPath") or "")
+
+
+def exact_xctest_filter(method_ids: Sequence[str]) -> str:
+    if not method_ids:
+        raise OptimizerError("cannot build an XCTest filter without selected methods")
+    # Builds a single anchored alternation regex passed to conductor via --filter.
+    # Current ledger scale keeps this well under macOS ARG_MAX, but very large
+    # impacted/shard selections could approach shell argv limits in the future;
+    # consider a guard or chunked invocation if selected_count grows past ~1k.
+    return "^(?:" + "|".join(re.escape(method_id.split("/", 1)[1]) for method_id in sorted(method_ids)) + ")$"
+
+
+def impacted_tests(
+    repo_root: Path,
+    ledger: Path,
+    range_spec: str,
+    include_heavy: bool = False,
+    smoke_floor_suites: Sequence[str] = DEFAULT_SMOKE_FLOOR_SUITES,
+    run_selected: bool = False,
+    validate_live_list: bool = True,
+) -> dict[str, Any]:
+    rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
+    live_ids: set[str] | None = None
+    list_log_path: str | None = None
+    if validate_live_list:
+        live_ids, list_log_path = listed_root_test_ids(repo_root)
+        ledger_ids = {row.method_id for row in rows}
+        missing = sorted(live_ids - ledger_ids)
+        stale = sorted(ledger_ids - live_ids)
+        if missing or stale:
+            raise OptimizerError(
+                f"ledger mismatch against live dev-test-list: missing={len(missing)} stale={len(stale)} "
+                f"missing_examples={missing[:5]} stale_examples={stale[:5]} list_log={list_log_path}"
+            )
+    changed = changed_files_for_range(repo_root, range_spec)
+    selected: dict[str, set[str]] = defaultdict(set)
+    skipped: dict[str, set[str]] = defaultdict(set)
+    broad_reasons: list[str] = []
+    domains: set[str] = set()
+    files = set(changed)
+    for path in changed:
+        if path.startswith(BROAD_IMPACT_PATH_PREFIXES):
+            broad_reasons.append(f"{path}: broad test/build/tooling boundary")
+        for domain in source_domains_for_changed_path(path):
+            domains.add(domain)
+    if broad_reasons:
+        full_count = len(rows)
+        if run_selected:
+            raise OptimizerError(
+                "impacted selection requires the full root suite; rerun as "
+                "`make dev-test` (or `conductor test`). broad boundaries: "
+                + ", ".join(broad_reasons)
+            )
+        return {
+            "range": range_spec,
+            "changed_files": changed,
+            "list_log_path": list_log_path,
+            "live_root_test_count": len(live_ids) if live_ids is not None else None,
+            "selection_mode": "full_root_required",
+            "full_root_required": True,
+            "full_root_reasons": broad_reasons,
+            "selected": [],
+            "selected_count": 0,
+            "full_root_total_count": full_count,
+            "filter": None,
+            "smoke_floor_suites": list(smoke_floor_suites),
+            "skipped_heavy_or_opt_in": [],
+            "command": [str(repo_root / "conductor"), "test"],
+            "run": None,
+        }
+    for row in rows:
+        if row.suite in smoke_floor_suites:
+            selected[row.method_id].add(f"smoke floor suite {row.suite}")
+        if row.domain in domains or any(row.domain.startswith(f"{domain}/") for domain in domains):
+            selected[row.method_id].add(f"domain impacted by changed sources: {row.domain}")
+        if row.file in files:
+            selected[row.method_id].add(f"{row.file}: changed test file")
+    selected_rows = {row.method_id: row for row in rows if row.method_id in selected}
+    for method_id, row in list(selected_rows.items()):
+        if row.execution_tier in HEAVY_TEST_EXECUTION_TIERS and not include_heavy:
+            skipped[method_id].update(selected.pop(method_id))
+            skipped[method_id].add(f"execution_tier={row.execution_tier} requires explicit opt-in")
+    selected_ids = sorted(selected)
+    filter_value = exact_xctest_filter(selected_ids) if selected_ids else None
+    run_payload: dict[str, Any] | None = None
+    if run_selected and filter_value:
+        run = run_conductor(repo_root, "root", filter_value=filter_value)
+        run_payload = {
+            "command": run.command,
+            "process_exit_code": run.process_exit_code,
+            "state": run.result.get("state"),
+            "exit_code": run.result.get("exitCode"),
+            "ticket": run.ticket,
+            "log_path": run.result.get("logPath"),
+        }
+        if (
+            run.process_exit_code != 0
+            or run.result.get("state") != "completed"
+            or run.result.get("exitCode") != 0
+        ):
+            raise OptimizerError(
+                "impacted test run failed: "
+                f"process_exit={run.process_exit_code} "
+                f"state={run.result.get('state')} "
+                f"exit={run.result.get('exitCode')} "
+                f"ticket={run.ticket} log={run.result.get('logPath')}"
+            )
+    return {
+        "range": range_spec,
+        "changed_files": changed,
+        "list_log_path": list_log_path,
+        "live_root_test_count": len(live_ids) if live_ids is not None else None,
+        "selection_mode": "impacted",
+        "full_root_required": False,
+        "impacted_domains": sorted(domains),
+        "smoke_floor_suites": list(smoke_floor_suites),
+        "selected_count": len(selected_ids),
+        "selected": [
+            {
+                "method_id": method_id,
+                "suite": selected_rows[method_id].suite,
+                "execution_tier": selected_rows[method_id].execution_tier,
+                "reasons": sorted(selected[method_id]),
+            }
+            for method_id in selected_ids
+        ],
+        "filter": filter_value,
+        "command": conductor_command(repo_root, "root", filter_value=filter_value) if filter_value else None,
+        "skipped_heavy_or_opt_in": [
+            {
+                "method_id": method_id,
+                "suite": next(row.suite for row in rows if row.method_id == method_id),
+                "execution_tier": next(row.execution_tier for row in rows if row.method_id == method_id),
+                "reasons": sorted(reasons),
+            }
+            for method_id, reasons in sorted(skipped.items())
+        ],
+        "run": run_payload,
+    }
+
+
+def shard_root_tests(ledger: Path, shard_count: int, include_heavy: bool = False) -> dict[str, Any]:
+    if shard_count <= 0:
+        raise OptimizerError("--shards must be greater than zero")
+    rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
+    if not include_heavy:
+        rows = [row for row in rows if row.execution_tier not in HEAVY_TEST_EXECUTION_TIERS]
+    shards: list[dict[str, Any]] = [
+        {"index": index + 1, "estimated_seconds": 0.0, "method_ids": []}
+        for index in range(shard_count)
+    ]
+    for row in sorted(rows, key=lambda item: (-(item.runtime_seconds or 1.0), item.method_id)):
+        shard = min(shards, key=lambda item: (item["estimated_seconds"], item["index"]))
+        weight = row.runtime_seconds or 1.0
+        shard["estimated_seconds"] += weight
+        shard["method_ids"].append(row.method_id)
+    for shard in shards:
+        shard["method_count"] = len(shard["method_ids"])
+        shard["filter"] = exact_xctest_filter(shard["method_ids"]) if shard["method_ids"] else None
+        shard["command"] = (
+            conductor_command(repo_root_from_script(), "root", filter_value=shard["filter"])
+            if shard["filter"]
+            else None
+        )
+        shard_rows = [row for row in rows if row.method_id in set(shard["method_ids"])]
+        shared_tags: dict[str, int] = defaultdict(int)
+        for row in shard_rows:
+            for tag in row.shared_state_tags:
+                shared_tags[tag] += 1
+        shard["shared_state_tag_counts"] = dict(sorted(shared_tags.items()))
+    return {
+        "target": "root",
+        "shard_count": shard_count,
+        "include_heavy": include_heavy,
+        "excluded_heavy_tiers": sorted(HEAVY_TEST_EXECUTION_TIERS if not include_heavy else []),
+        "parallelization_warning": (
+            "Shard filters are weighted by historical runtime; review shared_state_tag_counts "
+            "before running shards concurrently."
+        ),
+        "shards": shards,
+    }
 
 
 def git_metadata(repo_root: Path) -> dict[str, str]:
@@ -520,6 +1075,38 @@ def sample_invalid_reasons(
     return reasons
 
 
+def result_resource_usage(result: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "maxRSSBytes",
+        "maxRssBytes",
+        "maxRSS",
+        "maxRss",
+        "rssBytes",
+        "peakRSSBytes",
+        "peakRssBytes",
+        "memoryBytes",
+        "resourceUsage",
+    )
+    usage = {key: result.get(key) for key in keys if key in result}
+    return usage
+
+
+def build_result_dict(run: ConductorRun) -> dict[str, Any]:
+    result = run.result
+    return {
+        "command": run.command,
+        "process_exit_code": run.process_exit_code,
+        "state": result.get("state"),
+        "exit_code": result.get("exitCode"),
+        "queue_wait_seconds": result.get("queueWaitSeconds"),
+        "execution_seconds": result.get("executionSeconds"),
+        "measurement_invalid": result.get("measurementInvalid"),
+        "log_path": result.get("logPath"),
+        "ticket": run.ticket,
+        "resource_usage": result_resource_usage(result),
+    }
+
+
 def sample_from_run(
     index: int,
     target: str,
@@ -527,9 +1114,11 @@ def sample_from_run(
     source_changed: bool,
     source_guard_kind: str = SOURCE_GUARD_CONTENT,
     require_timings: bool = False,
+    build: dict[str, Any] | None = None,
 ) -> Sample:
     result = run.result
     timings = parse_xctest_timings(run.log_text)
+    resource_usage = result_resource_usage(result)
     return Sample(
         index=index,
         target=target,
@@ -552,6 +1141,8 @@ def sample_from_run(
         timings=timings,
         source_guard_kind=source_guard_kind,
         source_changed=source_changed,
+        build=build,
+        resource_usage=resource_usage,
     )
 
 
@@ -641,6 +1232,134 @@ def sample_to_dict(sample: Sample) -> dict[str, Any]:
         "parsed_test_case_timings": len(sample.timings),
         "source_guard_kind": sample.source_guard_kind,
         "source_changed": sample.source_changed,
+        "build": sample.build,
+        "resource_usage": sample.resource_usage or {},
+    }
+
+
+def parsed_xctest_seconds(sample: Sample) -> float | None:
+    if not sample.timings:
+        return None
+    return sum(timing.seconds for timing in sample.timings)
+
+
+def inferred_overhead_seconds(sample: Sample) -> float | None:
+    parsed_seconds = parsed_xctest_seconds(sample)
+    if sample.execution_seconds is None or parsed_seconds is None:
+        return None
+    return max(0.0, float(sample.execution_seconds) - parsed_seconds)
+
+
+def rss_bytes_from_value(value: Any, key: str) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric < 0:
+        return None
+    normalized = key.lower().replace("-", "_")
+    if normalized.endswith("_kb") or normalized.endswith("kb"):
+        numeric *= 1024
+    elif normalized.endswith("_mb") or normalized.endswith("mb"):
+        numeric *= 1024 * 1024
+    return int(numeric)
+
+
+def extract_max_rss_bytes(value: Any) -> int | None:
+    candidates: list[int] = []
+
+    def visit(node: Any, key: str = "") -> None:
+        if isinstance(node, dict):
+            for child_key, child_value in node.items():
+                visit(child_value, str(child_key))
+            return
+        if isinstance(node, list):
+            for child in node:
+                visit(child, key)
+            return
+        normalized = key.lower().replace("-", "_")
+        if "rss" not in normalized:
+            return
+        candidate = rss_bytes_from_value(node, normalized)
+        if candidate is not None:
+            candidates.append(candidate)
+
+    visit(value)
+    return max(candidates) if candidates else None
+
+
+def focused_cost_sample_to_dict(sample: Sample, run_result: dict[str, Any]) -> dict[str, Any]:
+    parsed_seconds = parsed_xctest_seconds(sample)
+    return {
+        "index": sample.index,
+        "target": sample.target,
+        "command": sample.command,
+        "process_exit_code": sample.process_exit_code,
+        "state": sample.state,
+        "exit_code": sample.exit_code,
+        "queue_wait_seconds": sample.queue_wait_seconds,
+        "total_execution_seconds": sample.execution_seconds,
+        "parsed_xctest_seconds": parsed_seconds,
+        "parsed_test_case_timings": len(sample.timings),
+        "inferred_overhead_seconds": inferred_overhead_seconds(sample),
+        "max_rss_bytes": extract_max_rss_bytes(run_result),
+        "timed_out": sample.timed_out,
+        "measurement_invalid": sample.measurement_invalid,
+        "diagnostic_paths": sample.diagnostic_paths,
+        "log_path": sample.log_path,
+        "valid": sample.valid,
+        "invalid_reasons": sample.invalid_reasons,
+        "source_guard_kind": sample.source_guard_kind,
+        "source_changed": sample.source_changed,
+    }
+
+
+def focused_cost_zero_valid_message(samples: Sequence[dict[str, Any]]) -> str:
+    details: list[str] = []
+    for sample in samples:
+        reasons = "; ".join(str(reason) for reason in sample.get("invalid_reasons") or [])
+        log_path = str(sample.get("log_path") or "")
+        detail = f"sample {sample.get('index')}: {reasons or 'invalid'}"
+        if log_path:
+            detail += f"; log={log_path}"
+        details.append(detail)
+    suffix = "; ".join(details[:5])
+    if len(details) > 5:
+        suffix += f"; ... {len(details) - 5} more"
+    return f"focused-cost produced no valid samples{': ' + suffix if suffix else ''}"
+
+
+def focused_cost_summary(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    valid = [sample for sample in samples if sample.get("valid")]
+    total_values = [float(sample["total_execution_seconds"]) for sample in valid if sample.get("total_execution_seconds") is not None]
+    if not total_values:
+        raise OptimizerError(focused_cost_zero_valid_message(samples))
+    parsed_values = [float(sample["parsed_xctest_seconds"]) for sample in valid if sample.get("parsed_xctest_seconds") is not None]
+    overhead_values = [
+        float(sample["inferred_overhead_seconds"])
+        for sample in valid
+        if sample.get("inferred_overhead_seconds") is not None
+    ]
+    rss_values = [int(sample["max_rss_bytes"]) for sample in valid if sample.get("max_rss_bytes") is not None]
+    rel_mad = relative_mad(total_values)
+    return {
+        "attempts": len(samples),
+        "valid_samples": len(valid),
+        "invalid_samples": len(samples) - len(valid),
+        "raw_total_execution_seconds": total_values,
+        "median_total_execution_seconds": statistics.median(total_values),
+        "observed_p95_total_execution_seconds": nearest_rank_p95(total_values),
+        "relative_mad_total_execution_seconds": rel_mad,
+        "noise_classification": noise_classification(rel_mad),
+        "raw_parsed_xctest_seconds": parsed_values,
+        "median_parsed_xctest_seconds": statistics.median(parsed_values) if parsed_values else None,
+        "raw_inferred_overhead_seconds": overhead_values,
+        "median_inferred_overhead_seconds": statistics.median(overhead_values) if overhead_values else None,
+        "max_rss_bytes": max(rss_values) if rss_values else None,
+        "reliable": False,
+        "diagnostic_only": True,
     }
 
 
@@ -650,7 +1369,12 @@ def baseline_summary(samples: Sequence[Sample]) -> dict[str, Any]:
     if not values:
         raise OptimizerError("baseline produced no valid samples")
     rel_mad = relative_mad(values)
-    return {
+    valid_builds = [
+        float((sample.build or {}).get("execution_seconds"))
+        for sample in valid
+        if (sample.build or {}).get("execution_seconds") is not None
+    ]
+    summary: dict[str, Any] = {
         "attempts": len(samples),
         "valid_samples": len(valid),
         "invalid_samples": len(samples) - len(valid),
@@ -660,6 +1384,14 @@ def baseline_summary(samples: Sequence[Sample]) -> dict[str, Any]:
         "relative_mad": rel_mad,
         "noise_classification": noise_classification(rel_mad),
     }
+    if valid_builds:
+        summary["raw_build_execution_seconds"] = valid_builds
+        summary["median_build_execution_seconds"] = statistics.median(valid_builds)
+        summary["observed_p95_build_execution_seconds"] = nearest_rank_p95(valid_builds)
+        summary["median_total_build_plus_test_seconds"] = (
+            summary["median_build_execution_seconds"] + summary["median_seconds"]
+        )
+    return summary
 
 
 def scoreboard_scaffold() -> str:
@@ -668,6 +1400,16 @@ def scoreboard_scaffold() -> str:
 ## Measurement contract
 
 - Primary metric: warm local root `Scripts/test_suite_optimizer.py baseline --target root` using conductor JSON `executionSeconds` from `./conductor test --json`.
+- Build/link cost is separate from warm XCTest execution cost. Use `baseline --build-before-samples`
+  only when an iteration needs paired build+test evidence; primary root timing remains test
+  `executionSeconds`.
+- Focused tiny-test latency is a different metric from full-suite runtime. Diagnose it with
+  paired build/test artifacts and, for hosted per-suite CI, prefer the built `.xctest` bundle
+  path through `Scripts/ci_app_test_runner.py` over repeated `swift test --skip-build --filter`
+  invocations.
+- Runtime-heavy Workspace/Codemap suites are optimized only from parsed XCTest method/suite
+  timings in complete or focused baseline artifacts. Do not claim a Workspace/Codemap runtime
+  win from build/link, process-startup, or package-resolution overhead changes.
 - Provider package timing is measured separately with `Scripts/test_suite_optimizer.py baseline --target provider`.
 - A root+provider number may be reported only as a derived secondary serial estimate, not as an observed single-process wallclock.
 - Normal timing samples must not enable XCTest stall diagnostics or wake probes.
@@ -699,6 +1441,16 @@ def scoreboard_scaffold() -> str:
 | 1 | Optimizer source-change guard, focused baseline support, and per-method ranking | Tooling only | Reduces campaign overhead and improves targeting; no primary suite-speed claim | Low | Always first setup step | Python optimizer tests, append-only scaffold, zero method/contract/scenario delta | Planned |
 | 2 | ACP mode-config fake ACP server fixture setup reduction | Root primary, conditional | Reduces repeated test fixture IO/setup if ACP suite ranks high | Low to medium | Initial root slow-suite/method ranking implicates `ACPAgentSessionControllerModeConfigTests` | Focused before/after artifact, focused XCTest, full-root after artifact, ledger verify | Waiting for baseline |
 | 3 | Hosted CI class-per-process batching | CI-only secondary | Reduces hosted CI subprocess overhead; no local root primary improvement | Medium/high | CI elapsed becomes explicit target after local baseline | CI runner self-tests and GitHub Build and Test evidence | Waiting for CI prioritization |
+| 4 | Root test-target split by domain boundary (`Workspace/Codemap`, `MCP`, root/unit) | Focused overhead secondary | Reduces fixed compile/link/load cost for tiny focused runs by shrinking the test target dependency graph; does not claim runtime-heavy suite improvement | Medium/high | Paired evidence shows focused total time dominated by fixed overhead, e.g. tiny suite total seconds greatly exceed parsed XCTest seconds; provider package remains a cheap control lane | Before/after focused tiny-suite artifact, complete root artifact, provider artifact, authoritative lists, exact ledger reconciliation, no contract/scenario loss | Evidence needed |
+| 5 | Workspace/Codemap fixture scale reduction and reuse | Root primary | Reduces parsed XCTest time in Workspace/Codemap suites where test body dominates total time | Medium | Slow-suite/method ranking implicates Workspace/Codemap runtime and the protected contract can be proven with smaller synthetic fixtures, such as crossing paging thresholds without thousands of files | Focused before/after artifact for affected suites, full-root artifact, contract/oracle review, ledger verify, scenario totals preserved | Evidence needed |
+| 6 | Workspace/Codemap async determinism pass | Root primary/reliability | Removes sleeps, uncontrolled timing, and process/file dependency variance from expensive async/worktree/context-builder tests | Medium | Invalid samples or slow methods correlate with waits, retries, real timing, worktree/process setup, or codemap readiness polling | Focused reliability repetitions, focused runtime artifact, full-root artifact, no diagnostics counted as timing samples | Evidence needed |
+
+## Optimization lanes
+
+- **Fixed overhead lane:** Tiny focused suites with near-zero parsed XCTest time but high total elapsed are package/build/link/test-launch problems. Use paired build/test artifacts, hosted `.xctest` bundle execution through `Scripts/ci_app_test_runner.py`, and domain target-split experiments. Do not count these as Workspace/Codemap runtime wins.
+- **Runtime-heavy lane:** Suites whose parsed XCTest seconds nearly equal total suite seconds need fixture, async, filesystem, worktree, codemap catalog, or scenario redesign. Target splitting may improve developer ergonomics but is not the primary speed lever.
+- **Memory/RSS lane:** RSS claims require explicit `resource_usage` evidence in optimizer artifacts or a separate diagnostic. Existing memory snapshots are insufficient for a strong compiler/test-run RSS conclusion.
+- **Ledger/trust lane:** `verify-ledger` depends on conductor list jobs. A conductor/list shell hang or missing Swift toolchain blocks trust restoration but is separate from XCTest runtime.
 
 ## Reverted attempts
 
@@ -739,6 +1491,67 @@ def format_seconds(value: float | None) -> str:
     return "" if value is None else f"{value:.3f}"
 
 
+def append_focused_cost_scoreboard(path: Path, payload: dict[str, Any]) -> None:
+    ensure_scoreboard(path)
+    source_guard = (payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT
+    lines = [
+        f"### Focused cost diagnostic: {payload['timestamp']} — {payload['target']} — {payload['label']}",
+        "",
+        f"Command: `{' '.join(payload['command'])}`",
+        f"Artifact: `{payload.get('artifact') or ''}`",
+        f"Filter: `{payload.get('filter') or ''}`",
+        f"Source-change guard: `{source_guard}`",
+        "Primary metric eligible: no",
+        "",
+        "| Sample | Valid | Total execution seconds | Parsed XCTest seconds | Inferred overhead seconds | Queue wait | Max RSS bytes | State | Exit | Log | Invalid reason |",
+        "|---:|---|---:|---:|---:|---:|---:|---|---:|---|---|",
+    ]
+    for sample in payload["samples"]:
+        reasons = "; ".join(sample["invalid_reasons"])
+        lines.append(
+            "| {index} | {valid} | {total} | {parsed} | {overhead} | {queue} | {rss} | {state} | {exit_code} | `{log}` | {reasons} |".format(
+                index=sample["index"],
+                valid="yes" if sample["valid"] else "no",
+                total=format_seconds(sample["total_execution_seconds"]),
+                parsed=format_seconds(sample["parsed_xctest_seconds"]),
+                overhead=format_seconds(sample["inferred_overhead_seconds"]),
+                queue=format_seconds(sample["queue_wait_seconds"]),
+                rss=sample["max_rss_bytes"] if sample["max_rss_bytes"] is not None else "",
+                state=sample["state"],
+                exit_code=sample["exit_code"],
+                log=sample["log_path"],
+                reasons=reasons,
+            )
+        )
+    summary = payload["summary"]
+    lines.extend(
+        [
+            "",
+            "Summary:",
+            "",
+            "| Valid | Invalid | Median total execution seconds | Observed p95 total execution seconds | Relative MAD | Noise | Median parsed XCTest seconds | Median inferred overhead seconds | Max RSS bytes | Diagnostic only | Primary metric eligible |",
+            "|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|",
+            "| {valid} | {invalid} | {median_total} | {p95_total} | {mad} | {noise} | {median_parsed} | {median_overhead} | {rss} | {diagnostic} | {primary} |".format(
+                valid=summary["valid_samples"],
+                invalid=summary["invalid_samples"],
+                median_total=format_seconds(summary["median_total_execution_seconds"]),
+                p95_total=format_seconds(summary["observed_p95_total_execution_seconds"]),
+                mad="" if summary["relative_mad_total_execution_seconds"] is None else f"{summary['relative_mad_total_execution_seconds']:.4f}",
+                noise=summary["noise_classification"],
+                median_parsed=format_seconds(summary["median_parsed_xctest_seconds"]),
+                median_overhead=format_seconds(summary["median_inferred_overhead_seconds"]),
+                rss=summary["max_rss_bytes"] if summary["max_rss_bytes"] is not None else "",
+                diagnostic="yes" if summary.get("diagnostic_only") else "no",
+                primary="yes" if payload.get("primary_metric_eligible") else "no",
+            ),
+            "",
+        ]
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+
 def append_baseline_scoreboard(
     path: Path,
     payload: dict[str, Any],
@@ -748,6 +1561,7 @@ def append_baseline_scoreboard(
     target = payload["target"]
     scope = str(payload.get("scope") or "complete")
     filter_value = payload.get("filter")
+    test_product = payload.get("test_product")
     scope_filter = scope if not filter_value else f"{scope}: `{filter_value}`"
     source_guard = (payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT
     summary = payload["summary"]
@@ -756,7 +1570,7 @@ def append_baseline_scoreboard(
     root_count = counts.get("root", 0)
     provider_count = counts.get("provider", 0)
     total_count = root_count + provider_count if counts else 0
-    record_heading = "Focused" if scope == "filtered" else "Baseline"
+    record_heading = "Focused" if scope in {"filtered", "test-product"} else "Baseline"
     lines = [
         f"### {record_heading}: {payload['timestamp']} — {target} — {payload['label']}",
         "",
@@ -764,18 +1578,22 @@ def append_baseline_scoreboard(
         f"Artifact: `{payload.get('artifact') or ''}`",
         f"Inventory: `{payload.get('inventory') or ''}`",
         f"Scope/filter: {scope_filter}",
+        f"Test product: `{test_product or ''}`",
         f"Source-change guard: `{source_guard}`",
+        f"Build before samples: {'yes' if payload.get('build_before_samples') else 'no'}",
         f"Primary metric eligible: {'yes' if payload.get('primary_metric_eligible') else 'no'}",
         "",
-        "| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |",
-        "|---:|---|---:|---:|---|---:|---|---|---|",
+        "| Sample | Valid | Build seconds | Test execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |",
+        "|---:|---|---:|---:|---:|---|---:|---|---|---|",
     ]
     for sample in payload["samples"]:
         reasons = "; ".join(sample["invalid_reasons"])
+        build = sample.get("build") or {}
         lines.append(
-            "| {index} | {valid} | {execution} | {queue} | {state} | {exit_code} | {invalid} | `{log}` | {reasons} |".format(
+            "| {index} | {valid} | {build_seconds} | {execution} | {queue} | {state} | {exit_code} | {invalid} | `{log}` | {reasons} |".format(
                 index=sample["index"],
                 valid="yes" if sample["valid"] else "no",
+                build_seconds=format_seconds(build.get("execution_seconds")),
                 execution=format_seconds(sample["execution_seconds"]),
                 queue=format_seconds(sample["queue_wait_seconds"]),
                 state=sample["state"],
@@ -811,6 +1629,22 @@ def append_baseline_scoreboard(
             "",
         ]
     )
+    if summary.get("median_build_execution_seconds") is not None:
+        lines.extend(
+            [
+                "Build/test cost split:",
+                "",
+                "| Median build seconds | Observed p95 build seconds | Median test seconds | Median build+test seconds |",
+                "|---:|---:|---:|---:|",
+                "| {build:.3f} | {build_p95:.3f} | {test:.3f} | {total:.3f} |".format(
+                    build=summary["median_build_execution_seconds"],
+                    build_p95=summary["observed_p95_build_execution_seconds"],
+                    test=summary["median_seconds"],
+                    total=summary["median_total_build_plus_test_seconds"],
+                ),
+                "",
+            ]
+        )
     if payload.get("slowest_suites"):
         lines.extend(
             [
@@ -890,13 +1724,61 @@ def inventory(repo_root: Path, ledger: Path, output: Path | None, force: bool) -
     return payload
 
 
-def verify_ledger(repo_root: Path, ledger: Path) -> dict[str, Any]:
+def verify_ledger(
+    repo_root: Path,
+    ledger: Path,
+    list_timeout_seconds: int = LIST_COMMAND_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    return verify_ledger_with_progress(repo_root, ledger, emit_progress_event, list_timeout_seconds)
+
+
+def verify_ledger_with_progress(
+    repo_root: Path,
+    ledger: Path,
+    progress_sink: ProgressSink | None,
+    list_timeout_seconds: int = LIST_COMMAND_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    if list_timeout_seconds <= 0:
+        raise OptimizerError("--list-timeout-seconds must be greater than zero")
     listed: list[ListedTest] = []
     logs: dict[str, str] = {}
     for target in ("root", "provider"):
-        run = run_conductor(repo_root, target, list_mode=True)
-        if run.process_exit_code != 0 or run.result.get("exitCode") != 0:
-            raise OptimizerError(f"{target} test list failed; log: {run.result.get('logPath')}")
+        if progress_sink is not None:
+            progress_sink({
+                "event": "verify_ledger_list_start",
+                "timestamp": utc_now(),
+                "target": target,
+                "timeout_seconds": list_timeout_seconds,
+            })
+        run = run_conductor(
+            repo_root,
+            target,
+            list_mode=True,
+            timeout_seconds=list_timeout_seconds,
+        )
+        if progress_sink is not None:
+            progress_sink({
+                "event": "verify_ledger_list_end",
+                "timestamp": utc_now(),
+                "target": target,
+                "ticket": run.ticket,
+                "process_exit_code": run.process_exit_code,
+                "state": run.result.get("state"),
+                "exit_code": run.result.get("exitCode"),
+                "log_path": run.result.get("logPath"),
+            })
+        if (
+            run.process_exit_code != 0
+            or run.result.get("state") != "completed"
+            or run.result.get("exitCode") != 0
+        ):
+            raise OptimizerError(
+                f"{target} test list failed: process_exit={run.process_exit_code} "
+                f"state={run.result.get('state')} exit={run.result.get('exitCode')} "
+                f"ticket={run.ticket} log={run.result.get('logPath')} stderr={run.stderr[-500:]}"
+            )
+        if not run.log_text:
+            raise OptimizerError(f"{target} test list log missing or empty: {run.result.get('logPath')}")
         listed.extend(parse_test_list(run.log_text, target))
         logs[target] = str(run.result.get("logPath") or "")
     listed_ids = sorted(test.method_id for test in listed)
@@ -922,13 +1804,19 @@ def baseline(
     inventory_path: Path | None = None,
     source_change_guard: str = SOURCE_GUARD_CONTENT,
     filter_value: str | None = None,
+    test_product: str | None = None,
+    build_before_samples: bool = False,
     progress_sink: ProgressSink | None = emit_progress_event,
 ) -> dict[str, Any]:
     if samples_requested <= 0:
         raise OptimizerError("--samples must be greater than zero")
+    if build_before_samples and target != "root":
+        raise OptimizerError("--build-before-samples currently supports only --target root")
+    if build_before_samples and test_product:
+        raise OptimizerError("--build-before-samples cannot be combined with --test-product")
     samples: list[Sample] = []
-    command = conductor_command(repo_root, target, filter_value=filter_value)
-    scope = "filtered" if filter_value else "complete"
+    command = conductor_command(repo_root, target, filter_value=filter_value, test_product=test_product)
+    scope = "filtered" if filter_value else "test-product" if test_product else "complete"
     for index in range(1, samples_requested + 1):
         if progress_sink is not None:
             progress_sink(
@@ -938,6 +1826,7 @@ def baseline(
                     "target": target,
                     "scope": scope,
                     "filter": filter_value,
+                    "test_product": test_product,
                     "source_guard": source_change_guard,
                     "sample_index": index,
                     "sample_count": samples_requested,
@@ -947,7 +1836,49 @@ def baseline(
                 }
             )
         before = measurement_source_guard_fingerprint(repo_root, source_change_guard)
-        run = run_conductor(repo_root, target, list_mode=False, filter_value=filter_value)
+        build: dict[str, Any] | None = None
+        if build_before_samples:
+            if progress_sink is not None:
+                progress_sink(
+                    {
+                        "event": "baseline_build_start",
+                        "timestamp": utc_now(),
+                        "target": target,
+                        "scope": scope,
+                        "filter": filter_value,
+                        "test_product": test_product,
+                        "sample_index": index,
+                        "sample_count": samples_requested,
+                    }
+                )
+            build_run = run_conductor_build(repo_root, target)
+            build = build_result_dict(build_run)
+            if progress_sink is not None:
+                progress_sink(
+                    {
+                        "event": "baseline_build_end",
+                        "timestamp": utc_now(),
+                        "target": target,
+                        "scope": scope,
+                        "filter": filter_value,
+                        "test_product": test_product,
+                        "sample_index": index,
+                        "sample_count": samples_requested,
+                        "ticket": build_run.ticket,
+                        "log_path": build.get("log_path"),
+                        "process_exit_code": build.get("process_exit_code"),
+                        "state": build.get("state"),
+                        "exit_code": build.get("exit_code"),
+                        "execution_seconds": build.get("execution_seconds"),
+                    }
+                )
+        run = run_conductor(
+            repo_root,
+            target,
+            list_mode=False,
+            filter_value=filter_value,
+            test_product=test_product,
+        )
         after = measurement_source_guard_fingerprint(repo_root, source_change_guard)
         sample = sample_from_run(
             index,
@@ -956,7 +1887,14 @@ def baseline(
             source_changed=before != after,
             source_guard_kind=source_change_guard,
             require_timings=filter_value is not None,
+            build=build,
         )
+        if build is not None and (
+            build.get("process_exit_code") != 0
+            or build.get("state") != "completed"
+            or build.get("exit_code") != 0
+        ):
+            sample.invalid_reasons.append("paired build failed")
         samples.append(sample)
         if progress_sink is not None:
             progress_sink(
@@ -966,6 +1904,7 @@ def baseline(
                     "target": target,
                     "scope": scope,
                     "filter": filter_value,
+                    "test_product": test_product,
                     "source_guard": source_change_guard,
                     "sample_index": index,
                     "sample_count": samples_requested,
@@ -990,7 +1929,9 @@ def baseline(
         "inventory": str(inventory_path) if inventory_path else None,
         "scope": scope,
         "filter": filter_value,
-        "primary_metric_eligible": target == "root" and filter_value is None,
+        "test_product": test_product,
+        "build_before_samples": build_before_samples,
+        "primary_metric_eligible": target == "root" and filter_value is None and test_product is None,
         "source_guard": {"kind": source_change_guard},
         "command": command,
         "git": git_metadata(repo_root),
@@ -1002,6 +1943,98 @@ def baseline(
     write_json_new(output, payload)
     append_baseline_scoreboard(scoreboard, payload, method_counts)
     return payload
+
+
+def focused_cost(
+    repo_root: Path,
+    target: str,
+    filter_value: str,
+    samples_requested: int,
+    label: str,
+    scoreboard: Path,
+    output: Path,
+    source_change_guard: str = SOURCE_GUARD_CONTENT,
+    progress_sink: ProgressSink | None = emit_progress_event,
+) -> dict[str, Any]:
+    if samples_requested <= 0:
+        raise OptimizerError("--samples must be greater than zero")
+    if not filter_value:
+        raise OptimizerError("--filter is required for focused-cost diagnostics")
+    samples: list[dict[str, Any]] = []
+    command = conductor_command(repo_root, target, filter_value=filter_value)
+    for index in range(1, samples_requested + 1):
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "focused_cost_sample_start",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "command": command,
+                    "ticket": None,
+                    "log_path": None,
+                }
+            )
+        before = measurement_source_guard_fingerprint(repo_root, source_change_guard)
+        run = run_conductor(repo_root, target, list_mode=False, filter_value=filter_value)
+        after = measurement_source_guard_fingerprint(repo_root, source_change_guard)
+        sample = sample_from_run(
+            index,
+            target,
+            run,
+            source_changed=before != after,
+            source_guard_kind=source_change_guard,
+            require_timings=True,
+        )
+        sample_payload = focused_cost_sample_to_dict(sample, run.result)
+        samples.append(sample_payload)
+        if progress_sink is not None:
+            progress_sink(
+                {
+                    "event": "focused_cost_sample_end",
+                    "timestamp": utc_now(),
+                    "target": target,
+                    "filter": filter_value,
+                    "source_guard": source_change_guard,
+                    "sample_index": index,
+                    "sample_count": samples_requested,
+                    "ticket": run.ticket,
+                    "log_path": sample.log_path or None,
+                    "process_exit_code": sample.process_exit_code,
+                    "state": sample.state,
+                    "exit_code": sample.exit_code,
+                    "total_execution_seconds": sample.execution_seconds,
+                    "parsed_xctest_seconds": sample_payload["parsed_xctest_seconds"],
+                    "inferred_overhead_seconds": sample_payload["inferred_overhead_seconds"],
+                    "max_rss_bytes": sample_payload["max_rss_bytes"],
+                    "measurement_invalid": sample.measurement_invalid,
+                    "source_changed": sample.source_changed,
+                    "valid": sample.valid,
+                    "invalid_reasons": sample.invalid_reasons,
+                }
+            )
+    payload = {
+        "timestamp": utc_now(),
+        "diagnostic_kind": "focused-cost",
+        "target": target,
+        "label": label,
+        "artifact": str(output),
+        "scope": "filtered",
+        "filter": filter_value,
+        "primary_metric_eligible": False,
+        "source_guard": {"kind": source_change_guard},
+        "command": command,
+        "git": git_metadata(repo_root),
+        "samples": samples,
+        "summary": focused_cost_summary(samples),
+    }
+    write_json_new(output, payload)
+    append_focused_cost_scoreboard(scoreboard, payload)
+    return payload
+
 
 
 def load_counts(path: Path | None) -> dict[str, int] | None:
@@ -1018,16 +2051,19 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
     targets: set[str] = set()
     scopes: set[str] = set()
     filters: set[str | None] = set()
+    test_products: set[str | None] = set()
     source_guards: set[str] = set()
     for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
         target = str(payload.get("target") or "")
         scope = str(payload.get("scope") or "complete")
         filter_value = payload.get("filter")
+        test_product = payload.get("test_product")
         source_guard = str((payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT)
         targets.add(target)
         scopes.add(scope)
         filters.add(str(filter_value) if filter_value is not None else None)
+        test_products.add(str(test_product) if test_product is not None else None)
         source_guards.add(source_guard)
         for raw_sample in payload.get("samples") or []:
             sample = dict(raw_sample)
@@ -1064,6 +2100,10 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
         raise OptimizerError(f"combined baselines must have one scope, found: {sorted(scopes)}")
     if len(filters) != 1:
         raise OptimizerError(f"combined baselines must have one filter, found: {sorted(filters, key=str)}")
+    if len(test_products) != 1:
+        raise OptimizerError(
+            f"combined baselines must have one test product, found: {sorted(test_products, key=str)}"
+        )
     if len(source_guards) != 1:
         raise OptimizerError(
             f"combined baselines must have one source change guard, found: {sorted(source_guards)}"
@@ -1075,13 +2115,15 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
     target = next(iter(targets))
     scope = next(iter(scopes))
     filter_value = next(iter(filters))
+    test_product = next(iter(test_products))
     source_guard = next(iter(source_guards))
     return {
         "timestamp": utc_now(),
         "target": target,
         "scope": scope,
         "filter": filter_value,
-        "primary_metric_eligible": target == "root" and filter_value is None,
+        "test_product": test_product,
+        "primary_metric_eligible": target == "root" and filter_value is None and test_product is None,
         "source_guard": {"kind": source_guard},
         "source_artifacts": [str(path) for path in paths],
         "samples": samples,
@@ -1166,6 +2208,32 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_parser.add_argument("--inventory", type=Path)
     baseline_parser.add_argument("--filter", help="optional XCTest filter for focused baseline artifacts")
     baseline_parser.add_argument(
+        "--test-product",
+        help="optional SwiftPM test product for focused split-target baseline artifacts",
+    )
+    baseline_parser.add_argument(
+        "--source-change-guard",
+        choices=[SOURCE_GUARD_CONTENT, SOURCE_GUARD_METADATA],
+        default=SOURCE_GUARD_CONTENT,
+        help="source mutation guard used before/after each sample",
+    )
+    baseline_parser.add_argument(
+        "--build-before-samples",
+        action="store_true",
+        help="run a coordinated build before each test sample and record build/test cost separately",
+    )
+
+    focused_cost_parser = subparsers.add_parser(
+        "focused-cost",
+        help="collect filtered compile/link/runtime overhead diagnostics without primary metric eligibility",
+    )
+    focused_cost_parser.add_argument("--target", choices=["root", "provider"], required=True)
+    focused_cost_parser.add_argument("--filter", required=True, help="XCTest filter for the focused diagnostic run")
+    focused_cost_parser.add_argument("--samples", type=int, required=True)
+    focused_cost_parser.add_argument("--label", required=True)
+    focused_cost_parser.add_argument("--scoreboard", type=Path, required=True)
+    focused_cost_parser.add_argument("--output", type=Path, required=True)
+    focused_cost_parser.add_argument(
         "--source-change-guard",
         choices=[SOURCE_GUARD_CONTENT, SOURCE_GUARD_METADATA],
         default=SOURCE_GUARD_CONTENT,
@@ -1185,8 +2253,68 @@ def build_parser() -> argparse.ArgumentParser:
     rank_parser.add_argument("--log", action="append", type=Path, required=True)
     rank_parser.add_argument("--top", type=int, default=20)
 
+    impacted_parser = subparsers.add_parser(
+        "impacted",
+        help="select and optionally run impacted root XCTest methods from git diff and the contract ledger",
+    )
+    impacted_parser.add_argument("--ledger", type=Path, required=True)
+    impacted_parser.add_argument(
+        "--range",
+        dest="range_spec",
+        default=DEFAULT_IMPACTED_RANGE,
+        help="git diff range/spec; default unions origin/main...HEAD with working-tree changes",
+    )
+    impacted_parser.add_argument(
+        "--include-heavy",
+        action="store_true",
+        help="include codemap_e2e/scale/diagnostic/live/release tiers when selected",
+    )
+    impacted_parser.add_argument(
+        "--smoke-suite",
+        action="append",
+        default=[],
+        help="suite to always include; defaults to the repository smoke floor",
+    )
+    impacted_parser.add_argument(
+        "--run",
+        action="store_true",
+        help="run the selected exact filters through conductor after printing the plan",
+    )
+    impacted_parser.add_argument(
+        "--skip-live-list-validation",
+        action="store_true",
+        help="do not run conductor test --list before selecting impacted rows",
+    )
+
+    shard_parser = subparsers.add_parser(
+        "shard-plan",
+        help="partition root XCTest methods into weighted conductor filters",
+    )
+    shard_parser.add_argument("--ledger", type=Path, required=True)
+    shard_parser.add_argument("--shards", type=int, required=True)
+    shard_parser.add_argument("--include-heavy", action="store_true")
+
+    runtime_import_parser = subparsers.add_parser("runtime-import", help="write a candidate ledger with runtime_seconds from a baseline artifact")
+    runtime_import_parser.add_argument("--ledger", type=Path, required=True)
+    runtime_import_parser.add_argument("--baseline", type=Path, required=True)
+    runtime_import_parser.add_argument("--output", type=Path, required=True)
+
+    ci_suite_plan_parser = subparsers.add_parser("ci-suite-plan", help="partition root XCTest suites for hosted CI planning")
+    ci_suite_plan_parser.add_argument("--ledger", type=Path, required=True)
+    ci_suite_plan_parser.add_argument("--shards", type=int, required=True)
+    ci_suite_plan_parser.add_argument("--suite", action="append", default=[])
+    ci_suite_plan_parser.add_argument("--default-runtime-seconds", type=float, default=1.0)
+    ci_suite_plan_parser.add_argument("--batch-max-seconds", type=float, default=5.0)
+    ci_suite_plan_parser.add_argument("--allow-missing-runtime-for-batching", action="store_true")
+
     verify_parser = subparsers.add_parser("verify-ledger", help="re-list tests and reconcile ledger rows")
     verify_parser.add_argument("--ledger", type=Path, required=True)
+    verify_parser.add_argument(
+        "--list-timeout-seconds",
+        type=int,
+        default=LIST_COMMAND_TIMEOUT_SECONDS,
+        help="client-side timeout for each conductor list job",
+    )
     return parser
 
 
@@ -1208,6 +2336,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 inventory_path=args.inventory,
                 source_change_guard=args.source_change_guard,
                 filter_value=args.filter,
+                test_product=args.test_product,
+                build_before_samples=args.build_before_samples,
+            )
+        elif args.command == "focused-cost":
+            payload = focused_cost(
+                repo_root=repo_root,
+                target=args.target,
+                filter_value=args.filter,
+                samples_requested=args.samples,
+                label=args.label,
+                scoreboard=args.scoreboard,
+                output=args.output,
+                source_change_guard=args.source_change_guard,
             )
         elif args.command == "combine-baselines":
             payload = combine_baselines(args.input, args.top)
@@ -1216,8 +2357,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = compare_baselines(args.before, args.after)
         elif args.command == "rank":
             payload = rank_logs(args.log, args.top)
+        elif args.command == "impacted":
+            smoke_floor = args.smoke_suite or DEFAULT_SMOKE_FLOOR_SUITES
+            payload = impacted_tests(
+                repo_root=repo_root,
+                ledger=args.ledger,
+                range_spec=args.range_spec,
+                include_heavy=args.include_heavy,
+                smoke_floor_suites=smoke_floor,
+                run_selected=args.run,
+                validate_live_list=not args.skip_live_list_validation,
+            )
+        elif args.command == "shard-plan":
+            payload = shard_root_tests(args.ledger, args.shards, include_heavy=args.include_heavy)
+        elif args.command == "runtime-import":
+            payload = runtime_import(args.ledger, args.baseline, args.output)
+        elif args.command == "ci-suite-plan":
+            payload = ci_suite_plan(
+                args.ledger,
+                args.shards,
+                suites=args.suite,
+                default_runtime_seconds=args.default_runtime_seconds,
+                batch_max_seconds=args.batch_max_seconds,
+                require_runtime_for_batching=not args.allow_missing_runtime_for_batching,
+            )
         elif args.command == "verify-ledger":
-            payload = verify_ledger(repo_root, args.ledger)
+            payload = verify_ledger(repo_root, args.ledger, args.list_timeout_seconds)
         else:
             raise OptimizerError(f"unsupported command: {args.command}")
     except (OSError, OptimizerError, ValueError) as exc:

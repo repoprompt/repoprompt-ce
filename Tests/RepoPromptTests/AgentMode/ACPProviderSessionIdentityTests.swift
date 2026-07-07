@@ -3,16 +3,6 @@ import Foundation
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
-    private var temporaryURLs: [URL] = []
-
-    override func tearDown() {
-        for url in temporaryURLs {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryURLs.removeAll()
-        super.tearDown()
-    }
-
     func testCursorNewSessionPublishesRuntimeIDAsVerifiedLoadID() async throws {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()
@@ -125,11 +115,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ACPProviderSessionIdentityTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryURLs.append(url)
-        return url
+        try makeTestDirectory(name: "ACPProviderSessionIdentityTests")
     }
 
     private func makeFakeACPServerScript() throws -> URL {
