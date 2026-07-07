@@ -50,6 +50,7 @@ enum MCPIntegrationHelper {
         "oracle_send",
         "oracle_utils",
         "oracle_chat_log",
+        "history",
         "git",
         "bind_context",
         "manage_workspaces",

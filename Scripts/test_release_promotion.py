@@ -396,6 +396,9 @@ class ReleasePromotionTests(unittest.TestCase):
                 "PATH": f"{fake_bin}:{env.get('PATH', '')}",
                 "RELEASE_TAG": release_tag,
                 "RELEASE_COMMIT": "fixture-release-commit",
+                # Pin the source repo so the mocked gh (which matches --repo repoprompt/repoprompt-ce)
+                # is selected regardless of ambient GITHUB_REPOSITORY on fork CI runners.
+                "SOURCE_GITHUB_REPOSITORY": "repoprompt/repoprompt-ce",
                 "SOURCE_GH_TOKEN": "source-token",
                 "PUBLIC_UPDATE_GH_TOKEN": "update-token",
                 "REVIEWED_CHECKSUMS_SHA256": reviewed_checksums_sha256 or self.sha256(checksums_path),

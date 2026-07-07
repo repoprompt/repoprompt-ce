@@ -1,0 +1,41 @@
+{
+  "id" : "99999999-9999-4999-8999-999999999999",
+  "serializationVersion" : 6,
+  "name" : "Raw Compacted Summary Session",
+  "savedAt" : 721762895,
+  "items" : [],
+  "transcript" : {
+    "version" : 3,
+    "nextSequenceIndex" : 1,
+    "turns" : [
+      {
+        "id" : "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "responseSpans" : [],
+        "retentionTier" : "summary",
+        "summary" : {
+          "middleSummaryItemID" : "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "requestText" : "Review raw history fixture behavior",
+          "compactConclusionText" : "Raw summary keyword completed for persisted summary coverage.",
+          "toolCount" : 4,
+          "notableToolNames" : ["apply_edits", "bash"],
+          "keyPaths" : ["Sources/History/RawSummary.swift"],
+          "compactedActivityCount" : 6,
+          "hadWarning" : false,
+          "hadError" : false
+        },
+        "startedAt" : 721762800,
+        "completedAt" : 721762890
+      }
+    ]
+  },
+  "itemCount" : 1,
+  "lastUserMessageAt" : 721762800,
+  "agentKind" : "claudeCodeGLM",
+  "agentModel" : "opus",
+  "lastRunState" : "completed",
+  "autoEditEnabled" : true,
+  "providerTokenUsageByTurn" : [],
+  "isMCPOriginated" : false,
+  "worktreeBindings" : [],
+  "worktreeMergeOperations" : []
+}

@@ -496,6 +496,22 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    // MARK: - History
+
+    func historyIdleThresholdMinutes() -> Int {
+        let raw = (defaults.object(forKey: HistoryMCPToolService.idleThresholdSettingsKey) as? Int)
+            ?? AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        // Defense for out-of-band writes; the UI slider caps 0...60 but `defaults write`
+        // can store anything. Clamp to the spec's 0...1440 range.
+        return min(max(0, raw), 1440)
+    }
+
+    func setHistoryIdleThresholdMinutes(_ minutes: Int) {
+        let clamped = min(max(0, minutes), 1440)
+        defaults.set(clamped, forKey: HistoryMCPToolService.idleThresholdSettingsKey)
+        objectWillChange.send()
+    }
+
     func fontScaleBodySize() -> Double {
         guard let rawValue = scalarPreferences.ui?.fontScaleBodySize,
               let preset = FontScalePreset(rawValue: rawValue)
