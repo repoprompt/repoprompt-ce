@@ -60,7 +60,7 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
             return snapshot
         } catch {
             await controller.shutdown()
-            throw error
+            throw provider.normalizeError(error)
         }
     }
 }

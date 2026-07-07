@@ -48,7 +48,6 @@ actor ACPAgentSessionController {
         case processNotRunning
         case protocolViolation(String)
         case requestFailed(String, code: Int? = nil)
-        case requestTimedOut(method: String, timeoutSeconds: TimeInterval, launchDescription: String?, diagnosticHint: String?)
         case transportClosed
 
         var errorDescription: String? {
@@ -64,25 +63,9 @@ actor ACPAgentSessionController {
                     return "ACP request failed: \(message) (code \(code))"
                 }
                 return "ACP request failed: \(message)"
-            case let .requestTimedOut(method, timeoutSeconds, launchDescription, diagnosticHint):
-                var message = "ACP request \(method) timed out after \(Self.formattedTimeout(timeoutSeconds))."
-                if let launchDescription, !launchDescription.isEmpty {
-                    message += " Launched: `\(launchDescription)`."
-                }
-                if let diagnosticHint, !diagnosticHint.isEmpty {
-                    message += " \(diagnosticHint)"
-                }
-                return message
             case .transportClosed:
                 return "ACP transport closed unexpectedly."
             }
-        }
-
-        private static func formattedTimeout(_ seconds: TimeInterval) -> String {
-            if seconds.rounded(.towardZero) == seconds {
-                return "\(Int(seconds))s"
-            }
-            return String(format: "%.1fs", seconds)
         }
     }
 
@@ -242,6 +225,7 @@ actor ACPAgentSessionController {
     private var stdoutFramer = LineFramer()
     private var stderrFramer = LineFramer()
     private var launchDescription: String?
+    private var agentIdentityDescription: String?
     private var stdoutByteCount = 0
     private var stdoutLineCount = 0
     private var invalidACPLineCount = 0
@@ -470,6 +454,10 @@ actor ACPAgentSessionController {
             ]
         )
         diagnose(.phaseCompleted("initialize"))
+        agentIdentityDescription = Self.agentIdentityDescription(from: initializeResponse)
+        if let agentIdentityDescription {
+            diagnose(.info("ACP agent identity: \(agentIdentityDescription)"))
+        }
         state = .initialized
 
         let authMethods = initializeResponse["authMethods"] as? [[String: Any]] ?? []
@@ -589,7 +577,7 @@ actor ACPAgentSessionController {
                 throw error
             }
             let message = displayText(for: provider.normalizeError(error))
-            if case ControllerError.requestTimedOut = error {
+            if error is ACPRequestTimeoutError {
                 emit(.stream(AIStreamResult(type: "error", text: message)))
                 log("ACP prompt request timed out; cancelling prompt")
             } else {
@@ -910,14 +898,19 @@ actor ACPAgentSessionController {
                 guard let self else { throw ControllerError.transportClosed }
                 try await waitForPromptSettlement(turnID: turnID)
             }
-            group.addTask { [launchDescription, diagnosticHint = timeoutDiagnosticHint()] in
+            group.addTask { [
+                launchDescription,
+                diagnosticHint = timeoutDiagnosticHint(),
+                agentIdentityDescription
+            ] in
                 let duration = UInt64((timeoutSeconds * 1_000_000_000).rounded())
                 try await Task.sleep(nanoseconds: duration)
-                throw ControllerError.requestTimedOut(
+                throw ACPRequestTimeoutError(
                     method: "session/cancel",
                     timeoutSeconds: timeoutSeconds,
                     launchDescription: launchDescription,
-                    diagnosticHint: diagnosticHint
+                    diagnosticHint: diagnosticHint,
+                    agentIdentity: agentIdentityDescription
                 )
             }
             defer { group.cancelAll() }
@@ -1577,11 +1570,12 @@ actor ACPAgentSessionController {
         for storageKey in candidateStorageKeys(for: requestID) {
             guard let pendingRequest = pendingRequests.removeValue(forKey: storageKey) else { continue }
             pendingRequest.timeoutTask?.cancel()
-            let error = ControllerError.requestTimedOut(
+            let error = ACPRequestTimeoutError(
                 method: method,
                 timeoutSeconds: timeoutSeconds,
                 launchDescription: launchDescription,
-                diagnosticHint: timeoutDiagnosticHint()
+                diagnosticHint: timeoutDiagnosticHint(),
+                agentIdentity: agentIdentityDescription
             )
             diagnose(.info(error.localizedDescription))
             pendingRequest.continuation.resume(throwing: error)
@@ -1606,6 +1600,22 @@ actor ACPAgentSessionController {
             return "The process did not write ACP stdout before timing out, but it wrote stderr.\(preview)"
         }
         return "The process stayed silent on ACP stdout/stderr. This usually means the selected command started an interactive/non-ACP mode instead of an ACP stdio server."
+    }
+
+    private static func agentIdentityDescription(from initializeResponse: [String: Any]) -> String? {
+        guard let info = initializeResponse["agentInfo"] as? [String: Any] else { return nil }
+        let name = (info["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = (info["version"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch (name?.isEmpty == false ? name : nil, version?.isEmpty == false ? version : nil) {
+        case let (name?, version?):
+            return "\(name) \(version)"
+        case let (name?, nil):
+            return name
+        case let (nil, version?):
+            return version
+        case (nil, nil):
+            return nil
+        }
     }
 
     private static func displayCommand(command: String, arguments: [String]) -> String {
