@@ -20,6 +20,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
 
+    /// Gates the keyboard ⌘Q quit gesture behind a hold (held by the AppDelegate
+    /// for the app's lifetime). Installed only in normal (non-launch-suppressed)
+    /// sessions so UI-test/launch-suppressed launches keep today's behavior.
+    private let quitHoldController = QuitHoldController()
+
     // New global routing/settings services (kept alive by the AppDelegate)
     private var windowRoutingService: WindowRoutingService?
     private var appSettingsMCPService: AppSettingsMCPService?
@@ -97,6 +102,14 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             Task.detached(priority: .utility) {
                 await MCPPromptValidationService.shared.validateCodexPromptsOnLaunch()
             }
+        }
+
+        // Install the hold-⌘Q-to-quit keyboard gate once for both DEBUG and
+        // release paths. Skipped for launch-suppressed / UI-test sessions so they
+        // keep today's ungated behavior. The gate lives entirely in the local
+        // NSEvent monitor; applicationShouldTerminate is unchanged.
+        if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
+            quitHoldController.install()
         }
 
         #if DEBUG
