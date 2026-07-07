@@ -688,6 +688,14 @@ actor AgentSessionDataService {
         for fileURL in files {
             let values = metadataResourceValues(for: fileURL)
             do {
+                // Load a lightweight stub (transcript=nil). Transcript-derived v5 fields
+                // (duration primitives, keyPaths, toolCount, activity bounds) are left empty
+                // here and computed on demand by the `history` tool — see
+                // `AgentSessionMetadataRecord.enrichingTranscriptDerivedFields(from:)`. This
+                // keeps the shared index rebuild — which feeds the agent-mode sidebar and
+                // workspace restore — from decoding every full session transcript just to
+                // precompute fields only history consumes. The save/load path still populates
+                // these fields for free for sessions touched through normal app use.
                 let stub = try await loadAgentSessionStub(
                     from: fileURL,
                     recoverMissingMetadata: false,
@@ -1386,7 +1394,7 @@ actor AgentSessionDataService {
             if !FileManager.default.fileExists(atPath: root.path) {
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             }
-            let folderName = "Workspace-\(workspace.name)-\(workspace.id.uuidString)"
+            let folderName = WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id)
             let workspaceDir = root.appendingPathComponent(folderName)
             if !FileManager.default.fileExists(atPath: workspaceDir.path) {
                 try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)

@@ -946,9 +946,197 @@ extension ToolOutputFormatter {
             return formatAgentRun(args: args, value: result)
         case "agent_manage":
             return formatAgentManage(args: args, value: result)
+        case "history":
+            return formatHistory(args: args, value: result)
         default:
             return formatGeneric(value: result)
         }
+    }
+
+    // MARK: - History
+
+    static func formatHistory(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
+        guard let object = value.objectValue else { return formatGeneric(value: value) }
+        if let error = nonEmpty(object["error"]?.stringValue) {
+            return [.text("## History ❌\n- **Error**: \(error)")]
+        }
+
+        let op = args["op"]?.stringValue ?? "history"
+        var lines: [String] = []
+        switch op {
+        case "list_sessions":
+            let total = object["total_sessions"]?.intValue ?? 0
+            let sessions = object["sessions"]?.arrayValue ?? []
+            lines.append("## History Sessions \(statusIcon(success: true))")
+            lines.append("- **Total sessions**: \(total) • **Returned**: \(sessions.count)")
+            if total == 0 { lines.append("- **Status**: No matching sessions found") }
+            if object["truncated"]?.boolValue == true { lines.append("- **More sessions available**: increase `limit` to return more") }
+            if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
+                lines.append("- **Hint**: `touched_file` matches basenames, suffixes, repo-relative paths, and absolute/worktree paths.")
+            }
+            appendHistoryScanMetadata(object, to: &lines)
+            for sessionValue in sessions {
+                guard let session = sessionValue.objectValue else { continue }
+                let name = nonEmpty(session["session_name"]?.stringValue) ?? "(untitled)"
+                let workspace = nonEmpty(session["workspace_name"]?.stringValue) ?? "unknown workspace"
+                let duration = session["active_duration_seconds"]?.intValue ?? 0
+                let turns = session["turn_count"]?.intValue ?? 0
+                let files = session["files_touched"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                let filesTouchedCount = session["files_touched_count"]?.intValue ?? files.count
+                var suffix = "\(duration)s, \(turns) turn\(turns == 1 ? "" : "s")"
+                if !files.isEmpty {
+                    suffix += ", files: \(files.prefix(3).joined(separator: ", "))"
+                    let omittedFiles = max(0, filesTouchedCount - files.count)
+                    if omittedFiles > 0 { suffix += " (+\(omittedFiles) more)" }
+                }
+                lines.append("- `\(session["session_id"]?.stringValue ?? "")` **\(name)** (\(workspace)) — \(suffix)")
+            }
+        case "search":
+            let total = object["total_matches"]?.intValue ?? 0
+            let results = object["results"]?.arrayValue ?? []
+            lines.append("## History Search \(statusIcon(success: true))")
+            lines.append("- **Total matches**: \(total) • **Returned**: \(results.count)")
+            if total == 0 { lines.append("- **Status**: No matching turns found") }
+            if object["truncated"]?.boolValue == true { lines.append("- **More matches available**: increase `limit` to return more") }
+            appendHistoryScanMetadata(object, to: &lines)
+            for resultValue in results {
+                guard let result = resultValue.objectValue else { continue }
+                let sessionID = nonEmpty(result["session_id"]?.stringValue) ?? ""
+                let session = nonEmpty(result["session_name"]?.stringValue) ?? "(untitled)"
+                let source = nonEmpty(result["source"]?.stringValue) ?? "match"
+                let snippet = nonEmpty(result["snippet"]?.stringValue) ?? ""
+                var line = "- `\(sessionID)` **\(session)** turn \(result["turn_index"]?.intValue ?? 0) [\(source)]"
+                if let role = nonEmpty(result["role"]?.stringValue) { line += " \(role)" }
+                if let timestamp = nonEmpty(result["timestamp"]?.stringValue) { line += " @ \(timestamp)" }
+                line += " — \(snippet)"
+                if let turnRequestText = nonEmpty(result["turn_request_text"]?.stringValue) {
+                    line += "\n  - request: \(turnRequestText)"
+                }
+                lines.append(line)
+            }
+        case "time":
+            let totalSessions = object["total_sessions"]?.intValue ?? 0
+            let totalDuration = object["total_active_duration_seconds"]?.intValue ?? 0
+            let groups = object["groups"]?.arrayValue ?? []
+            lines.append("## History Time \(statusIcon(success: true))")
+            lines.append("- **Total sessions**: \(totalSessions) • **Active duration**: \(totalDuration)s • **Groups**: \(groups.count)")
+            if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
+            if object["truncated"]?.boolValue == true { lines.append("- **More groups available**: increase `limit` to return more") }
+            appendHistoryScanMetadata(object, to: &lines)
+            for groupValue in groups {
+                guard let group = groupValue.objectValue else { continue }
+                let key = group["key"]?.stringValue ?? ""
+                let sessions = group["sessions"]?.intValue ?? 0
+                let duration = group["active_duration_seconds"]?.intValue ?? 0
+                let turns = group["turn_count"]?.intValue ?? 0
+                lines.append("- `\(key)` — \(duration)s, \(sessions) session\(sessions == 1 ? "" : "s"), \(turns) turn\(turns == 1 ? "" : "s")")
+                let details = group["details"]?.arrayValue ?? []
+                for detailValue in details.prefix(3) {
+                    guard let detail = detailValue.objectValue else { continue }
+                    let detailSessionID = nonEmpty(detail["session_id"]?.stringValue) ?? ""
+                    let detailSession = nonEmpty(detail["session_name"]?.stringValue) ?? "(untitled)"
+                    let detailDuration = detail["active_duration_seconds"]?.intValue ?? 0
+                    let detailTurns = detail["turn_count"]?.intValue ?? 0
+                    lines.append("  - `\(detailSessionID)` \(detailSession) — \(detailDuration)s, \(detailTurns) turn\(detailTurns == 1 ? "" : "s")")
+                }
+                if details.count > 3 {
+                    lines.append("  - … +\(details.count - 3) more")
+                }
+            }
+        case "get_session":
+            let sessionID = nonEmpty(object["session_id"]?.stringValue) ?? ""
+            let sessionName = nonEmpty(object["session_name"]?.stringValue) ?? "(untitled)"
+            let workspaceName = nonEmpty(object["workspace_name"]?.stringValue) ?? "unknown workspace"
+            let totalTurns = object["total_turns"]?.intValue ?? 0
+            let start = object["returned_turn_start"]?.intValue ?? 0
+            let end = object["returned_turn_end"]?.intValue ?? start
+            let turns = object["turns"]?.arrayValue ?? []
+            let targetTurn = args["around_turn"]?.intValue ?? args["turn_start"]?.intValue
+            let maxChars = clampedHistoryFormatterMaxChars(args["max_chars"]?.intValue)
+            lines.append("## History Session \(statusIcon(success: true))")
+            lines.append("- `\(sessionID)` **\(sessionName)** (\(workspaceName))")
+            lines.append("- **Turns**: \(start)–\(end) of \(totalTurns)")
+            if let targetTurn { lines.append("- **Target turn**: \(targetTurn)") }
+            if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
+
+            let orderedTurns = turns.sorted { lhs, rhs in
+                let leftIndex = lhs.objectValue?["turn_index"]?.intValue ?? Int.max
+                let rightIndex = rhs.objectValue?["turn_index"]?.intValue ?? Int.max
+                if leftIndex == targetTurn { return true }
+                if rightIndex == targetTurn { return false }
+                return leftIndex < rightIndex
+            }
+            for turnValue in orderedTurns {
+                guard let turn = turnValue.objectValue else { continue }
+                let turnIndex = turn["turn_index"]?.intValue ?? 0
+                let isTarget = targetTurn == turnIndex
+                lines.append("")
+                lines.append(isTarget ? "### Target Turn \(turnIndex)" : "### Context Turn \(turnIndex)")
+                if let startedAt = nonEmpty(turn["started_at"]?.stringValue) {
+                    lines.append("- **Started**: \(startedAt)")
+                }
+                if let request = nonEmpty(turn["request_text"]?.stringValue) {
+                    lines.append("- **Request**: \(request)")
+                }
+                if let toolSummary = nonEmpty(turn["tool_call_summary"]?.stringValue) {
+                    lines.append("- **Tools**: \(toolSummary)")
+                }
+                let entries = turn["entries"]?.arrayValue ?? []
+                for entryValue in entries {
+                    guard let entry = entryValue.objectValue else { continue }
+                    let role = nonEmpty(entry["role"]?.stringValue) ?? "entry"
+                    let text = nonEmpty(entry["text"]?.stringValue) ?? ""
+                    var prefix = "  - **\(role)**"
+                    if let timestamp = nonEmpty(entry["timestamp"]?.stringValue) {
+                        prefix += " @ \(timestamp)"
+                    }
+                    let suffix = entry["truncated"]?.boolValue == true ? " …" : ""
+                    lines.append("\(prefix): \(text)\(suffix)")
+                }
+                if turn["truncated"]?.boolValue == true {
+                    lines.append("  - … turn truncated; retry: `history get_session session_id=\(sessionID) around_turn=\(turnIndex) context_turns=0 max_chars=\(maxChars)`")
+                }
+                if let omitted = turn["entries_omitted"]?.intValue, omitted > 0 {
+                    lines.append("  - … +\(omitted) omitted entr\(omitted == 1 ? "y" : "ies")")
+                }
+            }
+        default:
+            return formatGeneric(value: value)
+        }
+        var formatted = lines.joined(separator: "\n")
+        if op == "get_session" {
+            let maxChars = clampedHistoryFormatterMaxChars(args["max_chars"]?.intValue)
+            if formatted.count > maxChars {
+                let hint = "\n\n… output clipped to max_chars=\(maxChars); retry `get_session` with `context_turns: 0` or a larger `max_chars`."
+                let contentBudget = max(1, maxChars - hint.count)
+                formatted = String(formatted.prefix(contentBudget)) + hint
+            }
+        }
+        return [.text(formatted)]
+    }
+
+    private static func clampedHistoryFormatterMaxChars(_ value: Int?) -> Int {
+        guard let value else { return 6000 }
+        return max(1, min(value, 20000))
+    }
+
+    private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
+        let skipped = object["skipped_workspaces"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        if !skipped.isEmpty {
+            lines.append(historySkippedWorkspacesSummary(skipped))
+        }
+    }
+
+    private static func historySkippedWorkspacesSummary(_ skipped: [String]) -> String {
+        if skipped.allSatisfy({ $0.localizedCaseInsensitiveContains("stale index schema") }) {
+            let compact = skipped.map { item in
+                item.replacingOccurrences(of: "stale index schema ", with: "")
+            }.joined(separator: "; ")
+            return "- **Skipped stale session indexes**: \(compact)"
+        }
+        let label = "Skipped workspaces"
+        return "- **\(label)**: \(skipped.joined(separator: "; "))"
     }
 
     // MARK: - App Settings

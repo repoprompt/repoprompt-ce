@@ -6,12 +6,16 @@ import XCTest
 final class MCPToolAdmissionPolicyTests: XCTestCase {
     func testClassificationExhaustivelyCoversCanonicalCatalogWithoutDefault() {
         let canonicalTools = MCPToolExecutionContractCatalog.orderedAdvertisedToolNames
-        XCTAssertEqual(canonicalTools.count, 26)
+        XCTAssertEqual(canonicalTools.count, 27)
         XCTAssertEqual(Set(MCPToolAdmissionPolicy.classifications.keys), Set(canonicalTools))
         XCTAssertEqual(MCPToolAdmissionPolicy.classifications.count, canonicalTools.count)
         XCTAssertNil(MCPToolAdmissionPolicy.classification(forCanonicalToolName: "future_unreviewed_tool"))
         XCTAssertNil(ServerNetworkManager.callLane(forCanonicalToolName: "future_unreviewed_tool"))
 
+        // Cheap read-only tools sharing a tight per-window cap. history is excluded:
+        // `search`/calendar `time` can decode up to maxSessionsScanned transcripts on the
+        // shared scanner actor — heavier than these per-file reads, so history rides the
+        // .control lane to avoid starving read_file/get_code_structure under the small-read cap.
         assertClass(.smallRead, tools: [
             MCPWindowToolName.getCodeStructure,
             MCPWindowToolName.getFileTree,
@@ -31,7 +35,8 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
             MCPWindowToolName.agentManage,
             MCPWindowToolName.shareThoughts,
             MCPWindowToolName.setStatus,
-            MCPWindowToolName.waitForNextInstruction
+            MCPWindowToolName.waitForNextInstruction,
+            MCPWindowToolName.history
         ])
         assertClass(.exclusive, tools: [
             MCPGlobalToolName.appSettings,

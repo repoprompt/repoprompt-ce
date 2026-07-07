@@ -492,7 +492,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=03e16bee789cb9343f6b1b16cb4d472aedd3d811a43f6f95ad8ea5e8f69dc28d|schema=f5bc6b05cf0683ef3acb7a82ee4a14b75fadf26f32c56b0314be1424688a2ba5",
         "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
-        "22|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef"
+        "22|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
+        "23|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=e082791f37b91a339f66223799d917cb511ac5d18dbff5bc1f93790743ffe4a8|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d"
     ]
 
     private static func signatures(for tools: [RepoPrompt.Tool]) throws -> [String] {
