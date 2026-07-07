@@ -245,7 +245,13 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
     }
 
     func testPromptTimeoutDoesNotUseOpenCodeStartupGuidance() {
-        let provider = makeProviderForNormalization()
+        let guidanceCalled = OpenCodeTestLockedFlag()
+        let provider = makeProviderForNormalization(
+            recursiveMCPConfigGuidance: {
+                guidanceCalled.setTrue()
+                return "Unexpected recursive MCP config guidance"
+            }
+        )
         let timeout = ACPRequestTimeoutError(
             method: "session/prompt",
             timeoutSeconds: 30,
@@ -260,6 +266,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             return XCTFail("Unexpected normalized error: \(normalized)")
         }
         XCTAssertEqual((source as? ACPRequestTimeoutError), timeout)
+        XCTAssertFalse(guidanceCalled.value)
     }
 
     func testSessionNewTimeoutIncludesRecursiveMCPConfigGuidanceWhenDetected() {
@@ -412,5 +419,22 @@ private actor OpenCodeTestEnvironmentBox {
 
     func set(_ environment: [String: String]) {
         self.environment = environment
+    }
+}
+
+private final class OpenCodeTestLockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func setTrue() {
+        lock.lock()
+        storage = true
+        lock.unlock()
     }
 }

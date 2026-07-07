@@ -135,7 +135,7 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         }
         if let guidance = Self.openCodeACPStartupGuidance(
             for: error,
-            recursiveMCPConfigGuidance: recursiveMCPConfigGuidance()
+            recursiveMCPConfigGuidance: recursiveMCPConfigGuidance
         ) {
             return AIProviderError.invalidConfiguration(detail: guidance)
         }
@@ -147,7 +147,7 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
 
     private static func openCodeACPStartupGuidance(
         for error: Error,
-        recursiveMCPConfigGuidance: String?
+        recursiveMCPConfigGuidance: @Sendable () -> String?
     ) -> String? {
         guard let timeout = error as? ACPRequestTimeoutError,
               ["initialize", "authenticate", "session/new", "session/load"].contains(timeout.method)
@@ -156,7 +156,7 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         }
 
         let message = timeout.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        let recursiveGuidance = recursiveMCPConfigGuidance?
+        let recursiveGuidance = recursiveMCPConfigGuidance()?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let recovery = if let recursiveGuidance, !recursiveGuidance.isEmpty {
             " \(recursiveGuidance)"
