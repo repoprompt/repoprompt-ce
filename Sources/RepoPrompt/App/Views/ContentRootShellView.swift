@@ -78,6 +78,14 @@ struct ContentRootShellView: View {
                 agentNavigationHUD.present(mode: mode, currentWindow: viewModel.state)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .selectAgentNavigationHUDResult)) { note in
+            guard noteTargetsCurrentWindow(note), agentNavigationHUD.isPresented else { return }
+            (note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.handledRequest] as? AgentNavigationHUDHandledRequest)?.handled = true
+            guard let index = note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.resultIndex] as? Int else { return }
+            Task {
+                await agentNavigationHUD.selectItem(atDisplayIndex: index, currentWindow: viewModel.state)
+            }
+        }
         .onChange(of: isBlockingOverlayVisible) { _, isVisible in
             if isVisible {
                 animateHUD { agentNavigationHUD.dismiss() }

@@ -5,6 +5,7 @@ struct AgentNavigationHUDView: View {
     let windowState: WindowState
     @FocusState private var queryFocused: Bool
     @State private var suppressHoverSelectionUntil = Date.distantPast
+    @State private var activityReferenceDate = Date()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -25,13 +26,6 @@ struct AgentNavigationHUDView: View {
                     .padding(.top, topInset(for: geometry.size))
                     .padding(.horizontal, 24)
                     .padding(.bottom, 24)
-            }
-        }
-        .task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled else { return }
-                viewModel.refresh(currentWindow: windowState)
             }
         }
         .accessibilityAddTraits(.isModal)
@@ -55,17 +49,26 @@ struct AgentNavigationHUDView: View {
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(panelBackgroundStyle)
+                .shadow(color: Color.black.opacity(0.24), radius: 24, y: 14)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(Color(NSColor.separatorColor).opacity(0.62), lineWidth: 1)
         )
-        .shadow(color: Color.black.opacity(0.24), radius: 24, y: 14)
-        .onAppear { queryFocused = true }
+        .onAppear {
+            queryFocused = true
+            activityReferenceDate = Date()
+        }
         .agentNavigationHUDKeys(
             viewModel: viewModel,
-            onKeyboardNavigation: suppressHoverSelectionAfterKeyboardNavigation
+            onKeyboardNavigation: suppressHoverSelectionAfterKeyboardNavigation,
+            onNumberSelection: { index in
+                Task { await viewModel.selectItem(atDisplayIndex: index, currentWindow: windowState) }
+            }
         )
+        .onExitCommand {
+            _ = viewModel.clearQueryOrDismiss()
+        }
         .accessibilityElement(children: .contain)
     }
 
@@ -167,6 +170,9 @@ struct AgentNavigationHUDView: View {
                 .onSubmit {
                     Task { await viewModel.selectHighlighted(currentWindow: windowState) }
                 }
+                .onExitCommand {
+                    _ = viewModel.clearQueryOrDismiss()
+                }
             if viewModel.hiddenSubagentCount > 0 {
                 subagentToggle
             }
@@ -227,12 +233,13 @@ struct AgentNavigationHUDView: View {
                     if items.isEmpty {
                         emptyState
                     } else {
-                        ForEach(items) { item in
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                             AgentNavigationHUDRow(
                                 item: item,
                                 isSelected: item.id == viewModel.selectedItemID,
                                 fontPreset: fontPreset,
-                                now: Date(),
+                                now: activityReferenceDate,
+                                shortcutNumber: index < 9 ? index + 1 : nil,
                                 showsSubagentRollup: !viewModel.showSubagents && viewModel.queryIsEmpty,
                                 onHover: {
                                     guard Date() >= suppressHoverSelectionUntil else { return }
@@ -291,6 +298,7 @@ struct AgentNavigationHUDView: View {
         HStack(spacing: 8) {
             footerHint("↑↓", "Navigate")
             footerHint("↩", "Jump")
+            footerHint("⌘1–9", "Pick")
             footerHint(viewModel.snapshot.mode == .currentWindow ? "⇧⌘K" : "⌘K", viewModel.snapshot.mode == .currentWindow ? "All Agents" : "This Window")
             Spacer()
             footerHint("esc", viewModel.queryIsEmpty ? "Close" : "Clear")
@@ -326,9 +334,16 @@ struct AgentNavigationHUDView: View {
 private extension View {
     func agentNavigationHUDKeys(
         viewModel: AgentNavigationHUDViewModel,
-        onKeyboardNavigation: @escaping () -> Void
+        onKeyboardNavigation: @escaping () -> Void,
+        onNumberSelection: @escaping (Int) -> Void
     ) -> some View {
         onKeyPress(phases: [.down, .repeat]) { press in
+            if press.modifiers == .command,
+               let index = hudSelectionIndex(for: press.key)
+            {
+                onNumberSelection(index)
+                return .handled
+            }
             if press.modifiers == .control {
                 if press.key == "n" {
                     onKeyboardNavigation()
@@ -342,6 +357,10 @@ private extension View {
                 }
                 if press.key == "s" {
                     viewModel.toggleSubagents()
+                    return .handled
+                }
+                if let index = hudSelectionIndex(for: press.key) {
+                    onNumberSelection(index)
                     return .handled
                 }
             }
@@ -362,6 +381,21 @@ private extension View {
             }
         }
     }
+
+    private func hudSelectionIndex(for key: KeyEquivalent) -> Int? {
+        switch key {
+        case "1": 0
+        case "2": 1
+        case "3": 2
+        case "4": 3
+        case "5": 4
+        case "6": 5
+        case "7": 6
+        case "8": 7
+        case "9": 8
+        default: nil
+        }
+    }
 }
 
 private struct AgentNavigationHUDRow: View {
@@ -369,6 +403,7 @@ private struct AgentNavigationHUDRow: View {
     let isSelected: Bool
     let fontPreset: FontScalePreset
     let now: Date
+    let shortcutNumber: Int?
     let showsSubagentRollup: Bool
     let onHover: () -> Void
     let action: () -> Void
@@ -457,6 +492,11 @@ private struct AgentNavigationHUDRow: View {
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
                 .foregroundStyle(Color.white.opacity(0.78))
                 .frame(width: 42, alignment: .trailing)
+        } else if let shortcutNumber {
+            Text("⌘\(shortcutNumber)")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                .foregroundStyle(Color.secondary.opacity(0.82))
+                .frame(width: 34, alignment: .trailing)
         } else if !item.isActiveTab {
             Text(relativeActivityLabel)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
@@ -631,8 +671,6 @@ private struct AgentNavigationHUDWorktreeMarker: View {
 
 private struct AgentNavigationHUDActivityArc: View {
     var tint: Color = .accentColor
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var rotation: Double = 0
 
     var body: some View {
         Circle()
@@ -642,13 +680,7 @@ private struct AgentNavigationHUDActivityArc: View {
                 style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
             )
             .frame(width: 15, height: 15)
-            .rotationEffect(.degrees(rotation))
-            .onAppear {
-                guard !reduceMotion else { return }
-                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
-                    rotation = 360
-                }
-            }
+            .rotationEffect(.degrees(35))
             .accessibilityLabel("Running")
     }
 }

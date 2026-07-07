@@ -270,6 +270,19 @@ struct AgentModeSidebarSessionBuilder {
         let activityDate = Self.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
         let resolvedSessionID = authoritativeSessionID ?? entry?.id
         let resolvedParentSessionID = metadataLiveSession?.parentSessionID ?? entry?.parentSessionID
+        let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
+        let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
+        let mergeAttention = sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
+        let searchFields = Self.searchFields(
+            title: title,
+            entry: entry,
+            runState: metadataLiveSession?.runState ?? entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") },
+            isMCPControlled: isMCPControlled,
+            worktree: worktree,
+            mergeAttention: mergeAttention,
+            sessionID: resolvedSessionID,
+            tabID: tab.id
+        )
 
         return SidebarSession(
             id: tab.id,
@@ -281,9 +294,10 @@ struct AgentModeSidebarSessionBuilder {
             sessionID: resolvedSessionID,
             parentSessionID: resolvedParentSessionID,
             depth: 0,
-            isMCPControlled: mcpControlledTabIDs.contains(tab.id),
-            worktree: sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry),
-            worktreeMergeAttention: sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
+            isMCPControlled: isMCPControlled,
+            worktree: worktree,
+            worktreeMergeAttention: mergeAttention,
+            searchFields: searchFields
         )
     }
 
@@ -399,6 +413,92 @@ struct AgentModeSidebarSessionBuilder {
                 }
             }
             return sidebarRowPrecedes(lhs, rhs, tabOrder: context.tabOrder)
+        }
+    }
+
+    static func searchFields(
+        title: String,
+        entry: AgentSessionIndexEntry?,
+        runState: AgentSessionRunState?,
+        isMCPControlled: Bool,
+        worktree: AgentWorktreeIndicator?,
+        mergeAttention: AgentWorktreeMergeAttention?,
+        sessionID: UUID?,
+        tabID: UUID
+    ) -> AgentSessionSearchFields {
+        let summaries = entry?.worktreeBindingSummaries ?? []
+        let mergeSummaries = entry?.activeWorktreeMergeSummaries ?? []
+        return AgentSessionSearchFields(
+            title: title,
+            status: [
+                runState.flatMap(searchLabel(for:)),
+                entry?.lastRunStateRaw,
+                isMCPControlled ? "MCP" : nil,
+                mergeAttention == nil ? nil : "merge"
+            ],
+            model: [
+                entry?.agentKindRaw,
+                entry?.agentModelRaw,
+                entry?.agentReasoningEffortRaw
+            ],
+            worktree: [
+                worktree?.label,
+                worktree?.worktreeName,
+                worktree?.branch,
+                worktree?.logicalRootName,
+                mergeAttention?.sourceLabel,
+                mergeAttention?.targetLabel
+            ] + summaries.flatMap { summary in
+                [
+                    summary.visualLabel,
+                    summary.worktreeName,
+                    summary.branch,
+                    summary.logicalRootName,
+                    summary.repositoryID,
+                    summary.worktreeID
+                ]
+            } + mergeSummaries.flatMap { summary in
+                [
+                    summary.sourceLabel,
+                    summary.sourceBranch,
+                    summary.targetLabel,
+                    summary.targetBranch,
+                    summary.repositoryID
+                ]
+            },
+            secondary: [
+                isMCPControlled ? "MCP controlled" : nil,
+                entry?.autoEditEnabled == true ? "auto edit" : nil,
+                entry?.hasUnknownConversationContent == true ? "unknown content" : nil,
+                entry?.parentSessionID == nil ? nil : "sub-agent"
+            ],
+            path: [
+                worktree?.logicalRootPath,
+                worktree?.worktreeRootPath,
+                mergeAttention?.targetPath
+            ] + summaries.flatMap { summary in
+                [summary.logicalRootPath, summary.worktreeRootPath]
+            } + mergeSummaries.flatMap { summary in
+                [summary.sourcePath, summary.targetPath]
+            },
+            identifier: [
+                sessionID?.uuidString,
+                tabID.uuidString,
+                entry?.id.uuidString
+            ]
+        )
+    }
+
+    private static func searchLabel(for state: AgentSessionRunState) -> String? {
+        switch state {
+        case .idle: "Idle"
+        case .running: "Running"
+        case .waitingForUser: "Needs input"
+        case .waitingForQuestion: "Question"
+        case .waitingForApproval: "Approval"
+        case .completed: "Done"
+        case .cancelled: "Cancelled"
+        case .failed: "Failed"
         }
     }
 
@@ -636,7 +736,8 @@ struct AgentModeSidebarSessionBuilder {
             depth: depth,
             isMCPControlled: session.isMCPControlled,
             worktree: session.worktree,
-            worktreeMergeAttention: session.worktreeMergeAttention
+            worktreeMergeAttention: session.worktreeMergeAttention,
+            searchFields: session.searchFields
         )
     }
 

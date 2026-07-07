@@ -127,7 +127,7 @@ final class AgentNavigationHUDViewModel: ObservableObject {
         isRouting = true
         defer { isRouting = false }
 
-        if item.windowID == currentWindow.windowID {
+        if item.windowID == currentWindow.windowID, !item.isArchived {
             guard currentWindow.promptManager.currentComposeTabs.contains(where: { $0.id == item.tabID }) else {
                 errorMessage = "That Agent session changed. Results refreshed."
                 refresh(currentWindow: currentWindow)
@@ -152,7 +152,7 @@ final class AgentNavigationHUDViewModel: ObservableObject {
         case .currentWindow:
             AgentNavigationHUDSnapshotBuilder.currentWindowSnapshot(windowState: currentWindow)
         case .allAgents:
-            AgentNavigationHUDSnapshotBuilder.allAgentsSnapshot()
+            AgentNavigationHUDSnapshotBuilder.allAgentsSnapshot(currentWindow: currentWindow)
         }
         if nextSnapshot != snapshot {
             snapshot = nextSnapshot
@@ -161,33 +161,39 @@ final class AgentNavigationHUDViewModel: ObservableObject {
 
     private func rebuildFilteredItems(preserveSelection: Bool) {
         let previousSelection = preserveSelection ? selectedItemID : nil
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let tokens = Self.searchTokens(in: trimmed)
-        let corpus = displayCorpus(searching: !tokens.isEmpty)
-        let matchingItems: [AgentNavigationHUDItem] = if tokens.isEmpty {
+        let searchQuery = AgentSessionSearchQuery.parse(query)
+        let corpus = displayCorpus(searching: !searchQuery.isEmpty)
+        let matchingItems: [AgentNavigationHUDItem] = if searchQuery.isEmpty {
             corpus
         } else {
-            corpus.filter { item in Self.matches(item, tokens: tokens) }
+            rankedMatches(for: searchQuery, in: corpus)
         }
-        if tokens.isEmpty, snapshot.mode == .allAgents, matchingItems.count > AgentNavigationHUDSnapshotBuilder.allAgentsCap {
+        if searchQuery.isEmpty, snapshot.mode == .allAgents, matchingItems.count > AgentNavigationHUDSnapshotBuilder.allAgentsCap {
             let cappedItems = Array(matchingItems.prefix(AgentNavigationHUDSnapshotBuilder.allAgentsCap))
             if filteredItems != cappedItems {
                 filteredItems = cappedItems
             }
-            isShowingLimitedResults = true
+            if !isShowingLimitedResults {
+                isShowingLimitedResults = true
+            }
         } else {
             if filteredItems != matchingItems {
                 filteredItems = matchingItems
             }
-            isShowingLimitedResults = false
+            if isShowingLimitedResults {
+                isShowingLimitedResults = false
+            }
         }
 
-        if let previousSelection,
-           filteredItems.contains(where: { $0.id == previousSelection })
+        let nextSelectedItemID: String? = if let previousSelection,
+                                             filteredItems.contains(where: { $0.id == previousSelection })
         {
-            selectedItemID = previousSelection
+            previousSelection
         } else {
-            selectedItemID = filteredItems.first?.id
+            filteredItems.first?.id
+        }
+        if selectedItemID != nextSelectedItemID {
+            selectedItemID = nextSelectedItemID
         }
     }
 
@@ -205,45 +211,28 @@ final class AgentNavigationHUDViewModel: ObservableObject {
         return snapshot.items.filter { !$0.isSubagent }
     }
 
-    private nonisolated static func matches(_ item: AgentNavigationHUDItem, tokens: [String]) -> Bool {
-        tokens.allSatisfy { token in
-            item.metadataSearchText.contains { field in
-                field.localizedCaseInsensitiveContains(token)
-            }
+    func selectItem(atDisplayIndex index: Int, currentWindow: WindowState) async {
+        guard filteredItems.indices.contains(index) else { return }
+        await select(filteredItems[index], currentWindow: currentWindow)
+    }
+
+    private func rankedMatches(
+        for query: AgentSessionSearchQuery,
+        in corpus: [AgentNavigationHUDItem]
+    ) -> [AgentNavigationHUDItem] {
+        corpus.enumerated().compactMap { index, item -> (Int, AgentSessionSearchScore, AgentNavigationHUDItem)? in
+            guard let score = AgentSessionSearchMatcher.score(query: query, fields: item.searchFields) else { return nil }
+            return (index, score, item)
         }
+        .sorted { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+            return lhs.0 < rhs.0
+        }
+        .map(\.2)
     }
 
     nonisolated static func searchTokens(in query: String) -> [String] {
-        var tokens: [String] = []
-        var current = ""
-        var inQuote = false
-
-        for character in query {
-            if character == "\"" {
-                if inQuote {
-                    appendToken(&tokens, current)
-                    current = ""
-                } else {
-                    appendToken(&tokens, current)
-                    current = ""
-                }
-                inQuote.toggle()
-            } else if character.isWhitespace, !inQuote {
-                appendToken(&tokens, current)
-                current = ""
-            } else {
-                current.append(character)
-            }
-        }
-        appendToken(&tokens, current)
-        return tokens
-    }
-
-    private nonisolated static func appendToken(_ tokens: inout [String], _ token: String) {
-        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            tokens.append(trimmed)
-        }
+        AgentSessionSearchQuery.tokenize(query)
     }
 
     private static func message(for result: AgentSessionRouteResult) -> String {

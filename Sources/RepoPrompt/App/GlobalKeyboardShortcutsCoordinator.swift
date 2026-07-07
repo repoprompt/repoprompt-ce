@@ -37,10 +37,24 @@ final class GlobalKeyboardShortcutsCoordinator {
         WindowStatesManager.shared.allWindows.first(where: { $0.isCurrentlyFocused })
     }
 
+    private func focusedOrLatestWindowState() -> WindowState? {
+        focusedWindowState() ?? WindowStatesManager.shared.latestWindowState
+    }
+
     private func guardedFocusedWindowState() -> WindowState? {
         guard NSApplication.shared.isActive else { return nil }
         guard let win = focusedWindowState(), win.isCurrentlyFocused else { return nil }
         return win
+    }
+
+    /// HUD shortcuts are also exposed as menu commands. On the first keypress after
+    /// activation, the Carbon shortcut can fire before our SwiftUI focus flag has
+    /// updated; if it consumes ⌘K while `isCurrentlyFocused` is still false, the
+    /// menu fallback never opens the HUD. Match the menu-command fallback here so
+    /// the first press still routes to the front/latest RepoPrompt window.
+    private func guardedHUDWindowState() -> WindowState? {
+        guard NSApplication.shared.isActive else { return nil }
+        return focusedOrLatestWindowState()
     }
 
     // MARK: - Presets
@@ -157,6 +171,9 @@ final class GlobalKeyboardShortcutsCoordinator {
 
     private func switchToComposeTab(_ index: Int) {
         guard let win = guardedFocusedWindowState() else { return }
+        if selectAgentNavigationHUDResultIfPresented(index, in: win) {
+            return
+        }
 
         let tabs = win.promptManager.currentComposeTabs
         guard index < tabs.count else { return }
@@ -170,6 +187,20 @@ final class GlobalKeyboardShortcutsCoordinator {
             return
         }
         Task { await win.promptManager.switchComposeTab(tabID) }
+    }
+
+    private func selectAgentNavigationHUDResultIfPresented(_ index: Int, in win: WindowState) -> Bool {
+        let request = AgentNavigationHUDHandledRequest()
+        NotificationCenter.default.post(
+            name: .selectAgentNavigationHUDResult,
+            object: nil,
+            userInfo: [
+                AgentNavigationHUDNotificationUserInfoKey.windowID: win.windowID,
+                AgentNavigationHUDNotificationUserInfoKey.resultIndex: index,
+                AgentNavigationHUDNotificationUserInfoKey.handledRequest: request
+            ]
+        )
+        return request.handled
     }
 
     // MARK: - Font scale
@@ -219,7 +250,7 @@ final class GlobalKeyboardShortcutsCoordinator {
     }
 
     private func showAgentNavigationHUD(mode: AgentNavigationHUDMode) {
-        guard let win = guardedFocusedWindowState() else { return }
+        guard let win = guardedHUDWindowState() else { return }
         NotificationCenter.default.post(
             name: .showAgentNavigationHUD,
             object: nil,

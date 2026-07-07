@@ -86,4 +86,8 @@ extension Notification.Name {
     /// Show the Agent navigation HUD for the target window.
     /// userInfo: ["windowID": Int, "mode": AgentNavigationHUDMode.rawValue]
     static let showAgentNavigationHUD = Notification.Name("showAgentNavigationHUD")
+
+    /// Select a numbered result in the Agent navigation HUD for the target window.
+    /// userInfo: ["windowID": Int, "resultIndex": Int, "handledRequest": AgentNavigationHUDHandledRequest]
+    static let selectAgentNavigationHUDResult = Notification.Name("selectAgentNavigationHUDResult")
 }

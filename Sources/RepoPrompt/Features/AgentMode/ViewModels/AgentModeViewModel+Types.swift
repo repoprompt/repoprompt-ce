@@ -692,6 +692,7 @@ extension AgentModeViewModel {
         /// completing or needing approval still gets a visible signal.
         let hiddenThreadDescendantAttentionCount: Int
         let threadActivityDate: Date?
+        let searchFields: AgentSessionSearchFields
 
         init(
             id: UUID,
@@ -711,7 +712,8 @@ extension AgentModeViewModel {
             isThreadCollapsed: Bool = false,
             hiddenThreadDescendantCount: Int = 0,
             hiddenThreadDescendantAttentionCount: Int = 0,
-            threadActivityDate: Date? = nil
+            threadActivityDate: Date? = nil,
+            searchFields: AgentSessionSearchFields = .empty
         ) {
             self.id = id
             self.tabID = tabID
@@ -731,6 +733,7 @@ extension AgentModeViewModel {
             self.hiddenThreadDescendantCount = hiddenThreadDescendantCount
             self.hiddenThreadDescendantAttentionCount = hiddenThreadDescendantAttentionCount
             self.threadActivityDate = threadActivityDate
+            self.searchFields = searchFields
         }
     }
 

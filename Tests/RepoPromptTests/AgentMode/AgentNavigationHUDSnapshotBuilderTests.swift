@@ -39,6 +39,14 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
         XCTAssertEqual(items[2].subagentCount, 0)
         XCTAssertEqual(items[3].attentionMarkedAt, attentionTime)
         XCTAssertEqual(items[3].statusLabel, "Failed")
+        XCTAssertTrue(AgentSessionSearchMatcher.matches(
+            query: AgentSessionSearchQuery.parse("workspace opus"),
+            fields: items[0].searchFields
+        ))
+        XCTAssertTrue(AgentSessionSearchMatcher.matches(
+            query: AgentSessionSearchQuery.parse("failed"),
+            fields: items[3].searchFields
+        ))
     }
 
     func testAllAgentsSortingCapAndSearchCorpusAreDeterministic() throws {
@@ -103,6 +111,44 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
         XCTAssertEqual(AgentNavigationHUDViewModel.searchTokens(in: "  \"unterminated phrase  "), ["unterminated phrase"])
     }
 
+    func testSharedSearchMatcherMatchesMetadataAndQuotedPhrases() {
+        let fields = AgentSessionSearchFields(
+            title: "PR cleanup: diagnostics minimization",
+            primary: ["Claude Opus", "Window One"],
+            status: ["Waiting for approval"],
+            worktree: ["wt/agent-search-command-k"],
+            path: ["https://github.com/repoprompt/repoprompt-ce/pull/123"],
+            identifier: ["ABCDEF-1234"]
+        )
+
+        XCTAssertTrue(AgentSessionSearchMatcher.matches(
+            query: AgentSessionSearchQuery.parse("approval \"Claude Opus\""),
+            fields: fields
+        ))
+        XCTAssertTrue(AgentSessionSearchMatcher.matches(
+            query: AgentSessionSearchQuery.parse("pull/123"),
+            fields: fields
+        ))
+        XCTAssertFalse(AgentSessionSearchMatcher.matches(
+            query: AgentSessionSearchQuery.parse("approval unrelated"),
+            fields: fields
+        ))
+    }
+
+    func testSharedSearchMatcherRanksTitleAbovePathContains() throws {
+        let query = AgentSessionSearchQuery.parse("cleanup")
+        let titleScore = try XCTUnwrap(AgentSessionSearchMatcher.score(
+            query: query,
+            fields: AgentSessionSearchFields(title: "Cleanup diagnostics", path: ["/tmp/other"])
+        ))
+        let pathScore = try XCTUnwrap(AgentSessionSearchMatcher.score(
+            query: query,
+            fields: AgentSessionSearchFields(title: "Other", path: ["/tmp/cleanup-diagnostics"])
+        ))
+
+        XCTAssertGreaterThan(titleScore, pathScore)
+    }
+
     private func row(tabID: UUID, depth: Int, title: String) -> AgentModeViewModel.SidebarSession {
         AgentModeViewModel.SidebarSession(
             id: tabID,
@@ -122,7 +168,14 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
             isThreadCollapsed: false,
             hiddenThreadDescendantCount: 0,
             hiddenThreadDescendantAttentionCount: 0,
-            threadActivityDate: nil
+            threadActivityDate: nil,
+            searchFields: AgentSessionSearchFields(
+                title: title,
+                primary: ["Claude", "Opus"],
+                worktree: ["wt/search"],
+                secondary: [depth > 0 ? "sub-agent" : nil],
+                identifier: [tabID.uuidString]
+            )
         )
     }
 
@@ -156,7 +209,15 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
             worktreeLabel: nil,
             mergeAttention: nil,
             mergeLabel: nil,
-            isMCPControlled: false
+            isMCPControlled: false,
+            isArchived: false,
+            searchFields: AgentSessionSearchFields(
+                title: title,
+                primary: ["Workspace", "Window"],
+                status: [runState.map { String(describing: $0) }],
+                secondary: [attentionState.map { String(describing: $0) }],
+                identifier: [tabID.uuidString, workspaceID.uuidString]
+            )
         )
     }
 }
