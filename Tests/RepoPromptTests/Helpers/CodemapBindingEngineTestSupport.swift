@@ -813,34 +813,43 @@ final class EngineBlockingGate: @unchecked Sendable {
 }
 
 final class EngineAsyncGate: @unchecked Sendable {
+    private let state = EngineAsyncGateState()
+
+    func enterAndWait() async {
+        await state.enterAndWait()
+    }
+
+    func waitUntilEntered(timeout: TimeInterval = 10) -> Bool {
+        let entered = state.waitUntilEntered(timeout: timeout)
+        if !entered {
+            XCTFail("Timed out waiting for engine async gate to enter")
+        }
+        return entered
+    }
+
+    func release() {
+        state.release()
+    }
+}
+
+private final class EngineAsyncGateState: @unchecked Sendable {
     private let condition = NSCondition()
     private var entered = false
     private var released = false
     private var continuation: CheckedContinuation<Void, Never>?
 
     func enterAndWait() async {
-        await withCheckedContinuation { continuation in
-            register(continuation)
-        }
-    }
-
-    private func register(_ continuation: CheckedContinuation<Void, Never>) {
-        condition.lock()
-        entered = true
-        condition.broadcast()
-        if released {
-            condition.unlock()
-            continuation.resume()
-        } else {
-            if self.continuation != nil {
-                preconditionFailure("EngineAsyncGate supports exactly one waiter")
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                register(continuation, waiterID: waiterID)
             }
-            self.continuation = continuation
-            condition.unlock()
+        } onCancel: {
+            cancel(waiterID: waiterID)
         }
     }
 
-    func waitUntilEntered(timeout: TimeInterval = 10) -> Bool {
+    func waitUntilEntered(timeout: TimeInterval) -> Bool {
         condition.lock()
         defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(timeout)
@@ -853,6 +862,32 @@ final class EngineAsyncGate: @unchecked Sendable {
     func release() {
         condition.lock()
         released = true
+        let continuation = continuation
+        self.continuation = nil
+        condition.broadcast()
+        condition.unlock()
+        continuation?.resume()
+    }
+
+    private func register(_ continuation: CheckedContinuation<Void, Never>, waiterID _: UUID) {
+        condition.lock()
+        entered = true
+        condition.broadcast()
+        if released || Task.isCancelled {
+            condition.unlock()
+            continuation.resume()
+        } else {
+            if self.continuation != nil {
+                condition.unlock()
+                preconditionFailure("EngineAsyncGate supports exactly one waiter")
+            }
+            self.continuation = continuation
+            condition.unlock()
+        }
+    }
+
+    private func cancel(waiterID _: UUID) {
+        condition.lock()
         let continuation = continuation
         self.continuation = nil
         condition.broadcast()
@@ -876,164 +911,314 @@ enum EngineRegistrationInvalidationKind: CaseIterable {
 }
 
 actor EngineMultiEntryGate {
-    private var enteredCount = 0
-    private var released = false
-    private var continuations: [CheckedContinuation<Void, Never>] = []
-    private var enteredWaiters: [(id: UUID, expectedCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private let state = EngineMultiEntryGateState()
 
     var count: Int {
-        enteredCount
+        state.count
     }
 
     func enter() async {
-        enteredCount += 1
-        resumeSatisfiedEnteredWaiters()
-        if released { return }
-        await withCheckedContinuation { continuations.append($0) }
+        await state.enter()
     }
 
     func waitUntilEntered(
         _ expectedCount: Int,
         timeout: Duration = .seconds(10)
     ) async -> Bool {
-        if enteredCount >= expectedCount { return true }
-        let waiterID = UUID()
-        let result = await withTaskGroup(of: Bool.self) { group in
-            group.addTask { [self] in
-                await waitForEnteredSignal(id: waiterID, expectedCount: expectedCount)
-                return true
-            }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return false
-            }
-            let result = await group.next() ?? false
-            if !result {
-                cancelEnteredWaiter(id: waiterID)
-            }
-            group.cancelAll()
-            return result
+        do {
+            return try await state.waitUntilEntered(
+                expectedCount,
+                timeout: CodemapBindingEngineTestCase.timeInterval(timeout)
+            )
+        } catch {
+            XCTFail(error.localizedDescription)
+            return state.count >= expectedCount
         }
-        return result || enteredCount >= expectedCount
     }
 
     func releaseAll() {
-        released = true
-        let pending = continuations
-        continuations.removeAll()
+        state.releaseAll()
+    }
+}
+
+private final class EngineMultiEntryGateState: @unchecked Sendable {
+    private struct EnteredWaiter {
+        let id: UUID
+        let expectedCount: Int
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let lock = NSLock()
+    private var enteredCount = 0
+    private var released = false
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var enteredWaiters: [EnteredWaiter] = []
+
+    var count: Int {
+        lock.withLock { enteredCount }
+    }
+
+    func enter() async {
+        let waiterID = UUID()
+        let readyWaiters = lock.withLock { () -> [EnteredWaiter] in
+            enteredCount += 1
+            return removeSatisfiedEnteredWaiters()
+        }
+        for waiter in readyWaiters {
+            waiter.continuation.resume()
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                var shouldResume = false
+                lock.lock()
+                if released || Task.isCancelled {
+                    shouldResume = true
+                } else {
+                    continuations[waiterID] = continuation
+                }
+                lock.unlock()
+                if shouldResume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            cancelEntryWaiter(id: waiterID)
+        }
+    }
+
+    func waitUntilEntered(_ expectedCount: Int, timeout: TimeInterval) async throws -> Bool {
+        if count >= expectedCount { return true }
+        let waiterID = UUID()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await self.waitForEnteredSignal(id: waiterID, expectedCount: expectedCount)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
+                self.cancelEnteredWaiter(
+                    id: waiterID,
+                    error: AsyncTestConditionTimeout(description: "engine multi-entry gate count \(expectedCount)", timeout: timeout)
+                )
+                throw AsyncTestConditionTimeout(description: "engine multi-entry gate count \(expectedCount)", timeout: timeout)
+            }
+            defer {
+                group.cancelAll()
+                cancelEnteredWaiter(id: waiterID, error: CancellationError())
+            }
+            _ = try await group.next()
+        }
+        return count >= expectedCount
+    }
+
+    func releaseAll() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            released = true
+            let pending = Array(continuations.values)
+            continuations.removeAll()
+            return pending
+        }
         for continuation in pending {
             continuation.resume()
         }
     }
 
-    private func resumeSatisfiedEnteredWaiters() {
-        var ready: [CheckedContinuation<Void, Never>] = []
-        enteredWaiters.removeAll { waiter in
-            guard enteredCount >= waiter.expectedCount else { return false }
-            ready.append(waiter.continuation)
-            return true
-        }
-        for continuation in ready {
-            continuation.resume()
-        }
-    }
-
-    private func waitForEnteredSignal(id: UUID, expectedCount: Int) async {
-        await withCheckedContinuation { continuation in
+    private func waitForEnteredSignal(id: UUID, expectedCount: Int) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            var shouldResume = false
+            lock.lock()
             if enteredCount >= expectedCount {
-                continuation.resume()
+                shouldResume = true
             } else {
-                enteredWaiters.append((id, expectedCount, continuation))
+                enteredWaiters.append(EnteredWaiter(id: id, expectedCount: expectedCount, continuation: continuation))
+            }
+            lock.unlock()
+
+            if shouldResume {
+                continuation.resume()
             }
         }
     }
 
-    private func cancelEnteredWaiter(id: UUID) {
-        var cancelled: [CheckedContinuation<Void, Never>] = []
+    private func removeSatisfiedEnteredWaiters() -> [EnteredWaiter] {
+        var ready: [EnteredWaiter] = []
         enteredWaiters.removeAll { waiter in
-            guard waiter.id == id else { return false }
-            cancelled.append(waiter.continuation)
+            guard enteredCount >= waiter.expectedCount else { return false }
+            ready.append(waiter)
             return true
         }
-        for continuation in cancelled {
-            continuation.resume()
+        return ready
+    }
+
+    private func cancelEntryWaiter(id: UUID) {
+        let continuation = lock.withLock {
+            continuations.removeValue(forKey: id)
         }
+        continuation?.resume()
+    }
+
+    private func cancelEnteredWaiter(id: UUID, error: Error) {
+        var continuation: CheckedContinuation<Void, Error>?
+        lock.lock()
+        if let index = enteredWaiters.firstIndex(where: { $0.id == id }) {
+            continuation = enteredWaiters.remove(at: index).continuation
+        }
+        lock.unlock()
+        continuation?.resume(throwing: error)
     }
 }
 
 actor EngineFirstResolutionGate {
-    private(set) var resolutionCount = 0
-    private var firstResolutionEntered = false
-    private var firstResolutionReleased = false
-    private var continuation: CheckedContinuation<Void, Never>?
-    private var firstResolutionWaiters: [(id: UUID, continuation: CheckedContinuation<Void, Never>)] = []
+    private let state = EngineFirstResolutionGateState()
+
+    var resolutionCount: Int {
+        state.resolutionCount
+    }
 
     func enter() async {
-        resolutionCount += 1
-        guard resolutionCount == 1 else { return }
-        firstResolutionEntered = true
-        let waiters = firstResolutionWaiters
-        firstResolutionWaiters.removeAll()
-        for waiter in waiters {
-            waiter.continuation.resume()
-        }
-        if firstResolutionReleased { return }
-        await withCheckedContinuation {
-            if continuation != nil {
-                preconditionFailure("EngineFirstResolutionGate supports exactly one waiter")
-            }
-            continuation = $0
-        }
+        await state.enter()
     }
 
     func waitUntilFirstResolution(timeout: Duration = .seconds(10)) async -> Bool {
-        if firstResolutionEntered { return true }
-        let waiterID = UUID()
-        let result = await withTaskGroup(of: Bool.self) { group in
-            group.addTask { [self] in
-                await waitForFirstResolutionSignal(id: waiterID)
-                return true
-            }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return false
-            }
-            let result = await group.next() ?? false
-            if !result {
-                cancelFirstResolutionWaiter(id: waiterID)
-            }
-            group.cancelAll()
-            return result
+        do {
+            return try await state.waitUntilFirstResolution(
+                timeout: CodemapBindingEngineTestCase.timeInterval(timeout)
+            )
+        } catch {
+            XCTFail(error.localizedDescription)
+            return state.firstResolutionEntered
         }
-        return result || firstResolutionEntered
     }
 
     func releaseFirstResolution() {
-        firstResolutionReleased = true
-        continuation?.resume()
-        continuation = nil
+        state.releaseFirstResolution()
+    }
+}
+
+private final class EngineFirstResolutionGateState: @unchecked Sendable {
+    private struct ResolutionWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
     }
 
-    private func waitForFirstResolutionSignal(id: UUID) async {
-        await withCheckedContinuation { continuation in
-            if firstResolutionEntered {
-                continuation.resume()
+    private let lock = NSLock()
+    private var storedResolutionCount = 0
+    private var storedFirstResolutionEntered = false
+    private var firstResolutionReleased = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var firstResolutionWaiters: [ResolutionWaiter] = []
+
+    var resolutionCount: Int {
+        lock.withLock { storedResolutionCount }
+    }
+
+    var firstResolutionEntered: Bool {
+        lock.withLock { storedFirstResolutionEntered }
+    }
+
+    func enter() async {
+        let entry = lock.withLock { () -> (readyWaiters: [ResolutionWaiter], shouldBlock: Bool) in
+            storedResolutionCount += 1
+            guard storedResolutionCount == 1 else { return ([], false) }
+            storedFirstResolutionEntered = true
+            let waiters = firstResolutionWaiters
+            firstResolutionWaiters.removeAll()
+            return (waiters, true)
+        }
+        for waiter in entry.readyWaiters {
+            waiter.continuation.resume()
+        }
+        guard entry.shouldBlock else { return }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                var shouldResume = false
+                lock.lock()
+                if firstResolutionReleased || Task.isCancelled {
+                    shouldResume = true
+                } else if self.continuation != nil {
+                    lock.unlock()
+                    preconditionFailure("EngineFirstResolutionGate supports exactly one waiter")
+                } else {
+                    self.continuation = continuation
+                }
+                lock.unlock()
+
+                if shouldResume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            cancelFirstResolutionBlocker()
+        }
+    }
+
+    func waitUntilFirstResolution(timeout: TimeInterval) async throws -> Bool {
+        if firstResolutionEntered { return true }
+        let waiterID = UUID()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await self.waitForFirstResolutionSignal(id: waiterID)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
+                self.cancelFirstResolutionWaiter(
+                    id: waiterID,
+                    error: AsyncTestConditionTimeout(description: "engine first resolution gate", timeout: timeout)
+                )
+                throw AsyncTestConditionTimeout(description: "engine first resolution gate", timeout: timeout)
+            }
+            defer {
+                group.cancelAll()
+                cancelFirstResolutionWaiter(id: waiterID, error: CancellationError())
+            }
+            _ = try await group.next()
+        }
+        return firstResolutionEntered
+    }
+
+    func releaseFirstResolution() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            firstResolutionReleased = true
+            let continuation = continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
+
+    private func waitForFirstResolutionSignal(id: UUID) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            var shouldResume = false
+            lock.lock()
+            if storedFirstResolutionEntered {
+                shouldResume = true
             } else {
-                firstResolutionWaiters.append((id, continuation))
+                firstResolutionWaiters.append(ResolutionWaiter(id: id, continuation: continuation))
+            }
+            lock.unlock()
+
+            if shouldResume {
+                continuation.resume()
             }
         }
     }
 
-    private func cancelFirstResolutionWaiter(id: UUID) {
-        var cancelled: [CheckedContinuation<Void, Never>] = []
-        firstResolutionWaiters.removeAll { waiter in
-            guard waiter.id == id else { return false }
-            cancelled.append(waiter.continuation)
-            return true
+    private func cancelFirstResolutionBlocker() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            let continuation = continuation
+            self.continuation = nil
+            return continuation
         }
-        for continuation in cancelled {
-            continuation.resume()
+        continuation?.resume()
+    }
+
+    private func cancelFirstResolutionWaiter(id: UUID, error: Error) {
+        var continuation: CheckedContinuation<Void, Error>?
+        lock.lock()
+        if let index = firstResolutionWaiters.firstIndex(where: { $0.id == id }) {
+            continuation = firstResolutionWaiters.remove(at: index).continuation
         }
+        lock.unlock()
+        continuation?.resume(throwing: error)
     }
 }
 

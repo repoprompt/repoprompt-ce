@@ -1432,7 +1432,10 @@ final class CodemapSelectionGraphBuildGate: @unchecked Sendable {
         defer { condition.unlock() }
         let deadline = Date(timeIntervalSinceNow: 10)
         while blockedGenerations.isEmpty {
-            guard condition.wait(until: deadline) else { return nil }
+            guard condition.wait(until: deadline) else {
+                XCTFail("Timed out waiting for codemap selection graph build gate to block")
+                return nil
+            }
         }
         return blockedGenerations[0]
     }
@@ -1442,7 +1445,10 @@ final class CodemapSelectionGraphBuildGate: @unchecked Sendable {
         defer { condition.unlock() }
         let deadline = Date(timeIntervalSinceNow: 10)
         while !blockedGenerations.contains(where: { $0 > generation }) {
-            guard condition.wait(until: deadline) else { return nil }
+            guard condition.wait(until: deadline) else {
+                XCTFail("Timed out waiting for codemap selection graph build gate after generation \(generation)")
+                return nil
+            }
         }
         return blockedGenerations.first(where: { $0 > generation })
     }
@@ -1472,11 +1478,22 @@ final class CodemapSelectionGraphBuildGate: @unchecked Sendable {
         if let autoReleaseTimeout {
             let deadline = Date(timeIntervalSinceNow: autoReleaseTimeout)
             while !isOpen, !releasedGenerations.contains(generation) {
-                guard condition.wait(until: deadline) else { break }
+                guard condition.wait(until: deadline) else {
+                    XCTFail("Timed out waiting to release codemap selection graph generation \(generation)")
+                    break
+                }
             }
         } else {
+            var didRecordWatchdogFailure = false
             while !isOpen, !releasedGenerations.contains(generation) {
-                condition.wait()
+                let watchdogDeadline = Date(timeIntervalSinceNow: 10)
+                guard condition.wait(until: watchdogDeadline) else {
+                    if !didRecordWatchdogFailure {
+                        didRecordWatchdogFailure = true
+                        XCTFail("Codemap selection graph generation \(generation) is still blocked without release")
+                    }
+                    continue
+                }
             }
         }
         condition.unlock()
@@ -1624,13 +1641,9 @@ final class CodemapRetryTestClock: @unchecked Sendable {
 }
 
 actor CodemapAutomaticSelectionSequenceHarness {
+    private let waitState = CodemapAutomaticSelectionWaitState()
     private var demandTickets: [WorkspaceCodemapArtifactDemandTicket] = []
     private var waiterInvocationCount = 0
-    private var releasedWaits = Set<Int>()
-    private var releaseAllWaits = false
-    private var continuations: [Int: CheckedContinuation<Void, Error>] = [:]
-    private var demandCountObservers: [UUID: AsyncStream<[WorkspaceCodemapArtifactDemandTicket]>.Continuation] = [:]
-    private var waitCountObservers: [UUID: AsyncStream<Int>.Continuation] = [:]
 
     var recordedTickets: [WorkspaceCodemapArtifactDemandTicket] {
         demandTickets
@@ -1642,7 +1655,6 @@ actor CodemapAutomaticSelectionSequenceHarness {
 
     func recordDemand(_ ticket: WorkspaceCodemapArtifactDemandTicket) -> Int {
         demandTickets.append(ticket)
-        publishDemandTickets()
         return demandTickets.count
     }
 
@@ -1650,162 +1662,266 @@ actor CodemapAutomaticSelectionSequenceHarness {
         try Task.checkCancellation()
         waiterInvocationCount += 1
         let invocation = waiterInvocationCount
-        publishWaitCount()
-        guard !releaseAllWaits, !releasedWaits.contains(invocation) else { return }
+        try await waitState.wait(invocation: invocation)
+    }
+
+    func releaseWait(_ invocation: Int) {
+        waitState.releaseWait(invocation)
+    }
+
+    func releaseAll() {
+        waitState.releaseAll()
+    }
+
+    func waitUntilDemandCount(
+        _ expectedCount: Int,
+        timeout: Duration = .seconds(10)
+    ) async -> [WorkspaceCodemapArtifactDemandTicket]? {
+        if demandTickets.count >= expectedCount { return demandTickets }
+        do {
+            try await AsyncTestWait.waitUntil(
+                "codemap automatic selection demand count \(expectedCount)",
+                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
+            ) {
+                await self.recordedTickets.count >= expectedCount
+            }
+            return demandTickets
+        } catch {
+            XCTFail(error.localizedDescription)
+            return demandTickets.count >= expectedCount ? demandTickets : nil
+        }
+    }
+
+    func waitUntilWaitCount(_ expectedCount: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        if waiterInvocationCount >= expectedCount { return true }
+        do {
+            try await AsyncTestWait.waitUntil(
+                "codemap automatic selection wait count \(expectedCount)",
+                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
+            ) {
+                await self.waitCount >= expectedCount
+            }
+            return true
+        } catch {
+            XCTFail(error.localizedDescription)
+            return waiterInvocationCount >= expectedCount
+        }
+    }
+
+}
+
+private final class CodemapAutomaticSelectionWaitState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var releasedWaits = Set<Int>()
+    private var releaseAllWaits = false
+    private var continuations: [Int: CheckedContinuation<Void, Error>] = [:]
+
+    func wait(invocation: Int) async throws {
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<Void, Error>) in
-                if releaseAllWaits || releasedWaits.contains(invocation) || Task.isCancelled {
-                    continuation.resume(throwing: CancellationError())
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var result: Result<Void, Error>?
+                lock.lock()
+                if releaseAllWaits || releasedWaits.contains(invocation) {
+                    result = .success(())
+                } else if Task.isCancelled {
+                    result = .failure(CancellationError())
                 } else {
                     continuations[invocation] = continuation
                 }
+                lock.unlock()
+
+                switch result {
+                case .success:
+                    continuation.resume(returning: ())
+                case let .failure(error):
+                    continuation.resume(throwing: error)
+                case nil:
+                    break
+                }
             }
         } onCancel: {
-            Task { await self.cancelWait(invocation) }
+            cancelWait(invocation)
         }
     }
 
     func releaseWait(_ invocation: Int) {
-        releasedWaits.insert(invocation)
-        continuations.removeValue(forKey: invocation)?.resume(returning: ())
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            releasedWaits.insert(invocation)
+            return continuations.removeValue(forKey: invocation)
+        }
+        continuation?.resume(returning: ())
     }
 
     func releaseAll() {
-        releaseAllWaits = true
-        let pending = Array(continuations.values)
-        continuations.removeAll()
-        let demandObservers = Array(demandCountObservers.values)
-        demandCountObservers.removeAll()
-        let waitObservers = Array(waitCountObservers.values)
-        waitCountObservers.removeAll()
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+            releaseAllWaits = true
+            let pending = Array(continuations.values)
+            continuations.removeAll()
+            return pending
+        }
         for continuation in pending {
             continuation.resume(returning: ())
         }
-        for observer in demandObservers {
-            observer.finish()
-        }
-        for observer in waitObservers {
-            observer.finish()
-        }
-    }
-
-    func waitUntilDemandCount(
-        _ expectedCount: Int
-    ) async -> [WorkspaceCodemapArtifactDemandTicket]? {
-        if demandTickets.count >= expectedCount { return demandTickets }
-        let stream = demandTicketStream()
-        for await tickets in stream {
-            if tickets.count >= expectedCount { return tickets }
-            guard !Task.isCancelled else { return nil }
-        }
-        return demandTickets.count >= expectedCount ? demandTickets : nil
-    }
-
-    func waitUntilWaitCount(_ expectedCount: Int) async -> Bool {
-        if waiterInvocationCount >= expectedCount { return true }
-        let stream = waitCountStream()
-        for await count in stream {
-            if count >= expectedCount { return true }
-            guard !Task.isCancelled else { return false }
-        }
-        return waiterInvocationCount >= expectedCount
-    }
-
-    private func demandTicketStream() -> AsyncStream<[WorkspaceCodemapArtifactDemandTicket]> {
-        let id = UUID()
-        let (stream, continuation) = AsyncStream<[WorkspaceCodemapArtifactDemandTicket]>.makeStream(
-            bufferingPolicy: .bufferingNewest(1)
-        )
-        demandCountObservers[id] = continuation
-        continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeDemandObserver(id) }
-        }
-        continuation.yield(demandTickets)
-        return stream
-    }
-
-    private func waitCountStream() -> AsyncStream<Int> {
-        let id = UUID()
-        let (stream, continuation) = AsyncStream<Int>.makeStream(
-            bufferingPolicy: .bufferingNewest(1)
-        )
-        waitCountObservers[id] = continuation
-        continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeWaitObserver(id) }
-        }
-        continuation.yield(waiterInvocationCount)
-        return stream
-    }
-
-    private func publishDemandTickets() {
-        for continuation in demandCountObservers.values {
-            continuation.yield(demandTickets)
-        }
-    }
-
-    private func publishWaitCount() {
-        for continuation in waitCountObservers.values {
-            continuation.yield(waiterInvocationCount)
-        }
-    }
-
-    private func removeDemandObserver(_ id: UUID) {
-        demandCountObservers.removeValue(forKey: id)
-    }
-
-    private func removeWaitObserver(_ id: UUID) {
-        waitCountObservers.removeValue(forKey: id)
     }
 
     private func cancelWait(_ invocation: Int) {
-        continuations.removeValue(forKey: invocation)?.resume(throwing: CancellationError())
+        let continuation = lock.withLock {
+            continuations.removeValue(forKey: invocation)
+        }
+        continuation?.resume(throwing: CancellationError())
     }
 }
 
 actor CodemapRetrySleepGate {
-    private(set) var delays: [UInt64] = []
-    private var released = false
-    private var continuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private let state = CodemapRetrySleepGateState()
+
+    var delays: [UInt64] {
+        state.delays
+    }
 
     func sleep(_ nanoseconds: UInt64) async throws {
-        delays.append(nanoseconds)
-        try Task.checkCancellation()
-        guard !released else { return }
-        let waiterID = UUID()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                if released || Task.isCancelled {
-                    continuation.resume(throwing: CancellationError())
-                } else {
-                    continuations[waiterID] = continuation
-                }
-            }
-        } onCancel: {
-            Task { await self.cancel(waiterID) }
-        }
+        try await state.sleep(nanoseconds)
     }
 
     func waitForFirstDelay(timeout: Duration = .seconds(10)) async -> UInt64? {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while delays.isEmpty, clock.now < deadline {
-            await Task.yield()
+        do {
+            return try await state.waitForFirstDelay(
+                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
+            )
+        } catch {
+            XCTFail(error.localizedDescription)
+            return delays.first
         }
-        return delays.first
     }
 
     func releaseAll() {
-        released = true
-        let pending = Array(continuations.values)
-        continuations.removeAll()
+        state.releaseAll()
+    }
+}
+
+private final class CodemapRetrySleepGateState: @unchecked Sendable {
+    private struct DelayWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<UInt64?, Error>
+    }
+
+    private let lock = NSLock()
+    private var storedDelays: [UInt64] = []
+    private var released = false
+    private var sleepContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var delayWaiters: [DelayWaiter] = []
+
+    var delays: [UInt64] {
+        lock.withLock { storedDelays }
+    }
+
+    func sleep(_ nanoseconds: UInt64) async throws {
+        let readyDelayWaiters = lock.withLock { () -> [DelayWaiter] in
+            storedDelays.append(nanoseconds)
+            let waiters = delayWaiters
+            delayWaiters = []
+            return waiters
+        }
+        for waiter in readyDelayWaiters {
+            waiter.continuation.resume(returning: nanoseconds)
+        }
+
+        try Task.checkCancellation()
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var result: Result<Void, Error>?
+                lock.lock()
+                if released {
+                    result = .success(())
+                } else if Task.isCancelled {
+                    result = .failure(CancellationError())
+                } else {
+                    sleepContinuations[waiterID] = continuation
+                }
+                lock.unlock()
+
+                switch result {
+                case .success:
+                    continuation.resume(returning: ())
+                case let .failure(error):
+                    continuation.resume(throwing: error)
+                case nil:
+                    break
+                }
+            }
+        } onCancel: {
+            cancelSleep(waiterID)
+        }
+    }
+
+    func waitForFirstDelay(timeout: TimeInterval) async throws -> UInt64? {
+        if let delay = delays.first { return delay }
+        let waiterID = UUID()
+        return try await withThrowingTaskGroup(of: UInt64?.self) { group in
+            group.addTask {
+                try await self.waitForFirstDelaySignal(id: waiterID)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
+                self.cancelDelayWaiter(
+                    id: waiterID,
+                    error: AsyncTestConditionTimeout(description: "codemap retry first delay", timeout: timeout)
+                )
+                throw AsyncTestConditionTimeout(description: "codemap retry first delay", timeout: timeout)
+            }
+            defer {
+                group.cancelAll()
+                cancelDelayWaiter(id: waiterID, error: CancellationError())
+            }
+            return try await group.next() ?? nil
+        }
+    }
+
+    func releaseAll() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+            released = true
+            let pending = Array(sleepContinuations.values)
+            sleepContinuations.removeAll()
+            return pending
+        }
         for continuation in pending {
             continuation.resume(returning: ())
         }
     }
 
-    private func cancel(_ waiterID: UUID) {
-        continuations.removeValue(forKey: waiterID)?.resume(throwing: CancellationError())
+    private func waitForFirstDelaySignal(id: UUID) async throws -> UInt64? {
+        try await withCheckedThrowingContinuation { continuation in
+            var result: UInt64?
+            lock.lock()
+            if let delay = storedDelays.first {
+                result = delay
+            } else {
+                delayWaiters.append(DelayWaiter(id: id, continuation: continuation))
+            }
+            lock.unlock()
+
+            if let result {
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    private func cancelSleep(_ waiterID: UUID) {
+        let continuation = lock.withLock {
+            sleepContinuations.removeValue(forKey: waiterID)
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    private func cancelDelayWaiter(id: UUID, error: Error) {
+        var continuation: CheckedContinuation<UInt64?, Error>?
+        lock.lock()
+        if let index = delayWaiters.firstIndex(where: { $0.id == id }) {
+            continuation = delayWaiters.remove(at: index).continuation
+        }
+        lock.unlock()
+        continuation?.resume(throwing: error)
     }
 }
 
