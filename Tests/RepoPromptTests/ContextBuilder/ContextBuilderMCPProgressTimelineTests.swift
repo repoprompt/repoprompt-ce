@@ -724,8 +724,7 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
     private var sleepingSeconds: TimeInterval?
     private var cancelled = false
     private var sleepWaitTerminalError: Error?
-    private var sleepContinuation: CheckedContinuation<Void, Error>?
-    private var sleepWaiterID: UUID?
+    private var sleepContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var cancelledSleepWaiters = Set<UUID>()
     private var sleepingWaiters: [CheckedContinuation<TimeInterval, Error>] = []
 
@@ -739,9 +738,10 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
                 if cancelled || Task.isCancelled || cancelledSleepWaiters.remove(waiterID) != nil {
                     result = .failure(CancellationError())
                 } else {
-                    sleepingSeconds = seconds
-                    sleepContinuation = continuation
-                    sleepWaiterID = waiterID
+                    if sleepingSeconds == nil {
+                        sleepingSeconds = seconds
+                    }
+                    sleepContinuations[waiterID] = continuation
                     let waiters = sleepingWaiters
                     sleepingWaiters.removeAll()
                     lock.unlock()
@@ -853,12 +853,10 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
     private func cancelSleep(waiterID: UUID) {
         lock.lock()
         cancelled = true
-        let pending = sleepContinuation
-        sleepContinuation = nil
-        if sleepWaiterID == waiterID {
-            sleepWaiterID = nil
-        }
-        if pending == nil {
+        let pending = Array(sleepContinuations.values)
+        let hadRegisteredWaiter = sleepContinuations.removeValue(forKey: waiterID) != nil
+        sleepContinuations.removeAll()
+        if !hadRegisteredWaiter {
             cancelledSleepWaiters.insert(waiterID)
         }
         if sleepWaitTerminalError == nil {
@@ -867,7 +865,7 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
         let waiters = sleepingWaiters
         sleepingWaiters.removeAll()
         lock.unlock()
-        pending?.resume(throwing: CancellationError())
+        pending.forEach { $0.resume(throwing: CancellationError()) }
         waiters.forEach { $0.resume(throwing: CancellationError()) }
     }
 }

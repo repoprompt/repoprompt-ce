@@ -235,6 +235,14 @@ enum TestProcessRunner {
                 }
             }
 
+            do {
+                try setCloseOnExec(outputPipe[0])
+                try setCloseOnExec(outputPipe[1])
+            } catch {
+                closePipe()
+                throw error
+            }
+
             #if os(macOS)
                 var fileActions: posix_spawn_file_actions_t? = nil
             #else
@@ -364,14 +372,26 @@ enum TestProcessRunner {
             }
 
             let terminationGroup = DispatchGroup()
-            let statusBox = LockedStatus()
+            let waitStatusBox = LockedWaitStatus()
             let spawnedPID = pid
             terminationGroup.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 var status: Int32 = 0
-                while waitpid(spawnedPID, &status, 0) < 0, errno == EINTR {}
-                statusBox.set(status)
-                noteReaped(spawnedPID)
+                var waitResult: pid_t = 0
+                repeat {
+                    waitResult = waitpid(spawnedPID, &status, 0)
+                } while waitResult < 0 && errno == EINTR
+
+                if waitResult == spawnedPID {
+                    waitStatusBox.set(.exited(status))
+                    noteReaped(spawnedPID)
+                } else {
+                    let errorNumber = errno
+                    waitStatusBox.set(.failed(errorNumber))
+                    if errorNumber == ECHILD {
+                        noteReaped(spawnedPID)
+                    }
+                }
                 terminationGroup.leave()
             }
 
@@ -395,7 +415,15 @@ enum TestProcessRunner {
                 )
             }
 
-            let status = terminationStatus(fromWaitStatus: statusBox.status)
+            let status: Int32
+            switch waitStatusBox.value {
+            case let .exited(waitStatus):
+                status = terminationStatus(fromWaitStatus: waitStatus)
+            case let .failed(errorNumber):
+                throw POSIXError(POSIXErrorCode(rawValue: errorNumber) ?? .ECHILD)
+            case nil:
+                throw POSIXError(.ECHILD)
+            }
             if finishReadingAfterProcessExit(outputReader, readerGroup: readerGroup) == false {
                 signalProcessGroup(rootPID: pid, SIGTERM)
                 signalProcessGroup(rootPID: pid, SIGKILL)
@@ -476,6 +504,26 @@ enum TestProcessRunner {
                 _ = Darwin.kill(pid, signal)
             #else
                 _ = Glibc.kill(pid, signal)
+            #endif
+        }
+
+        private static func setCloseOnExec(_ fd: Int32) throws {
+            #if os(macOS)
+                let flags = Darwin.fcntl(fd, F_GETFD)
+                guard flags >= 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard Darwin.fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            #else
+                let flags = Glibc.fcntl(fd, F_GETFD)
+                guard flags >= 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard Glibc.fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
             #endif
         }
 
@@ -681,17 +729,22 @@ private final class LockedOutput {
     }
 }
 
-private final class LockedStatus {
-    private let lock = NSLock()
-    private var storage: Int32 = 0
+private final class LockedWaitStatus {
+    enum Value {
+        case exited(Int32)
+        case failed(Int32)
+    }
 
-    var status: Int32 {
+    private let lock = NSLock()
+    private var storage: Value?
+
+    var value: Value? {
         lock.lock()
         defer { lock.unlock() }
         return storage
     }
 
-    func set(_ status: Int32) {
+    func set(_ status: Value) {
         lock.lock()
         storage = status
         lock.unlock()
