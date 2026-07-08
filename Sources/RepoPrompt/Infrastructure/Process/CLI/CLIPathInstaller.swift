@@ -201,7 +201,8 @@ enum CLIPathInstaller {
         case noBundledCLI
         case directoryMissing
         case permissionDenied
-        case pathExistsNotOurs
+        case pathExistsNotOurs(path: String)
+        case userSymlinkSetupFailed(path: String)
         case scriptFailed(String)
         case unknown(Error)
 
@@ -213,14 +214,31 @@ enum CLIPathInstaller {
                 "\(installDirectory) does not exist. Create it first with: sudo mkdir -p \(installDirectory)"
             case .permissionDenied:
                 "Permission denied. Administrator access is required."
-            case .pathExistsNotOurs:
-                "A file already exists at \(installPath) that wasn't created by RepoPrompt"
+            case let .pathExistsNotOurs(path):
+                "A file already exists at \(path) that wasn't created by RepoPrompt"
+            case let .userSymlinkSetupFailed(path):
+                "Could not set up the CLI link at \(path). Check permissions for its parent directory and try again."
             case let .scriptFailed(message):
                 "Installation failed: \(message)"
             case let .unknown(error):
                 "Installation failed: \(error.localizedDescription)"
             }
         }
+    }
+
+    /// Distinguishes an unmanaged occupant (a real conflict) from other
+    /// user-space symlink setup failures (e.g. directory creation or atomic
+    /// swap), so `install()` reports an accurate message instead of always
+    /// claiming a conflicting file exists.
+    static func userSymlinkInstallError(userLink: String, bundledPath: String) -> InstallError {
+        if case .unmanaged = ManagedCLIPathPolicy.classifySymlink(
+            at: userLink,
+            desiredDestination: bundledPath,
+            managedDestinations: ManagedCLIPathPolicy.managedDestinations(currentBundledCLIPath: bundledPath)
+        ) {
+            return .pathExistsNotOurs(path: userLink)
+        }
+        return .userSymlinkSetupFailed(path: userLink)
     }
 
     /// Install the CLI to PATH using AppleScript for admin privileges
@@ -236,7 +254,7 @@ enum CLIPathInstaller {
         case .directoryMissing:
             throw InstallError.directoryMissing
         case .installedByOther:
-            throw InstallError.pathExistsNotOurs
+            throw InstallError.pathExistsNotOurs(path: installPath)
         case .installed:
             logger.info("CLI already installed at \(installPath)")
             return
@@ -249,7 +267,7 @@ enum CLIPathInstaller {
             userSymlinkURL: URL(fileURLWithPath: userLink),
             bundledCLIURL: URL(fileURLWithPath: bundledPath)
         ) else {
-            throw InstallError.pathExistsNotOurs
+            throw Self.userSymlinkInstallError(userLink: userLink, bundledPath: bundledPath)
         }
 
         let managedDestinations = ManagedCLIPathPolicy.managedDestinations(
@@ -291,7 +309,7 @@ enum CLIPathInstaller {
             logger.info("CLI not installed, nothing to uninstall")
             return
         case .installedByOther:
-            throw InstallError.pathExistsNotOurs
+            throw InstallError.pathExistsNotOurs(path: installPath)
         case .installed, .installedButStale:
             break
         }
@@ -389,7 +407,7 @@ enum CLIPathInstaller {
         case .directoryMissing:
             throw InstallError.directoryMissing
         case .installedByOther:
-            throw InstallError.pathExistsNotOurs
+            throw InstallError.pathExistsNotOurs(path: claudeRPInstallPath)
         case .installed:
             // Wrapper is already installed, but still refresh the MCP config file
             logger.info("claude-rp already installed at \(claudeRPInstallPath)")
@@ -455,7 +473,7 @@ enum CLIPathInstaller {
             logger.info("claude-rp not installed, nothing to uninstall")
             return
         case .installedByOther:
-            throw InstallError.pathExistsNotOurs
+            throw InstallError.pathExistsNotOurs(path: claudeRPInstallPath)
         case .installed, .installedButOutdated:
             break
         }
