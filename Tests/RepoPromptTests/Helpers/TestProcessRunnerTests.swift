@@ -53,4 +53,20 @@ final class TestProcessRunnerTests: XCTestCase {
             XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
         }
     }
+
+    func testTimeoutReturnsWhenExitedParentLeavesChildHoldingPipe() throws {
+        let startedAt = Date()
+
+        do {
+            _ = try TestProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "printf parent-exited; sleep 5 & exit 0"],
+                timeout: 0.25
+            )
+            XCTFail("Expected process timeout")
+        } catch let error as TestProcessTimeoutError {
+            XCTAssertEqual(error.outputText, "parent-exited")
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
+        }
+    }
 }

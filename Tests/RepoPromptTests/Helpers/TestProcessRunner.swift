@@ -1,6 +1,8 @@
 import Foundation
 #if os(macOS)
 import Darwin
+#elseif os(Linux)
+import Glibc
 #endif
 
 struct TestProcessResult {
@@ -53,6 +55,32 @@ enum TestProcessRunner {
         currentDirectoryURL: URL? = nil,
         environment: [String: String]? = nil,
         timeout: TimeInterval = defaultTimeout
+    ) throws -> TestProcessResult {
+        #if os(macOS)
+            try runWithSpawnedProcessGroup(
+                executableURL: executableURL,
+                arguments: arguments,
+                currentDirectoryURL: currentDirectoryURL,
+                environment: environment,
+                timeout: timeout
+            )
+        #else
+            try runWithFoundationProcess(
+                executableURL: executableURL,
+                arguments: arguments,
+                currentDirectoryURL: currentDirectoryURL,
+                environment: environment,
+                timeout: timeout
+            )
+        #endif
+    }
+
+    private static func runWithFoundationProcess(
+        executableURL: URL,
+        arguments: [String],
+        currentDirectoryURL: URL?,
+        environment: [String: String]?,
+        timeout: TimeInterval
     ) throws -> TestProcessResult {
         precondition(timeout > 0, "TestProcessRunner timeout must be positive")
 
@@ -114,7 +142,15 @@ enum TestProcessRunner {
             )
         }
 
-        finishReadingAfterSuccess(output.fileHandleForReading, readerGroup: readerGroup)
+        if finishReadingAfterProcessExit(output.fileHandleForReading, readerGroup: readerGroup) == false {
+            throw TestProcessTimeoutError(
+                executableURL: executableURL,
+                arguments: arguments,
+                currentDirectoryURL: currentDirectoryURL,
+                timeout: timeout,
+                output: capturedOutput.data()
+            )
+        }
 
         return TestProcessResult(
             terminationStatus: process.terminationStatus,
@@ -122,8 +158,189 @@ enum TestProcessRunner {
         )
     }
 
+    #if os(macOS)
+    private static func runWithSpawnedProcessGroup(
+        executableURL: URL,
+        arguments: [String],
+        currentDirectoryURL: URL?,
+        environment: [String: String]?,
+        timeout: TimeInterval
+    ) throws -> TestProcessResult {
+        precondition(timeout > 0, "TestProcessRunner timeout must be positive")
+
+        var outputPipe: [Int32] = [-1, -1]
+        guard pipe(&outputPipe) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        func closePipe() {
+            if outputPipe[0] >= 0 {
+                Darwin.close(outputPipe[0])
+                outputPipe[0] = -1
+            }
+            if outputPipe[1] >= 0 {
+                Darwin.close(outputPipe[1])
+                outputPipe[1] = -1
+            }
+        }
+
+        var fileActions: posix_spawn_file_actions_t? = nil
+        var result = posix_spawn_file_actions_init(&fileActions)
+        guard result == 0 else {
+            closePipe()
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+        }
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+        func checkFileAction(_ result: Int32) throws {
+            guard result == 0 else {
+                closePipe()
+                throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+            }
+        }
+
+        try checkFileAction(posix_spawn_file_actions_adddup2(&fileActions, outputPipe[1], STDOUT_FILENO))
+        try checkFileAction(posix_spawn_file_actions_adddup2(&fileActions, outputPipe[1], STDERR_FILENO))
+        try checkFileAction(posix_spawn_file_actions_addclose(&fileActions, outputPipe[0]))
+        try checkFileAction(posix_spawn_file_actions_addclose(&fileActions, outputPipe[1]))
+
+        if let currentDirectoryURL {
+            result = currentDirectoryURL.path.withCString { path in
+                posix_spawn_file_actions_addchdir_np(&fileActions, path)
+            }
+            try checkFileAction(result)
+        }
+
+        var attributes: posix_spawnattr_t? = nil
+        result = posix_spawnattr_init(&attributes)
+        guard result == 0 else {
+            closePipe()
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+
+        var spawnFlags = Int16(POSIX_SPAWN_SETPGROUP)
+        #if canImport(Darwin)
+            spawnFlags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+        #endif
+        result = posix_spawnattr_setpgroup(&attributes, 0)
+        guard result == 0 else {
+            closePipe()
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+        }
+        result = posix_spawnattr_setflags(&attributes, spawnFlags)
+        guard result == 0 else {
+            closePipe()
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+        }
+
+        var argv: [UnsafeMutablePointer<CChar>?] = []
+        argv.reserveCapacity(arguments.count + 2)
+        argv.append(strdup(executableURL.path))
+        for argument in arguments {
+            argv.append(strdup(argument))
+        }
+        argv.append(nil)
+        defer {
+            for pointer in argv where pointer != nil {
+                free(pointer)
+            }
+        }
+
+        let processEnvironment = environment ?? ProcessInfo.processInfo.environment
+        var envp: [UnsafeMutablePointer<CChar>?] = []
+        envp.reserveCapacity(processEnvironment.count + 1)
+        for (key, value) in processEnvironment {
+            envp.append(strdup("\(key)=\(value)"))
+        }
+        envp.append(nil)
+        defer {
+            for pointer in envp where pointer != nil {
+                free(pointer)
+            }
+        }
+
+        var pid: pid_t = 0
+        result = posix_spawn(
+            &pid,
+            executableURL.path,
+            &fileActions,
+            &attributes,
+            argv,
+            envp
+        )
+        guard result == 0 else {
+            closePipe()
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+        }
+
+        Darwin.close(outputPipe[1])
+        outputPipe[1] = -1
+
+        let capturedOutput = LockedOutput()
+        let readerGroup = DispatchGroup()
+        let outputReader = FileHandle(fileDescriptor: outputPipe[0], closeOnDealloc: true)
+        outputPipe[0] = -1
+        readerGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { readerGroup.leave() }
+            while true {
+                guard let chunk = try? outputReader.read(upToCount: 64 * 1024), !chunk.isEmpty else {
+                    break
+                }
+                capturedOutput.append(chunk)
+            }
+        }
+
+        let terminationGroup = DispatchGroup()
+        let statusBox = LockedStatus()
+        terminationGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var status: Int32 = 0
+            while waitpid(pid, &status, 0) < 0, errno == EINTR {}
+            statusBox.set(status)
+            terminationGroup.leave()
+        }
+
+        if terminationGroup.wait(timeout: .now() + timeout) == .timedOut {
+            signalProcessGroup(rootPID: pid, SIGTERM)
+            if terminationGroup.wait(timeout: .now() + terminationGraceInterval) == .timedOut {
+                signalProcessGroup(rootPID: pid, SIGKILL)
+                _ = terminationGroup.wait(timeout: .now() + terminationGraceInterval)
+            }
+            finishReadingAfterTimeout(outputReader, readerGroup: readerGroup)
+            throw TestProcessTimeoutError(
+                executableURL: executableURL,
+                arguments: arguments,
+                currentDirectoryURL: currentDirectoryURL,
+                timeout: timeout,
+                output: capturedOutput.data()
+            )
+        }
+
+        if finishReadingAfterProcessExit(outputReader, readerGroup: readerGroup) == false {
+            signalProcessGroup(rootPID: pid, SIGTERM)
+            signalProcessGroup(rootPID: pid, SIGKILL)
+            throw TestProcessTimeoutError(
+                executableURL: executableURL,
+                arguments: arguments,
+                currentDirectoryURL: currentDirectoryURL,
+                timeout: timeout,
+                output: capturedOutput.data()
+            )
+        }
+
+        return TestProcessResult(
+            terminationStatus: terminationStatus(fromWaitStatus: statusBox.status),
+            output: capturedOutput.data()
+        )
+    }
+    #endif
+
     private static func terminate(_ process: Process) {
         #if os(macOS)
+        signal(process, SIGTERM)
+        #elseif os(Linux)
         signal(process, SIGTERM)
         #endif
         if process.isRunning {
@@ -133,6 +350,8 @@ enum TestProcessRunner {
 
     private static func forceTerminate(_ process: Process) {
         #if os(macOS)
+        signal(process, SIGKILL)
+        #elseif os(Linux)
         signal(process, SIGKILL)
         #endif
     }
@@ -145,9 +364,14 @@ enum TestProcessRunner {
         }
     }
 
-    private static func finishReadingAfterSuccess(_ handle: FileHandle, readerGroup: DispatchGroup) {
-        readerGroup.wait()
+    private static func finishReadingAfterProcessExit(_ handle: FileHandle, readerGroup: DispatchGroup) -> Bool {
+        if readerGroup.wait(timeout: .now() + outputDrainGraceInterval) == .timedOut {
+            close(handle)
+            _ = readerGroup.wait(timeout: .now() + outputDrainGraceInterval)
+            return false
+        }
         close(handle)
+        return true
     }
 
     private static func finishReadingAfterTimeout(_ handle: FileHandle, readerGroup: DispatchGroup) {
@@ -160,6 +384,12 @@ enum TestProcessRunner {
     }
 
     #if os(macOS)
+    private static func signalProcessGroup(rootPID: pid_t, _ signal: Int32) {
+        guard rootPID > 0 else { return }
+        _ = Darwin.kill(-rootPID, signal)
+        signalProcessTree(rootPID: rootPID, signal)
+    }
+
     private static func signal(_ process: Process, _ signal: Int32) {
         let pid = process.processIdentifier
         guard pid > 0 else { return }
@@ -200,6 +430,22 @@ enum TestProcessRunner {
             .split(whereSeparator: \.isNewline)
             .compactMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
+
+    private static func terminationStatus(fromWaitStatus status: Int32) -> Int32 {
+        if WIFEXITED(status) {
+            return WEXITSTATUS(status)
+        }
+        if WIFSIGNALED(status) {
+            return 128 + WTERMSIG(status)
+        }
+        return status
+    }
+    #elseif os(Linux)
+    private static func signal(_ process: Process, _ signal: Int32) {
+        let pid = process.processIdentifier
+        guard pid > 0 else { return }
+        _ = Glibc.kill(pid, signal)
+    }
     #endif
 }
 
@@ -217,5 +463,22 @@ private final class LockedOutput {
         lock.lock()
         defer { lock.unlock() }
         return storage
+    }
+}
+
+private final class LockedStatus {
+    private let lock = NSLock()
+    private var storage: Int32 = 0
+
+    var status: Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func set(_ status: Int32) {
+        lock.lock()
+        storage = status
+        lock.unlock()
     }
 }
