@@ -909,10 +909,20 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             sourceAgentSessionID: parentSessionID,
             routedRunID: nil
         )
-        let source = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
-            snapshot: launchSnapshot,
-            targetWindow: window
-        )
+        // The capture's drift guard re-validates the canonical selection after its async work. This
+        // test deliberately keeps the active UI selection diverged from canonical so it can prove
+        // capture serves the *stored* selection rather than the UI. A debounced token recount can
+        // otherwise flush that divergent UI selection back into canonical during the capture's await
+        // window and falsely trip the guard ("launching selection changed ..."). Hold the selection
+        // mirror's flush suppression across the capture — the same suppression production applies
+        // during sensitive selection operations — so canonical stays stable while the frozen review
+        // capability is built.
+        let source = await window.selectionCoordinator.withApplyingSelectionMirror {
+            await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                snapshot: launchSnapshot,
+                targetWindow: window
+            )
+        }
         guard case let .captured(captured) = source else {
             if case let .unavailable(unavailable) = source {
                 return XCTFail(
