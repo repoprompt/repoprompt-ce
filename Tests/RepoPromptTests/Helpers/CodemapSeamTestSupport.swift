@@ -1489,15 +1489,15 @@ final class CodemapSelectionGraphBuildGate: @unchecked Sendable {
                 }
             }
         } else {
-            var didRecordWatchdogFailure = false
+            let watchdogDeadline = Date(timeIntervalSinceNow: 10)
             while !isOpen, !releasedGenerations.contains(generation) {
-                let watchdogDeadline = Date(timeIntervalSinceNow: 10)
                 guard condition.wait(until: watchdogDeadline) else {
-                    if !didRecordWatchdogFailure {
-                        didRecordWatchdogFailure = true
-                        XCTFail("Codemap selection graph generation \(generation) is still blocked without release")
-                    }
-                    continue
+                    XCTFail("Codemap selection graph generation \(generation) is still blocked without release")
+                    // Fail closed: open the gate so the blocked builder can make progress
+                    // instead of spinning forever after the first XCTFail.
+                    isOpen = true
+                    condition.broadcast()
+                    break
                 }
             }
         }
@@ -1718,6 +1718,7 @@ actor CodemapAutomaticSelectionSequenceHarness {
 private final class CodemapAutomaticSelectionWaitState: @unchecked Sendable {
     private let lock = NSLock()
     private var releasedWaits = Set<Int>()
+    private var cancelledWaits = Set<Int>()
     private var releaseAllWaits = false
     private var continuations: [Int: CheckedContinuation<Void, Error>] = [:]
 
@@ -1728,7 +1729,7 @@ private final class CodemapAutomaticSelectionWaitState: @unchecked Sendable {
                 lock.lock()
                 if releaseAllWaits || releasedWaits.contains(invocation) {
                     result = .success(())
-                } else if Task.isCancelled {
+                } else if Task.isCancelled || cancelledWaits.remove(invocation) != nil {
                     result = .failure(CancellationError())
                 } else {
                     continuations[invocation] = continuation
@@ -1762,6 +1763,7 @@ private final class CodemapAutomaticSelectionWaitState: @unchecked Sendable {
             releaseAllWaits = true
             let pending = Array(continuations.values)
             continuations.removeAll()
+            cancelledWaits.removeAll()
             return pending
         }
         for continuation in pending {
@@ -1770,8 +1772,12 @@ private final class CodemapAutomaticSelectionWaitState: @unchecked Sendable {
     }
 
     private func cancelWait(_ invocation: Int) {
-        let continuation = lock.withLock {
-            continuations.removeValue(forKey: invocation)
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            if let continuation = continuations.removeValue(forKey: invocation) {
+                return continuation
+            }
+            cancelledWaits.insert(invocation)
+            return nil
         }
         continuation?.resume(throwing: CancellationError())
     }
@@ -1814,6 +1820,7 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
     private var storedDelays: [UInt64] = []
     private var released = false
     private var sleepContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var cancelledSleepWaiters = Set<UUID>()
     private var delayWaiters: [DelayWaiter] = []
 
     var delays: [UInt64] {
@@ -1839,7 +1846,7 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
                 lock.lock()
                 if released {
                     result = .success(())
-                } else if Task.isCancelled {
+                } else if Task.isCancelled || cancelledSleepWaiters.remove(waiterID) != nil {
                     result = .failure(CancellationError())
                 } else {
                     sleepContinuations[waiterID] = continuation
@@ -1888,6 +1895,7 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
             released = true
             let pending = Array(sleepContinuations.values)
             sleepContinuations.removeAll()
+            cancelledSleepWaiters.removeAll()
             return pending
         }
         for continuation in pending {
@@ -1913,8 +1921,12 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
     }
 
     private func cancelSleep(_ waiterID: UUID) {
-        let continuation = lock.withLock {
-            sleepContinuations.removeValue(forKey: waiterID)
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            if let continuation = sleepContinuations.removeValue(forKey: waiterID) {
+                return continuation
+            }
+            cancelledSleepWaiters.insert(waiterID)
+            return nil
         }
         continuation?.resume(throwing: CancellationError())
     }
@@ -1934,6 +1946,7 @@ private final class CodemapVoidContinuationGateState: @unchecked Sendable {
     private let lock = NSLock()
     private var released = false
     private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var cancelledWaiters = Set<UUID>()
 
     var isReleased: Bool {
         lock.withLock { released }
@@ -1946,7 +1959,7 @@ private final class CodemapVoidContinuationGateState: @unchecked Sendable {
             await withCheckedContinuation { continuation in
                 var shouldResume = false
                 lock.lock()
-                if released || Task.isCancelled {
+                if released || Task.isCancelled || cancelledWaiters.remove(waiterID) != nil {
                     shouldResume = true
                 } else {
                     continuations[waiterID] = continuation
@@ -1967,6 +1980,7 @@ private final class CodemapVoidContinuationGateState: @unchecked Sendable {
             released = true
             let pending = Array(continuations.values)
             continuations.removeAll()
+            cancelledWaiters.removeAll()
             return pending
         }
         for continuation in pending {
@@ -1975,8 +1989,12 @@ private final class CodemapVoidContinuationGateState: @unchecked Sendable {
     }
 
     private func cancel(_ waiterID: UUID) {
-        let continuation = lock.withLock {
-            continuations.removeValue(forKey: waiterID)
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            if let continuation = continuations.removeValue(forKey: waiterID) {
+                return continuation
+            }
+            cancelledWaiters.insert(waiterID)
+            return nil
         }
         continuation?.resume()
     }

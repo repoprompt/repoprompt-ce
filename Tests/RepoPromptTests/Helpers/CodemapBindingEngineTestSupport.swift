@@ -957,6 +957,7 @@ private final class EngineMultiEntryGateState: @unchecked Sendable {
     private var enteredCount = 0
     private var released = false
     private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var cancelledWaiters = Set<UUID>()
     private var enteredWaiters: [EnteredWaiter] = []
 
     var count: Int {
@@ -976,7 +977,7 @@ private final class EngineMultiEntryGateState: @unchecked Sendable {
             await withCheckedContinuation { continuation in
                 var shouldResume = false
                 lock.lock()
-                if released || Task.isCancelled {
+                if released || Task.isCancelled || cancelledWaiters.remove(waiterID) != nil {
                     shouldResume = true
                 } else {
                     continuations[waiterID] = continuation
@@ -1020,6 +1021,7 @@ private final class EngineMultiEntryGateState: @unchecked Sendable {
             released = true
             let pending = Array(continuations.values)
             continuations.removeAll()
+            cancelledWaiters.removeAll()
             return pending
         }
         for continuation in pending {
@@ -1055,8 +1057,12 @@ private final class EngineMultiEntryGateState: @unchecked Sendable {
     }
 
     private func cancelEntryWaiter(id: UUID) {
-        let continuation = lock.withLock {
-            continuations.removeValue(forKey: id)
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            if let continuation = continuations.removeValue(forKey: id) {
+                return continuation
+            }
+            cancelledWaiters.insert(id)
+            return nil
         }
         continuation?.resume()
     }
@@ -1110,6 +1116,7 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
     private var storedFirstResolutionEntered = false
     private var firstResolutionReleased = false
     private var continuation: CheckedContinuation<Void, Never>?
+    private var cancelledWaiters = Set<UUID>()
     private var firstResolutionWaiters: [ResolutionWaiter] = []
 
     var resolutionCount: Int {
@@ -1133,11 +1140,12 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
             waiter.continuation.resume()
         }
         guard entry.shouldBlock else { return }
+        let waiterID = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 var shouldResume = false
                 lock.lock()
-                if firstResolutionReleased || Task.isCancelled {
+                if firstResolutionReleased || Task.isCancelled || cancelledWaiters.remove(waiterID) != nil {
                     shouldResume = true
                 } else if self.continuation != nil {
                     lock.unlock()
@@ -1152,7 +1160,7 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
                 }
             }
         } onCancel: {
-            cancelFirstResolutionBlocker()
+            cancelFirstResolutionBlocker(waiterID: waiterID)
         }
     }
 
@@ -1181,13 +1189,14 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
     }
 
     func releaseFirstResolution() {
-        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
             firstResolutionReleased = true
-            let continuation = continuation
+            let pending = self.continuation
             self.continuation = nil
-            return continuation
+            cancelledWaiters.removeAll()
+            return pending
         }
-        continuation?.resume()
+        pending?.resume()
     }
 
     private func waitForFirstResolutionSignal(id: UUID) async throws {
@@ -1207,13 +1216,16 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
         }
     }
 
-    private func cancelFirstResolutionBlocker() {
-        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
-            let continuation = continuation
-            self.continuation = nil
-            return continuation
+    private func cancelFirstResolutionBlocker(waiterID: UUID) {
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            if let pending = self.continuation {
+                self.continuation = nil
+                return pending
+            }
+            cancelledWaiters.insert(waiterID)
+            return nil
         }
-        continuation?.resume()
+        pending?.resume()
     }
 
     private func cancelFirstResolutionWaiter(id: UUID, error: Error) {

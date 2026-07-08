@@ -156,13 +156,21 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             timeout: Duration,
             operation: @escaping @Sendable () async throws -> T
         ) async throws -> T {
+            let timeoutInterval = {
+                let components = timeout.components
+                return TimeInterval(components.seconds)
+                    + (TimeInterval(components.attoseconds) / 1e18)
+            }()
             try await withThrowingTaskGroup(of: T.self) { group in
                 group.addTask {
                     try await operation()
                 }
                 group.addTask {
                     try await Task.sleep(for: timeout)
-                    throw CancellationError()
+                    throw AsyncTestConditionTimeout(
+                        description: "shared MCP server lease re-acquisition",
+                        timeout: timeoutInterval
+                    )
                 }
                 let result = try await group.next()!
                 group.cancelAll()

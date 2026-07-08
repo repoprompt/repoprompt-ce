@@ -44,10 +44,43 @@ struct TestProcessTimeoutError: Error, LocalizedError, CustomStringConvertible {
     }
 }
 
+/// Raised when the child exits within the deadline but stdout/stderr drain does not complete.
+struct TestProcessOutputDrainTimeoutError: Error, LocalizedError, CustomStringConvertible {
+    let executableURL: URL
+    let arguments: [String]
+    let currentDirectoryURL: URL?
+    let drainTimeout: TimeInterval
+    let terminationStatus: Int32
+    let output: Data
+
+    var outputText: String {
+        String(decoding: output, as: UTF8.self)
+    }
+
+    var errorDescription: String? {
+        description
+    }
+
+    var description: String {
+        var parts = [
+            "Process exited (status \(terminationStatus)) but output drain timed out after \(String(format: "%.3f", drainTimeout))s:",
+            ([executableURL.path] + arguments).joined(separator: " ")
+        ]
+        if let currentDirectoryURL {
+            parts.append("cwd: \(currentDirectoryURL.path)")
+        }
+        if !output.isEmpty {
+            parts.append("captured output:\n\(outputText)")
+        }
+        return parts.joined(separator: "\n")
+    }
+}
+
 enum TestProcessRunner {
     static let defaultTimeout: TimeInterval = 30
     private static let terminationGraceInterval: TimeInterval = 1
     private static let outputDrainGraceInterval: TimeInterval = 1
+    private static let childPIDQueryTimeout: TimeInterval = 1
 
     static func run(
         executableURL: URL,
@@ -56,7 +89,7 @@ enum TestProcessRunner {
         environment: [String: String]? = nil,
         timeout: TimeInterval = defaultTimeout
     ) throws -> TestProcessResult {
-        #if os(macOS)
+        #if os(macOS) || os(Linux)
             try runWithSpawnedProcessGroup(
                 executableURL: executableURL,
                 arguments: arguments,
@@ -143,11 +176,15 @@ enum TestProcessRunner {
         }
 
         if finishReadingAfterProcessExit(output.fileHandleForReading, readerGroup: readerGroup) == false {
-            throw TestProcessTimeoutError(
+            // Best-effort cleanup for any orphaned descendants still holding the pipe.
+            terminate(process)
+            forceTerminate(process)
+            throw TestProcessOutputDrainTimeoutError(
                 executableURL: executableURL,
                 arguments: arguments,
                 currentDirectoryURL: currentDirectoryURL,
-                timeout: timeout,
+                drainTimeout: outputDrainGraceInterval,
+                terminationStatus: process.terminationStatus,
                 output: capturedOutput.data()
             )
         }
@@ -158,7 +195,7 @@ enum TestProcessRunner {
         )
     }
 
-    #if os(macOS)
+    #if os(macOS) || os(Linux)
     private static func runWithSpawnedProcessGroup(
         executableURL: URL,
         arguments: [String],
@@ -175,16 +212,20 @@ enum TestProcessRunner {
 
         func closePipe() {
             if outputPipe[0] >= 0 {
-                Darwin.close(outputPipe[0])
+                systemClose(outputPipe[0])
                 outputPipe[0] = -1
             }
             if outputPipe[1] >= 0 {
-                Darwin.close(outputPipe[1])
+                systemClose(outputPipe[1])
                 outputPipe[1] = -1
             }
         }
 
+        #if os(macOS)
         var fileActions: posix_spawn_file_actions_t? = nil
+        #else
+        var fileActions = posix_spawn_file_actions_t()
+        #endif
         var result = posix_spawn_file_actions_init(&fileActions)
         guard result == 0 else {
             closePipe()
@@ -211,7 +252,11 @@ enum TestProcessRunner {
             try checkFileAction(result)
         }
 
+        #if os(macOS)
         var attributes: posix_spawnattr_t? = nil
+        #else
+        var attributes = posix_spawnattr_t()
+        #endif
         result = posix_spawnattr_init(&attributes)
         guard result == 0 else {
             closePipe()
@@ -274,7 +319,7 @@ enum TestProcessRunner {
             throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
         }
 
-        Darwin.close(outputPipe[1])
+        systemClose(outputPipe[1])
         outputPipe[1] = -1
 
         let capturedOutput = LockedOutput()
@@ -294,10 +339,11 @@ enum TestProcessRunner {
 
         let terminationGroup = DispatchGroup()
         let statusBox = LockedStatus()
+        let spawnedPID = pid
         terminationGroup.enter()
         DispatchQueue.global(qos: .userInitiated).async {
             var status: Int32 = 0
-            while waitpid(pid, &status, 0) < 0, errno == EINTR {}
+            while waitpid(spawnedPID, &status, 0) < 0, errno == EINTR {}
             statusBox.set(status)
             terminationGroup.leave()
         }
@@ -318,20 +364,22 @@ enum TestProcessRunner {
             )
         }
 
+        let status = terminationStatus(fromWaitStatus: statusBox.status)
         if finishReadingAfterProcessExit(outputReader, readerGroup: readerGroup) == false {
             signalProcessGroup(rootPID: pid, SIGTERM)
             signalProcessGroup(rootPID: pid, SIGKILL)
-            throw TestProcessTimeoutError(
+            throw TestProcessOutputDrainTimeoutError(
                 executableURL: executableURL,
                 arguments: arguments,
                 currentDirectoryURL: currentDirectoryURL,
-                timeout: timeout,
+                drainTimeout: outputDrainGraceInterval,
+                terminationStatus: status,
                 output: capturedOutput.data()
             )
         }
 
         return TestProcessResult(
-            terminationStatus: terminationStatus(fromWaitStatus: statusBox.status),
+            terminationStatus: status,
             output: capturedOutput.data()
         )
     }
@@ -383,13 +431,32 @@ enum TestProcessRunner {
         }
     }
 
-    #if os(macOS)
-    private static func signalProcessGroup(rootPID: pid_t, _ signal: Int32) {
-        guard rootPID > 0 else { return }
-        _ = Darwin.kill(-rootPID, signal)
-        signalProcessTree(rootPID: rootPID, signal)
+    #if os(macOS) || os(Linux)
+    private static func systemClose(_ fd: Int32) {
+        #if os(macOS)
+            Darwin.close(fd)
+        #else
+            Glibc.close(fd)
+        #endif
     }
 
+    private static func systemKill(_ pid: pid_t, _ signal: Int32) {
+        #if os(macOS)
+            _ = Darwin.kill(pid, signal)
+        #else
+            _ = Glibc.kill(pid, signal)
+        #endif
+    }
+
+    private static func signalProcessGroup(rootPID: pid_t, _ signal: Int32) {
+        guard rootPID > 0 else { return }
+        systemKill(-rootPID, signal)
+        #if os(macOS)
+        signalProcessTree(rootPID: rootPID, signal)
+        #endif
+    }
+
+    #if os(macOS)
     private static func signal(_ process: Process, _ signal: Int32) {
         let pid = process.processIdentifier
         guard pid > 0 else { return }
@@ -412,39 +479,68 @@ enum TestProcessRunner {
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
 
+        let readerGroup = DispatchGroup()
+        let captured = LockedOutput()
+        let outputReader = output.fileHandleForReading
+        readerGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { readerGroup.leave() }
+            while true {
+                guard let chunk = try? outputReader.read(upToCount: 64 * 1024), !chunk.isEmpty else {
+                    break
+                }
+                captured.append(chunk)
+            }
+        }
+
+        let terminationGroup = DispatchGroup()
+        terminationGroup.enter()
+        process.terminationHandler = { _ in
+            terminationGroup.leave()
+        }
+
         do {
             try process.run()
         } catch {
             close(output.fileHandleForReading)
             close(output.fileHandleForWriting)
+            readerGroup.wait()
             return []
         }
         close(output.fileHandleForWriting)
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        close(output.fileHandleForReading)
-        process.waitUntilExit()
+
+        if terminationGroup.wait(timeout: .now() + childPIDQueryTimeout) == .timedOut {
+            terminate(process)
+            if terminationGroup.wait(timeout: .now() + terminationGraceInterval) == .timedOut {
+                forceTerminate(process)
+                _ = terminationGroup.wait(timeout: .now() + terminationGraceInterval)
+            }
+            finishReadingAfterTimeout(output.fileHandleForReading, readerGroup: readerGroup)
+            return []
+        }
+
+        _ = finishReadingAfterProcessExit(output.fileHandleForReading, readerGroup: readerGroup)
         guard process.terminationStatus == 0 else {
             return []
         }
-        return String(decoding: data, as: UTF8.self)
+        return String(decoding: captured.data(), as: UTF8.self)
             .split(whereSeparator: \.isNewline)
             .compactMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-    }
-
-    private static func terminationStatus(fromWaitStatus status: Int32) -> Int32 {
-        if WIFEXITED(status) {
-            return WEXITSTATUS(status)
-        }
-        if WIFSIGNALED(status) {
-            return 128 + WTERMSIG(status)
-        }
-        return status
     }
     #elseif os(Linux)
     private static func signal(_ process: Process, _ signal: Int32) {
         let pid = process.processIdentifier
         guard pid > 0 else { return }
-        _ = Glibc.kill(pid, signal)
+        systemKill(pid, signal)
+    }
+    #endif
+
+    private static func terminationStatus(fromWaitStatus status: Int32) -> Int32 {
+        let signal = status & 0x7F
+        if signal == 0 {
+            return (status >> 8) & 0xFF
+        }
+        return 128 + signal
     }
     #endif
 }

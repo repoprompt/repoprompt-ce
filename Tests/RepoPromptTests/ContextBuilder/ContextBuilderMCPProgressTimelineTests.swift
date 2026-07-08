@@ -136,7 +136,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         }
     }
 
-    func testSoftStageBoundEmitsOnceWithoutFailingTimeline() async {
+    func testSoftStageBoundEmitsOnceWithoutFailingTimeline() async throws {
         let clock = ContextBuilderProgressTestClock()
         let recorder = ContextBuilderProgressEventRecorder()
         let softBoundSleep = ContextBuilderSoftBoundSleepGate()
@@ -147,7 +147,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         )
 
         await timeline.transition(to: .modelResolution)
-        let scheduledSoftBound = await softBoundSleep.waitUntilSleeping()
+        let scheduledSoftBound = try await softBoundSleep.waitUntilSleeping()
         XCTAssertEqual(scheduledSoftBound, 2, accuracy: 0.000_1)
         clock.advance(by: 2.5)
         await timeline.checkSoftBound()
@@ -163,7 +163,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         XCTAssertEqual(events.count { $0.kind == .softBoundExceeded }, 1)
         XCTAssertTrue(events[1].message.contains("soft bound 2.000s"), events[1].message)
         XCTAssertEqual(events.last?.phaseElapsed ?? 0, 2.5, accuracy: 0.000_1)
-        await softBoundSleep.waitUntilCancelled()
+        try await softBoundSleep.waitUntilCancelled()
     }
 
     @MainActor
@@ -722,14 +722,13 @@ private actor ContextBuilderSoftBoundSleepGate {
     private var sleepingSeconds: TimeInterval?
     private var cancelled = false
     private var sleepContinuation: CheckedContinuation<Void, Error>?
-    private var sleepingWaiters: [CheckedContinuation<TimeInterval, Never>] = []
-    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var sleepingWaiters: [CheckedContinuation<TimeInterval, Error>] = []
 
     func sleep(seconds: TimeInterval) async throws {
         try Task.checkCancellation()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                if Task.isCancelled {
+                if Task.isCancelled || cancelled {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
@@ -740,33 +739,80 @@ private actor ContextBuilderSoftBoundSleepGate {
                 waiters.forEach { $0.resume(returning: seconds) }
             }
         } onCancel: {
-            Task { await self.cancel() }
+            Task.detached { await self.cancel() }
         }
     }
 
-    func waitUntilSleeping() async -> TimeInterval {
+    func waitUntilSleeping(timeout: TimeInterval = 10) async throws -> TimeInterval {
         if let sleepingSeconds {
             return sleepingSeconds
         }
-        return await withCheckedContinuation { continuation in
+        if cancelled {
+            throw CancellationError()
+        }
+        return try await withThrowingTaskGroup(of: TimeInterval.self) { group in
+            group.addTask {
+                try await self.waitForSleepSignal()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
+                throw AsyncTestConditionTimeout(
+                    description: "context builder soft-bound sleep gate",
+                    timeout: timeout
+                )
+            }
+            do {
+                let value = try await group.next()!
+                group.cancelAll()
+                await self.failPendingSleepWaiters(CancellationError())
+                return value
+            } catch {
+                group.cancelAll()
+                await self.failPendingSleepWaiters(error)
+                throw error
+            }
+        }
+    }
+
+    func waitUntilCancelled(timeout: TimeInterval = 10) async throws {
+        if cancelled { return }
+        try await AsyncTestWait.waitUntil(
+            "context builder soft-bound cancellation",
+            timeout: timeout
+        ) {
+            await self.isCancelled
+        }
+    }
+
+    private var isCancelled: Bool {
+        cancelled
+    }
+
+    private func waitForSleepSignal() async throws -> TimeInterval {
+        try await withCheckedThrowingContinuation { continuation in
+            if let sleepingSeconds {
+                continuation.resume(returning: sleepingSeconds)
+                return
+            }
+            if cancelled {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
             sleepingWaiters.append(continuation)
         }
     }
 
-    func waitUntilCancelled() async {
-        if cancelled { return }
-        await withCheckedContinuation { continuation in
-            cancellationWaiters.append(continuation)
-        }
+    private func failPendingSleepWaiters(_ error: Error) {
+        let waiters = sleepingWaiters
+        sleepingWaiters.removeAll()
+        waiters.forEach { $0.resume(throwing: error) }
     }
 
     private func cancel() {
         cancelled = true
         sleepContinuation?.resume(throwing: CancellationError())
         sleepContinuation = nil
-        let waiters = cancellationWaiters
-        cancellationWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        failPendingSleepWaiters(CancellationError())
     }
 }
 

@@ -63,9 +63,11 @@ final class TestProcessRunnerTests: XCTestCase {
                 arguments: ["-c", "printf parent-exited; sleep 5 & exit 0"],
                 timeout: 0.25
             )
-            XCTFail("Expected process timeout")
-        } catch let error as TestProcessTimeoutError {
+            XCTFail("Expected output drain timeout after successful parent exit")
+        } catch let error as TestProcessOutputDrainTimeoutError {
             XCTAssertEqual(error.outputText, "parent-exited")
+            XCTAssertEqual(error.terminationStatus, 0)
+            XCTAssertTrue(error.description.contains("output drain timed out"))
             XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
         }
     }
