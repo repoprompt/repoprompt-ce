@@ -6,6 +6,38 @@ import XCTest
 
 @MainActor
 final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
+    func testSharedServerLeaseCancellationRemovesQueuedWaiter() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let queuedWaiter = Task {
+                    try await MCPSharedServerTestLease.shared.withLease { _ in
+                        XCTFail("Cancelled lease waiter should not acquire the shared server lease.")
+                    }
+                }
+
+                let queued = await waitForSharedServerLeaseWaiterCount(1, timeout: .seconds(2))
+                XCTAssertTrue(queued)
+                queuedWaiter.cancel()
+
+                do {
+                    try await queuedWaiter.value
+                    XCTFail("Expected cancelled lease waiter to throw CancellationError.")
+                } catch is CancellationError {
+                    // Expected cancellation path.
+                }
+
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                XCTAssertEqual(waiterCount, 0)
+            }
+
+            try await withSharedServerLeaseTimeout(timeout: .seconds(2)) {
+                try await MCPSharedServerTestLease.shared.withLease { _ in }
+            }
+        #else
+            throw XCTSkip("Shared MCP server lease cancellation regression requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
     func testDistinctConnectionsOverlapWithoutCrossRoutingReadOrSearchResults() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -104,6 +136,38 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         enum ReadSelectionShape {
             case partial
             case full
+        }
+
+        func waitForSharedServerLeaseWaiterCount(
+            _ expectedCount: Int,
+            timeout: Duration
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now + timeout
+            while clock.now < deadline {
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                if waiterCount == expectedCount { return true }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return false
+        }
+
+        func withSharedServerLeaseTimeout<T>(
+            timeout: Duration,
+            operation: @escaping @Sendable () async throws -> T
+        ) async throws -> T {
+            try await withThrowingTaskGroup(of: T.self) { group in
+                group.addTask {
+                    try await operation()
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw CancellationError()
+                }
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            }
         }
 
         func runReadSelectionPersistenceCheckpoint(
