@@ -1454,6 +1454,51 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn('gitleaks git --redact --log-opts="$range" .', workflow)
         self.assertIn("gitleaks dir --redact .", workflow)
 
+    def test_swift_style_lint_uses_config_discovery_without_script_input_overhead(self) -> None:
+        root = SCRIPT_DIR.parent
+        style_script = (SCRIPT_DIR / "swift_style.sh").read_text(encoding="utf-8")
+        swiftlint_config = (root / ".swiftlint.yml").read_text(encoding="utf-8")
+        lint_body = style_script.split("run_swiftlint(){", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn('local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)', lint_body)
+        self.assertNotIn("SCRIPT_INPUT_FILE", lint_body)
+        self.assertNotIn("--use-script-input-files", lint_body)
+
+        style_paths_body = style_script.split("STYLE_PATHS=(", 1)[1].split("\n)", 1)[0]
+        style_paths = [
+            line.strip().strip('"')
+            for line in style_paths_body.splitlines()
+            if line.strip().startswith('"')
+        ]
+        for style_path in style_paths:
+            self.assertIn(f"  - {style_path}", swiftlint_config)
+
+        for excluded_path in (
+            ".build",
+            ".swiftpm",
+            "build",
+            "Carthage",
+            "DerivedData",
+            "Generated",
+            "Pods",
+            "Vendor",
+            "Packages/RepoPromptAgentProviders/.build",
+            "Sources/CSwiftPCRE2",
+            "Sources/RepoPromptC",
+            "Sources/RepoPrompt/ThirdParty/SwiftPCRE2",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift",
+        ):
+            self.assertIn(f"  - {excluded_path}", swiftlint_config)
+
     def test_publish_staged_validates_before_creating_dist(self) -> None:
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}", 1)[0]

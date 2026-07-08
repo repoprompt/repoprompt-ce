@@ -1,7 +1,6 @@
 # RepoPrompt CE SwiftLint policy.
-# Scripts/swift_style.sh owns the canonical first-party Swift file list used by
-# local and CI checks. The include/exclude lists here mirror that scope for
-# direct SwiftLint invocations and editor integrations.
+# Full-repo lint uses this config for file discovery. Keep these include/exclude
+# lists aligned with Scripts/swift_style.sh's SwiftFormat first-party scope.
 
 included:
   - Package.swift
@@ -16,13 +15,26 @@ included:
 excluded:
   - .build
   - .swiftpm
-  - DerivedData
   - build
+  - Carthage
+  - DerivedData
+  - Generated
+  - Pods
   - Vendor
   - Packages/RepoPromptAgentProviders/.build
   - Sources/CSwiftPCRE2
   - Sources/RepoPromptC
   - Sources/RepoPrompt/ThirdParty/SwiftPCRE2
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift
+  - Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift
 
 # Keep the initial integration intentionally humane. Broader cleanup-oriented
 # rules are deferred until the one-time baseline and future focused cleanup work.

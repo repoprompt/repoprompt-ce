@@ -133,19 +133,10 @@ run_swiftformat(){
 
 run_swiftlint(){
     ensure_tool swiftlint
-    ensure_swift_files_collected
 
-    if (( ${#SWIFT_FILES[@]} == 0 )); then
-        fail "No Swift files found in configured style scope."
-    fi
-
-    local index
-    export SCRIPT_INPUT_FILE_COUNT="${#SWIFT_FILES[@]}"
-    for index in "${!SWIFT_FILES[@]}"; do
-        export "SCRIPT_INPUT_FILE_$index=${SWIFT_FILES[$index]}"
-    done
-
-    local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --use-script-input-files)
+    # Full-repo lint lets SwiftLint discover files from .swiftlint.yml instead of
+    # paying the large environment/script-input overhead for every Swift file.
+    local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)
     if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
         args+=(--reporter github-actions-logging)
     fi
