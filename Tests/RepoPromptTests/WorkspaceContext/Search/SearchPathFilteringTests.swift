@@ -114,36 +114,62 @@ final class SearchPathFilteringTests: XCTestCase {
     }
 }
 
-private actor SearchPathFilteringCancellationGate {
+private final class SearchPathFilteringCancellationGate: @unchecked Sendable {
+    private let lock = NSLock()
     private var entered = false
+    private var cancelled = false
     private var continuation: CheckedContinuation<Void, Never>?
     private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
 
     func waitUntilCancelled() async {
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume()
-                    return
-                }
+                var shouldResume = false
+                lock.lock()
                 entered = true
-                self.continuation = continuation
+                if cancelled || Task.isCancelled {
+                    shouldResume = true
+                } else {
+                    self.continuation = continuation
+                }
                 let waiters = enteredWaiters
                 enteredWaiters.removeAll()
+                lock.unlock()
+
                 waiters.forEach { $0.resume() }
+                if shouldResume {
+                    continuation.resume()
+                }
             }
         } onCancel: {
-            Task { await self.cancel() }
+            cancel()
         }
     }
 
     func waitUntilEntered() async {
-        if entered { return }
-        await withCheckedContinuation { enteredWaiters.append($0) }
+        var shouldResume = false
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if entered {
+                shouldResume = true
+            } else {
+                enteredWaiters.append(continuation)
+            }
+            lock.unlock()
+
+            if shouldResume {
+                continuation.resume()
+            }
+        }
     }
 
     private func cancel() {
-        continuation?.resume()
-        continuation = nil
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            cancelled = true
+            let continuation = continuation
+            self.continuation = nil
+            return continuation
+        }
+        pending?.resume()
     }
 }

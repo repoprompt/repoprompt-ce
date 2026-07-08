@@ -837,6 +837,7 @@ private final class EngineAsyncGateState: @unchecked Sendable {
     private var entered = false
     private var released = false
     private var continuation: CheckedContinuation<Void, Never>?
+    private var cancelledWaiters = Set<UUID>()
 
     func enterAndWait() async {
         let waiterID = UUID()
@@ -869,11 +870,11 @@ private final class EngineAsyncGateState: @unchecked Sendable {
         continuation?.resume()
     }
 
-    private func register(_ continuation: CheckedContinuation<Void, Never>, waiterID _: UUID) {
+    private func register(_ continuation: CheckedContinuation<Void, Never>, waiterID: UUID) {
         condition.lock()
         entered = true
         condition.broadcast()
-        if released || Task.isCancelled {
+        if released || Task.isCancelled || cancelledWaiters.remove(waiterID) != nil {
             condition.unlock()
             continuation.resume()
         } else {
@@ -886,10 +887,14 @@ private final class EngineAsyncGateState: @unchecked Sendable {
         }
     }
 
-    private func cancel(waiterID _: UUID) {
+    private func cancel(waiterID: UUID) {
         condition.lock()
         let continuation = continuation
-        self.continuation = nil
+        if continuation == nil {
+            cancelledWaiters.insert(waiterID)
+        } else {
+            self.continuation = nil
+        }
         condition.broadcast()
         condition.unlock()
         continuation?.resume()

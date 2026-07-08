@@ -2041,7 +2041,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 guard activeFD >= 0 else { return }
                 var descriptor = pollfd(fd: activeFD, events: Int16(POLLIN), revents: 0)
                 let pollResult = Darwin.poll(&descriptor, 1, 100)
-                if pollResult == 0 { continue }
+                if pollResult == 0 {
+                    if withStateLock({ isClosed }) { return }
+                    continue
+                }
                 if pollResult < 0 {
                     if errno == EINTR { continue }
                     if withStateLock({ isClosed }) { return }
@@ -2054,6 +2057,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     close(with: ClientError.closed)
                     return
                 }
+                if withStateLock({ isClosed }) { return }
                 var bytes = [UInt8](repeating: 0, count: 4096)
                 let readCount = bytes.withUnsafeMutableBytes { storage in
                     Darwin.read(activeFD, storage.baseAddress, storage.count)
