@@ -55,6 +55,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
     func testStalledFakeQueryTimesOutWithAttributedSubphaseAndCancelsStream() async {
         let clock = ContextBuilderFinalizationTestClock()
         let cancellationRecorder = ContextBuilderFinalizationCancellationRecorder()
+        let finalizationGate = ContextBuilderCancellableFinalizationGate()
         let (events, continuation) = AsyncStream<OracleMessageLifecycleActivityEvent>.makeStream()
         defer { continuation.finish() }
 
@@ -72,7 +73,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
                     await Task.yield()
                 },
                 waitForFinalization: {
-                    try await Task.sleep(for: .seconds(60))
+                    try await finalizationGate.wait()
                 },
                 cancelStreaming: {
                     await cancellationRecorder.recordCancellation()
@@ -89,6 +90,8 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
 
         let cancellationCount = await cancellationRecorder.count()
         XCTAssertEqual(cancellationCount, 1)
+        let finalizationWasCancelled = await finalizationGate.wasCancelled()
+        XCTAssertTrue(finalizationWasCancelled)
     }
 
     func testTimeoutOutcomeWinsWhenCancellationAlsoCompletesFinalization() async {
@@ -282,6 +285,10 @@ private actor ContextBuilderCancellableFinalizationGate {
         completed = true
         continuation?.resume()
         continuation = nil
+    }
+
+    func wasCancelled() -> Bool {
+        cancelled
     }
 
     private func register(_ continuation: CheckedContinuation<Void, Never>) {

@@ -261,8 +261,7 @@ final class GitBlobSourceMaterializationServiceTests: XCTestCase {
             client: GitBlobSourceMaterializationClient(
                 size: { _, _ in UInt64(bytes.count) },
                 bytes: { _, _, _ in
-                    await gate.enter()
-                    try await Task.sleep(for: .seconds(60))
+                    try await gate.waitUntilCancelled()
                     return bytes
                 }
             )
@@ -363,18 +362,40 @@ final class GitBlobSourceMaterializationServiceTests: XCTestCase {
 
 private actor MaterializationCancellationGate {
     private var entered = false
+    private var continuation: CheckedContinuation<Void, Error>?
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    func enter() {
+    func waitUntilCancelled() async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                markEntered()
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func markEntered() {
         entered = true
         let current = waiters
         waiters.removeAll()
         current.forEach { $0.resume() }
     }
 
-    func waitUntilEntered() async {
-        if entered { return }
-        await withCheckedContinuation { waiters.append($0) }
+    private func cancel() {
+        continuation?.resume(throwing: CancellationError())
+        continuation = nil
     }
 }
 

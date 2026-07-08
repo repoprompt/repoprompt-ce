@@ -100,14 +100,50 @@ final class SearchPathFilteringTests: XCTestCase {
             clauses: [.legacyPrefix(candidateLower: "sources")]
         )
 
+        let cancellationGate = SearchPathFilteringCancellationGate()
         let task = Task.detached(priority: .background) {
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            await cancellationGate.waitUntilCancelled()
             return filterPathIndicesResult(snapshots: snapshots, spec: spec)
         }
+        await cancellationGate.waitUntilEntered()
         task.cancel()
         let result = await task.value
 
         XCTAssertTrue(result.cancelled)
         XCTAssertLessThan(result.visitedSnapshotCount, snapshots.count)
+    }
+}
+
+private actor SearchPathFilteringCancellationGate {
+    private var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitUntilCancelled() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume()
+                    return
+                }
+                entered = true
+                self.continuation = continuation
+                let waiters = enteredWaiters
+                enteredWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    private func cancel() {
+        continuation?.resume()
+        continuation = nil
     }
 }

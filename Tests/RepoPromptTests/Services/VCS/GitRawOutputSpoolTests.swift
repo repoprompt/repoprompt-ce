@@ -84,11 +84,13 @@ final class GitRawOutputSpoolTests: XCTestCase {
         )
         try cancellationSpool.append(Data("payload".utf8))
         let cancellationLease = try cancellationSpool.finish()
+        let cancellationGate = GitRawOutputCancellationGate()
         let task = Task {
             let reader = try cancellationLease.makeReader()
-            try await Task.sleep(for: .seconds(60))
+            try await cancellationGate.waitUntilCancelled()
             return try reader.nextChunk()
         }
+        await cancellationGate.waitUntilEntered()
         task.cancel()
         do {
             _ = try await task.value
@@ -136,5 +138,40 @@ final class GitRawOutputSpoolTests: XCTestCase {
             "git-raw-spool-tests-\(UUID().uuidString.lowercased())",
             isDirectory: true
         )
+    }
+}
+
+private actor GitRawOutputCancellationGate {
+    private var entered = false
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitUntilCancelled() async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                entered = true
+                self.continuation = continuation
+                let waiters = enteredWaiters
+                enteredWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    private func cancel() {
+        continuation?.resume(throwing: CancellationError())
+        continuation = nil
     }
 }

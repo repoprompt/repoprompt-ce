@@ -25,6 +25,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
     func testDeadlineCancelsCooperativeOperationAndReturnsSingleTimeout() async throws {
         let clock = ExecutionWatchdogManualClock()
         let events = ExecutionWatchdogEventRecorder()
+        let operationGate = ExecutionWatchdogCancellationGate()
         let task = Task<Int, Error> {
             try await MCPToolExecutionWatchdog.execute(
                 deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
@@ -32,7 +33,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
                 environment: clock.environment,
                 onEvent: { await events.append($0) }
             ) {
-                try await Task.sleep(for: .seconds(3600))
+                try await operationGate.waitUntilCancelled()
                 return 1
             }
         }
@@ -58,6 +59,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let clock = ExecutionWatchdogManualClock()
         let events = ExecutionWatchdogEventRecorder()
         let callbackGate = ExecutionWatchdogCallbackGate()
+        let operationGate = ExecutionWatchdogCancellationGate()
         let task = Task<Int, Error> {
             try await MCPToolExecutionWatchdog.execute(
                 deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
@@ -70,7 +72,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
                     }
                 }
             ) {
-                try await Task.sleep(for: .seconds(3600))
+                try await operationGate.waitUntilCancelled()
                 return 1
             }
         }
@@ -279,6 +281,30 @@ actor ExecutionWatchdogUncooperativeGate {
     func release() {
         released = true
         continuation?.resume()
+        continuation = nil
+    }
+}
+
+actor ExecutionWatchdogCancellationGate {
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    func waitUntilCancelled() async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    private func cancel() {
+        continuation?.resume(throwing: CancellationError())
         continuation = nil
     }
 }

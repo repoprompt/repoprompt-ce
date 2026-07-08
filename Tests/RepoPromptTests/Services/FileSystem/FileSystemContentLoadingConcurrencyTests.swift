@@ -1047,10 +1047,11 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             XCTAssertEqual(afterError.foregroundActivityCount, 0)
 
             let started = AsyncSignal()
+            let cancellationGate = AsyncCancellationGate()
             let cancelled = Task {
                 try await limiter.withForegroundActivity(kind: .interactiveRead) {
                     await started.mark()
-                    try await Task.sleep(for: .seconds(60))
+                    try await cancellationGate.waitUntilCancelled()
                 }
             }
             let didStart = await started.waitUntilMarked()
@@ -1438,5 +1439,29 @@ private actor AsyncSignal {
     private func finishWaiter(_ waiterID: UUID) {
         guard let continuation = waiters.removeValue(forKey: waiterID) else { return }
         continuation.resume(returning: marked)
+    }
+}
+
+private actor AsyncCancellationGate {
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    func waitUntilCancelled() async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    private func cancel() {
+        continuation?.resume(throwing: CancellationError())
+        continuation = nil
     }
 }
