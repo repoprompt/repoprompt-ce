@@ -437,12 +437,14 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                             MCPWindowToolName.git,
                             advertised
                         )
+                    } catch let error as CancellationError {
+                        throw error
                     } catch {
                         await dependencies.invalidateAdvertisedGitArtifactsForCurrentTab(
                             MCPWindowToolName.git
                         )
-                        throw MCPError.internalError(
-                            "Git artifacts were published, but their advertised aliases could not be authorized: \(error.localizedDescription)"
+                        dependencies.logDebug(
+                            "Git artifacts were published, but advertised aliases were not authorized: \(error.localizedDescription)"
                         )
                     }
                 }
