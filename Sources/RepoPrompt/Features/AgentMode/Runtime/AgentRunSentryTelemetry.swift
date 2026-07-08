@@ -325,7 +325,7 @@ enum AgentRunSentryTelemetry {
                 .fable
             case .claudeOpus, .claudeOpus1m, .claudeOpus45, .claudeOpus46, .claudeOpus47:
                 .opus
-            case .claudeSonnet, .claudeSonnet45, .claudeSonnet46:
+            case .claudeSonnet, .claudeSonnet5, .claudeSonnet45, .claudeSonnet46:
                 .sonnet
             case .claudeHaiku, .claudeHaiku45:
                 .haiku
