@@ -28,6 +28,8 @@ enum TestGitCommandRunner {
         return processEnvironment
     }
 
+    /// Runs git with the same default timeout as `TestProcessRunner` (30s).
+    /// Pass an explicit larger `timeout` for known-heavy fixtures (cold clone, large packs).
     static func runResult(
         _ arguments: [String],
         cwd: URL,
@@ -43,6 +45,7 @@ enum TestGitCommandRunner {
         )
     }
 
+    /// See `runResult` for timeout guidance.
     @discardableResult
     static func run(
         _ arguments: [String],

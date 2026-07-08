@@ -2707,8 +2707,8 @@ private final class ManifestAccessClock: @unchecked Sendable {
 
 private final class ManifestLockedMergeGate: @unchecked Sendable {
     private let condition = NSCondition()
+    private let firstWriterFence = TestBlockingFence(name: "manifest locked merge first-writer fence")
     private var firstWriterAcquired = false
-    private var firstWriterReleased = false
     private var secondWriterAttempted = false
     private var secondWriterAcquired = false
 
@@ -2716,14 +2716,12 @@ private final class ManifestLockedMergeGate: @unchecked Sendable {
         condition.withLock { secondWriterAcquired }
     }
 
-    func firstWriterAcquiredLockAndWait() {
+    func firstWriterAcquiredLockAndWait(timeout: TimeInterval = TestFenceDefaults.releaseWait) {
         condition.lock()
         firstWriterAcquired = true
         condition.broadcast()
-        while !firstWriterReleased {
-            condition.wait()
-        }
         condition.unlock()
+        firstWriterFence.enterAndWait(timeout: timeout)
     }
 
     func secondWriterAttemptedLock() {
@@ -2740,19 +2738,16 @@ private final class ManifestLockedMergeGate: @unchecked Sendable {
         }
     }
 
-    func waitUntilFirstWriterAcquiredLock(timeout: TimeInterval = 10) -> Bool {
+    func waitUntilFirstWriterAcquiredLock(timeout: TimeInterval = TestFenceDefaults.enterWait) -> Bool {
         wait(timeout: timeout) { firstWriterAcquired }
     }
 
-    func waitUntilSecondWriterAttemptedLock(timeout: TimeInterval = 10) -> Bool {
+    func waitUntilSecondWriterAttemptedLock(timeout: TimeInterval = TestFenceDefaults.enterWait) -> Bool {
         wait(timeout: timeout) { secondWriterAttempted }
     }
 
     func releaseFirstWriter() {
-        condition.withLock {
-            firstWriterReleased = true
-            condition.broadcast()
-        }
+        firstWriterFence.release()
     }
 
     private func wait(timeout: TimeInterval, condition predicate: () -> Bool) -> Bool {
@@ -2766,31 +2761,17 @@ private final class ManifestLockedMergeGate: @unchecked Sendable {
     }
 }
 
-private actor ManifestAccessRefreshGate {
-    private var blocked = false
-    private var released = false
-    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseContinuation: CheckedContinuation<Void, Never>?
+/// Manifest access refresh block/release fence (shared `TestReleaseFence`).
+private final class ManifestAccessRefreshGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "manifest access refresh gate")
 
-    func block() async {
-        blocked = true
-        let waiters = blockedWaiters
-        blockedWaiters.removeAll()
-        waiters.forEach { $0.resume() }
-        if released { return }
-        await withCheckedContinuation { releaseContinuation = $0 }
+    func block() async { await fence.enterAndWait() }
+
+    func waitUntilBlocked(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
-    func waitUntilBlocked() async {
-        if blocked { return }
-        await withCheckedContinuation { blockedWaiters.append($0) }
-    }
-
-    func release() {
-        released = true
-        releaseContinuation?.resume()
-        releaseContinuation = nil
-    }
+    func release() { fence.release() }
 }
 
 private final class ManifestRootReplacementHook: @unchecked Sendable {

@@ -1484,7 +1484,15 @@ final class CodemapSelectionGraphBuildGate: @unchecked Sendable {
             let deadline = Date(timeIntervalSinceNow: autoReleaseTimeout)
             while !isOpen, !releasedGenerations.contains(generation) {
                 guard condition.wait(until: deadline) else {
-                    XCTFail("Timed out waiting to release codemap selection graph generation \(generation)")
+                    XCTFail(
+                        "Timed out waiting to release codemap selection graph generation \(generation) "
+                            + "after \(String(format: "%.1f", autoReleaseTimeout))s. "
+                            + "Pass a larger autoReleaseTimeout if this release is intentionally slow."
+                    )
+                    // Fail open consistently with the nil-timeout path: open the gate so sibling
+                    // parallel generations are not left blocked until their own deadlines.
+                    isOpen = true
+                    condition.broadcast()
                     break
                 }
             }
@@ -1493,8 +1501,7 @@ final class CodemapSelectionGraphBuildGate: @unchecked Sendable {
             while !isOpen, !releasedGenerations.contains(generation) {
                 guard condition.wait(until: watchdogDeadline) else {
                     XCTFail("Codemap selection graph generation \(generation) is still blocked without release")
-                    // Fail closed: open the gate so the blocked builder can make progress
-                    // instead of spinning forever after the first XCTFail.
+                    // Fail open: open the gate so the blocked builder (and siblings) can progress.
                     isOpen = true
                     condition.broadcast()
                     break
@@ -1800,8 +1807,9 @@ actor CodemapRetrySleepGate {
                 timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
             )
         } catch {
+            if let delay = delays.first { return delay }
             XCTFail(error.localizedDescription)
-            return delays.first
+            return nil
         }
     }
 
@@ -1821,6 +1829,7 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
     private var released = false
     private var sleepContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var cancelledSleepWaiters = Set<UUID>()
+    private var cancelledDelayWaiters: [UUID: Error] = [:]
     private var delayWaiters: [DelayWaiter] = []
 
     var delays: [UInt64] {
@@ -1844,6 +1853,7 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 var result: Result<Void, Error>?
                 lock.lock()
+                // releaseAll() unblocks sleepers as success (proceed past the sleep), not cancellation.
                 if released {
                     result = .success(())
                 } else if Task.isCancelled || cancelledSleepWaiters.remove(waiterID) != nil {
@@ -1870,52 +1880,77 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
     func waitForFirstDelay(timeout: TimeInterval) async throws -> UInt64? {
         if let delay = delays.first { return delay }
         let waiterID = UUID()
-        return try await withThrowingTaskGroup(of: UInt64?.self) { group in
-            group.addTask {
-                try await self.waitForFirstDelaySignal(id: waiterID)
+        do {
+            return try await withThrowingTaskGroup(of: UInt64?.self) { group in
+                group.addTask {
+                    try await self.waitForFirstDelaySignal(id: waiterID)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
+                    self.cancelDelayWaiter(
+                        id: waiterID,
+                        error: AsyncTestConditionTimeout(description: "codemap retry first delay", timeout: timeout)
+                    )
+                    throw AsyncTestConditionTimeout(description: "codemap retry first delay", timeout: timeout)
+                }
+                defer {
+                    group.cancelAll()
+                    cancelDelayWaiter(id: waiterID, error: CancellationError())
+                }
+                return try await group.next() ?? nil
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
-                self.cancelDelayWaiter(
-                    id: waiterID,
-                    error: AsyncTestConditionTimeout(description: "codemap retry first delay", timeout: timeout)
-                )
-                throw AsyncTestConditionTimeout(description: "codemap retry first delay", timeout: timeout)
-            }
-            defer {
-                group.cancelAll()
-                cancelDelayWaiter(id: waiterID, error: CancellationError())
-            }
-            return try await group.next() ?? nil
+        } catch {
+            if let delay = delays.first { return delay }
+            throw error
         }
     }
 
     func releaseAll() {
-        let pending = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+        // Intentionally resume sleep waiters with success so callers proceed past the sleep gate.
+        // Also drain first-delay observers so teardown does not sit on the waiter timeout.
+        let pending = lock.withLock { () -> (
+            sleep: [CheckedContinuation<Void, Error>],
+            delay: [CheckedContinuation<UInt64?, Error>]
+        ) in
             released = true
-            let pending = Array(sleepContinuations.values)
+            let sleep = Array(sleepContinuations.values)
             sleepContinuations.removeAll()
+            let delay = delayWaiters.map(\.continuation)
+            delayWaiters.removeAll()
             cancelledSleepWaiters.removeAll()
-            return pending
+            cancelledDelayWaiters.removeAll()
+            return (sleep, delay)
         }
-        for continuation in pending {
+        for continuation in pending.sleep {
             continuation.resume(returning: ())
+        }
+        for continuation in pending.delay {
+            continuation.resume(returning: nil)
         }
     }
 
     private func waitForFirstDelaySignal(id: UUID) async throws -> UInt64? {
         try await withCheckedThrowingContinuation { continuation in
-            var result: UInt64?
+            var result: Result<UInt64?, Error>?
             lock.lock()
             if let delay = storedDelays.first {
-                result = delay
+                result = .success(delay)
+            } else if let error = cancelledDelayWaiters.removeValue(forKey: id) {
+                result = .failure(error)
+            } else if Task.isCancelled {
+                result = .failure(CancellationError())
             } else {
                 delayWaiters.append(DelayWaiter(id: id, continuation: continuation))
             }
             lock.unlock()
 
-            if let result {
-                continuation.resume(returning: result)
+            switch result {
+            case let .success(value):
+                continuation.resume(returning: value)
+            case let .failure(error):
+                continuation.resume(throwing: error)
+            case nil:
+                break
             }
         }
     }
@@ -1932,231 +1967,149 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
     }
 
     private func cancelDelayWaiter(id: UUID, error: Error) {
-        var continuation: CheckedContinuation<UInt64?, Error>?
-        lock.lock()
-        if let index = delayWaiters.firstIndex(where: { $0.id == id }) {
-            continuation = delayWaiters.remove(at: index).continuation
+        let continuation = lock.withLock { () -> CheckedContinuation<UInt64?, Error>? in
+            if let index = delayWaiters.firstIndex(where: { $0.id == id }) {
+                return delayWaiters.remove(at: index).continuation
+            }
+            if cancelledDelayWaiters[id] == nil {
+                cancelledDelayWaiters[id] = error
+            }
+            return nil
         }
-        lock.unlock()
         continuation?.resume(throwing: error)
     }
 }
 
-private final class CodemapVoidContinuationGateState: @unchecked Sendable {
+/// Shared hang-hardened enter/release fence for codemap suspension-style tests.
+final class CodemapSuspensionGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "codemap suspension gate")
+
+    func enterAndWait() async { await fence.enterAndWait() }
+
+    @discardableResult
+    func waitUntilEntered(
+        timeout: Duration = TestFenceDefaults.enterWaitDuration,
+        failOnTimeout: Bool = true
+    ) async -> Bool {
+        await fence.waitUntilEntered(timeout: timeout, failOnTimeout: failOnTimeout)
+    }
+
+    func release() { fence.release() }
+}
+
+/// Armable suspension: only parks after `arm()`.
+final class CodemapArmableSuspensionGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "codemap armable suspension gate")
     private let lock = NSLock()
-    private var released = false
-    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
-    private var cancelledWaiters = Set<UUID>()
-
-    var isReleased: Bool {
-        lock.withLock { released }
-    }
-
-    func waitUnlessReleased() async {
-        guard !Task.isCancelled else { return }
-        let waiterID = UUID()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                var shouldResume = false
-                lock.lock()
-                if released || Task.isCancelled || cancelledWaiters.remove(waiterID) != nil {
-                    shouldResume = true
-                } else {
-                    continuations[waiterID] = continuation
-                }
-                lock.unlock()
-
-                if shouldResume {
-                    continuation.resume()
-                }
-            }
-        } onCancel: {
-            cancel(waiterID)
-        }
-    }
-
-    func release() {
-        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-            released = true
-            let pending = Array(continuations.values)
-            continuations.removeAll()
-            cancelledWaiters.removeAll()
-            return pending
-        }
-        for continuation in pending {
-            continuation.resume()
-        }
-    }
-
-    private func cancel(_ waiterID: UUID) {
-        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
-            if let continuation = continuations.removeValue(forKey: waiterID) {
-                return continuation
-            }
-            cancelledWaiters.insert(waiterID)
-            return nil
-        }
-        continuation?.resume()
-    }
-}
-
-actor CodemapSuspensionGate {
-    private var entered = false
-    private let gateState = CodemapVoidContinuationGateState()
-
-    func enterAndWait() async {
-        entered = true
-        await gateState.waitUnlessReleased()
-    }
-
-    func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
-        do {
-            try await AsyncTestWait.waitUntil(
-                "codemap suspension gate entered",
-                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
-            ) {
-                self.entered
-            }
-            return true
-        } catch {
-            XCTFail(error.localizedDescription)
-            return entered
-        }
-    }
-
-    func release() {
-        gateState.release()
-    }
-}
-
-actor CodemapArmableSuspensionGate {
     private var armed = false
-    private var entered = false
-    private let gateState = CodemapVoidContinuationGateState()
 
     func arm() {
+        lock.lock()
         armed = true
+        lock.unlock()
     }
 
     func enterIfArmedAndWait() async {
-        guard armed else { return }
-        entered = true
-        await gateState.waitUnlessReleased()
+        let isArmed = lock.withLock { armed }
+        guard isArmed else { return }
+        await fence.enterAndWait()
     }
 
-    func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
-        do {
-            try await AsyncTestWait.waitUntil(
-                "codemap suspension gate entered",
-                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
-            ) {
-                self.entered
-            }
-            return true
-        } catch {
-            XCTFail(error.localizedDescription)
-            return entered
-        }
+    @discardableResult
+    func waitUntilEntered(timeout: Duration = TestFenceDefaults.enterWaitDuration) async -> Bool {
+        await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        gateState.release()
+        fence.release()
     }
 }
 
-actor CodemapGraphPublicationGate {
+/// Records publication root epochs while parking on a shared release fence.
+final class CodemapGraphPublicationGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "codemap graph publication gate")
+    private let lock = NSLock()
     private var invocationRoots: [WorkspaceCodemapRootEpoch] = []
-    private let gateState = CodemapVoidContinuationGateState()
 
     var invocationCount: Int {
-        invocationRoots.count
+        lock.withLock { invocationRoots.count }
     }
 
     func enterAndWait(_ rootEpoch: WorkspaceCodemapRootEpoch) async {
-        invocationRoots.append(rootEpoch)
-        await gateState.waitUnlessReleased()
+        lock.withLock { invocationRoots.append(rootEpoch) }
+        await fence.enterAndWait()
     }
 
     func waitUntilInvocationCount(
         _ expectedCount: Int,
-        timeout: Duration = .seconds(10)
+        timeout: Duration = TestFenceDefaults.enterWaitDuration
     ) async -> Bool {
         do {
             try await AsyncTestWait.waitUntil(
                 "codemap graph publication gate invocation count",
-                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
+                timeout: TestFenceDefaults.timeInterval(timeout)
             ) {
-                self.invocationRoots.count >= expectedCount
+                self.invocationCount >= expectedCount
             }
             return true
         } catch {
             XCTFail(error.localizedDescription)
-            return invocationRoots.count >= expectedCount
+            return invocationCount >= expectedCount
         }
     }
 
     func release() {
-        gateState.release()
+        fence.release()
     }
 }
 
-actor CodemapRootSuspensionGate {
+/// Parks only on the first root epoch enter.
+final class CodemapRootSuspensionGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "codemap root suspension gate")
+    private let lock = NSLock()
     private var enteredRootEpoch: WorkspaceCodemapRootEpoch?
-    private let gateState = CodemapVoidContinuationGateState()
 
     func enterAndWait(_ rootEpoch: WorkspaceCodemapRootEpoch) async {
-        guard enteredRootEpoch == nil else { return }
-        enteredRootEpoch = rootEpoch
-        await gateState.waitUnlessReleased()
+        let shouldPark = lock.withLock { () -> Bool in
+            guard enteredRootEpoch == nil else { return false }
+            enteredRootEpoch = rootEpoch
+            return true
+        }
+        guard shouldPark else { return }
+        await fence.enterAndWait()
     }
 
-    func waitUntilEntered(timeout: Duration = .seconds(10)) async -> WorkspaceCodemapRootEpoch? {
-        do {
-            try await AsyncTestWait.waitUntil(
-                "codemap root suspension gate entered",
-                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
-            ) {
-                self.enteredRootEpoch != nil
-            }
-            return enteredRootEpoch
-        } catch {
-            XCTFail(error.localizedDescription)
-            return enteredRootEpoch
-        }
+    func waitUntilEntered(timeout: Duration = TestFenceDefaults.enterWaitDuration) async -> WorkspaceCodemapRootEpoch? {
+        _ = await fence.waitUntilEntered(timeout: timeout)
+        return lock.withLock { enteredRootEpoch }
     }
 
     func release() {
-        gateState.release()
+        fence.release()
     }
 }
 
-actor CodemapResolutionGate {
-    private var entered = false
-    private let gateState = CodemapVoidContinuationGateState()
-    private(set) var resolutionCount = 0
+/// Resolution-count enter fence for codemap resolution hooks.
+final class CodemapResolutionGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "codemap resolution gate")
+    private let lock = NSLock()
+    private var storedResolutionCount = 0
 
-    func enterAndWait() async {
-        resolutionCount += 1
-        entered = true
-        await gateState.waitUnlessReleased()
+    var resolutionCount: Int {
+        lock.withLock { storedResolutionCount }
     }
 
-    func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
-        do {
-            try await AsyncTestWait.waitUntil(
-                "codemap suspension gate entered",
-                timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
-            ) {
-                self.entered
-            }
-            return true
-        } catch {
-            XCTFail(error.localizedDescription)
-            return entered
-        }
+    func enterAndWait() async {
+        lock.withLock { storedResolutionCount += 1 }
+        await fence.enterAndWait()
+    }
+
+    @discardableResult
+    func waitUntilEntered(timeout: Duration = TestFenceDefaults.enterWaitDuration) async -> Bool {
+        await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        gateState.release()
+        fence.release()
     }
 }

@@ -102,7 +102,8 @@ final class SearchPathFilteringTests: XCTestCase {
 
         let cancellationGate = SearchPathFilteringCancellationGate()
         let task = Task.detached(priority: .background) {
-            await cancellationGate.waitUntilCancelled()
+            // Shared cancellation gate resumes with CancellationError; continue into filter.
+            try? await cancellationGate.waitUntilCancelled()
             return filterPathIndicesResult(snapshots: snapshots, spec: spec)
         }
         await cancellationGate.waitUntilEntered()
@@ -114,62 +115,8 @@ final class SearchPathFilteringTests: XCTestCase {
     }
 }
 
-private final class SearchPathFilteringCancellationGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var entered = false
-    private var cancelled = false
-    private var continuation: CheckedContinuation<Void, Never>?
-    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
-
-    func waitUntilCancelled() async {
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                var shouldResume = false
-                lock.lock()
-                entered = true
-                if cancelled || Task.isCancelled {
-                    shouldResume = true
-                } else {
-                    self.continuation = continuation
-                }
-                let waiters = enteredWaiters
-                enteredWaiters.removeAll()
-                lock.unlock()
-
-                waiters.forEach { $0.resume() }
-                if shouldResume {
-                    continuation.resume()
-                }
-            }
-        } onCancel: {
-            cancel()
-        }
-    }
-
-    func waitUntilEntered() async {
-        var shouldResume = false
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if entered {
-                shouldResume = true
-            } else {
-                enteredWaiters.append(continuation)
-            }
-            lock.unlock()
-
-            if shouldResume {
-                continuation.resume()
-            }
-        }
-    }
-
-    private func cancel() {
-        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
-            cancelled = true
-            let continuation = continuation
-            self.continuation = nil
-            return continuation
-        }
-        pending?.resume()
-    }
-}
+/// Search path filter cancel handshake (shared `TestCancellationGate`).
+///
+/// Note: resumes with `CancellationError` on cancel (stricter than the old Never-continuation
+/// version, which treated cancel as a non-throwing resume). Call sites only assert cancellation.
+private typealias SearchPathFilteringCancellationGate = TestCancellationGate

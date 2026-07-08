@@ -1850,40 +1850,17 @@ private actor MutationTokenBox {
 }
 
 #if DEBUG
-    private actor ReceiptMutationLockGate {
-        private var entered = false
-        private var released = false
-        private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Receipt mutation lock fence (shared `TestReleaseFence` with legacy names).
+    private final class ReceiptMutationLockGate: @unchecked Sendable {
+        private let fence = TestReleaseFence(name: "receipt mutation lock gate")
 
-        func enterAndWaitForRelease() async {
-            entered = true
-            let waiters = enteredWaiters
-            enteredWaiters.removeAll()
-            for waiter in waiters {
-                waiter.resume()
-            }
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
-            }
+        func enterAndWaitForRelease() async { await fence.enterAndWait() }
+
+        func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+            _ = await fence.waitUntilEntered(timeout: timeout)
         }
 
-        func waitUntilEntered() async {
-            guard !entered else { return }
-            await withCheckedContinuation { continuation in
-                enteredWaiters.append(continuation)
-            }
-        }
-
-        func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            for waiter in waiters {
-                waiter.resume()
-            }
-        }
+        func release() { fence.release() }
     }
 #endif
 

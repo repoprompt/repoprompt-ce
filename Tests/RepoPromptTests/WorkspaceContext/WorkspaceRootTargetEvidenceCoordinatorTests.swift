@@ -552,29 +552,7 @@ private actor TargetEvidenceCancellationProbe {
     }
 }
 
-private actor TargetEvidenceCancellationGate {
-    private var continuation: CheckedContinuation<Void, Error>?
-
-    func waitUntilCancelled() async throws {
-        try Task.checkCancellation()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(throwing: CancellationError())
-                } else {
-                    self.continuation = continuation
-                }
-            }
-        } onCancel: {
-            Task { await self.cancel() }
-        }
-    }
-
-    private func cancel() {
-        continuation?.resume(throwing: CancellationError())
-        continuation = nil
-    }
-}
+private typealias TargetEvidenceCancellationGate = TestCancellationGate
 
 private actor TargetEvidenceCancellationOrderingProbe {
     enum Event: Equatable {

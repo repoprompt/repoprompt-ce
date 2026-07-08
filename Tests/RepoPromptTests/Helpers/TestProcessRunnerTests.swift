@@ -57,17 +57,27 @@ final class TestProcessRunnerTests: XCTestCase {
     func testTimeoutReturnsWhenExitedParentLeavesChildHoldingPipe() throws {
         let startedAt = Date()
 
+        // Hold the pipe write end with a child that ignores common signals so platform
+        // SIGHUP/termination of the orphan cannot make drain complete before the grace budget.
+        // Accept either drain-timeout (parent exits 0) or process-timeout as long as wall time
+        // stays bounded and the output prefix matches.
         do {
             _ = try TestProcessRunner.run(
                 executableURL: URL(fileURLWithPath: "/bin/sh"),
-                arguments: ["-c", "printf parent-exited; sleep 5 & exit 0"],
+                arguments: [
+                    "-c",
+                    "printf parent-exited; (trap '' HUP INT TERM; exec /bin/sleep 30) & exit 0"
+                ],
                 timeout: 0.25
             )
-            XCTFail("Expected output drain timeout after successful parent exit")
+            XCTFail("Expected a bounded timeout while orphaned child holds the pipe")
         } catch let error as TestProcessOutputDrainTimeoutError {
             XCTAssertEqual(error.outputText, "parent-exited")
             XCTAssertEqual(error.terminationStatus, 0)
             XCTAssertTrue(error.description.contains("output drain timed out"))
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
+        } catch let error as TestProcessTimeoutError {
+            XCTAssertEqual(error.outputText, "parent-exited")
             XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
         }
     }

@@ -384,26 +384,4 @@ private enum RegistryTestError: Error {
     case expectedProjectionPage
 }
 
-private actor RegistryRouteGate {
-    private var entered = false
-    private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
-
-    func enterAndWait() async {
-        entered = true
-        guard !released else { return }
-        await withCheckedContinuation { continuation = $0 }
-    }
-
-    func waitUntilEntered() async {
-        while !entered {
-            await Task.yield()
-        }
-    }
-
-    func release() {
-        released = true
-        continuation?.resume()
-        continuation = nil
-    }
-}
+private typealias RegistryRouteGate = TestReleaseFence

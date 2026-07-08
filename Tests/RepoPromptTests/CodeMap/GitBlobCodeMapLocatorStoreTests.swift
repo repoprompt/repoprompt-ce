@@ -1063,28 +1063,4 @@ private actor GitBlobLocatorAsyncBarrier {
     }
 }
 
-private actor GitBlobLocatorAsyncGate {
-    private var entered = false
-    private var released = false
-    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-
-    func enterAndWait() async {
-        entered = true
-        entryWaiters.forEach { $0.resume() }
-        entryWaiters.removeAll()
-        guard !released else { return }
-        await withCheckedContinuation { releaseWaiters.append($0) }
-    }
-
-    func waitUntilEntered() async {
-        guard !entered else { return }
-        await withCheckedContinuation { entryWaiters.append($0) }
-    }
-
-    func release() {
-        released = true
-        releaseWaiters.forEach { $0.resume() }
-        releaseWaiters.removeAll()
-    }
-}
+private typealias GitBlobLocatorAsyncGate = TestReleaseFence

@@ -172,7 +172,13 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                         timeout: timeoutInterval
                     )
                 }
-                let result = try await group.next()!
+                guard let result = try await group.next() else {
+                    group.cancelAll()
+                    throw AsyncTestConditionTimeout(
+                        description: "shared MCP server lease re-acquisition (empty task group)",
+                        timeout: timeoutInterval
+                    )
+                }
                 group.cancelAll()
                 return result
             }

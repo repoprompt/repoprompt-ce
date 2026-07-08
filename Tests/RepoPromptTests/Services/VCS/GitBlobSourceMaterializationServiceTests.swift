@@ -360,44 +360,7 @@ final class GitBlobSourceMaterializationServiceTests: XCTestCase {
     }
 }
 
-private actor MaterializationCancellationGate {
-    private var entered = false
-    private var continuation: CheckedContinuation<Void, Error>?
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func waitUntilCancelled() async throws {
-        try Task.checkCancellation()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                self.continuation = continuation
-                markEntered()
-            }
-        } onCancel: {
-            Task { await self.cancel() }
-        }
-    }
-
-    func waitUntilEntered() async {
-        if entered { return }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-
-    private func markEntered() {
-        entered = true
-        let current = waiters
-        waiters.removeAll()
-        current.forEach { $0.resume() }
-    }
-
-    private func cancel() {
-        continuation?.resume(throwing: CancellationError())
-        continuation = nil
-    }
-}
+private typealias MaterializationCancellationGate = TestCancellationGate
 
 private final class MaterializationHashRecorder: @unchecked Sendable {
     private let lock = NSLock()
@@ -416,27 +379,28 @@ private final class MaterializationHashRecorder: @unchecked Sendable {
     }
 }
 
+/// Sync hash-hook fence: `oidForBytes` is synchronous, so use a hang-hardened
+/// `TestBlockingFence` (bounded wait + XCTFail/fail-open) instead of unbounded semaphores.
 private final class MaterializationHashCancellationGate: @unchecked Sendable {
-    private let hashingEntered = DispatchSemaphore(value: 0)
-    private let hashingRelease = DispatchSemaphore(value: 0)
+    private let fence = TestBlockingFence(name: "materialization hash cancellation")
 
     func hash(bytes: Data, objectFormat: GitObjectFormat) -> GitBlobOID {
-        hashingEntered.signal()
-        hashingRelease.wait()
+        fence.enterAndWait()
         return GitBlobOID.blob(bytes: bytes, objectFormat: objectFormat)
     }
 
     func waitUntilHashing() async {
-        await withCheckedContinuation { continuation in
+        // `waitUntilEntered` is synchronous NSCondition; park off the calling executor.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
-                self.hashingEntered.wait()
+                _ = self.fence.waitUntilEntered()
                 continuation.resume()
             }
         }
     }
 
     func releaseHashing() {
-        hashingRelease.signal()
+        fence.release()
     }
 }
 

@@ -718,101 +718,157 @@ private final class ContextBuilderProgressTimelineReference: @unchecked Sendable
     }
 }
 
-private actor ContextBuilderSoftBoundSleepGate {
+/// Soft-bound sleep gate: lock-backed sticky cancel (no `Task { await }` hop).
+private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
+    private let lock = NSLock()
     private var sleepingSeconds: TimeInterval?
     private var cancelled = false
+    private var sleepWaitTerminalError: Error?
     private var sleepContinuation: CheckedContinuation<Void, Error>?
+    private var sleepWaiterID: UUID?
+    private var cancelledSleepWaiters = Set<UUID>()
     private var sleepingWaiters: [CheckedContinuation<TimeInterval, Error>] = []
 
     func sleep(seconds: TimeInterval) async throws {
         try Task.checkCancellation()
+        let waiterID = UUID()
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                if Task.isCancelled || cancelled {
-                    continuation.resume(throwing: CancellationError())
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var result: Result<Void, Error>?
+                lock.lock()
+                if cancelled || Task.isCancelled || cancelledSleepWaiters.remove(waiterID) != nil {
+                    result = .failure(CancellationError())
+                } else {
+                    sleepingSeconds = seconds
+                    sleepContinuation = continuation
+                    sleepWaiterID = waiterID
+                    let waiters = sleepingWaiters
+                    sleepingWaiters.removeAll()
+                    lock.unlock()
+                    waiters.forEach { $0.resume(returning: seconds) }
                     return
                 }
-                sleepingSeconds = seconds
-                sleepContinuation = continuation
-                let waiters = sleepingWaiters
-                sleepingWaiters.removeAll()
-                waiters.forEach { $0.resume(returning: seconds) }
+                lock.unlock()
+                if case let .failure(error) = result {
+                    continuation.resume(throwing: error)
+                }
             }
         } onCancel: {
-            Task.detached { await self.cancel() }
+            cancelSleep(waiterID: waiterID)
         }
     }
 
-    func waitUntilSleeping(timeout: TimeInterval = 10) async throws -> TimeInterval {
-        if let sleepingSeconds {
-            return sleepingSeconds
-        }
-        if cancelled {
-            throw CancellationError()
-        }
+    func waitUntilSleeping(timeout: TimeInterval = TestFenceDefaults.enterWait) async throws -> TimeInterval {
+        if let seconds = peekSleepingSeconds { return seconds }
+        if isCancelled { throw CancellationError() }
+        if let terminal = terminalError { throw terminal }
+
+        let timeoutError = AsyncTestConditionTimeout(
+            description: "context builder soft-bound sleep gate",
+            timeout: timeout
+        )
         return try await withThrowingTaskGroup(of: TimeInterval.self) { group in
             group.addTask {
                 try await self.waitForSleepSignal()
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
-                throw AsyncTestConditionTimeout(
-                    description: "context builder soft-bound sleep gate",
-                    timeout: timeout
-                )
+                self.closeSleepWait(with: timeoutError)
+                throw timeoutError
             }
+            defer { group.cancelAll() }
             do {
-                let value = try await group.next()!
-                group.cancelAll()
-                await self.failPendingSleepWaiters(CancellationError())
-                return value
+                if let value = try await group.next() {
+                    return value
+                }
             } catch {
-                group.cancelAll()
-                await self.failPendingSleepWaiters(error)
+                if let seconds = self.peekSleepingSeconds {
+                    return seconds
+                }
                 throw error
             }
+            if let seconds = peekSleepingSeconds {
+                return seconds
+            }
+            throw timeoutError
         }
     }
 
-    func waitUntilCancelled(timeout: TimeInterval = 10) async throws {
-        if cancelled { return }
+    func waitUntilCancelled(timeout: TimeInterval = TestFenceDefaults.enterWait) async throws {
+        if isCancelled { return }
         try await AsyncTestWait.waitUntil(
             "context builder soft-bound cancellation",
             timeout: timeout
         ) {
-            await self.isCancelled
+            self.isCancelled
         }
     }
 
+    private var peekSleepingSeconds: TimeInterval? {
+        lock.withLock { sleepingSeconds }
+    }
+
     private var isCancelled: Bool {
-        cancelled
+        lock.withLock { cancelled }
+    }
+
+    private var terminalError: Error? {
+        lock.withLock { sleepWaitTerminalError }
     }
 
     private func waitForSleepSignal() async throws -> TimeInterval {
         try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
             if let sleepingSeconds {
+                lock.unlock()
                 continuation.resume(returning: sleepingSeconds)
                 return
             }
             if cancelled {
+                lock.unlock()
                 continuation.resume(throwing: CancellationError())
                 return
             }
+            if let sleepWaitTerminalError {
+                lock.unlock()
+                continuation.resume(throwing: sleepWaitTerminalError)
+                return
+            }
             sleepingWaiters.append(continuation)
+            lock.unlock()
         }
     }
 
-    private func failPendingSleepWaiters(_ error: Error) {
+    private func closeSleepWait(with error: Error) {
+        lock.lock()
+        if sleepWaitTerminalError == nil {
+            sleepWaitTerminalError = error
+        }
         let waiters = sleepingWaiters
         sleepingWaiters.removeAll()
+        lock.unlock()
         waiters.forEach { $0.resume(throwing: error) }
     }
 
-    private func cancel() {
+    private func cancelSleep(waiterID: UUID) {
+        lock.lock()
         cancelled = true
-        sleepContinuation?.resume(throwing: CancellationError())
+        let pending = sleepContinuation
         sleepContinuation = nil
-        failPendingSleepWaiters(CancellationError())
+        if sleepWaiterID == waiterID {
+            sleepWaiterID = nil
+        }
+        if pending == nil {
+            cancelledSleepWaiters.insert(waiterID)
+        }
+        if sleepWaitTerminalError == nil {
+            sleepWaitTerminalError = CancellationError()
+        }
+        let waiters = sleepingWaiters
+        sleepingWaiters.removeAll()
+        lock.unlock()
+        pending?.resume(throwing: CancellationError())
+        waiters.forEach { $0.resume(throwing: CancellationError()) }
     }
 }
 

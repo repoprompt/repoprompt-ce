@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 #if os(macOS)
 import Darwin
 #elseif os(Linux)
@@ -77,10 +78,22 @@ struct TestProcessOutputDrainTimeoutError: Error, LocalizedError, CustomStringCo
 }
 
 enum TestProcessRunner {
+    /// Default wall-clock budget for `run`. Keep this modest so a wedged child cannot
+    /// stall the suite; known heavy call sites (cold git fixtures, large clones) should
+    /// pass an explicit larger `timeout:` rather than raising the global default.
     static let defaultTimeout: TimeInterval = 30
     private static let terminationGraceInterval: TimeInterval = 1
     private static let outputDrainGraceInterval: TimeInterval = 1
-    private static let childPIDQueryTimeout: TimeInterval = 1
+    /// Tight budget for assistive pgrep child discovery (primary kill is process-group).
+    private static let childPIDQueryTimeout: TimeInterval = 0.2
+    /// Cap emergency pgrep tree walks so hang recovery cannot spend unbounded time.
+    /// Process-group `kill(-pgid)` remains primary for the posix_spawn path; this walk is
+    /// assistive only for Foundation `Process` trees.
+    private static let maxProcessTreeWalkDepth = 3
+    private static let maxProcessTreeWalkNodes = 16
+    /// After kill grace, unreaped pids are tracked for best-effort `WNOHANG` reaping.
+    /// Residual zombies (D-state / unkillable) live only for the suite process lifetime.
+    private static let maxAbandonedPIDsBeforeFail = 16
 
     static func run(
         executableURL: URL,
@@ -90,6 +103,7 @@ enum TestProcessRunner {
         timeout: TimeInterval = defaultTimeout
     ) throws -> TestProcessResult {
         #if os(macOS) || os(Linux)
+            reapAbandonedChildren()
             try runWithSpawnedProcessGroup(
                 executableURL: executableURL,
                 arguments: arguments,
@@ -240,6 +254,18 @@ enum TestProcessRunner {
             }
         }
 
+        // Under POSIX_SPAWN_CLOEXEC_DEFAULT (Darwin), fds not explicitly installed are closed.
+        // Open stdin to /dev/null so children match Foundation.Process (valid fd 0, EOF on read)
+        // rather than a closed stdin that some tools probe differently.
+        try checkFileAction(
+            posix_spawn_file_actions_addopen(
+                &fileActions,
+                STDIN_FILENO,
+                "/dev/null",
+                O_RDONLY,
+                0
+            )
+        )
         try checkFileAction(posix_spawn_file_actions_adddup2(&fileActions, outputPipe[1], STDOUT_FILENO))
         try checkFileAction(posix_spawn_file_actions_adddup2(&fileActions, outputPipe[1], STDERR_FILENO))
         try checkFileAction(posix_spawn_file_actions_addclose(&fileActions, outputPipe[0]))
@@ -345,6 +371,7 @@ enum TestProcessRunner {
             var status: Int32 = 0
             while waitpid(spawnedPID, &status, 0) < 0, errno == EINTR {}
             statusBox.set(status)
+            noteReaped(spawnedPID)
             terminationGroup.leave()
         }
 
@@ -352,7 +379,11 @@ enum TestProcessRunner {
             signalProcessGroup(rootPID: pid, SIGTERM)
             if terminationGroup.wait(timeout: .now() + terminationGraceInterval) == .timedOut {
                 signalProcessGroup(rootPID: pid, SIGKILL)
-                _ = terminationGroup.wait(timeout: .now() + terminationGraceInterval)
+                if terminationGroup.wait(timeout: .now() + terminationGraceInterval) == .timedOut {
+                    // waitpid still blocked (D-state / unkillable). Track for best-effort reaping;
+                    // residual zombies last only for the suite process lifetime.
+                    noteAbandoned(spawnedPID)
+                }
             }
             finishReadingAfterTimeout(outputReader, readerGroup: readerGroup)
             throw TestProcessTimeoutError(
@@ -450,22 +481,107 @@ enum TestProcessRunner {
 
     private static func signalProcessGroup(rootPID: pid_t, _ signal: Int32) {
         guard rootPID > 0 else { return }
+        // Primary: process-group signal (posix_spawn SETPGROUP). Skip assistive pgrep tree walk
+        // here — `kill(-pgid)` already covers the spawn group; nested pgrep only adds teardown latency.
         systemKill(-rootPID, signal)
-        #if os(macOS)
-        signalProcessTree(rootPID: rootPID, signal)
-        #endif
+    }
+
+    // MARK: Abandoned-child reaper
+
+    private static let abandonedLock = NSLock()
+    private static var abandonedPIDs: [pid_t] = []
+
+    private static func noteAbandoned(_ pid: pid_t) {
+        guard pid > 0 else { return }
+        abandonedLock.lock()
+        if !abandonedPIDs.contains(pid) {
+            abandonedPIDs.append(pid)
+        }
+        let count = abandonedPIDs.count
+        abandonedLock.unlock()
+        if count > maxAbandonedPIDsBeforeFail {
+            XCTFail(
+                "TestProcessRunner has \(count) abandoned unreaped child pids "
+                    + "(threshold \(maxAbandonedPIDsBeforeFail)). "
+                    + "Residual zombies last only for the suite process lifetime; "
+                    + "investigate unkillable/D-state children or raise kill coverage."
+            )
+        }
+    }
+
+    private static func noteReaped(_ pid: pid_t) {
+        guard pid > 0 else { return }
+        abandonedLock.lock()
+        abandonedPIDs.removeAll { $0 == pid }
+        abandonedLock.unlock()
+    }
+
+    /// Best-effort `waitpid(..., WNOHANG)` over previously abandoned pids.
+    /// Safe when a background waitpid already reaped the child (ECHILD) or is still waiting (0).
+    private static func reapAbandonedChildren() {
+        abandonedLock.lock()
+        let candidates = abandonedPIDs
+        abandonedLock.unlock()
+        guard !candidates.isEmpty else { return }
+
+        var stillAbandoned: [pid_t] = []
+        for pid in candidates {
+            var status: Int32 = 0
+            let result = waitpid(pid, &status, WNOHANG)
+            if result == pid || (result < 0 && errno == ECHILD) {
+                continue
+            }
+            stillAbandoned.append(pid)
+        }
+
+        abandonedLock.lock()
+        // Merge: keep any newly abandoned during reap, drop successfully reaped.
+        let newlyAbandoned = abandonedPIDs.filter { !candidates.contains($0) }
+        abandonedPIDs = stillAbandoned + newlyAbandoned
+        abandonedLock.unlock()
     }
 
     #if os(macOS)
     private static func signal(_ process: Process, _ signal: Int32) {
         let pid = process.processIdentifier
         guard pid > 0 else { return }
-        signalProcessTree(rootPID: pid, signal)
+        var remainingNodes = maxProcessTreeWalkNodes
+        signalProcessTree(rootPID: pid, signal, depth: 0, remainingNodes: &remainingNodes)
     }
 
-    private static func signalProcessTree(rootPID: pid_t, _ signal: Int32) {
-        for childPID in childPIDs(of: rootPID) {
-            signalProcessTree(rootPID: childPID, signal)
+    /// Kill a single Process without walking its tree. Used for nested query helpers
+    /// (e.g. pgrep) so hang recovery cannot re-enter signalProcessTree.
+    private static func killProcessDirectly(_ process: Process, _ signal: Int32) {
+        let pid = process.processIdentifier
+        if pid > 0 {
+            systemKill(pid, signal)
+        }
+        if signal != SIGKILL, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    /// Best-effort recursive kill assist for Foundation `Process` trees.
+    /// Primary kill for the posix_spawn path is `kill(-pgid)`; this walk is assistive only.
+    /// Depth/node caps bound teardown latency; after the final grace wait the runner abandons
+    /// any still-unreaped waitpid threads (D-state / unkillable edge cases).
+    private static func signalProcessTree(
+        rootPID: pid_t,
+        _ signal: Int32,
+        depth: Int,
+        remainingNodes: inout Int
+    ) {
+        remainingNodes -= 1
+        if depth < maxProcessTreeWalkDepth, remainingNodes > 0 {
+            for childPID in childPIDs(of: rootPID) {
+                guard remainingNodes > 0 else { break }
+                signalProcessTree(
+                    rootPID: childPID,
+                    signal,
+                    depth: depth + 1,
+                    remainingNodes: &remainingNodes
+                )
+            }
         }
         _ = Darwin.kill(rootPID, signal)
     }
@@ -510,9 +626,11 @@ enum TestProcessRunner {
         close(output.fileHandleForWriting)
 
         if terminationGroup.wait(timeout: .now() + childPIDQueryTimeout) == .timedOut {
-            terminate(process)
+            // Direct kill only — do not call terminate/forceTerminate (those re-enter
+            // signalProcessTree via signal(_:_:) and can amplify hangs with nested pgrep).
+            killProcessDirectly(process, SIGTERM)
             if terminationGroup.wait(timeout: .now() + terminationGraceInterval) == .timedOut {
-                forceTerminate(process)
+                killProcessDirectly(process, SIGKILL)
                 _ = terminationGroup.wait(timeout: .now() + terminationGraceInterval)
             }
             finishReadingAfterTimeout(output.fileHandleForReading, readerGroup: readerGroup)

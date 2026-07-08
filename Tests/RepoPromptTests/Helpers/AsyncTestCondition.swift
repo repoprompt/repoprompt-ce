@@ -56,6 +56,10 @@ enum AsyncTestWait {
 /// This helper is intentionally small: tests mutate a protected snapshot and waiters
 /// are resumed exactly when a later mutation satisfies their predicate. The only
 /// sleep is the bounded timeout timer; it is not used for polling state.
+///
+/// Hang guarantees:
+/// - sticky cancel (timeout/cancel-before-register fails closed; late register cannot park forever)
+/// - synchronous `onCancel` via lock-backed state (no `Task { await }` hop)
 final class AsyncTestCondition<Value>: @unchecked Sendable {
     private struct Waiter {
         let id: UUID
@@ -66,6 +70,8 @@ final class AsyncTestCondition<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Value
     private var waiters: [Waiter] = []
+    /// Sticky cancel-before-register: timeout/cancel may race ahead of waiter registration.
+    private var cancelledWaiters: [UUID: Error] = [:]
 
     init(_ value: Value) {
         self.value = value
@@ -117,19 +123,32 @@ final class AsyncTestCondition<Value>: @unchecked Sendable {
     }
 
     private func waitForSignal(id: UUID, predicate: @escaping (Value) -> Bool) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            var shouldResume = false
-            lock.lock()
-            if predicate(value) {
-                shouldResume = true
-            } else {
-                waiters.append(Waiter(id: id, predicate: predicate, continuation: continuation))
-            }
-            lock.unlock()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                var resumeResult: Result<Void, Error>?
+                lock.lock()
+                if let error = cancelledWaiters.removeValue(forKey: id) {
+                    resumeResult = .failure(error)
+                } else if Task.isCancelled {
+                    resumeResult = .failure(CancellationError())
+                } else if predicate(value) {
+                    resumeResult = .success(())
+                } else {
+                    waiters.append(Waiter(id: id, predicate: predicate, continuation: continuation))
+                }
+                lock.unlock()
 
-            if shouldResume {
-                continuation.resume()
+                switch resumeResult {
+                case .success:
+                    continuation.resume()
+                case let .failure(error):
+                    continuation.resume(throwing: error)
+                case nil:
+                    break
+                }
             }
+        } onCancel: {
+            cancelWaiter(id: id, error: CancellationError())
         }
     }
 
@@ -138,6 +157,9 @@ final class AsyncTestCondition<Value>: @unchecked Sendable {
         lock.lock()
         if let index = waiters.firstIndex(where: { $0.id == id }) {
             continuation = waiters.remove(at: index).continuation
+        } else if cancelledWaiters[id] == nil {
+            // Sticky: cancel/timeout may race ahead of registration.
+            cancelledWaiters[id] = error
         }
         lock.unlock()
         continuation?.resume(throwing: error)

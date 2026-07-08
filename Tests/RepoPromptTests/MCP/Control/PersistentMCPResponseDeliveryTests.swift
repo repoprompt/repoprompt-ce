@@ -1593,6 +1593,7 @@ private actor ManualBridgeSocketPoller {
                 }
             }
         } onCancel: {
+            // Actor isolation requires a hop; sticky pendingPollCancelled covers cancel-before-register.
             Task { await self.cancelPendingPoll() }
         }
     }
@@ -1988,31 +1989,20 @@ private actor WriteRecorder {
     }
 }
 
-private actor AsyncGate {
-    private var entered = false
-    private var released = false
-    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+/// Response-delivery concurrency fence (shared `TestReleaseFence` with legacy names).
+private final class AsyncGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "persistent MCP response delivery async gate")
 
     func markEnteredAndWait() async {
-        entered = true
-        let waiters = enteredWaiters
-        enteredWaiters.removeAll()
-        waiters.forEach { $0.resume() }
-        guard !released else { return }
-        await withCheckedContinuation { releaseWaiters.append($0) }
+        await fence.enterAndWait()
     }
 
-    func waitUntilEntered() async {
-        guard !entered else { return }
-        await withCheckedContinuation { enteredWaiters.append($0) }
+    func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        released = true
-        let waiters = releaseWaiters
-        releaseWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        fence.release()
     }
 }
 

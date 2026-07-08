@@ -1943,64 +1943,47 @@ import XCTest
         }
     }
 
+    /// Cooperative cancel probe: thin wrapper over shared `TestCancellationGate`.
     private actor MCPExecutionCooperativeCancellationGate {
         private static let synchronizationTimeout: Duration = .seconds(10)
 
-        private var entered = false
-        private var cancellationCount = 0
-        private var continuation: CheckedContinuation<Void, Error>?
+        private let gate = TestCancellationGate(name: "MCP execution cooperative cancellation gate")
 
         func enterAndWait() async throws {
-            entered = true
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    self.continuation = continuation
-                }
-            } onCancel: {
-                Task { await self.cancel() }
-            }
+            try await gate.waitUntilCancelled()
         }
 
         func waitUntilEntered(
             timeout: Duration = synchronizationTimeout
         ) async throws {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while !entered {
-                try Task.checkCancellation()
-                guard clock.now < deadline else {
-                    throw MCPExecutionWatchdogIntegrationFixtureError.cooperativeGateDidNotEnter
-                }
-                try await Task.sleep(for: .milliseconds(10))
+            await gate.waitUntilEntered(timeout: TestFenceDefaults.timeInterval(timeout))
+            guard gate.hasEnteredForTesting else {
+                throw MCPExecutionWatchdogIntegrationFixtureError.cooperativeGateDidNotEnter
             }
         }
 
         func waitUntilCancellationObserved(
             timeout: Duration = synchronizationTimeout
         ) async throws {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while cancellationCount == 0 {
-                try Task.checkCancellation()
-                guard clock.now < deadline else {
-                    throw MCPExecutionWatchdogIntegrationFixtureError.cooperativeGateCancellationNotObserved
+            let timeoutInterval = TestFenceDefaults.timeInterval(timeout)
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "MCP cooperative gate cancellation observed",
+                    timeout: timeoutInterval
+                ) {
+                    self.gate.cancellationCount > 0
                 }
-                try await Task.sleep(for: .milliseconds(10))
+            } catch {
+                throw MCPExecutionWatchdogIntegrationFixtureError.cooperativeGateCancellationNotObserved
             }
         }
 
-        func observedCancellationCount() -> Int {
-            cancellationCount
+        func observedCancellationCount() async -> Int {
+            gate.cancellationCount
         }
 
-        func cancelForCleanup() {
-            cancel()
-        }
-
-        private func cancel() {
-            cancellationCount += 1
-            continuation?.resume(throwing: CancellationError())
-            continuation = nil
+        func cancelForCleanup() async {
+            gate.forceCancel()
         }
     }
 

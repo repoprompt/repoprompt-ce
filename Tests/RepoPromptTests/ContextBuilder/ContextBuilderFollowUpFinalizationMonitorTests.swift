@@ -265,65 +265,71 @@ private actor ContextBuilderFinalizationProgressRecorder {
     }
 }
 
-private actor ContextBuilderCancellableFinalizationGate {
+/// Finalization wait with sticky cancel (lock-backed; no actor cancel hop).
+private final class ContextBuilderCancellableFinalizationGate: @unchecked Sendable {
+    private let lock = NSLock()
     private var completed = false
     private var cancelled = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var storedWasCancelled = false
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var cancelledWaiters = Set<UUID>()
 
     func wait() async throws {
+        let waiterID = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                Task { await self.register(continuation) }
+                lock.lock()
+                if completed || cancelled || cancelledWaiters.remove(waiterID) != nil {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                continuations[waiterID] = continuation
+                lock.unlock()
             }
         } onCancel: {
-            Task { await self.cancel() }
+            cancel(waiterID: waiterID)
         }
         try Task.checkCancellation()
     }
 
     func complete() {
+        lock.lock()
         completed = true
-        continuation?.resume()
-        continuation = nil
+        let pending = Array(continuations.values)
+        continuations.removeAll()
+        lock.unlock()
+        for waiter in pending {
+            waiter.resume()
+        }
     }
 
     func wasCancelled() -> Bool {
-        cancelled
+        lock.withLock { storedWasCancelled }
     }
 
-    private func register(_ continuation: CheckedContinuation<Void, Never>) {
-        if completed || cancelled {
-            continuation.resume()
-        } else {
-            self.continuation = continuation
-        }
-    }
-
-    private func cancel() {
+    private func cancel(waiterID: UUID) {
+        lock.lock()
         cancelled = true
-        continuation?.resume()
-        continuation = nil
+        storedWasCancelled = true
+        let pending = continuations.removeValue(forKey: waiterID)
+        if pending == nil {
+            cancelledWaiters.insert(waiterID)
+        }
+        lock.unlock()
+        pending?.resume()
     }
 }
 
-private actor ContextBuilderFinalizationTestGate {
-    private var released = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+/// Finalization release fence (shared hang-hardened primitive).
+private final class ContextBuilderFinalizationTestGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "context builder finalization test gate")
 
     func arriveAndWait() async {
-        guard !released else { return }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
-        }
+        await fence.enterAndWait()
     }
 
     func release() {
-        guard !released else { return }
-        released = true
-        let currentWaiters = waiters
-        waiters.removeAll()
-        for waiter in currentWaiters {
-            waiter.resume()
-        }
+        fence.release()
     }
 }
