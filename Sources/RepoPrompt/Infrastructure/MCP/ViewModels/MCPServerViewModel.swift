@@ -3043,7 +3043,6 @@ final class MCPServerViewModel: ObservableObject {
                     correlation: lifecycleCorrelation,
                     EditFlowPerf.Dimensions(toolName: name)
                 )
-                MCPToolSentryTelemetry.recordStarted(toolName: name)
                 do {
                     let result = try await EditFlowPerf.measure(
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
@@ -3056,7 +3055,6 @@ final class MCPServerViewModel: ObservableObject {
                         correlation: lifecycleCorrelation,
                         EditFlowPerf.Dimensions(toolName: name, outcome: "success")
                     )
-                    MCPToolSentryTelemetry.recordCompleted(toolName: name)
                     return result
                 } catch {
                     let wasCancelled = error is CancellationError || MCPToolExecutionCancelledError.matches(error)
@@ -3068,11 +3066,6 @@ final class MCPServerViewModel: ObservableObject {
                             outcome: wasCancelled ? "cancelled" : "error"
                         )
                     )
-                    if wasCancelled {
-                        MCPToolSentryTelemetry.recordCancelled(toolName: name)
-                    } else {
-                        MCPToolSentryTelemetry.recordFailed(toolName: name)
-                    }
                     throw error
                 }
             }

@@ -222,7 +222,7 @@ Add these environment secrets:
 | `NOTARYTOOL_ISSUER_ID` | App Store Connect API issuer ID. |
 | `SPARKLE_PRIVATE_KEY` | Modern Sparkle EdDSA private-key seed for the CE update channel. It must decode from base64 to exactly 32 bytes. |
 | `PUBLIC_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission. |
-| `SENTRY_DSN` | Protected Sentry DSN injected into official signed builds. |
+| `SENTRY_DSN` | Sentry DSN injected into official signed builds for release routing. It is not a credential, but keep it in the protected release environment so unofficial artifacts do not route telemetry to the official project. |
 | `SENTRY_AUTH_TOKEN` | Sentry auth token used only for uploading release debug symbols during publication. |
 
 Add these non-secret release environment variables when Sentry symbol upload is enabled:
@@ -236,15 +236,19 @@ Add these non-secret release environment variables when Sentry symbol upload is 
 ## Sentry telemetry and debug symbols
 
 Official telemetry-enabled release staging links the Sentry SDK when
-`REPOPROMPT_ENABLE_SENTRY=1`. The protected `SENTRY_DSN` secret is injected into
-`Info.plist` as `RepoPromptSentryDSN` only by `Scripts/sign_staged_release.sh`.
-Do not commit, log, or record the DSN in artifact manifests; manifests record
-only the non-secret `telemetry_enabled` boolean.
+`REPOPROMPT_ENABLE_SENTRY=1`. The protected release environment provides
+`SENTRY_DSN`, and `Scripts/sign_staged_release.sh` injects it into `Info.plist`
+as `RepoPromptSentryDSN`. A DSN is not an auth secret, but it is not committed,
+logged, or recorded in artifact manifests so only official signed artifacts route
+telemetry to the official project. Manifests record only the non-secret
+`telemetry_enabled` boolean.
 
 When Sentry is enabled, release staging generates dSYMs under
 `.build/sentry-symbols/release` and carries them inside the staged release ZIP.
-`release.sh publish-staged` uploads those debug symbols when `SENTRY_AUTH_TOKEN`
-is available, using `REPOPROMPT_SENTRY_ORG` and `REPOPROMPT_SENTRY_PROJECT`.
+`release.sh publish-staged` requires `SENTRY_AUTH_TOKEN` (or
+`REPOPROMPT_SENTRY_AUTH_TOKEN_FILE`), `REPOPROMPT_SENTRY_ORG`, and
+`REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases, then uploads
+those debug symbols.
 The upload helper runs:
 
 ```bash

@@ -28,6 +28,109 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(store.skipSymlinks())
     }
 
+    func testTelemetrySettingsDefaultPersistAndMirrorMasterOptOut() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        #if REPOPROMPT_SENTRY_ENABLED
+            XCTAssertTrue(store.telemetryEnabled())
+        #else
+            XCTAssertFalse(store.telemetryEnabled())
+        #endif
+        XCTAssertTrue(store.telemetryAppHangReportsEnabled())
+        XCTAssertFalse(store.telemetryPerformanceTracingEnabled())
+
+        store.setTelemetryEnabled(false)
+        store.setTelemetryAppHangReportsEnabled(false)
+        store.setTelemetryPerformanceTracingEnabled(true)
+
+        let document = try fileStore.load()
+        XCTAssertEqual(document.scalarPreferences?.telemetry?.enabled, false)
+        XCTAssertEqual(document.scalarPreferences?.telemetry?.appHangReportsEnabled, false)
+        XCTAssertEqual(document.scalarPreferences?.telemetry?.performanceTracingEnabled, true)
+        XCTAssertEqual(defaults.object(forKey: "telemetry.enabled") as? Bool, false)
+
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertFalse(reloaded.telemetryEnabled())
+        XCTAssertFalse(reloaded.telemetryAppHangReportsEnabled())
+        XCTAssertTrue(reloaded.telemetryPerformanceTracingEnabled())
+    }
+
+    func testCorruptTelemetrySettingsFailSafeMasterOff() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("not json".utf8).write(to: fileURL)
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL, now: { Date(timeIntervalSince1970: 0) })
+        )
+
+        XCTAssertFalse(store.telemetryEnabled())
+        XCTAssertEqual(defaults.object(forKey: "telemetry.enabled") as? Bool, false)
+    }
+
+    func testTelemetryJSONValueOverridesStaleEnabledMirror() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(
+                telemetry: .init(enabled: false, appHangReportsEnabled: true, performanceTracingEnabled: false)
+            )
+        ))
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(true, forKey: "telemetry.enabled")
+
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        XCTAssertFalse(store.telemetryEnabled())
+        XCTAssertEqual(defaults.object(forKey: "telemetry.enabled") as? Bool, false)
+    }
+
+    func testTelemetryLoadClearsMirrorWhenJSONHasNoTelemetryValue() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(ui: .init(showTooltips: true))))
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(true, forKey: "telemetry.enabled")
+
+        _ = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        XCTAssertNil(defaults.object(forKey: "telemetry.enabled"))
+    }
+
+    func testSentryScrubStringRedactsSensitiveValues() {
+        let raw = "token=abcdef password:sekret /Users/\(NSUserName())/project 192.168.1.42"
+        let scrubbed = SentryTelemetryBootstrap.scrubStringForTesting(raw)
+
+        XCTAssertFalse(scrubbed.contains("abcdef"))
+        XCTAssertFalse(scrubbed.contains("sekret"))
+        XCTAssertFalse(scrubbed.contains("192.168.1.42"))
+        XCTAssertFalse(scrubbed.contains("/Users/\(NSUserName())"))
+        XCTAssertTrue(scrubbed.contains("token=[redacted]"))
+        XCTAssertTrue(scrubbed.contains("password=[redacted]"))
+        XCTAssertTrue(scrubbed.contains("[ip]"))
+    }
+
     func testObsoleteGitignoreJSONKeyIsIgnoredAndNeverEmitted() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }

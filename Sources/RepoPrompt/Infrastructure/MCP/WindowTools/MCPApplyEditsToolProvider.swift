@@ -76,15 +76,6 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
     }
 
     private func executeApplyEdits(args: [String: Value]) async throws -> EditSummary {
-        try await WorkspaceToolSentryTelemetry.span(
-            operation: .fileEditApply,
-            toolName: .applyEdits
-        ) {
-            try await executeApplyEditsBody(args: args)
-        }
-    }
-
-    private func executeApplyEditsBody(args: [String: Value]) async throws -> EditSummary {
         var requestPath: String? = nil
         do {
             let request = try EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.requestBuild) {

@@ -3143,12 +3143,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             urgent: true
         )
-        AgentRunSentryTelemetry.recordRuntimeEvent(
-            session: session,
-            event: .codexStallWarningShown,
-            action: .agentRuntimeStallWarningShown,
-            outcome: .started
-        )
         logCodex("[AgentModeVM][CodexWatchdog] recorded non-rendering stall warning for tab \(session.tabID) reason=\(reason)")
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
     }
@@ -3165,12 +3159,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard !hasPendingCodexInteraction(for: session) else {
                 return .skipped
             }
-            AgentRunSentryTelemetry.recordRuntimeEvent(
-                session: session,
-                event: .codexStallProbeTriggered,
-                action: .agentRuntimeStallProbeTriggered,
-                outcome: .started
-            )
         }
         guard let runID = session.runID else {
             if trigger == .stallWatchdog {
@@ -3263,25 +3251,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
 
-        if trigger == .unexpectedStreamEnd {
-            AgentRunSentryTelemetry.recordProviderError(session: session, kind: .streamEndedUnexpectedly)
-        }
+        if trigger == .unexpectedStreamEnd {}
         guard codexRecoveryAttemptedRunIDs.insert(runID).inserted else {
-            AgentRunSentryTelemetry.recordRuntimeEvent(
-                session: session,
-                event: .codexRecoveryFailed,
-                action: .agentRuntimeRecoveryFailed,
-                outcome: .failed
-            )
             return .unrecoverable(recoveryFailureMessage(for: trigger, recoveryAlreadyAttempted: true))
         }
 
-        AgentRunSentryTelemetry.recordRuntimeEvent(
-            session: session,
-            event: .codexRecoveryStarted,
-            action: .agentRuntimeRecoveryStarted,
-            outcome: .started
-        )
         let recoveryStartedAt = Date()
         setRunningStatus("Reconnecting…", source: .reconnect, session: session, urgent: true)
         session.codexLastEventAt = recoveryStartedAt
@@ -3328,12 +3302,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let alreadyReportedStartFailure = session.items.last.map {
                 $0.kind == .error && Self.isCodexNativeSessionFailureText($0.text)
             } ?? false
-            AgentRunSentryTelemetry.recordRuntimeEvent(
-                session: session,
-                event: .codexRecoveryFailed,
-                action: .agentRuntimeRecoveryFailed,
-                outcome: .failed
-            )
             return .unrecoverable(alreadyReportedStartFailure ? nil : recoveryFailureMessage(for: trigger))
         }
 
@@ -3341,12 +3309,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexLastEventAt = recoveredAt
         recordCodexWatchdogProgress(for: session, at: recoveredAt)
         updateCodexStallWatchdogState(for: session)
-        AgentRunSentryTelemetry.recordRuntimeEvent(
-            session: session,
-            event: .codexRecoveryRecovered,
-            action: .agentRuntimeRecoveryRecovered,
-            outcome: .completed
-        )
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         return .recovered
     }
@@ -3401,7 +3363,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         switch await authRecovery.refreshManagedAccount() {
         case let .requiresUserLogin(guidance):
-            AgentRunSentryTelemetry.recordProviderError(session: session, kind: .authRequired)
             _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required")
             await finalizeCodexRun(
                 session,
@@ -3413,7 +3374,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return true
         case let .executableUnavailable(message):
-            AgentRunSentryTelemetry.recordProviderError(session: session, kind: .executableUnavailable)
             await finalizeCodexRun(
                 session,
                 turnStatus: .failed,
@@ -3606,12 +3566,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 case .recovered:
                     return
                 case .skipped:
-                    AgentRunSentryTelemetry.recordRuntimeEvent(
-                        session: session,
-                        event: .codexRecoverySkipped,
-                        action: .agentRuntimeRecoverySkipped,
-                        outcome: .cancelled
-                    )
                     return
                 case let .unrecoverable(errorMessage):
                     guard shouldFinalizeAfterRecovery(session: session, expectedRunID: runID, source: "transport-closed-fallback") else { return }
@@ -3872,12 +3826,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     case .recovered:
                         return
                     case .skipped:
-                        AgentRunSentryTelemetry.recordRuntimeEvent(
-                            session: session,
-                            event: .codexRecoverySkipped,
-                            action: .agentRuntimeRecoverySkipped,
-                            outcome: .cancelled
-                        )
                         return
                     case let .unrecoverable(errorMessage):
                         guard shouldFinalizeAfterRecovery(session: session, expectedRunID: taskRunID, source: "unexpected-stream-end") else { return }
@@ -4042,12 +3990,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 switch await authRecovery.refreshManagedAccount() {
                 case let .requiresUserLogin(guidance):
-                    AgentRunSentryTelemetry.recordProviderError(session: session, kind: .authRequired)
                     providerErrorRecorded = true
                     _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required-during-start")
                     effectiveError = AIProviderError.invalidConfiguration(detail: guidance)
                 case let .executableUnavailable(message):
-                    AgentRunSentryTelemetry.recordProviderError(session: session, kind: .executableUnavailable)
                     providerErrorRecorded = true
                     effectiveError = AIProviderError.invalidConfiguration(detail: message)
                 case .recovered:
@@ -4136,7 +4082,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
                     return
                 } catch {
-                    AgentRunSentryTelemetry.recordProviderError(session: session, error: error)
                     let invalidatedTimedOutController = CodexAppServerClient.isTimeoutError(error)
                         ? invalidateCodexControllerForReconnect(
                             session: session,
@@ -4171,9 +4116,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if !invalidatedTimedOutController {
                 markCodexReconnectNeeded(for: session, source: "ensure-error")
             }
-            if !providerErrorRecorded {
-                AgentRunSentryTelemetry.recordProviderError(session: session, error: effectiveError)
-            }
+            if !providerErrorRecorded {}
             let errorItem = AgentChatItem.error(
                 "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
                 sequenceIndex: session.nextSequenceIndex
@@ -6110,13 +6053,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) async {
         let isTransportClosed = message.localizedCaseInsensitiveContains("transport closed")
         if isTransportClosed {
-            AgentRunSentryTelemetry.recordRuntimeEvent(
-                session: session,
-                event: .codexTransportClosed,
-                action: .agentRuntimeTransportClosed,
-                outcome: .started
-            )
-            AgentRunSentryTelemetry.recordProviderError(session: session, kind: .transportClosed)
             if !session.runState.isActive {
                 _ = invalidateCodexControllerForReconnect(
                     session: session,
@@ -6144,7 +6080,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return
         }
-        AgentRunSentryTelemetry.recordProviderError(session: session, kind: .unknown)
         await finalizeCodexRun(
             session,
             turnStatus: .failed,
@@ -7924,12 +7859,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         else {
             return
         }
-        AgentRunSentryTelemetry.recordApprovalDecision(
-            session: session,
-            kind: .toolPermission,
-            outcome: Self.telemetryApprovalOutcome(for: decision),
-            cancellationReason: Self.telemetryCancellationReason(for: decision)
-        )
         let result = Self.buildPermissionsResult(decision: decision, request: request)
         session.pendingPermissionsRequest = nil
         viewModel?.reconcileInteractiveRunState(session)
@@ -8008,24 +7937,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             answers[question.id] = [label]
         }
         return AgentRequestUserInputResponse(answersByQuestionID: answers)
-    }
-
-    private static func telemetryApprovalOutcome(for decision: AgentApprovalDecision) -> SentryTelemetryBootstrap.ApprovalOutcome {
-        switch decision {
-        case .accept, .acceptForSession, .acceptWithExecpolicyAmendment:
-            .approved
-        case .decline, .cancel:
-            .denied
-        }
-    }
-
-    private static func telemetryCancellationReason(for decision: AgentApprovalDecision) -> SentryTelemetryBootstrap.CancellationReason? {
-        switch decision {
-        case .cancel:
-            .user
-        case .accept, .acceptForSession, .acceptWithExecpolicyAmendment, .decline:
-            nil
-        }
     }
 
     private static func buildPermissionsResult(decision: AgentApprovalDecision, request: AgentPermissionsRequest) -> [String: Any] {

@@ -258,21 +258,8 @@ final class AgentRunTerminalCommitBarrier {
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
         session.waitingPrompt = nil
-        await SentryTelemetryBootstrap.spanAsync(
-            .agentTerminalCommit,
-            attributes: [
-                .entrypoint(session.mcpControlContext == nil ? .user : .mcp),
-                .clientClass(session.mcpControlContext == nil ? .inApp : .externalAgent),
-                .providerKind(SentryTelemetryBootstrap.ProviderKind(agentKind: session.selectedAgent)),
-                .outcome(request.terminalState == .completed ? .completed : request.terminalState == .cancelled ? .cancelled : .failed),
-                .isChildSession(session.parentSessionID != nil),
-                .hasProviderResumeSession(session.providerSessionID != nil)
-            ]
-        ) { _ in
-            session.runState = request.terminalState
-            _ = session.endRunAttempt(ifCurrent: request.ownership, source: request.source)
-            AgentRunSentryTelemetry.recordTerminal(session: session, terminalState: request.terminalState)
-        }
+        session.runState = request.terminalState
+        _ = session.endRunAttempt(ifCurrent: request.ownership, source: request.source)
         hooks.setAgentRunActive(session.tabID, false)
         hooks.prepareTerminalPublication(session)
         if let runID = request.expectedRunID, let terminalTurnID {

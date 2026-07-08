@@ -15040,22 +15040,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingApproval(for session: TabSession) {
-        if let pendingApproval = session.pendingApproval {
-            AgentRunSentryTelemetry.recordApprovalDecision(
-                session: session,
-                kind: telemetryApprovalKind(for: pendingApproval.kind),
-                outcome: .denied,
-                cancellationReason: .user
-            )
-        }
-        if session.pendingPermissionsRequest != nil {
-            AgentRunSentryTelemetry.recordApprovalDecision(
-                session: session,
-                kind: .toolPermission,
-                outcome: .denied,
-                cancellationReason: .user
-            )
-        }
+        if let pendingApproval = session.pendingApproval {}
+        if session.pendingPermissionsRequest != nil {}
         session.pendingApproval = nil
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil
@@ -15065,14 +15051,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingApplyEditsReview(for session: TabSession, reason: String) {
-        if session.pendingApplyEditsReview != nil {
-            AgentRunSentryTelemetry.recordApprovalDecision(
-                session: session,
-                kind: .applyEdits,
-                outcome: .denied,
-                cancellationReason: telemetryCancellationReason(forApprovalCancellationReason: reason)
-            )
-        }
+        if session.pendingApplyEditsReview != nil {}
         session.pendingApplyEditsReview = nil
         let scope = applyEditsScope(for: session.tabID)
         Task { [applyEditsApprovalStore] in
