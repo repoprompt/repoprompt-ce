@@ -74,6 +74,26 @@ final class MCPNewlineFrameAccumulatorTests: XCTestCase {
         XCTAssertFalse(accumulator.hasResidualData)
     }
 
+    func testResetKeepingCapacityDiscardsLogicalBytesAndCursorState() throws {
+        var accumulator = MCPNewlineFrameAccumulator(
+            maximumFrameByteCount: 16,
+            bufferReservation: 32,
+            compactionThreshold: 64
+        )
+        accumulator.append(Data("old\nresidual".utf8))
+        XCTAssertEqual(try accumulator.nextFrame(), Data("old".utf8))
+        XCTAssertTrue(accumulator.hasResidualData)
+
+        accumulator.reset(keepingCapacity: true)
+
+        XCTAssertEqual(accumulator.storageByteCount, 0)
+        XCTAssertEqual(accumulator.consumedPrefixByteCount, 0)
+        XCTAssertFalse(accumulator.hasResidualData)
+        accumulator.append(Data("new\n".utf8))
+        XCTAssertEqual(try accumulator.nextFrame(), Data("new".utf8))
+        XCTAssertNil(try accumulator.nextFrame())
+    }
+
     func testEmptyFramesRemainObservableToIngressPolicy() throws {
         var accumulator = MCPNewlineFrameAccumulator(maximumFrameByteCount: 1)
         accumulator.append(Data("\n\n".utf8))

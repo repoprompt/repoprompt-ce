@@ -190,6 +190,25 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
         XCTAssertEqual(script.readAttemptCount, 4)
     }
 
+    func testNonPositiveChunkSizesAreSanitizedBeforeReading() {
+        for chunkSize in [0, -1] {
+            let script = ScriptedReadOperation(outcomes: [.wouldBlock])
+            let state = ReaderCallbackState()
+            let reader = makeReader(
+                chunkSize: chunkSize,
+                readOperation: script.read,
+                state: state
+            )
+
+            reader.processReadableEvent()
+            reader.stop()
+
+            XCTAssertEqual(script.requestedByteCounts, [1])
+            XCTAssertTrue(state.errors.isEmpty)
+            XCTAssertTrue(state.eofResiduals.isEmpty)
+        }
+    }
+
     func testReentrantReadableEventDoesNotNestFrameDelivery() {
         let queue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests.reentrant")
         let script = ScriptedReadOperation(outcomes: [
@@ -338,6 +357,7 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
 
     private func makeReader(
         queue: DispatchQueue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests"),
+        chunkSize: Int = 64,
         maxReadCallsPerEvent: Int = 32,
         maxBytesPerEvent: Int = 256 * 1024,
         maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount,
@@ -348,7 +368,7 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
             fd: -1,
             queue: queue,
             logger: Logger(label: "NewlineDelimitedSocketReaderFairnessTests"),
-            chunkSize: 64,
+            chunkSize: chunkSize,
             maximumFrameByteCount: maximumFrameByteCount,
             maxReadCallsPerEvent: maxReadCallsPerEvent,
             maxBytesPerEvent: maxBytesPerEvent,
@@ -417,6 +437,7 @@ private final class ScriptedReadOperation {
 
     private var outcomes: [Outcome]
     private(set) var readAttemptCount = 0
+    private(set) var requestedByteCounts: [Int] = []
 
     init(outcomes: [Outcome]) {
         self.outcomes = outcomes
@@ -429,6 +450,7 @@ private final class ScriptedReadOperation {
     ) -> Int {
         _ = fd
         readAttemptCount += 1
+        requestedByteCounts.append(count)
         guard !outcomes.isEmpty else {
             errno = EAGAIN
             return -1

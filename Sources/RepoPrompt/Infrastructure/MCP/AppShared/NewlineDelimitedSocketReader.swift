@@ -223,7 +223,7 @@ public final class NewlineDelimitedSocketReader {
         self.fd = fd
         self.queue = queue
         self.logger = logger
-        self.chunkSize = chunkSize
+        self.chunkSize = max(1, chunkSize)
         self.maxReadCallsPerEvent = max(1, maxReadCallsPerEvent)
         self.maxBytesPerEvent = max(1, maxBytesPerEvent)
         self.maxFramesPerEvent = max(1, maxFramesPerEvent)
