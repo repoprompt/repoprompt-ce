@@ -79,6 +79,8 @@ final class OpenAIServiceTransportPool: @unchecked Sendable {
         let effectiveProxyPath = baseURL == nil ? nil : proxyPath
         let effectiveAPIVersion = baseURL == nil ? "v1" : (apiVersion ?? "v1")
         let effectiveExtraHeaders = baseURL == nil ? nil : extraHeaders
+        let effectiveIncludeUsageInStream = baseURL == nil ? true : includeUsageInStream
+        let effectiveDebugEnabled = baseURL == nil ? false : debugEnabled
         let transportConfiguration = Configuration(
             backend: .openAI,
             baseURL: effectiveBaseURL,
@@ -86,8 +88,8 @@ final class OpenAIServiceTransportPool: @unchecked Sendable {
             apiVersion: effectiveAPIVersion,
             credential: CredentialIdentity(apiKey),
             extraHeaders: Self.canonicalHeaders(effectiveExtraHeaders),
-            includeUsageInStream: includeUsageInStream,
-            debugEnabled: debugEnabled,
+            includeUsageInStream: effectiveIncludeUsageInStream,
+            debugEnabled: effectiveDebugEnabled,
             sessionPolicy: sessionPolicy
         )
 
@@ -107,9 +109,7 @@ final class OpenAIServiceTransportPool: @unchecked Sendable {
             }
             return OpenAIServiceFactory.service(
                 apiKey: apiKey,
-                configuration: configuration,
-                debugEnabled: debugEnabled,
-                includeUsageInStream: includeUsageInStream
+                configuration: configuration
             )
         }
     }

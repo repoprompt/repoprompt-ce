@@ -55,6 +55,52 @@ final class OpenAIServiceTransportPoolTests: XCTestCase {
         XCTAssertEqual(transportPool.retainedServiceCountForTesting, 1)
     }
 
+    func testDefaultOpenAIFactorySemanticsIgnoreUnsupportedOverrides() {
+        let transportPool = OpenAIServiceTransportPool()
+        let baseline = transportPool.openAIService(
+            owner: .openAI,
+            apiKey: "credential-a",
+            baseURL: nil,
+            apiVersion: nil,
+            includeUsageInStream: true
+        )
+        let variations = [
+            transportPool.openAIService(
+                owner: .openAI,
+                apiKey: "credential-a",
+                baseURL: nil,
+                proxyPath: "ignored-proxy",
+                apiVersion: nil,
+                includeUsageInStream: true
+            ),
+            transportPool.openAIService(
+                owner: .openAI,
+                apiKey: "credential-a",
+                baseURL: nil,
+                apiVersion: "ignored-version",
+                includeUsageInStream: true
+            ),
+            transportPool.openAIService(
+                owner: .openAI,
+                apiKey: "credential-a",
+                baseURL: nil,
+                apiVersion: nil,
+                extraHeaders: ["X-Ignored": "value"],
+                includeUsageInStream: true
+            ),
+            transportPool.openAIService(
+                owner: .openAI,
+                apiKey: "credential-a",
+                baseURL: nil,
+                apiVersion: nil,
+                includeUsageInStream: false
+            )
+        ]
+
+        XCTAssertTrue(variations.allSatisfy { ObjectIdentifier($0.session) == ObjectIdentifier(baseline.session) })
+        XCTAssertEqual(transportPool.retainedServiceCountForTesting, 1)
+    }
+
     func testCredentialAndConfigurationChangesRotateTransport() {
         let variants: [(OpenAIServiceTransportPool) -> (ObjectIdentifier, ObjectIdentifier)] = [
             { pool in
