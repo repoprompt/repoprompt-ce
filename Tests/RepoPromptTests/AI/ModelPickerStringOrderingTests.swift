@@ -151,6 +151,56 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         )
     }
 
+    func testCodexDynamicMaxEffortIsSelectableAndSerialized() throws {
+        let dynamicOptions = CodexDynamicModelMapper.options(from: [
+            CodexDynamicModelRecord(
+                id: "gpt-5.6-sol",
+                model: "gpt-5.6-sol",
+                displayName: "GPT-5.6-Sol",
+                description: "Frontier coding model",
+                isDefault: true,
+                supportedReasoningEfforts: [
+                    CodexDynamicReasoningRecord(reasoningEffort: "low", description: "Fast"),
+                    CodexDynamicReasoningRecord(reasoningEffort: "medium", description: "Balanced"),
+                    CodexDynamicReasoningRecord(reasoningEffort: "high", description: "Deep"),
+                    CodexDynamicReasoningRecord(reasoningEffort: "xhigh", description: "Extra deep"),
+                    CodexDynamicReasoningRecord(reasoningEffort: "max", description: "Maximum")
+                ],
+                defaultReasoningEffort: "medium"
+            )
+        ])
+        let menu = AgentModelCatalog.codexMenu(for: dynamicOptions.map {
+            AgentModelOption(
+                rawValue: $0.id,
+                displayName: $0.displayName,
+                description: $0.description,
+                isPlaceholderDefault: false,
+                isProviderDefault: $0.isDefault
+            )
+        })
+
+        let group = try XCTUnwrap(menu.groups.first)
+        XCTAssertEqual(group.baseModelID, "gpt-5.6-sol")
+        XCTAssertEqual(group.options.map(\.rawValue), [
+            "gpt-5.6-sol-low",
+            "gpt-5.6-sol-medium",
+            "gpt-5.6-sol-high",
+            "gpt-5.6-sol-xhigh",
+            "gpt-5.6-sol-max"
+        ])
+        XCTAssertEqual(group.options.last?.displayName, "GPT-5.6 Sol Max")
+
+        let specifier = CodexModelSpecifier(raw: group.options.last?.rawValue)
+        XCTAssertEqual(specifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(specifier.reasoningEffort, .max)
+        XCTAssertEqual(specifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=max"])
+        XCTAssertEqual(specifier.appServerEffortParam, "max")
+
+        let legacyMaxModel = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
+        XCTAssertEqual(legacyMaxModel.baseModel, "gpt-5.1-codex-max")
+        XCTAssertNil(legacyMaxModel.reasoningEffort)
+    }
+
     @MainActor
     func testCollapsedCodexOptionsUseStableSemanticOrderingAndPreserveDefaults() throws {
         let collapsed: [AgentModelOption] = CodexAgentModeCoordinator.test_collapseCodexModelOptions([

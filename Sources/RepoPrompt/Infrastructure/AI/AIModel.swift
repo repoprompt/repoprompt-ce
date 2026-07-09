@@ -1575,6 +1575,7 @@ public enum AIModel: Equatable, Hashable {
         guard !trimmed.isEmpty else { return trimmed }
 
         let suffixes = [
+            "-max", " max",
             "-xhigh", " xhigh", "-x-high", " x-high",
             "-medium", " medium", "-med", " med",
             "-minimal", " minimal",

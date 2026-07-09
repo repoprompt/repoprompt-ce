@@ -3,6 +3,10 @@ import Foundation
 struct CodexModelSpecifier: Equatable {
     typealias ReasoningEffort = CodexReasoningEffort
 
+    private static let knownBaseModelIDsEndingInEffortToken: Set<String> = [
+        "gpt-5.1-codex-max"
+    ]
+
     let baseModel: String?
     let reasoningEffort: ReasoningEffort?
     let serviceTier: String?
@@ -34,6 +38,7 @@ struct CodexModelSpecifier: Equatable {
 
         // First strip any reasoning effort suffix
         let suffixes: [(suffix: String, effort: ReasoningEffort)] = [
+            ("-max", .max),
             ("-xhigh", .xhigh),
             ("-medium", .medium),
             ("-minimal", .minimal),
@@ -44,14 +49,16 @@ struct CodexModelSpecifier: Equatable {
         var base = raw
         var effort: ReasoningEffort? = nil
         let lowered = raw.lowercased()
-        for (suffix, e) in suffixes where lowered.hasSuffix(suffix) {
-            let candidate = String(raw.dropLast(suffix.count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !candidate.isEmpty {
-                base = candidate
-                effort = e
+        if !knownBaseModelIDsEndingInEffortToken.contains(lowered) {
+            for (suffix, e) in suffixes where lowered.hasSuffix(suffix) {
+                let candidate = String(raw.dropLast(suffix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !candidate.isEmpty {
+                    base = candidate
+                    effort = e
+                }
+                break
             }
-            break
         }
 
         // Then check for a service tier infix (e.g. "gpt-5.4-fast" → base "gpt-5.4", tier "fast")
