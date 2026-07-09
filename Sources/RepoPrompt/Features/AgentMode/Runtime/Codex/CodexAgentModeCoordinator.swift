@@ -3251,7 +3251,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
 
-        if trigger == .unexpectedStreamEnd {}
         guard codexRecoveryAttemptedRunIDs.insert(runID).inserted else {
             return .unrecoverable(recoveryFailureMessage(for: trigger, recoveryAlreadyAttempted: true))
         }
@@ -4116,7 +4115,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if !invalidatedTimedOutController {
                 markCodexReconnectNeeded(for: session, source: "ensure-error")
             }
-            if !providerErrorRecorded {}
             let errorItem = AgentChatItem.error(
                 "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
                 sequenceIndex: session.nextSequenceIndex

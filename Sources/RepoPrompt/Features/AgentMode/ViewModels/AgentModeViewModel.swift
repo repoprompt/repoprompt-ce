@@ -15040,8 +15040,6 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingApproval(for session: TabSession) {
-        if let pendingApproval = session.pendingApproval {}
-        if session.pendingPermissionsRequest != nil {}
         session.pendingApproval = nil
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil
@@ -15051,7 +15049,6 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingApplyEditsReview(for session: TabSession, reason: String) {
-        if session.pendingApplyEditsReview != nil {}
         session.pendingApplyEditsReview = nil
         let scope = applyEditsScope(for: session.tabID)
         Task { [applyEditsApprovalStore] in

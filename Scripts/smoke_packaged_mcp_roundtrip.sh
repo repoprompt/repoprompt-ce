@@ -218,4 +218,10 @@ while (( $(date +%s) <= deadline )); do
     sleep 1
 done
 
+if [[ -n "${attempt_stdout:-}" && -f "$attempt_stdout" ]]; then
+    cat "$attempt_stdout" >&2 || true
+fi
+if [[ -n "${attempt_stderr:-}" && -f "$attempt_stderr" ]]; then
+    cat "$attempt_stderr" >&2 || true
+fi
 fail "$SMOKE_LABEL timed out waiting for bootstrap/windows response (last exit $last_status)"

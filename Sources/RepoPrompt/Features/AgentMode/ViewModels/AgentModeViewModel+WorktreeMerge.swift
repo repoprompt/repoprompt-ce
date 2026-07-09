@@ -594,7 +594,6 @@ extension AgentModeViewModel {
 
     func cancelPendingWorktreeMergeReview(for session: TabSession, reason: String) {
         let operationID = session.pendingWorktreeMergeReview?.operationID
-        if session.pendingWorktreeMergeReview != nil {}
         guard let continuation = session.worktreeMergeReviewContinuation else {
             finishPendingWorktreeMergeReview(session: session)
             if let operationID {
