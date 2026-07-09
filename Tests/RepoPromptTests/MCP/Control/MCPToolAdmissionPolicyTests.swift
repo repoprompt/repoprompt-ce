@@ -55,18 +55,18 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(ServerNetworkManager.admissionClass(forCanonicalToolName: alias), .exclusive)
     }
 
-    func testGateBCapacitiesRecordConservativeWI3BaselineChoices() {
+    func testCapacitiesRecordModernMultiAgentDefaults() {
         XCTAssertEqual(MCPToolAdmissionPolicy.exclusiveConnectionLimit, 1)
-        XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 8)
-        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, 2)
-        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, 2)
-        XCTAssertEqual(MCPToolAdmissionPolicy.gitReadConnectionLimit, 2)
+        XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 16)
+        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, 6)
+        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, 8)
+        XCTAssertEqual(MCPToolAdmissionPolicy.gitReadConnectionLimit, 4)
         XCTAssertEqual(MCPToolAdmissionPolicy.gitReadPerRepositoryLimit, 1)
-        XCTAssertEqual(MCPToolAdmissionPolicy.fileSearchConnectionLimit, 4)
-        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 2)
-        XCTAssertEqual(ServerNetworkManager.controlCallLaneLimit, 8)
-        XCTAssertEqual(ServerNetworkManager.gitReadCallLaneLimit, 2)
-        XCTAssertEqual(ServerNetworkManager.fileSearchCallLaneLimit, 4)
+        XCTAssertEqual(MCPToolAdmissionPolicy.fileSearchConnectionLimit, 6)
+        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 6)
+        XCTAssertEqual(ServerNetworkManager.controlCallLaneLimit, 16)
+        XCTAssertEqual(ServerNetworkManager.gitReadCallLaneLimit, 4)
+        XCTAssertEqual(ServerNetworkManager.fileSearchCallLaneLimit, 6)
     }
 
     func testSameConnectionSmallReadsOverlapAtBoundedCapacity() async throws {
@@ -226,31 +226,32 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
     }
 
     func testSmallReadResourceAdmissionBoundsOneWindowAndOverlapsDistinctWindows() async throws {
-        let controller = MCPToolResourceAdmissionController(
-            limit: MCPToolAdmissionPolicy.smallReadPerWindowLimit
-        )
+        let limit = MCPToolAdmissionPolicy.smallReadPerWindowLimit
+        let controller = MCPToolResourceAdmissionController(limit: limit)
         let gate = AdmissionTestGate()
 
-        let first = mutationTask(controller: controller, resource: .window(30), gate: gate)
-        let second = mutationTask(controller: controller, resource: .window(30), gate: gate)
-        let didFillWindowCapacity = await waitUntil { await gate.startedCount() == 2 }
+        let sameWindowTasks = (0 ..< limit).map { _ in
+            mutationTask(controller: controller, resource: .window(30), gate: gate)
+        }
+        let didFillWindowCapacity = await waitUntil { await gate.startedCount() == limit }
         XCTAssertTrue(didFillWindowCapacity)
 
         let queuedSameWindow = mutationTask(controller: controller, resource: .window(30), gate: gate)
         let distinctWindow = mutationTask(controller: controller, resource: .window(40), gate: gate)
-        let didOverlapDistinctWindow = await waitUntil { await gate.startedCount() == 3 }
+        let didOverlapDistinctWindow = await waitUntil { await gate.startedCount() == limit + 1 }
         XCTAssertTrue(didOverlapDistinctWindow)
-        XCTAssertEqual(controller.activeCount(for: .window(30)), 2)
+        XCTAssertEqual(controller.activeCount(for: .window(30)), limit)
         XCTAssertEqual(controller.activeCount(for: .window(40)), 1)
         XCTAssertEqual(controller.waiterCount(for: .window(30)), 1)
 
         await gate.release()
-        try await first.value
-        try await second.value
+        for task in sameWindowTasks {
+            try await task.value
+        }
         try await queuedSameWindow.value
         try await distinctWindow.value
         let finalReadCount = await gate.startedCount()
-        XCTAssertEqual(finalReadCount, 4)
+        XCTAssertEqual(finalReadCount, limit + 2)
         XCTAssertEqual(controller.activeCount(for: .window(30)), 0)
         XCTAssertEqual(controller.activeCount(for: .window(40)), 0)
     }
@@ -351,6 +352,113 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(finalGitCount, 3)
         XCTAssertEqual(controller.activeCount(repositoryKey: repoA), 0)
         XCTAssertEqual(controller.activeCount(repositoryKey: repoB), 0)
+    }
+
+    func testGitAdmissionWaiterTimesOutInsteadOfBlockingForever() async throws {
+        let controller = MCPGitToolAdmissionController(
+            perRepositoryLimit: 1,
+            waitTimeout: .milliseconds(50),
+            leaseTimeout: nil
+        )
+        let repo = "/tmp/WI10-Repo-Timeout"
+        let lease = try await controller.acquire(repositoryKeys: [repo])
+
+        let blocked = Task {
+            try await controller.acquire(repositoryKeys: [repo])
+        }
+
+        do {
+            _ = try await blocked.value
+            XCTFail("Expected queued Git admission to time out")
+        } catch let error as MCPGitToolAdmissionError {
+            XCTAssertEqual(error, .waitTimedOut)
+        }
+
+        XCTAssertEqual(controller.waiterCount(), 0)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 1)
+        controller.release(lease)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 0)
+    }
+
+    func testGitAdmissionExpiresStaleLeaseAndAdmitsQueuedWork() async throws {
+        let controller = MCPGitToolAdmissionController(
+            perRepositoryLimit: 1,
+            waitTimeout: nil,
+            leaseTimeout: .milliseconds(50)
+        )
+        let repo = "/tmp/WI10-Repo-StaleLease"
+        let staleLease = try await controller.acquire(repositoryKeys: [repo])
+
+        let successor = Task {
+            try await controller.acquire(repositoryKeys: [repo])
+        }
+
+        let successorLease = try await successor.value
+        XCTAssertEqual(controller.waiterCount(), 0)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 1)
+
+        // Releasing the expired lease should be a no-op; the successor remains active.
+        controller.release(staleLease)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 1)
+        controller.release(successorLease)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 0)
+    }
+
+    func testGitAdmissionReleaseCancelsLeaseWatchdog() async throws {
+        let controller = MCPGitToolAdmissionController(
+            perRepositoryLimit: 1,
+            waitTimeout: .seconds(1),
+            leaseTimeout: .milliseconds(50)
+        )
+        let repo = "/tmp/WI10-Repo-ReleaseCancelsWatchdog"
+        let firstLease = try await controller.acquire(repositoryKeys: [repo])
+        XCTAssertEqual(controller.leaseTimeoutTaskCount(), 1)
+
+        controller.release(firstLease)
+        XCTAssertEqual(controller.leaseTimeoutTaskCount(), 0)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 0)
+
+        let secondLease = try await controller.acquire(repositoryKeys: [repo])
+        XCTAssertEqual(controller.leaseTimeoutTaskCount(), 1)
+        XCTAssertEqual(controller.waiterCount(), 0)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 1)
+        controller.release(secondLease)
+        XCTAssertEqual(controller.leaseTimeoutTaskCount(), 0)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 0)
+    }
+
+    func testGitAdmissionCancellingBlockedWaiterDoesNotLaterTimeout() async throws {
+        let controller = MCPGitToolAdmissionController(
+            perRepositoryLimit: 1,
+            waitTimeout: .milliseconds(50),
+            leaseTimeout: nil
+        )
+        let repo = "/tmp/WI10-Repo-CancelWaiter"
+        let lease = try await controller.acquire(repositoryKeys: [repo])
+
+        let blocked = Task {
+            try await controller.acquire(repositoryKeys: [repo])
+        }
+        let didQueueWaiter = await waitUntil { controller.waiterCount() == 1 }
+        XCTAssertTrue(didQueueWaiter)
+        XCTAssertEqual(controller.waiterTimeoutTaskCount(), 1)
+
+        blocked.cancel()
+        do {
+            _ = try await blocked.value
+            XCTFail("Expected blocked Git admission waiter to cancel")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        XCTAssertEqual(controller.waiterTimeoutTaskCount(), 0)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(controller.waiterCount(), 0)
+        XCTAssertEqual(controller.waiterTimeoutTaskCount(), 0)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 1)
+        controller.release(lease)
+        XCTAssertEqual(controller.activeCount(repositoryKey: repo), 0)
     }
 
     private func assertClass(_ expected: MCPToolAdmissionClass, tools: [String]) {
