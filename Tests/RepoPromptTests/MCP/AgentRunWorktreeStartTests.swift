@@ -872,28 +872,25 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: sourceTabID))
         composeTab.activeAgentSessionID = parentSessionID
         window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
-        _ = await window.selectionCoordinator.persistSelection(
-            storedSelection,
-            for: sourceIdentity,
-            source: .runtimeMutation,
-            mirrorToUIIfActive: false
-        )
         // Wait for post-switch git-data root load to complete so any selection revision
-        // published by the async git-data load settles before we diverge the UI selection.
+        // published by the async git-data load settles before capture.
         await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
-        await window.selectionCoordinator.withApplyingSelectionMirror {
-            await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
-        }
+        await window.promptManager.createBlankComposeTab(createAgentSession: false)
+        let activeTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        XCTAssertNotEqual(activeTabID, sourceTabID)
         let divergentUISelection = window.workspaceFilesViewModel.snapshotSelection()
         XCTAssertTrue(divergentUISelection.selectedPaths.isEmpty)
         XCTAssertNotEqual(divergentUISelection, storedSelection)
+
         _ = await window.selectionCoordinator.persistSelection(
             storedSelection,
             for: sourceIdentity,
             source: .runtimeMutation,
             mirrorToUIIfActive: false
         )
-        XCTAssertEqual(window.workspaceManager.composeTab(for: sourceIdentity)?.selection, storedSelection)
+        try await AsyncTestWait.waitUntil("source review selection remains stored", timeout: 5) {
+            window.workspaceManager.composeTab(for: sourceIdentity)?.selection == storedSelection
+        }
 
         let launchSnapshot = AgentRunOracleReviewLaunchSnapshot(
             route: .explicitTabContext,
