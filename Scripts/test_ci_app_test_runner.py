@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import io
+import json
+import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -43,6 +46,61 @@ class FakeProcess:
 
 
 class CIAppTestRunnerTests(unittest.TestCase):
+    def write_policy(self, directory: Path, groups: dict[str, dict[str, str]] | None = None) -> Path:
+        path = directory / "policy.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "default_mode": "parallel_eligible",
+                    "groups": groups
+                    or {
+                        "WindowStatesManager": {
+                            "lane": "app_window_state",
+                            "reason": "shared windows",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def write_ledger(self, directory: Path, rows: list[dict[str, str]]) -> Path:
+        path = directory / "ledger.tsv"
+        columns = [
+            "method_id",
+            "target",
+            "file",
+            "suite",
+            "method",
+            "domain",
+            "primary_contract_id",
+            "secondary_contract_tags",
+            "validation_class",
+            "layer",
+            "execution_tier",
+            "scenario_count",
+            "fixture_ids",
+            "observable_oracle",
+            "failure_risk",
+            "runtime_seconds",
+            "resource_cost_tags",
+            "shared_state_tags",
+            "lifecycle_owner",
+            "current_disposition",
+            "replacement_method_id",
+            "preserved_scenario_delta",
+            "notes",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write("\t".join(columns) + "\n")
+            for row in rows:
+                values = {column: "" for column in columns}
+                values.update(row)
+                handle.write("\t".join(values[column] for column in columns) + "\n")
+        return path
+
     def stop_fake_process(self, stopped: list[FakeProcess]):
         def stop(process: FakeProcess) -> None:
             stopped.append(process)
@@ -65,6 +123,215 @@ class CIAppTestRunnerTests(unittest.TestCase):
             ci_app_test_runner.parse_suites(output),
             ["RepoPromptTests.A", "RepoPromptTests.B"],
         )
+
+    def test_serial_group_policy_accepts_valid_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = self.write_policy(Path(temp))
+
+            policy = ci_app_test_runner.load_serial_group_policy(path)
+
+        self.assertEqual(policy["WindowStatesManager"].lane, "app_window_state")
+
+    def test_serial_group_policy_rejects_unknown_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "policy.json"
+            path.write_text(
+                json.dumps({"version": 99, "default_mode": "parallel_eligible", "groups": {}}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "unsupported serial group policy version"):
+                ci_app_test_runner.load_serial_group_policy(path)
+
+    def test_serial_group_policy_rejects_malformed_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "policy.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "default_mode": "parallel_eligible",
+                        "groups": {"WindowStatesManager": {"lane": "app_window_state"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "must define a non-empty reason"):
+                ci_app_test_runner.load_serial_group_policy(path)
+
+    def test_ledger_aggregation_classifies_suites_by_serial_policy_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ledger = self.write_ledger(
+                root,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.A/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.A",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "1.5",
+                        "shared_state_tags": "WindowStatesManager;GlobalSettingsStore",
+                        "resource_cost_tags": "temp_directory;git_subprocess",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.A/testTwo",
+                        "target": "root",
+                        "suite": "RepoPromptTests.A",
+                        "method": "testTwo",
+                        "execution_tier": "diagnostic",
+                        "runtime_seconds": "2.0",
+                        "shared_state_tags": "WindowStatesManager",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.B/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.B",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "0.5",
+                        "resource_cost_tags": "UserDefaults.standard",
+                    },
+                ],
+            )
+            policy = self.write_policy(
+                root,
+                {
+                    "WindowStatesManager": {
+                        "lane": "app_window_state",
+                        "reason": "shared windows",
+                    },
+                    "UserDefaults.standard": {
+                        "lane": "user_defaults",
+                        "reason": "shared defaults",
+                    },
+                },
+            )
+
+            plan = ci_app_test_runner.build_suite_plan(
+                ["RepoPromptTests.B", "RepoPromptTests.A"],
+                ledger_suites=ci_app_test_runner.read_ledger_suites(ledger),
+                serial_policy=ci_app_test_runner.load_serial_group_policy(policy),
+            )
+
+        self.assertEqual(
+            [suite.suite for suite in plan.pinned_serial],
+            ["RepoPromptTests.A", "RepoPromptTests.B"],
+        )
+        self.assertEqual([suite.suite for suite in plan.parallel_eligible], [])
+        self.assertEqual(plan.pinned_serial[0].estimated_runtime_seconds, 3.5)
+        self.assertTrue(plan.pinned_serial[0].heavy_tier_present)
+        self.assertEqual(plan.pinned_serial[1].matched_serial_tags, ("UserDefaults.standard",))
+
+    def test_main_print_suite_plan_json_emits_stable_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ledger = self.write_ledger(
+                root,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.Pinned/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Pinned",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                        "shared_state_tags": "WindowStatesManager",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.Free/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Free",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                    },
+                ],
+            )
+            policy = self.write_policy(root)
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    ci_app_test_runner,
+                    "list_suites",
+                    return_value=["RepoPromptTests.Pinned", "RepoPromptTests.Free"],
+                ),
+                mock.patch("sys.stdout", output),
+            ):
+                exit_code = ci_app_test_runner.main(
+                    [
+                        "--ledger",
+                        str(ledger),
+                        "--serial-group-policy",
+                        str(policy),
+                        "--print-suite-plan-json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            [suite["suite"] for suite in payload["pinned_serial"]],
+            ["RepoPromptTests.Pinned"],
+        )
+        self.assertEqual(
+            [suite["suite"] for suite in payload["parallel_eligible"]],
+            ["RepoPromptTests.Free"],
+        )
+
+    def test_main_reports_missing_ledger_file(self) -> None:
+        output = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.object(ci_app_test_runner, "list_suites", return_value=["RepoPromptTests.A"]),
+            mock.patch("sys.stdout", output),
+        ):
+            policy = self.write_policy(Path(temp))
+            exit_code = ci_app_test_runner.main(
+                [
+                    "--ledger",
+                    str(Path(temp) / "missing.tsv"),
+                    "--serial-group-policy",
+                    str(policy),
+                    "--print-suite-plan-json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("ledger file does not exist", output.getvalue())
+
+    def test_main_reports_missing_serial_group_policy_file(self) -> None:
+        output = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.object(ci_app_test_runner, "list_suites", return_value=["RepoPromptTests.A"]),
+            mock.patch("sys.stdout", output),
+        ):
+            ledger = self.write_ledger(
+                Path(temp),
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.A/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.A",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                    },
+                ],
+            )
+            exit_code = ci_app_test_runner.main(
+                [
+                    "--ledger",
+                    str(ledger),
+                    "--serial-group-policy",
+                    str(Path(temp) / "missing.json"),
+                    "--print-suite-plan-json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("serial group policy file does not exist", output.getvalue())
 
     def test_xctest_failure_detection_matches_xctest_issue_lines_only(self) -> None:
         self.assertTrue(
@@ -224,6 +491,30 @@ class CIAppTestRunnerTests(unittest.TestCase):
         # timeout (2.0s); otherwise the retry would not happen until the whole budget
         # elapsed.
         self.assertLess(elapsed, 1.0)
+
+    def test_cancellation_event_stops_running_suite_process(self) -> None:
+        stopped: list[FakeProcess] = []
+        cancellation = threading.Event()
+        process = FakeProcess(["Test Case '-[RepoPromptTests.S testExample]' started.\n"])
+        timer = threading.Timer(0.02, cancellation.set)
+        timer.start()
+        try:
+            result = ci_app_test_runner.run_suite(
+                "RepoPromptTests.S",
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                process_factory=lambda suite: process,
+                stop_process_tree_func=self.stop_fake_process(stopped),
+                output=io.StringIO(),
+                poll_interval_seconds=0.001,
+                cancellation_event=cancellation,
+            )
+        finally:
+            timer.cancel()
+
+        self.assertEqual(result.state, "cancelled")
+        self.assertEqual(result.exit_code, 130)
+        self.assertEqual(stopped, [process])
 
     def test_discover_test_bundle_finds_xctest_in_bin_path(self) -> None:
         fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
@@ -531,6 +822,172 @@ class CIAppTestRunnerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("No XCTest bundle found for suite target UnknownTarget", output.getvalue())
+
+    def test_workers_one_preserves_current_serial_execution_order(self) -> None:
+        calls: list[str] = []
+
+        def fake_run_suite(suite, **kwargs):
+            calls.append(suite)
+            return ci_app_test_runner.SuiteRunResult(
+                suite=suite,
+                state="passed",
+                exit_code=0,
+                elapsed_seconds=0.1,
+                output_seen=True,
+                first_failure_line=None,
+                last_started_test=None,
+                timed_out_after_seconds=None,
+                attempts=1,
+            )
+
+        output = io.StringIO()
+        with mock.patch.object(ci_app_test_runner, "run_suite", side_effect=fake_run_suite):
+            exit_code = ci_app_test_runner.run_all_suites(
+                ["RepoPromptTests.B", "RepoPromptTests.A"],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=output,
+                workers=1,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, ["RepoPromptTests.B", "RepoPromptTests.A"])
+
+    def test_workers_never_schedule_pinned_suites_in_worker_pool(self) -> None:
+        pinned = ci_app_test_runner.PlannedSuite(
+            suite="RepoPromptTests.Pinned",
+            classification="pinned_serial",
+            serial_lanes=("app_window_state",),
+            matched_serial_tags=("WindowStatesManager",),
+            shared_state_tags=("WindowStatesManager",),
+            resource_cost_tags=(),
+            execution_tiers=("routine",),
+            estimated_runtime_seconds=1.0,
+            method_count=1,
+            heavy_tier_present=False,
+        )
+        eligible = ci_app_test_runner.PlannedSuite(
+            suite="RepoPromptTests.Free",
+            classification="parallel_eligible",
+            serial_lanes=(),
+            matched_serial_tags=(),
+            shared_state_tags=(),
+            resource_cost_tags=(),
+            execution_tiers=("routine",),
+            estimated_runtime_seconds=1.0,
+            method_count=1,
+            heavy_tier_present=False,
+        )
+        buffered_calls: list[str] = []
+        direct_calls: list[str] = []
+
+        def fake_buffered(suite, **kwargs):
+            buffered_calls.append(suite)
+            return (
+                ci_app_test_runner.SuiteRunResult(
+                    suite=suite,
+                    state="passed",
+                    exit_code=0,
+                    elapsed_seconds=0.2,
+                    output_seen=True,
+                    first_failure_line=None,
+                    last_started_test=None,
+                    timed_out_after_seconds=None,
+                    attempts=1,
+                ),
+                f"{suite} buffered\n",
+            )
+
+        def fake_direct(suite, **kwargs):
+            direct_calls.append(suite)
+            return ci_app_test_runner.SuiteRunResult(
+                suite=suite,
+                state="passed",
+                exit_code=0,
+                elapsed_seconds=0.1,
+                output_seen=True,
+                first_failure_line=None,
+                last_started_test=None,
+                timed_out_after_seconds=None,
+                attempts=1,
+            )
+
+        with (
+            mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered),
+            mock.patch.object(
+                ci_app_test_runner,
+                "run_and_report_single_suite",
+                side_effect=fake_direct,
+            ),
+        ):
+            exit_code = ci_app_test_runner.run_all_suites(
+                ["RepoPromptTests.Pinned", "RepoPromptTests.Free"],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=io.StringIO(),
+                suite_plan=ci_app_test_runner.SuitePlan((eligible, pinned)),
+                workers=2,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(direct_calls, ["RepoPromptTests.Pinned"])
+        self.assertEqual(buffered_calls, ["RepoPromptTests.Free"])
+
+    def test_parallel_fail_fast_stops_submitting_new_eligible_work(self) -> None:
+        suites = [
+            ci_app_test_runner.PlannedSuite(
+                suite=name,
+                classification="parallel_eligible",
+                serial_lanes=(),
+                matched_serial_tags=(),
+                shared_state_tags=(),
+                resource_cost_tags=(),
+                execution_tiers=("routine",),
+                estimated_runtime_seconds=1.0,
+                method_count=1,
+                heavy_tier_present=False,
+            )
+            for name in ["RepoPromptTests.Fail", "RepoPromptTests.NotSubmitted", "RepoPromptTests.AlsoNotSubmitted"]
+        ]
+        calls: list[str] = []
+
+        def fake_buffered(suite, **kwargs):
+            calls.append(suite)
+            state = "failed" if suite == "RepoPromptTests.Fail" else "passed"
+            return (
+                ci_app_test_runner.SuiteRunResult(
+                    suite=suite,
+                    state=state,
+                    exit_code=7 if state == "failed" else 0,
+                    elapsed_seconds=0.1,
+                    output_seen=True,
+                    first_failure_line=None,
+                    last_started_test=None,
+                    timed_out_after_seconds=None,
+                    attempts=1,
+                ),
+                f"{suite} {state}\n",
+            )
+
+        with mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered):
+            exit_code = ci_app_test_runner.run_all_suites(
+                [suite.suite for suite in suites],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=io.StringIO(),
+                suite_plan=ci_app_test_runner.SuitePlan(tuple(suites)),
+                workers=1 + 1,
+            )
+
+        self.assertEqual(exit_code, 7)
+        self.assertIn("RepoPromptTests.Fail", calls)
+        self.assertNotIn("RepoPromptTests.AlsoNotSubmitted", calls)
 
     def test_create_suite_process_falls_back_to_swift_test_without_bundle(self) -> None:
         captured_args: list[list[str]] = []
