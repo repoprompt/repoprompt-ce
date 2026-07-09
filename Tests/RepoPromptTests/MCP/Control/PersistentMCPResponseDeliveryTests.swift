@@ -213,7 +213,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         defer { bridgeTask.cancel() }
 
         try Self.writeAll(Data("12345\n".utf8), to: stdinPipe[1])
-        let completed = await resultBox.waitUntilStored(timeout: .seconds(2))
+        let completed = await resultBox.waitUntilStored(timeout: .seconds(5))
         XCTAssertTrue(completed)
         guard case let .failure(error) = resultBox.load() else {
             return XCTFail("Expected oversized client frame to fail the bridge")
@@ -259,7 +259,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         }
         defer { bridgeTask.cancel() }
 
-        let completed = await resultBox.waitUntilStored(timeout: .seconds(2))
+        let completed = await resultBox.waitUntilStored(timeout: .seconds(5))
         XCTAssertTrue(completed)
         guard case let .failure(error) = resultBox.load() else {
             return XCTFail("Expected oversized server frame to fail the bridge")

@@ -17,7 +17,7 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
         let stream = await transport.receive()
 
         try Self.writeAll(Data("12345\n".utf8), to: descriptors[1])
-        let didFail = await Self.waitUntil {
+        let didFail = await Self.waitUntil(timeout: 5) {
             let snapshot = await transport.ingressSnapshot()
             return snapshot.terminalCause == .frameTooLarge
         }

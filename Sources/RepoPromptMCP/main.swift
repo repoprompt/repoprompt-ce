@@ -1466,8 +1466,11 @@ extension BootstrapSocketProxy {
 
         while !Task.isCancelled {
             var pfd = pollfd(fd: stdinFD, events: Int16(POLLIN), revents: 0)
-            let pollResult = poll(&pfd, 1, 1000)
+            let pollResult = poll(&pfd, 1, 100)
 
+            if Task.isCancelled {
+                return
+            }
             if pollResult < 0 {
                 try validateCLIHostInputPollResult(pollResult, errno: errno)
                 continue
@@ -1763,8 +1766,11 @@ extension BootstrapSocketProxy {
                 readiness = try await socketPoller(socketFD)
             } else {
                 var pfd = pollfd(fd: socketFD, events: Int16(POLLIN), revents: 0)
-                let pollResult = poll(&pfd, 1, 1000)
+                let pollResult = poll(&pfd, 1, 100)
 
+                if Task.isCancelled {
+                    return
+                }
                 if pollResult < 0 {
                     if errno == EINTR {
                         continue
