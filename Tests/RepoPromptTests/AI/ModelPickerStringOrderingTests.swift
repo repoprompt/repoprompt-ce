@@ -151,7 +151,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         )
     }
 
-    func testCodexDynamicMaxEffortIsSelectableAndSerialized() throws {
+    func testCodexDynamicMaxAndUltraEffortsAreSelectableAndSerialized() throws {
         let dynamicOptions = CodexDynamicModelMapper.options(from: [
             CodexDynamicModelRecord(
                 id: "gpt-5.6-sol",
@@ -164,7 +164,8 @@ final class ModelPickerStringOrderingTests: XCTestCase {
                     CodexDynamicReasoningRecord(reasoningEffort: "medium", description: "Balanced"),
                     CodexDynamicReasoningRecord(reasoningEffort: "high", description: "Deep"),
                     CodexDynamicReasoningRecord(reasoningEffort: "xhigh", description: "Extra deep"),
-                    CodexDynamicReasoningRecord(reasoningEffort: "max", description: "Maximum")
+                    CodexDynamicReasoningRecord(reasoningEffort: "max", description: "Maximum"),
+                    CodexDynamicReasoningRecord(reasoningEffort: "ultra", description: "Proactive multi-agent")
                 ],
                 defaultReasoningEffort: "medium"
             )
@@ -186,9 +187,10 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             "gpt-5.6-sol-medium",
             "gpt-5.6-sol-high",
             "gpt-5.6-sol-xhigh",
-            "gpt-5.6-sol-max"
+            "gpt-5.6-sol-max",
+            "gpt-5.6-sol-ultra"
         ])
-        XCTAssertEqual(group.options.last?.displayName, "GPT-5.6 Sol Max")
+        XCTAssertEqual(group.options.suffix(2).map(\.displayName), ["GPT-5.6 Sol Max", "GPT-5.6 Sol Ultra"])
 
         let registryOptions = AgentCodexModelRegistry.shared.resolvedOptions(
             staticOptions: [],
@@ -203,20 +205,33 @@ final class ModelPickerStringOrderingTests: XCTestCase {
                         CodexAppServerClient.RemoteReasoningEffort(
                             reasoningEffort: "max",
                             description: "Maximum"
+                        ),
+                        CodexAppServerClient.RemoteReasoningEffort(
+                            reasoningEffort: "ultra",
+                            description: "Proactive multi-agent"
                         )
                     ],
-                    defaultReasoningEffort: "max"
+                    defaultReasoningEffort: "ultra"
                 )
             ]
         )
         let fastMaxOption = try XCTUnwrap(registryOptions.first { $0.rawValue == "gpt-5.6-sol-fast-max" })
         XCTAssertEqual(fastMaxOption.displayName, "GPT-5.6 Sol Fast Max")
+        let fastUltraOption = try XCTUnwrap(registryOptions.first { $0.rawValue == "gpt-5.6-sol-fast-ultra" })
+        XCTAssertEqual(fastUltraOption.displayName, "GPT-5.6 Sol Fast Ultra")
 
-        let specifier = CodexModelSpecifier(raw: group.options.last?.rawValue)
-        XCTAssertEqual(specifier.baseModel, "gpt-5.6-sol")
-        XCTAssertEqual(specifier.reasoningEffort, .max)
-        XCTAssertEqual(specifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=max"])
-        XCTAssertEqual(specifier.appServerEffortParam, "max")
+        let maxSpecifier = CodexModelSpecifier(raw: "gpt-5.6-sol-max")
+        XCTAssertEqual(maxSpecifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(maxSpecifier.reasoningEffort, .max)
+        XCTAssertEqual(maxSpecifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=max"])
+        XCTAssertEqual(maxSpecifier.appServerEffortParam, "max")
+
+        let ultraSpecifier = CodexModelSpecifier(raw: group.options.last?.rawValue)
+        XCTAssertEqual(ultraSpecifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(ultraSpecifier.reasoningEffort, .ultra)
+        XCTAssertEqual(ultraSpecifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=ultra"])
+        XCTAssertEqual(ultraSpecifier.appServerEffortParam, "ultra")
+        XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.6 Sol Ultra"), "GPT-5.6 Sol")
 
         let legacyMaxModel = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
         XCTAssertEqual(legacyMaxModel.baseModel, "gpt-5.1-codex-max")
@@ -244,6 +259,11 @@ final class ModelPickerStringOrderingTests: XCTestCase {
                                 "reasoning_effort": .string("max")
                             ]),
                             .object([
+                                "model_id": .string("codex:gpt-5.6-sol-ultra"),
+                                "name": .string("GPT-5.6 Sol Ultra"),
+                                "reasoning_effort": .string("ultra")
+                            ]),
+                            .object([
                                 "model_id": .string("codex:gpt-5.1-codex-max"),
                                 "name": .string("GPT-5.1 Codex Max Medium"),
                                 "reasoning_effort": .string("medium")
@@ -262,7 +282,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         guard case let .text(formattedText, _, _) = formattedBlock else {
             return XCTFail("Expected agent-manage text output")
         }
-        XCTAssertTrue(formattedText.contains("`codex:gpt-5.6-sol-{max}` — GPT-5.6 Sol"), formattedText)
+        XCTAssertTrue(formattedText.contains("`codex:gpt-5.6-sol-{max|ultra}` — GPT-5.6 Sol"), formattedText)
         XCTAssertTrue(formattedText.contains("`codex:gpt-5.1-codex-max-{medium|high}` — GPT-5.1 Codex Max"), formattedText)
         XCTAssertFalse(formattedText.contains("`codex:gpt-5.1-codex-{medium|high}`"), formattedText)
     }

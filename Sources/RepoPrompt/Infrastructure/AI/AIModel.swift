@@ -1601,6 +1601,7 @@ public enum AIModel: Equatable, Hashable {
             // Max is intentionally excluded without explicit effort metadata because it is
             // also part of the historical base model ID and label gpt-5.1-codex-max.
             [
+                "-ultra", " ultra",
                 "-xhigh", " xhigh", "-x-high", " x-high",
                 "-medium", " medium", "-med", " med",
                 "-minimal", " minimal",
