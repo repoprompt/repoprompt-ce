@@ -366,8 +366,13 @@ enum SentryTelemetryBootstrap {
             redacted = redacted.replacingOccurrences(of: "/Users/\(username)", with: "~/")
         }
         redacted = redacted.replacingOccurrences(
-            of: #"(?i)(api[_-]?key|token|secret|password|authorization)[=: ]+[^\s,;]+"#,
+            of: #"(?i)(api[_-]?key|token|secret|password|authorization)[=: ]+(?:(?:bearer|basic|token|dsn)\s+)?[^\s,;]+"#,
             with: "$1=[redacted]",
+            options: .regularExpression
+        )
+        redacted = redacted.replacingOccurrences(
+            of: #"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"#,
+            with: "[redacted]",
             options: .regularExpression
         )
         redacted = redacted.replacingOccurrences(

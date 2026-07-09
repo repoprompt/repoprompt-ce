@@ -132,6 +132,31 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(scrubbed.contains("[ip]"))
     }
 
+    func testSentryScrubStringRedactsAuthorizationSchemesAndCredentialTails() {
+        let raw = [
+            "Authorization: Bearer sk-abc123 request failed with 401",
+            "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            "authorization=Bearer abc.def.ghi",
+            "header was Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
+            "X-Api-Key: sk-live-9999",
+            "the basic idea is simple"
+        ].joined(separator: " | ")
+
+        let scrubbed = SentryTelemetryBootstrap.scrubStringForTesting(raw)
+
+        XCTAssertFalse(scrubbed.contains("sk-abc123"))
+        XCTAssertFalse(scrubbed.contains("Bearer sk"))
+        XCTAssertFalse(scrubbed.contains("dXNlcjpwYXNzd29yZA=="))
+        XCTAssertFalse(scrubbed.contains("abc.def.ghi"))
+        XCTAssertFalse(scrubbed.contains("eyJhbGciOiJIUzI1NiJ9.payload.sig"))
+        XCTAssertFalse(scrubbed.contains("sk-live-9999"))
+        XCTAssertTrue(scrubbed.contains("Authorization=[redacted] request failed with 401"))
+        XCTAssertTrue(scrubbed.contains("authorization=[redacted]"))
+        XCTAssertTrue(scrubbed.contains("header was [redacted]"))
+        XCTAssertTrue(scrubbed.contains("X-Api-Key=[redacted]"))
+        XCTAssertTrue(scrubbed.contains("the basic idea is simple"))
+    }
+
     func testObsoleteGitignoreJSONKeyIsIgnoredAndNeverEmitted() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
