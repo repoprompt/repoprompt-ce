@@ -164,4 +164,15 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertEqual(version.version, "1.0.27")
         XCTAssertEqual(version.buildNumber, "412")
     }
+
+    func testTipBuildVersionSortsBetweenAdjacentStableBuilds() throws {
+        let currentStable = try XCTUnwrap(SparkleBuildVersion("28"))
+        let tip = try XCTUnwrap(SparkleBuildVersion("28.7.95"))
+        let nextStable = try XCTUnwrap(SparkleBuildVersion("29"))
+
+        XCTAssertGreaterThan(tip, currentStable)
+        XCTAssertGreaterThan(nextStable, tip)
+        XCTAssertEqual(SparkleBuildVersion("28"), SparkleBuildVersion("28.0.0"))
+        XCTAssertNil(SparkleBuildVersion("28.7.95.1"))
+    }
 }

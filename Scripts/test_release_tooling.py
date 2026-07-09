@@ -1543,6 +1543,9 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
 
         self.assertIn("name: Publish Tip", tip_workflow)
         self.assertIn("group: main-tip-channel", tip_workflow)
+        self.assertIn("should-publish", tip_workflow)
+        self.assertIn("stable-appcast.xml", tip_workflow)
+        self.assertIn('build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"', tip_workflow)
         self.assertIn("environment: tip-release", tip_workflow)
         self.assertIn("TIP_UPDATE_REPOSITORY_TOKEN", tip_workflow)
         self.assertIn("repoprompt-ce-tip-updates", tip_workflow)
@@ -1563,6 +1566,11 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertNotIn("release-draft-creation", tip_workflow)
         self.assertNotIn("PUBLIC_UPDATE_REPOSITORY_TOKEN", tip_workflow)
 
+        self.assertIn('TIP_BUILD_NUMBER="$BUILD_NUMBER.$((TIP_BUILD_SEQUENCE / 100)).$((TIP_BUILD_SEQUENCE % 100))"', tip_script)
+        self.assertLess(
+            tip_script.index('if [[ -z "${TIP_BUILD_NUMBER:-}" ]]'),
+            tip_script.index('git rev-list --count "$TIP_COMMIT"'),
+        )
         self.assertIn('TIP_TAG="${TIP_TAG:-tip-$TIP_SHORT_SHA}"', tip_script)
         self.assertIn('TIP_UPDATE_REPOSITORY="${TIP_UPDATE_REPOSITORY:-repoprompt/repoprompt-ce-tip-updates}"', tip_script)
         self.assertNotIn("--prerelease", tip_script)
@@ -1849,6 +1857,28 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "RepoPrompt|1.0.0|1\n")
+
+    def test_release_metadata_parser_accepts_three_component_tip_build(self) -> None:
+        root = self.make_metadata_root()
+        metadata_path = root / "version.env"
+        metadata_path.write_text(
+            metadata_path.read_text(encoding="utf-8").replace("BUILD_NUMBER=1", "BUILD_NUMBER=28.7.95"),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{SCRIPT_DIR / "load_release_metadata.sh"}"; '
+                f'load_release_metadata "{root}"; printf "%s\n" "$BUILD_NUMBER"',
+            ],
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "28.7.95\n")
 
     def test_release_metadata_parser_rejects_shell_execution(self) -> None:
         root = self.make_metadata_root()

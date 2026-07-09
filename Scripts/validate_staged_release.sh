@@ -16,8 +16,8 @@ fail() {
     fail "Missing required environment variable: RELEASE_COMMIT"
 
 if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
-    [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]+$ ]] ||
-        fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be numeric"
+    [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
+        fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
     python3 - "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" \
         "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" <<'PYTHON'
 import sys

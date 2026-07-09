@@ -67,7 +67,7 @@ struct LicenseUpdatesSettingsView: View {
                                 .foregroundColor(.secondary)
 
                             if sparkleManager.updateChannel == .tip {
-                                Text("Tip builds are signed and notarized builds from the latest passing main branch. Returning to Stable may require waiting for a newer stable release or reinstalling the stable app.")
+                                Text("Tip builds are signed and notarized builds from the latest passing main branch. Returning to Stable takes effect with the next stable release; reinstall Stable to switch immediately.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }

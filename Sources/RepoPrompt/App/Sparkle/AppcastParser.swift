@@ -56,12 +56,13 @@ final class AppcastParser: NSObject, XMLParserDelegate {
         // Return the update with the highest numeric Sparkle build when present,
         // falling back to marketing-version comparison for legacy appcasts.
         return versions.max { lhs, rhs in
-            if let lhsBuild = lhs.buildNumber.flatMap(Int.init),
-               let rhsBuild = rhs.buildNumber.flatMap(Int.init)
+            if let lhsBuild = lhs.buildNumber.flatMap(SparkleBuildVersion.init),
+               let rhsBuild = rhs.buildNumber.flatMap(SparkleBuildVersion.init)
             {
                 return lhsBuild < rhsBuild
             }
-            return !isVersion(lhs.version, newerThan: rhs.version)
+            if isVersion(lhs.version, newerThan: rhs.version) { return false }
+            return isVersion(rhs.version, newerThan: lhs.version)
         }
     }
 

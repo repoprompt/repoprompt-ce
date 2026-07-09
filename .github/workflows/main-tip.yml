@@ -32,6 +32,7 @@ jobs:
       build-number: ${{ steps.tip.outputs.build-number }}
       tag: ${{ steps.tip.outputs.tag }}
       tooling-commit: ${{ steps.tip.outputs.tooling-commit }}
+      should-publish: ${{ steps.tip.outputs.should-publish }}
     steps:
       - name: Check out trusted tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -44,6 +45,7 @@ jobs:
         id: tip
         env:
           REQUESTED_COMMIT: ${{ inputs.commit || github.event.workflow_run.head_sha }}
+          TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -54,16 +56,94 @@ jobs:
             exit 1
           }
           short_sha="$(git rev-parse --short=12 "$commit")"
-          build_number="$(git rev-list --count "$commit")"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "short-sha=$short_sha" >> "$GITHUB_OUTPUT"
-          echo "build-number=$build_number" >> "$GITHUB_OUTPUT"
-          echo "tag=tip-$short_sha" >> "$GITHUB_OUTPUT"
-          echo "tooling-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          build_sequence="$(git rev-list --count "$commit")"
+          (( build_sequence <= 9999 )) || {
+            echo "Tip build sequence exceeds the three-component CFBundleVersion capacity" >&2
+            exit 1
+          }
+
+          stable_appcast="$RUNNER_TEMP/stable-appcast.xml"
+          curl --fail --location --retry 3 --silent --show-error \
+            https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml \
+            --output "$stable_appcast"
+          stable_build_number="$(python3 - "$stable_appcast" <<'PYTHON'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          versions = [
+              (element.text or "").strip()
+              for element in root.iter()
+              if element.tag.rsplit("}", 1)[-1] == "version"
+          ]
+          if len(versions) != 1 or not versions[0].isdigit():
+              raise SystemExit("Stable appcast must contain exactly one numeric sparkle:version")
+          print(versions[0])
+          PYTHON
+          )"
+          (( ${#stable_build_number} <= 4 )) || {
+            echo "Stable build number exceeds CFBundleVersion's four-digit major component" >&2
+            exit 1
+          }
+          build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"
+          archive_basename="RepoPrompt-tip-$short_sha-$build_number"
+          tag="tip-$short_sha"
+
+          release_json="$RUNNER_TEMP/existing-tip-release.json"
+          status="$(curl --location --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            --output "$release_json" \
+            --write-out '%{http_code}' \
+            "https://api.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/tags/$tag")"
+          case "$status" in
+            200)
+              python3 - "$release_json" "$archive_basename" <<'PYTHON'
+          import json
+          import sys
+
+          release = json.load(open(sys.argv[1], encoding="utf-8"))
+          archive_basename = sys.argv[2]
+          expected = {
+              f"{archive_basename}.zip",
+              f"{archive_basename}.dmg",
+              "appcast.xml",
+              "SHA256SUMS",
+              f"{archive_basename}-artifact-manifest.json",
+              f"{archive_basename}-metadata.json",
+          }
+          actual = {asset["name"] for asset in release.get("assets", [])}
+          if release.get("draft") or release.get("prerelease") or actual != expected:
+              missing = sorted(expected - actual)
+              extra = sorted(actual - expected)
+              raise SystemExit(
+                  "Existing tip release is incomplete or malformed; "
+                  f"missing={missing}, extra={extra}"
+              )
+          PYTHON
+              should_publish=false
+              echo "Tip release $tag already exists with the complete asset set; skipping rebuild."
+              ;;
+            404)
+              should_publish=true
+              ;;
+            *)
+              echo "Failed to inspect existing tip release: GitHub returned HTTP $status" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "commit=$commit"
+            echo "short-sha=$short_sha"
+            echo "build-number=$build_number"
+            echo "tag=$tag"
+            echo "tooling-commit=$(git rev-parse HEAD)"
+            echo "should-publish=$should_publish"
+          } >> "$GITHUB_OUTPUT"
 
   stage:
     name: Build Tip Source Without Secrets
     needs: setup
+    if: needs.setup.outputs.should-publish == 'true'
     runs-on: macos-26
     permissions:
       contents: read

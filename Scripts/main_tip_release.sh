@@ -11,9 +11,17 @@ cd "$ROOT_DIR"
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
 load_release_metadata "$ROOT_DIR"
 
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
 TIP_COMMIT="${TIP_COMMIT:-$(git rev-parse HEAD)}"
 TIP_SHORT_SHA="${TIP_SHORT_SHA:-${TIP_COMMIT:0:12}}"
-TIP_BUILD_NUMBER="${TIP_BUILD_NUMBER:-$(git rev-list --count "$TIP_COMMIT")}"
+if [[ -z "${TIP_BUILD_NUMBER:-}" ]]; then
+    TIP_BUILD_SEQUENCE="${TIP_BUILD_SEQUENCE:-$(git rev-list --count "$TIP_COMMIT")}"
+    TIP_BUILD_SEQUENCE="${TIP_BUILD_SEQUENCE//[[:space:]]/}"
+    [[ "$TIP_BUILD_SEQUENCE" =~ ^[0-9]+$ ]] || fail "TIP_BUILD_SEQUENCE must be numeric"
+    (( TIP_BUILD_SEQUENCE <= 9999 )) || fail "TIP_BUILD_SEQUENCE must not exceed 9999"
+    TIP_BUILD_NUMBER="$BUILD_NUMBER.$((TIP_BUILD_SEQUENCE / 100)).$((TIP_BUILD_SEQUENCE % 100))"
+fi
 TIP_BUILD_NUMBER="${TIP_BUILD_NUMBER//[[:space:]]/}"
 TIP_TAG="${TIP_TAG:-tip-$TIP_SHORT_SHA}"
 TIP_UPDATE_REPOSITORY="${TIP_UPDATE_REPOSITORY:-repoprompt/repoprompt-ce-tip-updates}"
@@ -36,7 +44,6 @@ STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
 TMP_DIR=""
 
-fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 require_command() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
 require_env() { [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"; }
 cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"; }
@@ -113,7 +120,8 @@ stage_tip() {
     require_command ditto
     require_command git
     require_command shasum
-    [[ "$TIP_BUILD_NUMBER" =~ ^[0-9]+$ ]] || fail "TIP_BUILD_NUMBER must be numeric"
+    [[ "$TIP_BUILD_NUMBER" =~ ^[0-9]{1,4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]] ||
+        fail "TIP_BUILD_NUMBER must be a three-component numeric build version"
     resolve_without_lockfile_drift
     "$CONTROL_PLANE_SCRIPTS_DIR/release.sh" preflight
     prepare_dist

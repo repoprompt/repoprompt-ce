@@ -377,12 +377,14 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     private func isBuildNumber(_ lhs: String, newerThan rhs: String) -> Bool? {
-        guard let lhsValue = Int(lhs), let rhsValue = Int(rhs) else { return nil }
+        guard let lhsValue = SparkleBuildVersion(lhs),
+              let rhsValue = SparkleBuildVersion(rhs)
+        else { return nil }
         return lhsValue > rhsValue
     }
 
     private func passiveSuppressionIdentifier(version: String, buildNumber: String?) -> String {
-        guard let buildNumber, Int(buildNumber) != nil else { return version }
+        guard let buildNumber, SparkleBuildVersion(buildNumber) != nil else { return version }
         return "\(version) (build \(buildNumber))"
     }
 

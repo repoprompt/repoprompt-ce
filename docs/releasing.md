@@ -84,10 +84,24 @@ release is marked latest inside the tip-only repository so GitHub's
 mark the tip release as a prerelease: GitHub excludes prereleases from
 `releases/latest`.
 
+Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow
+reads the currently published stable appcast and combines that stable build with
+the source commit count. For example, commit sequence `795` on stable build `28`
+becomes Tip build `28.7.95`: it is newer than stable `28`, while stable `29`
+still supersedes it. This keeps Stable and Tip in one monotonic Sparkle version
+space without forcing stable releases to adopt repository-sized build numbers.
+The source commit count must remain at or below `9999`; replace this encoding
+before the repository reaches that limit.
+
+The workflow uses GitHub concurrency to allow one active and one pending run.
+New successful `main` runs replace an older pending run while an active signing
+or notarization run finishes. Before compiling, it checks for a complete release
+for the immutable `tip-<shortsha>` tag and skips an already-published commit.
+
 Configure a protected GitHub Actions environment named `tip-release`. It can use
 the same Developer ID, provisioning, notarization, and Sparkle secrets as stable
 initially, but it needs a separate `TIP_UPDATE_REPOSITORY_TOKEN` scoped only to
-the tip update repository. Optionally set environment variable
+the tip update repository. Optionally set repository variable
 `TIP_UPDATE_REPOSITORY`; it defaults to `repoprompt/repoprompt-ce-tip-updates`.
 The publishing script fails closed if this variable points at the source repo or
 the stable update repo. Tip artifacts also include a small `*-metadata.json` asset

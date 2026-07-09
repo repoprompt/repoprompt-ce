@@ -14,7 +14,7 @@ patterns = {
     "APP_NAME": r"[A-Za-z0-9._ -]+",
     "DISPLAY_NAME": r"[A-Za-z0-9._ -]+",
     "MARKETING_VERSION": r"[0-9]+(?:\.[0-9]+){2}",
-    "BUILD_NUMBER": r"[0-9]+",
+    "BUILD_NUMBER": r"[0-9]{1,4}(?:\.[0-9]{1,2}){0,2}",
     "BUNDLE_ID": r"[A-Za-z0-9.-]+",
     "SIGNING_TEAM_ID": r"[A-Z0-9]+",
 }
