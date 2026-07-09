@@ -190,6 +190,28 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         ])
         XCTAssertEqual(group.options.last?.displayName, "GPT-5.6 Sol Max")
 
+        let registryOptions = AgentCodexModelRegistry.shared.resolvedOptions(
+            staticOptions: [],
+            preferredLiveModels: [
+                CodexAppServerClient.RemoteModel(
+                    id: "gpt-5.6-sol",
+                    model: "gpt-5.6-sol",
+                    displayName: "GPT-5.6-Sol",
+                    description: "Frontier coding model",
+                    isDefault: true,
+                    supportedReasoningEfforts: [
+                        CodexAppServerClient.RemoteReasoningEffort(
+                            reasoningEffort: "max",
+                            description: "Maximum"
+                        )
+                    ],
+                    defaultReasoningEffort: "max"
+                )
+            ]
+        )
+        let fastMaxOption = try XCTUnwrap(registryOptions.first { $0.rawValue == "gpt-5.6-sol-fast-max" })
+        XCTAssertEqual(fastMaxOption.displayName, "GPT-5.6 Sol Fast Max")
+
         let specifier = CodexModelSpecifier(raw: group.options.last?.rawValue)
         XCTAssertEqual(specifier.baseModel, "gpt-5.6-sol")
         XCTAssertEqual(specifier.reasoningEffort, .max)
@@ -199,6 +221,50 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         let legacyMaxModel = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
         XCTAssertEqual(legacyMaxModel.baseModel, "gpt-5.1-codex-max")
         XCTAssertNil(legacyMaxModel.reasoningEffort)
+        XCTAssertEqual(
+            AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max"),
+            "GPT-5.1 Codex Max"
+        )
+        XCTAssertEqual(
+            AIModel.stripCodexReasoningSuffix(from: "GPT-5.6 Sol Max", matching: .max),
+            "GPT-5.6 Sol"
+        )
+
+        let formattedModels = ToolOutputFormatter.formatAgentManage(
+            args: ["op": .string("list")],
+            value: .object([
+                "agents": .array([
+                    .object([
+                        "name": .string("Codex"),
+                        "available": .bool(true),
+                        "models": .array([
+                            .object([
+                                "model_id": .string("codex:gpt-5.6-sol-max"),
+                                "name": .string("GPT-5.6 Sol Max"),
+                                "reasoning_effort": .string("max")
+                            ]),
+                            .object([
+                                "model_id": .string("codex:gpt-5.1-codex-max"),
+                                "name": .string("GPT-5.1 Codex Max Medium"),
+                                "reasoning_effort": .string("medium")
+                            ]),
+                            .object([
+                                "model_id": .string("codex:gpt-5.1-codex-max-high"),
+                                "name": .string("GPT-5.1 Codex Max High"),
+                                "reasoning_effort": .string("high")
+                            ])
+                        ])
+                    ])
+                ])
+            ])
+        )
+        let formattedBlock = try XCTUnwrap(formattedModels.first)
+        guard case let .text(formattedText, _, _) = formattedBlock else {
+            return XCTFail("Expected agent-manage text output")
+        }
+        XCTAssertTrue(formattedText.contains("`codex:gpt-5.6-sol-{max}` — GPT-5.6 Sol"), formattedText)
+        XCTAssertTrue(formattedText.contains("`codex:gpt-5.1-codex-max-{medium|high}` — GPT-5.1 Codex Max"), formattedText)
+        XCTAssertFalse(formattedText.contains("`codex:gpt-5.1-codex-{medium|high}`"), formattedText)
     }
 
     @MainActor

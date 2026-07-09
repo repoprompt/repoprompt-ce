@@ -602,19 +602,6 @@ enum AgentModelCatalog {
             return CodexReasoningEffort.parse(String(suffix))
         }
 
-        func stripEffortSuffix(_ label: String) -> String {
-            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return trimmed }
-            var tokens = trimmed.split(separator: " ").map(String.init)
-            guard let last = tokens.last,
-                  CodexReasoningEffort.parse(last) != nil
-            else {
-                return trimmed
-            }
-            tokens.removeLast()
-            return tokens.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
         func humanizeCodexBaseModel(_ raw: String) -> String {
             let normalized = raw
                 .replacingOccurrences(of: "_", with: " ")
@@ -652,20 +639,24 @@ enum AgentModelCatalog {
 
         func displayNameForBaseModel(
             baseModelID: String,
-            fallbackDisplayName: String
+            fallbackDisplayName: String,
+            reasoningEffort: CodexReasoningEffort?
         ) -> String {
             let specifier = CodexModelSpecifier(raw: baseModelID)
+            let fallbackBaseDisplayName = AIModel.stripCodexReasoningSuffix(
+                from: fallbackDisplayName,
+                matching: reasoningEffort
+            )
             guard let serviceTier = specifier.serviceTier,
                   let baseModel = specifier.baseModel
             else {
-                let fallbackBaseDisplayName = stripEffortSuffix(fallbackDisplayName)
                 return AIModel.codexBaseDisplayName(
                     for: baseModelID,
-                    fallbackDisplayName: fallbackBaseDisplayName
+                    fallbackDisplayName: fallbackBaseDisplayName,
+                    reasoningEffort: reasoningEffort
                 )
             }
 
-            let fallbackBaseDisplayName = stripEffortSuffix(fallbackDisplayName)
             let loweredFallback = fallbackBaseDisplayName.lowercased()
             if loweredFallback.hasSuffix(" \(serviceTier)") || loweredFallback.hasSuffix("-\(serviceTier)") {
                 return fallbackBaseDisplayName
@@ -688,7 +679,8 @@ enum AgentModelCatalog {
             let reasoningEffort = specifier.reasoningEffort ?? effortFromDisplayName(option.displayName)
             let groupDisplayName = displayNameForBaseModel(
                 baseModelID: baseModelID,
-                fallbackDisplayName: option.displayName
+                fallbackDisplayName: option.displayName,
+                reasoningEffort: reasoningEffort
             )
             return Entry(
                 option: option,
@@ -1054,9 +1046,16 @@ enum AgentModelCatalog {
             CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: $0.rawValue)
                 .caseInsensitiveCompare(modelSlug) == .orderedSame
         }) {
-            return AIModel.stripCodexReasoningSuffix(from: option.displayName)
+            return AIModel.stripCodexReasoningSuffix(
+                from: option.displayName,
+                matching: CodexModelSpecifier(raw: option.rawValue).reasoningEffort
+            )
         }
-        return AIModel.codexBaseDisplayName(for: modelSlug, fallbackDisplayName: rawModel)
+        return AIModel.codexBaseDisplayName(
+            for: modelSlug,
+            fallbackDisplayName: rawModel,
+            reasoningEffort: CodexModelSpecifier(raw: rawModel).reasoningEffort
+        )
     }
 
     private static func codexEffort(

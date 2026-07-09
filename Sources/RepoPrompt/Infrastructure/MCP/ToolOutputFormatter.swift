@@ -5603,20 +5603,50 @@ extension ToolOutputFormatter {
                 var families: [(base: String, name: String, efforts: [String])] = []
                 var seen: Set<String> = []
 
+                func canonicalEffortRaw(_ effort: String) -> String {
+                    CodexReasoningEffort.parse(effort)?.rawValue
+                        ?? effort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
+
+                func stripEffortSuffix(from modelID: String, matching effort: String) -> String {
+                    let canonicalEffort = canonicalEffortRaw(effort)
+                    let suffixes = canonicalEffort == CodexReasoningEffort.xhigh.rawValue
+                        ? ["-xhigh", "-x-high"]
+                        : ["-\(canonicalEffort)"]
+                    for suffix in suffixes where modelID.lowercased().hasSuffix(suffix) {
+                        return String(modelID.dropLast(suffix.count))
+                    }
+                    return modelID
+                }
+
+                func stripEffortDisplaySuffix(from modelName: String, matching effort: String) -> String {
+                    let suffixes: [String] = switch canonicalEffortRaw(effort) {
+                    case CodexReasoningEffort.medium.rawValue:
+                        [" Medium", " Med"]
+                    case CodexReasoningEffort.xhigh.rawValue:
+                        [" XHigh", " X-High", " X High"]
+                    default:
+                        [" \(CodexReasoningEffort.parse(effort)?.displayName ?? effort.capitalized)"]
+                    }
+                    let loweredName = modelName.lowercased()
+                    for suffix in suffixes where loweredName.hasSuffix(suffix.lowercased()) {
+                        return String(modelName.dropLast(suffix.count))
+                            .trimmingCharacters(in: .whitespaces)
+                    }
+                    return modelName.trimmingCharacters(in: .whitespaces)
+                }
+
                 for model in models {
                     guard let m = model.objectValue else { continue }
                     let modelID = m["model_id"]?.stringValue ?? ""
                     let modelName = m["name"]?.stringValue ?? ""
                     let effort = m["reasoning_effort"]?.stringValue
 
-                    // Extract base: everything after "agentRaw:" minus the effort suffix
+                    // Extract base: everything after "agentRaw:" minus the explicit effort suffix.
+                    // Matching the metadata prevents model IDs such as gpt-5.1-codex-max from
+                    // being mistaken for a max-effort variant when their effort is medium.
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
-                    let effortSuffixes = ["-low", "-medium", "-high", "-xhigh", "-max", "-none", "-minimal"]
-                    var base = afterColon
-                    for suffix in effortSuffixes where base.lowercased().hasSuffix(suffix) {
-                        base = String(base.dropLast(suffix.count))
-                        break
-                    }
+                    let base = effort.map { stripEffortSuffix(from: afterColon, matching: $0) } ?? afterColon
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
                     let familyKey = agentPrefix + base
 
@@ -5628,13 +5658,7 @@ extension ToolOutputFormatter {
                     } else if effort != nil, !seen.contains(familyKey) {
                         // New family with efforts
                         seen.insert(familyKey)
-                        let baseName = modelName
-                            .replacingOccurrences(of: " Low", with: "")
-                            .replacingOccurrences(of: " Medium", with: "")
-                            .replacingOccurrences(of: " High", with: "")
-                            .replacingOccurrences(of: " XHigh", with: "")
-                            .replacingOccurrences(of: " Max", with: "")
-                            .trimmingCharacters(in: .whitespaces)
+                        let baseName = stripEffortDisplaySuffix(from: modelName, matching: effort!)
                         families.append((base: base, name: baseName, efforts: [effort!]))
                     } else {
                         // Simple model (no effort variants)

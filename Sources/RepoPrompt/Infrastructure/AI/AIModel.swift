@@ -1497,11 +1497,16 @@ public enum AIModel: Equatable, Hashable {
 
         let entries = models.map { model in
             let baseModelID = codexBaseModelID(for: model)
+            let reasoningEffort = codexReasoningEffort(for: model)
             return Entry(
                 model: model,
                 baseModelID: baseModelID,
-                displayName: codexBaseDisplayName(for: baseModelID, fallbackDisplayName: model.displayName),
-                reasoningEffort: codexReasoningEffort(for: model)
+                displayName: codexBaseDisplayName(
+                    for: baseModelID,
+                    fallbackDisplayName: model.displayName,
+                    reasoningEffort: reasoningEffort
+                ),
+                reasoningEffort: reasoningEffort
             )
         }
 
@@ -1535,15 +1540,19 @@ public enum AIModel: Equatable, Hashable {
         return semanticMetadataPrecedes(leftMetadata, rightMetadata)
     }
 
-    static func codexBaseDisplayName(for baseModelID: String, fallbackDisplayName: String) -> String {
+    static func codexBaseDisplayName(
+        for baseModelID: String,
+        fallbackDisplayName: String,
+        reasoningEffort: CodexReasoningEffort? = nil
+    ) -> String {
         if let storeLabel = CodexDynamicModelStore.displayName(forModelID: baseModelID) {
-            let normalizedStoreLabel = normalizedCodexBaseLabel(storeLabel)
+            let normalizedStoreLabel = normalizedCodexBaseLabel(storeLabel, matching: reasoningEffort)
             if !normalizedStoreLabel.isEmpty {
                 return codexPreviewDisplayAlias(for: normalizedStoreLabel) ?? normalizedStoreLabel
             }
         }
 
-        let fallbackLabel = normalizedCodexBaseLabel(fallbackDisplayName)
+        let fallbackLabel = normalizedCodexBaseLabel(fallbackDisplayName, matching: reasoningEffort)
         if !fallbackLabel.isEmpty {
             return humanizedCodexBaseModel(fallbackLabel)
         }
@@ -1570,19 +1579,36 @@ public enum AIModel: Equatable, Hashable {
         return label
     }
 
-    static func stripCodexReasoningSuffix(from label: String) -> String {
+    static func stripCodexReasoningSuffix(
+        from label: String,
+        matching reasoningEffort: CodexReasoningEffort? = nil
+    ) -> String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
-        let suffixes = [
-            "-max", " max",
-            "-xhigh", " xhigh", "-x-high", " x-high",
-            "-medium", " medium", "-med", " med",
-            "-minimal", " minimal",
-            "-high", " high",
-            "-none", " none",
-            "-low", " low"
-        ]
+        let suffixes: [String] = if let reasoningEffort {
+            switch reasoningEffort {
+            case .max:
+                ["-max", " max"]
+            case .xhigh:
+                ["-xhigh", " xhigh", "-x-high", " x-high"]
+            case .medium:
+                ["-medium", " medium", "-med", " med"]
+            default:
+                ["-\(reasoningEffort.rawValue)", " \(reasoningEffort.rawValue)"]
+            }
+        } else {
+            // Max is intentionally excluded without explicit effort metadata because it is
+            // also part of the historical base model ID and label gpt-5.1-codex-max.
+            [
+                "-xhigh", " xhigh", "-x-high", " x-high",
+                "-medium", " medium", "-med", " med",
+                "-minimal", " minimal",
+                "-high", " high",
+                "-none", " none",
+                "-low", " low"
+            ]
+        }
         let lowered = trimmed.lowercased()
         for suffix in suffixes where lowered.hasSuffix(suffix) {
             return String(trimmed.dropLast(suffix.count))
@@ -1727,11 +1753,14 @@ public enum AIModel: Equatable, Hashable {
         return nil
     }
 
-    private static func normalizedCodexBaseLabel(_ label: String) -> String {
+    private static func normalizedCodexBaseLabel(
+        _ label: String,
+        matching reasoningEffort: CodexReasoningEffort? = nil
+    ) -> String {
         let withoutPrefix = label
             .replacingOccurrences(of: "CLI·", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return stripCodexReasoningSuffix(from: withoutPrefix)
+        return stripCodexReasoningSuffix(from: withoutPrefix, matching: reasoningEffort)
     }
 
     private static func humanizedCodexBaseModel(_ raw: String) -> String {

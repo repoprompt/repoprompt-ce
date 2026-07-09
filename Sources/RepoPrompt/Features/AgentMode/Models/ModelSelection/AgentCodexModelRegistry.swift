@@ -118,7 +118,10 @@ final class AgentCodexModelRegistry {
     }
 
     private func fastDisplayName(for option: AgentModelOption, reasoningEffort: CodexReasoningEffort?) -> String {
-        let baseLabel = AIModel.stripCodexReasoningSuffix(from: option.displayName)
+        let baseLabel = AIModel.stripCodexReasoningSuffix(
+            from: option.displayName,
+            matching: reasoningEffort
+        )
         let fastLabel = baseLabel.range(of: " fast", options: [.caseInsensitive, .backwards]) == nil
             ? "\(baseLabel) Fast"
             : baseLabel
