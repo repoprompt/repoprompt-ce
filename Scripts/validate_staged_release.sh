@@ -15,10 +15,48 @@ fail() {
 [[ -n "${RELEASE_COMMIT:-}" ]] ||
     fail "Missing required environment variable: RELEASE_COMMIT"
 
-cmp "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" ||
-    fail "Staged version.env does not match approved source"
+if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
+    [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]+$ ]] ||
+        fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be numeric"
+    python3 - "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" \
+        "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" <<'PYTHON'
+import sys
+from pathlib import Path
+
+staged_path, approved_path, build_override = sys.argv[1:]
+
+def parse(path: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+staged = parse(staged_path)
+approved = parse(approved_path)
+expected = dict(approved)
+expected["BUILD_NUMBER"] = build_override
+if staged != expected:
+    mismatches = sorted(set(staged) | set(expected))
+    detail = ", ".join(
+        key for key in mismatches if staged.get(key) != expected.get(key)
+    )
+    raise SystemExit(f"ERROR: staged version.env does not match approved source plus build override: {detail}")
+PYTHON
+else
+    cmp "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" ||
+        fail "Staged version.env does not match approved source"
+fi
 source "$SCRIPT_DIR/load_release_metadata.sh"
 load_release_metadata "$APPROVED_SOURCE_ROOT"
+if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
+    BUILD_NUMBER="$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE"
+fi
 
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 

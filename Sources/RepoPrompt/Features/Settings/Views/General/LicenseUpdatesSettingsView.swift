@@ -48,6 +48,31 @@ struct LicenseUpdatesSettingsView: View {
                             .buttonStyle(.borderedProminent)
                         }
 
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker(
+                                "Update Channel",
+                                selection: Binding(
+                                    get: { sparkleManager.updateChannel },
+                                    set: { sparkleManager.setUpdateChannel($0) }
+                                )
+                            ) {
+                                ForEach(UpdateChannel.allCases) { channel in
+                                    Text(channel.displayName).tag(channel)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            Text(sparkleManager.updateChannel.shortDescription)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            if sparkleManager.updateChannel == .tip {
+                                Text("Tip builds are signed and notarized builds from the latest passing main branch. Returning to Stable may require waiting for a newer stable release or reinstalling the stable app.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
                         Toggle(
                             "Automatically check for updates",
                             isOn: Binding(

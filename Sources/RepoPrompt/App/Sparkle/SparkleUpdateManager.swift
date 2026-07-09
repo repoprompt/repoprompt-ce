@@ -23,7 +23,8 @@ import SwiftUI
 final class SparkleUpdaterManager: ObservableObject {
     /// Singleton instance - set by AppDelegate on launch
     static var shared: SparkleUpdaterManager!
-    private static let expectedFeedURL = SecurityObfuscation.decode(SecurityObfuscation.expectedFeedURLEncoded)
+    private static let stableFeedURL = SecurityObfuscation.decode(SecurityObfuscation.stableFeedURLEncoded)
+    private static let tipFeedURL = SecurityObfuscation.decode(SecurityObfuscation.tipFeedURLEncoded)
     private static let expectedPublicEdKey = SecurityObfuscation.decode(SecurityObfuscation.expectedPublicEdKeyEncoded)
 
     private struct CanonicalURL: Hashable {
@@ -40,6 +41,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     private struct AppcastUpdateInfo {
         let latestVersion: String
+        let latestBuildNumber: String?
         let date: Date?
         let releaseNotes: String?
     }
@@ -60,10 +62,10 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     private static var acceptedConfigurations: [AcceptedSparkleConfiguration] {
-        guard let canonical = canonicalizeFeedURL(expectedFeedURL) else { return [] }
-        return [
-            AcceptedSparkleConfiguration(feed: canonical, publicEdKey: expectedPublicEdKey)
-        ]
+        [stableFeedURL, tipFeedURL].compactMap { rawFeed in
+            guard let canonical = canonicalizeFeedURL(rawFeed) else { return nil }
+            return AcceptedSparkleConfiguration(feed: canonical, publicEdKey: expectedPublicEdKey)
+        }
     }
 
     /// Cleans corrupt Sparkle preferences that may cause crashes
@@ -85,6 +87,7 @@ final class SparkleUpdaterManager: ObservableObject {
     private var appcastCheckTask: Task<AppcastUpdateInfo?, Never>?
     private var userInitiatedSparkleCheckInProgress = false
     private var pendingUserInitiatedPassiveVersion: String?
+    private var pendingUserInitiatedPassiveBuildNumber: String?
     private var userCheckResetWorkItem: DispatchWorkItem?
     private var passivelySuppressedUpdateVersion: String?
     private let httpClient: HTTPClient = DefaultHTTPClient.uiCriticalClient
@@ -107,6 +110,7 @@ final class SparkleUpdaterManager: ObservableObject {
     @Published var updateAvailable = false
     @Published private(set) var sparkleConfigurationValid = true
     @Published private(set) var updatesDisabledMessage: String? = nil
+    @Published private(set) var updateChannel: UpdateChannel
 
     /// Tracks whether we detected an update via our custom appcast parser
     /// This prevents Sparkle's "no update" notification from overriding our detection
@@ -114,6 +118,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     // Update information
     @Published var updateVersion: String?
+    @Published var updateBuildNumber: String?
     @Published var updateDate: Date?
     @Published var updateDescription: String?
 
@@ -133,6 +138,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     init(updaterController: SPUStandardUpdaterController) {
         self.updaterController = updaterController
+        updateChannel = UpdateChannel.load()
         automaticallyChecksForUpdates = Self.loadPassiveAppcastChecksPreference(
             defaultingTo: updaterController.updater.automaticallyChecksForUpdates
         )
@@ -239,14 +245,14 @@ final class SparkleUpdaterManager: ObservableObject {
     @discardableResult
     func checkAppcastDirectly() async -> Bool {
         guard updaterStarted, sparkleConfigurationValid else { return false }
-        guard let feedURL = Bundle.main.infoDictionary?["SUFeedURL"] as? String,
-              let url = URL(string: feedURL)
-        else {
-            sparkleUpdaterManagerDebugLog("No SUFeedURL found in Info.plist")
+        let feedURL = updateChannel.feedURLString
+        guard let url = URL(string: feedURL) else {
+            sparkleUpdaterManagerDebugLog("Invalid update feed URL for channel \(updateChannel.rawValue): \(feedURL)")
             return false
         }
 
         let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+        let currentBuildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
         let client = httpClient
         appcastCheckTask?.cancel()
         let task = Task.detached(priority: .utility) {
@@ -256,7 +262,11 @@ final class SparkleUpdaterManager: ObservableObject {
         let appcastInfo = await task.value
         guard !Task.isCancelled else { return false }
         await MainActor.run {
-            self.apply(appcastInfo: appcastInfo, currentVersion: currentVersion)
+            self.apply(
+                appcastInfo: appcastInfo,
+                currentVersion: currentVersion,
+                currentBuildNumber: currentBuildNumber
+            )
         }
         return appcastInfo != nil
     }
@@ -294,6 +304,7 @@ final class SparkleUpdaterManager: ObservableObject {
                 }
                 return AppcastUpdateInfo(
                     latestVersion: latestVersion.version,
+                    latestBuildNumber: latestVersion.buildNumber,
                     date: latestVersion.date,
                     releaseNotes: latestVersion.releaseNotesURL
                 )
@@ -305,33 +316,46 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     @MainActor
-    private func apply(appcastInfo: AppcastUpdateInfo?, currentVersion: String) {
+    private func apply(
+        appcastInfo: AppcastUpdateInfo?,
+        currentVersion: String,
+        currentBuildNumber: String
+    ) {
         guard let appcastInfo else {
             sparkleUpdaterManagerDebugLog("Appcast check failed; preserving previous update state")
             return
         }
 
-        if isVersion(appcastInfo.latestVersion, newerThan: currentVersion) {
+        let isNewer = appcastInfo.latestBuildNumber.flatMap { latestBuild in
+            isBuildNumber(latestBuild, newerThan: currentBuildNumber)
+        } ?? isVersion(appcastInfo.latestVersion, newerThan: currentVersion)
+
+        if isNewer {
             let sanitizedLatestVersion = sanitizeVersionString(appcastInfo.latestVersion)
-            if passivelySuppressedUpdateVersion == sanitizedLatestVersion {
+            let suppressionIdentifier = passiveSuppressionIdentifier(
+                version: sanitizedLatestVersion,
+                buildNumber: appcastInfo.latestBuildNumber
+            )
+            if passivelySuppressedUpdateVersion == suppressionIdentifier {
                 customParserFoundUpdate = false
                 clearUpdateState()
-                sparkleUpdaterManagerDebugLog("Passive update \(appcastInfo.latestVersion) suppressed for this session after manual Sparkle check")
+                sparkleUpdaterManagerDebugLog("Passive update \(suppressionIdentifier) suppressed for this session after manual Sparkle check")
                 return
             }
 
             customParserFoundUpdate = true
             applyAvailableUpdateState(
                 version: sanitizedLatestVersion,
+                buildNumber: appcastInfo.latestBuildNumber,
                 date: appcastInfo.date,
                 description: appcastInfo.releaseNotes
             )
-            sparkleUpdaterManagerDebugLog("Update available: \(appcastInfo.latestVersion) (current: \(currentVersion))")
+            sparkleUpdaterManagerDebugLog("Update available: \(appcastInfo.latestVersion) build \(appcastInfo.latestBuildNumber ?? "<missing>") (current: \(currentVersion) build \(currentBuildNumber))")
         } else {
             customParserFoundUpdate = false
             passivelySuppressedUpdateVersion = nil
             clearUpdateState()
-            sparkleUpdaterManagerDebugLog("No update available. Current: \(currentVersion), Latest: \(appcastInfo.latestVersion)")
+            sparkleUpdaterManagerDebugLog("No update available. Current: \(currentVersion) build \(currentBuildNumber), Latest: \(appcastInfo.latestVersion) build \(appcastInfo.latestBuildNumber ?? "<missing>")")
         }
     }
 
@@ -350,6 +374,16 @@ final class SparkleUpdaterManager: ObservableObject {
             if v1Part < v2Part { return false }
         }
         return false
+    }
+
+    private func isBuildNumber(_ lhs: String, newerThan rhs: String) -> Bool? {
+        guard let lhsValue = Int(lhs), let rhsValue = Int(rhs) else { return nil }
+        return lhsValue > rhsValue
+    }
+
+    private func passiveSuppressionIdentifier(version: String, buildNumber: String?) -> String {
+        guard let buildNumber, Int(buildNumber) != nil else { return version }
+        return "\(version) (build \(buildNumber))"
     }
 
     private func setupObservers() {
@@ -375,6 +409,7 @@ final class SparkleUpdaterManager: ObservableObject {
                     self.customParserFoundUpdate = true // Sparkle agrees, mark as found
                     self.applyAvailableUpdateState(
                         version: self.sanitizeVersionString(appcastItem.displayVersionString),
+                        buildNumber: nil,
                         date: appcastItem.date,
                         description: appcastItem.itemDescription
                     )
@@ -390,8 +425,14 @@ final class SparkleUpdaterManager: ObservableObject {
                     guard let self else { return }
                     if self.userInitiatedSparkleCheckInProgress || self.pendingUserInitiatedPassiveVersion != nil {
                         let suppressedVersion = self.pendingUserInitiatedPassiveVersion ?? self.updateVersion
+                        let suppressedBuildNumber = self.pendingUserInitiatedPassiveBuildNumber ?? self.updateBuildNumber
                         self.finishUserInitiatedSparkleCheck()
-                        self.passivelySuppressedUpdateVersion = suppressedVersion
+                        self.passivelySuppressedUpdateVersion = suppressedVersion.map { version in
+                            self.passiveSuppressionIdentifier(
+                                version: version,
+                                buildNumber: suppressedBuildNumber
+                            )
+                        }
                         self.customParserFoundUpdate = false
                         self.clearUpdateState()
                     } else if !self.customParserFoundUpdate {
@@ -417,11 +458,15 @@ final class SparkleUpdaterManager: ObservableObject {
 
     private func applyAvailableUpdateState(
         version: String,
+        buildNumber: String?,
         date: Date?,
         description: String?
     ) {
         if updateVersion != version {
             updateVersion = version
+        }
+        if updateBuildNumber != buildNumber {
+            updateBuildNumber = buildNumber
         }
         if updateDate != date {
             updateDate = date
@@ -441,12 +486,26 @@ final class SparkleUpdaterManager: ObservableObject {
         if updateVersion != nil {
             updateVersion = nil
         }
+        if updateBuildNumber != nil {
+            updateBuildNumber = nil
+        }
         if updateDate != nil {
             updateDate = nil
         }
         if updateDescription != nil {
             updateDescription = nil
         }
+    }
+
+    func setUpdateChannel(_ channel: UpdateChannel) {
+        guard updateChannel != channel else { return }
+        updateChannel = channel
+        UpdateChannel.store(channel)
+        passivelySuppressedUpdateVersion = nil
+        customParserFoundUpdate = false
+        clearUpdateState()
+        updaterController.updater.resetUpdateCycle()
+        setupPeriodicUpdateCheck()
     }
 
     func checkForUpdates(silent: Bool = false) {
@@ -472,6 +531,7 @@ final class SparkleUpdaterManager: ObservableObject {
         customParserFoundUpdate = false
         userInitiatedSparkleCheckInProgress = true
         pendingUserInitiatedPassiveVersion = updateVersion
+        pendingUserInitiatedPassiveBuildNumber = updateBuildNumber
         scheduleUserInitiatedSparkleCheckReset()
         updaterController.checkForUpdates(nil)
     }
@@ -480,6 +540,7 @@ final class SparkleUpdaterManager: ObservableObject {
         userInitiatedSparkleCheckInProgress = false
         if clearPendingVersion {
             pendingUserInitiatedPassiveVersion = nil
+            pendingUserInitiatedPassiveBuildNumber = nil
         }
         userCheckResetWorkItem?.cancel()
         userCheckResetWorkItem = nil
@@ -503,14 +564,12 @@ final class SparkleUpdaterManager: ObservableObject {
     // MARK: - Sparkle Integrity
 
     private func validateSparkleConfiguration() -> (isValid: Bool, message: String?) {
-        guard let feedURLRaw = Bundle.main.infoDictionary?["SUFeedURL"] as? String,
-              let edKeyRaw = Bundle.main.infoDictionary?["SUPublicEDKey"] as? String
-        else {
-            return (false, "Updates are disabled because the Sparkle configuration is missing required Info.plist keys.")
+        guard let edKeyRaw = Bundle.main.infoDictionary?["SUPublicEDKey"] as? String else {
+            return (false, "Updates are disabled because the Sparkle signing key is missing from Info.plist.")
         }
 
-        guard let canonical = Self.canonicalizeFeedURL(feedURLRaw) else {
-            return (false, "Updates are disabled because the Sparkle feed URL is invalid.")
+        guard let canonical = Self.canonicalizeFeedURL(updateChannel.feedURLString) else {
+            return (false, "Updates are disabled because the selected Sparkle feed URL is invalid.")
         }
 
         let edKey = edKeyRaw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -553,16 +612,16 @@ final class SparkleUpdaterManager: ObservableObject {
         }
 
         static var debugExpectedFeedURL: String {
-            expectedFeedURL
+            stableFeedURL
+        }
+
+        static var debugTipFeedURL: String {
+            tipFeedURL
         }
 
         static func debugFeedURLMatchesExpected(_ raw: String) -> Bool {
-            guard let canonical = canonicalizeFeedURL(raw),
-                  let expected = canonicalizeFeedURL(expectedFeedURL)
-            else {
-                return false
-            }
-            return canonical == expected
+            guard let canonical = canonicalizeFeedURL(raw) else { return false }
+            return acceptedConfigurations.contains { $0.feed == canonical }
         }
 
         static func debugIsVersion(_ lhs: String, newerThan rhs: String) -> Bool {
@@ -583,6 +642,9 @@ final class SparkleUpdaterManager: ObservableObject {
         func debugPublishedSnapshot() -> [String: Any] {
             var snapshot: [String: Any] = [
                 "sparkle_configuration_valid": sparkleConfigurationValid,
+                "selected_update_channel": updateChannel.rawValue,
+                "active_feed_url": updateChannel.feedURLString,
+                "accepted_feed_urls": UpdateChannel.allCases.map(\.feedURLString),
                 "updater_started": updaterStarted,
                 "updates_disabled_message": updatesDisabledMessage ?? NSNull(),
                 "can_check_for_updates": canCheckForUpdates,
@@ -591,6 +653,7 @@ final class SparkleUpdaterManager: ObservableObject {
                 "sparkle_automatically_checks_for_updates": updaterController.updater.automaticallyChecksForUpdates,
                 "update_available": updateAvailable,
                 "update_version": updateVersion ?? NSNull(),
+                "update_build_number": updateBuildNumber ?? NSNull(),
                 "update_date_present": updateDate != nil,
                 "update_description_present": updateDescription != nil,
                 "appcast_task_present": appcastCheckTask != nil

@@ -98,23 +98,23 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         let xml = """
         <?xml version="1.0" encoding="utf-8"?>
         <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
-        	<channel>
-        		<item>
-        			<title>Version 2.1.9</title>
-        			<sparkle:shortVersionString>2.1.9</sparkle:shortVersionString>
-        			<sparkle:version>319</sparkle:version>
-        			<enclosure url="https://example.com/RepoPrompt-2.1.9.zip" />
-        		</item>
-        		<item>
-        			<title>Version 2.1.20</title>
-        			<sparkle:shortVersionString>2.1.20</sparkle:shortVersionString>
-        			<sparkle:version>320</sparkle:version>
-        			<pubDate>Tue, 21 Apr 2026 12:28:34 +0000</pubDate>
-        			<sparkle:releaseNotesLink>https://example.com/release-notes.html</sparkle:releaseNotesLink>
-        			<sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-        			<enclosure url="https://example.com/RepoPrompt-2.1.20.zip" />
-        		</item>
-        	</channel>
+            <channel>
+                <item>
+                    <title>Version 2.1.9</title>
+                    <sparkle:shortVersionString>2.1.9</sparkle:shortVersionString>
+                    <sparkle:version>319</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-2.1.9.zip" />
+                </item>
+                <item>
+                    <title>Version 2.1.20</title>
+                    <sparkle:shortVersionString>2.1.20</sparkle:shortVersionString>
+                    <sparkle:version>320</sparkle:version>
+                    <pubDate>Tue, 21 Apr 2026 12:28:34 +0000</pubDate>
+                    <sparkle:releaseNotesLink>https://example.com/release-notes.html</sparkle:releaseNotesLink>
+                    <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+                    <enclosure url="https://example.com/RepoPrompt-2.1.20.zip" />
+                </item>
+            </channel>
         </rss>
         """
 
@@ -126,5 +126,42 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertEqual(version.downloadURL, "https://example.com/RepoPrompt-2.1.20.zip")
         XCTAssertEqual(version.minimumSystemVersion, "14.0")
         XCTAssertNotNil(version.date)
+    }
+
+    func testUpdateChannelDefaultsToStableAndPersistsTipSelection() throws {
+        let suiteName = "UpdateChannelTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(UpdateChannel.load(defaults: defaults), .stable)
+
+        UpdateChannel.store(.tip, defaults: defaults)
+
+        XCTAssertEqual(UpdateChannel.load(defaults: defaults), .tip)
+        XCTAssertTrue(UpdateChannel.stable.feedURLString.contains("repoprompt-ce-updates"))
+        XCTAssertTrue(UpdateChannel.tip.feedURLString.contains("repoprompt-ce-tip-updates"))
+    }
+
+    func testAppcastParserPrefersHighestBuildNumberForSameMarketingVersion() throws {
+        let xml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+                <item>
+                    <sparkle:shortVersionString>1.0.27</sparkle:shortVersionString>
+                    <sparkle:version>28</sparkle:version>
+                </item>
+                <item>
+                    <sparkle:shortVersionString>1.0.27</sparkle:shortVersionString>
+                    <sparkle:version>412</sparkle:version>
+                </item>
+            </channel>
+        </rss>
+        """
+
+        let version = try XCTUnwrap(AppcastParser().parse(data: Data(xml.utf8)))
+
+        XCTAssertEqual(version.version, "1.0.27")
+        XCTAssertEqual(version.buildNumber, "412")
     }
 }
