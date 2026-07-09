@@ -329,6 +329,7 @@ public actor UnixSocketMCPTransport: Transport {
     /// Connection-local inbound and close channels. URL-backed transports replace
     /// these after teardown so a successor connection cannot inherit terminal state.
     private let receiveBufferCapacity: Int
+    private let maximumFrameByteCount: Int
     private var inboundChannel: InboundChannel
     private var closeChannel: CloseChannel
     private var closeSignaled = false
@@ -406,7 +407,8 @@ public actor UnixSocketMCPTransport: Transport {
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
         writePollIntervalMilliseconds: Int32 = 250,
-        receiveBufferCapacity: Int = 1024
+        receiveBufferCapacity: Int = 1024,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount
     ) {
         let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         self.socketURL = socketURL
@@ -418,6 +420,7 @@ public actor UnixSocketMCPTransport: Transport {
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
         self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
+        self.maximumFrameByteCount = max(1, maximumFrameByteCount)
         inboundChannel = InboundChannel(capacity: sanitizedReceiveBufferCapacity)
         closeChannel = CloseChannel()
     }
@@ -435,7 +438,8 @@ public actor UnixSocketMCPTransport: Transport {
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
         writePollIntervalMilliseconds: Int32 = 250,
-        receiveBufferCapacity: Int = 1024
+        receiveBufferCapacity: Int = 1024,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount
     ) throws {
         let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         do {
@@ -459,6 +463,7 @@ public actor UnixSocketMCPTransport: Transport {
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
         self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
+        self.maximumFrameByteCount = max(1, maximumFrameByteCount)
         inboundChannel = InboundChannel(capacity: sanitizedReceiveBufferCapacity)
         closeChannel = CloseChannel()
     }
@@ -1152,7 +1157,9 @@ public actor UnixSocketMCPTransport: Transport {
             let result = poll(&pfd, 1, pollTimeout)
 
             if result < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 let err = errno
                 let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
                 closeAfterSendFailure(error, cause: .writeFailure, errno: err)
@@ -1226,6 +1233,7 @@ public actor UnixSocketMCPTransport: Transport {
             fd: fd,
             queue: readQueue,
             logger: log,
+            maximumFrameByteCount: maximumFrameByteCount,
             onFrame: { [weak self] frame in
                 guard let self else { return }
                 responseDeliveryGate.recordAcceptedClientFrame(frame)
@@ -1417,6 +1425,14 @@ public actor UnixSocketMCPTransport: Transport {
 
         switch terminal {
         case let .error(error):
+            if error is MCPNewlineFrameTooLargeError {
+                tearDownSocket(
+                    error: error,
+                    cause: .frameTooLarge,
+                    initiator: .peer
+                )
+                return
+            }
             let errorNumber = Self.errnoValue(from: error)
             tearDownSocket(
                 error: error,
