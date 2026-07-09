@@ -108,6 +108,9 @@ jobs:
           echo "ARTIFACT_MANIFEST_PATH=${artifact_manifests[0]}" >> "$GITHUB_ENV"
 
       - name: Execute reviewed helper and packaged roundtrip without inherited secrets
+        env:
+          REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"
+          REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"
         run: |
           env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -124,6 +127,8 @@ jobs:
             TMPDIR="$RUNNER_TEMP" \
             USER="$USER" \
             LOGNAME="$LOGNAME" \
+            REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT" \
+            REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT" \
             ./trusted-control-plane/Scripts/smoke_packaged_mcp_roundtrip.sh \
             "extracted/RepoPrompt CE.app" \
             "Reviewed packaged app" \

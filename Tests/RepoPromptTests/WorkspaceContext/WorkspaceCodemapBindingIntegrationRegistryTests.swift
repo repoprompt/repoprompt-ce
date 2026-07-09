@@ -106,8 +106,10 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
         let catalogTask = Task {
             await catalog.resolveManifestBinding(rootEpoch, bindingIdentity.standardizedRelativePath)
         }
-        await sourceGate.waitUntilEntered()
-        await catalogGate.waitUntilEntered()
+        let sourceEntered = await sourceGate.waitUntilEntered()
+        let catalogEntered = await catalogGate.waitUntilEntered()
+        XCTAssertTrue(sourceEntered)
+        XCTAssertTrue(catalogEntered)
         let didUnregister = await registry.unregister(token)
         XCTAssertTrue(didUnregister)
         await sourceGate.release()
@@ -177,8 +179,10 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
         let catalogTask = Task {
             await catalog.resolveManifestBinding(rootEpoch, identity.standardizedRelativePath)
         }
-        await sourceGate.waitUntilEntered()
-        await catalogGate.waitUntilEntered()
+        let sourceEntered = await sourceGate.waitUntilEntered()
+        let catalogEntered = await catalogGate.waitUntilEntered()
+        XCTAssertTrue(sourceEntered)
+        XCTAssertTrue(catalogEntered)
 
         routeEndpoint = nil
         XCTAssertNil(weakEndpoint.value)
@@ -384,26 +388,4 @@ private enum RegistryTestError: Error {
     case expectedProjectionPage
 }
 
-private actor RegistryRouteGate {
-    private var entered = false
-    private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
-
-    func enterAndWait() async {
-        entered = true
-        guard !released else { return }
-        await withCheckedContinuation { continuation = $0 }
-    }
-
-    func waitUntilEntered() async {
-        while !entered {
-            await Task.yield()
-        }
-    }
-
-    func release() {
-        released = true
-        continuation?.resume()
-        continuation = nil
-    }
-}
+private typealias RegistryRouteGate = TestReleaseFence

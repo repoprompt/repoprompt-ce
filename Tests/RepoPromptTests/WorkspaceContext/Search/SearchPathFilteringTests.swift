@@ -100,13 +100,14 @@ final class SearchPathFilteringTests: XCTestCase {
             clauses: [.legacyPrefix(candidateLower: "sources")]
         )
 
-        let gate = SearchCancellationGate()
+        let cancellationGate = SearchPathFilteringCancellationGate()
         let task = Task.detached(priority: .background) {
-            await gate.wait()
+            // Shared cancellation gate resumes with CancellationError; continue into filter.
+            try? await cancellationGate.waitUntilCancelled()
             return filterPathIndicesResult(snapshots: snapshots, spec: spec)
         }
+        await cancellationGate.waitUntilEntered()
         task.cancel()
-        await gate.open()
         let result = await task.value
 
         XCTAssertTrue(result.cancelled)
@@ -114,21 +115,8 @@ final class SearchPathFilteringTests: XCTestCase {
     }
 }
 
-private actor SearchCancellationGate {
-    private var isOpen = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func open() {
-        isOpen = true
-        let current = waiters
-        waiters.removeAll()
-        current.forEach { $0.resume() }
-    }
-
-    func wait() async {
-        if isOpen { return }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
-        }
-    }
-}
+/// Search path filter cancel handshake (shared `TestCancellationGate`).
+///
+/// Note: resumes with `CancellationError` on cancel (stricter than the old Never-continuation
+/// version, which treated cancel as a non-throwing resume). Call sites only assert cancellation.
+private typealias SearchPathFilteringCancellationGate = TestCancellationGate

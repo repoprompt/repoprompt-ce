@@ -966,6 +966,13 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('CFFIXED_USER_HOME="$ISOLATED_HOME"', source)
         self.assertIn('"$MCP_HELPER"', source)
         self.assertIn('[helper, "-e", "windows"]', source)
+        self.assertIn('HELPER_REQUEST_TIMEOUT="${REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT:-30}"', source)
+        self.assertIn('timeout=int(helper_timeout)', source)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT must be a positive integer', source)
+        self.assertIn('log_phase() {', source)
+        self.assertIn('windows-attempt-${attempt}.out', source)
+        self.assertIn('windows-attempt-${attempt}.err', source)
+        self.assertIn('CLI windows attempt ${attempt}', source)
         self.assertIn('APP_PID=$!', source)
         self.assertIn('launched-process.json', source)
         self.assertIn('verify_packaged_mcp_socket_owner.py', source)
@@ -1109,9 +1116,16 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn("smoke_packaged_mcp_roundtrip.sh", signed_smoke)
         self.assertIn('"extracted/RepoPrompt CE.app"', signed_smoke)
         self.assertIn("env -i", signed_smoke)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', signed_smoke)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', signed_smoke)
         self.assertIn("PATH=/usr/bin:/bin:/usr/sbin:/sbin", signed_smoke)
         self.assertIn('HOME="$HOME"', signed_smoke)
         self.assertIn('TMPDIR="$RUNNER_TEMP"', signed_smoke)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"', signed_smoke)
+        self.assertIn(
+            'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
+            signed_smoke,
+        )
 
         reviewed_smoke = promote_workflow.split("\n  smoke-reviewed-helper:", 1)[1].split("\n  promote:", 1)[0]
         self.assertNotIn("environment: release", reviewed_smoke)
@@ -1124,6 +1138,16 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn("smoke_packaged_mcp_roundtrip.sh", reviewed_smoke)
         self.assertIn('"extracted/RepoPrompt CE.app"', reviewed_smoke)
         self.assertIn("env -i", reviewed_smoke)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', reviewed_smoke)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', reviewed_smoke)
+        self.assertIn(
+            'REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"',
+            reviewed_smoke,
+        )
+        self.assertIn(
+            'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
+            reviewed_smoke,
+        )
         promote_job = promote_workflow.split("\n  promote:", 1)[1]
         self.assertIn("- smoke-reviewed-helper", promote_job)
         self.assertIn("environment: release", promote_job)
@@ -1226,7 +1250,7 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"', release_script)
         self.assertIn('SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"', release_script)
         self.assertIn('ditto "$SENTRY_SYMBOLS_DIR" "$stage_root/.build/sentry-symbols/release"', release_script)
-        self.assertIn('upload_sentry_symbols_if_configured', release_script)
+        self.assertIn('upload_required_sentry_symbols', release_script)
 
         stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
         publish_job = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
@@ -1518,6 +1542,8 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         package_resolved = json.loads((root / "Package.resolved").read_text(encoding="utf-8"))
         notice_inventory = (root / "ThirdPartyLicenses" / "swiftpm" / "inventory.tsv").read_text(encoding="utf-8")
         release_workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        ci_workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        release_candidate_workflow = (root / ".github" / "workflows" / "release-candidate.yml").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
         bootstrap_source = (
@@ -1533,11 +1559,22 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn('repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
         self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', release_workflow)
+        self.assertIn('name: Sentry-enabled Build', ci_workflow)
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', ci_workflow)
+        self.assertIn('swift build --product RepoPrompt', ci_workflow)
+        self.assertIn('smoke_packaged_mcp_roundtrip.sh', release_candidate_workflow)
+        self.assertIn('".build/release/RepoPrompt.app"', release_candidate_workflow)
         self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", release_workflow)
         self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", release_script)
         self.assertIn('if [[ -n "${SENTRY_DSN:-}" ]]; then', staged_signing_script)
         self.assertIn('plutil -replace RepoPromptSentryDSN -string "$SENTRY_DSN"', staged_signing_script)
         self.assertIn('Bundle.main.object(forInfoDictionaryKey: "RepoPromptSentryDSN")', bootstrap_source)
+        self.assertIn('REPOPROMPT_TELEMETRY_DISABLED', bootstrap_source)
+        self.assertIn('GlobalSettingsStore.shared.telemetryEnabled()', bootstrap_source)
+        self.assertIn('options.beforeSend', bootstrap_source)
+        self.assertIn('options.tracesSampleRate = performanceTracingEnabled ? 0.05 : 0', bootstrap_source)
+        self.assertIn('#if DEBUG\n                if let value = ProcessInfo.processInfo.environment["REPOPROMPT_SENTRY_DSN"]', bootstrap_source)
+        self.assertIn('Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN', release_script)
 
         pins = {pin["identity"]: pin for pin in package_resolved["pins"]}
         self.assertEqual(pins["sentry-cocoa"]["state"]["version"], "9.17.1")

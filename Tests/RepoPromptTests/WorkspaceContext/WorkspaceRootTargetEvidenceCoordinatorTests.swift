@@ -240,12 +240,13 @@ final class WorkspaceRootTargetEvidenceCoordinatorTests: XCTestCase {
     func testLastWaiterCancellationCancelsProducerAndCleansFlight() async throws {
         let coordinator = WorkspaceRootTargetEvidenceCoordinator()
         let probe = TargetEvidenceCancellationProbe()
+        let cancellationGate = TargetEvidenceCancellationGate()
         let key = Self.flightKey(suffix: "last-waiter")
         let waiter = Task {
             try await coordinator.claim(for: key) { _, _ in
                 await probe.markStarted()
                 do {
-                    try await Task.sleep(for: .seconds(30))
+                    try await cancellationGate.waitUntilCancelled()
                     XCTFail("Producer should have been cancelled")
                     return .sealed(
                         handle: TargetEvidenceTestHandle(),
@@ -315,13 +316,14 @@ final class WorkspaceRootTargetEvidenceCoordinatorTests: XCTestCase {
         let coordinator = WorkspaceRootTargetEvidenceCoordinator()
         let releases = TargetEvidenceReleaseCounter()
         let probe = TargetEvidenceCancellationProbe()
+        let cancellationGate = TargetEvidenceCancellationGate()
         let waiter = Task {
             try await coordinator.claim(for: Self.flightKey(suffix: "last-cancel-resource")) { _, context in
                 try await context.retainResource(
                     TargetEvidenceTestResource(attempt: context.attemptIndex, releases: releases)
                 )
                 await probe.markStarted()
-                try await Task.sleep(for: .seconds(30))
+                try await cancellationGate.waitUntilCancelled()
                 return .sealed(
                     handle: TargetEvidenceTestHandle(),
                     authoritySnapshotIdentity: Data("authority".utf8)
@@ -348,6 +350,7 @@ final class WorkspaceRootTargetEvidenceCoordinatorTests: XCTestCase {
     func testLastWaiterCancellationJoinsProducerBeforeReleasingAttemptResource() async throws {
         let coordinator = WorkspaceRootTargetEvidenceCoordinator()
         let ordering = TargetEvidenceCancellationOrderingProbe()
+        let cancellationGate = TargetEvidenceCancellationGate()
         let waiter = Task {
             try await coordinator.claim(for: Self.flightKey(suffix: "last-cancel-join-order")) {
                 _, context in
@@ -356,7 +359,7 @@ final class WorkspaceRootTargetEvidenceCoordinatorTests: XCTestCase {
                 )
                 await ordering.markProducerStarted()
                 do {
-                    try await Task.sleep(for: .seconds(30))
+                    try await cancellationGate.waitUntilCancelled()
                     return .sealed(
                         handle: TargetEvidenceTestHandle(),
                         authoritySnapshotIdentity: Data("authority".utf8)
@@ -548,6 +551,8 @@ private actor TargetEvidenceCancellationProbe {
         cancelled = true
     }
 }
+
+private typealias TargetEvidenceCancellationGate = TestCancellationGate
 
 private actor TargetEvidenceCancellationOrderingProbe {
     enum Event: Equatable {

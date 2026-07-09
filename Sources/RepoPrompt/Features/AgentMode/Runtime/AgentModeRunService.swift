@@ -181,8 +181,6 @@ final class AgentModeRunService {
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
 
-        AgentRunSentryTelemetry.recordStarted(session: session, attachments: attachments)
-
         if selectedAgent == .codexExec {
             return await codexRunner.startRun(
                 tabID: tabID,

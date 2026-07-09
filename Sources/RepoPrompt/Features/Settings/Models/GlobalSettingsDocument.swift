@@ -151,6 +151,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
     var mcp: MCPSettings?
     var fileSystem: FileSystemSettings?
     var agentMode: AgentModeSettings?
+    var telemetry: TelemetrySettings?
     var modelOverrides: ModelOverrideSettingsData?
 
     init(
@@ -160,6 +161,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         mcp: MCPSettings? = nil,
         fileSystem: FileSystemSettings? = nil,
         agentMode: AgentModeSettings? = nil,
+        telemetry: TelemetrySettings? = nil,
         modelOverrides: ModelOverrideSettingsData? = nil
     ) {
         self.ui = ui
@@ -168,6 +170,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.mcp = mcp
         self.fileSystem = fileSystem
         self.agentMode = agentMode
+        self.telemetry = telemetry
         self.modelOverrides = modelOverrides
     }
 
@@ -296,6 +299,22 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.enableHierarchicalIgnores = enableHierarchicalIgnores
             self.skipSymlinks = skipSymlinks
             self.showEmptyFolders = showEmptyFolders
+        }
+    }
+
+    struct TelemetrySettings: Codable, Equatable {
+        var enabled: Bool?
+        var appHangReportsEnabled: Bool?
+        var performanceTracingEnabled: Bool?
+
+        init(
+            enabled: Bool? = nil,
+            appHangReportsEnabled: Bool? = nil,
+            performanceTracingEnabled: Bool? = nil
+        ) {
+            self.enabled = enabled
+            self.appHangReportsEnabled = appHangReportsEnabled
+            self.performanceTracingEnabled = performanceTracingEnabled
         }
     }
 

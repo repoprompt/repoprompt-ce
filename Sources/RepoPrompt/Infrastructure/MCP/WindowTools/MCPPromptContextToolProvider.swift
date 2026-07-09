@@ -73,12 +73,7 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
                 required: []
             )
         ) { [self] _, args in
-            try await WorkspaceToolSentryTelemetry.span(
-                operation: .promptRender,
-                toolName: .workspaceContext
-            ) {
-                try await executeWorkspaceContext(args: args)
-            }
+            try await executeWorkspaceContext(args: args)
         }
     }
 
@@ -161,12 +156,7 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
     }
 
     private func executePrompt(args: [String: Value]) async throws -> Value {
-        try await WorkspaceToolSentryTelemetry.span(
-            operation: .promptRender,
-            toolName: .prompt
-        ) {
-            try await executePromptBody(args: args)
-        }
+        try await executePromptBody(args: args)
     }
 
     private func executePromptBody(args: [String: Value]) async throws -> Value {

@@ -108,25 +108,20 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
     }
 
     private func executeManageSelection(args: [String: Value]) async throws -> ToolResultDTOs.SelectionReply {
-        try await WorkspaceToolSentryTelemetry.span(
-            operation: .selectionUpdate,
-            toolName: .manageSelection
-        ) {
-            #if DEBUG
-                let metadata = await dependencies.captureRequestMetadata()
-                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-                let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
-                    WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
-                        agentSessionID: $0
-                    )
-                }
-                return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(tag) {
-                    try await executeManageSelectionWithRetry(args: args)
-                }
-            #else
-                return try await executeManageSelectionWithRetry(args: args)
-            #endif
-        }
+        #if DEBUG
+            let metadata = await dependencies.captureRequestMetadata()
+            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
+                WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
+                    agentSessionID: $0
+                )
+            }
+            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(tag) {
+                try await executeManageSelectionWithRetry(args: args)
+            }
+        #else
+            return try await executeManageSelectionWithRetry(args: args)
+        #endif
     }
 
     private func executeManageSelectionWithRetry(

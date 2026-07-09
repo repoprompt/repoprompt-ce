@@ -25,6 +25,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
     func testDeadlineCancelsCooperativeOperationAndReturnsSingleTimeout() async throws {
         let clock = ExecutionWatchdogManualClock()
         let events = ExecutionWatchdogEventRecorder()
+        let operationGate = ExecutionWatchdogCancellationGate()
         let task = Task<Int, Error> {
             try await MCPToolExecutionWatchdog.execute(
                 deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
@@ -32,7 +33,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
                 environment: clock.environment,
                 onEvent: { await events.append($0) }
             ) {
-                try await Task.sleep(for: .seconds(3600))
+                try await operationGate.waitUntilCancelled()
                 return 1
             }
         }
@@ -58,6 +59,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let clock = ExecutionWatchdogManualClock()
         let events = ExecutionWatchdogEventRecorder()
         let callbackGate = ExecutionWatchdogCallbackGate()
+        let operationGate = ExecutionWatchdogCancellationGate()
         let task = Task<Int, Error> {
             try await MCPToolExecutionWatchdog.execute(
                 deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
@@ -70,7 +72,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
                     }
                 }
             ) {
-                try await Task.sleep(for: .seconds(3600))
+                try await operationGate.waitUntilCancelled()
                 return 1
             }
         }
@@ -283,17 +285,14 @@ actor ExecutionWatchdogUncooperativeGate {
     }
 }
 
+typealias ExecutionWatchdogCancellationGate = TestCancellationGate
+
 actor ExecutionWatchdogManualClock {
     private static let synchronizationTimeout: Duration = .seconds(10)
 
-    private struct Sleeper {
-        let duration: Duration
-        let continuation: CheckedContinuation<Void, Error>
-    }
-
     private var elapsed: Duration = .zero
-    private var sleeperOrder: [UUID] = []
-    private var sleepers: [UUID: Sleeper] = [:]
+    /// Lock-backed sleeper registry so `onCancel` can remove/resume synchronously.
+    private let sleeperState = ManualClockSleeperState()
 
     nonisolated var environment: MCPToolExecutionWatchdogEnvironment {
         MCPToolExecutionWatchdogEnvironment(
@@ -311,16 +310,15 @@ actor ExecutionWatchdogManualClock {
         let id = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                sleeperOrder.append(id)
-                sleepers[id] = Sleeper(duration: duration, continuation: continuation)
+                self.sleeperState.register(id: id, duration: duration, continuation: continuation)
             }
         } onCancel: {
-            Task { await self.cancelSleeper(id) }
+            sleeperState.cancel(id: id)
         }
     }
 
     func sleeperCount() -> Int {
-        sleepers.count
+        sleeperState.count
     }
 
     func waitForSleeperCount(
@@ -329,10 +327,10 @@ actor ExecutionWatchdogManualClock {
     ) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
-        while sleepers.count < count {
+        while sleeperState.count < count {
             try Task.checkCancellation()
             guard clock.now < deadline else {
-                throw ManualClockError.sleeperDidNotRegister(expected: count, actual: sleepers.count)
+                throw ManualClockError.sleeperDidNotRegister(expected: count, actual: sleeperState.count)
             }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -342,18 +340,14 @@ actor ExecutionWatchdogManualClock {
         guard duration > .zero else {
             throw ManualClockError.nonPositiveAdvance(duration)
         }
-        guard sleepers.isEmpty else {
-            throw ManualClockError.sleepersRegistered(sleepers.count)
+        guard sleeperState.count == 0 else {
+            throw ManualClockError.sleepersRegistered(sleeperState.count)
         }
         elapsed += duration
     }
 
     func advanceNext(expected: Duration) throws {
-        guard let id = sleeperOrder.first else {
-            throw ManualClockError.noSleeper
-        }
-        sleeperOrder.removeFirst()
-        guard let sleeper = sleepers.removeValue(forKey: id) else {
+        guard let sleeper = sleeperState.popNext() else {
             throw ManualClockError.noSleeper
         }
         guard sleeper.duration == expected else {
@@ -363,16 +357,64 @@ actor ExecutionWatchdogManualClock {
         sleeper.continuation.resume()
     }
 
-    private func cancelSleeper(_ id: UUID) {
-        sleeperOrder.removeAll { $0 == id }
-        sleepers.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
-    }
-
     private enum ManualClockError: Error {
         case noSleeper
         case nonPositiveAdvance(Duration)
         case sleeperDidNotRegister(expected: Int, actual: Int)
         case sleepersRegistered(Int)
         case unexpectedDuration(expected: Duration, actual: Duration)
+    }
+}
+
+/// Sync-cancelable sleeper registry for the manual watchdog clock.
+private final class ManualClockSleeperState: @unchecked Sendable {
+    private struct Sleeper {
+        let duration: Duration
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let lock = NSLock()
+    private var sleeperOrder: [UUID] = []
+    private var sleepers: [UUID: Sleeper] = [:]
+    private var cancelledIDs = Set<UUID>()
+
+    var count: Int {
+        lock.withLock { sleepers.count }
+    }
+
+    func register(
+        id: UUID,
+        duration: Duration,
+        continuation: CheckedContinuation<Void, Error>
+    ) {
+        lock.lock()
+        if cancelledIDs.remove(id) != nil {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        sleeperOrder.append(id)
+        sleepers[id] = Sleeper(duration: duration, continuation: continuation)
+        lock.unlock()
+    }
+
+    func cancel(id: UUID) {
+        lock.lock()
+        sleeperOrder.removeAll { $0 == id }
+        let sleeper = sleepers.removeValue(forKey: id)
+        if sleeper == nil {
+            cancelledIDs.insert(id)
+        }
+        lock.unlock()
+        sleeper?.continuation.resume(throwing: CancellationError())
+    }
+
+    func popNext() -> (duration: Duration, continuation: CheckedContinuation<Void, Error>)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let id = sleeperOrder.first else { return nil }
+        sleeperOrder.removeFirst()
+        guard let sleeper = sleepers.removeValue(forKey: id) else { return nil }
+        return (sleeper.duration, sleeper.continuation)
     }
 }

@@ -4059,6 +4059,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var fd: Int32
         private var buffer = Data()
         private var nonMatchingFrames: [String] = []
+        private let responseTimeout: TimeInterval = 10
 
         init(fd: Int32) {
             self.fd = fd
@@ -4103,45 +4104,58 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         private func response(matching expectedID: Int) async throws -> String {
-            let waiterHolder = SocketPairResponseWaiterHolder()
+            let waitState = SocketResponseWaitState()
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
-                    let responseWaiter = SocketPairResponseWaiter(continuation)
-                    waiterHolder.install(responseWaiter)
+                    guard waitState.install(continuation) else { return }
+                    let deadline = Date().addingTimeInterval(responseTimeout)
                     queue.async {
+                        let result: Result<String, Error>
                         do {
-                            while true {
-                                let line = try self.readLine()
-                                let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
-                                guard let object else { throw ClientError.invalidResponse }
-                                if let rawID = object["id"] {
-                                    guard let responseID = (rawID as? NSNumber)?.intValue else {
-                                        throw ClientError.invalidResponse
-                                    }
-                                    guard responseID == expectedID else {
-                                        throw ClientError.invalidResponse
-                                    }
-                                    guard let rawJSON = String(data: line, encoding: .utf8) else {
-                                        throw ClientError.invalidResponse
-                                    }
-                                    responseWaiter.resume(returning: rawJSON)
-                                    return
-                                }
-                                guard object["method"] as? String != nil,
-                                      let rawJSON = String(data: line, encoding: .utf8)
-                                else {
-                                    throw ClientError.invalidResponse
-                                }
-                                self.nonMatchingFrames.append(rawJSON)
-                            }
+                            result = try .success(self.readResponse(
+                                matching: expectedID,
+                                deadline: deadline,
+                                isCancelled: { waitState.isCancelled }
+                            ))
                         } catch {
-                            responseWaiter.resume(throwing: error)
+                            result = .failure(error)
                         }
+                        waitState.resume(with: result)
                     }
                 }
             } onCancel: {
-                waiterHolder.resume(throwing: CancellationError())
-                close()
+                waitState.cancel()
+            }
+        }
+
+        private func readResponse(
+            matching expectedID: Int,
+            deadline: Date,
+            isCancelled: () -> Bool
+        ) throws -> String {
+            while true {
+                if isCancelled() { throw CancellationError() }
+                let line = try readLine(deadline: deadline, isCancelled: isCancelled)
+                let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
+                guard let object else { throw ClientError.invalidResponse }
+                if let rawID = object["id"] {
+                    guard let responseID = (rawID as? NSNumber)?.intValue else {
+                        throw ClientError.invalidResponse
+                    }
+                    guard responseID == expectedID else {
+                        throw ClientError.invalidResponse
+                    }
+                    guard let rawJSON = String(data: line, encoding: .utf8) else {
+                        throw ClientError.invalidResponse
+                    }
+                    return rawJSON
+                }
+                guard object["method"] as? String != nil,
+                      let rawJSON = String(data: line, encoding: .utf8)
+                else {
+                    throw ClientError.invalidResponse
+                }
+                nonMatchingFrames.append(rawJSON)
             }
         }
 
@@ -4161,8 +4175,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
         }
 
-        private func readLine() throws -> Data {
+        private func readLine(deadline: Date, isCancelled: () -> Bool) throws -> Data {
             while true {
+                if isCancelled() { throw CancellationError() }
                 if let newline = buffer.firstIndex(of: 0x0A) {
                     let line = Data(buffer[..<newline])
                     buffer.removeSubrange(buffer.startIndex ... newline)
@@ -4170,8 +4185,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
                 guard fd >= 0 else { throw ClientError.closed }
                 var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-                let pollResult = Darwin.poll(&descriptor, 1, 10000)
-                if pollResult == 0 { throw ClientError.timedOut }
+                let remainingMilliseconds = Int32(deadline.timeIntervalSinceNow * 1000)
+                if remainingMilliseconds <= 0 { throw ClientError.timedOut }
+                let pollResult = Darwin.poll(&descriptor, 1, min(100, remainingMilliseconds))
+                if pollResult == 0 { continue }
                 if pollResult < 0 {
                     if errno == EINTR { continue }
                     throw ClientError.posix(operation: "poll", code: errno)
@@ -4194,6 +4211,56 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 if errno == EINTR { continue }
                 throw ClientError.posix(operation: "read", code: errno)
             }
+        }
+    }
+
+    private final class SocketResponseWaitState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String, Error>?
+        private var cancelled = false
+        private var completed = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            let result = cancelled
+            lock.unlock()
+            return result
+        }
+
+        func install(_ continuation: CheckedContinuation<String, Error>) -> Bool {
+            lock.lock()
+            if cancelled || completed {
+                lock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return false
+            }
+            self.continuation = continuation
+            lock.unlock()
+            return true
+        }
+
+        func cancel() {
+            let continuation = takeContinuation(cancelled: true)
+            continuation?.resume(throwing: CancellationError())
+        }
+
+        func resume(with result: Result<String, Error>) {
+            guard let continuation = takeContinuation(cancelled: false) else { return }
+            continuation.resume(with: result)
+        }
+
+        private func takeContinuation(cancelled: Bool) -> CheckedContinuation<String, Error>? {
+            lock.lock()
+            if completed {
+                lock.unlock()
+                return nil
+            }
+            self.cancelled = self.cancelled || cancelled
+            completed = true
+            let continuation = continuation
+            self.continuation = nil
+            lock.unlock()
+            return continuation
         }
     }
 #endif

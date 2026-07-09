@@ -24,7 +24,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let demand = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/Shutdown.swift"))
         }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let shutdownFinished = EngineCompletionFlag()
         let shutdown = Task {
             await fixture.engine.shutdown()
@@ -68,7 +69,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 2))
         writeGate.release()
@@ -209,7 +211,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 path: "Sources/First.swift"
             ))
         }
-        XCTAssertTrue(writerGate.waitUntilEntered())
+        let writerEntered = await writerGate.waitUntilEntered()
+        XCTAssertTrue(writerEntered)
         defer { writerGate.release() }
         await engine.unloadRoot(rootEpoch: firstEpoch)
         guard case .cancelled = await first.value else {
@@ -292,7 +295,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let demand = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/Feature.swift"))
         }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let invalidation = Task {
             await fixture.engine.invalidateModified(
                 rootEpoch: fixture.rootEpoch,

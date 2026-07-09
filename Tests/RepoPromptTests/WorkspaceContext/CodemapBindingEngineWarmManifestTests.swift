@@ -329,7 +329,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let racedLookup = Task {
             await fixture.engine.lookupPublishedArtifact(lookupRequest(UUID()))
         }
-        XCTAssertTrue(lookupCurrentnessGate.waitUntilEntered())
+        let lookupCurrentnessEntered = await lookupCurrentnessGate.waitUntilEntered()
+        XCTAssertTrue(lookupCurrentnessEntered)
         let accountingBeforePostLookupInvalidation = await fixture.engine.accounting()
         let invalidation = await fixture.engine.invalidateModified(
             rootEpoch: fixture.rootEpoch,

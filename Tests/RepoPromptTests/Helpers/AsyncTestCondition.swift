@@ -36,17 +36,24 @@ enum AsyncTestWait {
         maximumDelayNanoseconds: UInt64 = 25_000_000,
         condition: @escaping () async throws -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        var delay = initialDelayNanoseconds
+        let timeoutDuration = Duration.seconds(max(0, timeout))
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeoutDuration)
+        let maximumDelay = max(1, min(maximumDelayNanoseconds, UInt64(Int64.max)))
+        var delay = max(1, min(initialDelayNanoseconds, maximumDelay))
+
         while true {
             if try await condition() { return }
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else {
+            let now = clock.now
+            guard now < deadline else {
                 throw AsyncTestConditionTimeout(description: description, timeout: timeout)
             }
-            let remainingNanoseconds = UInt64((remaining * 1_000_000_000).rounded(.up))
-            try await Task.sleep(nanoseconds: min(delay, remainingNanoseconds))
-            delay = min(delay * 2, maximumDelayNanoseconds)
+            let sleepDeadline = min(
+                deadline,
+                now.advanced(by: .nanoseconds(Int64(delay)))
+            )
+            try await clock.sleep(until: sleepDeadline, tolerance: .zero)
+            delay = min(delay > maximumDelay / 2 ? maximumDelay : delay * 2, maximumDelay)
         }
     }
 }
@@ -56,6 +63,10 @@ enum AsyncTestWait {
 /// This helper is intentionally small: tests mutate a protected snapshot and waiters
 /// are resumed exactly when a later mutation satisfies their predicate. The only
 /// sleep is the bounded timeout timer; it is not used for polling state.
+///
+/// Hang guarantees:
+/// - sticky cancel (timeout/cancel-before-register fails closed; late register cannot park forever)
+/// - synchronous `onCancel` via lock-backed state (no `Task { await }` hop)
 final class AsyncTestCondition<Value>: @unchecked Sendable {
     private struct Waiter {
         let id: UUID
@@ -63,9 +74,20 @@ final class AsyncTestCondition<Value>: @unchecked Sendable {
         let continuation: CheckedContinuation<Void, Error>
     }
 
+    private enum WaiterState {
+        case pendingRegistration
+        case registered
+        case completed
+    }
+
     private let lock = NSLock()
     private var value: Value
     private var waiters: [Waiter] = []
+    /// Sticky cancel-before-register: timeout/cancel may race ahead of waiter registration.
+    private var cancelledWaiters: [UUID: Error] = [:]
+    /// Tracks terminal waiter IDs so cleanup after a successful wait cannot create
+    /// stale sticky-cancel entries for IDs that will never register again.
+    private var waiterStates: [UUID: WaiterState] = [:]
 
     init(_ value: Value) {
         self.value = value
@@ -83,6 +105,7 @@ final class AsyncTestCondition<Value>: @unchecked Sendable {
         mutate(&value)
         waiters.removeAll { waiter in
             guard waiter.predicate(value) else { return false }
+            waiterStates[waiter.id] = .completed
             ready.append(waiter.continuation)
             return true
         }
@@ -99,13 +122,20 @@ final class AsyncTestCondition<Value>: @unchecked Sendable {
         predicate: @escaping (Value) -> Bool
     ) async throws {
         let waiterID = UUID()
+        lock.lock()
+        waiterStates[waiterID] = .pendingRegistration
+        lock.unlock()
+
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await self.waitForSignal(id: waiterID, predicate: predicate)
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: UInt64((timeout * 1_000_000_000).rounded()))
-                self.cancelWaiter(id: waiterID, error: AsyncTestConditionTimeout(description: description, timeout: timeout))
+                try await Task.sleep(for: .seconds(max(0, timeout)))
+                self.cancelWaiter(
+                    id: waiterID,
+                    error: AsyncTestConditionTimeout(description: description, timeout: timeout)
+                )
                 throw AsyncTestConditionTimeout(description: description, timeout: timeout)
             }
             defer {
@@ -117,27 +147,57 @@ final class AsyncTestCondition<Value>: @unchecked Sendable {
     }
 
     private func waitForSignal(id: UUID, predicate: @escaping (Value) -> Bool) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            var shouldResume = false
-            lock.lock()
-            if predicate(value) {
-                shouldResume = true
-            } else {
-                waiters.append(Waiter(id: id, predicate: predicate, continuation: continuation))
-            }
-            lock.unlock()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                var resumeResult: Result<Void, Error>?
+                lock.lock()
+                if let error = cancelledWaiters.removeValue(forKey: id) {
+                    waiterStates.removeValue(forKey: id)
+                    resumeResult = .failure(error)
+                } else if Task.isCancelled {
+                    waiterStates.removeValue(forKey: id)
+                    resumeResult = .failure(CancellationError())
+                } else if predicate(value) {
+                    waiterStates[id] = .completed
+                    resumeResult = .success(())
+                } else {
+                    waiters.append(Waiter(id: id, predicate: predicate, continuation: continuation))
+                    waiterStates[id] = .registered
+                }
+                lock.unlock()
 
-            if shouldResume {
-                continuation.resume()
+                switch resumeResult {
+                case .success:
+                    continuation.resume()
+                case let .failure(error):
+                    continuation.resume(throwing: error)
+                case nil:
+                    break
+                }
             }
+        } onCancel: {
+            cancelWaiter(id: id, error: CancellationError())
         }
     }
 
     private func cancelWaiter(id: UUID, error: Error) {
         var continuation: CheckedContinuation<Void, Error>?
         lock.lock()
-        if let index = waiters.firstIndex(where: { $0.id == id }) {
-            continuation = waiters.remove(at: index).continuation
+        switch waiterStates[id] {
+        case .registered:
+            if let index = waiters.firstIndex(where: { $0.id == id }) {
+                continuation = waiters.remove(at: index).continuation
+            }
+            waiterStates[id] = .completed
+        case .pendingRegistration:
+            if cancelledWaiters[id] == nil {
+                cancelledWaiters[id] = error
+            }
+        case .completed:
+            waiterStates.removeValue(forKey: id)
+            cancelledWaiters.removeValue(forKey: id)
+        case nil:
+            cancelledWaiters.removeValue(forKey: id)
         }
         lock.unlock()
         continuation?.resume(throwing: error)

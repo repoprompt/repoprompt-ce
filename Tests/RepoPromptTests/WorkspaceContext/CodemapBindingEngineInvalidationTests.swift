@@ -458,7 +458,7 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
                 root: root,
                 runtime: runtime,
                 capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
-                    beforeResolution: { await gate.enter() }
+                    beforeResolution: { await gate.enterIgnoringCancellationUntilRelease() }
                 )
             )
             let registration = Task { await fixture.engine.registerRoot(fixture.registration) }

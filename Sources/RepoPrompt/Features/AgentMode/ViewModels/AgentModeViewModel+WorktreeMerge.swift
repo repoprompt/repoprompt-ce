@@ -572,12 +572,6 @@ extension AgentModeViewModel {
               session.pendingWorktreeMergeReview?.id == reviewID,
               let continuation = session.worktreeMergeReviewContinuation
         else { return }
-        AgentRunSentryTelemetry.recordApprovalDecision(
-            session: session,
-            kind: .worktreeMerge,
-            outcome: telemetryApprovalOutcome(for: decision),
-            cancellationReason: telemetryCancellationReason(for: decision)
-        )
         finishPendingWorktreeMergeReview(session: session)
         continuation.resume(returning: decision)
     }
@@ -600,14 +594,6 @@ extension AgentModeViewModel {
 
     func cancelPendingWorktreeMergeReview(for session: TabSession, reason: String) {
         let operationID = session.pendingWorktreeMergeReview?.operationID
-        if session.pendingWorktreeMergeReview != nil {
-            AgentRunSentryTelemetry.recordApprovalDecision(
-                session: session,
-                kind: .worktreeMerge,
-                outcome: .denied,
-                cancellationReason: telemetryCancellationReason(forApprovalCancellationReason: reason)
-            )
-        }
         guard let continuation = session.worktreeMergeReviewContinuation else {
             finishPendingWorktreeMergeReview(session: session)
             if let operationID {

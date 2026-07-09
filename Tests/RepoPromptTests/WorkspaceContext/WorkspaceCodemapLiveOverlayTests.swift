@@ -3115,30 +3115,27 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     }
 }
 
-private actor OverlayFirstCommitGate {
-    private var firstCommitEntered = false
-    private var firstCommitReleased = false
+/// First-commit-only fence: parks only on the first `enter()`.
+private final class OverlayFirstCommitGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "overlay first commit gate")
+    private let lock = NSLock()
     private var commitCount = 0
-    private var continuation: CheckedContinuation<Void, Never>?
 
     func enter() async {
-        commitCount += 1
-        guard commitCount == 1 else { return }
-        firstCommitEntered = true
-        if firstCommitReleased { return }
-        await withCheckedContinuation { continuation = $0 }
+        let shouldPark = lock.withLock { () -> Bool in
+            commitCount += 1
+            return commitCount == 1
+        }
+        guard shouldPark else { return }
+        await fence.enterAndWait()
     }
 
-    func waitUntilFirstCommit() async {
-        while !firstCommitEntered {
-            await Task.yield()
-        }
+    func waitUntilFirstCommit(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func releaseFirstCommit() {
-        firstCommitReleased = true
-        continuation?.resume()
-        continuation = nil
+        fence.release()
     }
 }
 

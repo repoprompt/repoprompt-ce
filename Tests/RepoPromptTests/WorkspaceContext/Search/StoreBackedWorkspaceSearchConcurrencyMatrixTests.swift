@@ -353,65 +353,90 @@ import XCTest
         case sameStoreBroadSearchDidNotStart
     }
 
-    private actor SearchPermitGate {
+    /// Search permit fence: shared release fence + started-count polling.
+    private final class SearchPermitGate: @unchecked Sendable {
+        private let fence = TestReleaseFence(name: "search permit gate")
+        private let lock = NSLock()
         private var startedCount = 0
-        private var released = false
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
         func markStartedAndWaitForRelease() async {
-            startedCount += 1
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
-            }
+            lock.withLock { startedCount += 1 }
+            await fence.enterAndWait()
         }
 
         func waitUntilStartedCount(
             _ expectedCount: Int,
             timeout: Duration = .seconds(2)
         ) async -> Bool {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while startedCount < expectedCount, clock.now < deadline {
-                try? await Task.sleep(for: .milliseconds(5))
+            let timeoutInterval = TestFenceDefaults.timeInterval(timeout)
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "search permit started count \(expectedCount)",
+                    timeout: timeoutInterval
+                ) {
+                    self.lock.withLock { self.startedCount >= expectedCount }
+                }
+                return true
+            } catch {
+                return lock.withLock { startedCount >= expectedCount }
             }
-            return startedCount >= expectedCount
         }
 
         func release() {
-            released = true
-            releaseWaiters.forEach { $0.resume() }
-            releaseWaiters.removeAll()
+            fence.release()
         }
     }
 
-    private actor KWayIsolationBarrier {
+    /// K-way barrier: wait for arrivals then park on a cancellable async release fence.
+    private final class KWayIsolationBarrier: @unchecked Sendable {
         private let expectedCount: Int
+        private let releaseFence = TestReleaseFence(name: "k-way isolation barrier")
+        private let lock = NSLock()
         private var arrivedCount = 0
-        private var released = false
 
         init(expectedCount: Int) {
             self.expectedCount = expectedCount
         }
 
-        func arriveAndWaitForRelease() async {
-            arrivedCount += 1
-            while !released {
-                try? await Task.sleep(for: .milliseconds(1))
+        func arriveAndWaitForRelease(timeout: Duration = TestFenceDefaults.releaseWaitDuration) async {
+            lock.withLock { arrivedCount += 1 }
+            let timeoutInterval = TestFenceDefaults.timeInterval(timeout)
+            await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    await self.releaseFence.enterAndWait()
+                    return true
+                }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: UInt64((timeoutInterval * 1_000_000_000).rounded()))
+                    return false
+                }
+                let first = await group.next() ?? false
+                group.cancelAll()
+                if !first {
+                    XCTFail("Timed out waiting for KWayIsolationBarrier release")
+                    // Fail open so remaining waiters (and this cancelled task) can unwind.
+                    self.releaseFence.release()
+                }
             }
         }
 
         func waitUntilAllArrived(timeout: Duration = .seconds(2)) async -> Bool {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while arrivedCount < expectedCount, clock.now < deadline {
-                try? await Task.sleep(for: .milliseconds(1))
+            let timeoutInterval = TestFenceDefaults.timeInterval(timeout)
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "k-way isolation all arrived",
+                    timeout: timeoutInterval
+                ) {
+                    self.lock.withLock { self.arrivedCount >= self.expectedCount }
+                }
+                return true
+            } catch {
+                return lock.withLock { arrivedCount >= expectedCount }
             }
-            return arrivedCount == expectedCount
         }
 
         func release() {
-            released = true
+            releaseFence.release()
         }
     }
 #endif

@@ -181,7 +181,15 @@ require_staged_sentry_symbols_when_enabled() {
     fi
 }
 
-upload_sentry_symbols_if_configured() {
+require_sentry_publish_symbol_upload_configuration() {
+    sentry_linking_enabled || return 0
+    [[ -n "${SENTRY_AUTH_TOKEN:-}" || -n "${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}" ]] || fail "Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN or REPOPROMPT_SENTRY_AUTH_TOKEN_FILE for debug symbol upload."
+    require_env REPOPROMPT_SENTRY_ORG
+    require_env REPOPROMPT_SENTRY_PROJECT
+}
+
+upload_required_sentry_symbols() {
+    require_sentry_publish_symbol_upload_configuration
     "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" "$SENTRY_SYMBOLS_DIR"
 }
 
@@ -230,10 +238,7 @@ verify_publish_inputs() {
     require_release_tag_matches_metadata
     require_file "$REPOPROMPT_PROVISIONING_PROFILE"
     require_file "$NOTARYTOOL_PRIVATE_KEY"
-    if [[ -n "${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}" || -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
-        require_env REPOPROMPT_SENTRY_ORG
-        require_env REPOPROMPT_SENTRY_PROJECT
-    fi
+    require_sentry_publish_symbol_upload_configuration
 
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
 }
@@ -312,7 +317,7 @@ publish_staged_release() {
     xcrun stapler validate "$APP_BUNDLE"
     write_final_artifact_manifest
     validate_public_app "$APP_BUNDLE" "$FINAL_ARTIFACT_MANIFEST" "Final Developer ID app"
-    upload_sentry_symbols_if_configured
+    upload_required_sentry_symbols
 
     local distribution_dir="$TMP_DIR/distribution"
     mkdir -p "$distribution_dir"

@@ -321,7 +321,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         Self.closeIfOpen(stdinPipe[1])
         stdinPipe[1] = -1
         let forwardedRequest = try await Task.detached {
-            try Self.readLine(from: sockets[1])
+            try Self.readLine(from: sockets[1], timeout: 2)
         }.value
         XCTAssertEqual(forwardedRequest, requestFrame)
         let observedStdinClose = await poller.waitUntilStdinClosed()
@@ -342,7 +342,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         await poller.resumeNext(.events(Int16(POLLIN)))
         try await bridgeTask.value
 
-        let deliveredResponse = try Self.readLine(from: stdoutPipe[0])
+        let deliveredResponse = try Self.readLine(from: stdoutPipe[0], timeout: 2)
         XCTAssertEqual(deliveredResponse, responseFrame)
         let snapshot = await ledger.snapshot()
         XCTAssertEqual(snapshot.activeRequestCount, 0)
@@ -395,7 +395,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         Self.closeIfOpen(stdinPipe[1])
         stdinPipe[1] = -1
         let forwardedRequest = try await Task.detached {
-            try Self.readLine(from: sockets[1])
+            try Self.readLine(from: sockets[1], timeout: 2)
         }.value
         XCTAssertEqual(forwardedRequest, requestFrame)
         let observedStdinClose = await poller.waitUntilStdinClosed()
@@ -1593,6 +1593,7 @@ private actor ManualBridgeSocketPoller {
                 }
             }
         } onCancel: {
+            // Actor isolation requires a hop; sticky pendingPollCancelled covers cancel-before-register.
             Task { await self.cancelPendingPoll() }
         }
     }
@@ -1988,31 +1989,20 @@ private actor WriteRecorder {
     }
 }
 
-private actor AsyncGate {
-    private var entered = false
-    private var released = false
-    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+/// Response-delivery concurrency fence (shared `TestReleaseFence` with legacy names).
+private final class AsyncGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "persistent MCP response delivery async gate")
 
     func markEnteredAndWait() async {
-        entered = true
-        let waiters = enteredWaiters
-        enteredWaiters.removeAll()
-        waiters.forEach { $0.resume() }
-        guard !released else { return }
-        await withCheckedContinuation { releaseWaiters.append($0) }
+        await fence.enterAndWait()
     }
 
-    func waitUntilEntered() async {
-        guard !entered else { return }
-        await withCheckedContinuation { enteredWaiters.append($0) }
+    func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        released = true
-        let waiters = releaseWaiters
-        releaseWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        fence.release()
     }
 }
 

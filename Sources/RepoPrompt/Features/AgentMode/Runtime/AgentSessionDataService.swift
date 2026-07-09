@@ -934,36 +934,18 @@ actor AgentSessionDataService {
         let filename = "AgentSession-\(session.id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
 
-        AgentSessionPersistenceSentryTelemetry.recordScheduled(session: session)
-        do {
-            return try await SentryTelemetryBootstrap.spanAsync(
-                .agentSessionPersist,
-                attributes: AgentSessionPersistenceSentryTelemetry.attributes(session: session, outcome: .started)
-            ) { parentSpan in
-                let sessionToSave = try await SentryTelemetryBootstrap.childSpanAsync(
-                    parent: parentSpan,
-                    operation: .agentSessionPrepare,
-                    attributes: AgentSessionPersistenceSentryTelemetry.attributes(session: session, outcome: .started)
-                ) {
-                    sessionPreparedForStorage(
-                        session,
-                        fileURL: fileURL,
-                        savedAt: Date(),
-                        preparation: preparation,
-                        trustedCanonicalItemCount: trustedCanonicalItemCount
-                    )
-                }
-                let freshEncoder = JSONEncoder()
-                let data = try freshEncoder.encode(sessionToSave)
-                try await diskWriter.enqueueAndWait(data: data, url: fileURL)
-                await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
-                AgentSessionPersistenceSentryTelemetry.recordCompleted(session: sessionToSave)
-                return fileURL
-            }
-        } catch {
-            AgentSessionPersistenceSentryTelemetry.recordFailed(session: session)
-            throw error
-        }
+        let sessionToSave = sessionPreparedForStorage(
+            session,
+            fileURL: fileURL,
+            savedAt: Date(),
+            preparation: preparation,
+            trustedCanonicalItemCount: trustedCanonicalItemCount
+        )
+        let freshEncoder = JSONEncoder()
+        let data = try freshEncoder.encode(sessionToSave)
+        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
+        return fileURL
     }
 
     func renameAgentSession(

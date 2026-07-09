@@ -306,6 +306,7 @@ class GlobalSettingsStore: ObservableObject {
     private static let defaultSelectedFilesSortMethodRaw = "nameAscending"
     private static let defaultFileEditFormatRaw = "Diff"
     private static let defaultComplexEditStrategyRaw = "Sequential split"
+    private static let telemetryEnabledDefaultsKey = "telemetry.enabled"
     private static let settingsWriteDiagnosticsLimit = 80
 
     private var settingsWriteDiagnostics: [GlobalSettingsWriteDiagnostic] = []
@@ -1050,6 +1051,47 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func telemetryEnabled() -> Bool {
+        if let mirrored = defaults.object(forKey: Self.telemetryEnabledDefaultsKey) as? Bool {
+            return mirrored
+        }
+        return scalarPreferences.telemetry?.enabled ?? Self.defaultTelemetryEnabled
+    }
+
+    func setTelemetryEnabled(_ enabled: Bool, commit: Bool = true) {
+        defaults.set(enabled, forKey: Self.telemetryEnabledDefaultsKey)
+        updateTelemetryScalar(commit: commit) { settings in
+            settings.enabled = enabled
+        }
+        if enabled {
+            SentryTelemetryBootstrap.start()
+        } else {
+            SentryTelemetryBootstrap.disableAndClose()
+        }
+    }
+
+    func telemetryAppHangReportsEnabled() -> Bool {
+        scalarPreferences.telemetry?.appHangReportsEnabled ?? false
+    }
+
+    func setTelemetryAppHangReportsEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateTelemetryScalar(commit: commit) { settings in
+            settings.appHangReportsEnabled = enabled
+        }
+        SentryTelemetryBootstrap.restartIfStarted()
+    }
+
+    func telemetryPerformanceTracingEnabled() -> Bool {
+        scalarPreferences.telemetry?.performanceTracingEnabled ?? false
+    }
+
+    func setTelemetryPerformanceTracingEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateTelemetryScalar(commit: commit) { settings in
+            settings.performanceTracingEnabled = enabled
+        }
+        SentryTelemetryBootstrap.restartIfStarted()
+    }
+
     func modelResponsesOverrides() -> [String: Bool] {
         scalarPreferences.modelOverrides?.responsesOverrides ?? [:]
     }
@@ -1130,6 +1172,17 @@ class GlobalSettingsStore: ObservableObject {
             var settings = preferences.agentMode ?? GlobalScalarPreferences.AgentModeSettings()
             mutation(&settings)
             preferences.agentMode = settings
+        }
+    }
+
+    private func updateTelemetryScalar(
+        commit: Bool,
+        _ mutation: (inout GlobalScalarPreferences.TelemetrySettings) -> Void
+    ) {
+        updateScalarPreferences(commit: commit) { preferences in
+            var settings = preferences.telemetry ?? GlobalScalarPreferences.TelemetrySettings()
+            mutation(&settings)
+            preferences.telemetry = settings
         }
     }
 
@@ -1673,11 +1726,22 @@ class GlobalSettingsStore: ObservableObject {
     // MARK: - Persistence
 
     private func load() {
-        let document = fileStore.loadOrCreateDefault()
+        let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
+        let loadedExistingDocument = fileExists ? try? fileStore.load() : nil
+        let existingFileWasCorrupt = fileExists && loadedExistingDocument == nil
+        if !fileExists {
+            defaults.removeObject(forKey: Self.telemetryEnabledDefaultsKey)
+        } else if existingFileWasCorrupt {
+            defaults.set(false, forKey: Self.telemetryEnabledDefaultsKey)
+        }
+        let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
         copySettings = document.copySettings
         chatSettings = document.chatSettings
         globalDefaults = document.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+        if !existingFileWasCorrupt {
+            syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
+        }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         persistenceBlockReason = fileStore.blockReason
     }
@@ -1726,6 +1790,7 @@ class GlobalSettingsStore: ObservableObject {
             chatSettings = document.chatSettings
             globalDefaults = document.globalDefaults
             scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+            syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             persistenceBlockReason = fileStore.blockReason
             return true
@@ -1763,6 +1828,22 @@ class GlobalSettingsStore: ObservableObject {
         let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmed, !trimmed.isEmpty else { return nil }
         return "\(trimmed).snap_to_planning"
+    }
+
+    private func syncTelemetryMirrorFromLoadedSettings(_ preferences: GlobalScalarPreferences) {
+        if let enabled = preferences.telemetry?.enabled {
+            defaults.set(enabled, forKey: Self.telemetryEnabledDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: Self.telemetryEnabledDefaultsKey)
+        }
+    }
+
+    private static var defaultTelemetryEnabled: Bool {
+        #if REPOPROMPT_SENTRY_ENABLED
+            true
+        #else
+            false
+        #endif
     }
 
     private func makeDocument() -> GlobalSettingsDocument {

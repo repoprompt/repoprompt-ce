@@ -76,18 +76,14 @@ struct RepoPromptSwiftUIApp: App {
             flushStdout: true
         )
         Task.detached {
-            await SentryTelemetryBootstrap.traceAsync(.appLaunch) {
-                SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
-                ProcessDebugLogging.log(
-                    prefix: "MCPStartup",
-                    "RepoPromptApp.init start task running",
-                    flushStdout: true
-                )
-                await SentryTelemetryBootstrap.traceAsync(.mcpServerStart) {
-                    await ServerController.shared.startServer()
-                    SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
-                }
-            }
+            SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
+            ProcessDebugLogging.log(
+                prefix: "MCPStartup",
+                "RepoPromptApp.init start task running",
+                flushStdout: true
+            )
+            await ServerController.shared.startServer()
+            SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {

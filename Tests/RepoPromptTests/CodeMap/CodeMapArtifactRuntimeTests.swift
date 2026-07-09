@@ -736,11 +736,11 @@ private final class RuntimeProviderOverlapGate: @unchecked Sendable {
         let factoryEntryCount: Int
     }
 
-    private let condition = NSCondition()
     private let expectedCallerCount: Int
+    private let factoryFence = TestBlockingFence(name: "runtime provider factory fence")
+    private let condition = NSCondition()
     private var callerCount = 0
     private var factoryEntryCount = 0
-    private var factoryReleased = false
 
     init(expectedCallerCount: Int) {
         self.expectedCallerCount = expectedCallerCount
@@ -759,17 +759,15 @@ private final class RuntimeProviderOverlapGate: @unchecked Sendable {
         condition.unlock()
     }
 
-    func factoryEnteredAndWaitForRelease() {
+    func factoryEnteredAndWaitForRelease(timeout: TimeInterval = TestFenceDefaults.releaseWait) {
         condition.lock()
         factoryEntryCount += 1
         condition.broadcast()
-        while !factoryReleased {
-            condition.wait()
-        }
         condition.unlock()
+        factoryFence.enterAndWait(timeout: timeout)
     }
 
-    func waitForDeterministicOverlap(timeout: TimeInterval = 10) -> Bool {
+    func waitForDeterministicOverlap(timeout: TimeInterval = TestFenceDefaults.enterWait) -> Bool {
         condition.lock()
         defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(timeout)
@@ -780,10 +778,7 @@ private final class RuntimeProviderOverlapGate: @unchecked Sendable {
     }
 
     func releaseFactory() {
-        condition.lock()
-        factoryReleased = true
-        condition.broadcast()
-        condition.unlock()
+        factoryFence.release()
     }
 }
 

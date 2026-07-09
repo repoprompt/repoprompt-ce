@@ -186,156 +186,151 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: ["scope"]
             )
         ) { [self] _, args in
-            try await WorkspaceToolSentryTelemetry.span(
-                operation: .codeMapStructure,
-                toolName: .getCodeStructure
-            ) {
-                try await withActiveWorktreeStartupBenchmarkTag {
-                    try await MCPToolWorkCountDiagnostics.withGitInvocation(
-                        operation: MCPWindowToolName.getCodeStructure
-                    ) {
-                        try Task.checkCancellation()
-                        let allowedRootKeys: Set = ["scope", "paths", "expand", "limits"]
-                        guard Set(args.keys).isSubset(of: allowedRootKeys) else {
-                            throw MCPError.invalidParams("unknown get_code_structure parameter")
-                        }
-                        guard let scope = args["scope"]?.stringValue?.lowercased(),
-                              scope == "paths" || scope == "selected"
-                        else {
-                            throw MCPError.invalidParams("scope must be 'paths' or 'selected'")
-                        }
-
-                        let direction: WorkspaceCodemapStructureTraversalDirection?
-                        let maximumDepth: Int
-                        if let expandValue = args["expand"] {
-                            guard let expand = expandValue.objectValue else {
-                                throw MCPError.invalidParams("expand must be an object")
-                            }
-                            guard Set(expand.keys).isSubset(of: ["direction", "max_depth"]) else {
-                                throw MCPError.invalidParams("unknown expand parameter")
-                            }
-                            guard let rawDirection = expand["direction"]?.stringValue else {
-                                throw MCPError.invalidParams("expand.direction is required")
-                            }
-                            direction = switch rawDirection {
-                            case "referenced_definitions": .referencedDefinitions
-                            case "referrers": .referrers
-                            case "both": .both
-                            default: throw MCPError.invalidParams("invalid expand.direction")
-                            }
-                            maximumDepth = expand["max_depth"]?.intValue ?? 1
-                            guard (1 ... 4).contains(maximumDepth) else {
-                                throw MCPError.invalidParams("expand.max_depth must be between 1 and 4")
-                            }
-                        } else {
-                            direction = nil
-                            maximumDepth = 0
-                        }
-
-                        let limits: [String: Value]
-                        if let limitsValue = args["limits"] {
-                            guard let object = limitsValue.objectValue else {
-                                throw MCPError.invalidParams("limits must be an object")
-                            }
-                            guard Set(object.keys).isSubset(
-                                of: ["max_files", "max_edges", "max_codemap_tokens"]
-                            ) else {
-                                throw MCPError.invalidParams("unknown limits parameter")
-                            }
-                            limits = object
-                        } else {
-                            limits = [:]
-                        }
-                        let maximumFiles = limits["max_files"]?.intValue ?? 10
-                        let maximumEdges = limits["max_edges"]?.intValue ?? 500
-                        let maximumCodemapTokens = limits["max_codemap_tokens"]?.intValue ?? 6000
-                        guard (1 ... 200).contains(maximumFiles) else {
-                            throw MCPError.invalidParams("limits.max_files must be between 1 and 200")
-                        }
-                        guard (1 ... 10000).contains(maximumEdges) else {
-                            throw MCPError.invalidParams("limits.max_edges must be between 1 and 10000")
-                        }
-                        guard (256 ... 20000).contains(maximumCodemapTokens) else {
-                            throw MCPError.invalidParams("limits.max_codemap_tokens must be between 256 and 20000")
-                        }
-                        let request = MCPServerViewModel.CodeStructureRequest(
-                            direction: direction,
-                            maximumDepth: maximumDepth,
-                            maximumFiles: maximumFiles,
-                            maximumEdges: maximumEdges,
-                            maximumCodemapTokens: maximumCodemapTokens
-                        )
-
-                        let metadata = await dependencies.captureRequestMetadata()
-                        try Task.checkCancellation()
-                        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-                        try Task.checkCancellation()
-                        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(
-                            rootScope: lookupContext.rootScope
-                        )
-                        try Task.checkCancellation()
-
-                        let files: [WorkspaceFileRecord]
-                        switch scope {
-                        case "selected":
-                            guard args["paths"] == nil else {
-                                throw MCPError.invalidParams("paths is forbidden when scope='selected'")
-                            }
-                            guard await dependencies.drainReadFileAutoSelection(
-                                metadata,
-                                .canonicalSelection
-                            ) == .completed else {
-                                throw CancellationError()
-                            }
-                            files = try await dependencies.resolveSelectedFilesForCodeStructure(
-                                metadata,
-                                lookupContext,
-                                MCPServerViewModel.codeStructureSeedLimit(for: request)
-                            )
-                        case "paths":
-                            guard let rawPaths = args["paths"]?.arrayValue else {
-                                throw MCPError.invalidParams("paths is required when scope='paths'")
-                            }
-                            guard !rawPaths.isEmpty, rawPaths.count <= 256,
-                                  rawPaths.allSatisfy({ $0.stringValue != nil })
-                            else {
-                                throw MCPError.invalidParams("paths must contain one to 256 strings")
-                            }
-                            let translated = lookupContext.translateInputPaths(
-                                rawPaths.compactMap(\.stringValue)
-                            )
-                            for path in translated {
-                                try Task.checkCancellation()
-                                if let issue = await dependencies.promptVM.workspaceFileContextStore
-                                    .exactPathResolutionIssue(
-                                        for: path,
-                                        kind: .either,
-                                        rootScope: lookupContext.rootScope
-                                    )
-                                {
-                                    throw MCPError.invalidParams(
-                                        PathResolutionIssueRenderer.message(for: issue)
-                                    )
-                                }
-                            }
-                            files = try await dependencies.resolveFilesForCodeStructure(
-                                translated,
-                                lookupContext.rootScope,
-                                MCPServerViewModel.codeStructureSeedLimit(for: request)
-                            )
-                        default:
-                            throw MCPError.invalidParams("invalid scope")
-                        }
-                        try Task.checkCancellation()
-                        let reply = try await dependencies.buildCodeStructureDTO(
-                            files,
-                            request,
-                            true,
-                            lookupContext
-                        )
-                        try Task.checkCancellation()
-                        return try Value(reply)
+            try await withActiveWorktreeStartupBenchmarkTag {
+                try await MCPToolWorkCountDiagnostics.withGitInvocation(
+                    operation: MCPWindowToolName.getCodeStructure
+                ) {
+                    try Task.checkCancellation()
+                    let allowedRootKeys: Set = ["scope", "paths", "expand", "limits"]
+                    guard Set(args.keys).isSubset(of: allowedRootKeys) else {
+                        throw MCPError.invalidParams("unknown get_code_structure parameter")
                     }
+                    guard let scope = args["scope"]?.stringValue?.lowercased(),
+                          scope == "paths" || scope == "selected"
+                    else {
+                        throw MCPError.invalidParams("scope must be 'paths' or 'selected'")
+                    }
+
+                    let direction: WorkspaceCodemapStructureTraversalDirection?
+                    let maximumDepth: Int
+                    if let expandValue = args["expand"] {
+                        guard let expand = expandValue.objectValue else {
+                            throw MCPError.invalidParams("expand must be an object")
+                        }
+                        guard Set(expand.keys).isSubset(of: ["direction", "max_depth"]) else {
+                            throw MCPError.invalidParams("unknown expand parameter")
+                        }
+                        guard let rawDirection = expand["direction"]?.stringValue else {
+                            throw MCPError.invalidParams("expand.direction is required")
+                        }
+                        direction = switch rawDirection {
+                        case "referenced_definitions": .referencedDefinitions
+                        case "referrers": .referrers
+                        case "both": .both
+                        default: throw MCPError.invalidParams("invalid expand.direction")
+                        }
+                        maximumDepth = expand["max_depth"]?.intValue ?? 1
+                        guard (1 ... 4).contains(maximumDepth) else {
+                            throw MCPError.invalidParams("expand.max_depth must be between 1 and 4")
+                        }
+                    } else {
+                        direction = nil
+                        maximumDepth = 0
+                    }
+
+                    let limits: [String: Value]
+                    if let limitsValue = args["limits"] {
+                        guard let object = limitsValue.objectValue else {
+                            throw MCPError.invalidParams("limits must be an object")
+                        }
+                        guard Set(object.keys).isSubset(
+                            of: ["max_files", "max_edges", "max_codemap_tokens"]
+                        ) else {
+                            throw MCPError.invalidParams("unknown limits parameter")
+                        }
+                        limits = object
+                    } else {
+                        limits = [:]
+                    }
+                    let maximumFiles = limits["max_files"]?.intValue ?? 10
+                    let maximumEdges = limits["max_edges"]?.intValue ?? 500
+                    let maximumCodemapTokens = limits["max_codemap_tokens"]?.intValue ?? 6000
+                    guard (1 ... 200).contains(maximumFiles) else {
+                        throw MCPError.invalidParams("limits.max_files must be between 1 and 200")
+                    }
+                    guard (1 ... 10000).contains(maximumEdges) else {
+                        throw MCPError.invalidParams("limits.max_edges must be between 1 and 10000")
+                    }
+                    guard (256 ... 20000).contains(maximumCodemapTokens) else {
+                        throw MCPError.invalidParams("limits.max_codemap_tokens must be between 256 and 20000")
+                    }
+                    let request = MCPServerViewModel.CodeStructureRequest(
+                        direction: direction,
+                        maximumDepth: maximumDepth,
+                        maximumFiles: maximumFiles,
+                        maximumEdges: maximumEdges,
+                        maximumCodemapTokens: maximumCodemapTokens
+                    )
+
+                    let metadata = await dependencies.captureRequestMetadata()
+                    try Task.checkCancellation()
+                    let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                    try Task.checkCancellation()
+                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(
+                        rootScope: lookupContext.rootScope
+                    )
+                    try Task.checkCancellation()
+
+                    let files: [WorkspaceFileRecord]
+                    switch scope {
+                    case "selected":
+                        guard args["paths"] == nil else {
+                            throw MCPError.invalidParams("paths is forbidden when scope='selected'")
+                        }
+                        guard await dependencies.drainReadFileAutoSelection(
+                            metadata,
+                            .canonicalSelection
+                        ) == .completed else {
+                            throw CancellationError()
+                        }
+                        files = try await dependencies.resolveSelectedFilesForCodeStructure(
+                            metadata,
+                            lookupContext,
+                            MCPServerViewModel.codeStructureSeedLimit(for: request)
+                        )
+                    case "paths":
+                        guard let rawPaths = args["paths"]?.arrayValue else {
+                            throw MCPError.invalidParams("paths is required when scope='paths'")
+                        }
+                        guard !rawPaths.isEmpty, rawPaths.count <= 256,
+                              rawPaths.allSatisfy({ $0.stringValue != nil })
+                        else {
+                            throw MCPError.invalidParams("paths must contain one to 256 strings")
+                        }
+                        let translated = lookupContext.translateInputPaths(
+                            rawPaths.compactMap(\.stringValue)
+                        )
+                        for path in translated {
+                            try Task.checkCancellation()
+                            if let issue = await dependencies.promptVM.workspaceFileContextStore
+                                .exactPathResolutionIssue(
+                                    for: path,
+                                    kind: .either,
+                                    rootScope: lookupContext.rootScope
+                                )
+                            {
+                                throw MCPError.invalidParams(
+                                    PathResolutionIssueRenderer.message(for: issue)
+                                )
+                            }
+                        }
+                        files = try await dependencies.resolveFilesForCodeStructure(
+                            translated,
+                            lookupContext.rootScope,
+                            MCPServerViewModel.codeStructureSeedLimit(for: request)
+                        )
+                    default:
+                        throw MCPError.invalidParams("invalid scope")
+                    }
+                    try Task.checkCancellation()
+                    let reply = try await dependencies.buildCodeStructureDTO(
+                        files,
+                        request,
+                        true,
+                        lookupContext
+                    )
+                    try Task.checkCancellation()
+                    return try Value(reply)
                 }
             }
         }
@@ -479,12 +474,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     }
 
     private func executeReadFile(args: [String: Value]) async throws -> Value {
-        try await WorkspaceToolSentryTelemetry.span(
-            operation: .fileRead,
-            toolName: .readFile
-        ) {
-            try await executeReadFileBody(args: args)
-        }
+        try await executeReadFileBody(args: args)
     }
 
     private func executeReadFileBody(args: [String: Value]) async throws -> Value {
@@ -664,18 +654,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
         let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
-        let reply = try await WorkspaceToolSentryTelemetry.span(
-            operation: .workspaceSearch,
-            toolName: .fileSearch,
-            completionAttributes: { reply in
-                [
-                    .resultCount(reply.totalMatches),
-                    .limitHit(reply.limitHit)
-                ]
-            }
-        ) {
-            try await executeFileSearch(args: args)
-        }
+        let reply = try await executeFileSearch(args: args)
+
         try Task.checkCancellation()
         let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
             try Value(reply)

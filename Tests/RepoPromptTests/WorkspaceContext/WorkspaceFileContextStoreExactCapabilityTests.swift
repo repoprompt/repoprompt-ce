@@ -259,7 +259,8 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
                     folderPolicy: .expandFolders
                 )
             }
-            await gate.waitUntilEntered()
+            let gateEntered = await gate.waitUntilEntered()
+            XCTAssertTrue(gateEntered)
             await store.releaseSessionWorktreeOwnership(ownerID: fixture.sessionID)
             let replacement = try await store.loadRoot(
                 path: worktreeRoot.path,
@@ -306,35 +307,5 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
 }
 
 #if DEBUG
-    private actor ContextBuilderCandidateGate {
-        private var entered = false
-        private var released = false
-        private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-
-        func enterAndWait() async {
-            entered = true
-            let waiters = enteredWaiters
-            enteredWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
-            }
-        }
-
-        func waitUntilEntered() async {
-            guard !entered else { return }
-            await withCheckedContinuation { continuation in
-                enteredWaiters.append(continuation)
-            }
-        }
-
-        func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-        }
-    }
+    private typealias ContextBuilderCandidateGate = TestReleaseFence
 #endif
