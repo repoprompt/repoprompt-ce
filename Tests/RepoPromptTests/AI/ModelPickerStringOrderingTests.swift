@@ -363,11 +363,100 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         )
     }
 
+    func testCodexDynamicMapperPreservesKnownAndFutureReasoningEfforts() {
+        let record = CodexDynamicModelRecord(
+            id: "gpt-5.6-sol",
+            model: "gpt-5.6-sol",
+            displayName: "GPT-5.6 Sol",
+            description: "Frontier model",
+            isDefault: true,
+            supportedReasoningEfforts: [
+                .init(reasoningEffort: "low", description: "Low effort"),
+                .init(reasoningEffort: "medium", description: "Medium effort"),
+                .init(reasoningEffort: "high", description: "High effort"),
+                .init(reasoningEffort: "xhigh", description: "Extra high effort"),
+                .init(reasoningEffort: "max", description: "Maximum effort"),
+                .init(reasoningEffort: "ultra", description: "Ultra effort"),
+                .init(reasoningEffort: "quantum", description: "Future effort")
+            ],
+            defaultReasoningEffort: "low"
+        )
+
+        let options = CodexDynamicModelMapper.options(from: [record])
+
+        XCTAssertEqual(
+            options.map(\.id),
+            [
+                "gpt-5.6-sol-low",
+                "gpt-5.6-sol-medium",
+                "gpt-5.6-sol-high",
+                "gpt-5.6-sol-xhigh",
+                "gpt-5.6-sol-max",
+                "gpt-5.6-sol-ultra",
+                "gpt-5.6-sol-quantum"
+            ]
+        )
+        XCTAssertEqual(options.last?.displayName, "GPT-5.6 Sol Quantum")
+    }
+
+    func testCodexDynamicStoreCanonicalizationRetainsUnknownEfforts() {
+        let model = CodexAppServerClient.RemoteModel(
+            id: "gpt-5.6-luna",
+            model: "gpt-5.6-luna",
+            displayName: "GPT-5.6 Luna",
+            description: "Fast model",
+            isDefault: false,
+            supportedReasoningEfforts: [
+                .init(reasoningEffort: "low", description: "Low"),
+                .init(reasoningEffort: "max", description: "Max"),
+                .init(reasoningEffort: "quantum", description: "Future")
+            ],
+            defaultReasoningEffort: "max"
+        )
+
+        let records = CodexDynamicModelStore.canonicalRecords(from: [model])
+
+        XCTAssertEqual(records.first?.supportedReasoningEfforts.map(\.reasoningEffort), ["low", "max", "quantum"])
+        XCTAssertEqual(records.first?.defaultReasoningEffort, "max")
+    }
+
+    func testCodexModelSpecifierRecognizesNewEffortsWithoutBreakingCodexMaxBaseModel() {
+        let lunaMax = CodexModelSpecifier(raw: "gpt-5.6-luna-max")
+        XCTAssertEqual(lunaMax.baseModel, "gpt-5.6-luna")
+        XCTAssertEqual(lunaMax.reasoningEffort, .max)
+        XCTAssertEqual(lunaMax.appServerEffortParam, "max")
+
+        let solUltra = CodexModelSpecifier(raw: "gpt-5.6-sol-ultra")
+        XCTAssertEqual(solUltra.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(solUltra.reasoningEffort, .ultra)
+
+        let existingCodexMax = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
+        XCTAssertEqual(existingCodexMax.baseModel, "gpt-5.1-codex-max")
+        XCTAssertNil(existingCodexMax.reasoningEffort)
+    }
+
+    @MainActor
+    func testCollapsedDynamicOptionUsesMetadataForUnknownEffortSuffix() throws {
+        let collapsed = CodexAgentModeCoordinator.test_collapseCodexModelOptions([
+            option(
+                raw: "gpt-5.6-luna-quantum",
+                displayName: "GPT-5.6 Luna Quantum",
+                codexBaseModelID: "gpt-5.6-luna",
+                supportedReasoningEfforts: [.custom("quantum")]
+            )
+        ])
+
+        let luna = try XCTUnwrap(collapsed.first)
+        XCTAssertEqual(luna.rawValue, "gpt-5.6-luna")
+        XCTAssertEqual(luna.supportedReasoningEfforts, [.custom("quantum")])
+    }
+
     private func option(
         raw: String,
         displayName: String,
         placeholderDefault: Bool = false,
         providerDefault: Bool = false,
+        codexBaseModelID: String? = nil,
         supportedReasoningEfforts: [CodexReasoningEffort] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil
     ) -> AgentModelOption {
@@ -377,6 +466,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             description: nil,
             isPlaceholderDefault: placeholderDefault,
             isProviderDefault: providerDefault,
+            codexBaseModelID: codexBaseModelID,
             supportedReasoningEfforts: supportedReasoningEfforts,
             defaultReasoningEffort: defaultReasoningEffort
         )
