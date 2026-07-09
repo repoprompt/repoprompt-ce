@@ -39,7 +39,7 @@ class ReleaseToolingTests(unittest.TestCase):
         info_plist = plistlib.loads((root / "AppBundle" / "Info.plist.template").read_bytes())
 
         self.assertIn('environment["REPOPROMPT_ENABLE_SENTRY"] == "1"', package_manifest)
-        self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertIn('repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
         self.assertNotIn("let sentryEnabled = true", package_manifest)
 
         self.assertIn(
@@ -1556,8 +1556,8 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         ).read_text(encoding="utf-8")
 
         self.assertIn('.package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1")', package_manifest)
-        self.assertIn('repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
-        self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertIn('repoPromptAppDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
+        self.assertIn('repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', release_workflow)
         self.assertIn('name: Sentry-enabled Build', ci_workflow)
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', ci_workflow)
