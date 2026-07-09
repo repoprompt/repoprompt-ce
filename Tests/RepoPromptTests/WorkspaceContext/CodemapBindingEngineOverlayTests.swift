@@ -55,7 +55,8 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         addTeardownBlock { publicationGate.release() }
         _ = await fixture.engine.registerRoot(fixture.registration)
         _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
-        XCTAssertTrue(publicationGate.waitUntilEntered())
+        let publicationEntered = await publicationGate.waitUntilEntered()
+        XCTAssertTrue(publicationEntered)
 
         guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Live.swift")) else {
             publicationGate.release()

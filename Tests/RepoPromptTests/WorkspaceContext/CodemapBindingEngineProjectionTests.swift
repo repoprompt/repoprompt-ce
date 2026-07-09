@@ -124,7 +124,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
             return XCTFail("Expected eligible registration.")
         }
         _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
-        XCTAssertTrue(pageGate.waitUntilEntered())
+        let pageEntered = await pageGate.waitUntilEntered()
+        XCTAssertTrue(pageEntered)
 
         let acquisition = await fixture.engine.acquireProjectionDemand(
             rootEpoch: fixture.rootEpoch,
@@ -268,7 +269,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         guard case let .acquired(replacementTicket, _) = replacement else {
             return XCTFail("Expected capacity to be reusable after expiry.")
         }
-        XCTAssertTrue(pageGate.waitUntilEntered())
+        let pageEntered = await pageGate.waitUntilEntered()
+        XCTAssertTrue(pageEntered)
         clock.set(401)
         pageGate.release()
         let completedAfterDeadline = await waitForEngineCondition {
@@ -392,7 +394,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         }
 
         _ = await engine.scheduleProjectionPreload(rootEpoch: rootEpochs[0])
-        XCTAssertTrue(blocker.waitUntilEntered())
+        let blockerEntered = await blocker.waitUntilEntered()
+        XCTAssertTrue(blockerEntered)
         let later = await engine.acquireProjectionDemand(
             rootEpoch: rootEpochs[1],
             fileIDs: [UUID()],
@@ -485,7 +488,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         let foreground = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/Foreground.swift"))
         }
-        XCTAssertTrue(foregroundGate.waitUntilEntered())
+        let foregroundEntered = await foregroundGate.waitUntilEntered()
+        XCTAssertTrue(foregroundEntered)
         defer {
             foreground.cancel()
             foregroundGate.release()
@@ -1434,7 +1438,8 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
-        XCTAssertTrue(gate.waitUntilEntered())
+        let gateEntered = await gate.waitUntilEntered()
+        XCTAssertTrue(gateEntered)
 
         let unload = Task { await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch) }
         gate.release()

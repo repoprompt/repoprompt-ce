@@ -640,6 +640,14 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
         composeTab.selection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
         window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+        try await AsyncTestWait.waitUntil("selected code structure candidates are cataloged", timeout: 5) {
+            let resolution = await store.resolveSelectedCodeStructureFiles(
+                atPaths: files.map(\.standardizedFullPath),
+                rootScope: .visibleWorkspace,
+                maximumUniqueFileCount: 1
+            )
+            return resolution.didExceedLimit && resolution.visitedUniqueFileCount == 2
+        }
 
         let connectionID = UUID()
         try window.mcpServer.bindTabForConnection(

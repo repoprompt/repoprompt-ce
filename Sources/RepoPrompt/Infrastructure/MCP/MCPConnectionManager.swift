@@ -3350,6 +3350,36 @@ actor ServerNetworkManager {
         return token
     }
 
+    /// Unregister one tool event observer for a specific run.
+    ///
+    /// Owner-scoped teardown should use this token-specific path so another
+    /// observer registered for the same run remains active. If the observer was
+    /// already captured by a run-wide unregister, wait for that cleanup barrier
+    /// instead of returning before its in-flight delivery drains.
+    func unregisterToolEventObserver(for runID: UUID, token: UUID) async {
+        let removedObserver: ToolEventObserver?
+        if var observers = toolEventObservers[runID] {
+            removedObserver = observers.removeValue(forKey: token)
+            if observers.isEmpty {
+                toolEventObservers.removeValue(forKey: runID)
+            } else {
+                toolEventObservers[runID] = observers
+            }
+        } else {
+            removedObserver = nil
+        }
+
+        if let removedObserver {
+            await removedObserver.deliveryBarrier.waitUntilIdle()
+            connectionLog("Unregistered tool event observer for runID: \(runID) token: \(token)")
+            return
+        }
+
+        if let unregistration = toolObserverUnregistrationsByRunID[runID] {
+            await unregistration.task.value
+        }
+    }
+
     /// Unregister all tool event observers for a specific run
     func unregisterToolEventObservers(for runID: UUID) async {
         await unregisterToolObservers(for: runID)

@@ -84,11 +84,13 @@ final class GitRawOutputSpoolTests: XCTestCase {
         )
         try cancellationSpool.append(Data("payload".utf8))
         let cancellationLease = try cancellationSpool.finish()
+        let cancellationGate = GitRawOutputCancellationGate()
         let task = Task {
             let reader = try cancellationLease.makeReader()
-            try await Task.sleep(for: .seconds(60))
+            try await cancellationGate.waitUntilCancelled()
             return try reader.nextChunk()
         }
+        await cancellationGate.waitUntilEntered()
         task.cancel()
         do {
             _ = try await task.value
@@ -138,3 +140,5 @@ final class GitRawOutputSpoolTests: XCTestCase {
         )
     }
 }
+
+private typealias GitRawOutputCancellationGate = TestCancellationGate

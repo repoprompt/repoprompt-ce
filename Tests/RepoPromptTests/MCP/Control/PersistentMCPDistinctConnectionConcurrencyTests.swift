@@ -6,6 +6,38 @@ import XCTest
 
 @MainActor
 final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
+    func testSharedServerLeaseCancellationRemovesQueuedWaiter() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let queuedWaiter = Task {
+                    try await MCPSharedServerTestLease.shared.withLease { _ in
+                        XCTFail("Cancelled lease waiter should not acquire the shared server lease.")
+                    }
+                }
+
+                let queued = await waitForSharedServerLeaseWaiterCount(1, timeout: .seconds(2))
+                XCTAssertTrue(queued)
+                queuedWaiter.cancel()
+
+                do {
+                    try await queuedWaiter.value
+                    XCTFail("Expected cancelled lease waiter to throw CancellationError.")
+                } catch is CancellationError {
+                    // Expected cancellation path.
+                }
+
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                XCTAssertEqual(waiterCount, 0)
+            }
+
+            try await withSharedServerLeaseTimeout(timeout: .seconds(2)) {
+                try await MCPSharedServerTestLease.shared.withLease { _ in }
+            }
+        #else
+            throw XCTSkip("Shared MCP server lease cancellation regression requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
     func testDistinctConnectionsOverlapWithoutCrossRoutingReadOrSearchResults() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -104,6 +136,52 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         enum ReadSelectionShape {
             case partial
             case full
+        }
+
+        func waitForSharedServerLeaseWaiterCount(
+            _ expectedCount: Int,
+            timeout: Duration
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now + timeout
+            while clock.now < deadline {
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                if waiterCount == expectedCount { return true }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return false
+        }
+
+        func withSharedServerLeaseTimeout<T>(
+            timeout: Duration,
+            operation: @escaping @Sendable () async throws -> T
+        ) async throws -> T {
+            let timeoutInterval = {
+                let components = timeout.components
+                return TimeInterval(components.seconds)
+                    + (TimeInterval(components.attoseconds) / 1e18)
+            }()
+            return try await withThrowingTaskGroup(of: T.self) { group in
+                group.addTask {
+                    try await operation()
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw AsyncTestConditionTimeout(
+                        description: "shared MCP server lease re-acquisition",
+                        timeout: timeoutInterval
+                    )
+                }
+                guard let result = try await group.next() else {
+                    group.cancelAll()
+                    throw AsyncTestConditionTimeout(
+                        description: "shared MCP server lease re-acquisition (empty task group)",
+                        timeout: timeoutInterval
+                    )
+                }
+                group.cancelAll()
+                return result
+            }
         }
 
         func runReadSelectionPersistenceCheckpoint(
@@ -2002,7 +2080,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 guard activeFD >= 0 else { return }
                 var descriptor = pollfd(fd: activeFD, events: Int16(POLLIN), revents: 0)
                 let pollResult = Darwin.poll(&descriptor, 1, 100)
-                if pollResult == 0 { continue }
+                if pollResult == 0 {
+                    if withStateLock({ isClosed }) { return }
+                    continue
+                }
                 if pollResult < 0 {
                     if errno == EINTR { continue }
                     if withStateLock({ isClosed }) { return }
@@ -2015,6 +2096,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     close(with: ClientError.closed)
                     return
                 }
+                if withStateLock({ isClosed }) { return }
                 var bytes = [UInt8](repeating: 0, count: 4096)
                 let readCount = bytes.withUnsafeMutableBytes { storage in
                     Darwin.read(activeFD, storage.baseAddress, storage.count)

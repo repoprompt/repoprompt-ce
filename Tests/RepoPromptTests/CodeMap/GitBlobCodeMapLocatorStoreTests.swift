@@ -467,7 +467,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         )
         let reader = try GitBlobCodeMapLocatorStore(rootURL: root)
         let task = Task { try await writer.write(association: association) }
-        await gate.waitUntilEntered()
+        let gateEntered = await gate.waitUntilEntered()
+        XCTAssertTrue(gateEntered)
         let readDuringPublish = try await reader.read(identity: identity)
         await gate.release()
         let publishResult = try await task.value
@@ -733,7 +734,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             )
         )
         let truncateTask = Task { try await truncateReader.read(identity: identity) }
-        await truncateGate.waitUntilEntered()
+        let truncateEntered = await truncateGate.waitUntilEntered()
+        XCTAssertTrue(truncateEntered)
         let handle = try FileHandle(forWritingTo: recordURL)
         try handle.truncate(atOffset: 0)
         try handle.close()
@@ -753,7 +755,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             )
         )
         let replaceTask = Task { try await replaceReader.read(identity: identity) }
-        await replaceGate.waitUntilEntered()
+        let replaceEntered = await replaceGate.waitUntilEntered()
+        XCTAssertTrue(replaceEntered)
         let replacement = recordURL.deletingLastPathComponent().appendingPathComponent("replacement")
         try original.write(to: replacement)
         XCTAssertEqual(chmod(replacement.path, 0o600), 0)
@@ -1063,28 +1066,4 @@ private actor GitBlobLocatorAsyncBarrier {
     }
 }
 
-private actor GitBlobLocatorAsyncGate {
-    private var entered = false
-    private var released = false
-    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-
-    func enterAndWait() async {
-        entered = true
-        entryWaiters.forEach { $0.resume() }
-        entryWaiters.removeAll()
-        guard !released else { return }
-        await withCheckedContinuation { releaseWaiters.append($0) }
-    }
-
-    func waitUntilEntered() async {
-        guard !entered else { return }
-        await withCheckedContinuation { entryWaiters.append($0) }
-    }
-
-    func release() {
-        released = true
-        releaseWaiters.forEach { $0.resume() }
-        releaseWaiters.removeAll()
-    }
-}
+private typealias GitBlobLocatorAsyncGate = TestReleaseFence

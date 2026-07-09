@@ -257,6 +257,7 @@ final class GitTargetEvidenceStreamingParserTests: XCTestCase {
 
     func testCancellationInterruptsDirectWriterEmission() async throws {
         let entered = GitTargetEvidenceAsyncSignal()
+        let cancellationGate = GitTargetEvidenceCancellationGate()
         let objectID = objectID
         let task = Task {
             var parser = try GitTargetIndexStreamingParser(
@@ -264,7 +265,7 @@ final class GitTargetEvidenceStreamingParserTests: XCTestCase {
                 rootPrefix: GitRepositoryRelativeRootPrefix("Root")
             ) { _ in
                 await entered.signal()
-                try await Task.sleep(for: .seconds(60))
+                try await cancellationGate.waitUntilCancelled()
             }
             try await parser.consume(Data("H 100644 \(objectID) 0\tRoot/file\0".utf8))
         }
@@ -350,6 +351,8 @@ private actor GitTargetEvidenceAsyncSignal {
         }
     }
 }
+
+private typealias GitTargetEvidenceCancellationGate = TestCancellationGate
 
 private extension Data {
     func chunkedForParserTest(widths: [Int]) -> [Data] {
