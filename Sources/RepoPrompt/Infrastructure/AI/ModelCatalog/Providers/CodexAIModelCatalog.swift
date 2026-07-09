@@ -285,6 +285,7 @@ enum CodexDynamicModelMapper {
         if lower == "codex" { return "Codex" }
         if lower == "openai" { return "OpenAI" }
         if lower == "xhigh" { return "XHigh" }
+        if lower == "ultra" { return "Ultra" }
         if lower == "low" { return "Low" }
         if lower == "medium" { return "Medium" }
         if lower == "high" { return "High" }

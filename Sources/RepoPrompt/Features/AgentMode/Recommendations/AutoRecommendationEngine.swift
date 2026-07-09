@@ -142,7 +142,7 @@ final class AutoRecommendationEngine {
             )
         }
 
-        // OpenAI API option - shows reasoning but higher cost. GPT-5.6 Sol XHigh is a ChatGPT Pro export/planning recommendation,
+        // OpenAI API option - shows reasoning but higher cost. GPT-5.6 Sol is ChatGPT Pro export/planning guidance,
         // not an OpenAI API model in RepoPrompt's guidance.
         if status.openAI == .ready {
             openAIOption = ChatBackendOption(

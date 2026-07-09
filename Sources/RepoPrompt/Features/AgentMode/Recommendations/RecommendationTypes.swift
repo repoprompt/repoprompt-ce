@@ -307,13 +307,13 @@ enum BestPracticeProfiles {
     static let bestPlanning = UseCase(
         id: "bestPlanning",
         title: "Best Planning",
-        modelLabel: "GPT-5.6 Sol XHigh",
+        modelLabel: "GPT-5.6 Sol",
         accessLabel: "ChatGPT Pro export",
-        modelString: "gpt-5.6-sol-xhigh",
+        modelString: "gpt-5.6-sol",
         agentKind: nil,
         agentModel: nil,
         strengths: [
-            "Extended reasoning time produces thorough analysis",
+            "Use ChatGPT Pro's current GPT-5.6 Sol export/planning mode without forcing a RepoPrompt effort suffix",
             "Can reason about entire codebases at once",
             "Produces clear, actionable architectural specifications",
             "Catches edge cases and implications other models miss"
@@ -332,7 +332,7 @@ enum BestPracticeProfiles {
             "Strong reasoning without extended wait times",
             "Won't exhaust weekly usage limits quickly",
             "Excellent diff generation",
-            "XHigh available when maximum reasoning is needed"
+            "Extended efforts are available when explicitly selected for exceptional tasks"
         ]
     )
 
@@ -369,7 +369,7 @@ enum BestPracticeProfiles {
     static let gpt5HighStrengths = """
     GPT-5.6 Sol Low/High via Codex CLI provides strong reasoning without extended wait times. \
     Low is recommended for explore and discovery; Medium is recommended for Engineer/default implementation; High is recommended for Oracle, review, and pair agents. \
-    XHigh offers maximum reasoning but can exhaust usage limits quickly.
+    Extended efforts are available for exceptional tasks but can exhaust usage limits quickly; keep them explicit.
     """
 
     static let geminiStrengths = """
@@ -383,7 +383,7 @@ enum BestPracticeProfiles {
     GPT-5.6 Sol is available to RepoPrompt through Codex CLI; do not configure it as an OpenAI API/OpenRouter model.
 
     Use GPT‑5.6 Sol Low via Codex CLI for Context Builder discovery and explore, \
-    GPT‑5.6 Sol Medium for Engineer/default implementation, and GPT‑5.6 Sol High for Oracle, review, and pair-agent work. Use GPT‑5.6 Sol XHigh for ChatGPT Pro export/planning.
+    GPT‑5.6 Sol Medium for Engineer/default implementation, and GPT‑5.6 Sol High for Oracle, review, and pair-agent work. Use effort-neutral GPT‑5.6 Sol for ChatGPT Pro export/planning.
     """
 
     static let contextBuilderRationale = "Codex with GPT-5.6 Sol Low provides the best Context Builder/discovery default – strong codebase exploration with practical usage burn."
