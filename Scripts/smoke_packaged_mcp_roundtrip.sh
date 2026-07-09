@@ -21,6 +21,10 @@ fail() {
     exit 1
 }
 
+log_phase() {
+    printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
 process_matches() {
     [[ -n "$APP_PID" ]] || return 1
     kill -0 "$APP_PID" 2>/dev/null || return 1

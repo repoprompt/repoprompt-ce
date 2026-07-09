@@ -967,7 +967,7 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('"$MCP_HELPER"', source)
         self.assertIn('[helper, "-e", "windows"]', source)
         self.assertIn('timeout=30', source)
-        self.assertIn('log_phase', source)
+        self.assertIn('log_phase() {', source)
         self.assertIn('windows-attempt-${attempt}.out', source)
         self.assertIn('windows-attempt-${attempt}.err', source)
         self.assertIn('CLI windows attempt ${attempt}', source)
