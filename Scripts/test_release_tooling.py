@@ -1121,6 +1121,11 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn("PATH=/usr/bin:/bin:/usr/sbin:/sbin", signed_smoke)
         self.assertIn('HOME="$HOME"', signed_smoke)
         self.assertIn('TMPDIR="$RUNNER_TEMP"', signed_smoke)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"', signed_smoke)
+        self.assertIn(
+            'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
+            signed_smoke,
+        )
 
         reviewed_smoke = promote_workflow.split("\n  smoke-reviewed-helper:", 1)[1].split("\n  promote:", 1)[0]
         self.assertNotIn("environment: release", reviewed_smoke)
@@ -1135,6 +1140,14 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn("env -i", reviewed_smoke)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', reviewed_smoke)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', reviewed_smoke)
+        self.assertIn(
+            'REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"',
+            reviewed_smoke,
+        )
+        self.assertIn(
+            'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
+            reviewed_smoke,
+        )
         promote_job = promote_workflow.split("\n  promote:", 1)[1]
         self.assertIn("- smoke-reviewed-helper", promote_job)
         self.assertIn("environment: release", promote_job)
