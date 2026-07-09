@@ -38,7 +38,7 @@ telemetry uses the signed bundle's `RepoPromptSentryDSN` instead.
 When active, RepoPrompt can send:
 
 - crash reports and unhandled exception diagnostics with stack traces,
-- app-hang reports when **App hang reports** is enabled,
+- app-hang reports when **App hang reports** is enabled; this sub-option defaults off for release safety,
 - app version/build, OS version, release distribution, and SDK metadata,
 - a conservative sample of app startup performance traces when **Performance timing and tracing** is enabled.
 

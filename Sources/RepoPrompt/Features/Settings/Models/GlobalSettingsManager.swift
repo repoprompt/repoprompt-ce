@@ -1068,7 +1068,7 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     func telemetryAppHangReportsEnabled() -> Bool {
-        scalarPreferences.telemetry?.appHangReportsEnabled ?? true
+        scalarPreferences.telemetry?.appHangReportsEnabled ?? false
     }
 
     func setTelemetryAppHangReportsEnabled(_ enabled: Bool, commit: Bool = true) {

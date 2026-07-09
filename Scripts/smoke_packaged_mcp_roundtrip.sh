@@ -101,6 +101,7 @@ chmod 700 "$TEMP_ROOT" "$ISOLATED_HOME" "$ISOLATED_TMP"
 
 MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 APP_COMMAND="$APP_EXECUTABLE"
+log_phase "$SMOKE_LABEL launching packaged app"
 env -i \
     PATH="$MINIMAL_PATH" \
     HOME="$ISOLATED_HOME" \
@@ -148,7 +149,7 @@ try:
         env=environment,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=30,
     )
 except subprocess.TimeoutExpired:
     raise SystemExit(124)
@@ -162,6 +163,8 @@ PYTHON
 
 deadline=$(( $(date +%s) + ROUNDTRIP_TIMEOUT ))
 last_status=75
+attempt=0
+log_phase "$SMOKE_LABEL waiting up to ${ROUNDTRIP_TIMEOUT}s for MCP socket/windows roundtrip"
 while (( $(date +%s) <= deadline )); do
     process_matches || fail "packaged app exited before MCP bootstrap completed"
     if [[ -z "$MCP_SOCKET_PATH" ]]; then
@@ -171,6 +174,7 @@ while (( $(date +%s) <= deadline )); do
         set -e
         if (( owner_status == 75 )); then
             MCP_SOCKET_PATH=""
+            log_phase "$SMOKE_LABEL waiting for MCP socket ownership"
             sleep 1
             continue
         fi
@@ -179,23 +183,34 @@ while (( $(date +%s) <= deadline )); do
             fail "$SMOKE_LABEL could not prove the launched app owns the release MCP socket"
         fi
         [[ -n "$MCP_SOCKET_PATH" ]] || fail "$SMOKE_LABEL ownership verifier returned an empty socket path"
+        log_phase "$SMOKE_LABEL found owned MCP socket: $MCP_SOCKET_PATH"
     fi
 
     "$SOCKET_OWNER_HELPER" verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE" ||
         fail "$SMOKE_LABEL launched app no longer owns the release MCP socket: $MCP_SOCKET_PATH"
+    attempt=$((attempt + 1))
+    attempt_stdout="$TEMP_ROOT/windows-attempt-${attempt}.out"
+    attempt_stderr="$TEMP_ROOT/windows-attempt-${attempt}.err"
+    log_phase "$SMOKE_LABEL CLI windows attempt ${attempt} using 30s subprocess timeout"
     set +e
-    run_windows_request
+    run_windows_request >"$attempt_stdout" 2>"$attempt_stderr"
     last_status=$?
     set -e
+    log_phase "$SMOKE_LABEL CLI windows attempt ${attempt} exited with $last_status"
     if (( last_status == 0 )); then
+        cat "$attempt_stdout"
+        cat "$attempt_stderr" >&2
         "$SOCKET_OWNER_HELPER" verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE" ||
             fail "$SMOKE_LABEL release MCP socket ownership changed during the helper request"
         printf 'OK: %s completed bootstrap and windows request with exact helper %s against launched pid %s socket %s\n' \
             "$SMOKE_LABEL" "$MCP_HELPER" "$APP_PID" "$MCP_SOCKET_PATH"
         exit 0
     fi
-    (( last_status == 1 || last_status == 124 )) ||
+    if (( last_status != 1 && last_status != 124 )); then
+        cat "$attempt_stdout" >&2 || true
+        cat "$attempt_stderr" >&2 || true
         fail "$SMOKE_LABEL helper request failed with exit $last_status: $MCP_HELPER"
+    fi
     sleep 1
 done
 

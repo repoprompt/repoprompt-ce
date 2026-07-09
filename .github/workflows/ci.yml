@@ -82,6 +82,29 @@ jobs:
             --batch-fast-suites \
             --require-runtime-for-batching
 
+
+  sentry-enabled-build:
+    name: Sentry-enabled Build
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Restore SwiftPM build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            Packages/RepoPromptAgentProviders/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
+
+      - name: Build app product with Sentry SDK linked
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: swift build --product RepoPrompt
+
   provider-tests:
     name: Provider Tests
     runs-on: macos-26

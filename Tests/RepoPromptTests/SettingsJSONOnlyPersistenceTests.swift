@@ -43,7 +43,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         #else
             XCTAssertFalse(store.telemetryEnabled())
         #endif
-        XCTAssertTrue(store.telemetryAppHangReportsEnabled())
+        XCTAssertFalse(store.telemetryAppHangReportsEnabled())
         XCTAssertFalse(store.telemetryPerformanceTracingEnabled())
 
         store.setTelemetryEnabled(false)
