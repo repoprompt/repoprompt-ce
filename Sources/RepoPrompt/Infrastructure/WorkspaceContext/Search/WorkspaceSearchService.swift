@@ -121,6 +121,18 @@ actor WorkspaceSearchService {
             searchDidCaptureGenerationHandler = handler
         }
 
+        /// DEBUG-only: transform the generation reported by `rebuildIndex` so the
+        /// search-readiness convergence loop can be driven into a deterministic
+        /// non-converging state in tests (repoprompt-ce #419). Internal freshness
+        /// bookkeeping (`commit`) is unaffected — only the value reported to callers.
+        private var rebuildIndexReportedGenerationTransformForTesting: (@Sendable (UInt64) -> UInt64)?
+
+        func setRebuildIndexReportedGenerationTransformForTesting(
+            _ transform: (@Sendable (UInt64) -> UInt64)?
+        ) {
+            rebuildIndexReportedGenerationTransformForTesting = transform
+        }
+
         static func authoritativeGlobalResultsForTesting(
             from snapshot: WorkspaceSearchCatalogSnapshot,
             query: String,
@@ -203,7 +215,11 @@ actor WorkspaceSearchService {
         }
         commit(prepared)
         activeRebuildGeneration = nil
-        return snapshot.generation
+        #if DEBUG
+            return rebuildIndexReportedGenerationTransformForTesting?(snapshot.generation) ?? snapshot.generation
+        #else
+            return snapshot.generation
+        #endif
     }
 
     @discardableResult

@@ -5936,6 +5936,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         3
     }
 
+    /// Maximum extra `rebuildIndex` passes the search-readiness convergence loop in
+    /// `loadWorkspaceFolders` will spend chasing a live catalog generation before
+    /// breaking out and letting the keep-fresh listener finish catch-up. Bounds the
+    /// otherwise unbounded rebuild chase under multi-window catalog churn.
+    /// See repoprompt-ce #419.
+    nonisolated static let maxSearchIndexConvergenceRebuilds = 3
+
     nonisolated static func boundedWorkspaceRootLoadLimit(forRootCount rootCount: Int) -> Int {
         guard rootCount > 0 else { return 0 }
         return min(rootCount, maxConcurrentWorkspaceRootLoads)
@@ -6328,10 +6335,20 @@ class WorkspaceManagerViewModel: ObservableObject {
             _ = await warmedGeneration
         #endif
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+        var convergenceRebuilds = 0
         while true {
             let currentCatalogGeneration = await fileManager.workspaceFileContextStore.catalogGeneration(rootScope: .visibleWorkspace)
-            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+            guard !Task.isCancelled,
+                  isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
             guard currentCatalogGeneration != indexGeneration else { break }
+            guard convergenceRebuilds < Self.maxSearchIndexConvergenceRebuilds else {
+                // The keep-fresh listener (subscribed above) continues catch-up in the
+                // background and queries report `isStale` until it lands. Bounding this
+                // readiness barrier avoids an unbounded rebuild chase under multi-window
+                // catalog churn (repoprompt-ce #419).
+                break
+            }
+            convergenceRebuilds += 1
             #if DEBUG
                 let loopSearchCatalogSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
@@ -6392,6 +6409,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "catalogFolders": "\(snapshot.diagnostics.folderCount)",
                 "catalogFiles": "\(snapshot.diagnostics.fileCount)",
                 "rebuildCount": "\(searchIndexRebuildCount)",
+                "convergenceCapReached": "\(convergenceRebuilds >= Self.maxSearchIndexConvergenceRebuilds)",
                 "failureCount": "\(failures.count)",
                 "catalogSnapshotDuration": WorkspaceRestorePerfLog.formatMS(totalSearchCatalogSnapshotDurationMS),
                 "searchRebuildDuration": WorkspaceRestorePerfLog.formatMS(totalSearchIndexRebuildDurationMS),

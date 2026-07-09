@@ -1,5 +1,12 @@
 import Foundation
 import OSLog
+import RepoPromptShared
+
+/// Outcome of a bounded wait on the headless agent connection gate.
+enum HeadlessAgentConnectionWaitOutcome {
+    case resumed
+    case timedOut
+}
 
 /// Global gate to serialize headless agent connections and prevent racing.
 /// This ensures that only one headless agent (discovery, delegate-edit, or future types)
@@ -30,38 +37,73 @@ actor HeadlessAgentConnectionGate {
     private var activeConnectionID: UUID?
     private struct WaitingContinuation {
         let id: UUID
-        let continuation: CheckedContinuation<Void, Never>
+        let continuation: CheckedContinuation<HeadlessAgentConnectionWaitOutcome, Never>
     }
 
     private var waitingContinuations: [WaitingContinuation] = []
+    private var deadlineTasks: [UUID: Task<Void, Never>] = [:]
 
     private let log = Logger(subsystem: "com.repoprompt.agents", category: "ConnectionGate")
 
-    /// Wait for any currently connecting agent to finish before proceeding
-    func waitForClearConnection() async {
-        if let currentConnectionID = activeConnectionID {
-            log.info("Gate busy; waiting (current=\(currentConnectionID.uuidString))")
-            let waiterID = UUID()
-            await withTaskCancellationHandler(
-                operation: {
-                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                        waitingContinuations.append(WaitingContinuation(id: waiterID, continuation: continuation))
+    /// Wait for any currently connecting agent to finish before proceeding.
+    ///
+    /// A bounded `deadline` keeps a stalled peer connection from blocking this
+    /// wait indefinitely; on expiry the wait simply returns so the caller can
+    /// proceed to acquire (which queues with its own deadline). See #419.
+    func waitForClearConnection(
+        deadline: Duration? = MCPTimeoutPolicy.headlessAgentConnectionAcquireDeadline
+    ) async {
+        guard let currentConnectionID = activeConnectionID else { return }
+        log.info("Gate busy; waiting (current=\(currentConnectionID.uuidString))")
+        let waiterID = UUID()
+        await withTaskCancellationHandler(
+            operation: {
+                await withCheckedContinuation { (continuation: CheckedContinuation<HeadlessAgentConnectionWaitOutcome, Never>) in
+                    if Task.isCancelled {
+                        continuation.resume(returning: .resumed)
+                        return
                     }
-                },
-                onCancel: {
-                    Task { await self.cancelWaitingContinuation(with: waiterID) }
+                    waitingContinuations.append(WaitingContinuation(id: waiterID, continuation: continuation))
+                    if let deadline {
+                        scheduleDeadline(for: waiterID, deadline: deadline)
+                    }
                 }
-            )
-        }
+            },
+            onCancel: {
+                Task { await self.cancelWaitingContinuation(with: waiterID) }
+            }
+        )
     }
 
     /// Note: Intentionally no logging here to avoid actor hop complexity during cancellation
     /// which can cause resource starvation/deadlock.
     private func cancelWaitingContinuation(with id: UUID) {
+        cancelDeadlineTask(for: id)
         if let index = waitingContinuations.firstIndex(where: { $0.id == id }) {
             let waiter = waitingContinuations.remove(at: index)
-            waiter.continuation.resume()
+            waiter.continuation.resume(returning: .resumed)
         }
+    }
+
+    /// Schedule a deadline after which `waiterID` is resumed with `.timedOut`.
+    private func scheduleDeadline(for waiterID: UUID, deadline: Duration) {
+        deadlineTasks[waiterID] = Task { [weak self] in
+            try? await Task.sleep(for: deadline)
+            guard !Task.isCancelled else { return }
+            await self?.timeoutWaiter(waiterID)
+        }
+    }
+
+    private func timeoutWaiter(_ waiterID: UUID) {
+        cancelDeadlineTask(for: waiterID)
+        guard let index = waitingContinuations.firstIndex(where: { $0.id == waiterID }) else { return }
+        let waiter = waitingContinuations.remove(at: index)
+        log.info("Gate waiter timed out (id=\(waiterID.uuidString))")
+        waiter.continuation.resume(returning: .timedOut)
+    }
+
+    private func cancelDeadlineTask(for waiterID: UUID) {
+        deadlineTasks.removeValue(forKey: waiterID)?.cancel()
     }
 
     /// Atomically waits until the gate is free, then marks it owned by `gateID`.
@@ -69,7 +111,10 @@ actor HeadlessAgentConnectionGate {
     /// IMPORTANT: This method re-checks ownership after every suspension so that a resumed waiter
     /// cannot overwrite a gate acquisition by a task that arrived between resume and re-entry.
     /// Returns diagnostics used by the MCP bootstrap history/perf surfaces.
-    func acquireWithDiagnostics(_ gateID: UUID) async -> AcquisitionResult {
+    func acquireWithDiagnostics(
+        _ gateID: UUID,
+        deadline: Duration? = MCPTimeoutPolicy.headlessAgentConnectionAcquireDeadline
+    ) async -> AcquisitionResult {
         let startUptime = ProcessInfo.processInfo.systemUptime
         let activeConnectionIDAtStart = activeConnectionID
         let queueDepthAtStart = waitingContinuations.count
@@ -77,17 +122,35 @@ actor HeadlessAgentConnectionGate {
         while let currentConnectionID = activeConnectionID {
             log.info("Gate busy; waiting to acquire (gateID=\(gateID.uuidString), current=\(currentConnectionID.uuidString))")
             let waiterID = UUID()
-            await withTaskCancellationHandler(
+            let outcome = await withTaskCancellationHandler(
                 operation: {
-                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    await withCheckedContinuation { (continuation: CheckedContinuation<HeadlessAgentConnectionWaitOutcome, Never>) in
+                        if Task.isCancelled {
+                            continuation.resume(returning: .resumed)
+                            return
+                        }
                         waitingContinuations.append(WaitingContinuation(id: waiterID, continuation: continuation))
+                        if let deadline {
+                            scheduleDeadline(for: waiterID, deadline: deadline)
+                        }
                     }
                 },
                 onCancel: {
                     Task { await self.cancelWaitingContinuation(with: waiterID) }
                 }
             )
+            cancelDeadlineTask(for: waiterID)
             if Task.isCancelled {
+                return AcquisitionResult(
+                    acquired: false,
+                    activeConnectionIDAtStart: activeConnectionIDAtStart,
+                    queueDepthAtStart: queueDepthAtStart,
+                    queueDepthAtAcquire: waitingContinuations.count,
+                    waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000
+                )
+            }
+            if outcome == .timedOut {
+                log.info("Gate acquire timed out before acquisition (gateID=\(gateID.uuidString))")
                 return AcquisitionResult(
                     acquired: false,
                     activeConnectionIDAtStart: activeConnectionIDAtStart,
@@ -117,8 +180,11 @@ actor HeadlessAgentConnectionGate {
         )
     }
 
-    func acquire(_ gateID: UUID) async -> Bool {
-        await acquireWithDiagnostics(gateID).acquired
+    func acquire(
+        _ gateID: UUID,
+        deadline: Duration? = MCPTimeoutPolicy.headlessAgentConnectionAcquireDeadline
+    ) async -> Bool {
+        await acquireWithDiagnostics(gateID, deadline: deadline).acquired
     }
 
     /// Mark an agent as beginning connection
@@ -145,10 +211,11 @@ actor HeadlessAgentConnectionGate {
 
         // Resume ONE waiting agent (FIFO)
         let resumedWaiter: Bool
-        if !waitingContinuations.isEmpty {
-            let next = waitingContinuations.removeFirst()
+        if let next = waitingContinuations.first {
+            cancelDeadlineTask(for: next.id)
+            waitingContinuations.removeFirst()
             log.info("Resuming waiting gate permit (id=\(next.id.uuidString))")
-            next.continuation.resume()
+            next.continuation.resume(returning: .resumed)
             resumedWaiter = true
         } else {
             resumedWaiter = false
@@ -228,8 +295,9 @@ actor HeadlessAgentConnectionGate {
     /// Cancel all waiting agents (e.g., on app shutdown)
     func cancelAll() {
         activeConnectionID = nil
-        for continuation in waitingContinuations {
-            continuation.continuation.resume()
+        for waiter in waitingContinuations {
+            cancelDeadlineTask(for: waiter.id)
+            waiter.continuation.resume(returning: .resumed)
         }
         waitingContinuations.removeAll()
     }
