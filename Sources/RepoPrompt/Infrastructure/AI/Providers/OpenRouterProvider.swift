@@ -71,14 +71,22 @@ class OpenRouterProvider: AIProvider {
 
         print("Model: \(model.modelName)")
 
-        return AsyncThrowingStream { continuation in
-            Task {
+        return bridgeStream(stream)
+    }
+
+    func bridgeStream(_ stream: AsyncThrowingStream<ChatCompletionChunkObject, Error>) -> AsyncThrowingStream<AIStreamResult, Error> {
+        AsyncThrowingStream { continuation in
+            let bridgeTask = Task {
                 do {
                     var promptTokens: Int? = nil
                     var completionTokens: Int? = nil
                     var cost: Double? = nil
 
                     for try await chunk in stream {
+                        if Task.isCancelled {
+                            return
+                        }
+
                         // Use optional chaining to unwrap the optional 'choices'
                         let content = chunk.choices?.first?.delta?.content
                         let reasoning = chunk.choices?.first?.delta?.reasoningContent
@@ -98,6 +106,10 @@ class OpenRouterProvider: AIProvider {
                         }
                     }
 
+                    if Task.isCancelled {
+                        return
+                    }
+
                     // Indicate the message has ended with token counts
                     continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens, cost: cost))
                     continuation.finish()
@@ -105,6 +117,8 @@ class OpenRouterProvider: AIProvider {
                     continuation.finish(throwing: error)
                 }
             }
+
+            continuation.onTermination = { _ in bridgeTask.cancel() }
         }
     }
 
