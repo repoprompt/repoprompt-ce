@@ -24,6 +24,15 @@ enum CLIExecutableLaunchability: Equatable {
 }
 
 enum CommandPathResolver {
+    enum ShellLookupMode: Equatable {
+        /// Query the user's shell before PATH search. Preserves legacy alias/function-first behavior.
+        case preferShell
+        /// Search the captured environment PATH first; query the shell only if PATH search misses.
+        case fallbackOnly
+        /// Do not query the shell; rely on explicit paths, PATH search, and bare-command fallback.
+        case disabled
+    }
+
     /// Heuristic: a basename matches an expected program name if it is equal, or if it
     /// is a versioned variant (e.g., "python3.11" matches "python").
     private static func basenameMatches(_ basename: String, expected: Set<String>) -> Bool {
@@ -33,9 +42,9 @@ enum CommandPathResolver {
 
     /// Resolves a command to its full executable path using a prioritized search strategy:
     /// 1. If command contains "/" and is executable, use it directly
-    /// 2. Query the user's interactive shell (respects PATH, aliases, nvm, etc.)
-    /// 3. Search additionalPaths as fallback (e.g., ~/.claude/local)
-    /// 4. Return original command and let the system resolve it
+    /// 2. Query the user's interactive shell (respects PATH, aliases, nvm, etc.) when requested
+    /// 3. Search captured PATH/additionalPaths (e.g., ~/.claude/local)
+    /// 4. Optionally query the shell as fallback, then return original command and let the system resolve it
     ///
     /// IMPORTANT: The environment passed here should NOT have additionalPaths merged into PATH.
     /// This ensures the interactive shell uses the user's actual PATH configuration,
@@ -45,7 +54,8 @@ enum CommandPathResolver {
         environment: [String: String],
         additionalPaths: [String],
         logger: ((String) -> Void)? = nil,
-        preferredBasenames: [String]? = nil
+        preferredBasenames: [String]? = nil,
+        shellLookupMode: ShellLookupMode = .preferShell
     ) -> String {
         let expanded = expandPath(command, environment: environment)
         // Honor explicit paths only when they already point to a runnable executable file.
@@ -53,36 +63,34 @@ enum CommandPathResolver {
             commandPathResolverLog("Command '\(command)' -> '\(expanded)' (explicit path)")
             return expanded
         }
-        // Prefer the user shell so aliases/functions take precedence.
-        if let shellResult = lookupViaInteractiveShell(expanded, environment: environment, preferredBasenames: preferredBasenames) {
-            let shellPath = shellResult.path
-            let isAliasTarget = shellResult.isAliasTarget
-
-            // Trust the shell's resolution if it returns a path - command -v/which are reliable
-            if shellPath.contains("/") {
-                logger?("Interactive shell resolved \(expanded) to \(shellPath)")
-                commandPathResolverLog("Command '\(command)' -> '\(shellPath)' (via shell)")
-                return shellPath
-            }
-
-            if !shellPath.contains("/"),
-               let located = locateInSearchPaths(shellPath, environment: environment, additionalPaths: additionalPaths)
-            {
-                logger?("Interactive shell target \(shellPath) located at \(located)")
-                commandPathResolverLog("Command '\(command)' -> '\(located)' (shell target in search paths)")
-                return located
-            }
-
-            if isAliasTarget {
-                logger?("Interactive shell resolved alias \(expanded) to \(shellPath)")
-                commandPathResolverLog("Command '\(command)' -> '\(shellPath)' (alias)")
-                return shellPath
-            }
+        if shellLookupMode == .preferShell,
+           let shellResolved = resolveViaShellLookup(
+               expanded,
+               originalCommand: command,
+               environment: environment,
+               additionalPaths: additionalPaths,
+               logger: logger,
+               preferredBasenames: preferredBasenames
+           )
+        {
+            return shellResolved
         }
         if let located = locateInSearchPaths(expanded, environment: environment, additionalPaths: additionalPaths) {
             logger?("Resolved \(expanded) to \(located)")
             commandPathResolverLog("Command '\(command)' -> '\(located)' (search paths)")
             return located
+        }
+        if shellLookupMode == .fallbackOnly,
+           let shellResolved = resolveViaShellLookup(
+               expanded,
+               originalCommand: command,
+               environment: environment,
+               additionalPaths: additionalPaths,
+               logger: logger,
+               preferredBasenames: preferredBasenames
+           )
+        {
+            return shellResolved
         }
         logger?("Falling back to original command \(expanded)")
         commandPathResolverLog("Command '\(command)' -> '\(expanded)' (fallback, will let system resolve)")
@@ -151,6 +159,45 @@ enum CommandPathResolver {
             if isExecutableRegularFile(candidate) {
                 return candidate
             }
+        }
+        return nil
+    }
+
+    private static func resolveViaShellLookup(
+        _ expanded: String,
+        originalCommand: String,
+        environment: [String: String],
+        additionalPaths: [String],
+        logger: ((String) -> Void)?,
+        preferredBasenames: [String]?
+    ) -> String? {
+        guard let shellResult = lookupViaInteractiveShell(
+            expanded,
+            environment: environment,
+            preferredBasenames: preferredBasenames
+        ) else { return nil }
+        let shellPath = shellResult.path
+        let isAliasTarget = shellResult.isAliasTarget
+
+        // Trust the shell's resolution if it returns a path - command -v/which are reliable.
+        if shellPath.contains("/") {
+            logger?("Interactive shell resolved \(expanded) to \(shellPath)")
+            commandPathResolverLog("Command '\(originalCommand)' -> '\(shellPath)' (via shell)")
+            return shellPath
+        }
+
+        if !shellPath.contains("/"),
+           let located = locateInSearchPaths(shellPath, environment: environment, additionalPaths: additionalPaths)
+        {
+            logger?("Interactive shell target \(shellPath) located at \(located)")
+            commandPathResolverLog("Command '\(originalCommand)' -> '\(located)' (shell target in search paths)")
+            return located
+        }
+
+        if isAliasTarget {
+            logger?("Interactive shell resolved alias \(expanded) to \(shellPath)")
+            commandPathResolverLog("Command '\(originalCommand)' -> '\(shellPath)' (alias)")
+            return shellPath
         }
         return nil
     }

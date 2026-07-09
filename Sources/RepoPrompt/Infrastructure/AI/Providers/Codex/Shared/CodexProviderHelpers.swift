@@ -62,7 +62,8 @@ enum CodexProviderHelpers {
             environment: environment,
             additionalPaths: expandedHints,
             logger: logger,
-            preferredBasenames: [preferredBasename]
+            preferredBasenames: [preferredBasename],
+            shellLookupMode: .fallbackOnly
         )
         var launchability = CommandPathResolver.launchability(of: resolvedCommand)
 

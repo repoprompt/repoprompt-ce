@@ -39,6 +39,7 @@ PROTOCOL_VERSION = 9
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
+BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
 SUMMARY_FAILURE_MAX_LINES = 100
@@ -67,6 +68,7 @@ APP_STOP_QUIET_SECONDS = 1.0
 APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS = 12.0
 APP_STOP_CONFIRM_TIMEOUT_SECONDS = 8.0
 APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS = 25.0
+GLOBAL_HEAVY_SLOT_POLL_SECONDS = 0.2
 
 SHORT_TIMEOUT_SECONDS = 5 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
@@ -140,6 +142,7 @@ Operation commands:
   ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run]
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
+  ./conductor diagnostics build-cache [--limit <n>]
   ./conductor release preflight|artifact|package|local-install
 
 Foundation validation operation:
@@ -627,7 +630,7 @@ class OutputSummarizer:
     TIMEOUT_RE = re.compile(r"(timed out after|terminating process (?:group|tree)|killing process (?:group|tree)|canceled)", re.IGNORECASE)
     PHASE_RE = re.compile(r"^(==>|\$ |\+ )")
     ARTIFACT_RE = re.compile(
-        r"^(Created:|APP_BUNDLE=|COMPAT_APP_BUNDLE=|CLI_PATH=|Output written to:|Agent Mode diagnostics enabled|Resolved rpce-cli-debug:)"
+        r"^(Created:|APP_BUNDLE=|COMPAT_APP_BUNDLE=|CLI_PATH=|Output written to:|Agent Mode diagnostics enabled|Resolved rpce-cli-debug:|Build cache diagnostics|Current \.build:|Managed worktree container:|Worktree \.build total:|Top \.build directories:|\s+[0-9.]+ [KMGT]?i?B\s+)"
     )
     APP_LIFECYCLE_RE = re.compile(
         r"(Stopping existing RepoPrompt|Waiting for existing RepoPrompt|Launching .*RepoPrompt\.app|Confirming launched RepoPrompt|Observed launched RepoPrompt|Guarding against a delayed RepoPrompt|Delayed launch guard confirmed|RepoPrompt(?: CE debug app)? stop confirmed|RepoPrompt was (not running|already stopped))"
@@ -877,6 +880,50 @@ def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
     )
 
 
+def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
+    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli", "run"}:
+        return True
+    if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
+        return True
+    if operation == "app" and args.get("subcommand") == "relaunch":
+        return True
+    if operation == "smoke" and bool(args.get("launch")):
+        return True
+    if operation == "release" and args.get("subcommand") in {"artifact", "package", "local-install"}:
+        return True
+    return False
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "n/a"
+    seconds = max(0.0, float(seconds))
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remainder:.0f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {remainder:.0f}s"
+
+
+def format_bytes(byte_count: Optional[int]) -> str:
+    if byte_count is None:
+        return "n/a"
+    value = float(max(0, int(byte_count)))
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{int(value)} B"
+    return f"{value:.1f} {unit}"
+
+
 @dataclasses.dataclass
 class Job:
     ticket: str
@@ -899,6 +946,9 @@ class Job:
     process_pgid: Optional[int] = None
     process_start: Optional[str] = None
     tracked_processes: Dict[int, str] = dataclasses.field(default_factory=dict, repr=False)
+    process_group_identity_confirmed: bool = False
+    global_heavy_slot_wait_seconds: Optional[float] = None
+    global_heavy_slot_path: Optional[str] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
     result_summary: Optional[str] = None
@@ -954,6 +1004,8 @@ class Job:
             "logPath": str(self.log_path),
             "processPID": self.process_pid,
             "processPGID": self.process_pgid,
+            "globalHeavySlotWaitSeconds": self.global_heavy_slot_wait_seconds,
+            "globalHeavySlotPath": self.global_heavy_slot_path,
             "exitCode": self.exit_code,
             "error": self.error,
             "resultSummary": self.result_summary,
@@ -1177,7 +1229,11 @@ class OperationRegistry:
             smoke_args["operationTimeout"] = effective_timeout
             return self._internal_argv("smoke", smoke_args), lanes, cwd, env, effective_timeout
         if operation == "diagnostics":
-            return self._internal_argv("diagnostics_agent_mode_on", dict(args)), ["debugArtifact", "liveApp"], cwd, env, effective_timeout
+            subcommand = args.get("subcommand")
+            if subcommand == "agent-mode-on":
+                return self._internal_argv("diagnostics_agent_mode_on", dict(args)), ["debugArtifact", "liveApp"], cwd, env, effective_timeout
+            if subcommand == "build-cache":
+                return self._internal_argv("diagnostics_build_cache", dict(args)), lanes, cwd, env, effective_timeout
         if operation == "release":
             subcommand = args.get("subcommand")
             if subcommand == "package":
@@ -1295,6 +1351,9 @@ class DaemonState:
         self.shutdown_requested = False
         self.server: Optional[socketserver.BaseServer] = None
 
+    def _global_heavy_slot_path(self) -> Path:
+        return self.paths.socket_path.parent / "global-heavy.lock"
+
     def status_payload(self) -> Dict[str, Any]:
         with self.lock:
             active_by_lane = {
@@ -1312,6 +1371,7 @@ class DaemonState:
                 "repoHash": self.paths.repo_hash,
                 "socketPath": str(self.paths.socket_path),
                 "stateDir": str(self.paths.state_dir),
+                "globalHeavySlotPath": str(self._global_heavy_slot_path()),
                 "activeJobsByLane": active_by_lane,
                 "runningJobs": running_jobs,
                 "queuedJobs": queued_jobs,
@@ -1662,11 +1722,69 @@ class DaemonState:
         if to_start:
             self.condition.notify_all()
 
+    def _acquire_global_heavy_slot(self, ticket: str) -> Optional[Any]:
+        wait_start = now()
+        lock_path = self._global_heavy_slot_path()
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_file = lock_path.open("a+", encoding="utf-8")
+        did_log_wait = False
+        while True:
+            with self.condition:
+                job = self.jobs.get(ticket)
+                if not job or job.state != "running":
+                    lock_file.close()
+                    return None
+                if job.cancel_requested:
+                    job.state = "canceled"
+                    job.exit_code = 130
+                    job.result_summary = "canceled before global heavy slot"
+                    job.finished_at = now()
+                    self._append_system_line_locked(job, "job canceled before global heavy slot\n")
+                    self.condition.notify_all()
+                    lock_file.close()
+                    return None
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                with self.condition:
+                    job = self.jobs.get(ticket)
+                    if job and job.state == "running" and not did_log_wait:
+                        job.global_heavy_slot_path = str(lock_path)
+                        self._append_system_line_locked(job, f"waiting for global heavy slot: {lock_path}\n")
+                        self.condition.notify_all()
+                        did_log_wait = True
+                time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                lock_file.close()
+                raise
+        waited = now() - wait_start
+        with self.condition:
+            job = self.jobs.get(ticket)
+            if job and job.state == "running":
+                job.global_heavy_slot_wait_seconds = waited
+                job.global_heavy_slot_path = str(lock_path)
+                self._append_system_line_locked(job, f"acquired global heavy slot after {format_duration(waited)}\n")
+                self.condition.notify_all()
+        return lock_file
+
+    @staticmethod
+    def _release_global_heavy_slot(lock_file: Optional[Any]) -> None:
+        if lock_file is None:
+            return
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            lock_file.close()
+
     def _run_job(self, ticket: str) -> None:
         job: Optional[Job] = None
         process: Optional[subprocess.Popen[bytes]] = None
         output_transport: Optional[ProcessOutputTransport] = None
         watchdog: Optional[threading.Thread] = None
+        global_heavy_slot: Optional[Any] = None
         try:
             with self.lock:
                 job = self.jobs[ticket]
@@ -1685,6 +1803,10 @@ class DaemonState:
                     self._append_system_line_locked(job, "job canceled before process start\n")
                     return
             argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
+            if operation_requires_global_heavy_slot(job.operation, job.args):
+                global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
+                if global_heavy_slot is None:
+                    return
             start_line = f"$ {format_argv(argv)}\n"
             with job.log_path.open("ab") as log_file:
                 with self.lock:
@@ -1825,6 +1947,7 @@ class DaemonState:
                     job.finished_at = now()
                     self._append_system_line_locked(job, f"daemon runner error: {exc}\n")
         finally:
+            self._release_global_heavy_slot(global_heavy_slot)
             if output_transport is not None:
                 output_transport.close_all()
             refresh_after_release = False
@@ -2354,6 +2477,24 @@ class DaemonState:
         verified, _depths = self._refresh_process_tree_locked(job)
         return bool(verified)
 
+    def _process_group_id_alive_locked(self, job: Job) -> bool:
+        if not job.process_group_identity_confirmed:
+            return False
+        try:
+            pgid = int(job.process_pgid) if job.process_pgid is not None else 0
+        except (TypeError, ValueError):
+            return False
+        if pgid <= 0:
+            return False
+        with contextlib.suppress(OSError):
+            if pgid == os.getpgrp():
+                return False
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
     def _wait_for_process_tree_exit_locked(
         self,
         job: Job,
@@ -2363,16 +2504,59 @@ class DaemonState:
         while now() < deadline:
             verified, depths = self._refresh_process_tree_locked(job)
             if not verified:
-                return False
+                if not self._process_group_id_alive_locked(job):
+                    return False
+                self._signal_process_group_id_locked(job, signal_for_new)
+                self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - now())))
+                continue
             self._signal_verified_processes_locked(job, signal_for_new, verified, depths)
             self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - now())))
-        return self._process_tree_alive_locked(job)
+        return self._process_tree_alive_locked(job) or self._process_group_id_alive_locked(job)
+
+    def _signal_process_group_id_locked(self, job: Job, sig: signal.Signals) -> bool:
+        try:
+            pgid = int(job.process_pgid) if job.process_pgid is not None else 0
+        except (TypeError, ValueError):
+            return False
+        if pgid <= 0:
+            return False
+        with contextlib.suppress(OSError):
+            if pgid == os.getpgrp():
+                return False
+
+        # Once a start-token-verified job process is observed in the job PGID, keep
+        # trusting that PGID for this job's short TERM -> KILL cleanup window. This
+        # lets escalation reach same-PGID descendants that reparent after the root
+        # exits and are no longer discoverable by PPID tree walking.
+        group_identity_confirmed = job.process_group_identity_confirmed
+        if not group_identity_confirmed:
+            verified, _depths = self._refresh_process_tree_locked(job)
+            for pid, (_ppid, _start_token) in verified.items():
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    if os.getpgid(pid) == pgid:
+                        group_identity_confirmed = True
+                        break
+            if group_identity_confirmed:
+                job.process_group_identity_confirmed = True
+
+        if not group_identity_confirmed:
+            return False
+
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
 
     def _terminate_process_group_locked(self, job: Job, reason: str) -> None:
+        if self._signal_process_group_id_locked(job, signal.SIGTERM):
+            self._append_system_line_locked(job, f"terminating process group: {reason}\n")
         self._append_system_line_locked(job, f"terminating process tree: {reason}\n")
         self._signal_process_tree_locked(job, signal.SIGTERM)
 
     def _kill_process_group_locked(self, job: Job, reason: str) -> None:
+        if self._signal_process_group_id_locked(job, signal.SIGKILL):
+            self._append_system_line_locked(job, f"killing process group: {reason}\n")
         self._append_system_line_locked(job, f"killing process tree: {reason}\n")
         self._signal_process_tree_locked(job, signal.SIGKILL)
 
@@ -2733,7 +2917,14 @@ def render_daemon_status(payload: Dict[str, Any], shorthand: bool = False) -> No
     if active:
         print("active lanes:")
         for lane, job in active.items():
-            print(f"  {lane}: {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} [{job.get('state')}]")
+            run_for = None
+            if job.get("startedAt"):
+                run_for = max(0.0, now() - float(job.get("startedAt")))
+            timing = f" run={format_duration(run_for)}" if run_for is not None else ""
+            global_wait = job.get("globalHeavySlotWaitSeconds")
+            if global_wait is not None:
+                timing += f" global-wait={format_duration(float(global_wait))}"
+            print(f"  {lane}: {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} [{job.get('state')}]{timing}")
     else:
         print("active lanes: none")
     print(f"queued:   {payload.get('queueDepth', 0)}")
@@ -2741,7 +2932,11 @@ def render_daemon_status(payload: Dict[str, Any], shorthand: bool = False) -> No
     if shorthand and payload.get("queuedJobs"):
         print("queued jobs:")
         for job in payload.get("queuedJobs") or []:
-            print(f"  {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} lanes={','.join(job.get('lanes') or [])}")
+            queued_for = None
+            if job.get("createdAt"):
+                queued_for = max(0.0, now() - float(job.get("createdAt")))
+            timing = f" queued={format_duration(queued_for)}" if queued_for is not None else ""
+            print(f"  {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} lanes={','.join(job.get('lanes') or [])}{timing}")
 
 
 def render_superseded_jobs(payload: Dict[str, Any]) -> None:
@@ -2838,6 +3033,15 @@ def print_job_result_header(payload: Dict[str, Any], summary: Optional[Dict[str,
     if payload.get("exitCode") is not None:
         print(f"Exit:     {payload.get('exitCode')}")
     print(f"Log:      {payload.get('logPath')}")
+    timing_parts: List[str] = []
+    if payload.get("queueWaitSeconds") is not None:
+        timing_parts.append(f"queue={format_duration(float(payload.get('queueWaitSeconds')))}")
+    if payload.get("executionSeconds") is not None:
+        timing_parts.append(f"exec={format_duration(float(payload.get('executionSeconds')))}")
+    if payload.get("globalHeavySlotWaitSeconds") is not None:
+        timing_parts.append(f"global-wait={format_duration(float(payload.get('globalHeavySlotWaitSeconds')))}")
+    if timing_parts:
+        print(f"Timing:   {', '.join(timing_parts)}")
     if payload.get("error"):
         print(f"Error:    {payload.get('error')}")
 
@@ -2953,6 +3157,15 @@ def render_job(job: Dict[str, Any], output_mode: str = "summary", include_tail: 
     print(f"operation: {job.get('operationLabel') or job.get('operation')}")
     print(f"state:     {job.get('state')}")
     print(f"lanes:     {', '.join(job.get('lanes') or []) or 'none'}")
+    timing_parts: List[str] = []
+    if job.get("createdAt"):
+        timing_parts.append(f"queued={format_duration(max(0.0, now() - float(job.get('createdAt'))))}")
+    if job.get("startedAt"):
+        timing_parts.append(f"running={format_duration(max(0.0, now() - float(job.get('startedAt'))))}")
+    if job.get("globalHeavySlotWaitSeconds") is not None:
+        timing_parts.append(f"global-wait={format_duration(float(job.get('globalHeavySlotWaitSeconds')))}")
+    if timing_parts:
+        print(f"timing:    {', '.join(timing_parts)}")
     print(f"log:       {job.get('logPath')}")
     if job.get("startedAtISO"):
         print(f"started:   {job.get('startedAtISO')}")
@@ -3617,6 +3830,119 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
     return 0
 
 
+def directory_size_bytes(path: Path) -> Optional[int]:
+    try:
+        if not path.exists():
+            return None
+        if path.is_symlink():
+            path = path.resolve(strict=True)
+    except OSError:
+        return None
+
+    # Prefer the platform disk-usage tool for explicit cache diagnostics. It is
+    # read-only and much faster than Python-level recursive stat walks for large
+    # SwiftPM scratch directories. Fall back to a Python walk for small tests or
+    # unusual environments where `du` is unavailable.
+    try:
+        result = subprocess.run(
+            ["du", "-sk", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if result.returncode == 0:
+            first = result.stdout.strip().split()[0]
+            return int(first) * 1024
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        pass
+
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        stat_result = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                    else:
+                        total += stat_result.st_size
+        except NotADirectoryError:
+            try:
+                total += current.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+        except OSError:
+            continue
+    return total
+
+
+def latest_mtime(path: Path) -> Optional[float]:
+    try:
+        return path.stat(follow_symlinks=False).st_mtime
+    except OSError:
+        return None
+
+
+def managed_worktree_container(repo_root: Path) -> Optional[Path]:
+    parent = repo_root.parent
+    try:
+        if parent.parent.name == ".repoprompt-worktrees":
+            return parent
+    except IndexError:
+        return None
+    return None
+
+
+def operation_diagnostics_build_cache(repo_root: Path, args: Dict[str, Any]) -> int:
+    limit = int(args.get("limit") or BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
+    limit = max(1, min(limit, 100))
+    current_build = repo_root / ".build"
+
+    print("Build cache diagnostics", flush=True)
+    if current_build.exists():
+        symlink_note = ""
+        if current_build.is_symlink():
+            with contextlib.suppress(OSError):
+                symlink_note = f" -> {current_build.resolve(strict=True)}"
+        print(f"Current .build: {format_bytes(directory_size_bytes(current_build))}{symlink_note}", flush=True)
+    else:
+        print("Current .build: missing", flush=True)
+
+    container = managed_worktree_container(repo_root)
+    if container is None or not container.exists():
+        print("Managed worktree container: not detected", flush=True)
+        return 0
+
+    rows: List[Tuple[int, Optional[float], str]] = []
+    for child in sorted(container.iterdir(), key=lambda item: item.name):
+        if not child.is_dir():
+            continue
+        build_dir = child / ".build"
+        size = directory_size_bytes(build_dir)
+        if size is None:
+            continue
+        rows.append((size, latest_mtime(build_dir), child.name))
+
+    total = sum(size for size, _mtime, _name in rows)
+    print(f"Managed worktree container: {container}", flush=True)
+    print(f"Worktree .build total: {format_bytes(total)} across {len(rows)} build director{'y' if len(rows) == 1 else 'ies'}", flush=True)
+    if not rows:
+        return 0
+
+    print("Top .build directories:", flush=True)
+    for size, mtime, name in sorted(rows, key=lambda row: row[0], reverse=True)[:limit]:
+        mtime_text = "unknown" if mtime is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+        print(f"  {format_bytes(size):>9}  {name}  modified={mtime_text}", flush=True)
+    return 0
+
+
 def operation_diagnostics_agent_mode_on(repo_root: Path, args: Dict[str, Any]) -> int:
     cli = require_debug_cli()
     if not cli:
@@ -3656,6 +3982,8 @@ def run_operation_runner(payload_json: str) -> int:
         return operation_smoke(repo_root, args)
     if kind == "diagnostics_agent_mode_on":
         return operation_diagnostics_agent_mode_on(repo_root, args)
+    if kind == "diagnostics_build_cache":
+        return operation_diagnostics_build_cache(repo_root, args)
     if kind == "release_preflight_missing":
         return operation_release_preflight_missing(repo_root)
     print(f"unknown internal operation runner kind: {kind}", file=sys.stderr)
@@ -3817,11 +4145,23 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         )
     elif operation == "diagnostics":
         parser = argparse.ArgumentParser(prog="conductor diagnostics")
-        parser.add_argument("subcommand", choices=["agent-mode-on"])
-        parser.add_argument("--log-file", default="/tmp/repoprompt-ce-claude-raw-events")
-        parser.add_argument("--window-id", type=int, default=1)
+        subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+        agent_mode = subparsers.add_parser("agent-mode-on")
+        agent_mode.add_argument("--log-file", default="/tmp/repoprompt-ce-claude-raw-events")
+        agent_mode.add_argument("--window-id", type=int, default=1)
+
+        build_cache = subparsers.add_parser("build-cache")
+        build_cache.add_argument("--limit", type=int, default=BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
+
         ns = parser.parse_args(rest)
-        args.update({"subcommand": ns.subcommand, "logFile": ns.log_file, "windowId": ns.window_id})
+        args["subcommand"] = ns.subcommand
+        if ns.subcommand == "agent-mode-on":
+            args.update({"logFile": ns.log_file, "windowId": ns.window_id})
+        elif ns.subcommand == "build-cache":
+            if ns.limit <= 0:
+                raise ConductorError("diagnostics build-cache --limit must be greater than zero")
+            args["limit"] = ns.limit
     elif operation == "release":
         parser = argparse.ArgumentParser(prog="conductor release")
         parser.add_argument("subcommand", choices=["preflight", "artifact", "package", "local-install"])

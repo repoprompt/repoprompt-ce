@@ -455,6 +455,95 @@ import XCTest
             }
         }
 
+        func testGitDiffArtifactsReturnWhenExplicitLinkedWorktreeAdvertisementIsUnauthorized() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let gitFixture = try ReviewGitRepositoryFixture(name: "ExplicitLinkedArtifactNoBinding")
+                defer { gitFixture.cleanup() }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let logicalRoot = try gitFixture.makeRepository(
+                        named: "logical",
+                        files: ["Sources/Feature.swift": "let value = \"initial\"\n"]
+                    )
+                    let worktreeRoot = try gitFixture.makeLinkedWorktree(
+                        from: logicalRoot,
+                        named: "worktree",
+                        branch: "feature/explicit-artifact"
+                    )
+                    let logicalFile = logicalRoot.appendingPathComponent("Sources/Feature.swift")
+                    let worktreeFile = worktreeRoot.appendingPathComponent("Sources/Feature.swift")
+                    try write("let value = \"canonical_artifact_leak\"\n", to: logicalFile)
+                    try write("let value = \"explicit_worktree_artifact_source\"\n", to: worktreeFile)
+                    _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(
+                        path: logicalRoot.path,
+                        kind: .primaryWorkspace
+                    )
+
+                    let context = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(),
+                        bindings: []
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
+
+                    let gitResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.git,
+                        arguments: [
+                            "op": "diff",
+                            "repo_root": worktreeRoot.path,
+                            "scope": "all",
+                            "artifacts": true,
+                            "mode": "standard",
+                            "inline": ["map": false]
+                        ],
+                        timeoutSeconds: 30
+                    )
+
+                    XCTAssertFalse(gitResponse.rawJSON.contains("\"isError\":true"), gitResponse.rawJSON)
+                    let gitText = try toolResultText(gitResponse)
+                    XCTAssertTrue(gitText.contains("MAP.txt"), gitText)
+                    XCTAssertTrue(gitText.contains("all.patch"), gitText)
+                    let patchAlias = try XCTUnwrap(
+                        gitText.split(separator: "`").map(String.init).first { candidate in
+                            candidate.hasPrefix("_git_data/") && candidate.hasSuffix("/diff/all.patch")
+                        },
+                        gitText
+                    )
+                    let workspaceDirectory = try fixture.contextA.window.workspaceManager.workspaceDirectory(
+                        for: XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
+                    )
+                    let patchPath = workspaceDirectory
+                        .appendingPathComponent("_git_data", isDirectory: true)
+                        .appendingPathComponent(String(patchAlias.dropFirst("_git_data/".count)))
+                        .path
+                    let patchText = try String(contentsOfFile: patchPath, encoding: .utf8)
+                    XCTAssertTrue(patchText.contains("explicit_worktree_artifact_source"), patchText)
+                    XCTAssertFalse(patchText.contains("canonical_artifact_leak"), patchText)
+
+                    let rejectedAliasSelection = try await endpoint.callTool(
+                        name: MCPWindowToolName.manageSelection,
+                        arguments: [
+                            "op": "add",
+                            "paths": [patchAlias],
+                            "strict": true
+                        ],
+                        timeoutSeconds: 20
+                    )
+                    XCTAssertTrue(
+                        rejectedAliasSelection.rawJSON.contains("\"isError\":true"),
+                        rejectedAliasSelection.rawJSON
+                    )
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testGitDiffSelectedArtifactsAutoSelectPatchForBoundLinkedWorktreeWithoutSessionRootCatalog() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)

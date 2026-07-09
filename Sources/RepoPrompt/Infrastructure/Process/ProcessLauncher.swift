@@ -4,6 +4,7 @@ import RepoPromptShared
 
 struct SpawnedProcess: @unchecked Sendable {
     let pid: pid_t
+    let processGroupID: pid_t?
     let stdin: FileHandle?
     let stdinDescriptor: Int32?
     let stdout: FileHandle
@@ -215,7 +216,19 @@ enum ProcessLauncher {
             throw ProcessLauncherError.spawnAttributesFailed(operation: "setsigdefault", errno: setSigDefaultResult)
         }
 
-        var configuredSpawnFlags = spawnFlags | Int16(POSIX_SPAWN_SETSIGDEF)
+        // Place each spawned CLI/provider root in its own process group. Cancellation
+        // and timeout cleanup can then signal the whole tool family, not just the
+        // direct child PID, which prevents same-PGID descendants from surviving if
+        // they are reparented away from the original process tree.
+        let setProcessGroupResult = posix_spawnattr_setpgroup(&attributes, 0)
+        if setProcessGroupResult != 0 {
+            closePipe(&stdinPipe)
+            closePipe(&stdoutPipe)
+            closePipe(&stderrPipe)
+            throw ProcessLauncherError.spawnAttributesFailed(operation: "setpgroup", errno: setProcessGroupResult)
+        }
+
+        var configuredSpawnFlags = spawnFlags | Int16(POSIX_SPAWN_SETSIGDEF) | Int16(POSIX_SPAWN_SETPGROUP)
         #if canImport(Darwin)
             configuredSpawnFlags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
         #endif
@@ -279,6 +292,7 @@ enum ProcessLauncher {
 
         return SpawnedProcess(
             pid: pid,
+            processGroupID: pid,
             stdin: stdinHandle,
             stdinDescriptor: stdinPipe[1],
             stdout: stdoutHandle,

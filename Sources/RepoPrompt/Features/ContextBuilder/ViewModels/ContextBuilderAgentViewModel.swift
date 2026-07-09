@@ -908,6 +908,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // Live cross-window sync: when another window mutates the shared global store
+        // (Context Builder agent/model, role defaults), re-apply the persisted selection
+        // without waiting for a workspace switch or recommendations pass. Dispatched to the
+        // main queue and guarded by `isRestoringState` to prevent feedback loops.
+        settingsManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                guard !isRestoringState else { return }
+                applyGlobalAgentModel()
+            }
+            .store(in: &cancellables)
+
         if let apiSettingsViewModel = promptManager.apiSettingsViewModel {
             // Level-triggered: `agentAvailability` replays the current provider
             // availability on subscription, while the Context Builder validation publishers

@@ -117,7 +117,12 @@ final class CLIProcessRunner {
         // and request termination so reader threads aren't left blocked on a closed read end.
         p.stdin?.closeFile()
         if sendSigterm {
-            kill(p.pid, SIGTERM)
+            ProcessTermination.signalProcessGroupOrPID(
+                pid: p.pid,
+                processGroupID: p.processGroupID,
+                signal: SIGTERM,
+                logger: { [weak self] message in self?.log(message) }
+            )
         }
     }
 
@@ -160,7 +165,8 @@ final class CLIProcessRunner {
                     logger: { [weak self] message in
                         self?.log(message)
                     },
-                    preferredBasenames: (config.resolveCandidates?.isEmpty == false ? config.resolveCandidates : [config.command])
+                    preferredBasenames: (config.resolveCandidates?.isEmpty == false ? config.resolveCandidates : [config.command]),
+                    shellLookupMode: config.shellLookupMode
                 )
             }()
             let workingDirectory = CommandPathResolver.expandPath(config.workingDirectory, environment: environment)
@@ -295,7 +301,11 @@ final class CLIProcessRunner {
                 // 3) Wait asynchronously for termination
                 let waitTask = Task.detached { () throws -> (Int32, Bool) in
                     // Use async, cooperative waiting to avoid blocking the pool
-                    try await Self.waitForTerminationAsync(pid: spawned.pid, timeout: timeout) { [weak self] warning in
+                    try await Self.waitForTerminationAsync(
+                        pid: spawned.pid,
+                        processGroupID: spawned.processGroupID,
+                        timeout: timeout
+                    ) { [weak self] warning in
                         self?.log(warning)
                     }
                 }
@@ -310,7 +320,7 @@ final class CLIProcessRunner {
                             return result
                         } onCancel: {
                             spawned.stdin?.closeFile()
-                            kill(spawned.pid, SIGTERM)
+                            terminateChild(spawned, sendSigterm: true)
                             waitTask.cancel()
                         }
                     } else {
@@ -386,7 +396,8 @@ final class CLIProcessRunner {
                 logger: { [weak self] message in
                     self?.log(message)
                 },
-                preferredBasenames: (config.resolveCandidates?.isEmpty == false ? config.resolveCandidates : [config.command])
+                preferredBasenames: (config.resolveCandidates?.isEmpty == false ? config.resolveCandidates : [config.command]),
+                shellLookupMode: config.shellLookupMode
             )
         }()
 
@@ -546,7 +557,11 @@ final class CLIProcessRunner {
 
             let waitTask = Task.detached { () throws -> (Int32, Bool) in
                 // Use async, cooperative waiting to avoid blocking the pool
-                try await Self.waitForTerminationAsync(pid: spawned.pid, timeout: timeout) { warning in
+                try await Self.waitForTerminationAsync(
+                    pid: spawned.pid,
+                    processGroupID: spawned.processGroupID,
+                    timeout: timeout
+                ) { warning in
                     ProcessDiagnostics.log(warning)
                 }
             }
@@ -628,7 +643,11 @@ final class CLIProcessRunner {
                     // then close FDs, drain readers briefly, and release the gate.
                     Task.detached { [self, gateCoordinator] in
                         let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()
-                        _ = try? await Self.waitForTerminationAsync(pid: spawned.pid, timeout: timeout) { msg in
+                        _ = try? await Self.waitForTerminationAsync(
+                            pid: spawned.pid,
+                            processGroupID: spawned.processGroupID,
+                            timeout: timeout
+                        ) { msg in
                             ProcessDiagnostics.log(msg)
                         }
                         // Ensure reader threads unblock even if the monitor path stalls.
@@ -673,12 +692,21 @@ final class CLIProcessRunner {
         for process in processes {
             // Stop further input and ask the child to exit. The waitpid cleanup will close stdout/stderr.
             process.stdin?.closeFile()
-            kill(process.pid, SIGTERM)
+            ProcessTermination.signalProcessGroupOrPID(
+                pid: process.pid,
+                processGroupID: process.processGroupID,
+                signal: SIGTERM,
+                logger: { [weak self] message in self?.log(message) }
+            )
         }
         for process in processes {
             // Give every child a chance to begin exiting before we await individual reaping.
             do {
-                let (status, _) = try await Self.waitForTerminationAsync(pid: process.pid, timeout: timeout) { [weak self] message in
+                let (status, _) = try await Self.waitForTerminationAsync(
+                    pid: process.pid,
+                    processGroupID: process.processGroupID,
+                    timeout: timeout
+                ) { [weak self] message in
                     self?.log(message)
                 }
                 log("Cancelled process \(process.pid) with status \(status)")
@@ -807,12 +835,14 @@ final class CLIProcessRunner {
 
     private static func waitForTerminationAsync(
         pid: pid_t,
+        processGroupID: pid_t?,
         timeout: TimeInterval?,
         logger: (String) -> Void
     ) async throws -> (Int32, Bool) {
         do {
             let (exitCode, timedOut) = try await ProcessTermination.waitForTermination(
                 pid: pid,
+                processGroupID: processGroupID,
                 timeout: timeout,
                 logger: logger
             )

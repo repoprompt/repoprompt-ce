@@ -672,8 +672,9 @@ actor CodexAppServerClient {
         process.stderr.readabilityHandler = nil
         process.stdin?.closeFile()
         let pid = process.pid
+        let processGroupID = process.processGroupID
         Task.detached {
-            _ = await ProcessTermination.terminateAndReap(pid: pid)
+            _ = await ProcessTermination.terminateAndReap(pid: pid, processGroupID: processGroupID)
         }
     }
 
@@ -693,6 +694,7 @@ actor CodexAppServerClient {
         let pid = process.pid
         _ = await ProcessTermination.terminateAndReap(
             pid: pid,
+            processGroupID: process.processGroupID,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : { _ in }
         )
     }
@@ -722,11 +724,25 @@ actor CodexAppServerClient {
     }
 
     func request(method: String, params: [String: Any]?, timeout: TimeInterval? = nil) async throws -> [String: Any] {
+        try await request(
+            method: method,
+            params: params,
+            timeout: timeout,
+            useDefaultTimeout: true
+        )
+    }
+
+    func request(
+        method: String,
+        params: [String: Any]?,
+        timeout: TimeInterval?,
+        useDefaultTimeout: Bool
+    ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard process != nil else { throw ClientError.processNotRunning }
         let requestID = makeRequestID()
         let generation = transportGeneration
-        let deadline = timeout ?? config.requestTimeout
+        let deadline = timeout ?? (useDefaultTimeout ? config.requestTimeout : nil)
         var payload: [String: Any] = [
             "method": method,
             "id": Int(requestID) ?? requestID
@@ -1617,6 +1633,7 @@ actor CodexAppServerClient {
             let stderrPipe = Pipe()
             process = SpawnedProcess(
                 pid: pid_t.max,
+                processGroupID: nil,
                 stdin: stdinPipe.fileHandleForWriting,
                 stdinDescriptor: stdinPipe.fileHandleForWriting.fileDescriptor,
                 stdout: stdoutPipe.fileHandleForReading,

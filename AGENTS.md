@@ -147,6 +147,7 @@ These settings are intentionally DEBUG-only. If a key is unavailable, confirm `r
 Prefer the developer daemon as the default way to build, run, and validate. Two properties are the whole reason it exists — and the reason to reach for it instead of a bare `swift build` / `swift test`:
 
 - **Lane-serialized job queue** — every job claims named lanes (`build`, `debugArtifact`, `liveApp`, `release`, `style`); the daemon runs jobs that share a lane one at a time while letting unrelated lanes proceed concurrently. That serial queue is what stops multiple agents from building, launching, or running style tooling over each other and corrupting `.build` or the live app.
+- **Machine-wide heavy-job slot** — Swift/Xcode-heavy daemon jobs also acquire a per-user global heavy slot before spawning their subprocess. This coordinates expensive work across worktree-local conductor daemons. If `job status` or `job wait` shows `global-wait` or "waiting for global heavy slot", another checkout/worktree is already running heavy work; wait on the ticket instead of bypassing conductor with direct `swift`/`xcodebuild` commands or starting duplicate jobs.
 - **Tickets + async jobs** — every job gets a ticket and can run detached (`--async`). Fire a build, keep working, and query or wait on it later (`job status` / `job wait`) instead of blocking on a long compile. Jobs survive reconnects and are reusable by `--request-key`.
 
 `conductor` is repo-internal developer tooling for this checkout; the daemon auto-starts on first use.

@@ -903,6 +903,23 @@ class PromptViewModel: ObservableObject {
         gitViewModel.gitDiffInclusionMode = gitDiffInclusionModeForCopy
     }
 
+    /// Narrow re-sync of only the global-derived cache (Oracle model, preferred model,
+    /// Context Builder agent/model), invoked when the shared global store is mutated from
+    /// another window. Deliberately does NOT touch per-window copy/chat overlays.
+    private func syncGlobalDerivedSettingsFromStore() {
+        isSyncingSettings = true
+        defer { isSyncingSettings = false }
+
+        // Sync Context Builder agent/model from global settings (single source of truth).
+        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
+            contextBuilderAgent = normalizedContextBuilder.agent
+            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
+        }
+
+        // Sync model selection (Oracle + preferred) from the global store.
+        syncModelSelectionFromSettingsManager()
+    }
+
     /// Updates fileTreeOption and auto-switches to Manual mode if needed
     func updateFileTreeOption(_ newValue: FileTreeOption) {
         // Check if we're in a non-manual preset
@@ -2067,6 +2084,18 @@ class PromptViewModel: ObservableObject {
     // MARK: - Setup and Observer Configuration
 
     private func setupObservers() {
+        // Live cross-window sync: when another window mutates the shared global store
+        // (Oracle model, Context Builder agent, role defaults, …), re-seed this window's
+        // global-derived cache. Dispatched to the main queue to avoid synchronous re-entry
+        // during our own write-back, and guarded by `isSyncingSettings` to prevent loops.
+        settingsManager.globalSettingsStore.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, !self.isSyncingSettings else { return }
+                syncGlobalDerivedSettingsFromStore()
+            }
+            .store(in: &cancellables)
+
         // Sync prompt text with workspace manager after debounce
         $promptText
             .removeDuplicates()

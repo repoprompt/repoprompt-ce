@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -239,6 +241,49 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertTrue(Path(argv[0]).name.startswith("python3"))
         self.assertIn('"kind":"smoke"', argv[-1].replace(" ", ""))
 
+    def test_diagnostics_build_cache_delegates_read_only_without_lanes(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "diagnostics", ["build-cache", "--limit", "3"])
+
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        argv, lanes, cwd, _env, timeout = registry.prepare(
+            {"operation": "diagnostics", "args": {"subcommand": "build-cache", "limit": 3}}
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[1], "diagnostics")
+        self.assertEqual(enqueue.call_args.args[2], {"subcommand": "build-cache", "limit": 3})
+        self.assertEqual(lanes, [])
+        self.assertEqual(cwd, state.paths.repo_root)
+        self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
+        self.assertTrue(Path(argv[0]).name.startswith("python3"))
+        self.assertIn('"kind":"diagnostics_build_cache"', argv[-1].replace(" ", ""))
+
+    def test_diagnostics_build_cache_reports_managed_worktree_build_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            container = Path(tmp) / ".repoprompt-worktrees" / "repoprompt-ce-upstream"
+            repo_root = container / "wt-a"
+            sibling = container / "wt-b"
+            (repo_root / ".build").mkdir(parents=True)
+            (sibling / ".build").mkdir(parents=True)
+            (repo_root / ".build" / "a.bin").write_bytes(b"a" * 1024)
+            (sibling / ".build" / "b.bin").write_bytes(b"b" * 2 * 1024 * 1024)
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = conductor.operation_diagnostics_build_cache(repo_root, {"limit": 1})
+
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("Build cache diagnostics", text)
+        self.assertIn("Current .build:", text)
+        self.assertIn("Worktree .build total:", text)
+        self.assertIn("across 2 build directories", text)
+        self.assertIn("Top .build directories:", text)
+        self.assertIn("wt-b", text)
+
     def test_release_local_install_delegates_installer_with_release_lanes_and_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
@@ -336,6 +381,138 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertIn("job processes remained alive after SIGKILL escalation", job.error or "")
         self.assertNotIn("daemon runner error", job.result_summary or "")
 
+    def test_process_group_signal_requires_verified_job_identity(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "job-pgid-unverified", "fixture", {}, ["build"], job_state="running")
+        job.process_pgid = 123456
+        state.jobs[job.ticket] = job
+
+        with mock.patch.object(conductor.os, "killpg") as killpg:
+            with state.condition:
+                state._terminate_process_group_locked(job, reason="unverified group")
+
+        killpg.assert_not_called()
+        self.assertFalse(job.process_group_identity_confirmed)
+        self.assertIn("terminating process tree: unverified group", "".join(job.tail))
+        self.assertNotIn("terminating process group: unverified group", "".join(job.tail))
+
+    def test_cancel_signals_process_group_for_reparented_descendant(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        grandchild_pid_path = root / "grandchild.pid"
+        grandchild_ready_path = root / "grandchild.ready"
+        job = self.make_job(state, "job-pgid-orphan", "fixture", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        state.active_lanes = {"build": job.ticket}
+
+        grandchild_code = textwrap.dedent(
+            """
+            import os
+            import signal
+            import sys
+            import time
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            pid_path = sys.argv[1]
+            ready_path = sys.argv[2]
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            with open(ready_path, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()} {os.getppid()} {os.getpgid(0)}")
+            while True:
+                time.sleep(1)
+            """
+        )
+        intermediate_code = textwrap.dedent(
+            """
+            import subprocess
+            import sys
+
+            subprocess.Popen(
+                [sys.executable, "-u", "-c", sys.argv[1], sys.argv[2], sys.argv[3]],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=False,
+            )
+            """
+        )
+        root_code = textwrap.dedent(
+            """
+            import os
+            import subprocess
+            import sys
+            import time
+
+            grandchild_code = sys.argv[1]
+            pid_path = sys.argv[2]
+            ready_path = sys.argv[3]
+            subprocess.run(
+                [sys.executable, "-u", "-c", sys.argv[4], grandchild_code, pid_path, ready_path],
+                check=True,
+            )
+            deadline = time.time() + 5.0
+            while not os.path.exists(ready_path) and time.time() < deadline:
+                time.sleep(0.05)
+            print("ROOT_READY", flush=True)
+            while True:
+                time.sleep(1)
+            """
+        )
+        argv = [
+            sys.executable,
+            "-u",
+            "-c",
+            root_code,
+            grandchild_code,
+            str(grandchild_pid_path),
+            str(grandchild_ready_path),
+            intermediate_code,
+        ]
+        state.registry.prepare = lambda _request: (argv, ["build"], root, os.environ.copy(), 30.0)  # type: ignore[method-assign]
+
+        def cleanup_grandchild() -> None:
+            if not grandchild_pid_path.exists() or not grandchild_ready_path.exists():
+                return
+            with contextlib.suppress(ValueError, ProcessLookupError, PermissionError, OSError):
+                grandchild_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+                grandchild_pgid = int(grandchild_ready_path.read_text(encoding="utf-8").split()[2])
+                if os.getpgid(grandchild_pid) == grandchild_pgid:
+                    os.kill(grandchild_pid, signal.SIGKILL)
+
+        self.addCleanup(cleanup_grandchild)
+        worker = threading.Thread(target=state._run_job, args=(job.ticket,), daemon=True)
+        worker.start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with state.condition:
+                process_pgid = job.process_pgid
+            if grandchild_ready_path.exists() and process_pgid:
+                break
+            time.sleep(0.05)
+        self.assertTrue(grandchild_ready_path.exists())
+        grandchild_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+        with state.condition:
+            self.assertEqual(os.getpgid(grandchild_pid), job.process_pgid)
+
+        with mock.patch.multiple(
+            conductor,
+            TERMINATE_GRACE_SECONDS=0.2,
+            KILL_GRACE_SECONDS=1.0,
+            PROCESS_TREE_POLL_SECONDS=0.02,
+        ):
+            state.job_cancel(job.ticket, None)
+        worker.join(timeout=5.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(job.state, "canceled")
+        deadline = time.time() + 3.0
+        while time.time() < deadline and conductor.pid_alive(grandchild_pid):
+            time.sleep(0.05)
+        self.assertFalse(conductor.pid_alive(grandchild_pid))
+
     def test_run_operation_command_uses_devnull_stdin(self) -> None:
         completed = subprocess.CompletedProcess(["echo", "ok"], 0, "ok\n", "")
         with mock.patch.object(conductor.subprocess, "run", return_value=completed) as run, contextlib.redirect_stdout(io.StringIO()):
@@ -398,9 +575,13 @@ class LifecycleQueueTests(LifecycleTestCase):
                 }}
             )
             ticket = payload["ticket"]
+            job = state.jobs[ticket]
+            job.state = "running"
+            job.started_at = conductor.now()
+            for lane in job.lanes:
+                state.active_lanes[lane] = ticket
             os.close(0)
             state._run_job(ticket)
-            job = state.jobs[ticket]
             log = job.log_path.read_text(encoding="utf-8")
             if job.state != "completed" or "STDIN_DEVNULL_OK" not in log:
                 print(f"job_state={{job.state}} exit={{job.exit_code}}")
@@ -598,6 +779,119 @@ class LifecycleQueueTests(LifecycleTestCase):
 
         self.assertEqual(payload["blockedBy"][0]["ticket"], active.ticket)
         self.assertEqual(payload["blockedBy"][0]["conflictingLanes"], ["build"])
+
+    def wait_for_terminal_job(self, state: conductor.DaemonState, ticket: str, timeout: float = 5.0) -> conductor.Job:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with state.condition:
+                job = state.jobs[ticket]
+                if job.state in conductor.TERMINAL_STATES:
+                    return job
+            time.sleep(0.01)
+        with state.condition:
+            return state.jobs[ticket]
+
+    def make_state_for_global_slot(
+        self,
+        root: Path,
+        name: str,
+        shared_socket_parent: Path,
+    ) -> conductor.DaemonState:
+        state_dir = root / name
+        jobs_dir = state_dir / "jobs"
+        jobs_dir.mkdir(parents=True)
+        paths = conductor.Paths(
+            repo_root=state_dir,
+            repo_hash=name,
+            state_dir=state_dir,
+            socket_path=shared_socket_parent / f"{name}.sock",
+            pid_path=state_dir / "conductor.pid",
+            lock_path=state_dir / "conductor.lock",
+            jobs_dir=jobs_dir,
+            daemon_log_path=state_dir / "daemon.log",
+            daemon_meta_path=state_dir / "daemon.json",
+            running_processes_path=state_dir / "running.json",
+        )
+        return conductor.DaemonState(paths)
+
+    def test_global_heavy_slot_serializes_build_lane_jobs_across_daemons(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        shared_socket_parent = root / "shared"
+        shared_socket_parent.mkdir()
+        state_a = self.make_state_for_global_slot(root, "daemon-a", shared_socket_parent)
+        state_b = self.make_state_for_global_slot(root, "daemon-b", shared_socket_parent)
+
+        with mock.patch.object(conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01):
+            payload_a = state_a.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-a"},
+                }
+            )
+            payload_b = state_b.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-b"},
+                }
+            )
+            job_a = self.wait_for_terminal_job(state_a, payload_a["ticket"])
+            job_b = self.wait_for_terminal_job(state_b, payload_b["ticket"])
+
+        self.assertEqual(job_a.state, "completed", job_a.result_summary)
+        self.assertEqual(job_b.state, "completed", job_b.result_summary)
+        self.assertEqual(job_a.global_heavy_slot_path, str(shared_socket_parent / "global-heavy.lock"))
+        self.assertEqual(job_b.global_heavy_slot_path, str(shared_socket_parent / "global-heavy.lock"))
+        self.assertIsNotNone(job_a.process_started_at)
+        self.assertIsNotNone(job_a.process_finished_at)
+        self.assertIsNotNone(job_b.process_started_at)
+        self.assertIsNotNone(job_b.process_finished_at)
+
+        first, second = sorted([job_a, job_b], key=lambda job: job.process_started_at or 0)
+        self.assertGreaterEqual(second.process_started_at or 0, first.process_finished_at or 0)
+        self.assertGreater(max(job_a.global_heavy_slot_wait_seconds or 0, job_b.global_heavy_slot_wait_seconds or 0), 0.05)
+
+    def test_cancel_waiting_for_global_heavy_slot_does_not_spawn_process(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        shared_socket_parent = root / "shared"
+        shared_socket_parent.mkdir()
+        state = self.make_state_for_global_slot(root, "daemon", shared_socket_parent)
+        lock_path = shared_socket_parent / "global-heavy.lock"
+        lock_file = lock_path.open("a+", encoding="utf-8")
+        self.addCleanup(lock_file.close)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        self.addCleanup(lambda: fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN))
+
+        with mock.patch.object(conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01):
+            payload = state.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.5, "lanes": ["build"], "message": "blocked"},
+                }
+            )
+            ticket = payload["ticket"]
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with state.condition:
+                    job = state.jobs[ticket]
+                    if job.global_heavy_slot_path and job.process_started_at is None:
+                        break
+                time.sleep(0.01)
+            with state.condition:
+                self.assertEqual(state.jobs[ticket].state, "running")
+                self.assertIsNone(state.jobs[ticket].process_started_at)
+            state.job_cancel(ticket, None)
+            job = self.wait_for_terminal_job(state, ticket)
+
+        self.assertEqual(job.state, "canceled")
+        self.assertEqual(job.exit_code, 130)
+        self.assertEqual(job.result_summary, "canceled before global heavy slot")
+        self.assertIsNone(job.process_pid)
+        self.assertIsNone(job.process_started_at)
+        self.assertIn("job canceled before global heavy slot", "".join(job.tail))
 
 
 class XCTestStallWatchdogTests(LifecycleTestCase):

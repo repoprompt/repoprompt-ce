@@ -69,6 +69,22 @@ final class DebugCLIInstallerScriptTests: XCTestCase {
         XCTAssertTrue(result.output.contains("PATH command: unmanaged symlink"), result.output)
     }
 
+    func testInstallRepairsPathLinkPointingAtLegacyUserLink() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let legacyUserLink = fixture.home
+            .appendingPathComponent("Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug")
+        try FileManager.default.createDirectory(at: legacyUserLink.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: legacyUserLink, withDestinationURL: fixture.bundledCLI)
+        try FileManager.default.createSymbolicLink(at: fixture.pathLink, withDestinationURL: legacyUserLink)
+
+        let install = try fixture.run("install")
+        XCTAssertEqual(install.status, 0, install.output)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fixture.pathLink.path), fixture.userLink.path)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fixture.userLink.path), fixture.bundledCLI.path)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: fixture.pathLink.path))
+    }
+
     private struct Fixture {
         let root: URL
         let home: URL
@@ -84,7 +100,7 @@ final class DebugCLIInstallerScriptTests: XCTestCase {
             home = root.appendingPathComponent("home", isDirectory: true)
             appBundle = root.appendingPathComponent("RepoPrompt.app", isDirectory: true)
             bundledCLI = appBundle.appendingPathComponent("Contents/MacOS/repoprompt-mcp")
-            userLink = home.appendingPathComponent("Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug")
+            userLink = home.appendingPathComponent("RepoPrompt/repoprompt_ce_cli_debug")
             pathLink = root.appendingPathComponent("bin/rpce-cli-debug")
             script = try RepoRoot.url().appendingPathComponent("Scripts/install_debug_cli.sh")
 

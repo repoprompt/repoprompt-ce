@@ -625,6 +625,7 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Claude Code binary probe started")
         await CLIEnvironmentCache.shared.invalidate()
         var config = CLIProcessConfiguration(
+            shellLookupMode: .fallbackOnly,
             captureStdoutTailBytes: 16 * 1024,
             captureStderrTailBytes: 16 * 1024
         )
@@ -1189,6 +1190,7 @@ public class APISettingsViewModel: ObservableObject {
         }
 
         var config = CLIProcessConfiguration(
+            shellLookupMode: .fallbackOnly,
             captureStdoutTailBytes: 8 * 1024,
             captureStderrTailBytes: 8 * 1024
         )

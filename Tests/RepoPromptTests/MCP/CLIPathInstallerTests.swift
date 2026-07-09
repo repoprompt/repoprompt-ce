@@ -124,6 +124,62 @@ final class CLIPathInstallerTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: linkURL.path), bundledCLI.path)
     }
 
+    func testClassifierReclaimsStaleTranslocatedManagedTarget() throws {
+        // Managed destination lives inside an app bundle.
+        let allowlist: Set = [bundledCLI.path]
+
+        // Simulate a user-space link created while the app ran translocated:
+        // it targets the same app bundle CLI, but under a now-removed App
+        // Translocation mount (dangling; the path does not exist).
+        let staleTranslocated = "/private/var/folders/xx/T/AppTranslocation/"
+            + UUID().uuidString
+            + "/d/RepoPrompt.app/Contents/MacOS/repoprompt-mcp"
+        try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: staleTranslocated)
+        XCTAssertEqual(
+            ManagedCLIPathPolicy.classifySymlink(
+                at: linkURL.path,
+                desiredDestination: bundledCLI.path,
+                managedDestinations: allowlist
+            ),
+            .managedStale(destination: staleTranslocated)
+        )
+
+        // A translocated path whose app-bundle suffix does NOT match any
+        // managed destination must stay unmanaged.
+        try FileManager.default.removeItem(at: linkURL)
+        let foreignTranslocated = "/private/var/folders/xx/T/AppTranslocation/"
+            + UUID().uuidString
+            + "/d/Evil.app/Contents/MacOS/repoprompt-mcp"
+        try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: foreignTranslocated)
+        XCTAssertEqual(
+            ManagedCLIPathPolicy.classifySymlink(
+                at: linkURL.path,
+                desiredDestination: bundledCLI.path,
+                managedDestinations: allowlist
+            ),
+            .unmanaged
+        )
+    }
+
+    func testUserSpaceManagerRepairsStaleTranslocatedSymlink() throws {
+        // Reproduces the reported bug: the user-space link points at a CLI
+        // inside a now-removed App Translocation mount (dangling). Because the
+        // app has since moved to a stable location, the link must be reclaimed
+        // and repaired rather than rejected as unmanaged.
+        let staleTranslocated = "/private/var/folders/xx/T/AppTranslocation/"
+            + UUID().uuidString
+            + "/d/RepoPrompt.app/Contents/MacOS/repoprompt-mcp"
+        try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: staleTranslocated)
+
+        XCTAssertTrue(
+            CLISymlinkManagerUserSpace.ensureLocalSymlink(
+                userSymlinkURL: linkURL,
+                bundledCLIURL: bundledCLI
+            )
+        )
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: linkURL.path), bundledCLI.path)
+    }
+
     func testUserSpaceManagerRollsBackRacedUnmanagedReplacement() throws {
         let recognizedOldPath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app/Contents/MacOS/repoprompt-mcp")
@@ -142,6 +198,29 @@ final class CLIPathInstallerTests: XCTestCase {
 
         XCTAssertFalse(installed)
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: linkURL.path), foreign.path)
+    }
+
+    func testManagedDestinationsRecognizeNoSpaceAndLegacyUserSpaceLinks() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let destinations = ManagedCLIPathPolicy.managedDestinations(currentBundledCLIPath: nil)
+
+        XCTAssertTrue(
+            destinations.contains(home.appendingPathComponent("RepoPrompt/repoprompt_ce_cli_debug").standardizedFileURL.path)
+        )
+        XCTAssertTrue(
+            destinations.contains(
+                home.appendingPathComponent(
+                    "Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug"
+                ).standardizedFileURL.path
+            )
+        )
+        XCTAssertTrue(
+            destinations.contains(
+                home.appendingPathComponent(
+                    "Library/Application Support/RepoPrompt CE/repoprompt_cli_debug"
+                ).standardizedFileURL.path
+            )
+        )
     }
 
     func testPrivilegedShellCommandReplacesAndRemovesOnlyManagedLinks() throws {
@@ -211,5 +290,59 @@ final class CLIPathInstallerTests: XCTestCase {
         XCTAssertTrue(ManagedCLIPathPolicy.isManagedWrapper("#!/bin/bash\n\(ManagedCLIPathPolicy.legacyClaudeWrapperMarkers[0])\n"))
         XCTAssertFalse(ManagedCLIPathPolicy.isManagedWrapper("#!/bin/bash\necho '\(ManagedCLIPathPolicy.currentClaudeWrapperMarker)'\n"))
         XCTAssertFalse(ManagedCLIPathPolicy.isManagedWrapper("#!/bin/bash\necho unrelated\n"))
+    }
+
+    func testPathExistsNotOursErrorReportsProvidedPath() {
+        // The message must name the actual offending path, not a hardcoded one.
+        let path = "/Users/example/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli"
+        let description = CLIPathInstaller.InstallError.pathExistsNotOurs(path: path).errorDescription
+        XCTAssertEqual(description, "A file already exists at \(path) that wasn't created by RepoPrompt")
+    }
+
+    func testUserSymlinkInstallErrorDistinguishesConflictFromSetupFailure() throws {
+        // A genuinely foreign occupant is reported as a real conflict.
+        try Data("foreign".utf8).write(to: linkURL)
+        let conflict = CLIPathInstaller.userSymlinkInstallError(userLink: linkURL.path, bundledPath: bundledCLI.path)
+        guard case let .pathExistsNotOurs(path) = conflict else {
+            return XCTFail("expected pathExistsNotOurs, got \(conflict)")
+        }
+        XCTAssertEqual(path, linkURL.path)
+
+        // No occupant (e.g. a directory-creation or atomic-swap failure) is
+        // reported as a setup failure, not a spurious conflict.
+        try FileManager.default.removeItem(at: linkURL)
+        let setupFailure = CLIPathInstaller.userSymlinkInstallError(userLink: linkURL.path, bundledPath: bundledCLI.path)
+        guard case let .userSymlinkSetupFailed(path) = setupFailure else {
+            return XCTFail("expected userSymlinkSetupFailed, got \(setupFailure)")
+        }
+        XCTAssertEqual(path, linkURL.path)
+    }
+
+    func testUserSymlinkSetupFailedErrorReportsProvidedPath() {
+        // The setup-failure message must name the path and avoid claiming a conflict.
+        let path = "/Users/example/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli"
+        let description = CLIPathInstaller.InstallError.userSymlinkSetupFailed(path: path).errorDescription
+        XCTAssertEqual(
+            description,
+            "Could not set up the CLI link at \(path). Check permissions for its parent directory and try again."
+        )
+    }
+
+    func testClassifierRejectsTranslocatedPathWithoutAppBundleComponent() throws {
+        // A path under /AppTranslocation/ but with no *.app component has no
+        // app-bundle suffix to match, so it must remain unmanaged.
+        let allowlist: Set = [bundledCLI.path]
+        let noAppBundle = "/private/var/folders/xx/T/AppTranslocation/"
+            + UUID().uuidString
+            + "/d/repoprompt-mcp"
+        try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: noAppBundle)
+        XCTAssertEqual(
+            ManagedCLIPathPolicy.classifySymlink(
+                at: linkURL.path,
+                desiredDestination: bundledCLI.path,
+                managedDestinations: allowlist
+            ),
+            .unmanaged
+        )
     }
 }

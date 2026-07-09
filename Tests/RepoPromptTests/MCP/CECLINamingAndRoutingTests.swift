@@ -25,9 +25,12 @@ final class CECLINamingAndRoutingTests: XCTestCase {
         }
     }
 
-    func testUserSpaceSymlinkPathUsesApplicationSupport() {
+    func testUserSpaceSymlinkPathUsesStableNoSpaceDirectory() {
         let path = CLISymlinkManagerUserSpace.userSymlinkPath
-        XCTAssertTrue(path.contains("Library/Application Support/RepoPrompt CE"), path)
+        let expectedDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("RepoPrompt", isDirectory: true)
+        XCTAssertEqual(URL(fileURLWithPath: path).deletingLastPathComponent(), expectedDirectory, path)
+        XCTAssertFalse(path.contains(" "), path)
         #if DEBUG
             XCTAssertTrue(path.hasSuffix("repoprompt_ce_cli_debug"), path)
         #else
@@ -39,6 +42,9 @@ final class CECLINamingAndRoutingTests: XCTestCase {
         func testClaudeRPCEWrapperMarkerDetection() {
             let generated = CLIPathInstaller.test_claudeRPScriptContent()
             XCTAssertTrue(generated.contains("# claude-rpce: Claude Code wrapper configured for RepoPrompt CE"))
+            XCTAssertTrue(generated.contains("command -v claude"))
+            XCTAssertTrue(generated.contains("$HOME/.claude/local/claude"))
+            XCTAssertTrue(generated.contains("exec \"$claude_bin\""))
             XCTAssertTrue(CLIPathInstaller.test_isManagedClaudeRPScript(generated))
             XCTAssertTrue(CLIPathInstaller.test_isManagedClaudeRPScript("# claude-rp-ce: Claude Code wrapper configured for RepoPrompt CE\n"))
             XCTAssertFalse(CLIPathInstaller.test_isManagedClaudeRPScript("#!/bin/bash\necho '# claude-rpce: Claude Code wrapper configured for RepoPrompt CE'\n"))

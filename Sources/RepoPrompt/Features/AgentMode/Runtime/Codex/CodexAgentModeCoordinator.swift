@@ -3979,7 +3979,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
         } catch {
             var effectiveError: Error = error
-            var providerErrorRecorded = false
             if session.runState.isActive,
                let runID = session.runID,
                CodexManagedAuthRecoveryClassifier.isRecoverable(message: error.localizedDescription),
@@ -3989,11 +3988,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 switch await authRecovery.refreshManagedAccount() {
                 case let .requiresUserLogin(guidance):
-                    providerErrorRecorded = true
                     _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required-during-start")
                     effectiveError = AIProviderError.invalidConfiguration(detail: guidance)
                 case let .executableUnavailable(message):
-                    providerErrorRecorded = true
                     effectiveError = AIProviderError.invalidConfiguration(detail: message)
                 case .recovered:
                     let expectedController = session.codexController
@@ -4205,7 +4202,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let hadResumeEligibleCodexHistoryBeforeSend = Self.hasResumeEligibleCodexHistory(session.items)
         session.waitingPrompt = nil
         clearCodexNativeToolLiveness(session)
-        setRunningStatus("Connecting…", source: .transport, session: session, urgent: true)
+        setRunningStatus("Initializing…", source: .transport, session: session, urgent: true)
         session.runState = .running
         let sendStartedAt = Date()
         session.codexLastEventAt = sendStartedAt

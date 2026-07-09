@@ -4,6 +4,23 @@ import Foundation
 import XCTest
 
 final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
+    func testSpawnedChildStartsInOwnProcessGroup() throws {
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "printf 'ready\n'; exec /bin/cat >/dev/null"],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil
+        )
+        defer { Self.cleanup(spawned) }
+
+        XCTAssertEqual(spawned.processGroupID, spawned.pid)
+        XCTAssertEqual(Darwin.getpgid(spawned.pid), spawned.pid)
+
+        spawned.stdin?.closeFile()
+        _ = spawned.stdout.readDataToEndOfFile()
+        _ = try Self.waitForExit(spawned.pid)
+    }
+
     func testParentPipeEndsHaveCloseOnExecAndChildStdioStillWorks() throws {
         let spawned = try ProcessLauncher.spawn(
             command: "/bin/sh",

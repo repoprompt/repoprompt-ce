@@ -7,6 +7,7 @@ extension SentryTelemetryBootstrap {
         case agentTool = "agent.tool"
         case agentRuntime = "agent.runtime"
         case appLifecycle = "app.lifecycle"
+        case cliPath = "cli.path"
         case contextBuilderAction = "context_builder.action"
         case mcpBootstrap = "mcp.bootstrap"
         case mcpTool = "mcp.tool"
@@ -36,6 +37,7 @@ extension SentryTelemetryBootstrap {
         case contextBuilderCompleted = "context_builder.completed"
         case contextBuilderFailed = "context_builder.failed"
         case contextBuilderStarted = "context_builder.started"
+        case cliPathResolutionFailed = "cli.path_resolution.failed"
         case mcpBootstrapAccepted = "mcp.bootstrap.accepted"
         case mcpBootstrapRejected = "mcp.bootstrap.rejected"
         case mcpServerStarted = "mcp.server.started"
@@ -95,6 +97,7 @@ extension SentryTelemetryBootstrap {
         case agentRunDuration = "agent.run.duration"
         case agentRunSessionStarts = "agent.run.session.starts"
         case agentRuntimeEvents = "agent.runtime.events"
+        case cliPathResolutionFailures = "cli.path_resolution.failures"
         case mcpExternalSessionStarts = "mcp.external.session.starts"
     }
 
@@ -327,6 +330,7 @@ extension SentryTelemetryBootstrap {
         case resultCount(Int)
         case runtimeEvent(RuntimeEvent)
         case selectionFileCount(Int)
+        case shellEnvironmentSource(ShellEnvironmentSource?)
         case tokenBudgetBucket(TokenBudgetBucket)
         case toolCallCount(Int)
         case toolDomain(ToolDomain)
@@ -339,7 +343,8 @@ extension SentryTelemetryBootstrap {
             "error_kind", "has_provider_resume_session", "is_child_session", "is_error",
             "limit_hit", "message_count", "message_role", "model_family", "outcome",
             "protocol_version", "provider_error_kind", "provider_kind", "result_count", "runtime_event",
-            "selection_file_count", "token_budget_bucket", "tool_call_count", "tool_domain", "tool_name",
+            "selection_file_count", "shell_environment_source", "token_budget_bucket", "tool_call_count", "tool_domain",
+            "tool_name",
             "workspace_action"
         ]
 
@@ -370,6 +375,7 @@ extension SentryTelemetryBootstrap {
             case .resultCount: "result_count"
             case .runtimeEvent: "runtime_event"
             case .selectionFileCount: "selection_file_count"
+            case .shellEnvironmentSource: "shell_environment_source"
             case .tokenBudgetBucket: "token_budget_bucket"
             case .toolCallCount: "tool_call_count"
             case .toolDomain: "tool_domain"
@@ -405,6 +411,7 @@ extension SentryTelemetryBootstrap {
             case let .resultCount(count): SentryTelemetryValue.formatCount(count)
             case let .runtimeEvent(event): event.rawValue
             case let .selectionFileCount(count): SentryTelemetryValue.formatCount(count)
+            case let .shellEnvironmentSource(source): SentryTelemetryValue.formatShellEnvironmentSource(source)
             case let .tokenBudgetBucket(bucket): bucket.rawValue
             case let .toolCallCount(count): SentryTelemetryValue.formatCount(count)
             case let .toolDomain(domain): domain.rawValue
@@ -434,5 +441,19 @@ enum SentryTelemetryValue {
     static func formatCount(_ value: Int) -> String? {
         guard value >= 0 else { return nil }
         return String(min(value, maxCount))
+    }
+
+    static func formatShellEnvironmentSource(_ source: ShellEnvironmentSource?) -> String? {
+        guard let source else { return nil }
+        switch source {
+        case .capturedLoginShell:
+            return "captured_login_shell"
+        case .enrichedFallback:
+            return "enriched_fallback"
+        case .inheritedRichEnvironment:
+            return "inherited_rich_environment"
+        case .previousCapturedFallback:
+            return "previous_captured_fallback"
+        }
     }
 }

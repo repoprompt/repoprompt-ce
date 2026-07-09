@@ -20,6 +20,7 @@ struct WindowContentView: View {
 
     var body: some View {
         ContentView(windowState: windowState)
+            .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner() }
             .environmentObject(windowState) // If your subviews need it
             .environmentObject(sparkleManager)
             .environmentObject(versionManager) // Pass versionManager to ContentView

@@ -45,7 +45,7 @@ When preparing computed-outgoing-range local PR evidence, when a maintainer requ
 .agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready
 ```
 
-`pr-ready` reruns the push safety gate, then runs any matching path-selected heavyweight lanes for the computed outgoing range, such as conductor selftests, Swift lint, root/provider tests, product builds, and generated Xcode workspace validation for Xcode boundary changes. It does not replace explicit release validation, live smoke, already-pushed PR-base comparison, or destructive-operation approval requirements.
+`pr-ready` reruns the push safety gate, then runs any matching path-selected heavyweight lanes for the computed outgoing range, such as conductor selftests, Swift lint, root/provider tests, product builds, and generated Xcode workspace validation for Xcode boundary changes. Heavy build/test/package lanes may wait on conductor's per-user global heavy slot when another worktree is already running Swift/Xcode-heavy work; treat that as coordination, not a reason to launch duplicate direct `swift`/`xcodebuild` commands. It does not replace explicit release validation, live smoke, already-pushed PR-base comparison, or destructive-operation approval requirements.
 
 ## Escalate before destructive operations
 

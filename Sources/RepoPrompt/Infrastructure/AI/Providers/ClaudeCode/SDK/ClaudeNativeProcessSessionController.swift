@@ -242,8 +242,9 @@ final actor ClaudeNativeProcessSessionController {
     ///
     /// Normal owners must call async `shutdown()`, which can reap the process and
     /// clear expected PID registrations. `deinit` cannot await that path, so this
-    /// method releases file-handle callbacks, closes stdin, sends SIGTERM to any
-    /// still-owned child process, and schedules expected-PID cleanup on the MCP actor.
+    /// method releases file-handle callbacks, closes stdin, sends SIGTERM to the
+    /// child process family, schedules group-aware termination/reaping, and schedules
+    /// expected-PID cleanup on the MCP actor.
     ///
     /// The non-blocking `waitpid(WNOHANG)` here will usually return before the
     /// child exits, leaving a zombie. A detached `Task` is scheduled to reap the
@@ -255,14 +256,19 @@ final actor ClaudeNativeProcessSessionController {
 
         if let process {
             let pid = process.pid
-            _ = Darwin.kill(pid, SIGTERM)
+            let processGroupID = process.processGroupID
+            ProcessTermination.signalProcessGroupOrPID(
+                pid: pid,
+                processGroupID: processGroupID,
+                signal: SIGTERM
+            )
             var status: Int32 = 0
             _ = Darwin.waitpid(pid, &status, WNOHANG)
             // Schedule an async reap so the child is collected even if the
             // non-blocking waitpid above did not reap it. The detached task is
             // cancellation-shielded by design — the actor is already gone.
             Task.detached(priority: .utility) {
-                _ = await ProcessTermination.terminateAndReap(pid: pid)
+                _ = await ProcessTermination.terminateAndReap(pid: pid, processGroupID: processGroupID)
             }
         }
 
@@ -525,6 +531,7 @@ final actor ClaudeNativeProcessSessionController {
             let pid = process.pid
             _ = await ProcessTermination.terminateAndReap(
                 pid: pid,
+                processGroupID: process.processGroupID,
                 logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
             )
         }
@@ -625,6 +632,7 @@ final actor ClaudeNativeProcessSessionController {
             process = nil
             _ = await ProcessTermination.terminateAndReap(
                 pid: spawned.pid,
+                processGroupID: spawned.processGroupID,
                 logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
             )
             throw ControllerError.initializationFailed("Failed to start Claude process readers: \(error.localizedDescription)")

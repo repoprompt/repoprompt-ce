@@ -176,7 +176,7 @@ final class AppSettingsMCPService: Service {
         let definition = try AppSettingsMCPRegistry.definition(forKey: key)
         let normalizedValue = try definition.validate(rawValue)
 
-        let result = try await MainActor.run { () throws -> (oldValue: Value, newValue: Value, changed: Bool, applied: Bool) in
+        let result = try await MainActor.run { () throws -> (oldValue: Value, newValue: Value, changed: Bool, applied: Bool, persistenceBlockReason: GlobalSettingsPersistenceBlockReason?) in
             let oldValue = definition.read(store)
             let changed = !Self.valuesEqual(oldValue, normalizedValue)
             if changed {
@@ -185,10 +185,10 @@ final class AppSettingsMCPService: Service {
             }
             let newValue = definition.read(store)
             definition.afterSet?(store, newValue, changed, notificationCenter)
-            return (oldValue, newValue, changed, changed)
+            return (oldValue, newValue, changed, changed, store.persistenceBlockReason)
         }
 
-        return .object([
+        var response: [String: Value] = [
             "op": .string("set"),
             "status": .string("ok"),
             "key": .string(definition.key),
@@ -196,7 +196,13 @@ final class AppSettingsMCPService: Service {
             "new_value": result.newValue,
             "changed": .bool(result.changed),
             "applied": .bool(result.applied)
-        ])
+        ]
+        if let reason = result.persistenceBlockReason {
+            response["persistence_blocked"] = .bool(true)
+            response["persistence_block_reason"] = .string(Self.persistenceBlockReasonCode(reason))
+            response["persistence_warning"] = .string(Self.persistenceBlockWarning(reason))
+        }
+        return .object(response)
     }
 
     private func options(_ args: [String: Value]) async throws -> Value {
@@ -295,6 +301,32 @@ final class AppSettingsMCPService: Service {
 
     private static func valuesEqual(_ lhs: Value, _ rhs: Value) -> Bool {
         ToolOutputFormatter.rawJSONString(lhs) == ToolOutputFormatter.rawJSONString(rhs)
+    }
+
+    private static func persistenceBlockReasonCode(_ reason: GlobalSettingsPersistenceBlockReason) -> String {
+        switch reason {
+        case .unsupportedFutureSchema:
+            "unsupported_future_schema"
+        case .incompatibleSchema:
+            "incompatible_schema"
+        case .corruptUnrecoverable:
+            "corrupt_unrecoverable"
+        case .saveFailed:
+            "save_failed"
+        }
+    }
+
+    private static func persistenceBlockWarning(_ reason: GlobalSettingsPersistenceBlockReason) -> String {
+        switch reason {
+        case let .unsupportedFutureSchema(onDiskVersion, supportedVersion):
+            "Setting was applied in memory, but globalSettings.json is schema v\(onDiskVersion), newer than this RepoPrompt build supports (v\(supportedVersion)); it will not persist until the settings file is recovered."
+        case .incompatibleSchema:
+            "Setting was applied in memory, but globalSettings.json was written by a different or unrecognized RepoPrompt settings schema; it will not persist until the settings file is imported or recovered."
+        case .corruptUnrecoverable:
+            "Setting was applied in memory, but globalSettings.json is unreadable and could not be backed up; it will not persist until the settings file is recovered."
+        case .saveFailed:
+            "Setting was applied in memory, but RepoPrompt could not write globalSettings.json; it will not persist until saving succeeds."
+        }
     }
 
     private func parseOptionalString(_ value: Value?, parameter: String) throws -> String? {

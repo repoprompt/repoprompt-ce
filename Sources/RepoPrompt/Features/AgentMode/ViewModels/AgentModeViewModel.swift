@@ -103,7 +103,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private var sessionActivationGeneration: Int = 0
-    private var workspaceSwitchInFlight = false
+    private(set) var workspaceSwitchInFlight = false
 
     /// Working-thread rows for the active tab. This is the bounded equilibrium view.
     var items: [AgentChatItem] {
@@ -685,6 +685,10 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setCurrentTabIDOverride(_ tabID: UUID?) {
             test_currentTabIDOverride = tabID
+        }
+
+        func test_setWorkspaceSwitchInFlight(_ isInFlight: Bool) {
+            workspaceSwitchInFlight = isInFlight
         }
 
         func test_setSidebarAutoArchiveDependencies(
@@ -14497,6 +14501,9 @@ final class AgentModeViewModel: ObservableObject {
         }
         if validateSubmissionToken, session?.composerSubmissionToken != target.expectedSubmissionToken {
             return "submission_token_mismatch"
+        }
+        if workspaceSwitchInFlight, (target.expectedInitialStartLocation ?? .local) == .local {
+            return "workspace_switch_in_flight"
         }
 
         switch target.route {

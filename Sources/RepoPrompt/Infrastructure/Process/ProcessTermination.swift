@@ -95,22 +95,74 @@ enum ProcessTermination {
         return rawStatus
     }
 
+    private static func safeProcessGroupID(_ processGroupID: pid_t?) -> pid_t? {
+        guard let processGroupID, processGroupID > 0 else { return nil }
+        // Never signal our own group; provider cleanup must not be able to take down
+        // RepoPrompt or the test runner if metadata is wrong or a PID/PGID was reused.
+        // A stale PGID could theoretically be reused by an unrelated process family
+        // after the original group exits; cleanup callers keep the TERM→KILL window
+        // short and only pass PGIDs returned from ProcessLauncher.spawn.
+        guard processGroupID != getpgrp() else { return nil }
+        return processGroupID
+    }
+
+    private static func processGroupExists(_ processGroupID: pid_t?) -> Bool {
+        guard let processGroupID = safeProcessGroupID(processGroupID) else { return false }
+        if killpg(processGroupID, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    @discardableResult
+    static func signalProcessGroupOrPID(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        signal: Int32,
+        logger: (String) -> Void = { _ in }
+    ) -> Bool {
+        if let processGroupID = safeProcessGroupID(processGroupID) {
+            if killpg(processGroupID, signal) == 0 { return true }
+            if errno != ESRCH {
+                let message = String(cString: strerror(errno))
+                logger("killpg(\(processGroupID), \(signal)) failed: \(message); falling back to pid \(pid)")
+            }
+        }
+        if kill(pid, signal) == 0 { return true }
+        if errno != ESRCH {
+            let message = String(cString: strerror(errno))
+            logger("kill(\(pid), \(signal)) failed: \(message)")
+        }
+        return false
+    }
+
     private static func waitForExitUntil(
         pid: pid_t,
+        processGroupID: pid_t?,
         status: inout Int32,
         deadline: TimeInterval,
         pollIntervalNs: UInt64,
+        waitForProcessGroupExit: Bool,
         logger: (String) -> Void
     ) async -> Bool {
+        var rootExited = false
         while ProcessInfo.processInfo.systemUptime < deadline {
-            let r = waitpid(pid, &status, WNOHANG)
-            if r == pid { return true }
-            if r == -1, errno == EINTR { continue }
-            if r == -1, errno == ECHILD { return true }
-            if r == -1 {
-                let message = String(cString: strerror(errno))
-                logger("waitpid failed while reaping process \(pid): \(message)")
-                return false
+            if !rootExited {
+                let r = waitpid(pid, &status, WNOHANG)
+                if r == pid {
+                    rootExited = true
+                } else if r == -1, errno == EINTR {
+                    continue
+                } else if r == -1, errno == ECHILD {
+                    rootExited = true
+                } else if r == -1 {
+                    let message = String(cString: strerror(errno))
+                    logger("waitpid failed while reaping process \(pid): \(message)")
+                    return false
+                }
+            }
+            if rootExited {
+                if !waitForProcessGroupExit || !processGroupExists(processGroupID) {
+                    return true
+                }
             }
             try? await Task.sleep(nanoseconds: pollIntervalNs)
         }
@@ -119,6 +171,7 @@ enum ProcessTermination {
 
     private static func terminateAndReap(
         pid: pid_t,
+        processGroupID: pid_t?,
         status: inout Int32,
         sigtermGrace: TimeInterval,
         sigkillGrace: TimeInterval,
@@ -127,36 +180,41 @@ enum ProcessTermination {
         let shortPollNs = UInt64(pollInterval * 1_000_000_000)
         var lastSignal: Int32?
 
-        if kill(pid, SIGTERM) == 0 {
+        if signalProcessGroupOrPID(pid: pid, processGroupID: processGroupID, signal: SIGTERM, logger: logger) {
             lastSignal = SIGTERM
-        } else if errno == ESRCH {
-            return normalizedExitCode(status)
+        } else {
+            logger("Process \(pid) could not be signaled with SIGTERM; waiting for exit/reap")
         }
 
+        let waitForProcessGroupExit = safeProcessGroupID(processGroupID) != nil
         let sigtermDeadline = ProcessInfo.processInfo.systemUptime + max(sigtermGrace, 0)
         if await waitForExitUntil(
             pid: pid,
+            processGroupID: processGroupID,
             status: &status,
             deadline: sigtermDeadline,
             pollIntervalNs: shortPollNs,
+            waitForProcessGroupExit: waitForProcessGroupExit,
             logger: logger
         ) {
             return normalizedExitCode(status)
         }
 
-        logger("Process \(pid) did not exit after SIGTERM; sending SIGKILL")
-        if kill(pid, SIGKILL) == 0 {
+        logger("Process \(pid) family did not exit after SIGTERM; sending SIGKILL")
+        if signalProcessGroupOrPID(pid: pid, processGroupID: processGroupID, signal: SIGKILL, logger: logger) {
             lastSignal = SIGKILL
-        } else if errno == ESRCH {
-            return normalizedExitCode(status)
+        } else {
+            logger("Process \(pid) could not be signaled with SIGKILL; waiting for exit/reap")
         }
 
         let sigkillDeadline = ProcessInfo.processInfo.systemUptime + max(sigkillGrace, 0)
         if await waitForExitUntil(
             pid: pid,
+            processGroupID: processGroupID,
             status: &status,
             deadline: sigkillDeadline,
             pollIntervalNs: shortPollNs,
+            waitForProcessGroupExit: waitForProcessGroupExit,
             logger: logger
         ) {
             return normalizedExitCode(status)
@@ -170,6 +228,7 @@ enum ProcessTermination {
 
     static func waitForTermination(
         pid: pid_t,
+        processGroupID: pid_t?,
         timeout: TimeInterval?,
         logger: (String) -> Void = { _ in }
     ) async throws -> (exitCode: Int32, timedOut: Bool) {
@@ -192,6 +251,7 @@ enum ProcessTermination {
                     logger("Process cancelled; terminating")
                     let code = await terminateAndReap(
                         pid: pid,
+                        processGroupID: processGroupID,
                         status: &status,
                         sigtermGrace: timing.sigtermGrace,
                         sigkillGrace: timing.sigkillGrace,
@@ -208,6 +268,7 @@ enum ProcessTermination {
                         logger("Process timed out after \(timeout) seconds; sending SIGTERM")
                         let code = await terminateAndReap(
                             pid: pid,
+                            processGroupID: processGroupID,
                             status: &status,
                             sigtermGrace: timing.sigtermGrace,
                             sigkillGrace: timing.sigkillGrace,
@@ -233,6 +294,7 @@ enum ProcessTermination {
                 logger("Process cancelled; terminating")
                 let code = await terminateAndReap(
                     pid: pid,
+                    processGroupID: processGroupID,
                     status: &status,
                     sigtermGrace: timing.sigtermGrace,
                     sigkillGrace: timing.sigkillGrace,
@@ -258,6 +320,7 @@ enum ProcessTermination {
 
     static func terminateAndReap(
         pid: pid_t,
+        processGroupID: pid_t?,
         sigtermGrace: TimeInterval? = nil,
         sigkillGrace: TimeInterval? = nil,
         logger: (String) -> Void = { _ in }
@@ -266,6 +329,7 @@ enum ProcessTermination {
         let timing = currentTiming()
         return await terminateAndReap(
             pid: pid,
+            processGroupID: processGroupID,
             status: &status,
             sigtermGrace: sigtermGrace ?? timing.sigtermGrace,
             sigkillGrace: sigkillGrace ?? timing.sigkillGrace,

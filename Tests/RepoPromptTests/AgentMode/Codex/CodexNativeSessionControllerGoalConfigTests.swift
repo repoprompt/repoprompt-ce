@@ -160,6 +160,40 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertEqual(initialized["hasParams"] as? Bool, false)
     }
 
+    func testOptionalMemoryModeRetriesDoNotFailStartup() async throws {
+        let options = CodexNativeSessionController.Options(
+            requestTimeout: 0.2,
+            configOverridesProvider: { [:] },
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            authTokensRefreshHandler: nil
+        )
+        let (controller, recordURL) = try await makeController(
+            options: options,
+            ignoreMemoryModeRequests: true
+        )
+
+        let startedAt = Date()
+        let ref = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertEqual(ref.conversationID, "fresh-thread")
+        XCTAssertLessThan(elapsed, 30.0)
+        let memoryModeRequests = try recordedRequests(for: "thread/memoryMode/set", at: recordURL)
+        XCTAssertGreaterThanOrEqual(memoryModeRequests.count, 2)
+        let memoryModeParams = try XCTUnwrap(memoryModeRequests.first?["params"] as? [String: Any])
+        XCTAssertEqual(memoryModeParams["threadId"] as? String, "fresh-thread")
+        XCTAssertEqual(memoryModeParams["mode"] as? String, "disabled")
+
+        let requestCountAfterBackgroundRetry = try await waitForRecordedRequestCount(
+            for: "thread/memoryMode/set",
+            at: recordURL,
+            minimumCount: 3
+        )
+        await controller.shutdown()
+        XCTAssertGreaterThanOrEqual(requestCountAfterBackgroundRetry, 3)
+    }
+
     func testResumeRequiresThreadIDAndIncludesOptionalPath() async throws {
         let (controller, recordURL) = try await makeController(options: makeOptions())
         let existing = CodexNativeSessionController.SessionRef(
@@ -326,7 +360,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     }
 
     private func makeController(
-        options: CodexNativeSessionController.Options
+        options: CodexNativeSessionController.Options,
+        ignoreMemoryModeRequests: Bool = false
     ) async throws -> (CodexNativeSessionController, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
@@ -334,7 +369,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         temporaryDirectories.append(directory)
 
         let recordURL = directory.appendingPathComponent("requests.jsonl")
-        let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
+        let executableURL = try makeFakeCodexAppServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoreMemoryModeRequests: ignoreMemoryModeRequests
+        )
         let client = CodexAppServerClient()
         await client.updateConfig(
             CodexAppServerClient.Config(
@@ -357,7 +396,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         return (controller, recordURL)
     }
 
-    private func makeFakeCodexAppServer(in directory: URL, recordURL: URL) throws -> URL {
+    private func makeFakeCodexAppServer(
+        in directory: URL,
+        recordURL: URL,
+        ignoreMemoryModeRequests: Bool = false
+    ) throws -> URL {
         let scriptURL = directory.appendingPathComponent("fake-codex")
         let script = """
         #!/usr/bin/env python3
@@ -365,6 +408,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         import sys
 
         record_path = \(String(reflecting: recordURL.path))
+        ignore_memory_mode_requests = \(ignoreMemoryModeRequests ? "True" : "False")
 
         with open(record_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"method": "__process_args", "argv": sys.argv[1:]}) + "\\n")
@@ -384,6 +428,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 handle.write(json.dumps({"method": method, "hasParams": has_params, "params": params}) + "\\n")
             if "id" not in request:
                 continue
+            if method == "thread/memoryMode/set" and ignore_memory_mode_requests:
+                continue
             if method == "thread/start":
                 respond(request["id"], {"thread": {"id": "fresh-thread", "status": "idle", "turns": []}})
             elif method == "thread/resume":
@@ -399,6 +445,35 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     private func recordedParams(for method: String, at recordURL: URL) throws -> [String: Any] {
         let request = try recordedRequest(for: method, at: recordURL)
         return try XCTUnwrap(request["params"] as? [String: Any])
+    }
+
+    private func waitForRecordedRequestCount(
+        for method: String,
+        at recordURL: URL,
+        minimumCount: Int,
+        timeout: TimeInterval = 2
+    ) async throws -> Int {
+        let deadline = Date().addingTimeInterval(timeout)
+        var latestCount = try recordedRequests(for: method, at: recordURL).count
+        while latestCount < minimumCount, Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            latestCount = try recordedRequests(for: method, at: recordURL).count
+        }
+        return latestCount
+    }
+
+    private func recordedRequests(for method: String, at recordURL: URL) throws -> [[String: Any]] {
+        let data = try Data(contentsOf: recordURL)
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        var requests: [[String: Any]] = []
+        for line in text.split(whereSeparator: { $0.isNewline }) {
+            let lineData = try XCTUnwrap(String(line).data(using: .utf8))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: lineData) as? [String: Any])
+            if object["method"] as? String == method {
+                requests.append(object)
+            }
+        }
+        return requests
     }
 
     private func recordedProcessArguments(at recordURL: URL) throws -> [String] {

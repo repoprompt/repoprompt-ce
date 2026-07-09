@@ -59,4 +59,45 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertEqual(setFalse.objectValue?["changed"]?.boolValue, true)
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
     }
+
+    func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let futureJSON = #"{"schemaVersion":999,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{},"scalarPreferences":{}}"#
+        try Data(futureJSON.utf8).write(to: fileURL)
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(
+            store.persistenceBlockReason,
+            .unsupportedFutureSchema(onDiskVersion: 999, supportedVersion: GlobalSettingsDocument.currentSchemaVersion)
+        )
+
+        let service = AppSettingsMCPService(store: store)
+        let key = "agent_mode.codex_reasoning_summaries_enabled"
+        let result = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string(key),
+            "value": .bool(true)
+        ])
+
+        XCTAssertEqual(result.objectValue?["status"]?.stringValue, "ok")
+        XCTAssertEqual(result.objectValue?["changed"]?.boolValue, true)
+        XCTAssertEqual(result.objectValue?["new_value"]?.boolValue, true)
+        XCTAssertEqual(result.objectValue?["persistence_blocked"]?.boolValue, true)
+        XCTAssertEqual(result.objectValue?["persistence_block_reason"]?.stringValue, "unsupported_future_schema")
+        XCTAssertTrue(result.objectValue?["persistence_warning"]?.stringValue?.contains("will not persist") ?? false)
+        XCTAssertTrue(store.codexReasoningSummariesEnabled())
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), futureJSON)
+    }
 }

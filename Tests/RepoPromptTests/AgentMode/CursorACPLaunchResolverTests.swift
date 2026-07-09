@@ -431,7 +431,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             "/first/cursor-agent: first failure",
             "/second/cursor-agent: second failure"
         ]
-        let error = CursorACPLaunchResolutionError.noValidLaunchCandidate("cursor-agent", failures)
+        let error = CursorACPLaunchResolutionError.noValidLaunchCandidate("cursor-agent", failures, nil)
 
         XCTAssertEqual(
             error.errorDescription,

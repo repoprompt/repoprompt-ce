@@ -428,12 +428,12 @@ actor ACPAgentSessionController {
             spawned.stderr.readabilityHandler = nil
             spawned.stdin?.closeFile()
             process = nil
-            _ = await ProcessTermination.terminateAndReap(pid: spawned.pid)
+            _ = await ProcessTermination.terminateAndReap(pid: spawned.pid, processGroupID: spawned.processGroupID)
             state = .failed
             throw ControllerError.protocolViolation("Failed to start ACP process readers: \(error.localizedDescription)")
         }
         await registerExpectedAgentPIDIfNeeded(spawned.pid)
-        startProcessWaitTask(for: spawned.pid)
+        startProcessWaitTask(for: spawned)
         await recordRunLaunchContract(
             event: "acp_launch_contract_resolved",
             resolvedCommand: resolvedCommand,
@@ -997,7 +997,7 @@ actor ACPAgentSessionController {
             process.stdout.readabilityHandler = nil
             process.stderr.readabilityHandler = nil
             process.stdin?.closeFile()
-            _ = await ProcessTermination.terminateAndReap(pid: process.pid)
+            _ = await ProcessTermination.terminateAndReap(pid: process.pid, processGroupID: process.processGroupID)
         }
 
         await clearExpectedAgentPIDIfNeeded()
@@ -1064,10 +1064,14 @@ actor ACPAgentSessionController {
         }
     }
 
-    private func startProcessWaitTask(for pid: pid_t) {
+    private func startProcessWaitTask(for process: SpawnedProcess) {
         processWaitTask = Task { [weak self] in
             guard let self else { return }
-            let result = try? await ProcessTermination.waitForTermination(pid: pid, timeout: nil)
+            let result = try? await ProcessTermination.waitForTermination(
+                pid: process.pid,
+                processGroupID: process.processGroupID,
+                timeout: nil
+            )
             await handleProcessExit(result?.exitCode ?? 0, timedOut: result?.timedOut ?? false)
         }
     }

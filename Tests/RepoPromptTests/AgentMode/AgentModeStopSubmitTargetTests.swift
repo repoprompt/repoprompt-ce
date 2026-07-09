@@ -4,6 +4,37 @@ import XCTest
 
 @MainActor
 final class AgentModeStopSubmitTargetTests: XCTestCase {
+    func testComposerSubmitTargetIsUnavailableDuringWorkspaceSwitchInFlight() throws {
+        let vm = makeViewModel()
+        let tabID = UUID()
+        let session = vm.session(for: tabID)
+        vm.test_setCurrentTabIDOverride(tabID)
+        defer { vm.test_setCurrentTabIDOverride(nil) }
+
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+
+        vm.test_setWorkspaceSwitchInFlight(true)
+        XCTAssertNil(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        XCTAssertNil(vm.makeComposerProps(tabID: tabID).submitTarget)
+
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 0,
+            noticeRevision: 0,
+            rawDraftSnapshot: "test"
+        )
+        switch vm.claimComposerSubmitAttempt(attempt) {
+        case .claimed:
+            XCTFail("Workspace switch should reject a pre-rendered local submit target")
+        case let .rejected(rejection):
+            XCTAssertEqual(rejection, .targetRejected(reason: "workspace_switch_in_flight"))
+        }
+
+        vm.test_setWorkspaceSwitchInFlight(false)
+        XCTAssertNotNil(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+    }
+
     func testComposerCancelTargetUsesExplicitTabSessionIdentity() throws {
         let vm = makeViewModel()
         let runningTabID = UUID()

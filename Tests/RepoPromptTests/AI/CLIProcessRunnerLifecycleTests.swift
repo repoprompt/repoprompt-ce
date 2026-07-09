@@ -100,6 +100,126 @@ final class CLIProcessRunnerLifecycleTests: XCTestCase {
         XCTAssertEqual(snapshot.terminatedPID, snapshot.startedPID)
     }
 
+    func testCancelAllTerminatesReparentedSameProcessGroupDescendant() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cli-runner-reparented-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: marker) }
+
+        let runner = CLIProcessRunner(
+            config: CLIProcessConfiguration(command: "/bin/sh", enableDebugLogging: false)
+        )
+
+        let stream = try await runner.runStreaming(
+            args: [
+                "-c",
+                "( /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"$1\"; while :; do sleep 1; done' child \"$1\" & ); while :; do sleep 1; done",
+                "root",
+                marker.path
+            ],
+            stdin: nil,
+            outputMode: .none,
+            timeout: 30
+        )
+
+        let consumer = Task {
+            do {
+                for try await _ in stream {}
+            } catch {}
+        }
+        defer { consumer.cancel() }
+
+        let descendantPID = try await Self.waitForPIDFile(marker)
+        defer {
+            if Self.processExists(descendantPID) {
+                _ = Darwin.kill(descendantPID, SIGKILL)
+            }
+        }
+        XCTAssertTrue(Self.processExists(descendantPID))
+
+        await runner.cancelAll()
+        consumer.cancel()
+        _ = await consumer.result
+
+        let descendantGone = await Self.waitUntilProcessGone(descendantPID)
+        XCTAssertTrue(
+            descendantGone,
+            "Reparented same-process-group descendant should be killed during runner cancellation"
+        )
+    }
+
+    func testTerminateAndReapUsesSpawnedProcessGroupForDirectProviderStyleProcess() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("direct-provider-reparented-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: marker) }
+
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: [
+                "-c",
+                "( /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"$1\"; while :; do sleep 1; done' child \"$1\" & ); while :; do sleep 1; done",
+                "root",
+                marker.path
+            ],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil
+        )
+        spawned.stdin?.closeFile()
+        spawned.stdout.closeFile()
+        spawned.stderr.closeFile()
+
+        let descendantPID = try await Self.waitForPIDFile(marker)
+        defer {
+            if Self.processExists(descendantPID) {
+                _ = Darwin.kill(descendantPID, SIGKILL)
+            }
+            if Self.processExists(spawned.pid) {
+                _ = Darwin.kill(spawned.pid, SIGKILL)
+            }
+        }
+        XCTAssertEqual(spawned.processGroupID, spawned.pid)
+        XCTAssertTrue(Self.processExists(descendantPID))
+
+        _ = await ProcessTermination.terminateAndReap(
+            pid: spawned.pid,
+            processGroupID: spawned.processGroupID,
+            sigtermGrace: 0.2,
+            sigkillGrace: 1.0
+        )
+
+        let descendantGone = await Self.waitUntilProcessGone(descendantPID)
+        XCTAssertTrue(
+            descendantGone,
+            "Direct provider-style ProcessLauncher shutdown should kill same-process-group descendants"
+        )
+    }
+
+    private static func waitForPIDFile(_ url: URL, timeout: TimeInterval = 3) async throws -> pid_t {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let text = try? String(contentsOf: url, encoding: .utf8),
+               let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            {
+                return value
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        throw CLIProcessRunnerLifecycleTestError.pidFileTimedOut
+    }
+
+    private static func waitUntilProcessGone(_ pid: pid_t, timeout: TimeInterval = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !processExists(pid) { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return !processExists(pid)
+    }
+
+    private static func processExists(_ pid: pid_t) -> Bool {
+        if Darwin.kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
     private static func makeLifecycleFIFO(prefix: String) throws -> (url: URL, gateFD: Int32) {
         let directory = FileManager.default.temporaryDirectory
         let fifoURL = directory.appendingPathComponent("\(prefix)-\(UUID().uuidString).fifo")
@@ -128,6 +248,10 @@ final class CLIProcessRunnerLifecycleTests: XCTestCase {
         }
         return (fifoURL, gateFD)
     }
+}
+
+private enum CLIProcessRunnerLifecycleTestError: Error {
+    case pidFileTimedOut
 }
 
 private actor ProcessLifecycleRecorder {

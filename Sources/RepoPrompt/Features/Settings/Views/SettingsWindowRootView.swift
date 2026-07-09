@@ -19,6 +19,7 @@ struct SettingsWindowRootView: View {
             selectedTab: $model.selectedTab,
             closeAction: nil
         )
+        .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner() }
         .environmentObject(windowState)
         .environmentObject(windowState.workspaceManager)
         .environmentObject(WindowStatesManager.shared)

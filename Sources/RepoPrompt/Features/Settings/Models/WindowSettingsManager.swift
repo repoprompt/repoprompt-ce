@@ -7,6 +7,10 @@ import SwiftUI
 /// This allows for dependency injection and testing.
 @MainActor
 protocol SettingsManaging {
+    /// The backing global store. Exposed so window view models can subscribe to its
+    /// `objectWillChange` and re-sync global-derived state when another window mutates it.
+    var globalSettingsStore: GlobalSettingsStore { get }
+
     func copySettings(for workspaceID: UUID) -> CopyGlobalSettings
     func chatSettings(for workspaceID: UUID) -> ChatGlobalSettings
     func updateCopySettings(_ settings: CopyGlobalSettings, commit: Bool?)
@@ -56,6 +60,11 @@ protocol SettingsManaging {
 final class WindowSettingsManager: ObservableObject, SettingsManaging {
     let windowID: Int
     private let store: GlobalSettingsStore
+
+    /// Exposes the backing store so window view models can observe its `objectWillChange`.
+    var globalSettingsStore: GlobalSettingsStore {
+        store
+    }
 
     // Overlay per workspace for THIS WINDOW ONLY
     @Published private var copyOverlays: [UUID: CopyGlobalSettings] = [:]

@@ -9,8 +9,19 @@ import Foundation
 /// accessors without losing current default behavior.
 struct GlobalSettingsDocument: Codable {
     static let currentSchemaVersion = 2
+    /// Lineage marker for settings files written by this open-source CE schema family.
+    ///
+    /// CE inherited numeric schema versions from classic/internal builds, so version numbers
+    /// alone are not globally meaningful. Unlineaged v1/v2 files are accepted as legacy CE
+    /// documents; unlineaged higher versions are treated as foreign/future documents even if
+    /// this fork later reaches the same numeric schema version.
+    static let schemaLineage = "repoprompt-ce.global-settings"
+    /// FROZEN at 2 forever: this is the last schema version OSS CE wrote without
+    /// a lineage marker. It must never track `currentSchemaVersion`.
+    static let legacyUnlineagedSchemaVersionCeiling = 2
 
     var schemaVersion: Int
+    var schemaLineage: String?
     var updatedAt: Date
     var copySettingsByWorkspaceID: [String: CopyGlobalSettings]
     var chatSettingsByWorkspaceID: [String: ChatGlobalSettings]
@@ -26,6 +37,7 @@ struct GlobalSettingsDocument: Codable {
         scalarPreferences: GlobalScalarPreferences? = nil
     ) {
         self.schemaVersion = schemaVersion
+        schemaLineage = Self.schemaLineage
         self.updatedAt = updatedAt
         copySettingsByWorkspaceID = Self.encodeUUIDKeyedDictionary(copySettings)
         chatSettingsByWorkspaceID = Self.encodeUUIDKeyedDictionary(chatSettings)
@@ -49,7 +61,7 @@ struct GlobalSettingsDocument: Codable {
         updatedAt: Date = Date()
     ) -> GlobalSettingsDocument {
         GlobalSettingsDocument(
-            schemaVersion: max(schemaVersion, Self.currentSchemaVersion),
+            schemaVersion: Self.currentSchemaVersion,
             updatedAt: updatedAt,
             copySettings: copySettings,
             chatSettings: chatSettings,
