@@ -10,14 +10,27 @@ class OpenAIProvider: AIProvider {
     private let overrideVersion: String? // Add property for API version override
     private let includeUsageInStream: Bool // Whether to include usage in streamed responses
     private let serviceTier: String? // Service tier for Responses API (auto/default/flex/priority)
+    private let transportPool: OpenAIServiceTransportPool
+    private let transportOwner: AIProviderType
 
-    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil) {
+    init(
+        apiKey: String? = nil,
+        baseURL: URL? = nil,
+        configuredMaxTokens: Int? = nil,
+        overrideVersion: String? = nil,
+        includeUsageInStream: Bool = true,
+        serviceTier: String? = nil,
+        transportPool: OpenAIServiceTransportPool = .shared,
+        transportOwner: AIProviderType = .openAI
+    ) {
         cachedApiKey = apiKey
         cachedBaseURL = baseURL
         self.configuredMaxTokens = configuredMaxTokens
         self.overrideVersion = overrideVersion
         self.includeUsageInStream = includeUsageInStream
         self.serviceTier = serviceTier
+        self.transportPool = transportPool
+        self.transportOwner = transportOwner
     }
 
     // MARK: - Provider-specific overrides
@@ -30,30 +43,12 @@ class OpenAIProvider: AIProvider {
 
     /// Get service using cached values
     open func getService() -> OpenAIService {
-        let apiKey = cachedApiKey ?? ""
-
-        if let baseURL = cachedBaseURL {
-            let configuration = URLSessionConfiguration.default
-            configuration.timeoutIntervalForRequest = 21600 // 6 hours
-            configuration.timeoutIntervalForResource = 21600 // 6 hours
-
-            return OpenAIServiceFactory.service(
-                apiKey: apiKey,
-                overrideBaseURL: baseURL.absoluteString,
-                configuration: configuration,
-                overrideVersion: overrideVersion,
-                includeUsageInStream: includeUsageInStream,
-                debugEnabled: false
-            )
-        }
-
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 21600 // 6 hours
-        configuration.timeoutIntervalForResource = 21600 // 6 hours
-
-        return OpenAIServiceFactory.service(
-            apiKey: apiKey,
-            configuration: configuration
+        transportPool.openAIService(
+            owner: transportOwner,
+            apiKey: cachedApiKey ?? "",
+            baseURL: cachedBaseURL,
+            apiVersion: overrideVersion,
+            includeUsageInStream: includeUsageInStream
         )
     }
 

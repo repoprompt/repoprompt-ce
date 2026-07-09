@@ -2468,7 +2468,8 @@ public class APISettingsViewModel: ObservableObject {
                 baseURL: URL(string: baseURL),
                 configuredMaxTokens: 16,
                 overrideVersion: detectedVersion,
-                includeUsageInStream: false
+                includeUsageInStream: false,
+                transportOwner: .customProvider
             )
 
             let testMessage = AIMessage(

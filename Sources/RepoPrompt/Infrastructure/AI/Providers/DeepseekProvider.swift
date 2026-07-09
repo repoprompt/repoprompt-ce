@@ -15,7 +15,8 @@ final class DeepSeekProvider: OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil,
-            overrideVersion: "v1"
+            overrideVersion: "v1",
+            transportOwner: .deepseek
         )
     }
 

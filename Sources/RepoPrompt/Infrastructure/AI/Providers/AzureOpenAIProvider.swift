@@ -351,21 +351,16 @@ final class AzureOpenAIProvider: AIProvider {
     }
 
     private let configuration: AzureOpenAIConfiguration
-    private lazy var urlSessionConfiguration: URLSessionConfiguration = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 21600 // 6 hours
-        config.timeoutIntervalForResource = 21600 // 6 hours
-        return config
-    }()
+    private let transportPool: OpenAIServiceTransportPool
 
-    private lazy var azureService: OpenAIService = OpenAIServiceFactory.service(
-        azureConfiguration: configuration.toSwiftOpenAIConfiguration,
-        urlSessionConfiguration: urlSessionConfiguration,
+    private lazy var azureService: OpenAIService = transportPool.azureService(
+        configuration: configuration,
         debugEnabled: Self.enableDebugLogging
     )
 
-    init(configuration: AzureOpenAIConfiguration) {
+    init(configuration: AzureOpenAIConfiguration, transportPool: OpenAIServiceTransportPool = .shared) {
         self.configuration = configuration
+        self.transportPool = transportPool
     }
 
     // MARK: - Helpers

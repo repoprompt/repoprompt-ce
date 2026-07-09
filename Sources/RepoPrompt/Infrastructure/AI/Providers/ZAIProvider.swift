@@ -23,7 +23,8 @@ final class ZAIProvider: OpenAIProvider {
             apiKey: apiKey,
             baseURL: endpoint.baseURL,
             configuredMaxTokens: nil,
-            overrideVersion: "v4"
+            overrideVersion: "v4",
+            transportOwner: .zAI
         )
     }
 

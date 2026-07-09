@@ -7,7 +7,8 @@ final class GeminiProvider: OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil,
-            overrideVersion: "v1beta"
+            overrideVersion: "v1beta",
+            transportOwner: .gemini
         )
     }
 

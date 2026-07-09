@@ -127,7 +127,8 @@ class AIProviderFactory {
                     baseURL: baseURL,
                     configuredMaxTokens: configuredMaxTokens,
                     overrideVersion: version,
-                    includeUsageInStream: false
+                    includeUsageInStream: false,
+                    transportOwner: .customProvider
                 )
             }
 
@@ -161,7 +162,7 @@ class BlankProvider: AIProvider {
     func dispose() async {}
 }
 
-enum AIProviderType: Codable, Equatable {
+enum AIProviderType: Codable, Hashable {
     case anthropic
     case openAI
     case ollama

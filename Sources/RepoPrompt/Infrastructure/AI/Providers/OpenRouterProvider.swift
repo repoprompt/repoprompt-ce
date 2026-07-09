@@ -3,18 +3,18 @@ import SwiftOpenAI
 
 class OpenRouterProvider: AIProvider {
     private let cachedApiKey: String
+    private let transportPool: OpenAIServiceTransportPool
 
-    init(apiKey: String) {
+    init(apiKey: String, transportPool: OpenAIServiceTransportPool = .shared) {
         cachedApiKey = apiKey
+        self.transportPool = transportPool
     }
 
     private func getConfiguration() -> OpenRouterConfiguration {
         ProviderConfigurationManager.shared.getOpenRouterConfiguration()
     }
 
-    private func getService() -> OpenAIService {
-        let config = getConfiguration()
-
+    func getService(configuration config: OpenRouterConfiguration) -> OpenAIService {
         // Merge default headers with custom headers
         var headers = [
             "HTTP-Referer": "https://repoprompt.com/",
@@ -28,17 +28,14 @@ class OpenRouterProvider: AIProvider {
             }
         }
 
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 21600 // 6 hours
-        configuration.timeoutIntervalForResource = 21600 // 6 hours
-
-        return OpenAIServiceFactory.service(
+        return transportPool.openAIService(
+            owner: .openRouter,
             apiKey: cachedApiKey,
-            overrideBaseURL: "https://openrouter.ai",
-            configuration: configuration,
+            baseURL: URL(string: "https://openrouter.ai")!,
             proxyPath: "api",
+            apiVersion: nil,
             extraHeaders: headers,
-            debugEnabled: false
+            includeUsageInStream: true
         )
     }
 
@@ -69,7 +66,7 @@ class OpenRouterProvider: AIProvider {
             temperature: effectiveTemperature
         )
 
-        let service = getService()
+        let service = getService(configuration: config)
         let stream = try await service.startStreamedChat(parameters: parameters)
 
         print("Model: \(model.modelName)")
@@ -128,7 +125,7 @@ class OpenRouterProvider: AIProvider {
             temperature: effectiveTemperature
         )
 
-        let service = getService()
+        let service = getService(configuration: config)
         let completion = try await service.startChat(parameters: parameters)
 
         // Extract token usage if available

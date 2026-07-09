@@ -15,7 +15,8 @@ final class FireworksProvider: OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil, // Use model-specific max tokens
-            overrideVersion: "v1"
+            overrideVersion: "v1",
+            transportOwner: .fireworks
         )
     }
 

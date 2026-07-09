@@ -694,7 +694,8 @@ extension OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: 16, // keep the test cheap
-            overrideVersion: split.version
+            overrideVersion: split.version,
+            transportOwner: .customProvider
         )
 
         // ── 3. Perform a tiny completion call ───────────────────────────────

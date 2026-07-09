@@ -15,7 +15,8 @@ final class GroqProvider: OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: 16384, // Set max output tokens to 16,384
-            overrideVersion: "v1"
+            overrideVersion: "v1",
+            transportOwner: .groq
         )
     }
 
