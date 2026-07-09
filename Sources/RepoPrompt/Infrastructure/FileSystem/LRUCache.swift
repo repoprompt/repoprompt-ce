@@ -66,6 +66,13 @@ struct LRUCache<Key: Hashable, Value> {
 
     @discardableResult
     mutating func set(_ value: Value, forKey key: Key) -> Key? {
+        setReturningEvictedEntry(value, forKey: key)?.key
+    }
+
+    /// Inserts or replaces a value and returns the entry evicted by the count limit.
+    /// Replacement is not reported as eviction.
+    @discardableResult
+    mutating func setReturningEvictedEntry(_ value: Value, forKey key: Key) -> (key: Key, value: Value)? {
         insert(key: key, value: value)
     }
 
@@ -93,7 +100,7 @@ struct LRUCache<Key: Hashable, Value> {
     }
 
     @discardableResult
-    private mutating func insert(key: Key, value: Value) -> Key? {
+    private mutating func insert(key: Key, value: Value) -> (key: Key, value: Value)? {
         if let node = dict[key] {
             // Update value and move to MRU position
             node.value = value
@@ -110,15 +117,25 @@ struct LRUCache<Key: Hashable, Value> {
         if dict.count > capacity, let oldTail = tail {
             dict.removeValue(forKey: oldTail.key)
             removeNode(oldTail)
-            return oldTail.key
+            return (oldTail.key, oldTail.value)
         }
         return nil
     }
 
-    mutating func removeValue(forKey key: Key) {
-        guard let node = dict[key] else { return }
+    @discardableResult
+    mutating func removeValue(forKey key: Key) -> Value? {
+        guard let node = dict[key] else { return nil }
         dict.removeValue(forKey: key)
         removeNode(node)
+        return node.value
+    }
+
+    @discardableResult
+    mutating func removeLeastRecentlyUsed() -> (key: Key, value: Value)? {
+        guard let oldTail = tail else { return nil }
+        dict.removeValue(forKey: oldTail.key)
+        removeNode(oldTail)
+        return (oldTail.key, oldTail.value)
     }
 
     // MARK: - Linked list operations
