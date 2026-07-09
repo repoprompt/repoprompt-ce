@@ -1,5 +1,5 @@
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class MCPMutationRetryableFailureTests: XCTestCase {

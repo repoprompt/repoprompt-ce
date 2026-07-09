@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import MCP
 import Ontology
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 
@@ -460,7 +460,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     #endif
 
     private static func schemaProperties(
-        for tool: RepoPrompt.Tool,
+        for tool: RepoPromptApp.Tool,
         label: String = "",
         file: StaticString = #filePath,
         line: UInt = #line
@@ -496,7 +496,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "23|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=e082791f37b91a339f66223799d917cb511ac5d18dbff5bc1f93790743ffe4a8|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d"
     ]
 
-    private static func signatures(for tools: [RepoPrompt.Tool]) throws -> [String] {
+    private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {
         try tools.enumerated().map { index, tool in
             let schemaValue = try Value(tool.inputSchema)
             let schemaDigest = try digest(canonicalJSONString(schemaValue))

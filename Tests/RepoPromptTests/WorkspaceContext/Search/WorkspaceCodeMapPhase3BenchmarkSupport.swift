@@ -1,7 +1,7 @@
 #if DEBUG && RPCE_BENCHMARK_TESTS
     import Darwin
     import Foundation
-    @testable import RepoPrompt
+    @testable import RepoPromptApp
 
     enum WorkspaceCodeMapPhase3BenchmarkMetric: String, CaseIterable {
         case canonicalKeyPipelineConstruction

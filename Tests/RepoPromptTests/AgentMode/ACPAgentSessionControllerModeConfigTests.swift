@@ -1,7 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class ACPAgentSessionControllerModeConfigTests: XCTestCase {

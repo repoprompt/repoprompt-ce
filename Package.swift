@@ -44,7 +44,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(path: "Packages/RepoPromptAgentProviders")
 ]
 
-var repoPromptDependencies: [Target.Dependency] = [
+var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptShared",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
     "Sparkle",
@@ -77,7 +77,7 @@ var repoPromptDependencies: [Target.Dependency] = [
     .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
 ]
 
-var repoPromptSwiftSettings: [SwiftSetting] = [
+var repoPromptAppSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug)),
     .enableUpcomingFeature("BareSlashRegexLiterals"),
     .unsafeFlags([
@@ -91,8 +91,8 @@ var repoPromptTestSwiftSettings: [SwiftSetting] = [
 ]
 
 if sentryEnabled {
-    repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))
-    repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
+    repoPromptAppDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))
+    repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
 }
 
 if benchmarkTestsEnabled {
@@ -110,9 +110,14 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "RepoPrompt",
-            dependencies: repoPromptDependencies,
+            dependencies: ["RepoPromptApp"],
+            path: "Sources/RepoPromptExecutable"
+        ),
+        .target(
+            name: "RepoPromptApp",
+            dependencies: repoPromptAppDependencies,
             path: "Sources/RepoPrompt",
-            swiftSettings: repoPromptSwiftSettings
+            swiftSettings: repoPromptAppSwiftSettings
         ),
         .executableTarget(
             name: "RepoPromptMCP",
@@ -133,7 +138,7 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPrompt", "RepoPromptMCP", "RepoPromptShared"],
+            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),

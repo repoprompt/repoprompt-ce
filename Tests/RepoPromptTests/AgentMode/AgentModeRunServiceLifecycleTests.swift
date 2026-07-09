@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 private let lifecycleAwaitTimeoutSeconds: TimeInterval = 5
 

@@ -2,7 +2,7 @@
     import CryptoKit
     import Darwin
     import Foundation
-    @testable import RepoPrompt
+    @testable import RepoPromptApp
 
     enum WorkspaceCodeMapPhase4BenchmarkMetric: String, CaseIterable {
         case canonicalBatchClassification

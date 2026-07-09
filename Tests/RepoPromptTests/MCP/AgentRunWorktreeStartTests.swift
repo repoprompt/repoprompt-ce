@@ -2,7 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 private final class AgentRunWorktreeStartGitSeedRepository: @unchecked Sendable {

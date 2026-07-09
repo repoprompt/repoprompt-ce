@@ -2,7 +2,7 @@ import Darwin
 import Dispatch
 import Foundation
 import Logging
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {

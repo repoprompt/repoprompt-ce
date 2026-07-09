@@ -2,7 +2,7 @@
     import Combine
     import CoreServices
     import MCP
-    @testable import RepoPrompt
+    @testable import RepoPromptApp
     import RepoPromptShared
     import XCTest
 

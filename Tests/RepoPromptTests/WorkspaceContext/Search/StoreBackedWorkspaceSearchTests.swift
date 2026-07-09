@@ -1,5 +1,5 @@
 import CoreServices
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class StoreBackedWorkspaceSearchTests: XCTestCase {

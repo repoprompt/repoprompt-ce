@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 
 /// Small fixture generator for history MCP integration tests.
 ///

@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 /// End-to-end history MCP tests against generated on-disk workspace/session fixtures.

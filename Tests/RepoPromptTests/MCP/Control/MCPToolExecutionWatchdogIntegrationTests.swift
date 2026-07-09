@@ -1,7 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 
@@ -1906,10 +1906,10 @@ import XCTest
             self.windowID = windowID
         }
 
-        var tools: [RepoPrompt.Tool] {
+        var tools: [RepoPromptApp.Tool] {
             get async {
                 [
-                    RepoPrompt.Tool(
+                    RepoPromptApp.Tool(
                         name: MCPWindowToolName.readFile,
                         description: "Test probe for resolved provider arguments.",
                         inputSchema: .object(

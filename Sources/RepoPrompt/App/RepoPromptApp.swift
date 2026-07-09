@@ -54,8 +54,7 @@ struct RepoPromptFileLogHandler: LogHandler {
     }
 }
 
-@main
-struct RepoPromptApp: App {
+struct RepoPromptSwiftUIApp: App {
     init() {
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
@@ -168,5 +167,12 @@ struct RepoPromptApp: App {
                     .environmentObject(versionManager)
             }
         }
+    }
+}
+
+@MainActor
+public enum RepoPromptApplication {
+    public static func main() {
+        RepoPromptSwiftUIApp.main()
     }
 }

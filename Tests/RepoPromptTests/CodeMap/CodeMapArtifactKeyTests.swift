@@ -1,6 +1,6 @@
 import CryptoKit
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class CodeMapArtifactKeyTests: XCTestCase {

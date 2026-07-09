@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 

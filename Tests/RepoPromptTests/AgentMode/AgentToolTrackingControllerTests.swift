@@ -1,7 +1,7 @@
 #if DEBUG
     import Foundation
     import MCP
-    @testable import RepoPrompt
+    @testable import RepoPromptApp
     import XCTest
 
     final class AgentToolTrackingControllerTests: XCTestCase {

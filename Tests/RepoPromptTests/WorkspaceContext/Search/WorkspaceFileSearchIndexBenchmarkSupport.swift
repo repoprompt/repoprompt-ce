@@ -1,7 +1,7 @@
 #if DEBUG
     import Darwin
     import Foundation
-    @testable import RepoPrompt
+    @testable import RepoPromptApp
 
     #if RPCE_BENCHMARK_TESTS
         enum WorkspaceFileSearchIndexBenchmarkRuntimeConfiguration {

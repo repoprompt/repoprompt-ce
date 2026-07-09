@@ -1,5 +1,5 @@
 import Combine
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor

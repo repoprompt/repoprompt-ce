@@ -1,5 +1,5 @@
 import Darwin
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class GitRawOutputSpoolTests: XCTestCase {

@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 
 extension CodeMapSyntaxArtifact {
     func renderedCodeMap(displayPath: String) -> String {

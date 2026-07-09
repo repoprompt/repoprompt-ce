@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 
 @MainActor
 enum WorkspaceRootLoadTestSupport {

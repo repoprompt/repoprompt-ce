@@ -1,13 +1,15 @@
 # Source Layout Ownership Map
 
-Current as of 2026-05-30 after the source-layout refactor, Context Builder discovery cleanup, provider extraction, post-native-tree cleanup guardrail pass, provider-neutral workflow prompt catalog cleanup, and upstream Tree-sitter grammar migration. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
+Current as of 2026-07-08 after the source-layout refactor, provider extraction, upstream Tree-sitter grammar migration, and the thin-executable split. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
 
 ## Current source tree shape
 
 ```text
 Sources/
-  RepoPrompt/
-    Support/                     # Obj-C bridging header / bridging-header-sensitive support path used by Package.swift
+  RepoPromptExecutable/          # thin shipped RepoPrompt executable target; sole @main and delegation only
+    RepoPromptExecutable.swift
+  RepoPrompt/                    # internal RepoPromptApp implementation library target (not a package product)
+    Support/                     # Obj-C bridging header / bridging-header-sensitive support owned by RepoPromptApp
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
       Notifications/
       Sparkle/
@@ -54,6 +56,8 @@ Tests/
   RepoPromptTests/               # XCTest tests, support, and fixtures
 ```
 
+The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. Root app tests import `RepoPromptApp`; the separate `RepoPromptMCP` executable dependency remains unchanged.
+
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
 - `Models`
@@ -76,9 +80,10 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 
 ## Placement rules for new files
 
+- `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
-- New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App`.
-- Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support` unless `Package.swift` is updated in the same change.
+- New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
+- Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
 - Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
@@ -97,7 +102,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 
 Exceptions must be explicit, narrow, and documented here before they become precedent.
 
-### App-visible diagnostics retained in the app target
+### App-visible diagnostics retained in the RepoPromptApp target
 
 These files are intentionally compiled as app-integrated diagnostics and live under `Sources/RepoPrompt/Features/Diagnostics`:
 
@@ -143,6 +148,8 @@ make guardrails
 
 The guardrail script verifies:
 
+- the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the `RepoPromptApp` implementation declares none;
+- `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;

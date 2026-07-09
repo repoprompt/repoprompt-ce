@@ -1,7 +1,7 @@
 import CoreServices
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -919,7 +919,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         return try XCTUnwrap(tab)
     }
 
-    private static func windowTool(named name: String, in window: WindowState) async throws -> RepoPrompt.Tool {
+    private static func windowTool(named name: String, in window: WindowState) async throws -> RepoPromptApp.Tool {
         let tools = await window.mcpServer.windowMCPTools
         return try XCTUnwrap(tools.first { $0.name == name })
     }

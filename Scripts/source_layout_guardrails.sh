@@ -23,6 +23,7 @@ print_matches() {
 
 # 0. Required layout roots/files should exist before negative scans run.
 required_dirs=(
+  "Sources/RepoPromptExecutable"
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
@@ -34,6 +35,28 @@ for dir in "${required_dirs[@]}"; do
     fail "required source layout directory missing: $dir"
   fi
 done
+
+repo_prompt_entry="Sources/RepoPromptExecutable/RepoPromptExecutable.swift"
+if [[ ! -f "$repo_prompt_entry" ]]; then
+  fail "required thin RepoPrompt executable entry missing: $repo_prompt_entry"
+fi
+unexpected_repo_prompt_executable_files=""
+if [[ -d "Sources/RepoPromptExecutable" ]]; then
+  unexpected_repo_prompt_executable_files="$(find Sources/RepoPromptExecutable -type f ! -path "$repo_prompt_entry" -print)"
+fi
+if [[ -n "$unexpected_repo_prompt_executable_files" ]]; then
+  fail "thin RepoPrompt executable target contains implementation files"
+  printf '%s\n' "$unexpected_repo_prompt_executable_files" >&2
+fi
+repo_prompt_app_main_declarations="$(grep -R -n -E '^[[:space:]]*@main([[:space:]]|$)' Sources/RepoPrompt --include='*.swift' || true)"
+if [[ -n "$repo_prompt_app_main_declarations" ]]; then
+  fail "RepoPromptApp implementation target must not declare @main"
+  printf '%s\n' "$repo_prompt_app_main_declarations" >&2
+fi
+repo_prompt_entry_main_count="$(grep -c -E '^[[:space:]]*@main([[:space:]]|$)' "$repo_prompt_entry" || true)"
+if [[ "$repo_prompt_entry_main_count" -ne 1 ]]; then
+  fail "thin RepoPrompt executable entry must declare exactly one @main"
+fi
 
 shared_mcp_required_files=(
   "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
@@ -112,12 +135,30 @@ resolved_pins = {pin["identity"]: pin for pin in resolved["pins"]}
 package = json.loads(subprocess.check_output(["swift", "package", "dump-package"], text=True))
 targets = {target["name"]: target for target in package["targets"]}
 repo_prompt = targets.get("RepoPrompt", {})
+repo_prompt_app = targets.get("RepoPromptApp", {})
 repo_prompt_dependencies = repo_prompt.get("dependencies", [])
-repo_prompt_products = {
+repo_prompt_app_dependencies = repo_prompt_app.get("dependencies", [])
+repo_prompt_app_products = {
     (dependency["product"][0], dependency["product"][1])
-    for dependency in repo_prompt_dependencies
+    for dependency in repo_prompt_app_dependencies
     if "product" in dependency
 }
+
+if repo_prompt.get("type") != "executable":
+    errors.append("RepoPrompt target must remain executable")
+if repo_prompt.get("path") != "Sources/RepoPromptExecutable":
+    errors.append("RepoPrompt target must remain the thin Sources/RepoPromptExecutable entry target")
+repo_prompt_by_name_dependencies = [
+    dependency["byName"][0]
+    for dependency in repo_prompt_dependencies
+    if dependency.get("byName")
+]
+if len(repo_prompt_dependencies) != 1 or repo_prompt_by_name_dependencies != ["RepoPromptApp"]:
+    errors.append("RepoPrompt executable target must depend only on RepoPromptApp")
+if repo_prompt_app.get("type") != "regular":
+    errors.append("RepoPromptApp target must remain an internal library target")
+if repo_prompt_app.get("path") != "Sources/RepoPrompt":
+    errors.append("RepoPromptApp target must retain the Sources/RepoPrompt implementation path")
 
 for identity, (url, revision, product) in expected_packages.items():
     manifest_pin = f'.package(url: "{url}", revision: "{revision}")'
@@ -128,8 +169,8 @@ for identity, (url, revision, product) in expected_packages.items():
         errors.append(f"Package.resolved missing pin: {identity}")
     elif pin.get("location") != url or pin.get("state", {}).get("revision") != revision:
         errors.append(f"Package.resolved pin drift: {identity}")
-    if (product, identity) not in repo_prompt_products:
-        errors.append(f"RepoPrompt missing upstream grammar product dependency: {product} ({identity})")
+    if (product, identity) not in repo_prompt_app_products:
+        errors.append(f"RepoPromptApp missing upstream grammar product dependency: {product} ({identity})")
 
 support = targets.get("TreeSitterScannerSupport")
 if support is None:
@@ -140,8 +181,8 @@ else:
     expected_sources = ["src/javascript/scanner.c", "src/python/scanner.c"]
     if sorted(support.get("sources", [])) != expected_sources:
         errors.append("TreeSitterScannerSupport sources must remain exactly JavaScript/Python scanner.c")
-if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in repo_prompt_dependencies):
-    errors.append("RepoPrompt must directly depend on TreeSitterScannerSupport")
+if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in repo_prompt_app_dependencies):
+    errors.append("RepoPromptApp must directly depend on TreeSitterScannerSupport")
 
 if errors:
     raise SystemExit("\n".join(errors))

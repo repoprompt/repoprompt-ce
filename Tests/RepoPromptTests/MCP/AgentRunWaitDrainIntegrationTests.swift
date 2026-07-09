@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class AgentRunWaitDrainIntegrationTests: XCTestCase {

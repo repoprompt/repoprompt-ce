@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 import Ontology
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 

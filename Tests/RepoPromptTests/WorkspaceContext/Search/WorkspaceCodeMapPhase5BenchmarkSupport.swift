@@ -1,7 +1,7 @@
 #if DEBUG && RPCE_BENCHMARK_TESTS
     import Darwin
     import Foundation
-    @testable import RepoPrompt
+    @testable import RepoPromptApp
 
     enum WorkspaceCodeMapPhase5BenchmarkMetric: String, CaseIterable {
         case runtimeConstruction

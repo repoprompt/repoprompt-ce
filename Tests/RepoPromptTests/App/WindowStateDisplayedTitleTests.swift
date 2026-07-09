@@ -1,6 +1,6 @@
 import AppKit
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor

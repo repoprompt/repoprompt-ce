@@ -82,6 +82,14 @@ def _target_map(manifest: dict) -> dict[str, dict]:
     return {target.get("name", ""): target for target in manifest.get("targets", [])}
 
 
+def _by_name_dependencies(target: dict) -> list[str]:
+    return [
+        dependency["byName"][0]
+        for dependency in target.get("dependencies", [])
+        if dependency.get("byName")
+    ]
+
+
 def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if manifest.get("name") != "RepoPromptCE":
         raise GeneratorError("Package.swift must define package 'RepoPromptCE'")
@@ -91,10 +99,15 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         product = products.get(name)
         if product is None or "executable" not in product.get("type", {}):
             raise GeneratorError(f"Package.swift must retain executable product '{name}'")
+    if products["RepoPrompt"].get("targets") != ["RepoPrompt"]:
+        raise GeneratorError(
+            "Executable product 'RepoPrompt' must remain mapped only to target 'RepoPrompt'"
+        )
 
     targets = _target_map(manifest)
     required_targets = (
         "RepoPrompt",
+        "RepoPromptApp",
         "RepoPromptMCP",
         "RepoPromptShared",
         "RepoPromptC",
@@ -106,8 +119,46 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         if name not in targets:
             raise GeneratorError(f"Package.swift must retain target '{name}'")
 
+    repo_prompt = targets["RepoPrompt"]
+    if repo_prompt.get("type") != "executable":
+        raise GeneratorError("Target 'RepoPrompt' must remain executable")
+    if repo_prompt.get("path") != "Sources/RepoPromptExecutable":
+        raise GeneratorError(
+            "Target 'RepoPrompt' must remain the thin Sources/RepoPromptExecutable entry target"
+        )
+    if len(repo_prompt.get("dependencies", [])) != 1 or _by_name_dependencies(repo_prompt) != [
+        "RepoPromptApp"
+    ]:
+        raise GeneratorError("Target 'RepoPrompt' must depend only on 'RepoPromptApp'")
+    repo_prompt_unsafe_flags = [
+        setting.get("kind", {}).get("unsafeFlags", {}).get("_0", [])
+        for setting in repo_prompt.get("settings", [])
+    ]
+    if any("-import-objc-header" in flags for flags in repo_prompt_unsafe_flags):
+        raise GeneratorError(
+            "Target 'RepoPrompt' must not own the RepoPromptApp Objective-C bridging header"
+        )
+
+    repo_prompt_app = targets["RepoPromptApp"]
+    if repo_prompt_app.get("type") != "regular":
+        raise GeneratorError("Target 'RepoPromptApp' must remain an internal library target")
+    if repo_prompt_app.get("path") != "Sources/RepoPrompt":
+        raise GeneratorError(
+            "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
+        )
+
+    expected_test_dependencies = {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"}
+    repo_prompt_tests = targets["RepoPromptTests"]
+    if (
+        len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
+        or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
+    ):
+        raise GeneratorError(
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, and RepoPromptShared"
+        )
+
     unsafe_flags: list[list[str]] = []
-    for setting in targets["RepoPrompt"].get("settings", []):
+    for setting in repo_prompt_app.get("settings", []):
         value = setting.get("kind", {}).get("unsafeFlags", {}).get("_0")
         if isinstance(value, list):
             unsafe_flags.append(value)
@@ -120,7 +171,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         for flags in unsafe_flags
     ):
         raise GeneratorError(
-            "RepoPrompt must retain the Objective-C bridging-header unsafe flags"
+            "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
         )
 
     expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}
@@ -151,6 +202,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "Package.resolved",
         "Scripts/package_app.sh",
         "Scripts/xcode_developer_workflow.sh",
+        "Sources/RepoPromptExecutable/RepoPromptExecutable.swift",
         "conductor",
         "AppBundle/Info.plist.template",
         "Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework",

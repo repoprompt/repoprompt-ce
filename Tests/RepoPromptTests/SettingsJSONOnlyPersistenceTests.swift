@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class SettingsJSONOnlyPersistenceTests: XCTestCase {

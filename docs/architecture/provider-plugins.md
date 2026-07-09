@@ -17,7 +17,7 @@ The seam intentionally stops short of dynamic plugin loading. It is static Swift
 ## High-level layering
 
 ```
-+--------------------------- core (RepoPrompt target) ---------------------------+
++-------------------------- core (RepoPromptApp target) --------------------------+
 |                                                                                |
 | AgentMode/UI · transcript · tool tracking · MCP permission · run state         |
 |     │                                                                          |

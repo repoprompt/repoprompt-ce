@@ -1,6 +1,6 @@
 import CoreServices
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 #if DEBUG

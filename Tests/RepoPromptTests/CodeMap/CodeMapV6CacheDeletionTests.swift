@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class CodeMapV6CacheDeletionTests: XCTestCase {
