@@ -7,6 +7,7 @@ SMOKE_LABEL="${2:-Packaged MCP roundtrip}"
 ARTIFACT_MANIFEST="${3:-}"
 EXPECTED_ARCHITECTURES="${REPOPROMPT_EXPECTED_ARCHITECTURES:-arm64,x86_64}"
 ROUNDTRIP_TIMEOUT="${REPOPROMPT_PACKAGED_SMOKE_TIMEOUT:-60}"
+HELPER_REQUEST_TIMEOUT="${REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT:-30}"
 SOCKET_OWNER_HELPER="$SCRIPT_DIR/verify_packaged_mcp_socket_owner.py"
 MCP_SOCKET_DIR="${REPOPROMPT_PACKAGED_SMOKE_SOCKET_DIR:-/tmp/repoprompt-ce-mcp-$(id -u)}"
 APP_PID=""
@@ -60,6 +61,10 @@ trap 'exit 130' INT TERM
 
 [[ -n "$APP_BUNDLE" ]] || fail "usage: $0 <app-bundle> [label] [artifact-manifest]"
 [[ -x "$SOCKET_OWNER_HELPER" ]] || fail "missing packaged MCP socket ownership verifier: $SOCKET_OWNER_HELPER"
+[[ "$ROUNDTRIP_TIMEOUT" =~ ^[0-9]+$ && "$ROUNDTRIP_TIMEOUT" -gt 0 ]] ||
+    fail "REPOPROMPT_PACKAGED_SMOKE_TIMEOUT must be a positive integer, got $ROUNDTRIP_TIMEOUT"
+[[ "$HELPER_REQUEST_TIMEOUT" =~ ^[0-9]+$ && "$HELPER_REQUEST_TIMEOUT" -gt 0 ]] ||
+    fail "REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT must be a positive integer, got $HELPER_REQUEST_TIMEOUT"
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "$SMOKE_LABEL layout"
 "$SCRIPT_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$EXPECTED_ARCHITECTURES" "$SMOKE_LABEL architectures"
 if [[ -n "$ARTIFACT_MANIFEST" ]]; then
@@ -131,12 +136,12 @@ printf '{"pid":%s,"command":"%s","start":"%s"}\n' \
     > "$TEMP_ROOT/launched-process.json"
 
 run_windows_request() {
-    python3 - "$MCP_HELPER" "$ISOLATED_HOME" "$ISOLATED_TMP" <<'PYTHON'
+    python3 - "$MCP_HELPER" "$ISOLATED_HOME" "$ISOLATED_TMP" "$HELPER_REQUEST_TIMEOUT" <<'PYTHON'
 import os
 import subprocess
 import sys
 
-helper, home, temporary = sys.argv[1:]
+helper, home, temporary, helper_timeout = sys.argv[1:]
 environment = {
     "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
     "HOME": home,
@@ -153,7 +158,7 @@ try:
         env=environment,
         text=True,
         capture_output=True,
-        timeout=30,
+        timeout=int(helper_timeout),
     )
 except subprocess.TimeoutExpired:
     raise SystemExit(124)
@@ -195,7 +200,7 @@ while (( $(date +%s) <= deadline )); do
     attempt=$((attempt + 1))
     attempt_stdout="$TEMP_ROOT/windows-attempt-${attempt}.out"
     attempt_stderr="$TEMP_ROOT/windows-attempt-${attempt}.err"
-    log_phase "$SMOKE_LABEL CLI windows attempt ${attempt} using 30s subprocess timeout"
+    log_phase "$SMOKE_LABEL CLI windows attempt ${attempt} using ${HELPER_REQUEST_TIMEOUT}s subprocess timeout"
     set +e
     run_windows_request >"$attempt_stdout" 2>"$attempt_stderr"
     last_status=$?
