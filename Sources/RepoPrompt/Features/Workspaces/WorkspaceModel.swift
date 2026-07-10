@@ -563,7 +563,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
     }
 }
 
-enum WorkspacePersistenceDisposition: Equatable, Sendable {
+enum WorkspacePersistenceDisposition: Equatable {
     case persistent
     case skipEphemeral
 }
@@ -576,19 +576,6 @@ enum WorkspacePersistenceError: LocalizedError, Equatable {
         case .ephemeralWorkspace:
             "Temporary workspaces are memory-only and cannot be persisted."
         }
-    }
-}
-
-/// Proof that a workspace-owned filesystem location belongs to a persistent workspace.
-/// Constructing this value performs no filesystem work.
-struct WorkspacePersistentStorage: Equatable, Sendable {
-    let workspaceDirectory: URL
-
-    init(workspace: WorkspaceModel, workspaceDirectory: URL) throws {
-        guard workspace.persistenceDisposition == .persistent else {
-            throw WorkspacePersistenceError.ephemeralWorkspace
-        }
-        self.workspaceDirectory = workspaceDirectory.standardizedFileURL
     }
 }
 
