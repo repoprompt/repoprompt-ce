@@ -133,9 +133,12 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
         }
     }
 
-    func closeAndSnapshot() -> MCPTransportIngressSnapshot {
+    func closeAndSnapshot(cause: MCPTransportTerminalCause? = nil) -> MCPTransportIngressSnapshot {
         lock.lock()
         isTerminal = true
+        if terminalCause == nil {
+            terminalCause = cause
+        }
         let snapshot = makeSnapshot()
         lock.unlock()
         return snapshot
@@ -859,7 +862,7 @@ public actor UnixSocketMCPTransport: Transport {
                 )
             }
         #endif
-        let ingressSnapshot = inboundChannel.gate.closeAndSnapshot()
+        let ingressSnapshot = inboundChannel.gate.closeAndSnapshot(cause: proposedCause)
         let overflowError = MCPReceiveBufferOverflowError(
             capacity: ingressSnapshot.receiveBufferCapacity,
             highWaterMark: ingressSnapshot.receiveBufferHighWaterMark

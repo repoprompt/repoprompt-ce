@@ -890,7 +890,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
                     "private var generation: UInt64 = 0",
                     "private var pendingCancelledSources: [ObjectIdentifier: ReadEventSource] = [:]",
                     "finishTerminalOnQueue(.failure(posixError), generation: pumpGeneration)",
-                    "finishTerminalOnQueue(.success(!buffer.isEmpty), generation: pumpGeneration)",
+                    "finishTerminalOnQueue(.success(frameAccumulator.hasResidualData), generation: pumpGeneration)",
                     "guard terminalGeneration == generation, lifecycle == .running else { return }",
                     "cancelCurrentSourceOnQueue()",
                     "guard pendingCancelledSources.removeValue(forKey: sourceID) != nil else { return }"
