@@ -13,19 +13,26 @@ import XCTest
             let holderID = UUID()
             let waiterID = UUID()
 
-            let holderAcquired = await HeadlessAgentConnectionGate.shared.acquire(holderID, deadline: .seconds(60))
+            let holderAcquired = await HeadlessAgentConnectionGate.shared.acquire(holderID)
             XCTAssertTrue(holderAcquired, "holder should acquire the idle gate immediately")
 
             // The holder holds for 60s, so the waiter (200ms deadline) must time out, return
-            // false, and do so promptly — not park on the gate continuation up to the ~30-minute
-            // MCP client idle timeout.
+            // acquired=false with timedOut=true, and do so promptly — not park on the gate
+            // continuation up to the ~30-minute MCP client idle timeout.
             let clock = ContinuousClock()
             let waitStart = clock.now
-            let waiterAcquired = await HeadlessAgentConnectionGate.shared.acquire(waiterID, deadline: .milliseconds(200))
+            let waiterAcquisition = await HeadlessAgentConnectionGate.shared.acquireWithDiagnostics(
+                waiterID,
+                deadline: .milliseconds(200)
+            )
             let waitElapsed = waitStart.duration(to: clock.now)
             XCTAssertFalse(
-                waiterAcquired,
-                "a queued gate acquire must respect its deadline and return false on timeout (repoprompt-ce #419)"
+                waiterAcquisition.acquired,
+                "a queued gate acquire must respect its deadline and return acquired=false on timeout (repoprompt-ce #419)"
+            )
+            XCTAssertTrue(
+                waiterAcquisition.timedOut,
+                "a deadline expiry must be reported as timedOut=true so callers can distinguish it from cancellation (repoprompt-ce #419)"
             )
             XCTAssertLessThan(
                 waitElapsed,

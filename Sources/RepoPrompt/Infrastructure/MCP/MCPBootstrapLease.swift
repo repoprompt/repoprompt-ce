@@ -66,6 +66,15 @@ actor MCPBootstrapLease {
     private var didReleaseGate = false
     private var didCleanupRouting = false
     private var didClearPolicy = false
+    /// True iff the most recent `acquire()` failed specifically because the gate
+    /// deadline elapsed (vs. cancellation/abort), so callers can tell a provisioning
+    /// timeout from an intentional cancel. See #419.
+    private var lastAcquireTimedOut = false
+
+    /// Whether the most recent failed `acquire()` was a gate-deadline timeout.
+    var lastAcquireWasTimeout: Bool {
+        lastAcquireTimedOut
+    }
 
     /// Creates a unified bootstrap lease.
     ///
@@ -98,6 +107,7 @@ actor MCPBootstrapLease {
     /// PID-owned policies release the gate after their unique pending policy is confirmed armed.
     /// Returns `false` if cancelled, the gate could not be acquired, or PID ownership could not be armed.
     func acquire() async -> Bool {
+        lastAcquireTimedOut = false
         if hasReleased {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) acquire() ignored because lease already released")
             return false
@@ -159,13 +169,18 @@ actor MCPBootstrapLease {
             if gateAcquisition.acquired {
                 ownsGate = true
             }
+            // A gate deadline expiry is the one acquire failure that is not a
+            // cancel/abort; record it so callers can surface a timeout-specific
+            // error instead of a misleading cancellation. See #419.
+            lastAcquireTimedOut = (!gateAcquisition.acquired) && gateAcquisition.timedOut
             await recordDiagnosticEvent(
                 gateAcquisition.acquired ? "lease_gate_acquired" : "lease_gate_acquire_failed",
                 fields: [
                     "active_gate_id_at_start": gateAcquisition.activeConnectionIDAtStart?.uuidString ?? "nil",
                     "queue_depth_at_start": String(gateAcquisition.queueDepthAtStart),
                     "queue_depth_at_acquire": String(gateAcquisition.queueDepthAtAcquire),
-                    "wait_duration_ms": String(format: "%.3f", gateAcquisition.waitDurationMS)
+                    "wait_duration_ms": String(format: "%.3f", gateAcquisition.waitDurationMS),
+                    "timed_out": String(gateAcquisition.timedOut)
                 ]
             )
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) global MCP gate acquired=\(gateAcquisition.acquired)")

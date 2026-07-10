@@ -8,6 +8,24 @@ enum HeadlessAgentConnectionWaitOutcome {
     case timedOut
 }
 
+/// Acquiring the gate exceeded its deadline (see #419).
+///
+/// Deliberately distinct from `CancellationError` so a provisioning timeout is not
+/// misclassified as an intentional cancel by `catch is CancellationError` branches
+/// (e.g. the `agent_run` start path). Callers that fail fast on cancellation should
+/// keep treating `CancellationError` as a cancel and surface this as a retryable error.
+struct HeadlessAgentConnectionAcquireTimeoutError: Error, CustomStringConvertible, LocalizedError {
+    private static let message = "Timed out waiting to acquire the headless agent connection gate. Another agent start may still be in progress; please retry."
+    var description: String {
+        Self.message
+    }
+
+    /// Surfaced via `error.localizedDescription` by callers that finalize the run as failed.
+    var errorDescription: String? {
+        Self.message
+    }
+}
+
 /// Global gate to serialize headless agent connections and prevent racing.
 /// This ensures that only one headless agent (discovery, delegate-edit, or future types)
 /// installs its connection policy and spawns at a time, preventing MCP connection conflicts.
@@ -25,6 +43,26 @@ actor HeadlessAgentConnectionGate {
         let queueDepthAtStart: Int
         let queueDepthAtAcquire: Int
         let waitDurationMS: Double
+        /// True when acquisition failed specifically because the deadline elapsed
+        /// (vs. task cancellation), so callers can tell a provisioning timeout from
+        /// an intentional cancel. See #419.
+        let timedOut: Bool
+
+        init(
+            acquired: Bool,
+            activeConnectionIDAtStart: UUID?,
+            queueDepthAtStart: Int,
+            queueDepthAtAcquire: Int,
+            waitDurationMS: Double,
+            timedOut: Bool = false
+        ) {
+            self.acquired = acquired
+            self.activeConnectionIDAtStart = activeConnectionIDAtStart
+            self.queueDepthAtStart = queueDepthAtStart
+            self.queueDepthAtAcquire = queueDepthAtAcquire
+            self.waitDurationMS = waitDurationMS
+            self.timedOut = timedOut
+        }
     }
 
     struct ReleaseResult {
@@ -46,6 +84,12 @@ actor HeadlessAgentConnectionGate {
     private let log = Logger(subsystem: "com.repoprompt.agents", category: "ConnectionGate")
 
     /// Wait for any currently connecting agent to finish before proceeding.
+    ///
+    /// - Note: This method and its static wrapper currently have no production
+    ///   callers — production bootstraps route through `acquireWithDiagnostics`,
+    ///   which atomically waits and acquires. This is most likely dead code,
+    ///   retained for symmetry/future use. If you call it, wire it through the
+    ///   same fail-fast contract as `acquireWithDiagnostics`. See #419.
     ///
     /// A bounded `deadline` keeps a stalled peer connection from blocking this
     /// wait indefinitely; on expiry the wait simply returns so the caller can
@@ -156,7 +200,8 @@ actor HeadlessAgentConnectionGate {
                     activeConnectionIDAtStart: activeConnectionIDAtStart,
                     queueDepthAtStart: queueDepthAtStart,
                     queueDepthAtAcquire: waitingContinuations.count,
-                    waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000
+                    waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000,
+                    timedOut: true
                 )
             }
         }
@@ -180,11 +225,8 @@ actor HeadlessAgentConnectionGate {
         )
     }
 
-    func acquire(
-        _ gateID: UUID,
-        deadline: Duration? = MCPTimeoutPolicy.headlessAgentConnectionAcquireDeadline
-    ) async -> Bool {
-        await acquireWithDiagnostics(gateID, deadline: deadline).acquired
+    func acquire(_ gateID: UUID) async -> Bool {
+        await acquireWithDiagnostics(gateID).acquired
     }
 
     /// Mark an agent as beginning connection
@@ -306,7 +348,8 @@ actor HeadlessAgentConnectionGate {
 // MARK: - Static Convenience Methods
 
 extension HeadlessAgentConnectionGate {
-    /// Wait for any in-progress agent connection to complete before proceeding
+    /// Wait for any in-progress agent connection to complete before proceeding.
+    /// - Note: Most likely dead code — no production callers (see instance method).
     static func waitForClearConnection() async {
         await HeadlessAgentConnectionGate.shared.waitForClearConnection()
     }
