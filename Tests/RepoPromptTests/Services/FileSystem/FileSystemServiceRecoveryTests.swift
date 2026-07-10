@@ -266,10 +266,11 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             ])
             XCTAssertNotNil(accepted)
             await resyncGate.waitUntilStartCount(1)
+            let staleBatchTask = await service.watcherBatchProcessingTaskForTesting()
 
             await service.stopWatchingForChanges()
             await resyncGate.releaseAll()
-            await service.waitForWatcherBatchProcessingForTesting()
+            await staleBatchTask?.value
 
             let state = await service.watcherStateForTesting()
             XCTAssertTrue(state.pendingScanTargets.isEmpty)
@@ -314,10 +315,11 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             ])
             XCTAssertNotNil(accepted)
             await resyncGate.waitUntilStartCount(1)
+            let staleBatchTask = await service.watcherBatchProcessingTaskForTesting()
 
             await service.stopWatchingForChanges()
             await resyncGate.releaseAll()
-            await service.waitForWatcherBatchProcessingForTesting()
+            await staleBatchTask?.value
 
             let inventory = await service.getTestState()
             XCTAssertFalse(inventory.visitedPaths.contains("Stale.swift"))
@@ -331,6 +333,268 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertTrue(diagnostics.recoveryEpisodes.isEmpty)
             await service.setFullResyncWillStartHandlerForTesting(nil)
             withExtendedLifetime(cancellable) {}
+        }
+
+        func testImmediateRestartProcessesNewGenerationWhileOldRecoveryScanIsStalled() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryImmediateRestart")
+            let fileURL = root.appendingPathComponent("Known.swift")
+            try "before".write(to: fileURL, atomically: true, encoding: .utf8)
+            let staleResyncGate = SteppedBatchGate()
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                testVisitedPaths: ["Known.swift"],
+                testVisitedItems: ["Known.swift": false],
+                isTestMode: true
+            )
+            await service.setFullResyncWillStartHandlerForTesting {
+                await staleResyncGate.markStartedAndWaitForRelease()
+            }
+            let recoveryFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped
+            )
+            let staleWatermark = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: recoveryFlags, eventId: 30)
+            ])
+            XCTAssertNotNil(staleWatermark)
+            await staleResyncGate.waitUntilStartCount(1)
+            let staleBatchTask = await service.watcherBatchProcessingTaskForTesting()
+
+            await service.stopWatchingForChanges()
+            await service.setFullResyncWillStartHandlerForTesting(nil)
+            try await service.startWatchingForChanges()
+            try "after".write(to: fileURL, atomically: true, encoding: .utf8)
+            let modifiedFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
+            )
+            let restartedWatermarkValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: fileURL.path, flags: modifiedFlags, eventId: 31)
+            ], scheduleDrain: false)
+            let restartedWatermark = try XCTUnwrap(restartedWatermarkValue)
+            let flushCompleted = CompletionSignal()
+            let flushTask = Task {
+                _ = await service.flushPendingEventsNow(
+                    throughAcceptedWatcherWatermark: restartedWatermark
+                )
+                await flushCompleted.mark()
+            }
+            for _ in 0 ..< 2000 where await !(flushCompleted.isMarked()) {
+                await Task.yield()
+            }
+            let completedBeforeStaleRelease = await flushCompleted.isMarked()
+
+            await staleResyncGate.releaseAll()
+            await staleBatchTask?.value
+            await flushTask.value
+            await service.stopWatchingForChanges()
+            XCTAssertTrue(completedBeforeStaleRelease)
+            let publication = await service.publicationStateForTesting()
+            XCTAssertGreaterThanOrEqual(
+                publication.lastPublishedWatcherAcceptedWatermark,
+                restartedWatermark
+            )
+        }
+
+        func testPersistentRecoveryFailureQuiescesAndNewEvidenceReactivates() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryQuiescence")
+            let retryGate = SteppedBatchGate()
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                isTestMode: true,
+                maxRecoveryFullResyncFailuresOverride: 2,
+                recoveryScanRetryBaseNanosecondsOverride: 1,
+                recoveryScanSleep: { _ in
+                    await retryGate.markStartedAndWaitForRelease()
+                }
+            )
+            await service.setFullResyncFailureCountForTesting(2)
+            let recoveryFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped
+            )
+            let initialWatermarkValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: recoveryFlags, eventId: 40)
+            ], scheduleDrain: false)
+            let initialWatermark = try XCTUnwrap(initialWatermarkValue)
+            let flushCompleted = CompletionSignal()
+            let flushTask = Task {
+                _ = await service.flushPendingEventsNow(
+                    throughAcceptedWatcherWatermark: initialWatermark
+                )
+                await flushCompleted.mark()
+            }
+
+            await retryGate.waitUntilStartCount(1)
+            await retryGate.releaseNext()
+            for _ in 0 ..< 2000 {
+                if await service.watcherStateForTesting().recoveryIsQuiescent { break }
+                await Task.yield()
+            }
+            let quiescentState = await service.watcherStateForTesting()
+            XCTAssertTrue(quiescentState.recoveryIsQuiescent)
+            XCTAssertEqual(quiescentState.recoveryFullResyncFailureCount, 2)
+            let retryStartCount = await retryGate.observedStartCount()
+            let didFlushWhileQuiescent = await flushCompleted.isMarked()
+            XCTAssertEqual(retryStartCount, 1)
+            XCTAssertFalse(didFlushWhileQuiescent)
+
+            let reactivationWatermarkValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: root.path, flags: recoveryFlags, eventId: 41)
+            ])
+            let reactivationWatermark = try XCTUnwrap(reactivationWatermarkValue)
+            for _ in 0 ..< 2000 where await !(flushCompleted.isMarked()) {
+                await Task.yield()
+            }
+            await flushTask.value
+            let recoveredState = await service.watcherStateForTesting()
+            let publication = await service.publicationStateForTesting()
+            XCTAssertFalse(recoveredState.requiresRecoveryFullResync)
+            XCTAssertFalse(recoveredState.recoveryIsQuiescent)
+            XCTAssertTrue(recoveredState.dirtyRecoveryScanTargets.isEmpty)
+            XCTAssertGreaterThanOrEqual(
+                publication.lastPublishedWatcherAcceptedWatermark,
+                reactivationWatermark
+            )
+        }
+
+        func testResetDuringOrdinaryFolderScanCannotMutateRestartedGeneration() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryOrdinaryReset")
+            let folders = ["A", "B", "C"]
+            for folder in folders {
+                let folderURL = root.appendingPathComponent(folder, isDirectory: true)
+                try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+                try "initial".write(
+                    to: folderURL.appendingPathComponent("initial.txt"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+            let folderA = root.appendingPathComponent("A", isDirectory: true)
+            let staleScanGate = SteppedBatchGate()
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                testVisitedPaths: [
+                    "A", "A/initial.txt",
+                    "B", "B/initial.txt",
+                    "C", "C/initial.txt",
+                    "Known.swift"
+                ],
+                testVisitedItems: [
+                    "A": true, "A/initial.txt": false,
+                    "B": true, "B/initial.txt": false,
+                    "C": true, "C/initial.txt": false,
+                    "Known.swift": false
+                ],
+                isTestMode: false
+            )
+            await service.setParallelFolderEnumerationHookForTesting { _ in
+                await staleScanGate.markStartedAndWaitForRelease()
+            }
+            let staleFileURL = folderA.appendingPathComponent("stale.txt")
+            try "stale".write(to: staleFileURL, atomically: true, encoding: .utf8)
+            let folderModifiedFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsDir
+            )
+            let staleWatermark = await service.acceptWatcherPayloadForTesting(
+                folders.enumerated().map { index, folder in
+                    (
+                        absolutePath: root.appendingPathComponent(folder).path,
+                        flags: folderModifiedFlags,
+                        eventId: FSEventStreamEventId(50 + index)
+                    )
+                }
+            )
+            XCTAssertNotNil(staleWatermark)
+            await staleScanGate.waitUntilStartCount(1)
+            let staleBatchTask = await service.watcherBatchProcessingTaskForTesting()
+
+            await service.stopWatchingForChanges()
+            await service.setParallelFolderEnumerationHookForTesting(nil)
+            let restartedFileURL = root.appendingPathComponent("Known.swift")
+            try "current".write(to: restartedFileURL, atomically: true, encoding: .utf8)
+            let modifiedFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
+            )
+            let restartedWatermarkValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: restartedFileURL.path, flags: modifiedFlags, eventId: 51)
+            ], scheduleDrain: false)
+            let restartedWatermark = try XCTUnwrap(restartedWatermarkValue)
+            _ = await service.flushPendingEventsNow(
+                throughAcceptedWatcherWatermark: restartedWatermark
+            )
+
+            await staleScanGate.releaseAll()
+            await staleBatchTask?.value
+            let inventory = await service.getTestState()
+            let publication = await service.publicationStateForTesting()
+            XCTAssertFalse(inventory.visitedPaths.contains("A/stale.txt"))
+            XCTAssertGreaterThanOrEqual(
+                publication.lastPublishedWatcherAcceptedWatermark,
+                restartedWatermark
+            )
+        }
+
+        func testEvidenceAcceptedDuringThresholdFailureReactivatesWithoutAnotherEvent() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryThresholdEvidence")
+            let resyncGate = SteppedBatchGate()
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                isTestMode: true,
+                maxRecoveryFullResyncFailuresOverride: 2,
+                recoveryScanRetryBaseNanosecondsOverride: 1,
+                recoveryScanSleep: { _ in }
+            )
+            await service.setFullResyncFailureCountForTesting(2)
+            await service.setFullResyncWillStartHandlerForTesting {
+                await resyncGate.markStartedAndWaitForRelease()
+            }
+            let recoveryFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped
+            )
+            let initialWatermarkValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: recoveryFlags, eventId: 60)
+            ], scheduleDrain: false)
+            let initialWatermark = try XCTUnwrap(initialWatermarkValue)
+            let flushTask = Task {
+                await service.flushPendingEventsNow(
+                    throughAcceptedWatcherWatermark: initialWatermark
+                )
+            }
+
+            await resyncGate.waitUntilStartCount(1)
+            await resyncGate.releaseNext()
+            await resyncGate.waitUntilStartCount(2)
+            let reactivationWatermarkValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: root.path, flags: recoveryFlags, eventId: 61)
+            ])
+            let reactivationWatermark = try XCTUnwrap(reactivationWatermarkValue)
+            await resyncGate.releaseAll()
+            _ = await flushTask.value
+
+            let recoveredState = await service.watcherStateForTesting()
+            let publication = await service.publicationStateForTesting()
+            XCTAssertFalse(recoveredState.requiresRecoveryFullResync)
+            XCTAssertFalse(recoveredState.recoveryIsQuiescent)
+            XCTAssertTrue(recoveredState.dirtyRecoveryScanTargets.isEmpty)
+            XCTAssertGreaterThanOrEqual(
+                publication.lastPublishedWatcherAcceptedWatermark,
+                reactivationWatermark
+            )
+            await service.setFullResyncWillStartHandlerForTesting(nil)
         }
 
         func testKnownNestedFileModificationPublishesWatermarkWithoutParentScan() async throws {

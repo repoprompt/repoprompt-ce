@@ -212,7 +212,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
             case let .entries(entries):
                 for entry in entries {
                     highestEventID = max(highestEventID, entry.id)
-                    if Self.isIgnoreControlPath(entry.path) {
+                    if FileSystemWatcherPathClassifier.isIgnoreControlPath(entry.path) {
                         changedIgnoreAbsolutePaths.insert(entry.path)
                     }
                 }
@@ -280,10 +280,5 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         drainTask = nil
         scheduleDrainIfNeeded(scheduleDrain)
         lock.unlock()
-    }
-
-    private static func isIgnoreControlPath(_ path: String) -> Bool {
-        let filename = (path as NSString).lastPathComponent.lowercased()
-        return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
     }
 }

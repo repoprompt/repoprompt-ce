@@ -317,8 +317,8 @@ actor FileSystemService {
     var dirtyRecoveryScanTargets: Set<String> = []
     var recoveryScanFailureCountByFolder: [String: Int] = [:]
     var recoveryScanRetryTask: Task<Void, Never>?
-    var requiresRecoveryFullResync = false
-    var pendingRecoveryIngressEvidence = FileSystemWatcherIngressEvidence.empty
+    var recoveryEpisode: FileSystemWatcherRecoveryEpisodeState?
+    var recoveryReactivationWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
 
     /// Short-lived cache
     /// results during a directory walk to avoid repeated allocations.
@@ -346,6 +346,7 @@ actor FileSystemService {
     /// Maximum folders to scan in a single batch (bounds per-tick work)
     let maxFoldersPerBatch: Int
     let maxRecoveryScanAttempts: Int
+    let maxRecoveryFullResyncFailures: Int
     let recoveryScanRetryBaseNanoseconds: UInt64
     let recoveryScanSleep: @Sendable (UInt64) async -> Void
 
@@ -396,6 +397,7 @@ actor FileSystemService {
         maxParallelScansPerActor = max(2, min(4, cores / 2))
         maxFoldersPerBatch = 256
         maxRecoveryScanAttempts = 3
+        maxRecoveryFullResyncFailures = 5
         recoveryScanRetryBaseNanoseconds = 50_000_000
         recoveryScanSleep = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
@@ -469,6 +471,7 @@ actor FileSystemService {
             maxFoldersPerBatchOverride: Int? = nil,
             maxPendingWatcherIngressEntriesOverride: Int? = nil,
             maxRecoveryScanAttemptsOverride: Int? = nil,
+            maxRecoveryFullResyncFailuresOverride: Int? = nil,
             recoveryScanRetryBaseNanosecondsOverride: UInt64? = nil,
             recoveryScanSleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
                 try? await Task.sleep(nanoseconds: nanoseconds)
@@ -500,6 +503,7 @@ actor FileSystemService {
             maxParallelScansPerActor = maxParallelScansOverride ?? max(2, min(4, cores / 2))
             maxFoldersPerBatch = maxFoldersPerBatchOverride ?? 256
             maxRecoveryScanAttempts = max(1, maxRecoveryScanAttemptsOverride ?? 3)
+            maxRecoveryFullResyncFailures = max(1, maxRecoveryFullResyncFailuresOverride ?? 5)
             recoveryScanRetryBaseNanoseconds = recoveryScanRetryBaseNanosecondsOverride ?? 50_000_000
             self.recoveryScanSleep = recoveryScanSleep
 

@@ -1,6 +1,13 @@
 import CoreServices
 import Foundation
 
+enum FileSystemWatcherPathClassifier {
+    static func isIgnoreControlPath(_ path: String) -> Bool {
+        let filename = (path as NSString).lastPathComponent.lowercased()
+        return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
+    }
+}
+
 struct FileSystemWatcherRecoveryCauseSet: OptionSet, Hashable {
     let rawValue: UInt16
 
@@ -18,16 +25,6 @@ struct FileSystemWatcherRecoveryCauseSet: OptionSet, Hashable {
         .kernelDropped,
         .rootChanged,
         .eventIDsWrapped
-    ]
-
-    static let rootRescanRequired: Self = [
-        .mustScanSubdirectories,
-        .userDropped,
-        .kernelDropped,
-        .rootChanged,
-        .eventIDsWrapped,
-        .mailboxCapacity,
-        .serviceCapacity
     ]
 
     static func from(_ flags: FSEventStreamEventFlags) -> Self {
@@ -96,7 +93,7 @@ struct FileSystemWatcherIngressEvidence: Equatable {
         var hasIgnoreControl = false
         for entry in sourcePayload.entries {
             causes.formUnion(.from(entry.flags))
-            hasIgnoreControl = hasIgnoreControl || Self.isIgnoreControlPath(entry.path)
+            hasIgnoreControl = hasIgnoreControl || FileSystemWatcherPathClassifier.isIgnoreControlPath(entry.path)
         }
         if causes.intersection(.fseventUncertainty).isEmpty {
             triggers.insert(.ordinary)
@@ -115,6 +112,18 @@ struct FileSystemWatcherIngressEvidence: Equatable {
             triggers: triggers,
             recoveryCauses: causes
         )
+    }
+
+    func finalizingCallback(
+        retainedEntryCount: Int,
+        earlyFilteredEntryCount: Int,
+        callbackDurationMicroseconds: UInt64
+    ) -> Self {
+        var updated = self
+        updated.retainedEntryCount = retainedEntryCount
+        updated.earlyFilteredEntryCount = earlyFilteredEntryCount
+        updated.callbackDurationMicroseconds = callbackDurationMicroseconds
+        return updated
     }
 
     func merging(_ other: Self) -> Self {
@@ -138,10 +147,26 @@ struct FileSystemWatcherIngressEvidence: Equatable {
         updated.triggers.formUnion(trigger)
         return updated
     }
+}
 
-    private static func isIgnoreControlPath(_ path: String) -> Bool {
-        let filename = (path as NSString).lastPathComponent.lowercased()
-        return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
+enum FileSystemWatcherRecoveryOutcome: Equatable {
+    case rootRescan
+    case fullResyncFailed
+    case fullResyncCompleted
+}
+
+enum FileSystemWatcherRecoveryPhase: Equatable {
+    case recovering
+    case quiescent
+}
+
+struct FileSystemWatcherRecoveryEpisodeState: Equatable {
+    var evidence: FileSystemWatcherIngressEvidence
+    var phase: FileSystemWatcherRecoveryPhase
+    var failedFullResyncCount: Int
+
+    mutating func merge(_ evidence: FileSystemWatcherIngressEvidence) {
+        self.evidence = self.evidence.merging(evidence)
     }
 }
 
@@ -152,11 +177,21 @@ struct FileSystemWatcherRecoveryEpisodeSummary: Equatable {
     let acceptedEntryCount: Int
     let earlyFilteredEntryCount: Int
     let callbackDurationMicroseconds: UInt64
-    let triggeredRootRescan: Bool
-    let triggeredFullResync: Bool
-    let completedFullResync: Bool
+    let outcome: FileSystemWatcherRecoveryOutcome
     let acceptedHighWatermark: UInt64?
     let servicePublicationSequence: UInt64?
+
+    var triggeredRootRescan: Bool {
+        true
+    }
+
+    var triggeredFullResync: Bool {
+        outcome != .rootRescan
+    }
+
+    var completedFullResync: Bool {
+        outcome == .fullResyncCompleted
+    }
 }
 
 struct FileSystemWatcherRecoveryDiagnosticsSnapshot: Equatable {
@@ -191,8 +226,7 @@ final class FileSystemWatcherRecoveryDiagnostics: @unchecked Sendable {
 
     func recordRecoveryEpisode(
         evidence: FileSystemWatcherIngressEvidence,
-        triggeredFullResync: Bool,
-        completedFullResync: Bool,
+        outcome: FileSystemWatcherRecoveryOutcome,
         acceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark?,
         servicePublicationSequence: UInt64?
     ) {
@@ -204,9 +238,7 @@ final class FileSystemWatcherRecoveryDiagnostics: @unchecked Sendable {
             acceptedEntryCount: evidence.retainedEntryCount,
             earlyFilteredEntryCount: evidence.earlyFilteredEntryCount,
             callbackDurationMicroseconds: evidence.callbackDurationMicroseconds,
-            triggeredRootRescan: !evidence.recoveryCauses.intersection(.rootRescanRequired).isEmpty,
-            triggeredFullResync: triggeredFullResync,
-            completedFullResync: completedFullResync,
+            outcome: outcome,
             acceptedHighWatermark: acceptedHighWatermark?.rawValue,
             servicePublicationSequence: servicePublicationSequence
         )

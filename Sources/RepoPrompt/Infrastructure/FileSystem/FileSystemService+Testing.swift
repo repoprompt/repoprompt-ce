@@ -159,9 +159,18 @@ import Foundation
                     FSEventCallbackEntry(path: event.absolutePath, flags: event.flags, id: event.eventId)
                 }
             )
-            let filterResult = watcherEarlyFilter.filter(payload)
-            let evidence = FileSystemWatcherIngressEvidence.callback(
+            var evidence = FileSystemWatcherIngressEvidence.callback(
                 sourcePayload: payload,
+                retainedEntryCount: payload.count,
+                earlyFilteredEntryCount: 0,
+                callbackDurationMicroseconds: 0
+            )
+            let analyzedPayload = FSEventCallbackPayload(
+                entries: payload.entries,
+                ingressEvidence: evidence
+            )
+            let filterResult = watcherEarlyFilter.filter(analyzedPayload)
+            evidence = evidence.finalizingCallback(
                 retainedEntryCount: filterResult.payload?.count ?? 0,
                 earlyFilteredEntryCount: filterResult.filteredEntryCount,
                 callbackDurationMicroseconds: 0
@@ -231,6 +240,10 @@ import Foundation
             await watcherBatchProcessingTask?.value
         }
 
+        func watcherBatchProcessingTaskForTesting() -> Task<Void, Never>? {
+            watcherBatchProcessingTask
+        }
+
         func setContentReadChunkHandlerForTesting(
             _ handler: (@Sendable (String) async -> Void)?
         ) {
@@ -271,6 +284,8 @@ import Foundation
             pendingQuietFolderScanTargets: Set<String>,
             dirtyRecoveryScanTargets: Set<String>,
             requiresRecoveryFullResync: Bool,
+            recoveryIsQuiescent: Bool,
+            recoveryFullResyncFailureCount: Int,
             recoveryScanFailureCountByFolder: [String: Int],
             lastScannedEventIdByFolder: [String: FSEventStreamEventId],
             lastVerifiedAtByFolder: [String: TimeInterval],
@@ -283,7 +298,9 @@ import Foundation
                 pendingScanTargets,
                 pendingQuietFolderScanTargets,
                 dirtyRecoveryScanTargets,
-                requiresRecoveryFullResync,
+                recoveryEpisode != nil,
+                recoveryIsQuiescent,
+                recoveryEpisode?.failedFullResyncCount ?? 0,
                 recoveryScanFailureCountByFolder,
                 lastScannedEventIdByFolder,
                 lastVerifiedAtByFolder,
