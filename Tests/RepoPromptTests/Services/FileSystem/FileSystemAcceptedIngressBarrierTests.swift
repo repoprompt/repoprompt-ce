@@ -107,6 +107,12 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let filter = await service.watcherEarlyFilterSnapshotForTesting()
         XCTAssertTrue(filter.isValid)
         XCTAssertEqual(filter.filteredEntryCount, 10)
+        let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+        XCTAssertEqual(diagnostics.callbackCount, 10)
+        XCTAssertEqual(diagnostics.sourceEntryCount, 10)
+        XCTAssertEqual(diagnostics.retainedEntryCount, 0)
+        XCTAssertEqual(diagnostics.earlyFilteredEntryCount, 10)
+        XCTAssertTrue(diagnostics.recoveryEpisodes.isEmpty)
     }
 
     func testMixedIgnoredAndVisibleEventsPreserveVisibleOrderingAndWatermarks() async throws {
@@ -175,6 +181,9 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let filter = await service.watcherEarlyFilterSnapshotForTesting()
         XCTAssertFalse(filter.isValid)
         XCTAssertEqual(filter.filteredEntryCount, 1)
+        let firstPayload = try XCTUnwrap(service.watcherIngressMailbox.takeNextAcceptedPayload())
+        XCTAssertTrue(firstPayload.ingressEvidence.triggers.contains(.ignoreControl))
+        XCTAssertTrue(firstPayload.ingressEvidence.recoveryCauses.isEmpty)
     }
 
     func testMailboxOverflowRootRescanPreservesHighestAcceptedWatermark() async throws {
@@ -203,8 +212,17 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let publication = try XCTUnwrap(publications.snapshot().last)
         XCTAssertEqual(publication.source, .overflowRootRescan)
         XCTAssertEqual(publication.watcherAcceptedWatermark, highest)
+        XCTAssertTrue(publication.requiresFullResync)
         let serviceState = await service.publicationStateForTesting()
         XCTAssertEqual(serviceState.lastPublishedWatcherAcceptedWatermark, highest)
+        let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+        let episode = try XCTUnwrap(diagnostics.recoveryEpisodes.last)
+        XCTAssertTrue(episode.triggers.contains(.mailboxCapacity))
+        XCTAssertTrue(episode.causes.contains(.mailboxCapacity))
+        XCTAssertTrue(episode.triggeredRootRescan)
+        XCTAssertTrue(episode.triggeredFullResync)
+        XCTAssertTrue(episode.completedFullResync)
+        XCTAssertEqual(episode.acceptedHighWatermark, highest.rawValue)
         cancellables.insert(cancellable)
     }
 

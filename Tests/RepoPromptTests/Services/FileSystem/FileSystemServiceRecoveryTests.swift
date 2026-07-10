@@ -35,6 +35,304 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
     }
 
     #if DEBUG
+        func testProviderLevelDroppedSignalForcesAttributedFullResyncBeforeFreshness() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemProviderDropRecovery")
+            let nestedFolder = root.appendingPathComponent("Sources/Nested", isDirectory: true)
+            try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: true)
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                testVisitedPaths: ["Sources", "Sources/Nested"],
+                testVisitedItems: ["Sources": true, "Sources/Nested": true],
+                isTestMode: true
+            )
+            await service.setCachedSearchContentWatcherActiveOverrideForTesting(true)
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+
+            let ordinaryValue = await service.acceptWatcherPayloadForTesting([
+                (
+                    absolutePath: "/outside/ordinary.swift",
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified),
+                    eventId: 1
+                )
+            ], scheduleDrain: false)
+            let ordinary = try XCTUnwrap(ordinaryValue)
+            _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: ordinary)
+            let ordinaryPublication = try XCTUnwrap(publications.snapshot().last)
+            XCTAssertEqual(ordinaryPublication.source, .watcherBarrierNoop)
+            XCTAssertFalse(ordinaryPublication.requiresFullResync)
+
+            let nestedFile = nestedFolder.appendingPathComponent("Recovered.swift")
+            try "struct Recovered {}\n".write(to: nestedFile, atomically: true, encoding: .utf8)
+            let recoveryFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs
+                    | kFSEventStreamEventFlagUserDropped
+                    | kFSEventStreamEventFlagKernelDropped
+                    | kFSEventStreamEventFlagRootChanged
+            )
+            let recoveryValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: recoveryFlags, eventId: 2)
+            ], scheduleDrain: false)
+            let recovery = try XCTUnwrap(recoveryValue)
+            XCTAssertGreaterThan(recovery, ordinary)
+            let freshnessBeforeRecovery = await service.canUseCachedSearchContent(
+                afterAppliedWatcherWatermark: ordinary.rawValue
+            )
+            XCTAssertFalse(freshnessBeforeRecovery)
+
+            _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: recovery)
+
+            let recoveryPublication = try XCTUnwrap(publications.snapshot().last)
+            XCTAssertEqual(recoveryPublication.source, .recoveryFullResync)
+            XCTAssertEqual(recoveryPublication.watcherAcceptedWatermark, recovery)
+            XCTAssertTrue(recoveryPublication.requiresFullResync)
+            XCTAssertTrue(recoveryPublication.deltas.contains(.fileAdded("Sources/Nested/Recovered.swift")))
+            let serviceState = await service.publicationStateForTesting()
+            XCTAssertEqual(serviceState.lastPublishedWatcherAcceptedWatermark, recovery)
+            let freshnessAfterRecovery = await service.canUseCachedSearchContent(
+                afterAppliedWatcherWatermark: recovery.rawValue
+            )
+            XCTAssertTrue(freshnessAfterRecovery)
+
+            let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+            XCTAssertEqual(diagnostics.callbackCount, 2)
+            XCTAssertEqual(diagnostics.recoveryEpisodes.count, 1)
+            let episode = try XCTUnwrap(diagnostics.recoveryEpisodes.first)
+            XCTAssertEqual(episode.triggers, [.fseventRecovery])
+            XCTAssertEqual(episode.causes, [
+                .mustScanSubdirectories,
+                .userDropped,
+                .kernelDropped,
+                .rootChanged
+            ])
+            XCTAssertEqual(episode.acceptedEntryCount, 1)
+            XCTAssertTrue(episode.triggeredRootRescan)
+            XCTAssertTrue(episode.triggeredFullResync)
+            XCTAssertTrue(episode.completedFullResync)
+            XCTAssertEqual(episode.acceptedHighWatermark, recovery.rawValue)
+            XCTAssertEqual(episode.servicePublicationSequence, recoveryPublication.servicePublicationSequence)
+            withExtendedLifetime(cancellable) {}
+        }
+
+        func testRecoverySignalsDuringActiveEpisodeCoalesceIntoOneFollowUp() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryEpisodeCoalescing")
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                isTestMode: true
+            )
+            let batchGate = SteppedBatchGate()
+            await service.setWatcherBatchWillProcessHandlerForTesting {
+                await batchGate.markStartedAndWaitForRelease()
+            }
+            let flags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped
+            )
+            let firstValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: flags, eventId: 1)
+            ])
+            let first = try XCTUnwrap(firstValue)
+            await batchGate.waitUntilStartCount(1)
+
+            var latest = first
+            for eventID in 2 ... 6 {
+                let accepted = await service.acceptWatcherPayloadForTesting([
+                    (absolutePath: "/", flags: flags, eventId: FSEventStreamEventId(eventID))
+                ], scheduleDrain: false)
+                latest = try XCTUnwrap(accepted)
+            }
+            await service.drainAcceptedWatcherIngressMailbox()
+            let startCountWhileFirstBlocked = await batchGate.observedStartCount()
+            XCTAssertEqual(startCountWhileFirstBlocked, 1)
+
+            await batchGate.releaseNext()
+            await batchGate.waitUntilStartCount(2)
+            let startCountAtFollowUp = await batchGate.observedStartCount()
+            XCTAssertEqual(startCountAtFollowUp, 2)
+            await batchGate.releaseAll()
+            _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: latest)
+
+            let finalStartCount = await batchGate.observedStartCount()
+            XCTAssertEqual(finalStartCount, 2)
+            let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+            XCTAssertEqual(diagnostics.callbackCount, 6)
+            XCTAssertEqual(diagnostics.recoveryEpisodes.count, 2)
+            XCTAssertEqual(diagnostics.recoveryEpisodes.map(\.callbackCount), [1, 5])
+            XCTAssertEqual(
+                diagnostics.recoveryEpisodes.map(\.acceptedHighWatermark),
+                [first.rawValue, latest.rawValue]
+            )
+            XCTAssertTrue(diagnostics.recoveryEpisodes.allSatisfy(\.completedFullResync))
+            await service.setWatcherBatchWillProcessHandlerForTesting(nil)
+        }
+
+        func testRecoveryFullResyncFailureRetainsGapUntilRetrySucceeds() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryGapRetry")
+            let retryGate = SteppedBatchGate()
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                isTestMode: true,
+                recoveryScanRetryBaseNanosecondsOverride: 1,
+                recoveryScanSleep: { _ in
+                    await retryGate.markStartedAndWaitForRelease()
+                }
+            )
+            await service.setCachedSearchContentWatcherActiveOverrideForTesting(true)
+            await service.setFullResyncFailureCountForTesting(1)
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+            let flags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped
+            )
+            let acceptedValue = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: flags, eventId: 10)
+            ], scheduleDrain: false)
+            let accepted = try XCTUnwrap(acceptedValue)
+            let flush = Task {
+                await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: accepted)
+            }
+
+            await retryGate.waitUntilStartCount(1)
+            let blockedState = await service.watcherStateForTesting()
+            let blockedPublication = await service.publicationStateForTesting()
+            let blockedFreshness = await service.canUseCachedSearchContent(
+                afterAppliedWatcherWatermark: accepted.rawValue
+            )
+            XCTAssertEqual(blockedState.dirtyRecoveryScanTargets, [""])
+            XCTAssertTrue(blockedState.requiresRecoveryFullResync)
+            XCTAssertLessThan(blockedPublication.lastPublishedWatcherAcceptedWatermark, accepted)
+            XCTAssertFalse(blockedFreshness)
+            XCTAssertTrue(publications.snapshot().isEmpty)
+            let blockedDiagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+            XCTAssertEqual(blockedDiagnostics.recoveryEpisodes.count, 1)
+            XCTAssertFalse(blockedDiagnostics.recoveryEpisodes[0].completedFullResync)
+
+            await retryGate.releaseAll()
+            _ = await flush.value
+            let finalState = await service.watcherStateForTesting()
+            let publication = try XCTUnwrap(publications.snapshot().last)
+            XCTAssertFalse(finalState.requiresRecoveryFullResync)
+            XCTAssertTrue(finalState.dirtyRecoveryScanTargets.isEmpty)
+            XCTAssertEqual(publication.source, .recoveryFullResync)
+            XCTAssertEqual(publication.watcherAcceptedWatermark, accepted)
+            XCTAssertTrue(publication.requiresFullResync)
+            let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+            XCTAssertEqual(diagnostics.recoveryEpisodes.count, 1)
+            XCTAssertTrue(diagnostics.recoveryEpisodes[0].triggeredFullResync)
+            XCTAssertTrue(diagnostics.recoveryEpisodes[0].completedFullResync)
+            withExtendedLifetime(cancellable) {}
+        }
+
+        func testTeardownDuringFailedRecoveryCannotRestoreOldGenerationGap() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryTeardown")
+            let resyncGate = SteppedBatchGate()
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                isTestMode: true,
+                recoveryScanRetryBaseNanosecondsOverride: 1,
+                recoveryScanSleep: { _ in
+                    XCTFail("A stale recovery generation must not schedule retry sleep")
+                }
+            )
+            await service.setFullResyncFailureCountForTesting(1)
+            await service.setFullResyncWillStartHandlerForTesting {
+                await resyncGate.markStartedAndWaitForRelease()
+            }
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+            let flags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped
+            )
+            let accepted = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: flags, eventId: 20)
+            ])
+            XCTAssertNotNil(accepted)
+            await resyncGate.waitUntilStartCount(1)
+
+            await service.stopWatchingForChanges()
+            await resyncGate.releaseAll()
+            await service.waitForWatcherBatchProcessingForTesting()
+
+            let state = await service.watcherStateForTesting()
+            XCTAssertTrue(state.pendingScanTargets.isEmpty)
+            XCTAssertTrue(state.pendingQuietFolderScanTargets.isEmpty)
+            XCTAssertTrue(state.dirtyRecoveryScanTargets.isEmpty)
+            XCTAssertFalse(state.requiresRecoveryFullResync)
+            XCTAssertTrue(state.recoveryScanFailureCountByFolder.isEmpty)
+            XCTAssertTrue(publications.snapshot().isEmpty)
+            let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+            XCTAssertTrue(diagnostics.recoveryEpisodes.isEmpty)
+            await service.setFullResyncWillStartHandlerForTesting(nil)
+            withExtendedLifetime(cancellable) {}
+        }
+
+        func testTeardownDuringSuccessfulRecoveryCannotInstallOldGenerationSnapshot() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoverySuccessTeardown")
+            let resyncGate = SteppedBatchGate()
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                isTestMode: true
+            )
+            await service.setFullResyncWillStartHandlerForTesting {
+                await resyncGate.markStartedAndWaitForRelease()
+            }
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+            try "struct Stale {}\n".write(
+                to: root.appendingPathComponent("Stale.swift"),
+                atomically: true,
+                encoding: .utf8
+            )
+            let flags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped
+            )
+            let accepted = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: "/", flags: flags, eventId: 21)
+            ])
+            XCTAssertNotNil(accepted)
+            await resyncGate.waitUntilStartCount(1)
+
+            await service.stopWatchingForChanges()
+            await resyncGate.releaseAll()
+            await service.waitForWatcherBatchProcessingForTesting()
+
+            let inventory = await service.getTestState()
+            XCTAssertFalse(inventory.visitedPaths.contains("Stale.swift"))
+            XCTAssertNil(inventory.visitedItems["Stale.swift"])
+            let state = await service.watcherStateForTesting()
+            XCTAssertTrue(state.pendingScanTargets.isEmpty)
+            XCTAssertTrue(state.dirtyRecoveryScanTargets.isEmpty)
+            XCTAssertFalse(state.requiresRecoveryFullResync)
+            XCTAssertTrue(publications.snapshot().isEmpty)
+            let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+            XCTAssertTrue(diagnostics.recoveryEpisodes.isEmpty)
+            await service.setFullResyncWillStartHandlerForTesting(nil)
+            withExtendedLifetime(cancellable) {}
+        }
+
         func testKnownNestedFileModificationPublishesWatermarkWithoutParentScan() async throws {
             let root = try temporaryRoots.makeRoot(suiteName: "FileSystemKnownFileModification")
             let folderURL = root.appendingPathComponent("Sources/Nested", isDirectory: true)
@@ -738,6 +1036,10 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
                 let waiters = releaseWaiters
                 releaseWaiters.removeAll()
                 waiters.forEach { $0.resume() }
+            }
+
+            func observedStartCount() -> Int {
+                startCount
             }
         }
     #endif
