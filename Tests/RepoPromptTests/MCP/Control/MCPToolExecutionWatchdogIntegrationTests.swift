@@ -1681,29 +1681,20 @@ import XCTest
                 }
                 do {
                     let endpoint = try fixture.endpointA()
-                    let first = Task {
-                        try await endpoint.callTool(
-                            name: MCPWindowToolName.readFile,
-                            arguments: [
-                                "path": fixture.contextA.fileURL.path,
-                                "context_id": fixture.contextA.tabID.uuidString
-                            ]
-                        )
+                    let capacity = MCPToolAdmissionPolicy.smallReadConnectionLimit
+                    let admittedTasks = (0 ..< capacity).map { _ in
+                        Task {
+                            try await endpoint.callTool(
+                                name: MCPWindowToolName.readFile,
+                                arguments: [
+                                    "path": fixture.contextA.fileURL.path,
+                                    "context_id": fixture.contextA.tabID.uuidString
+                                ]
+                            )
+                        }
                     }
-                    try await clock.waitForSleeperCount(1)
-                    try await operationGate.waitUntilEntered(count: 1)
-
-                    let second = Task {
-                        try await endpoint.callTool(
-                            name: MCPWindowToolName.readFile,
-                            arguments: [
-                                "path": fixture.contextA.fileURL.path,
-                                "context_id": fixture.contextA.tabID.uuidString
-                            ]
-                        )
-                    }
-                    try await clock.waitForSleeperCount(2)
-                    try await operationGate.waitUntilEntered(count: 2)
+                    try await clock.waitForSleeperCount(capacity)
+                    try await operationGate.waitUntilEntered(count: capacity)
 
                     let queuedBeyondCapacity = Task {
                         try await endpoint.callTool(
@@ -1714,18 +1705,19 @@ import XCTest
                             ]
                         )
                     }
-                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
-                    try await clock.waitForSleeperCount(2)
-                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
-                    try await clock.waitForSleeperCount(2)
+                    for _ in 0 ..< capacity {
+                        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+                        try await clock.waitForSleeperCount(capacity)
+                    }
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
 
-                    await Self.assertSocketClosed(first)
-                    await Self.assertSocketClosed(second)
+                    for task in admittedTasks {
+                        await Self.assertSocketClosed(task)
+                    }
                     await Self.assertSocketClosed(queuedBeyondCapacity)
                     let enteredCount = await operationGate.enteredCount()
                     let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
-                    XCTAssertEqual(enteredCount, MCPToolAdmissionPolicy.smallReadPerWindowLimit)
+                    XCTAssertEqual(enteredCount, capacity)
                     XCTAssertTrue(isTerminal)
 
                     let events = recorder.snapshot().filter {
