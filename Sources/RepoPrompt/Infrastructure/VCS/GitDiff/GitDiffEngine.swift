@@ -19,7 +19,7 @@ actor GitDiffEngine {
         }
     }
 
-    struct DiffTextResult: Sendable {
+    struct DiffTextResult {
         let fingerprint: GitDiffFingerprint
         let text: String
         let perFile: [String: String]?
