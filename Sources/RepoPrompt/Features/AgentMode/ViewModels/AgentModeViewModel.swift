@@ -560,7 +560,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
-    let attachmentWorkspaceDirectoryProvider: () -> URL?
+    let attachmentWorkspaceStorageProvider: () -> WorkspacePersistentStorage?
     private let workspacePathProvider: () -> String?
     private let skillCatalog: AgentSkillCatalog
     private let headlessProviderFactory: HeadlessProviderFactory
@@ -1420,11 +1420,14 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
         workspacePathProvider = codexWorkspacePathProvider
-        attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
-            guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
+        attachmentWorkspaceStorageProvider = { [weak workspaceManager] in
+            guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
                 return nil
             }
-            return FileManager.default.temporaryDirectory
+            return try? WorkspacePersistentStorage(
+                workspace: workspace,
+                workspaceDirectory: FileManager.default.temporaryDirectory
+            )
         }
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
@@ -1634,11 +1637,12 @@ final class AgentModeViewModel: ObservableObject {
             mcpServer = testMCPServer
             self.applyEditsApprovalStore = applyEditsApprovalStore
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
-            attachmentWorkspaceDirectoryProvider = {
-                if let testWorkspaceDirectory {
-                    return testWorkspaceDirectory
-                }
-                return FileManager.default.temporaryDirectory
+            attachmentWorkspaceStorageProvider = {
+                let workspace = WorkspaceModel(name: "Agent attachment test", repoPaths: [])
+                return try? WorkspacePersistentStorage(
+                    workspace: workspace,
+                    workspaceDirectory: testWorkspaceDirectory ?? FileManager.default.temporaryDirectory
+                )
             }
             let codexWorkspacePathProvider = { testWorkspacePath }
             let sessionWorkspacePathProvider: (TabSession) throws -> String? = { session in

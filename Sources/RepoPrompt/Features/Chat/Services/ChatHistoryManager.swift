@@ -120,6 +120,10 @@ actor ChatDataService {
         _ session: ChatSession,
         for workspace: WorkspaceModel
     ) async throws -> URL {
+        guard workspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+
         // 1) Get "Chats" folder
         let chatsFolder = try ensureChatsFolder(for: workspace)
 
@@ -440,6 +444,10 @@ actor ChatDataService {
     /// Creates (if needed) and returns the "Chats" subfolder for the given workspace.
     /// Uses workspace.customStoragePath if set, else the default ~Library location.
     private func ensureChatsFolder(for workspace: WorkspaceModel) throws -> URL {
+        guard workspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+
         let baseFolder = try workspaceFolderURL(for: workspace)
         let chatsFolder = baseFolder.appendingPathComponent("Chats")
 

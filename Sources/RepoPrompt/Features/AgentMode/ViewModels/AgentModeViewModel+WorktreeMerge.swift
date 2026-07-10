@@ -373,9 +373,18 @@ extension AgentModeViewModel {
             selector: target,
             source: source
         )
-        let directory = workspaceDirectory
-            ?? workspaceManager?.activeWorkspace?.customStoragePath
-            ?? FileManager.default.temporaryDirectory
+        let directory: URL = if publishArtifacts,
+                                let workspaceManager,
+                                let workspace = workspaceManager.activeWorkspace
+        {
+            let storage = try workspaceManager
+                .persistentStorage(for: workspace)
+            workspaceDirectory ?? storage.workspaceDirectory
+        } else {
+            workspaceDirectory
+                ?? workspaceManager?.activeWorkspace?.customStoragePath
+                ?? FileManager.default.temporaryDirectory
+        }
         let preview = try await VCSService.shared.previewGitWorktreeMerge(.init(
             source: source,
             target: targetEndpoint,

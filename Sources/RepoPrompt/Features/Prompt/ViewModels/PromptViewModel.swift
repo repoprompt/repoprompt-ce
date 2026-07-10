@@ -1040,7 +1040,9 @@ class PromptViewModel: ObservableObject {
         guard let workspaceManager else {
             throw GitArtifactPublishError.noActiveWorkspace
         }
-        let workspaceDirectory = workspaceManager.workspaceDirectory(for: workspace)
+        let workspaceDirectory = try workspaceManager
+            .persistentStorage(for: workspace)
+            .workspaceDirectory
         let compareDisplay = compareSpec.displayString
 
         // Publish the artifacts

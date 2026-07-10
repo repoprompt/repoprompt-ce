@@ -95,7 +95,7 @@ extension AgentModeViewModel {
     func attachImages(tabID: UUID, urls: [URL]) {
         guard !urls.isEmpty else { return }
         let session = session(for: tabID)
-        guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else {
+        guard let storage = attachmentWorkspaceStorage() else {
             let errorItem = AgentChatItem.error("Images require an active workspace.", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(errorItem)
             updateBindingsFromSession(session)
@@ -134,7 +134,7 @@ extension AgentModeViewModel {
             }
 
             do {
-                let result = try attachmentStore.importImageFile(sourceURL: standardizedSourceURL, workspaceDirectory: workspaceDirectory)
+                let result = try attachmentStore.importImageFile(sourceURL: standardizedSourceURL, storage: storage)
                 if !standardizedSourceURL.path.isEmpty {
                     seenSourcePaths.insert(standardizedSourceURL.path)
                 }
@@ -263,15 +263,15 @@ extension AgentModeViewModel {
         return ImageAttachmentFingerprint(byteCount: byteCount, digestHex: digestHex)
     }
 
-    private func attachmentWorkspaceDirectoryURL() -> URL? {
-        attachmentWorkspaceDirectoryProvider()?.standardizedFileURL
+    private func attachmentWorkspaceStorage() -> WorkspacePersistentStorage? {
+        attachmentWorkspaceStorageProvider()
     }
 
     private func clearConsumedAttachmentFilesIfNeeded(_ attachments: [AgentImageAttachment]) {
         guard clearConsumedAttachmentsAfterProviderConsumption else { return }
         guard !attachments.isEmpty else { return }
-        guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else { return }
-        attachmentStore.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
+        guard let storage = attachmentWorkspaceStorage() else { return }
+        attachmentStore.clearConsumedLocalFiles(attachments, storage: storage)
     }
 
     @discardableResult

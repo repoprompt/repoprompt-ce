@@ -1375,6 +1375,10 @@ actor AgentSessionDataService {
 
     /// Creates (if needed) and returns the "AgentSessions" subfolder for the given workspace.
     private func ensureAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL {
+        guard workspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+
         let baseFolder = try workspaceFolderURL(for: workspace)
         let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")
 
