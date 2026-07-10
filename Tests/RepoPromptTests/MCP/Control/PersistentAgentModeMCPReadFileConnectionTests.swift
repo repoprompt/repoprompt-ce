@@ -591,6 +591,59 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(selection.slices[targetLogicalPath], expectedRanges)
             fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = Fixture.agentSessionID
 
+            // Pause after ownership await inside hiddenSessionSliceRangesIfTargetCurrent, then
+            // clear the tab's active session while selection ranges stay unchanged. Post-await
+            // re-read must fail closed so ranges from the pre-await snapshot are not returned.
+            let ownershipPassGate = PersistentAsyncGate()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRangesDidPassOwnershipHandlerForTesting { path in
+                guard path == targetLogicalPath || path == physicalURL.path else { return }
+                await ownershipPassGate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRangesDidPassOwnershipHandlerForTesting(nil)
+                Task { await ownershipPassGate.release() }
+            }
+            var ownershipRaceLines = editedLines
+            ownershipRaceLines.insert(contentsOf: (1 ... 10).map { "ownership-race-insert-\($0)" }, at: 0)
+            let ownershipReplacementURL = physicalURL.deletingLastPathComponent()
+                .appendingPathComponent(".SessionWorktree6500.swift.ownership-\(UUID().uuidString)")
+            try (ownershipRaceLines.joined(separator: "\n") + "\n").write(
+                to: ownershipReplacementURL,
+                atomically: false,
+                encoding: .utf8
+            )
+            _ = try FileManager.default.replaceItemAt(physicalURL, withItemAt: ownershipReplacementURL)
+            let ownershipAccepted = try await fixture.window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+                rootID: fixture.installedWorktreeRootID,
+                events: [(
+                    absolutePath: physicalURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemRenamed
+                            | kFSEventStreamEventFlagItemCreated
+                            | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 8_900_000_000_000_000_004
+                )]
+            )
+            XCTAssertNotNil(ownershipAccepted)
+            _ = await fixture.window.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: physicalURL.path,
+                fallbackScope: .allLoaded
+            )
+            try await requireGateStarted(ownershipPassGate)
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = nil
+            await ownershipPassGate.release()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRangesDidPassOwnershipHandlerForTesting(nil)
+            let ownershipFence = await fixture.window.workspaceFilesViewModel.waitForPendingSliceRebasesAndCaptureFence(
+                affectingCandidatePaths: [physicalURL.path]
+            )
+            XCTAssertTrue(fixture.window.workspaceFilesViewModel.isSliceRebaseFenceCurrent(ownershipFence))
+            selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(selection.slices[targetLogicalPath], expectedRanges)
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = Fixture.agentSessionID
+
             // `manage_selection get` flushes pending active-UI state before replying. Hidden
             // worktree-only paths cannot materialize in the visible file tree, so the MCP-owned
             // canonical selection fence must advance with the watcher-driven rebase rather than

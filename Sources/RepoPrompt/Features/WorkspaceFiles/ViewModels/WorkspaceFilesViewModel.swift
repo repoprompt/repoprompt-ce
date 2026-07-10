@@ -1157,6 +1157,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
         private var hiddenSessionSliceRebaseWillCommitHandler: (@Sendable (String) async -> Void)?
         private var hiddenSessionSliceRebaseWillApplyTabPlansHandler: (@Sendable (String) async -> Void)?
+        private var hiddenSessionSliceRangesDidPassOwnershipHandler: (@Sendable (String) async -> Void)?
         private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
 
         func setAppliedIndexProjectionWillHandleHandlerForTesting(
@@ -1175,6 +1176,12 @@ class WorkspaceFilesViewModel: ObservableObject {
             _ handler: (@Sendable (String) async -> Void)?
         ) {
             hiddenSessionSliceRebaseWillApplyTabPlansHandler = handler
+        }
+
+        func setHiddenSessionSliceRangesDidPassOwnershipHandlerForTesting(
+            _ handler: (@Sendable (String) async -> Void)?
+        ) {
+            hiddenSessionSliceRangesDidPassOwnershipHandler = handler
         }
 
         func setAppliedIndexProjectionStateObserverForTesting(
@@ -1941,7 +1948,23 @@ class WorkspaceFilesViewModel: ObservableObject {
                   physicalRootPaths: target.physicalRootPaths
               )
         else { return nil }
-        return SliceRangeMath.normalize(ranges)
+
+        #if DEBUG
+            if let hiddenSessionSliceRangesDidPassOwnershipHandler {
+                await hiddenSessionSliceRangesDidPassOwnershipHandler(target.logicalFullPath)
+            }
+        #endif
+
+        // Re-read after the ownership await (actor hop). A mid-suspension session
+        // clear/switch must not return ranges for a tab that no longer owns the target.
+        guard let refreshedTab = manager.composeTab(for: target.identity),
+              refreshedTab.activeAgentSessionID == target.agentSessionID,
+              let refreshedRanges = StoredSelectionPathNormalization.standardizedSlices(
+                  refreshedTab.selection.slices
+              )[target.logicalFullPath],
+              !refreshedRanges.isEmpty
+        else { return nil }
+        return SliceRangeMath.normalize(refreshedRanges)
     }
 
     @MainActor
