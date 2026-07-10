@@ -109,7 +109,7 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         _ = await latestTask.value
 
         XCTAssertEqual(harness.manager.mirrorStartedSelections, [first, latest])
-        XCTAssertEqual(harness.manager.mirrorCompletedSelections, [first, latest])
+        XCTAssertEqual(harness.manager.mirrorCompletedSelections, [latest])
         XCTAssertEqual(harness.manager.mirroredSelection, latest)
         XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, latest)
     }
@@ -213,37 +213,181 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         let gate = SelectionMirrorGate()
         harness.manager.firstMirrorGate = gate
         let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
-        let completion = SelectionMirrorCompletion(expectedCount: 2)
+        let firstCompletion = SelectionMirrorCompletion(expectedCount: 1)
 
         let firstTask = Task { @MainActor in
             await coordinator.persistActiveSelection(first, source: .mcpTabContext)
-            await completion.markCompleted()
+            await firstCompletion.markCompleted()
         }
         let mirrorStarted = await gate.waitUntilStarted()
         XCTAssertTrue(mirrorStarted)
         guard mirrorStarted else { return }
 
         firstTask.cancel()
+        await gate.release()
+        let firstCompleted = await firstCompletion.waitUntilComplete()
+        XCTAssertTrue(firstCompleted)
+        _ = await firstTask.value
+        let firstMirrorCompleted = await waitForMirrorAttempts(1, in: harness)
+        XCTAssertTrue(firstMirrorCompleted)
+
         let latestTask = Task { @MainActor in
             await coordinator.persistActiveSelection(latest, source: .mcpTabContext)
-            await completion.markCompleted()
         }
-        await waitForSelection(latest, in: harness)
-        XCTAssertEqual(harness.manager.mirrorStartedSelections, [first])
-
-        await gate.release()
-        let completed = await completion.waitUntilComplete()
-        XCTAssertTrue(completed)
-        guard completed else {
-            latestTask.cancel()
-            return
-        }
-        _ = await firstTask.value
         _ = await latestTask.value
 
         XCTAssertEqual(harness.manager.mirrorStartedSelections, [first, latest])
         XCTAssertEqual(harness.manager.mirrorCompletedSelections, [first, latest])
         XCTAssertEqual(harness.manager.mirroredSelection, latest)
+    }
+
+    func testNewMCPMirrorCancelsSupersededApply() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let superseded = StoredSelection(selectedPaths: ["/tmp/superseded.swift"])
+        let latest = StoredSelection(selectedPaths: ["/tmp/latest.swift"])
+        let harness = CoordinatorHarness(initialSelection: initial)
+        let gate = SelectionMirrorGate()
+        harness.manager.firstMirrorGate = gate
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        let completion = SelectionMirrorCompletion(expectedCount: 2)
+
+        let supersededTask = Task { @MainActor in
+            await coordinator.persistActiveSelection(superseded, source: .mcpTabContext)
+            await completion.markCompleted()
+        }
+        let mirrorStarted = await gate.waitUntilStarted()
+        XCTAssertTrue(mirrorStarted)
+        guard mirrorStarted else {
+            supersededTask.cancel()
+            return
+        }
+
+        let latestTask = Task { @MainActor in
+            await coordinator.persistActiveSelection(latest, source: .mcpTabContext)
+            await completion.markCompleted()
+        }
+        let completed = await completion.waitUntilComplete(timeout: .seconds(1))
+        XCTAssertTrue(completed)
+        guard completed else {
+            supersededTask.cancel()
+            latestTask.cancel()
+            await gate.release()
+            return
+        }
+        _ = await supersededTask.value
+        _ = await latestTask.value
+
+        XCTAssertEqual(harness.manager.mirrorStartedSelections, [superseded, latest])
+        XCTAssertEqual(harness.manager.mirrorCompletedSelections, [latest])
+        XCTAssertEqual(harness.manager.mirroredSelection, latest)
+        XCTAssertEqual(harness.manager.maximumConcurrentMirrorAttempts, 1)
+    }
+
+    func testMCPMirrorTimeoutRepairsCanonicalSelectionAfterCancelledApplyReturns() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let canonical = StoredSelection(selectedPaths: ["/tmp/canonical.swift"])
+        let harness = CoordinatorHarness(initialSelection: initial)
+        let gate = SelectionMirrorGate()
+        harness.manager.firstMirrorGate = gate
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: harness.manager,
+            store: harness.store,
+            mcpSelectionMirrorTimeout: .milliseconds(100)
+        )
+        let requestCompletion = SelectionMirrorCompletion(expectedCount: 1)
+
+        let requestTask = Task { @MainActor in
+            await coordinator.persistActiveSelection(canonical, source: .mcpTabContext)
+            await requestCompletion.markCompleted()
+        }
+        let mirrorStarted = await gate.waitUntilStarted()
+        XCTAssertTrue(mirrorStarted)
+        guard mirrorStarted else {
+            requestTask.cancel()
+            return
+        }
+
+        let requestFinished = await requestCompletion.waitUntilComplete(timeout: .seconds(1))
+        XCTAssertTrue(requestFinished)
+        guard requestFinished else {
+            await gate.release()
+            _ = await requestTask.value
+            return
+        }
+        _ = await requestTask.value
+
+        let repairedCanonical = await waitForMirrorAttempts(1, in: harness)
+        XCTAssertTrue(repairedCanonical)
+        XCTAssertEqual(harness.manager.mirrorStartedSelections, [canonical, canonical])
+        XCTAssertEqual(harness.manager.mirrorCompletedSelections, [canonical])
+        XCTAssertEqual(harness.manager.mirroredSelection, canonical)
+        XCTAssertEqual(harness.manager.maximumConcurrentMirrorAttempts, 1)
+    }
+
+    func testMCPMirrorTimeoutBoundsUncooperativeTailAndRepairsLatestSelection() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let wedged = StoredSelection(selectedPaths: ["/tmp/wedged.swift"])
+        let next = StoredSelection(selectedPaths: ["/tmp/next.swift"])
+        let harness = CoordinatorHarness(initialSelection: initial)
+        let gate = SelectionMirrorGate()
+        harness.manager.firstMirrorGate = gate
+        harness.manager.firstMirrorIgnoresCancellation = true
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: harness.manager,
+            store: harness.store,
+            mcpSelectionMirrorTimeout: .milliseconds(100)
+        )
+        let firstCompletion = SelectionMirrorCompletion(expectedCount: 1)
+        let firstTask = Task { @MainActor in
+            await coordinator.persistActiveSelection(wedged, source: .mcpTabContext)
+            await firstCompletion.markCompleted()
+        }
+
+        let mirrorStarted = await gate.waitUntilStarted()
+        XCTAssertTrue(mirrorStarted)
+        guard mirrorStarted else {
+            firstTask.cancel()
+            return
+        }
+
+        let startedAt = ContinuousClock.now
+        let firstFinished = await firstCompletion.waitUntilComplete(timeout: .seconds(1))
+        let elapsed = startedAt.duration(to: ContinuousClock.now)
+        XCTAssertTrue(firstFinished)
+        XCTAssertLessThan(elapsed, .seconds(1))
+        guard firstFinished else {
+            await gate.release()
+            _ = await firstTask.value
+            return
+        }
+
+        let nextCompletion = SelectionMirrorCompletion(expectedCount: 1)
+        let nextTask = Task { @MainActor in
+            await coordinator.persistActiveSelection(next, source: .mcpTabContext)
+            await nextCompletion.markCompleted()
+        }
+        let nextFinished = await nextCompletion.waitUntilComplete(timeout: .seconds(1))
+        XCTAssertTrue(nextFinished)
+        guard nextFinished else {
+            await gate.release()
+            _ = await firstTask.value
+            _ = await nextTask.value
+            return
+        }
+        _ = await firstTask.value
+        _ = await nextTask.value
+
+        XCTAssertEqual(harness.manager.mirrorStartedSelections, [wedged])
+        XCTAssertEqual(harness.manager.maximumConcurrentMirrorAttempts, 1)
+        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, next)
+
+        await gate.release()
+        let repairedLatest = await waitForMirrorAttempts(1, in: harness)
+        XCTAssertTrue(repairedLatest)
+        XCTAssertEqual(harness.manager.mirrorStartedSelections, [wedged, next])
+        XCTAssertEqual(harness.manager.mirrorCompletedSelections, [next])
+        XCTAssertEqual(harness.manager.mirroredSelection, next)
+        XCTAssertEqual(harness.manager.maximumConcurrentMirrorAttempts, 1)
     }
 
     private func waitForSelection(_ selection: StoredSelection, in harness: CoordinatorHarness) async {
@@ -557,7 +701,7 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(peer.manager.composeTab(for: peer.identity)?.selection, propagated)
         XCTAssertEqual(peer.manager.updateStoredOnlyCallCount, storedUpdateCountAtClose)
         XCTAssertEqual(peer.manager.mirrorStartedSelections, [peerCanonical])
-        XCTAssertEqual(peer.manager.mirrorCompletedSelections, [peerCanonical])
+        XCTAssertTrue(peer.manager.mirrorCompletedSelections.isEmpty)
         XCTAssertEqual(peer.manager.mirroredSelection, peerCanonical)
     }
 
@@ -900,11 +1044,21 @@ private final class FakeMCPSelectionRevisionLedger {
 private actor SelectionMirrorGate {
     private var started = false
     private var released = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-    func markStartedAndWaitForRelease(timeout: Duration = .seconds(5)) async {
+    func markStartedAndWaitForRelease(
+        timeout: Duration = .seconds(5),
+        ignoresCancellation: Bool = false
+    ) async {
         started = true
+        if ignoresCancellation, !released {
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+            return
+        }
         let deadline = ContinuousClock.now + timeout
-        while !released, ContinuousClock.now < deadline {
+        while !released, !Task.isCancelled, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(10))
         }
     }
@@ -919,6 +1073,11 @@ private actor SelectionMirrorGate {
 
     func release() {
         released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 }
 
@@ -957,9 +1116,12 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
     private(set) var publishSnapshotCallCount = 0
     private(set) var updateStoredOnlyCallCount = 0
     var firstMirrorGate: SelectionMirrorGate?
+    var firstMirrorIgnoresCancellation = false
     var mirrorGatesByAttempt: [Int: SelectionMirrorGate] = [:]
     private(set) var mirrorStartedSelections: [StoredSelection] = []
     private(set) var mirrorCompletedSelections: [StoredSelection] = []
+    private(set) var maximumConcurrentMirrorAttempts = 0
+    private var concurrentMirrorAttempts = 0
     var mirroredSelection: StoredSelection?
     private(set) var presentedSelection: StoredSelection?
     let mcpSelectionPropagationHostID = UUID()
@@ -1018,12 +1180,18 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
               activeWorkspace?.activeComposeTabID == tabID
         else { return }
         mirrorStartedSelections.append(selection)
+        concurrentMirrorAttempts += 1
+        maximumConcurrentMirrorAttempts = max(maximumConcurrentMirrorAttempts, concurrentMirrorAttempts)
+        defer { concurrentMirrorAttempts -= 1 }
         let attempt = mirrorStartedSelections.count
         if let gate = mirrorGatesByAttempt[attempt] {
             await gate.markStartedAndWaitForRelease()
         } else if attempt == 1, let firstMirrorGate {
-            await firstMirrorGate.markStartedAndWaitForRelease()
+            await firstMirrorGate.markStartedAndWaitForRelease(
+                ignoresCancellation: firstMirrorIgnoresCancellation
+            )
         }
+        guard !Task.isCancelled else { return }
         mirroredSelection = selection
         mirrorCompletedSelections.append(selection)
         if advanceLiveUISelectionRevisionDuringMirror {
