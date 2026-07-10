@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -7,6 +7,109 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
     override func tearDown() async throws {
         await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
         try await super.tearDown()
+    }
+
+    func testFailedThenSuccessfulPayloadsReceiveTheirOwnOutcomes() async throws {
+        let storageRoot = try makeTestDirectory(named: "FailedThenSuccessful")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let url = storageRoot.appendingPathComponent("payload.json")
+        let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
+        let gate = WorkspaceSavePreparationGate()
+        await writer.setAtomicWriteGateForTesting {
+            await gate.pauseFirstPreparation()
+        }
+        await writer.setFailAtomicWriteForTesting(url: url, afterAdditionalAttempts: 1)
+
+        let failedTask = Task { await writer.enqueueAndWait(data: Data("failed".utf8), url: url) }
+        await gate.waitUntilPaused()
+        let successfulTask = Task { await writer.enqueueAndWait(data: Data("successful".utf8), url: url) }
+        let flushTask = Task { await writer.flush(url: url) }
+        await drainMainActorTasks()
+        await gate.release()
+
+        let failedOutcome = await failedTask.value
+        let successfulOutcome = await successfulTask.value
+        let flushOutcome = await flushTask.value
+        XCTAssertEqual(failedOutcome, .failed)
+        XCTAssertEqual(successfulOutcome, .committed)
+        XCTAssertEqual(flushOutcome, .failed)
+        XCTAssertEqual(try Data(contentsOf: url), Data("successful".utf8))
+    }
+
+    func testSuccessfulThenFailedPayloadsReceiveTheirOwnOutcomes() async throws {
+        let storageRoot = try makeTestDirectory(named: "SuccessfulThenFailed")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let url = storageRoot.appendingPathComponent("payload.json")
+        let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
+        let gate = WorkspaceSavePreparationGate()
+        await writer.setAtomicWriteGateForTesting {
+            await gate.pauseFirstPreparation()
+        }
+        await writer.setFailAtomicWriteForTesting(url: url, afterAdditionalAttempts: 2)
+
+        let successfulTask = Task { await writer.enqueueAndWait(data: Data("successful".utf8), url: url) }
+        await gate.waitUntilPaused()
+        let failedTask = Task { await writer.enqueueAndWait(data: Data("failed".utf8), url: url) }
+        let flushTask = Task { await writer.flush(url: url) }
+        await drainMainActorTasks()
+        await gate.release()
+
+        let successfulOutcome = await successfulTask.value
+        let failedOutcome = await failedTask.value
+        let flushOutcome = await flushTask.value
+        XCTAssertEqual(successfulOutcome, .committed)
+        XCTAssertEqual(failedOutcome, .failed)
+        XCTAssertEqual(flushOutcome, .failed)
+        XCTAssertEqual(try Data(contentsOf: url), Data("successful".utf8))
+    }
+
+    func testCloseBoundaryFlushesPendingDebouncedSave() async throws {
+        let storageRoot = try makeTestDirectory(named: "CloseDuringDebounce")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let manager = makeManager(storageRoot: storageRoot)
+        let workspace = representativeWorkspace(storageRoot: storageRoot)
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+        manager.markWorkspaceDirty()
+
+        manager.test_scheduleWorkspaceSave(source: "test.close.deferred")
+        manager.prepareForWindowClose()
+        let outcome = await manager.flushPendingWorkspaceSavesBeforeClose()
+
+        let committedVersion = try unwrapCommittedVersion(outcome)
+        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), committedVersion)
+        let fileURL = try XCTUnwrap(workspace.customStoragePath?.appendingPathComponent("workspace.json"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        let decoded = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL)
+        XCTAssertEqual(decoded.id, workspace.id)
+    }
+
+    func testCloseBoundaryRetriesDirtyVersionAfterEarlierFailure() async throws {
+        let storageRoot = try makeTestDirectory(named: "CloseRetryAfterFailure")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let manager = makeManager(storageRoot: storageRoot)
+        defer { manager.prepareForWindowClose() }
+        let workspace = representativeWorkspace(storageRoot: storageRoot)
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+        manager.markWorkspaceDirty()
+        let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
+        await writer.setFailAtomicWriteForTesting(true)
+
+        manager.test_scheduleWorkspaceSave(source: "test.preCloseFailure")
+        let failed = await manager.test_flushWorkspaceSave(
+            workspaceID: workspace.id,
+            source: "test.observePreCloseFailure"
+        )
+        XCTAssertEqual(failed, .failed)
+        XCTAssertNil(manager.test_lastSavedVersion(workspaceID: workspace.id))
+
+        await writer.setFailAtomicWriteForTesting(false)
+        let closeOutcome = await manager.flushPendingWorkspaceSavesBeforeClose()
+        let committedVersion = try unwrapCommittedVersion(closeOutcome)
+        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), committedVersion)
+        let fileURL = try XCTUnwrap(workspace.customStoragePath?.appendingPathComponent("workspace.json"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
     }
 
     func testRapidRequestsCoalesceBeforeRepresentativeWorkspacePreparation() async throws {
@@ -23,9 +126,10 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
             manager.test_scheduleWorkspaceSave(source: "test.rapid")
         }
         await drainMainActorTasks()
-        let outcome = await manager.test_flushWorkspaceSave(source: "test.rapid.flush")
+        let outcome = await manager.test_flushWorkspaceSave(workspaceID: workspace.id, source: "test.rapid.flush")
 
-        XCTAssertEqual(outcome, .committed(version: 1))
+        let committedVersion = try unwrapCommittedVersion(outcome)
+        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), committedVersion)
         XCTAssertEqual(manager.test_workspaceSavePreparationCount(workspaceID: workspace.id), 1)
         let summary = try XCTUnwrap(manager.test_workspaceSavePerformanceSummary(workspaceID: workspace.id))
         XCTAssertEqual(summary.composeTabCount, 25)
@@ -56,20 +160,21 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
         await gate.waitUntilPaused()
         manager.workspaces[0].currentPromptText = "after"
         manager.workspaces[0].dateModified = Date()
+        manager.markWorkspaceDirty()
         for _ in 0 ..< 20 {
             manager.test_scheduleWorkspaceSave(source: "test.newerWhileBlocked")
         }
         await drainMainActorTasks()
         await gate.release()
-        let outcome = await manager.test_flushWorkspaceSave(source: "test.boundaryFlush")
+        let outcome = await manager.test_flushWorkspaceSave(workspaceID: workspace.id, source: "test.boundaryFlush")
         manager.test_setWorkspaceSavePreparationGate(nil)
 
-        XCTAssertEqual(outcome, .committed(version: 1))
+        let committedVersion = try unwrapCommittedVersion(outcome)
         XCTAssertEqual(manager.test_workspaceSavePreparationCount(workspaceID: workspace.id), 2)
         let fileURL = try XCTUnwrap(workspace.customStoragePath?.appendingPathComponent("workspace.json"))
         let decoded = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL)
         XCTAssertEqual(decoded.currentPromptText, "after")
-        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), 1)
+        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), committedVersion)
     }
 
     func testFailedAtomicWriteIsObservableAndDoesNotAdvanceSavedVersion() async throws {
@@ -77,38 +182,35 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: storageRoot) }
         let manager = makeManager(storageRoot: storageRoot)
         defer { manager.prepareForWindowClose() }
-        let workspace = representativeWorkspace(storageRoot: storageRoot)
+        var workspace = representativeWorkspace(storageRoot: storageRoot)
+        workspace.currentPromptText = "state to retry"
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
         manager.markWorkspaceDirty()
         let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
-        let gate = WorkspaceSavePreparationGate()
-        manager.test_setWorkspaceSavePreparationGate { _, _ in
-            await gate.pauseFirstPreparation()
-        }
         let fileURL = try XCTUnwrap(workspace.customStoragePath?.appendingPathComponent("workspace.json"))
-        await writer.setFailAtomicWriteForTesting(url: fileURL, afterAdditionalAttempts: 2)
+        await writer.setFailAtomicWriteForTesting(true)
 
-        manager.test_scheduleWorkspaceSave(source: "test.firstSnapshot")
-        await gate.waitUntilPaused()
-        manager.workspaces[0].currentPromptText = "newer same-version state"
-        manager.workspaces[0].dateModified = Date()
-        manager.test_scheduleWorkspaceSave(source: "test.newerSnapshot")
-        await drainMainActorTasks()
-        await gate.release()
-
-        let failed = await manager.test_flushWorkspaceSave(source: "test.injectedFailure")
-        manager.test_setWorkspaceSavePreparationGate(nil)
+        manager.test_scheduleWorkspaceSave(source: "test.failingSnapshot")
+        let failed = await manager.test_flushWorkspaceSave(workspaceID: workspace.id, source: "test.injectedFailure")
 
         XCTAssertEqual(failed, .failed)
         XCTAssertNil(manager.test_lastSavedVersion(workspaceID: workspace.id))
 
-        await writer.setFailAtomicWriteForTesting(url: fileURL, afterAdditionalAttempts: nil)
-        let retried = await manager.test_flushWorkspaceSave(source: "test.retryAfterFailure")
-        XCTAssertEqual(retried, .committed(version: 1))
-        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), 1)
+        await writer.setFailAtomicWriteForTesting(false)
+        let retried = await manager.test_flushWorkspaceSave(workspaceID: workspace.id, source: "test.retryAfterFailure")
+        let committedVersion = try unwrapCommittedVersion(retried)
+        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), committedVersion)
         let decoded = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL)
-        XCTAssertEqual(decoded.currentPromptText, "newer same-version state")
+        XCTAssertEqual(decoded.currentPromptText, "state to retry")
+    }
+
+    private func unwrapCommittedVersion(_ outcome: WorkspaceSaveCompletion) throws -> Int {
+        guard case let .committed(version) = outcome else {
+            XCTFail("Expected committed workspace save, received \(outcome)")
+            throw UnexpectedWorkspaceSaveOutcome()
+        }
+        return version
     }
 
     private func makeManager(storageRoot: URL) -> WorkspaceManagerViewModel {
@@ -178,6 +280,8 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
         }
     }
 }
+
+private struct UnexpectedWorkspaceSaveOutcome: Error {}
 
 private actor WorkspaceSavePreparationGate {
     private var didPause = false
