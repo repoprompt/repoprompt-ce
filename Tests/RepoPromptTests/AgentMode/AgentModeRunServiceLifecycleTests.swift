@@ -1044,6 +1044,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     }
 
     func testClaudeIdleShutdownWaitsForActiveChildAgentRunWait() async throws {
+        // Production schedules idle cleanup once from postCommit. While a child
+        // agent_run.wait is active, teardown is unsafe; the scheduler must re-arm
+        // autonomously after the wait drains — no second schedule call.
         let recorder = LifecycleRecorder()
         let controller = LifecycleFakeNativeController(recorder: recorder)
         var hasActiveChildWait = true
@@ -1074,14 +1077,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.providerSessionID, "resume-child-wait")
 
         hasActiveChildWait = false
-        harness.service.scheduleClaudeIdleShutdownIfNeeded(
-            for: session,
-            completedRunID: session.runID,
-            retainedController: controller,
-            agent: .claudeCode,
-            reason: "test"
-        )
-        try await waitUntil("Claude idle cleanup should resume after the child wait drains") {
+        try await waitUntil("Claude idle cleanup should re-arm and teardown after the child wait drains") {
             session.claudeController == nil
         }
         XCTAssertEqual(session.providerSessionID, "lifecycle-claude-session")

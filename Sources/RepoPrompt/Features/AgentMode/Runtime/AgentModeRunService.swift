@@ -1327,20 +1327,13 @@ private final class AgentModeIdleShutdownScheduler {
         retainedController: AnyObject,
         agent: AgentProviderKind,
         delayNanos: UInt64,
-        reason _: String,
+        reason: String,
         providerIsEligible: @escaping ProviderEligibility,
         teardown: @escaping Teardown
     ) {
-        guard isSafeToTeardown(
-            session: session,
-            completedRunID: completedRunID,
-            agent: agent,
-            providerIsEligible: providerIsEligible
-        ) else {
-            cancel(for: session.tabID)
-            return
-        }
-
+        // Always arm a timer for a completed retention request. Transient unsafety
+        // (active child agent_run.wait, pending UI, etc.) is re-checked at fire time
+        // and re-armed instead of discarding the only cleanup opportunity.
         let tabID = session.tabID
         let token = UUID()
         let shutdownDelayNanos = AgentModeIdleShutdownPolicy.normalizedDelayNanos(delayNanos)
@@ -1353,14 +1346,33 @@ private final class AgentModeIdleShutdownScheduler {
                 return
             }
             defer { removeEntry(for: tabID, token: token) }
-            guard let session,
-                  isSafeToTeardown(
-                      session: session,
-                      completedRunID: completedRunID,
-                      agent: agent,
-                      providerIsEligible: providerIsEligible
-                  )
-            else {
+            guard let session else { return }
+
+            if !isSafeToTeardown(
+                session: session,
+                completedRunID: completedRunID,
+                agent: agent,
+                providerIsEligible: providerIsEligible
+            ) {
+                // Keep trying while this completed run still owns the retained controller.
+                // New runs / agent switches cancel via cancel(for:).
+                if stillOwnsRetainedController(
+                    session: session,
+                    completedRunID: completedRunID,
+                    agent: agent,
+                    retainedController: retainedController
+                ) {
+                    scheduleIfNeeded(
+                        for: session,
+                        completedRunID: completedRunID,
+                        retainedController: retainedController,
+                        agent: agent,
+                        delayNanos: delayNanos,
+                        reason: reason,
+                        providerIsEligible: providerIsEligible,
+                        teardown: teardown
+                    )
+                }
                 return
             }
 
@@ -1381,6 +1393,29 @@ private final class AgentModeIdleShutdownScheduler {
             previous.task.cancel()
         }
         entriesByTabID[tabID] = Entry(token: token, task: task)
+    }
+
+    private func stillOwnsRetainedController(
+        session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        agent: AgentProviderKind,
+        retainedController: AnyObject
+    ) -> Bool {
+        guard session.selectedAgent == agent,
+              session.runID == completedRunID,
+              session.runState == .completed
+        else {
+            return false
+        }
+        if agent.usesClaudeNativeRuntime {
+            guard let current = session.claudeController else { return false }
+            return ObjectIdentifier(current as AnyObject) == ObjectIdentifier(retainedController)
+        }
+        if agent.acpProviderID != nil {
+            guard let current = session.acpController else { return false }
+            return ObjectIdentifier(current as AnyObject) == ObjectIdentifier(retainedController)
+        }
+        return false
     }
 
     func cancel(for tabID: UUID) {
