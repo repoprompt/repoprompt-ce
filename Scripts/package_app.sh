@@ -82,11 +82,17 @@ finish(){
 trap 'finish $?' EXIT
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
+RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"
 # Invalidate public-release manifests before metadata parsing, checks, or builds
 # so failed non-public packaging cannot leave stale release metadata behind.
 remove_stale_artifact_manifests
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
 load_release_metadata "$ROOT_DIR"
+if [[ -n "$RELEASE_BUILD_NUMBER_OVERRIDE" ]]; then
+    [[ "$RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
+        fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
+    BUILD_NUMBER="$RELEASE_BUILD_NUMBER_OVERRIDE"
+fi
 APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
 ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"

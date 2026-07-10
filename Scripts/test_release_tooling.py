@@ -1540,6 +1540,7 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
     def test_main_tip_workflow_keeps_tip_separate_and_uses_hardened_smoke(self) -> None:
         tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
         tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
 
         self.assertIn("name: Publish Tip", tip_workflow)
         self.assertIn("group: main-tip-channel", tip_workflow)
@@ -1578,7 +1579,21 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn("--target main", tip_script)
         self.assertIn('fail "TIP_UPDATE_REPOSITORY must not target the source or stable update repository"', tip_script)
         self.assertIn('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"', tip_script)
+        self.assertEqual(tip_script.count('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"'), 3)
+        self.assertNotIn('BUILD_NUMBER="$TIP_BUILD_NUMBER"', tip_script)
         self.assertIn("stage|sign|publish-tip", tip_script)
+
+        capture_override = package_script.index(
+            'RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"'
+        )
+        load_metadata = package_script.index('load_release_metadata "$ROOT_DIR"')
+        apply_override = package_script.index('BUILD_NUMBER="$RELEASE_BUILD_NUMBER_OVERRIDE"')
+        self.assertLess(capture_override, load_metadata)
+        self.assertLess(load_metadata, apply_override)
+        self.assertIn(
+            'fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"',
+            package_script,
+        )
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
