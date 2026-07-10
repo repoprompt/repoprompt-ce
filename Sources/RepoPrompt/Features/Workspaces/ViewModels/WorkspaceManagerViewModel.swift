@@ -7507,8 +7507,16 @@ class WorkspaceManagerViewModel: ObservableObject {
             .cancelled
         case (.skippedIneligible, _):
             next
-        default:
-            next
+        case let (.committed(currentVersion), .committed(nextVersion)):
+            .committed(version: max(currentVersion, nextVersion))
+        case let (.committed(version), _), let (_, .committed(version)):
+            .committed(version: version)
+        case let (.superseded(currentVersion), .superseded(nextVersion)):
+            .superseded(version: max(currentVersion, nextVersion))
+        case let (.superseded(version), _), let (_, .superseded(version)):
+            .superseded(version: version)
+        case (.skippedIneligible, .skippedIneligible):
+            .skippedIneligible
         }
     }
 
