@@ -77,7 +77,16 @@ private final class BootstrapSocketMCPIngressGate: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let receiveBufferCapacity: Int
     private var isTerminal = false
+    /// First-writer-wins terminal cause. Overflow is recorded synchronously on
+    /// `.dropped` so a racing EOF/error teardown still finishes the stream with
+    /// the authoritative overflow error (mirrors app UnixSocketMCPTransport).
+    private var terminalError: (any Swift.Error)?
+
+    init(receiveBufferCapacity: Int) {
+        self.receiveBufferCapacity = max(1, receiveBufferCapacity)
+    }
 
     func offer(
         _ frame: Data,
@@ -92,6 +101,11 @@ private final class BootstrapSocketMCPIngressGate: @unchecked Sendable {
             return .accepted
         case .dropped:
             isTerminal = true
+            if terminalError == nil {
+                terminalError = BootstrapSocketMCPReceiveBufferOverflowError(
+                    capacity: receiveBufferCapacity
+                )
+            }
             return .overflow
         case .terminated:
             isTerminal = true
@@ -102,10 +116,22 @@ private final class BootstrapSocketMCPIngressGate: @unchecked Sendable {
         }
     }
 
-    func markTerminal() {
+    /// Marks the gate terminal. Optional `error` is recorded only when no
+    /// stronger cause (e.g. overflow) was already stored.
+    func markTerminal(error: (any Swift.Error)? = nil) {
         lock.lock()
         isTerminal = true
+        if terminalError == nil, let error {
+            terminalError = error
+        }
         lock.unlock()
+    }
+
+    /// Authoritative terminal error for stream finish (overflow wins over nil/EOF).
+    func authoritativeTerminalError() -> (any Swift.Error)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminalError
     }
 }
 
@@ -123,7 +149,7 @@ public actor BootstrapSocketMCPTransport: Transport {
     private let maximumFrameByteCount: Int
 
     private nonisolated let messageStream: AsyncThrowingStream<Data, Swift.Error>
-    private nonisolated let ingressGate = BootstrapSocketMCPIngressGate()
+    private nonisolated let ingressGate: BootstrapSocketMCPIngressGate
     private var messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
 
     private let readQueue = DispatchQueue(label: "com.repoprompt.ce.mcp.cli.socket.read", qos: .userInitiated)
@@ -198,6 +224,9 @@ public actor BootstrapSocketMCPTransport: Transport {
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
         self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
         self.maximumFrameByteCount = max(1, maximumFrameByteCount)
+        ingressGate = BootstrapSocketMCPIngressGate(
+            receiveBufferCapacity: sanitizedReceiveBufferCapacity
+        )
 
         // Create message stream (buffered to avoid unbounded growth if consumer is slow)
         var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
@@ -483,6 +512,9 @@ public actor BootstrapSocketMCPTransport: Transport {
                 case .accepted:
                     break
                 case .overflow:
+                    // Cause is already recorded synchronously on the gate; the
+                    // async task only drives teardown. finishStreamIfNeeded always
+                    // resolves the gate's authoritative overflow error.
                     let error = BootstrapSocketMCPReceiveBufferOverflowError(
                         capacity: receiveBufferCapacity
                     )
@@ -608,8 +640,16 @@ public actor BootstrapSocketMCPTransport: Transport {
         _ error: BootstrapSocketMCPReceiveBufferOverflowError,
         from identity: ReaderIdentity
     ) {
-        guard activeReaderOwnership?.identity == identity, !streamFinished else { return }
-        logger.error("BootstrapSocketMCPTransport receive buffer overflow; terminating connection")
+        // Identity may already be cleared if a racing EOF teardown won the stop race.
+        // The gate still holds the overflow cause recorded synchronously at yield-drop.
+        let isCurrentReader = activeReaderOwnership?.identity == identity
+        if !isCurrentReader, activeReaderOwnership != nil {
+            // A newer reader owns the socket; do not tear it down for a stale overflow.
+            return
+        }
+        if !streamFinished {
+            logger.error("BootstrapSocketMCPTransport receive buffer overflow; terminating connection")
+        }
         tearDownSocket(error: error)
     }
 
@@ -629,10 +669,12 @@ public actor BootstrapSocketMCPTransport: Transport {
     private func finishStreamIfNeeded(throwing error: Swift.Error? = nil) {
         guard !streamFinished else { return }
         streamFinished = true
-        ingressGate.markTerminal()
+        // Prefer a synchronously recorded overflow cause over a racing EOF/nil teardown.
+        let resolvedError = ingressGate.authoritativeTerminalError() ?? error
+        ingressGate.markTerminal(error: resolvedError)
 
-        if let error {
-            messageContinuation.finish(throwing: error)
+        if let resolvedError {
+            messageContinuation.finish(throwing: resolvedError)
         } else {
             messageContinuation.finish()
         }

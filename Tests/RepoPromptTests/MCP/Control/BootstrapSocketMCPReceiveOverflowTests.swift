@@ -36,6 +36,44 @@ final class BootstrapSocketMCPReceiveOverflowTests: XCTestCase {
         }
     }
 
+    func testOverflowThenImmediatePeerCloseStillFailsWithOverflow() async throws {
+        // If peer EOF teardown races the unstructured overflow Task and wins,
+        // the stream must still terminate with the overflow error (cause recorded
+        // synchronously at yield-drop), not a clean finish.
+        var descriptors = try Self.makeSocketPair()
+        defer { Self.closeIfOpen(descriptors[1]) }
+
+        let transport = try BootstrapSocketMCPTransport(
+            connectedFD: descriptors[0],
+            receiveBufferCapacity: 1
+        )
+        try await transport.connect()
+        let stream = await transport.receive()
+
+        try Self.writeAll(Data("first\nsecond\nthird\n".utf8), to: descriptors[1])
+        // Close the peer immediately so EOF/error teardown races the overflow path.
+        Self.closeIfOpen(descriptors[1])
+        descriptors[1] = -1
+
+        let finished = await Self.waitUntil {
+            await transport.debugIsStreamFinished()
+        }
+        XCTAssertTrue(finished)
+
+        var iterator = stream.makeAsyncIterator()
+        let firstFrame = try await iterator.next()
+        XCTAssertEqual(firstFrame, Data("first".utf8))
+        do {
+            _ = try await iterator.next()
+            XCTFail("Expected overflow to remain the terminal cause after peer close")
+        } catch {
+            XCTAssertEqual(
+                error as? BootstrapSocketMCPReceiveBufferOverflowError,
+                BootstrapSocketMCPReceiveBufferOverflowError(capacity: 1)
+            )
+        }
+    }
+
     func testOversizedFrameFailsClosedWithoutYieldingFrame() async throws {
         let descriptors = try Self.makeSocketPair()
         defer { Self.closeIfOpen(descriptors[1]) }
