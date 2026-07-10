@@ -318,6 +318,10 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         await transport.ingressSnapshot()
     }
 
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        await transport.responseDeliverySnapshot()
+    }
+
     func waitUntilResponseDeliveryDrained() async -> Bool {
         await transport.waitUntilResponseDeliveryDrained()
     }

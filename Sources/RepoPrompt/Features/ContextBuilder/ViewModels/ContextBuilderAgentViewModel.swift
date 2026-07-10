@@ -464,6 +464,23 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         func isRunTeardownPendingForTesting(runID: UUID) -> Bool {
             runRegistry.record(runID: runID)?.isTeardownPending == true
         }
+
+        func replaceSessionForTesting(tabID: UUID) {
+            sessions[tabID] = TabSession(tabID: tabID)
+        }
+
+        func retireStaleRunRecordForTesting(
+            _ record: ContextBuilderRunRecord,
+            waiterResolution: ContextBuilderRunWaiterResolution = .snapshot,
+            cancelExecution: Bool = true
+        ) {
+            retireContextBuilderRunRecordWithoutPublishing(
+                record,
+                waiterResolution: waiterResolution,
+                cancelExecution: cancelExecution,
+                source: "contextBuilder.testing.staleRetirement"
+            )
+        }
     #endif
 
     // MARK: - Published session-scoped proxies
@@ -1460,8 +1477,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 session.followUpOracleSessionID = nil
             }
 
-            // 3. Logically cancel the active run without waiting for teardown.
-            if let record = runRegistry.activeRecord(tabID: tabID) {
+            // 3. Logically cancel every registered run for the tab without waiting for teardown.
+            // A superseded record may no longer own the active slot but still owns a provider,
+            // execution task, waiter, and launch-config lease that tab close must retire.
+            for record in runRegistry.records(tabID: tabID) where !record.isTerminal {
                 debugLog("handleComposeTabsWillClose: cancelling run \(record.runID) for tab \(tabID)")
                 cancelRun(
                     record,
@@ -1939,9 +1958,20 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         saveHistory: Bool,
         source: String
     ) -> Bool {
-        guard acceptsEvents(from: record) else { return false }
+        guard acceptsEvents(from: record) else {
+            retireContextBuilderRunRecordWithoutPublishing(
+                record,
+                waiterResolution: waiterResolution,
+                cancelExecution: cancelExecution,
+                source: source
+            )
+            return false
+        }
         flushAssistantPreview(for: record)
-        guard record.claimTerminal(outcome) else { return false }
+        guard record.claimTerminal(outcome) else {
+            scheduleRunTeardown(record, cancelExecution: cancelExecution)
+            return false
+        }
 
         let session = record.session
         session.lastAgentOutput = record.output.fullOutput()
@@ -2018,6 +2048,47 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             continuation?.resume(throwing: CancellationError())
         }
         return true
+    }
+
+    /// Retires records that have lost active ownership before their terminal path runs.
+    ///
+    /// Superseded/stale records must not publish previews, mutate current tab state, or
+    /// restore run-start configuration over a newer run. They still own provider/process
+    /// resources, continuations, and possibly a registry record, so retirement must always
+    /// schedule teardown and resolve any waiter exactly once.
+    private func retireContextBuilderRunRecordWithoutPublishing(
+        _ record: ContextBuilderRunRecord,
+        waiterResolution: ContextBuilderRunWaiterResolution,
+        cancelExecution: Bool,
+        source: String
+    ) {
+        record.previewPublicationTask?.cancel()
+        record.previewPublicationTask = nil
+
+        let didClaimTerminal = record.claimTerminal(.cancelled)
+        record.session.endRunAttempt(ifCurrent: record.ownership, source: "\(source).staleRetirement")
+        if runRegistry.releaseActiveSlot(for: record) {
+            tabsWithActiveContextBuilderRun.remove(record.tabID)
+        }
+
+        let continuation = didClaimTerminal ? record.takeContinuation() : nil
+        let completion = MCPContextBuilderRunCompletion(
+            runID: record.runID,
+            tabID: record.tabID,
+            terminalDisposition: .cancelled,
+            agentOutput: record.output.fullOutput(),
+            usedAgentOutputAsPrompt: false,
+            committedTab: nil
+        )
+
+        scheduleRunTeardown(record, cancelExecution: cancelExecution)
+
+        switch waiterResolution {
+        case .snapshot:
+            continuation?.resume(returning: completion)
+        case .cancellationError:
+            continuation?.resume(throwing: CancellationError())
+        }
     }
 
     private func scheduleRunTeardown(
@@ -2319,6 +2390,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 )
                 guard !Task.isCancelled, acceptsEvents(from: record) else { return .cancelled }
                 debugLog("Routing result for run \(runID): routed=\(routed)")
+                if routed {
+                    record.finalContextConnectionIDForDiagnostics =
+                        mcpServer.contextBuilderFinalContextConnectionID(runID: runID)
+                }
 
                 if !routed, record.origin.isMCP {
                     let timeoutSeconds = TimeInterval(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000
@@ -2544,7 +2619,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         waiterResolution: ContextBuilderRunWaiterResolution,
         saveHistory: Bool
     ) {
-        guard acceptsEvents(from: record) else { return }
+        guard acceptsEvents(from: record) else {
+            retireContextBuilderRunRecordWithoutPublishing(
+                record,
+                waiterResolution: waiterResolution,
+                cancelExecution: true,
+                source: "contextBuilder.cancel.staleRetirement"
+            )
+            return
+        }
         guard record.canAcceptCancellation else {
             debugLog("Cancel ignored after final context commit claim for run \(record.runID)")
             return
@@ -2729,7 +2812,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 }
             #endif
             return MCPServerViewModel.ContextBuilderTabContextCommitResult(
-                outcome: .missingFinalContext(runID: runID, connectionID: nil),
+                outcome: .missingFinalContext(
+                    runID: runID,
+                    connectionID: record.finalContextConnectionIDForDiagnostics
+                ),
                 committedTab: nil
             )
         }
@@ -2783,7 +2869,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                         #endif
                         return result
                     },
-                    isAuthoritativePeerEOFDetached: {
+                    isAuthoritativeDetached: {
                         mcpServer.isDetachedContextBuilderConnection(
                             connectionID: cid,
                             runID: runID

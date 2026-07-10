@@ -162,12 +162,6 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
 /// Tracks request/response publication at the socket boundary so lifecycle cleanup can
 /// wait for completed writes rather than closing after a handler merely returns.
 final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
-    struct Snapshot {
-        let pendingRequestCount: Int
-        let waiterCount: Int
-        let isTerminal: Bool
-    }
-
     private let lock = NSLock()
     private var pendingRequestIDs: Set<JSONRPCBridgeID> = []
     private var waiters: [CheckedContinuation<Bool, Never>] = []
@@ -268,10 +262,10 @@ final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
         continuations.forEach { $0.resume(returning: false) }
     }
 
-    func snapshot() -> Snapshot {
+    func snapshot() -> MCPResponseDeliverySnapshot {
         lock.lock()
         defer { lock.unlock() }
-        return Snapshot(
+        return MCPResponseDeliverySnapshot(
             pendingRequestCount: pendingRequestIDs.count,
             waiterCount: waiters.count,
             isTerminal: isTerminal
@@ -735,6 +729,10 @@ public actor UnixSocketMCPTransport: Transport {
     public func secondsSinceLastActivity() -> TimeInterval? {
         guard let lastActivityTime else { return nil }
         return Date().timeIntervalSince(lastActivityTime)
+    }
+
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot {
+        responseDeliveryGate.snapshot()
     }
 
     func waitUntilResponseDeliveryDrained() async -> Bool {

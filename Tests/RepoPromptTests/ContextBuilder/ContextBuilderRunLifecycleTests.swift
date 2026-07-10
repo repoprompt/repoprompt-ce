@@ -279,7 +279,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let liveDrainFailure = await ContextBuilderResponseDeliveryDrainResolver.resolve(
             initiallyDetached: false,
             awaitDrain: { false },
-            isAuthoritativePeerEOFDetached: { false },
+            isAuthoritativeDetached: { false },
             awaitTeardownPublication: {
                 didAwaitNegativeTeardownResolution = true
                 return .resolvedWithoutPeerEOFDetachment(reason: "read_error")
@@ -288,6 +288,56 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertTrue(didAwaitNegativeTeardownResolution)
         XCTAssertEqual(liveDrainFailure, .failed)
         XCTAssertFalse(liveDrainFailure.succeeded)
+
+        var didAttemptInitialDrain = false
+        let initiallyDetachedPeerEOF = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                didAttemptInitialDrain = true
+                return false
+            },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: { .peerEOFDetached }
+        )
+        XCTAssertFalse(didAttemptInitialDrain)
+        XCTAssertEqual(initiallyDetachedPeerEOF, .peerEOFDetached)
+        XCTAssertTrue(initiallyDetachedPeerEOF.succeeded)
+
+        let initiallyDetachedAfterDrainedClose = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                XCTFail("Already-detached contexts must resolve from the teardown publication")
+                return false
+            },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: {
+                .detachedAfterResponseDeliveryDrained(reason: "read_error")
+            }
+        )
+        XCTAssertEqual(initiallyDetachedAfterDrainedClose, .detachedAfterResponseDeliveryDrained)
+        XCTAssertTrue(initiallyDetachedAfterDrainedClose.succeeded)
+        XCTAssertTrue(initiallyDetachedAfterDrainedClose.transportAlreadyClosed)
+
+        let initiallyDetachedFailure = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                XCTFail("Already-detached contexts must resolve from the teardown publication")
+                return true
+            },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: { .detachedWithoutOrderlyPeerEOF(reason: "read_error") }
+        )
+        XCTAssertEqual(initiallyDetachedFailure, .failed)
+        XCTAssertFalse(initiallyDetachedFailure.succeeded)
+
+        let failureDetachedDuringDrain = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: false,
+            awaitDrain: { false },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: { .detachedWithoutOrderlyPeerEOF(reason: "write_hangup") }
+        )
+        XCTAssertEqual(failureDetachedDuringDrain, .failed)
+        XCTAssertFalse(failureDetachedDuringDrain.succeeded)
     }
 
     func testRealConnectionCleanupCannotEraseContextBeforeCommit() async throws {
@@ -401,9 +451,9 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 .missingFinalContext(runID: runID, connectionID: connectionID)
             )
 
-            // Begin finalization while the connection is live, then complete peer-EOF
-            // teardown while response delivery is draining. The failed drain is accepted
-            // only after the same authoritative context has been detached.
+            // Begin finalization while the connection is live, then complete a non-orderly
+            // teardown after every accepted request has a delivered response. The failed live
+            // drain is accepted only from the retained close-time delivery snapshot.
             let transitioningConnectionID = UUID()
             let transitioningRunID = UUID()
             let transitioningPrompt = "context detached during response drain"
@@ -421,7 +471,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             transitioningContext.promptText = transitioningPrompt
             window.mcpServer.tabContextByConnectionID[transitioningConnectionID] = transitioningContext
 
-            let transitioningConnection = ContextBuilderCleanupTestConnection()
+            let transitioningConnection = ContextBuilderCleanupTestConnection(pendingRequestCount: 0)
             await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
                 connectionID: transitioningConnectionID,
                 connection: transitioningConnection,
@@ -450,7 +500,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                                 XCTAssertEqual(drainedID, transitioningConnectionID)
                                 return false
                             },
-                            isAuthoritativePeerEOFDetached: {
+                            isAuthoritativeDetached: {
                                 window.mcpServer.isDetachedContextBuilderConnection(
                                     connectionID: drainedID,
                                     runID: transitioningRunID
@@ -514,7 +564,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             await ServerNetworkManager.shared.removeConnection(
                 transitioningConnectionID,
                 context: MCPConnectionCloseContext(
-                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    reason: MCPTransportTerminalCause.readError.rawValue,
                     initiator: .peer
                 )
             )
@@ -529,7 +579,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
             let didFinalizeTransition = await transitioningFinalization.value
             XCTAssertTrue(didFinalizeTransition)
-            XCTAssertEqual(transitioningDrainOutcome, .peerEOFDetached)
+            XCTAssertEqual(transitioningDrainOutcome, .detachedAfterResponseDeliveryDrained)
             XCTAssertEqual(transitioningCommitCount, 1)
             XCTAssertEqual(transitioningTerminationCount, 0)
             XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
@@ -553,6 +603,107 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             let transitioningConnectionTerminationCount = await transitioningConnection.terminationCount()
             XCTAssertEqual(transitioningConnectionTerminationCount, 0)
+
+            // Non-orderly transport failures with an accepted response still pending detach
+            // the final context so a later safe path can inspect/discard it, but they must not
+            // satisfy response drain or commit partial context through successful finalization.
+            let failureConnectionID = UUID()
+            let failureRunID = UUID()
+            let failurePrompt = "must not auto-commit after read error"
+            try window.mcpServer.bindTabForConnection(
+                connectionID: failureConnectionID,
+                clientName: clientName,
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID,
+                runID: failureRunID
+            )
+            var failureContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[failureConnectionID])
+            failureContext.promptText = failurePrompt
+            window.mcpServer.tabContextByConnectionID[failureConnectionID] = failureContext
+            await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                connectionID: failureConnectionID,
+                connection: ContextBuilderCleanupTestConnection(pendingRequestCount: 1),
+                clientName: clientName,
+                sessionToken: UUID().uuidString
+            )
+            await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                connectionID: failureConnectionID,
+                runID: failureRunID,
+                purpose: .discoverRun,
+                windowID: window.windowID
+            )
+
+            let failureWaitStarted = LifecycleTestGate()
+            var failureDrainOutcome: ContextBuilderResponseDeliveryDrainOutcome = .drained
+            var failureCommitCount = 0
+            var failureTerminationCount = 0
+            let failureFinalization = Task { @MainActor in
+                await ContextBuilderChildConnectionFinalizer.finalize(
+                    connectionIDs: [failureConnectionID],
+                    awaitResponseDeliveryDrain: { drainedID in
+                        failureDrainOutcome = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+                            initiallyDetached: false,
+                            awaitDrain: {
+                                XCTAssertEqual(drainedID, failureConnectionID)
+                                return false
+                            },
+                            isAuthoritativeDetached: {
+                                window.mcpServer.isDetachedContextBuilderConnection(
+                                    connectionID: drainedID,
+                                    runID: failureRunID
+                                )
+                            },
+                            awaitTeardownPublication: {
+                                await failureWaitStarted.arrive()
+                                return await window.mcpServer.contextBuilderTeardownPublicationCoordinator.wait(
+                                    runID: failureRunID,
+                                    connectionID: drainedID,
+                                    timeoutSeconds: 1
+                                )
+                            }
+                        )
+                        return failureDrainOutcome.succeeded
+                    },
+                    commitContext: { _ in
+                        failureCommitCount += 1
+                        return true
+                    },
+                    beforeTerminationRequest: {},
+                    requestTermination: { _ in
+                        failureTerminationCount += 1
+                        return Task {}
+                    },
+                    beforeTerminationJoin: {},
+                    cleanupMapping: { _ in }
+                )
+            }
+
+            await failureWaitStarted.waitUntilArrived()
+            await ServerNetworkManager.shared.removeConnection(
+                failureConnectionID,
+                context: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.readError.rawValue,
+                    initiator: .peer
+                )
+            )
+            let didFinalizeFailure = await failureFinalization.value
+            XCTAssertFalse(didFinalizeFailure)
+            XCTAssertEqual(failureDrainOutcome, .failed)
+            XCTAssertEqual(failureCommitCount, 0)
+            XCTAssertEqual(failureTerminationCount, 0)
+            XCTAssertTrue(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: failureConnectionID,
+                    runID: failureRunID
+                )
+            )
+            XCTAssertEqual(
+                window.mcpServer.contextBuilderFinalContextConnectionID(runID: failureRunID),
+                failureConnectionID
+            )
+            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
+            window.mcpServer.discardDetachedContextBuilderTabContext(runID: failureRunID)
 
             // The negative twin uses the same production peer-EOF teardown, then models
             // explicit cancellation before commit. Detached ownership is discarded and
@@ -608,6 +759,88 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 )
             )
 
+            func seedDiscoveryConnection(
+                connectionID: UUID,
+                runID: UUID,
+                purpose: MCPRunPurpose,
+                prompt: String? = nil,
+                authoritative: Bool = true
+            ) async throws {
+                try window.mcpServer.bindTabForConnection(
+                    connectionID: connectionID,
+                    clientName: clientName,
+                    tabID: tabID,
+                    workspaceID: activeWorkspace.id,
+                    windowID: window.windowID,
+                    runID: runID
+                )
+                if let prompt {
+                    var context = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+                    context.promptText = prompt
+                    window.mcpServer.tabContextByConnectionID[connectionID] = context
+                }
+                await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: ContextBuilderCleanupTestConnection(),
+                    clientName: clientName,
+                    sessionToken: UUID().uuidString
+                )
+                await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                    connectionID: connectionID,
+                    runID: runID,
+                    purpose: purpose,
+                    windowID: window.windowID
+                )
+                if !authoritative {
+                    window.mcpServer.connectionIDByRunID[runID] = UUID()
+                }
+            }
+
+            func assertDiscoveryCloseDetachesAndCommits(
+                closeContext: MCPConnectionCloseContext,
+                prompt: String
+            ) async throws {
+                let detachedConnectionID = UUID()
+                let detachedRunID = UUID()
+                try await seedDiscoveryConnection(
+                    connectionID: detachedConnectionID,
+                    runID: detachedRunID,
+                    purpose: .discoverRun,
+                    prompt: prompt
+                )
+
+                await ServerNetworkManager.shared.removeConnection(
+                    detachedConnectionID,
+                    context: closeContext
+                )
+
+                XCTAssertNil(window.mcpServer.tabContextByConnectionID[detachedConnectionID])
+                XCTAssertTrue(
+                    window.mcpServer.isDetachedContextBuilderConnection(
+                        connectionID: detachedConnectionID,
+                        runID: detachedRunID
+                    )
+                )
+                XCTAssertEqual(
+                    window.mcpServer.contextBuilderFinalContextConnectionID(runID: detachedRunID),
+                    detachedConnectionID
+                )
+                let commitOutcome = await window.mcpServer.commitContextBuilderTabContext(
+                    connectionID: detachedConnectionID,
+                    expectedRunID: detachedRunID,
+                    isStillCurrent: { true }
+                )
+                XCTAssertEqual(commitOutcome.outcome, .committed)
+                XCTAssertEqual(commitOutcome.committedTab?.nestedRunID, detachedRunID)
+                XCTAssertEqual(commitOutcome.committedTab?.tab.promptText, prompt)
+                XCTAssertFalse(
+                    window.mcpServer.isDetachedContextBuilderConnection(
+                        connectionID: detachedConnectionID,
+                        runID: detachedRunID
+                    )
+                )
+            }
+
             func assertDoesNotDetach(
                 closeContext: MCPConnectionCloseContext,
                 purpose: MCPRunPurpose,
@@ -615,29 +848,12 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             ) async throws {
                 let excludedConnectionID = UUID()
                 let excludedRunID = UUID()
-                try window.mcpServer.bindTabForConnection(
-                    connectionID: excludedConnectionID,
-                    clientName: clientName,
-                    tabID: tabID,
-                    workspaceID: activeWorkspace.id,
-                    windowID: window.windowID,
-                    runID: excludedRunID
-                )
-                await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
-                    connectionID: excludedConnectionID,
-                    connection: ContextBuilderCleanupTestConnection(),
-                    clientName: clientName,
-                    sessionToken: UUID().uuidString
-                )
-                await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                try await seedDiscoveryConnection(
                     connectionID: excludedConnectionID,
                     runID: excludedRunID,
                     purpose: purpose,
-                    windowID: window.windowID
+                    authoritative: authoritative
                 )
-                if !authoritative {
-                    window.mcpServer.connectionIDByRunID[excludedRunID] = UUID()
-                }
 
                 await ServerNetworkManager.shared.removeConnection(
                     excludedConnectionID,
@@ -672,26 +888,40 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 )
             }
 
-            try await assertDoesNotDetach(
+            try await assertDiscoveryCloseDetachesAndCommits(
                 closeContext: MCPConnectionCloseContext(
                     reason: "server_shutdown",
                     initiator: .app
                 ),
-                purpose: .discoverRun
+                prompt: "context retained after app/server shutdown"
             )
-            try await assertDoesNotDetach(
+            try await assertDiscoveryCloseDetachesAndCommits(
                 closeContext: MCPConnectionCloseContext(
                     reason: TerminationReason.runCancelled.rawValue,
                     initiator: .app
                 ),
-                purpose: .discoverRun
+                prompt: "context retained after app cancellation close"
             )
-            try await assertDoesNotDetach(
+            try await assertDiscoveryCloseDetachesAndCommits(
                 closeContext: MCPConnectionCloseContext(
                     reason: MCPTransportTerminalCause.readError.rawValue,
                     initiator: .peer
                 ),
-                purpose: .discoverRun
+                prompt: "context retained after read error"
+            )
+            try await assertDiscoveryCloseDetachesAndCommits(
+                closeContext: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.writeHangup.rawValue,
+                    initiator: .app
+                ),
+                prompt: "context retained after write hangup"
+            )
+            try await assertDiscoveryCloseDetachesAndCommits(
+                closeContext: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.writeStall.rawValue,
+                    initiator: .app
+                ),
+                prompt: "context retained after write stall"
             )
             try await assertDoesNotDetach(
                 closeContext: MCPConnectionCloseContext(
@@ -796,7 +1026,93 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertTrue(registry.acceptsEvents(from: second, currentSession: session))
     }
 
+    func testStaleRunRetirementStillDisposesProviderAndCancelsExecution() async throws {
+        #if DEBUG
+            let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let composition = WindowStateCompositionFactory.make(
+                windowID: -176,
+                deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService()
+            )
+            GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
+            await composition.workspaceManager.awaitInitialized()
+            defer {
+                Task {
+                    await composition.mcpServer.stopServer()
+                    await composition.mcpServer.shutdownListener()
+                }
+            }
+
+            let tabID = UUID()
+            let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+            let ownership = session.beginRunAttempt(source: "stale-retirement-test")
+            let record = ContextBuilderRunRecord(
+                runID: UUID(),
+                tabID: tabID,
+                session: session,
+                ownership: ownership,
+                origin: .mcp(controlToken: UUID()),
+                agentKind: .claudeCode,
+                modelRaw: AgentModel.defaultModel.rawValue
+            )
+            let providerDisposeFinished = expectation(description: "stale provider disposed")
+            let provider = ControllableLifecycleTestProvider(
+                eventTexts: [],
+                blocksDisposal: false,
+                disposeFinishedExpectation: providerDisposeFinished
+            )
+            XCTAssertTrue(record.installProvider(provider))
+
+            let executionCancelled = LifecycleTestGate()
+            let executionTask = Task<Void, Never> {
+                await withTaskCancellationHandler {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(10))
+                    }
+                } onCancel: {
+                    Task { await executionCancelled.arrive() }
+                }
+            }
+            record.executionTask = executionTask
+
+            composition.contextBuilderAgentViewModel.retireStaleRunRecordForTesting(
+                record,
+                waiterResolution: .snapshot,
+                cancelExecution: true
+            )
+
+            await executionCancelled.waitUntilArrived()
+            await executionTask.value
+            await fulfillment(of: [providerDisposeFinished], timeout: 1)
+            for _ in 0 ..< 100 where record.teardownFinishedAt == nil {
+                await Task.yield()
+            }
+
+            let disposeCallCount = await provider.disposeCallCount()
+            XCTAssertEqual(disposeCallCount, 1)
+            XCTAssertTrue(record.providerDisposalFinished)
+            XCTAssertTrue(record.executionTaskFinished)
+            XCTAssertNotNil(record.teardownFinishedAt)
+            XCTAssertTrue(record.isTerminal)
+        #else
+            throw XCTSkip("Stale run retirement test uses DEBUG-only test hook.")
+        #endif
+    }
+
     func testProductionMCPCancellationResumesBeforeTeardownAndRejectsLateProviderEvent() async throws {
+        let configRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderStaleRunLeaseTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: configRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: configRoot) }
+        let configService = MCPConfigExportService(
+            configDirectoryURL: configRoot,
+            renderServerConfig: { "{\"mcpServers\":{}}" }
+        )
+        let firstConfigLease = try await configService.prepareLaunchConfig()
+        let firstConfigURL = firstConfigLease.url
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstConfigURL.path))
+
         let firstStreamStarted = expectation(description: "first provider stream started")
         let firstEventAccepted = expectation(description: "first provider event accepted")
         let firstDisposeStarted = expectation(description: "first provider disposal started")
@@ -811,7 +1127,8 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             blocksDisposal: true,
             streamStartedExpectation: firstStreamStarted,
             disposeStartedExpectation: firstDisposeStarted,
-            disposeFinishedExpectation: firstDisposeFinished
+            disposeFinishedExpectation: firstDisposeFinished,
+            configLease: firstConfigLease
         )
         let successorProvider = ControllableLifecycleTestProvider(
             eventTexts: ["successor-event"],
@@ -930,8 +1247,13 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             firstRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
 
+            // Replace the tab session to model a superseding owner while the original
+            // provider stream remains parked. Cancellation by run ID must eagerly retire
+            // the registered stale record instead of waiting for another provider event.
+            viewModel.replaceSessionForTesting(tabID: tabID)
             try await viewModel.cancelMCPContextBuilderRun(runID: XCTUnwrap(firstRunID))
             await fulfillment(of: [firstWaiterFinished, firstDisposeStarted], timeout: 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: firstConfigURL.path))
 
             let firstWaiterWasCancelled = await firstWaiter.value
             let firstCompletionCount = await firstWaiterCompletion.value()
@@ -1357,6 +1679,7 @@ private final class ControllableLifecycleTestProvider: HeadlessAgentProvider {
     private let streamStartedExpectation: XCTestExpectation?
     private let disposeStartedExpectation: XCTestExpectation?
     private let disposeFinishedExpectation: XCTestExpectation?
+    private let configLease: MCPConfigLease?
     private let disposeGate = LifecycleTestGate()
     private let state = LifecycleTestProviderState()
     private var streamContinuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation?
@@ -1366,13 +1689,15 @@ private final class ControllableLifecycleTestProvider: HeadlessAgentProvider {
         blocksDisposal: Bool,
         streamStartedExpectation: XCTestExpectation? = nil,
         disposeStartedExpectation: XCTestExpectation? = nil,
-        disposeFinishedExpectation: XCTestExpectation? = nil
+        disposeFinishedExpectation: XCTestExpectation? = nil,
+        configLease: MCPConfigLease? = nil
     ) {
         self.eventTexts = eventTexts
         self.blocksDisposal = blocksDisposal
         self.streamStartedExpectation = streamStartedExpectation
         self.disposeStartedExpectation = disposeStartedExpectation
         self.disposeFinishedExpectation = disposeFinishedExpectation
+        self.configLease = configLease
     }
 
     func streamAgentMessage(
@@ -1396,6 +1721,7 @@ private final class ControllableLifecycleTestProvider: HeadlessAgentProvider {
 
     func dispose() async {
         await state.recordDisposeCall()
+        configLease?.release()
         disposeStartedExpectation?.fulfill()
         if blocksDisposal {
             await disposeGate.arriveAndWait()
@@ -1702,6 +2028,17 @@ private actor CodexShapedBlockedRoutingTestState {
 private actor ContextBuilderCleanupTestConnection: MCPServerConnection {
     private var terminations = 0
     private var stops = 0
+    private let deliverySnapshot: MCPResponseDeliverySnapshot?
+
+    init(pendingRequestCount: Int? = nil) {
+        deliverySnapshot = pendingRequestCount.map {
+            MCPResponseDeliverySnapshot(
+                pendingRequestCount: $0,
+                waiterCount: 0,
+                isTerminal: true
+            )
+        }
+    }
 
     nonisolated var isFilesystemBacked: Bool {
         false
@@ -1745,6 +2082,10 @@ private actor ContextBuilderCleanupTestConnection: MCPServerConnection {
 
     func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
         nil
+    }
+
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        deliverySnapshot
     }
 
     func terminate(reason _: TerminationReason, message _: String?) async {

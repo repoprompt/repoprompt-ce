@@ -35,6 +35,7 @@ enum ContextBuilderRunWaiterResolution {
 enum ContextBuilderResponseDeliveryDrainOutcome: Equatable {
     case drained
     case peerEOFDetached
+    case detachedAfterResponseDeliveryDrained
     case failed
 
     var succeeded: Bool {
@@ -42,7 +43,7 @@ enum ContextBuilderResponseDeliveryDrainOutcome: Equatable {
     }
 
     var transportAlreadyClosed: Bool {
-        self == .peerEOFDetached
+        self == .peerEOFDetached || self == .detachedAfterResponseDeliveryDrained
     }
 }
 
@@ -51,18 +52,18 @@ enum ContextBuilderResponseDeliveryDrainResolver {
     static func resolve(
         initiallyDetached: Bool,
         awaitDrain: @MainActor () async -> Bool,
-        isAuthoritativePeerEOFDetached: @MainActor () -> Bool,
+        isAuthoritativeDetached: @MainActor () -> Bool,
         awaitTeardownPublication: @MainActor () async -> MCPServerViewModel.ContextBuilderTeardownPublicationOutcome
     ) async -> ContextBuilderResponseDeliveryDrainOutcome {
-        if initiallyDetached { return .peerEOFDetached }
-        if await awaitDrain() { return .drained }
-        if isAuthoritativePeerEOFDetached() { return .peerEOFDetached }
+        if !initiallyDetached, await awaitDrain() { return .drained }
 
         let publication = await awaitTeardownPublication()
-        guard publication == .peerEOFDetached,
-              isAuthoritativePeerEOFDetached()
+        guard publication.completedDiscoveryCanCommit,
+              isAuthoritativeDetached()
         else { return .failed }
-        return .peerEOFDetached
+        return publication == .peerEOFDetached
+            ? .peerEOFDetached
+            : .detachedAfterResponseDeliveryDrained
     }
 }
 
@@ -274,6 +275,10 @@ final class ContextBuilderRunRegistry {
     func activeRecord(tabID: UUID) -> ContextBuilderRunRecord? {
         guard let runID = activeRunIDByTabID[tabID] else { return nil }
         return recordsByRunID[runID]
+    }
+
+    func records(tabID: UUID) -> [ContextBuilderRunRecord] {
+        recordsByRunID.values.filter { $0.tabID == tabID }
     }
 
     func acceptsEvents(from record: ContextBuilderRunRecord, currentSession: ContextBuilderAgentViewModel.TabSession?) -> Bool {
