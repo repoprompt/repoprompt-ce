@@ -396,7 +396,7 @@ extension FileSystemService {
             throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
         }
 
-        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamSetDispatchQueue(stream, fseventCallbackQueue)
         #if DEBUG
             let didStart = watcherActivationFailurePointForTesting == .streamStart ? false : FSEventStreamStart(stream)
         #else
@@ -404,6 +404,7 @@ extension FileSystemService {
         #endif
         if !didStart {
             // Clean up to avoid leaks
+            deactivateFSEventCallbackContext()
             FSEventStreamInvalidate(stream)
             FSEventStreamRelease(stream)
             fseventStreamRef = nil
@@ -416,13 +417,13 @@ extension FileSystemService {
 
     func stopFSEventStream() {
         if let stream = fseventStreamRef {
-            nextFSEventStreamStartEventID = max(
-                nextFSEventStreamStartEventID,
-                FSEventStreamGetLatestEventId(stream)
-            )
             FSEventStreamStop(stream)
             FSEventStreamFlushSync(stream)
             FSEventStreamInvalidate(stream)
+            // Drain callbacks that were already submitted before releasing their
+            // unretained context pointer.
+            fseventCallbackQueue.sync {}
+            deactivateFSEventCallbackContext()
             FSEventStreamRelease(stream)
             fseventStreamRef = nil
 
@@ -434,6 +435,13 @@ extension FileSystemService {
         }
 
         resetWatcherIngressState()
+    }
+
+    private func deactivateFSEventCallbackContext() {
+        guard let ptr = fseventCallbackContextPointer else { return }
+        Unmanaged<FileSystemServiceFSEventCallbackContext>.fromOpaque(ptr)
+            .takeUnretainedValue()
+            .deactivate()
     }
 
     private func releaseFSEventCallbackContext() {
@@ -479,7 +487,8 @@ extension FileSystemService {
         eventIds: UnsafePointer<FSEventStreamEventId>
     ) -> FSEventCallbackPayload? {
         let cfArray = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
-        let safeCount = min(numEvents, CFArrayGetCount(cfArray))
+        let availableCount = min(numEvents, CFArrayGetCount(cfArray))
+        let safeCount = min(availableCount, maximumCallbackEntries)
         guard safeCount > 0 else { return nil }
 
         var entries: [FSEventCallbackEntry] = []
@@ -513,7 +522,17 @@ extension FileSystemService {
             )
         }
 
-        guard !entries.isEmpty else { return nil }
+        if entries.isEmpty, availableCount <= safeCount { return nil }
+        if availableCount > safeCount {
+            // Do not synchronously walk an unbounded burst. The sentinel preserves the
+            // highest callback event ID and forces the existing whole-root recovery path.
+            entries.append(FSEventCallbackEntry(
+                path: "",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+                    | FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped),
+                id: eventIds[availableCount - 1]
+            ))
+        }
         return FSEventCallbackPayload(entries: entries)
     }
 
@@ -526,7 +545,7 @@ extension FileSystemService {
         let callbackContext = Unmanaged<FileSystemServiceFSEventCallbackContext>
             .fromOpaque(context)
             .takeUnretainedValue()
-        guard let service = callbackContext.service else { return }
+        guard callbackContext.isActive, let service = callbackContext.service else { return }
 
         let count = Int(numEvents)
         guard count > 0 else { return }

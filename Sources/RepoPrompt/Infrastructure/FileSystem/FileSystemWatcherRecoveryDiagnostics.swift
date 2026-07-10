@@ -1,7 +1,7 @@
 import CoreServices
 import Foundation
 
-struct FileSystemWatcherRecoveryCauseSet: OptionSet, Sendable, Hashable {
+struct FileSystemWatcherRecoveryCauseSet: OptionSet, Hashable {
     let rawValue: UInt16
 
     static let mustScanSubdirectories = Self(rawValue: 1 << 0)
@@ -56,7 +56,7 @@ struct FileSystemWatcherRecoveryCauseSet: OptionSet, Sendable, Hashable {
     }
 }
 
-struct FileSystemWatcherIngressTriggerSet: OptionSet, Sendable, Hashable {
+struct FileSystemWatcherIngressTriggerSet: OptionSet, Hashable {
     let rawValue: UInt8
 
     static let ordinary = Self(rawValue: 1 << 0)
@@ -66,7 +66,7 @@ struct FileSystemWatcherIngressTriggerSet: OptionSet, Sendable, Hashable {
     static let serviceCapacity = Self(rawValue: 1 << 4)
 }
 
-struct FileSystemWatcherIngressEvidence: Sendable, Equatable {
+struct FileSystemWatcherIngressEvidence: Equatable {
     var callbackCount: Int
     var sourceEntryCount: Int
     var retainedEntryCount: Int
@@ -145,7 +145,7 @@ struct FileSystemWatcherIngressEvidence: Sendable, Equatable {
     }
 }
 
-struct FileSystemWatcherRecoveryEpisodeSummary: Sendable, Equatable {
+struct FileSystemWatcherRecoveryEpisodeSummary: Equatable {
     let triggers: FileSystemWatcherIngressTriggerSet
     let causes: FileSystemWatcherRecoveryCauseSet
     let callbackCount: Int
@@ -159,7 +159,7 @@ struct FileSystemWatcherRecoveryEpisodeSummary: Sendable, Equatable {
     let servicePublicationSequence: UInt64?
 }
 
-struct FileSystemWatcherRecoveryDiagnosticsSnapshot: Sendable, Equatable {
+struct FileSystemWatcherRecoveryDiagnosticsSnapshot: Equatable {
     let callbackCount: UInt64
     let sourceEntryCount: UInt64
     let retainedEntryCount: UInt64

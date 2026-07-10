@@ -13,6 +13,45 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testFSEventCallbackQueueIsSerialOffMainAndCanBeFenced() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemWatcherCallbackQueue")
+        let service = try await makeService(root: root)
+        let queue = service.fseventCallbackQueue
+        XCTAssertNotEqual(queue.label, DispatchQueue.main.label)
+
+        let callbackContext = FileSystemServiceFSEventCallbackContext(service: nil)
+        XCTAssertTrue(callbackContext.isActive)
+        callbackContext.deactivate()
+        XCTAssertFalse(callbackContext.isActive)
+
+        let expectation = expectation(description: "serial callback ordering")
+        let values = LockedValues()
+        for value in 0 ..< 4 {
+            queue.async {
+                values.append(value)
+                if value == 3 { expectation.fulfill() }
+            }
+        }
+        await fulfillment(of: [expectation], timeout: 1)
+        XCTAssertEqual(values.snapshot(), [0, 1, 2, 3])
+    }
+
+    func testLargeFSEventCallbackIsBoundedWithRecoverySentinel() {
+        let count = 5000
+        let paths = (0 ..< count).map { "/root/file-\($0)" as NSString }
+        let flags = Array(repeating: createdFileFlags, count: count)
+        let ids = (1 ... FSEventStreamEventId(count)).map(\.self)
+        let payload = FileSystemService.buildOwnedFSEventPayloadFromCFArrayForTesting(
+            pathObjects: paths,
+            flags: flags,
+            ids: ids
+        )
+        XCTAssertEqual(payload?.paths.count, 4097)
+        let mustScanSubdirectories = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+        XCTAssertNotEqual((payload?.flags.last ?? 0) & mustScanSubdirectories, 0)
+        XCTAssertEqual(payload?.ids.last, FSEventStreamEventId(count))
+    }
+
     func testAcceptedBeforeAndAfterCaptureCutsPublishIndependentWatermarks() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressBarrier")
         let service = try await makeService(root: root)
@@ -113,6 +152,50 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertEqual(diagnostics.retainedEntryCount, 0)
         XCTAssertEqual(diagnostics.earlyFilteredEntryCount, 10)
         XCTAssertTrue(diagnostics.recoveryEpisodes.isEmpty)
+    }
+
+    func testIgnoredBuildBurstWithRecoverySignalProducesOneFullResync() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressIgnoredRecovery")
+        try ".build/\n".write(
+            to: root.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let service = try await makeService(
+            root: root,
+            maxPendingWatcherIngressEntries: 4
+        )
+        let publications = LockedPublications()
+        let publisher = await service.publisherForChanges()
+        let cancellable = publisher.sink { publications.append($0) }
+
+        var entries: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)] =
+            (1 ... 20).map { eventID in
+                (
+                    root.appendingPathComponent(".build/churn-\(eventID).o").path,
+                    createdFileFlags,
+                    FSEventStreamEventId(eventID)
+                )
+            }
+        entries.append((
+            "/",
+            FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped),
+            21
+        ))
+
+        let acceptedPayload = await service.acceptWatcherPayloadForTesting(entries, scheduleDrain: false)
+        let accepted = try XCTUnwrap(acceptedPayload)
+        _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: accepted)
+
+        let fullResyncs = publications.snapshot().filter(\.requiresFullResync)
+        XCTAssertEqual(fullResyncs.count, 1)
+        XCTAssertEqual(fullResyncs.first?.watcherAcceptedWatermark, accepted)
+        let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+        XCTAssertEqual(diagnostics.recoveryEpisodes.count, 1)
+        XCTAssertTrue(diagnostics.recoveryEpisodes[0].causes.contains(.kernelDropped))
+        XCTAssertTrue(diagnostics.recoveryEpisodes[0].completedFullResync)
+        cancellables.insert(cancellable)
     }
 
     func testMixedIgnoredAndVisibleEventsPreserveVisibleOrderingAndWatermarks() async throws {
@@ -709,5 +792,22 @@ private actor AsyncCounter {
 
     func value() -> Int {
         count
+    }
+}
+
+private final class LockedValues: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Int] = []
+
+    func append(_ value: Int) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    func snapshot() -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 }

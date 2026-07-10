@@ -28,9 +28,23 @@ struct FileSystemMutationWaiter {
 
 final class FileSystemServiceFSEventCallbackContext {
     weak var service: FileSystemService?
+    private let lock = NSLock()
+    private var active = true
 
-    init(service: FileSystemService) {
+    init(service: FileSystemService?) {
         self.service = service
+    }
+
+    func deactivate() {
+        lock.lock()
+        active = false
+        lock.unlock()
+    }
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
     }
 }
 
@@ -42,6 +56,7 @@ actor FileSystemService {
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     nonisolated let watcherEarlyFilter: FileSystemWatcherEarlyFilter
     nonisolated let watcherRecoveryDiagnostics = FileSystemWatcherRecoveryDiagnostics()
+    static let maximumCallbackEntries = 4096
     static let maxPendingRawEvents = 50000
     static let overflowRescanEventFlags = FSEventStreamEventFlags(
         kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
@@ -197,6 +212,8 @@ actor FileSystemService {
 
     /// The FSEvent stream reference
     var fseventStreamRef: FSEventStreamRef?
+    /// Serial, non-main queue preserving FSEvents callback order without using the UI queue.
+    nonisolated let fseventCallbackQueue: DispatchQueue
     /// The last durable FSEvents journal cut. Captured before the initial crawl so
     /// watcher startup can replay mutations that happen while the crawl is running.
     var nextFSEventStreamStartEventID: FSEventStreamEventId
@@ -365,6 +382,10 @@ actor FileSystemService {
         self.respectCursorignore = respectCursorignore
         self.skipSymlinks = skipSymlinks
         self.enableHierarchicalIgnores = enableHierarchicalIgnores
+        fseventCallbackQueue = DispatchQueue(
+            label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
+            qos: .utility
+        )
 
         watcherIngressMailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: Self.maxPendingRawEvents)
         watcherEarlyFilter = FileSystemWatcherEarlyFilter(rootPath: path)
@@ -461,6 +482,10 @@ actor FileSystemService {
             self.respectCursorignore = respectCursorignore
             self.skipSymlinks = skipSymlinks
             self.enableHierarchicalIgnores = enableHierarchicalIgnores
+            fseventCallbackQueue = DispatchQueue(
+                label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
+                qos: .utility
+            )
             self.isTestMode = isTestMode
             self.fileManagerOverride = fileManagerOverride
 
