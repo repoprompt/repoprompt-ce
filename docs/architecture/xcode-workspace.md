@@ -32,7 +32,7 @@ The native product schemes are useful for source navigation and indexing. Use `R
 
 This workflow is Debug-only. It does not define a second source graph, alter `Package.swift`, replace SwiftPM test resources, or support release/archive packaging. The app scheme permits ad-hoc signing when no stable identity is available; set `REPOPROMPT_XCODE_SIGN_IDENTITY` to choose an Apple Development identity explicitly. Ad-hoc builds use ephemeral secure storage.
 
-Generated app, MCP, and test builds are conductor-coordinated. Xcode cancellation can stop waiting without canceling the queued daemon job; inspect `./conductor job list` before retrying. The explicit `REPOPROMPT_XCODE_UNCOORDINATED=1` fallback is build/test-only. Xcode Run still requires conductor so its pre-launch action can perform exact-executable lifecycle handling safely.
+Generated app, MCP, and test builds are conductor-coordinated. This coordination serializes daemon-submitted heavy work, but a running CE debug app remains exposed to filesystem activity produced by those builds/tests when they touch a watched root; the app watcher and codemap pipeline are not paused by the conductor. The app’s watcher recovery path is off the UI queue, bounded, generation-fenced, and emits debug attribution for recovery, watcher-gap invalidation, and projection preload work. Xcode cancellation can stop waiting without canceling the queued daemon job; inspect `./conductor job list` before retrying. The explicit `REPOPROMPT_XCODE_UNCOORDINATED=1` fallback is build/test-only. Xcode Run still requires conductor so its pre-launch action can perform exact-executable lifecycle handling safely.
 
 ## Validation ownership
 
