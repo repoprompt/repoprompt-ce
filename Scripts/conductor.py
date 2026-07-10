@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import dataclasses
 import errno
 import fcntl
@@ -35,7 +36,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -69,6 +70,9 @@ APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS = 12.0
 APP_STOP_CONFIRM_TIMEOUT_SECONDS = 8.0
 APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS = 25.0
 GLOBAL_HEAVY_SLOT_POLL_SECONDS = 0.2
+MACHINE_LOCK_POLL_SECONDS = 0.2
+MAX_GLOBAL_HEAVY_SLOTS = 64
+DEBUG_APP_PROVENANCE_RELATIVE_PATH = "Contents/Resources/RepoPromptDebugProvenance.json"
 
 SHORT_TIMEOUT_SECONDS = 5 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
@@ -135,9 +139,10 @@ Operation commands:
   ./conductor provider-test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
-  ./conductor run [-- <app args...>]                  # FIFO coordinated run
+  ./conductor run [-- <app args...>]                  # build/package, then FIFO coordinated launch
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
+  ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
   ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run]
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
@@ -167,6 +172,8 @@ Output:
 State paths:
   state dir default: ~/Library/Application Support/RepoPrompt CE/Conductor/<repo-root-hash>/
   socket default:    /tmp/conductor-<uid>/<repo-root-hash16>.sock (directory mode 0700)
+  machine locks:     /tmp/repoprompt-ce-dev-locks-<uid>/ (directory mode 0700; independent of socket overrides)
+  heavy slots:       REPOPROMPT_DEV_HEAVY_SLOTS=N (default 1)
   overrides: REPOPROMPT_DEV_DAEMON_STATE_DIR, REPOPROMPT_DEV_DAEMON_SOCKET (socket parent must be owned 0700)
 
 Protocol version: {PROTOCOL_VERSION}
@@ -378,6 +385,173 @@ def ensure_state_dirs(paths: Paths) -> None:
     ensure_private_dir(paths.state_dir)
     ensure_private_dir(paths.jobs_dir)
     ensure_private_dir(paths.socket_path.parent)
+    ensure_private_dir(machine_lock_dir())
+
+
+def machine_lock_dir() -> Path:
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path("/tmp") / f"repoprompt-ce-dev-locks-{uid}"
+
+
+def configured_global_heavy_slots(env: Optional[Dict[str, str]] = None) -> int:
+    raw = (env or os.environ).get("REPOPROMPT_DEV_HEAVY_SLOTS")
+    if raw is None or raw == "":
+        return 1
+    try:
+        slots = int(raw)
+    except ValueError as exc:
+        raise ConductorError("REPOPROMPT_DEV_HEAVY_SLOTS must be a positive integer") from exc
+    if slots < 1 or slots > MAX_GLOBAL_HEAVY_SLOTS:
+        raise ConductorError(f"REPOPROMPT_DEV_HEAVY_SLOTS must be between 1 and {MAX_GLOBAL_HEAVY_SLOTS}")
+    return slots
+
+
+def global_heavy_slot_paths(env: Optional[Dict[str, str]] = None) -> List[Path]:
+    root = machine_lock_dir()
+    return [root / f"global-heavy-{index}.lock" for index in range(configured_global_heavy_slots(env))]
+
+
+def live_app_lock_path() -> Path:
+    return machine_lock_dir() / "live-app.lock"
+
+
+def repo_worktree_name(repo_root: Path) -> str:
+    return repo_root.name or str(repo_root)
+
+
+def display_lock_metadata(
+    *,
+    lock_kind: str,
+    ticket: Optional[str],
+    operation: str,
+    operation_label: str,
+    repo_root: Path,
+    repo_hash: Optional[str] = None,
+) -> Dict[str, Any]:
+    acquired_at = now()
+    return {
+        "version": 1,
+        "displayOnly": True,
+        "kind": lock_kind,
+        "ticket": ticket,
+        "operation": operation,
+        "operationLabel": operation_label,
+        "repoRoot": str(repo_root),
+        "repoHash": repo_hash,
+        "worktree": repo_worktree_name(repo_root),
+        "pid": os.getpid(),
+        "acquiredAt": acquired_at,
+        "acquiredAtISO": iso_timestamp(acquired_at),
+    }
+
+
+def write_display_lock_metadata(lock_file: Any, metadata: Dict[str, Any]) -> None:
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(json.dumps(metadata, indent=2, sort_keys=True))
+        lock_file.write("\n")
+        lock_file.flush()
+    except OSError:
+        pass
+
+
+def read_display_lock_metadata(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        payload = json.loads(raw) if raw.strip() else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def format_display_lock_holder(metadata: Optional[Dict[str, Any]]) -> str:
+    if not metadata:
+        return "holder unknown"
+    label = metadata.get("operationLabel") or metadata.get("operation") or "unknown operation"
+    ticket = metadata.get("ticket") or "no-ticket"
+    repo = metadata.get("repoRoot") or "unknown repo"
+    worktree = metadata.get("worktree") or Path(str(repo)).name
+    acquired_at = metadata.get("acquiredAt")
+    held_for = "unknown duration"
+    if isinstance(acquired_at, (int, float)):
+        held_for = format_duration(now() - float(acquired_at))
+    return f"holder {label} ticket={ticket} repo={repo} worktree={worktree} held={held_for}"
+
+
+@contextlib.contextmanager
+def machine_exclusive_lock(lock_path: Path, metadata: Dict[str, Any], wait_label: str):
+    ensure_private_dir(lock_path.parent)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    did_log_wait = False
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if not did_log_wait:
+                holder = format_display_lock_holder(read_display_lock_metadata(lock_path))
+                print(f"waiting for {wait_label}: {lock_path} ({holder})", flush=True)
+                did_log_wait = True
+            time.sleep(MACHINE_LOCK_POLL_SECONDS)
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            lock_file.close()
+            raise
+    write_display_lock_metadata(lock_file, metadata)
+    try:
+        yield lock_file
+    finally:
+        with contextlib.suppress(OSError):
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.flush()
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            lock_file.close()
+
+
+@contextlib.contextmanager
+def machine_heavy_slot(metadata: Dict[str, Any], env: Optional[Dict[str, str]], wait_label: str):
+    ensure_private_dir(machine_lock_dir())
+    lock_files = [(path, path.open("a+", encoding="utf-8")) for path in global_heavy_slot_paths(env)]
+    did_log_wait = False
+    selected_file: Optional[Any] = None
+    try:
+        while True:
+            for lock_path, lock_file in lock_files:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    selected_file = lock_file
+                    write_display_lock_metadata(lock_file, metadata)
+                    print(f"acquired {wait_label}: {lock_path}", flush=True)
+                    yield lock_file
+                    return
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    raise
+            if not did_log_wait:
+                holders = "; ".join(format_display_lock_holder(read_display_lock_metadata(path)) for path, _ in lock_files)
+                paths = ",".join(str(path) for path, _ in lock_files)
+                print(f"waiting for {wait_label} ({len(lock_files)} configured): {paths}; {holders}", flush=True)
+                did_log_wait = True
+            time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
+    finally:
+        for _path, lock_file in lock_files:
+            if lock_file is selected_file:
+                with contextlib.suppress(OSError):
+                    lock_file.seek(0)
+                    lock_file.truncate()
+                    lock_file.flush()
+                with contextlib.suppress(OSError):
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                lock_file.close()
 
 
 def read_pid(path: Path) -> Optional[int]:
@@ -861,13 +1035,13 @@ class OutputSummarizer:
 
 
 def operation_display_name(operation: str, args: Dict[str, Any]) -> str:
-    if operation == "app" and args.get("subcommand") in {"status", "stop", "relaunch"}:
+    if operation == "app" and args.get("subcommand") in {"status", "stop", "launch-existing", "relaunch"}:
         return f"app {args['subcommand']}"
     return operation
 
 
 def latest_lifecycle_intent(operation: str, args: Dict[str, Any]) -> Optional[str]:
-    if operation == "app" and args.get("subcommand") in {"stop", "relaunch"}:
+    if operation == "app" and args.get("subcommand") in {"stop", "launch-existing", "relaunch"}:
         return operation_display_name(operation, args)
     return None
 
@@ -875,19 +1049,15 @@ def latest_lifecycle_intent(operation: str, args: Dict[str, Any]) -> Optional[st
 def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
     return (
         operation == "run"
-        or (operation == "app" and args.get("subcommand") == "relaunch")
+        or (operation == "app" and args.get("subcommand") in {"launch-existing", "relaunch"})
         or (operation == "smoke" and bool(args.get("launch") or args.get("packagedApp")))
     )
 
 
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli", "run"}:
+    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
-        return True
-    if operation == "app" and args.get("subcommand") == "relaunch":
-        return True
-    if operation == "smoke" and bool(args.get("launch")):
         return True
     if operation == "release" and args.get("subcommand") in {"artifact", "package", "local-install"}:
         return True
@@ -949,6 +1119,7 @@ class Job:
     process_group_identity_confirmed: bool = False
     global_heavy_slot_wait_seconds: Optional[float] = None
     global_heavy_slot_path: Optional[str] = None
+    global_heavy_slot_holder: Optional[str] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
     result_summary: Optional[str] = None
@@ -1006,6 +1177,7 @@ class Job:
             "processPGID": self.process_pgid,
             "globalHeavySlotWaitSeconds": self.global_heavy_slot_wait_seconds,
             "globalHeavySlotPath": self.global_heavy_slot_path,
+            "globalHeavySlotHolder": self.global_heavy_slot_holder,
             "exitCode": self.exit_code,
             "error": self.error,
             "resultSummary": self.result_summary,
@@ -1082,6 +1254,9 @@ class OperationRegistry:
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
     ]
+    CONDUCTOR_ENV_KEYS = [
+        "REPOPROMPT_DEV_HEAVY_SLOTS",
+    ]
     TELEMETRY_ENV_KEYS = [
         "REPOPROMPT_ENABLE_SENTRY",
         "REPOPROMPT_SENTRY_DSN",
@@ -1099,6 +1274,7 @@ class OperationRegistry:
             + BUILD_ENV_KEYS
             + STYLE_ENV_KEYS
             + TEST_ENV_KEYS
+            + CONDUCTOR_ENV_KEYS
             + TELEMETRY_ENV_KEYS
         )
     )
@@ -1207,7 +1383,7 @@ class OperationRegistry:
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
         if operation == "run":
-            return [script("run.sh"), *[str(arg) for arg in args.get("appArgs") or []]], ["build", "debugArtifact", "liveApp"], cwd, env, effective_timeout
+            return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "app":
             subcommand = args.get("subcommand")
             if subcommand == "stop":
@@ -1215,14 +1391,14 @@ class OperationRegistry:
                 return self._internal_argv("app_stop", internal_args), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "status":
                 return self._internal_argv("app_status", {}), lanes, cwd, env, effective_timeout
+            if subcommand == "launch-existing":
+                return self._internal_argv("app_launch_existing", dict(args)), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "relaunch":
-                if args.get("guardDelayedLaunch"):
-                    env["REPOPROMPT_GUARD_DELAYED_LAUNCH"] = "1"
-                return [script("run.sh"), *[str(arg) for arg in args.get("appArgs") or []]], ["build", "debugArtifact", "liveApp"], cwd, env, effective_timeout
+                return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "smoke":
             lanes = ["debugArtifact", "liveApp"]
             if args.get("launch"):
-                lanes = ["build", "debugArtifact", "liveApp"]
+                lanes = ["liveApp"]
             elif args.get("packagedApp"):
                 lanes = ["liveApp"]
             smoke_args = dict(args)
@@ -1351,8 +1527,8 @@ class DaemonState:
         self.shutdown_requested = False
         self.server: Optional[socketserver.BaseServer] = None
 
-    def _global_heavy_slot_path(self) -> Path:
-        return self.paths.socket_path.parent / "global-heavy.lock"
+    def _global_heavy_slot_paths(self, env: Optional[Dict[str, str]] = None) -> List[Path]:
+        return global_heavy_slot_paths(env)
 
     def status_payload(self) -> Dict[str, Any]:
         with self.lock:
@@ -1371,7 +1547,9 @@ class DaemonState:
                 "repoHash": self.paths.repo_hash,
                 "socketPath": str(self.paths.socket_path),
                 "stateDir": str(self.paths.state_dir),
-                "globalHeavySlotPath": str(self._global_heavy_slot_path()),
+                "globalHeavySlotPaths": [str(path) for path in self._global_heavy_slot_paths()],
+                "globalHeavySlotCount": configured_global_heavy_slots(),
+                "liveAppLockPath": str(live_app_lock_path()),
                 "activeJobsByLane": active_by_lane,
                 "runningJobs": running_jobs,
                 "queuedJobs": queued_jobs,
@@ -1432,7 +1610,7 @@ class DaemonState:
             raise ConductorError("request args must be an object")
         args = dict(raw_args)
         operation = str(request.get("operation") or "")
-        if operation == "app" and args.get("subcommand") in {"stop", "relaunch"}:
+        if operation == "app" and args.get("subcommand") in {"stop", "launch-existing", "relaunch"}:
             # Derived exclusively by supersession below, never accepted from a client.
             args.pop("guardDelayedLaunch", None)
         normalized_request = dict(request)
@@ -1724,56 +1902,94 @@ class DaemonState:
 
     def _acquire_global_heavy_slot(self, ticket: str) -> Optional[Any]:
         wait_start = now()
-        lock_path = self._global_heavy_slot_path()
-        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock_file = lock_path.open("a+", encoding="utf-8")
-        did_log_wait = False
-        while True:
-            with self.condition:
-                job = self.jobs.get(ticket)
-                if not job or job.state != "running":
-                    lock_file.close()
-                    return None
-                if job.cancel_requested:
-                    job.state = "canceled"
-                    job.exit_code = 130
-                    job.result_summary = "canceled before global heavy slot"
-                    job.finished_at = now()
-                    self._append_system_line_locked(job, "job canceled before global heavy slot\n")
-                    self.condition.notify_all()
-                    lock_file.close()
-                    return None
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                with self.condition:
-                    job = self.jobs.get(ticket)
-                    if job and job.state == "running" and not did_log_wait:
-                        job.global_heavy_slot_path = str(lock_path)
-                        self._append_system_line_locked(job, f"waiting for global heavy slot: {lock_path}\n")
-                        self.condition.notify_all()
-                        did_log_wait = True
-                time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
-            except OSError as exc:
-                if exc.errno == errno.EINTR:
-                    continue
-                lock_file.close()
-                raise
-        waited = now() - wait_start
         with self.condition:
             job = self.jobs.get(ticket)
-            if job and job.state == "running":
-                job.global_heavy_slot_wait_seconds = waited
-                job.global_heavy_slot_path = str(lock_path)
-                self._append_system_line_locked(job, f"acquired global heavy slot after {format_duration(waited)}\n")
-                self.condition.notify_all()
-        return lock_file
+            env = dict(job.env) if job else {}
+        lock_paths = self._global_heavy_slot_paths(env)
+        ensure_private_dir(machine_lock_dir())
+        lock_files = [(path, path.open("a+", encoding="utf-8")) for path in lock_paths]
+        did_log_wait = False
+        selected_path: Optional[Path] = None
+        selected_file: Optional[Any] = None
+        try:
+            while True:
+                with self.condition:
+                    job = self.jobs.get(ticket)
+                    if not job or job.state != "running":
+                        return None
+                    if job.cancel_requested:
+                        job.state = "canceled"
+                        job.exit_code = 130
+                        job.result_summary = "canceled before global heavy slot"
+                        job.finished_at = now()
+                        self._append_system_line_locked(job, "job canceled before global heavy slot\n")
+                        self.condition.notify_all()
+                        return None
+                for lock_path, lock_file in lock_files:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        selected_path = lock_path
+                        selected_file = lock_file
+                        break
+                    except BlockingIOError:
+                        continue
+                    except OSError as exc:
+                        if exc.errno == errno.EINTR:
+                            continue
+                        raise
+                if selected_file is not None and selected_path is not None:
+                    break
+                holders = [format_display_lock_holder(read_display_lock_metadata(path)) for path, _file in lock_files]
+                with self.condition:
+                    job = self.jobs.get(ticket)
+                    if job and job.state == "running":
+                        job.global_heavy_slot_path = ",".join(str(path) for path, _file in lock_files)
+                        job.global_heavy_slot_holder = "; ".join(holders)
+                        if not did_log_wait:
+                            self._append_system_line_locked(
+                                job,
+                                f"waiting for global heavy slot ({len(lock_files)} configured): {job.global_heavy_slot_path}; {job.global_heavy_slot_holder}\n",
+                            )
+                            self.condition.notify_all()
+                            did_log_wait = True
+                time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
+            waited = now() - wait_start
+            with self.condition:
+                job = self.jobs.get(ticket)
+                if job and job.state == "running":
+                    metadata = display_lock_metadata(
+                        lock_kind="global-heavy",
+                        ticket=job.ticket,
+                        operation=job.operation,
+                        operation_label=operation_display_name(job.operation, job.args),
+                        repo_root=self.paths.repo_root,
+                        repo_hash=self.paths.repo_hash,
+                    )
+                    write_display_lock_metadata(selected_file, metadata)
+                    job.global_heavy_slot_wait_seconds = waited
+                    job.global_heavy_slot_path = str(selected_path)
+                    job.global_heavy_slot_holder = None
+                    self._append_system_line_locked(
+                        job,
+                        f"acquired global heavy slot {selected_path} after {format_duration(waited)}\n",
+                    )
+                    self.condition.notify_all()
+            return selected_file
+        finally:
+            for _path, lock_file in lock_files:
+                if lock_file is selected_file:
+                    continue
+                with contextlib.suppress(OSError):
+                    lock_file.close()
 
     @staticmethod
     def _release_global_heavy_slot(lock_file: Optional[Any]) -> None:
         if lock_file is None:
             return
+        with contextlib.suppress(OSError):
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.flush()
         with contextlib.suppress(OSError):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         with contextlib.suppress(OSError):
@@ -1803,6 +2019,7 @@ class DaemonState:
                     self._append_system_line_locked(job, "job canceled before process start\n")
                     return
             argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
+            env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
             if operation_requires_global_heavy_slot(job.operation, job.args):
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
@@ -3166,6 +3383,10 @@ def render_job(job: Dict[str, Any], output_mode: str = "summary", include_tail: 
         timing_parts.append(f"global-wait={format_duration(float(job.get('globalHeavySlotWaitSeconds')))}")
     if timing_parts:
         print(f"timing:    {', '.join(timing_parts)}")
+    if job.get("globalHeavySlotPath") and job.get("state") == "running":
+        print(f"heavy:     {job.get('globalHeavySlotPath')}")
+    if job.get("globalHeavySlotHolder") and job.get("state") == "running":
+        print(f"holder:    {job.get('globalHeavySlotHolder')}")
     print(f"log:       {job.get('logPath')}")
     if job.get("startedAtISO"):
         print(f"started:   {job.get('startedAtISO')}")
@@ -3626,45 +3847,131 @@ def terminate_debug_app_processes() -> List[str]:
     return [str(pid) for pid in terminate_matching_processes(debug_app_executable_path())]
 
 
-def operation_app_status(repo_root: Path) -> int:
-    bundle = debug_app_bundle_path()
-    print("RepoPrompt CE debug app status")
-    print(f"  Debug app bundle: {bundle}")
-    print("  Running matching debug app PIDs: ", end="")
+def debug_app_provenance_path(bundle: Path) -> Path:
+    return bundle / DEBUG_APP_PROVENANCE_RELATIVE_PATH
+
+
+def read_debug_app_provenance(bundle: Path) -> Optional[Dict[str, Any]]:
+    path = debug_app_provenance_path(bundle)
     try:
-        pids = find_debug_app_pids()
-    except ProcessIdentityError as exc:
-        print("unknown")
-        print(f"ERROR: could not safely identify the debug app process: {exc}")
-        return 1
-    print(", ".join(pids) if pids else "none")
-    print(f"  Bundle exists: {'yes' if bundle.exists() else 'no'}")
-    if bundle.exists():
-        # Keep the signing/storage probes aligned with Scripts/run.sh launch diagnostics.
-        codesign = subprocess.run(["codesign", "-dv", str(bundle)], text=True, capture_output=True)
-        details = (codesign.stdout or "") + (codesign.stderr or "")
-        team = "<missing>"
-        authorities: List[str] = []
-        for line in details.splitlines():
-            if line.startswith("TeamIdentifier="):
-                team = line.split("=", 1)[1] or "<missing>"
-            elif line.startswith("Authority="):
-                authorities.append(line.split("=", 1)[1])
-        print(f"  Signing team: {team}")
-        print(f"  Signing authorities: {', '.join(authorities) if authorities else '<none/ad-hoc>'}")
-        plist = bundle / "Contents" / "Info.plist"
-        marker = subprocess.run(
-            ["plutil", "-extract", "RepoPromptDebugSecureStorageBackend", "raw", "-o", "-", str(plist)],
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def git_metadata_value(repo_root: Path, args: Sequence[str]) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
             text=True,
             capture_output=True,
+            timeout=2.0,
         )
-        print(f"  Debug secure storage marker: {marker.stdout.strip() if marker.returncode == 0 and marker.stdout.strip() else '<missing>'}")
-    status_script = repo_root / "Scripts" / "install_debug_cli.sh"
-    code, _stdout, _stderr = run_operation_command("debug CLI status", [str(status_script), "status"], repo_root, allow_exit_codes={0, 1})
-    return 0 if code in {0, 1} else code
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return value or None
 
 
-def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
+def current_repo_commit(repo_root: Path) -> Optional[str]:
+    return git_metadata_value(repo_root, ["rev-parse", "HEAD"])
+
+
+def provenance_report_lines(repo_root: Path, bundle: Path) -> List[str]:
+    provenance = read_debug_app_provenance(bundle)
+    if not provenance:
+        return ["  Bundle provenance: <missing>"]
+    lines = ["  Bundle provenance:"]
+    repo = str(provenance.get("repoRoot") or "<unknown>")
+    worktree = str(provenance.get("worktreePath") or repo)
+    branch = str(provenance.get("branch") or "<unknown>")
+    commit = str(provenance.get("commit") or "<unknown>")
+    dirty = provenance.get("dirty")
+    built_at = str(provenance.get("buildTimeISO") or "<unknown>")
+    lines.append(f"    repo: {repo}")
+    lines.append(f"    worktree: {worktree}")
+    lines.append(f"    branch: {branch}")
+    lines.append(f"    commit: {commit[:12] if commit != '<unknown>' else commit}")
+    lines.append(f"    dirty at build: {dirty if isinstance(dirty, bool) else '<unknown>'}")
+    lines.append(f"    built: {built_at}")
+    flags: List[str] = []
+    try:
+        current_root = str(repo_root.resolve())
+        built_root = str(Path(repo).resolve(strict=False))
+        if built_root != current_root:
+            flags.append("foreign worktree")
+    except OSError:
+        flags.append("foreign worktree unknown")
+    current_commit = current_repo_commit(repo_root)
+    if current_commit and commit not in {"<unknown>", current_commit}:
+        flags.append("stale commit")
+    if flags:
+        lines.append(f"    WARNING: {'; '.join(flags)}")
+    return lines
+
+
+def print_debug_app_provenance(repo_root: Path, bundle: Path) -> None:
+    for line in provenance_report_lines(repo_root, bundle):
+        print(line, flush=True)
+
+
+def report_launch_bundle_details(repo_root: Path, bundle: Path) -> int:
+    print(f"Launch app path: {bundle}", flush=True)
+    print_debug_app_provenance(repo_root, bundle)
+    codesign = subprocess.run(["codesign", "-dv", str(bundle)], text=True, capture_output=True)
+    details = (codesign.stdout or "") + (codesign.stderr or "")
+    team = "<missing>"
+    authorities: List[str] = []
+    for line in details.splitlines():
+        if line.startswith("TeamIdentifier="):
+            team = line.split("=", 1)[1] or "<missing>"
+        elif line.startswith("Authority="):
+            authorities.append(line.split("=", 1)[1])
+    marker = subprocess.run(
+        ["plutil", "-extract", "RepoPromptDebugSecureStorageBackend", "raw", "-o", "-", str(bundle / "Contents" / "Info.plist")],
+        text=True,
+        capture_output=True,
+    )
+    storage = marker.stdout.strip() if marker.returncode == 0 and marker.stdout.strip() else "<missing>"
+    print(f"Launch app team: {team}", flush=True)
+    print(f"Launch app signing authorities: {', '.join(authorities) if authorities else '<none/ad-hoc>'}", flush=True)
+    print(f"Launch app debug secure storage marker: {storage}", flush=True)
+    if storage != "keychain":
+        print("WARNING: Debug secure storage is in-memory this run; secrets and permission changes won't persist.", flush=True)
+    elif not team or team in {"<missing>", "not set"}:
+        print("WARNING: Launching a keychain-marked debug app without a team identifier; runtime will fall back to in-memory secure storage.", flush=True)
+    return 0
+
+
+def wait_for_no_debug_app_process(timeout: float = 5.0) -> bool:
+    deadline = now() + timeout
+    while now() <= deadline:
+        pids = find_debug_app_pids()
+        if not pids:
+            return True
+        time.sleep(APP_STOP_POLL_SECONDS)
+    return False
+
+
+def wait_for_debug_app_process(timeout: float = STARTUP_TIMEOUT_SECONDS) -> List[str]:
+    deadline = now() + timeout
+    while now() <= deadline:
+        pids = find_debug_app_pids()
+        if pids:
+            return pids
+        time.sleep(APP_STOP_POLL_SECONDS)
+    return []
+
+
+def guard_delayed_debug_app_launch() -> int:
+    print("Guarding against a delayed RepoPrompt CE debug app launch from superseded app work.", flush=True)
+    return _operation_app_stop_unlocked(Path.cwd(), {"guardDelayedLaunch": True})
+
+
+def _operation_app_stop_unlocked(_repo_root: Path, args: Dict[str, Any]) -> int:
     guard_delayed_launch = bool(args.get("guardDelayedLaunch"))
     required_quiet = APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS if guard_delayed_launch else APP_STOP_QUIET_SECONDS
     confirmation_timeout = APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS if guard_delayed_launch else APP_STOP_CONFIRM_TIMEOUT_SECONDS
@@ -3701,6 +4008,223 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
             print("ERROR: timed out confirming that RepoPrompt remained stopped.", flush=True)
             return 1
         time.sleep(APP_STOP_POLL_SECONDS)
+
+
+def staged_debug_app_parent(live_bundle: Optional[Path] = None) -> Path:
+    bundle = live_bundle or debug_app_bundle_path()
+    token = f"{int(now() * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    return bundle.parent / ".staging" / token
+
+
+def cleanup_staged_debug_bundle(staged_bundle: Optional[Path]) -> None:
+    if staged_bundle is None:
+        return
+    parent = staged_bundle.parent
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(parent)
+
+
+def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tuple[int, Optional[Path]]:
+    live_bundle = debug_app_bundle_path()
+    staging_parent = staged_debug_app_parent(live_bundle)
+    staged_bundle = staging_parent / live_bundle.name
+    metadata = display_lock_metadata(
+        lock_kind="global-heavy",
+        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        operation=operation_label,
+        operation_label=operation_label,
+        repo_root=repo_root,
+        repo_hash=None,
+    )
+    env = os.environ.copy()
+    env["REPOPROMPT_DEBUG_APP_BUNDLE"] = str(staged_bundle)
+    try:
+        with machine_heavy_slot(metadata, env, "global heavy slot for debug package"):
+            code, _stdout, _stderr = run_operation_command(
+                "package staged debug app",
+                [str(repo_root / "Scripts" / "package_app.sh"), "debug"],
+                repo_root,
+                env=env,
+            )
+        if code != 0:
+            cleanup_staged_debug_bundle(staged_bundle)
+            return code, None
+        executable = staged_bundle / "Contents" / "MacOS" / "RepoPrompt"
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            print(f"ERROR: staged debug app is not launchable: {staged_bundle}", flush=True)
+            cleanup_staged_debug_bundle(staged_bundle)
+            return 1, None
+        print(f"Staged debug app bundle: {staged_bundle}", flush=True)
+        return 0, staged_bundle
+    except BaseException:
+        cleanup_staged_debug_bundle(staged_bundle)
+        raise
+
+
+def swap_staged_debug_bundle_into_place(staged_bundle: Path, live_bundle: Path) -> bool:
+    if not live_bundle.exists():
+        staged_bundle.rename(live_bundle)
+        return True
+    if sys.platform != "darwin":
+        return False
+    try:
+        renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
+    except AttributeError:
+        return False
+    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    renamex_np.restype = ctypes.c_int
+    rename_swap = 0x00000002
+    result = renamex_np(os.fsencode(staged_bundle), os.fsencode(live_bundle), rename_swap)
+    if result == 0:
+        return True
+    return False
+
+
+def activate_staged_debug_bundle(staged_bundle: Path, live_bundle: Optional[Path] = None) -> None:
+    live = live_bundle or debug_app_bundle_path()
+    if not staged_bundle.exists():
+        raise ConductorError(f"staged debug app bundle is missing: {staged_bundle}")
+    executable = staged_bundle / "Contents" / "MacOS" / "RepoPrompt"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ConductorError(f"staged debug app bundle is not launchable: {staged_bundle}")
+    live.parent.mkdir(parents=True, exist_ok=True)
+    backup = live.parent / f".{live.name}.previous.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    moved_existing = False
+    try:
+        if not swap_staged_debug_bundle_into_place(staged_bundle, live):
+            if live.exists():
+                live.rename(backup)
+                moved_existing = True
+            staged_bundle.rename(live)
+    except BaseException:
+        if moved_existing and not live.exists() and backup.exists():
+            with contextlib.suppress(OSError):
+                backup.rename(live)
+        raise
+    finally:
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        staging_parent = staged_bundle.parent
+        if staging_parent.exists():
+            shutil.rmtree(staging_parent, ignore_errors=True)
+    print(f"Activated staged debug app bundle: {live}", flush=True)
+
+
+def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
+    bundle = debug_app_bundle_path()
+    staged_value = args.get("stagedBundle")
+    staged_bundle = Path(str(staged_value)) if staged_value else None
+    activated = False
+    executable = bundle / "Contents" / "MacOS" / "RepoPrompt"
+    if staged_bundle is None and (not bundle.exists() or not executable.is_file() or not os.access(executable, os.X_OK)):
+        print(f"ERROR: existing debug app bundle is not launchable: {bundle}", flush=True)
+        print("Build it first with './conductor build' or './conductor run'.", flush=True)
+        return 1
+    metadata = display_lock_metadata(
+        lock_kind="live-app",
+        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        operation="app launch-existing" if staged_bundle is None else "app activate-staged-and-launch",
+        operation_label="app launch-existing" if staged_bundle is None else "app activate staged and launch",
+        repo_root=repo_root,
+        repo_hash=None,
+    )
+    try:
+        with machine_exclusive_lock(live_app_lock_path(), metadata, "live-app lock"):
+            if staged_bundle is None:
+                report_launch_bundle_details(repo_root, bundle)
+            print("Stopping existing RepoPrompt CE debug app instance", flush=True)
+            stop_code = _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": bool(args.get("guardDelayedLaunch"))})
+            if stop_code != 0:
+                return stop_code
+            if staged_bundle is not None:
+                activate_staged_debug_bundle(staged_bundle, bundle)
+                activated = True
+                report_launch_bundle_details(repo_root, bundle)
+            app_args = [str(arg) for arg in args.get("appArgs") or []]
+            argv = ["open", "-n", str(bundle)]
+            if app_args:
+                argv.extend(["--args", *app_args])
+            code, _stdout, _stderr = run_operation_command("launch existing debug app", argv, repo_root)
+            if code != 0:
+                return code
+            try:
+                launched_pids = wait_for_debug_app_process()
+            except ProcessIdentityError as exc:
+                print(f"ERROR: could not safely identify the launched RepoPrompt CE debug app process: {exc}", flush=True)
+                return 1
+            if not launched_pids:
+                print("ERROR: launch request returned, but no matching RepoPrompt CE debug app process appeared within 10 seconds.", flush=True)
+                _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": True})
+                return 1
+            print(f"Observed launched RepoPrompt CE debug PID(s): {', '.join(launched_pids)}", flush=True)
+        return 0
+    finally:
+        if staged_bundle is not None and not activated:
+            cleanup_staged_debug_bundle(staged_bundle)
+
+
+def operation_debug_app_build_then_launch(repo_root: Path, args: Dict[str, Any]) -> int:
+    package_code, staged_bundle = package_debug_app_under_heavy(repo_root, "debug app build/package")
+    if package_code != 0 or staged_bundle is None:
+        print("Package failed; no live bundle or stop/launch lifecycle action was performed.", flush=True)
+        return package_code or 1
+    launch_args = dict(args)
+    launch_args.setdefault("appArgs", [])
+    launch_args["stagedBundle"] = str(staged_bundle)
+    return operation_app_launch_existing(repo_root, launch_args)
+
+
+def operation_app_status(repo_root: Path) -> int:
+    bundle = debug_app_bundle_path()
+    print("RepoPrompt CE debug app status")
+    print(f"  Debug app bundle: {bundle}")
+    print("  Running matching debug app PIDs: ", end="")
+    try:
+        pids = find_debug_app_pids()
+    except ProcessIdentityError as exc:
+        print("unknown")
+        print(f"ERROR: could not safely identify the debug app process: {exc}")
+        return 1
+    print(", ".join(pids) if pids else "none")
+    print(f"  Bundle exists: {'yes' if bundle.exists() else 'no'}")
+    if bundle.exists():
+        # Keep the signing/storage probes aligned with Scripts/run.sh launch diagnostics.
+        codesign = subprocess.run(["codesign", "-dv", str(bundle)], text=True, capture_output=True)
+        details = (codesign.stdout or "") + (codesign.stderr or "")
+        team = "<missing>"
+        authorities: List[str] = []
+        for line in details.splitlines():
+            if line.startswith("TeamIdentifier="):
+                team = line.split("=", 1)[1] or "<missing>"
+            elif line.startswith("Authority="):
+                authorities.append(line.split("=", 1)[1])
+        print(f"  Signing team: {team}")
+        print(f"  Signing authorities: {', '.join(authorities) if authorities else '<none/ad-hoc>'}")
+        plist = bundle / "Contents" / "Info.plist"
+        marker = subprocess.run(
+            ["plutil", "-extract", "RepoPromptDebugSecureStorageBackend", "raw", "-o", "-", str(plist)],
+            text=True,
+            capture_output=True,
+        )
+        print(f"  Debug secure storage marker: {marker.stdout.strip() if marker.returncode == 0 and marker.stdout.strip() else '<missing>'}")
+        for line in provenance_report_lines(repo_root, bundle):
+            print(line)
+    status_script = repo_root / "Scripts" / "install_debug_cli.sh"
+    code, _stdout, _stderr = run_operation_command("debug CLI status", [str(status_script), "status"], repo_root, allow_exit_codes={0, 1})
+    return 0 if code in {0, 1} else code
+
+
+def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
+    metadata = display_lock_metadata(
+        lock_kind="live-app",
+        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        operation="app stop",
+        operation_label="app stop",
+        repo_root=repo_root,
+        repo_hash=None,
+    )
+    with machine_exclusive_lock(live_app_lock_path(), metadata, "live-app lock"):
+        return _operation_app_stop_unlocked(repo_root, args)
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
@@ -3743,7 +4267,7 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
 
     launched = bool(args.get("launch"))
     if launched:
-        code, _stdout, _stderr = run_operation_command("launch debug app", [str(repo_root / "Scripts" / "run.sh")], repo_root, env=env)
+        code = operation_debug_app_build_then_launch(repo_root, {"appArgs": []})
         if code != 0:
             return code
 
@@ -3978,6 +4502,10 @@ def run_operation_runner(payload_json: str) -> int:
         return operation_app_stop(repo_root, args)
     if kind == "app_status":
         return operation_app_status(repo_root)
+    if kind == "app_launch_existing":
+        return operation_app_launch_existing(repo_root, args)
+    if kind == "debug_app_build_then_launch":
+        return operation_debug_app_build_then_launch(repo_root, args)
     if kind == "smoke":
         return operation_smoke(repo_root, args)
     if kind == "diagnostics_agent_mode_on":
@@ -4105,15 +4633,15 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         app_args = rest[1:] if rest and rest[0] == "--" else rest
         args["appArgs"] = app_args
     elif operation == "app":
-        if not rest or rest[0] not in {"status", "stop", "relaunch"}:
-            raise ConductorError("usage: ./conductor app status|stop|relaunch [-- <app args...>]")
+        if not rest or rest[0] not in {"status", "stop", "launch-existing", "relaunch"}:
+            raise ConductorError("usage: ./conductor app status|stop|launch-existing|relaunch [-- <app args...>]")
         args["subcommand"] = rest[0]
         trailing = rest[1:]
         if args["subcommand"] in {"status", "stop"} and trailing:
             raise ConductorError(f"app {args['subcommand']} does not accept application arguments")
-        if args["subcommand"] == "relaunch":
+        if args["subcommand"] in {"launch-existing", "relaunch"}:
             if trailing and trailing[0] != "--":
-                raise ConductorError("app relaunch application arguments must follow '--'")
+                raise ConductorError(f"app {args['subcommand']} application arguments must follow '--'")
             args["appArgs"] = trailing[1:] if trailing else []
     elif operation == "smoke":
         parser = argparse.ArgumentParser(prog="conductor smoke")
@@ -4175,19 +4703,21 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
 
 def main(argv: List[str]) -> int:
     repo_root = resolve_repo_root()
-    paths = compute_paths(repo_root)
-    ensure_state_dirs(paths)
 
+    if argv and argv[0] == "__operation_runner":
+        if len(argv) != 2:
+            raise ConductorError("__operation_runner requires one JSON payload argument")
+        return run_operation_runner(argv[1])
     if argv and argv[0] == "__daemon":
         parser = argparse.ArgumentParser(prog="conductor.py __daemon")
         parser.add_argument("--repo-root", required=True)
         ns = parser.parse_args(argv[1:])
         daemon_paths = compute_paths(Path(ns.repo_root))
+        ensure_state_dirs(daemon_paths)
         return run_daemon(daemon_paths)
-    if argv and argv[0] == "__operation_runner":
-        if len(argv) != 2:
-            raise ConductorError("__operation_runner requires one JSON payload argument")
-        return run_operation_runner(argv[1])
+
+    paths = compute_paths(repo_root)
+    ensure_state_dirs(paths)
 
     if not argv or argv[0] in {"-h", "--help"}:
         print(HELP)

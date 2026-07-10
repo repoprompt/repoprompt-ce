@@ -335,6 +335,51 @@ run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
 run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
 
+if (( ! IS_RELEASE )); then
+    phase "Writing debug bundle provenance"
+    ROOT_DIR_FOR_PROVENANCE="$ROOT_DIR" APP_BUNDLE_FOR_PROVENANCE="$APP_BUNDLE" python3 - <<'PY'
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import os
+import subprocess
+import time
+
+root = Path(os.environ["ROOT_DIR_FOR_PROVENANCE"]).resolve()
+bundle = Path(os.environ["APP_BUNDLE_FOR_PROVENANCE"])
+
+def git(args: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True, timeout=5)
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+status = git(["status", "--porcelain"])
+now = time.time()
+payload = {
+    "version": 1,
+    "repoRoot": str(root),
+    "worktreePath": str(root),
+    "worktreeName": root.name,
+    "branch": git(["rev-parse", "--abbrev-ref", "HEAD"]),
+    "commit": git(["rev-parse", "HEAD"]),
+    "dirty": bool(status),
+    "buildTimeEpoch": now,
+    "buildTimeISO": datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(timespec="seconds"),
+}
+path = bundle / "Contents" / "Resources" / "RepoPromptDebugProvenance.json"
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(f"Debug bundle provenance: {path}")
+PY
+    run plutil -lint "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"
+fi
+
 phase "Signing app bundle"
 sign_path(){
     local path="$1"

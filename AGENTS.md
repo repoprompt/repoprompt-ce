@@ -144,10 +144,11 @@ These settings are intentionally DEBUG-only. If a key is unavailable, confirm `r
 
 ## Developer daemon / coordinated validation
 
-Prefer the developer daemon as the default way to build, run, and validate. Two properties are the whole reason it exists — and the reason to reach for it instead of a bare `swift build` / `swift test`:
+Prefer the developer daemon as the default way to build, run, and validate. Four properties are the whole reason it exists — and the reason to reach for it instead of a bare `swift build` / `swift test`:
 
 - **Lane-serialized job queue** — every job claims named lanes (`build`, `debugArtifact`, `liveApp`, `release`, `style`); the daemon runs jobs that share a lane one at a time while letting unrelated lanes proceed concurrently. That serial queue is what stops multiple agents from building, launching, or running style tooling over each other and corrupting `.build` or the live app.
-- **Machine-wide heavy-job slot** — Swift/Xcode-heavy daemon jobs also acquire a per-user global heavy slot before spawning their subprocess. This coordinates expensive work across worktree-local conductor daemons. If `job status` or `job wait` shows `global-wait` or "waiting for global heavy slot", another checkout/worktree is already running heavy work; wait on the ticket instead of bypassing conductor with direct `swift`/`xcodebuild` commands or starting duplicate jobs.
+- **Machine-wide heavy-job slots** — Swift/Xcode-heavy daemon jobs acquire per-user global heavy admission under `/tmp/repoprompt-ce-dev-locks-<uid>/`, independent of daemon socket overrides. The default capacity is 1; set `REPOPROMPT_DEV_HEAVY_SLOTS=N` explicitly to allow more concurrent heavy jobs. If `job status` or `job wait` shows `global-wait` or "waiting for global heavy slot", another checkout/worktree is already running heavy work; wait on the ticket instead of bypassing conductor with direct `swift`/`xcodebuild` commands or starting duplicate jobs. Holder metadata is display-only and identifies the operation/ticket/repo/worktree when available.
+- **Machine-wide live-app lock** — debug app stop/launch/relaunch/smoke-launch lifecycle work acquires a separate per-user `live-app.lock`, so worktree-local daemons cannot mutate the singleton debug app at the same time.
 - **Tickets + async jobs** — every job gets a ticket and can run detached (`--async`). Fire a build, keep working, and query or wait on it later (`job status` / `job wait`) instead of blocking on a long compile. Jobs survive reconnects and are reusable by `--request-key`.
 
 `conductor` is repo-internal developer tooling for this checkout; the daemon auto-starts on first use.
@@ -159,6 +160,7 @@ make dev-status
 make dev-build
 make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRODUCT=RepoPrompt|repoprompt-mcp|all, default all)
 make dev-run
+make dev-launch-existing                         # launch current DebugApps bundle without building
 make dev-test                                       # full coordinated test suite
 make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
 make dev-test-list                                  # coordinated authoritative root XCTest method list
@@ -191,7 +193,8 @@ Daemon output defaults are intentionally concise for agent use: synchronous `dev
 
 Behavior notes:
 
-- `make dev-run` (daemon `run`) still delegates to the debug launch flow and stops only the running process whose resolved executable matches the target CE debug app, same as `make run`; it remains FIFO and does not supersede older lifecycle work.
+- `make dev-run` (daemon `run`) builds/packages a unique staged app under heavy admission, releases that heavy slot, then takes the live-app lock for stop/staged-bundle activation/open/confirm against the shared `DebugApps/RepoPrompt.app` bundle. A build/package failure performs no lifecycle action and does not mutate the live bundle.
+- `./conductor app launch-existing` / `make dev-launch-existing` requires the shared debug app bundle to already exist, reports bundle provenance, never waits for heavy admission, and never falls back to building.
 - `./conductor app relaunch` is the overriding interactive relaunch used by the Finder launcher; like `app stop`, it can cancel older active or queued `liveApp` work. It builds/packages before replacing the visible app, so a failure before lifecycle work begins does not itself stop or reopen an already-running app.
 - Do not assume an in-flight `run`, `smoke`, or diagnostics job will complete if another operator issues `app stop` or interactive `app relaunch`.
 - `make dev-smoke` is the non-disruptive live-only check: it assumes the CE debug app is already running and the debug CLI is installed/resolvable.

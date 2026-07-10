@@ -133,7 +133,8 @@ class LifecycleSurfaceTests(unittest.TestCase):
         for source in [run_script, conductor_script, finder_launcher]:
             self.assertNotIn("pgrep -x RepoPrompt", source)
             self.assertNotIn("pkill -x RepoPrompt", source)
-        self.assertIn('python3 "$PROCESS_HELPER" list --executable "$APP_EXECUTABLE"', run_script)
+        self.assertIn('exec python3 -u "$ROOT_DIR/Scripts/conductor.py" __operation_runner "$PAYLOAD"', run_script)
+        self.assertIn('"kind": "debug_app_build_then_launch"', run_script)
         self.assertIn("terminate_matching_processes(debug_app_executable_path())", conductor_script)
         self.assertIn("safe coordinated launcher requires Python 3", finder_launcher)
         self.assertIn("No uncoordinated fallback is provided", finder_launcher)
