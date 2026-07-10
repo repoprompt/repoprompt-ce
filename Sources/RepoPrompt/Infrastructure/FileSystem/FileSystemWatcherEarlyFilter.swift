@@ -90,7 +90,10 @@ final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
         lock.unlock()
 
         return Result(
-            payload: retainedEntries.isEmpty ? nil : FSEventCallbackPayload(entries: retainedEntries),
+            payload: retainedEntries.isEmpty ? nil : FSEventCallbackPayload(
+                entries: retainedEntries,
+                ingressEvidence: payload.ingressEvidence
+            ),
             filteredEntryCount: filteredCount
         )
     }

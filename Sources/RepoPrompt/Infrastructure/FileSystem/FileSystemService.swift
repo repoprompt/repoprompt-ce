@@ -41,6 +41,7 @@ actor FileSystemService {
     nonisolated let diagnosticRootToken = UUID()
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     nonisolated let watcherEarlyFilter: FileSystemWatcherEarlyFilter
+    nonisolated let watcherRecoveryDiagnostics = FileSystemWatcherRecoveryDiagnostics()
     static let maxPendingRawEvents = 50000
     static let overflowRescanEventFlags = FSEventStreamEventFlags(
         kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
@@ -225,6 +226,8 @@ actor FileSystemService {
         var freshnessWatcherBatchEventCount = 0
         var freshnessLastWatcherBatchSize = 0
         var freshnessMaxWatcherBatchSize = 0
+        var fullResyncFailuresRemainingForTesting = 0
+        var fullResyncWillStartHandlerForTesting: (@Sendable () async -> Void)?
     #endif
 
     /// Retained FSEvent callback context. The context holds the service weakly so an
@@ -274,6 +277,7 @@ actor FileSystemService {
     var pendingFSEvents: [PendingFSEvent] = []
     var pendingWatcherAcceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark?
     var pendingWatcherPublicationSource: FileSystemDeltaPublicationSource = .watcher
+    var pendingWatcherIngressEvidence = FileSystemWatcherIngressEvidence.empty
     var hasPendingOverflowRescan = false
     var overflowChangedIgnoreDirs: Set<String> = []
     var coalescingTask: Task<Void, Never>?
@@ -296,6 +300,8 @@ actor FileSystemService {
     var dirtyRecoveryScanTargets: Set<String> = []
     var recoveryScanFailureCountByFolder: [String: Int] = [:]
     var recoveryScanRetryTask: Task<Void, Never>?
+    var requiresRecoveryFullResync = false
+    var pendingRecoveryIngressEvidence = FileSystemWatcherIngressEvidence.empty
 
     /// Short-lived cache
     /// results during a directory walk to avoid repeated allocations.
