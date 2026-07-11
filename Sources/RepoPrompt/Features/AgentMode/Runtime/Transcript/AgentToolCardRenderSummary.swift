@@ -49,9 +49,15 @@ struct AgentToolCardRenderSummary: Codable, Equatable {
             "title": title,
             "status": status.rawValue
         ]
-        if let subtitle { object["subtitle"] = subtitle }
-        if let detailText { object["detail_text"] = detailText }
-        if let op { object["op"] = op }
+        if let subtitle {
+            object["subtitle"] = subtitle
+        }
+        if let detailText {
+            object["detail_text"] = detailText
+        }
+        if let op {
+            object["op"] = op
+        }
         return object
     }
 
@@ -121,7 +127,9 @@ struct AgentToolCardRenderSummary: Codable, Equatable {
         switch toolName {
         case "read_file":
             guard detailText == nil, let subtitle else { return false }
-            if subtitle == "file" || subtitle.contains(" • Lines ") { return true }
+            if subtitle == "file" || subtitle.contains(" • Lines ") {
+                return true
+            }
             let ext = (subtitle as NSString).pathExtension
             return !ext.isEmpty && !subtitle.contains("/") && !subtitle.contains("\\")
         case "manage_selection":
@@ -135,7 +143,9 @@ struct AgentToolCardRenderSummary: Codable, Equatable {
             if let detailText {
                 let allowedLabels = Set(["prompt", "selection", "file tree", "code structure", "file blocks", "copy preset", "presets"])
                 for part in detailText.components(separatedBy: " • ") {
-                    if part.hasPrefix("+"), part.hasSuffix(" more") { continue }
+                    if part.hasPrefix("+"), part.hasSuffix(" more") {
+                        continue
+                    }
                     guard allowedLabels.contains(part) else { return false }
                 }
             }
@@ -205,7 +215,9 @@ struct AgentToolCardRenderSummary: Codable, Equatable {
 
     private static func smallSummaryString(_ value: String?) -> String? {
         guard let value = trimmed(value) else { return nil }
-        if value.count <= 240 { return value }
+        if value.count <= 240 {
+            return value
+        }
         let prefix = value.prefix(237).trimmingCharacters(in: .whitespacesAndNewlines)
         return prefix.isEmpty ? nil : prefix + "…"
     }
@@ -271,8 +283,12 @@ enum AgentToolCardRenderSummaryBuilder {
     static func stringValue(_ object: [String: Any]?, keys: [String]) -> String? {
         guard let object else { return nil }
         for key in keys {
-            if let value = object[key] as? String { return value }
-            if let value = object[key] as? NSNumber { return value.stringValue }
+            if let value = object[key] as? String {
+                return value
+            }
+            if let value = object[key] as? NSNumber {
+                return value.stringValue
+            }
         }
         return nil
     }
@@ -280,8 +296,12 @@ enum AgentToolCardRenderSummaryBuilder {
     static func intValue(_ object: [String: Any]?, keys: [String]) -> Int? {
         guard let object else { return nil }
         for key in keys {
-            if let value = object[key] as? Int { return value }
-            if let value = object[key] as? NSNumber { return value.intValue }
+            if let value = object[key] as? Int {
+                return value
+            }
+            if let value = object[key] as? NSNumber {
+                return value.intValue
+            }
             if let value = object[key] as? String,
                let intValue = Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
             {
@@ -294,8 +314,12 @@ enum AgentToolCardRenderSummaryBuilder {
     static func boolValue(_ object: [String: Any]?, keys: [String]) -> Bool? {
         guard let object else { return nil }
         for key in keys {
-            if let value = object[key] as? Bool { return value }
-            if let value = object[key] as? NSNumber { return value.boolValue }
+            if let value = object[key] as? Bool {
+                return value
+            }
+            if let value = object[key] as? NSNumber {
+                return value.boolValue
+            }
         }
         return nil
     }
@@ -303,7 +327,9 @@ enum AgentToolCardRenderSummaryBuilder {
     static func arrayValue(_ object: [String: Any]?, keys: [String]) -> [Any]? {
         guard let object else { return nil }
         for key in keys {
-            if let value = object[key] as? [Any] { return value }
+            if let value = object[key] as? [Any] {
+                return value
+            }
         }
         return nil
     }
@@ -311,7 +337,9 @@ enum AgentToolCardRenderSummaryBuilder {
     static func objectValue(_ object: [String: Any]?, keys: [String]) -> [String: Any]? {
         guard let object else { return nil }
         for key in keys {
-            if let value = object[key] as? [String: Any] { return value }
+            if let value = object[key] as? [String: Any] {
+                return value
+            }
         }
         return nil
     }
@@ -362,11 +390,20 @@ enum AgentToolCardRenderSummaryBuilder {
         }
         let renderStatus: AgentToolCardRenderStatus = {
             let baseStatus = status(from: statusWord, defaultStatus: .neutral)
-            if baseStatus == .failure { return .failure }
-            if trimmed(stringValue(rawObject, keys: ["error"])) != nil { return .failure }
+            if baseStatus == .failure {
+                return .failure
+            }
+            if trimmed(stringValue(rawObject, keys: ["error"])) != nil {
+                return .failure
+            }
             if boolValue(rawObject, keys: ["limit_hit", "limitHit"]) == true
-                || boolValue(rawObject, keys: ["size_limit_hit", "sizeLimitHit"]) == true { return .warning }
-            if (intValue(rawObject, keys: ["total_matches", "totalMatches"]) ?? 0) > 0 { return .success }
+                || boolValue(rawObject, keys: ["size_limit_hit", "sizeLimitHit"]) == true
+            {
+                return .warning
+            }
+            if (intValue(rawObject, keys: ["total_matches", "totalMatches"]) ?? 0) > 0 {
+                return .success
+            }
             return baseStatus
         }()
         return AgentToolCardRenderSummary(
@@ -407,9 +444,15 @@ enum AgentToolCardRenderSummaryBuilder {
             nil
         }
         let renderStatus: AgentToolCardRenderStatus = {
-            if errorDetail != nil, baseStatus != .success { return .failure }
-            if baseStatus == .failure || baseStatus == .warning || baseStatus == .running { return baseStatus }
-            if detailText != nil { return .success }
+            if errorDetail != nil, baseStatus != .success {
+                return .failure
+            }
+            if baseStatus == .failure || baseStatus == .warning || baseStatus == .running {
+                return baseStatus
+            }
+            if detailText != nil {
+                return .success
+            }
             return baseStatus
         }()
         return AgentToolCardRenderSummary(
@@ -431,8 +474,12 @@ enum AgentToolCardRenderSummaryBuilder {
         let errorDetail = webSearchErrorDetail(rawObject)
         let countSummary: String? = {
             var parts: [String] = []
-            if let resultCount { parts.append("\(resultCount) result\(resultCount == 1 ? "" : "s")") }
-            if let sourceCount { parts.append("\(sourceCount) source\(sourceCount == 1 ? "" : "s")") }
+            if let resultCount {
+                parts.append("\(resultCount) result\(resultCount == 1 ? "" : "s")")
+            }
+            if let sourceCount {
+                parts.append("\(sourceCount) source\(sourceCount == 1 ? "" : "s")")
+            }
             return parts.isEmpty ? nil : parts.joined(separator: " • ")
         }()
         let subtitle = [query.map { "\"\($0)\"" }, countSummary]
@@ -441,10 +488,18 @@ enum AgentToolCardRenderSummaryBuilder {
         let baseStatus = status(from: stringValue(rawObject, keys: ["status", "state", "outcome"]) ?? statusWord, defaultStatus: .neutral)
         let resultDetail = webSearchDetailText(rawObject)
         let renderStatus: AgentToolCardRenderStatus = {
-            if errorDetail != nil, baseStatus != .success { return .failure }
-            if baseStatus == .failure || baseStatus == .warning || baseStatus == .running { return baseStatus }
-            if (resultCount ?? 0) > 0 || (sourceCount ?? 0) > 0 { return .success }
-            if resultDetail != nil { return .success }
+            if errorDetail != nil, baseStatus != .success {
+                return .failure
+            }
+            if baseStatus == .failure || baseStatus == .warning || baseStatus == .running {
+                return baseStatus
+            }
+            if (resultCount ?? 0) > 0 || (sourceCount ?? 0) > 0 {
+                return .success
+            }
+            if resultDetail != nil {
+                return .success
+            }
             return baseStatus
         }()
         let detailText = baseStatus == .success ? (resultDetail ?? errorDetail) : (errorDetail ?? resultDetail)
@@ -547,13 +602,27 @@ enum AgentToolCardRenderSummaryBuilder {
             summaryParts.append("\(total) tokens")
         }
         var sections: [String] = []
-        if trimmed(stringValue(rawObject, keys: ["prompt"])) != nil { sections.append("prompt") }
-        if rawObject["selection"] != nil { sections.append("selection") }
-        if rawObject["file_tree"] != nil || rawObject["fileTree"] != nil { sections.append("file tree") }
-        if hasNestedCodeStructureObject(rawObject) { sections.append("code structure") }
-        if let fileBlocks = arrayValue(rawObject, keys: ["file_blocks", "fileBlocks"]), !fileBlocks.isEmpty { sections.append("file blocks") }
-        if rawObject["copy_preset"] != nil || rawObject["copyPreset"] != nil { sections.append("copy preset") }
-        if let copyPresets = rawObject["copy_presets"] as? [Any], !copyPresets.isEmpty { sections.append("presets") }
+        if trimmed(stringValue(rawObject, keys: ["prompt"])) != nil {
+            sections.append("prompt")
+        }
+        if rawObject["selection"] != nil {
+            sections.append("selection")
+        }
+        if rawObject["file_tree"] != nil || rawObject["fileTree"] != nil {
+            sections.append("file tree")
+        }
+        if hasNestedCodeStructureObject(rawObject) {
+            sections.append("code structure")
+        }
+        if let fileBlocks = arrayValue(rawObject, keys: ["file_blocks", "fileBlocks"]), !fileBlocks.isEmpty {
+            sections.append("file blocks")
+        }
+        if rawObject["copy_preset"] != nil || rawObject["copyPreset"] != nil {
+            sections.append("copy preset")
+        }
+        if let copyPresets = rawObject["copy_presets"] as? [Any], !copyPresets.isEmpty {
+            sections.append("presets")
+        }
         let detailText: String? = {
             guard !sections.isEmpty else { return nil }
             let visible = Array(sections.prefix(3))
@@ -601,10 +670,18 @@ enum AgentToolCardRenderSummaryBuilder {
         let detailText = codeStructureUnmappedDetail(paths: unmappedPaths, unmappedCount: unmappedCount)
         let baseStatus = status(from: statusWord, defaultStatus: .neutral)
         let renderStatus: AgentToolCardRenderStatus = {
-            if baseStatus == .failure { return .failure }
-            if totalOmitted > 0 || boolValue(codeObject, keys: ["token_budget_hit", "tokenBudgetHit"]) == true { return .warning }
-            if (fileCount ?? 0) > 0 { return .success }
-            if fileCount != nil { return .neutral }
+            if baseStatus == .failure {
+                return .failure
+            }
+            if totalOmitted > 0 || boolValue(codeObject, keys: ["token_budget_hit", "tokenBudgetHit"]) == true {
+                return .warning
+            }
+            if (fileCount ?? 0) > 0 {
+                return .success
+            }
+            if fileCount != nil {
+                return .neutral
+            }
             return baseStatus
         }()
         return AgentToolCardRenderSummary(
@@ -627,16 +704,26 @@ enum AgentToolCardRenderSummaryBuilder {
         let wasTruncated = boolValue(rawObject, keys: ["was_truncated", "wasTruncated"]) == true
         let subtitle: String = {
             if note != nil {
-                if treeType == "roots" { return "File tree unavailable" }
+                if treeType == "roots" {
+                    return "File tree unavailable"
+                }
                 return fileTreeFilesSubtitle(mode: mode, startPath: startPath, rootsCount: startPath == nil ? rootsCount : nil) ?? "File tree unavailable"
             }
-            if treeType == "roots" { return rootCountText(rootsCount) }
+            if treeType == "roots" {
+                return rootCountText(rootsCount)
+            }
             return fileTreeFilesSubtitle(mode: mode, startPath: startPath, rootsCount: startPath == nil ? rootsCount : nil) ?? "File tree"
         }()
         let renderStatus: AgentToolCardRenderStatus = {
-            if status(from: statusWord, defaultStatus: .neutral) == .failure { return .failure }
-            if note != nil || wasTruncated { return .warning }
-            if trimmed(stringValue(rawObject, keys: ["tree"])) != nil { return .success }
+            if status(from: statusWord, defaultStatus: .neutral) == .failure {
+                return .failure
+            }
+            if note != nil || wasTruncated {
+                return .warning
+            }
+            if trimmed(stringValue(rawObject, keys: ["tree"])) != nil {
+                return .success
+            }
             return status(from: statusWord, defaultStatus: .neutral)
         }()
         return AgentToolCardRenderSummary(
@@ -677,7 +764,9 @@ enum AgentToolCardRenderSummaryBuilder {
             detailText = gitDiffDetailText(rawObject: rawObject, argsObject: argsObject)
         }
         let renderStatus: AgentToolCardRenderStatus = {
-            if trimmed(stringValue(rawObject, keys: ["error"])) != nil { return .failure }
+            if trimmed(stringValue(rawObject, keys: ["error"])) != nil {
+                return .failure
+            }
             if trimmed(stringValue(rawObject, keys: ["empty_reason", "emptyReason", "warning"])) != nil
                 || boolValue(rawObject?["diff"] as? [String: Any], keys: ["truncated"]) == true
                 || boolValue(rawObject?["inline"] as? [String: Any], keys: ["truncated"]) == true
@@ -727,7 +816,9 @@ enum AgentToolCardRenderSummaryBuilder {
         }
         for arrayKey in ["results", "items", "web_results", "webResults", "search_results", "searchResults"] {
             guard let first = arrayValue(object, keys: [arrayKey])?.first else { continue }
-            if let text = webSearchDetailText(fromResult: first) { return text }
+            if let text = webSearchDetailText(fromResult: first) {
+                return text
+            }
         }
         if let nested = objectValue(object, keys: ["result", "output", "response", "content", "data", "payload"]),
            let text = webSearchDetailText(nested)
@@ -736,13 +827,17 @@ enum AgentToolCardRenderSummaryBuilder {
         }
         for arrayKey in ["sources", "citations"] {
             guard let first = arrayValue(object, keys: [arrayKey])?.first else { continue }
-            if let text = webSearchDetailText(fromResult: first) { return text }
+            if let text = webSearchDetailText(fromResult: first) {
+                return text
+            }
         }
         return nil
     }
 
     private static func webSearchDetailText(fromResult value: Any) -> String? {
-        if let text = value as? String { return safeCollapsedText(text) }
+        if let text = value as? String {
+            return safeCollapsedText(text)
+        }
         guard let object = value as? [String: Any] else { return nil }
         let title = safeCollapsedText(stringValue(object, keys: ["title", "name", "source", "url"]))
         let snippet = safeCollapsedText(stringValue(object, keys: ["snippet", "summary", "text", "description", "content"]))
@@ -751,7 +846,9 @@ enum AgentToolCardRenderSummaryBuilder {
 
     private static func webSearchErrorDetail(_ object: [String: Any]?) -> String? {
         guard let object else { return nil }
-        if let error = object["error"] as? String { return safeCollapsedText(error) }
+        if let error = object["error"] as? String {
+            return safeCollapsedText(error)
+        }
         if let errorMessage = trimmed(stringValue(object, keys: ["error_message", "errorMessage"])) {
             return safeCollapsedText(errorMessage)
         }
@@ -759,7 +856,9 @@ enum AgentToolCardRenderSummaryBuilder {
             return safeCollapsedText(stringValue(error, keys: ["message", "detail", "description", "code"]))
         }
         if let errors = object["errors"] as? [Any], let first = errors.first {
-            if let text = first as? String { return safeCollapsedText(text) }
+            if let text = first as? String {
+                return safeCollapsedText(text)
+            }
             if let error = first as? [String: Any] {
                 return safeCollapsedText(stringValue(error, keys: ["message", "detail", "description", "code"]))
             }
@@ -776,7 +875,9 @@ enum AgentToolCardRenderSummaryBuilder {
     private static func firstNestedSearchResultCount(_ object: [String: Any]?) -> Int? {
         for key in ["result", "output", "response", "content", "data", "payload"] {
             guard let nested = objectValue(object, keys: [key]) else { continue }
-            if let count = firstSearchResultCount(nested) { return count }
+            if let count = firstSearchResultCount(nested) {
+                return count
+            }
         }
         return nil
     }
@@ -793,14 +894,18 @@ enum AgentToolCardRenderSummaryBuilder {
     private static func firstNestedSearchSourceCount(_ object: [String: Any]?) -> Int? {
         for key in ["result", "output", "response", "content", "data", "payload"] {
             guard let nested = objectValue(object, keys: [key]) else { continue }
-            if let count = firstSearchSourceCount(nested) { return count }
+            if let count = firstSearchSourceCount(nested) {
+                return count
+            }
         }
         return nil
     }
 
     private static func firstArrayCount(_ object: [String: Any]?, keys: [String]) -> Int? {
         for key in keys {
-            if let count = arrayValue(object, keys: [key])?.count { return count }
+            if let count = arrayValue(object, keys: [key])?.count {
+                return count
+            }
         }
         return nil
     }
@@ -825,7 +930,9 @@ enum AgentToolCardRenderSummaryBuilder {
 
     private static func smallSummaryString(_ value: String?) -> String? {
         guard let value = trimmed(value) else { return nil }
-        if value.count <= 240 { return value }
+        if value.count <= 240 {
+            return value
+        }
         let prefix = value.prefix(237).trimmingCharacters(in: .whitespacesAndNewlines)
         return prefix.isEmpty ? nil : prefix + "…"
     }
@@ -833,7 +940,9 @@ enum AgentToolCardRenderSummaryBuilder {
     private static func nativeScalarSummary(object: [String: Any]?, preferredKeys: [String]) -> String? {
         guard let object else { return nil }
         for key in preferredKeys {
-            if let value = safeNativeScalar(object[key]) { return value }
+            if let value = safeNativeScalar(object[key]) {
+                return value
+            }
         }
         return nil
     }
@@ -946,7 +1055,9 @@ enum AgentToolCardRenderSummaryBuilder {
     }
 
     private static func normalizedTreeType(rawObject: [String: Any]?, argsObject: [String: Any]?) -> String {
-        if let raw = trimmed(stringValue(argsObject, keys: ["type"]))?.lowercased() { return raw }
+        if let raw = trimmed(stringValue(argsObject, keys: ["type"]))?.lowercased() {
+            return raw
+        }
         if stringValue(argsObject, keys: ["mode"]) != nil
             || stringValue(argsObject, keys: ["path"]) != nil
             || intValue(argsObject, keys: ["max_depth", "maxDepth"]) != nil
@@ -967,8 +1078,12 @@ enum AgentToolCardRenderSummaryBuilder {
 
     private static func selectedCodeStructureObject(_ object: [String: Any]?) -> [String: Any]? {
         guard let object else { return nil }
-        if let codeStructure = object["code_structure"] as? [String: Any] { return codeStructure }
-        if let codeStructure = object["codeStructure"] as? [String: Any] { return codeStructure }
+        if let codeStructure = object["code_structure"] as? [String: Any] {
+            return codeStructure
+        }
+        if let codeStructure = object["codeStructure"] as? [String: Any] {
+            return codeStructure
+        }
         if intValue(object, keys: ["file_count", "fileCount"]) != nil
             || object["content"] != nil
             || object["unmapped_paths"] != nil
@@ -1002,7 +1117,9 @@ enum AgentToolCardRenderSummaryBuilder {
 
     private static func stringArrayValue(_ object: [String: Any]?, keys: [String]) -> [String] {
         arrayValue(object, keys: keys)?.compactMap { element in
-            if let string = element as? String { return trimmed(string) }
+            if let string = element as? String {
+                return trimmed(string)
+            }
             return nil
         } ?? []
     }
@@ -1029,7 +1146,9 @@ enum AgentToolCardRenderSummaryBuilder {
         if let ahead, let behind, ahead > 0 || behind > 0 {
             parts.append("+\(ahead) -\(behind)")
         }
-        if let upstream = trimmed(stringValue(status, keys: ["upstream"])) { parts.append(upstream) }
+        if let upstream = trimmed(stringValue(status, keys: ["upstream"])) {
+            parts.append(upstream)
+        }
         appendArrayCountSummary(&parts, object: status, key: "staged", label: "staged")
         appendArrayCountSummary(&parts, object: status, key: "modified", label: "modified")
         appendArrayCountSummary(&parts, object: status, key: "untracked", label: "untracked")
@@ -1041,10 +1160,18 @@ enum AgentToolCardRenderSummaryBuilder {
         let diff = rawObject?["diff"] as? [String: Any]
         let worktree = rawObject?["worktree"] as? [String: Any]
         var parts: [String] = []
-        if let compare = trimmed(stringValue(inputs, keys: ["compare"]) ?? stringValue(argsObject, keys: ["compare"])) { parts.append(compare) }
-        if let scope = trimmed(stringValue(inputs, keys: ["scope"])) { parts.append(scope) }
-        if let detail = trimmed(stringValue(diff, keys: ["detail"]) ?? stringValue(argsObject, keys: ["detail"])) { parts.append(detail) }
-        if parts.count < 3, let branch = trimmed(stringValue(worktree, keys: ["worktree_branch", "worktreeBranch"])) { parts.append(branch) }
+        if let compare = trimmed(stringValue(inputs, keys: ["compare"]) ?? stringValue(argsObject, keys: ["compare"])) {
+            parts.append(compare)
+        }
+        if let scope = trimmed(stringValue(inputs, keys: ["scope"])) {
+            parts.append(scope)
+        }
+        if let detail = trimmed(stringValue(diff, keys: ["detail"]) ?? stringValue(argsObject, keys: ["detail"])) {
+            parts.append(detail)
+        }
+        if parts.count < 3, let branch = trimmed(stringValue(worktree, keys: ["worktree_branch", "worktreeBranch"])) {
+            parts.append(branch)
+        }
         return parts.isEmpty ? nil : parts.joined(separator: " • ")
     }
 
@@ -1087,8 +1214,12 @@ enum AgentToolCardRenderSummaryBuilder {
               let first = commits.first
         else { return nil }
         var parts: [String] = []
-        if let shortSHA = trimmed(stringValue(first, keys: ["short_sha", "shortSha"])) { parts.append("latest \(shortSHA)") }
-        if let author = trimmed(stringValue(first, keys: ["author"])) { parts.append(author) }
+        if let shortSHA = trimmed(stringValue(first, keys: ["short_sha", "shortSha"])) {
+            parts.append("latest \(shortSHA)")
+        }
+        if let author = trimmed(stringValue(first, keys: ["author"])) {
+            parts.append(author)
+        }
         if commits.count == 1,
            let totals = gitTotalsSummaryText(object: [
                "files": intValue(first, keys: ["files_changed", "filesChanged"]) ?? 0,
@@ -1109,14 +1240,20 @@ enum AgentToolCardRenderSummaryBuilder {
     private static func gitShowDetailText(rawObject: [String: Any]?) -> String? {
         guard let show = rawObject?["show"] as? [String: Any] else { return nil }
         var parts: [String] = []
-        if let message = trimmed(stringValue(show, keys: ["message"])) { parts.append(shortenedGitMessage(message)) }
-        if let totals = gitTotalsSummaryText(object: show["totals"] as? [String: Any]) { parts.append(totals) }
+        if let message = trimmed(stringValue(show, keys: ["message"])) {
+            parts.append(shortenedGitMessage(message))
+        }
+        if let totals = gitTotalsSummaryText(object: show["totals"] as? [String: Any]) {
+            parts.append(totals)
+        }
         return parts.isEmpty ? nil : parts.joined(separator: " • ")
     }
 
     private static func gitBlameSummary(rawObject: [String: Any]?) -> String? {
         guard let blame = rawObject?["blame"] as? [String: Any] else { return nil }
-        if let lines = blame["lines"] as? [Any] { return "\(lines.count) lines" }
+        if let lines = blame["lines"] as? [Any] {
+            return "\(lines.count) lines"
+        }
         return nil
     }
 
@@ -1149,13 +1286,17 @@ enum AgentToolCardRenderSummaryBuilder {
               !value.contains("+++"),
               !value.contains("---")
         else { return nil }
-        if lowered == "no changes" { return value }
+        if lowered == "no changes" {
+            return value
+        }
         let range = NSRange(value.startIndex ..< value.endIndex, in: value)
         return safeGitDiffOnelinerRegex.firstMatch(in: value, range: range) != nil ? value : nil
     }
 
     private static func shortenedGitMessage(_ message: String) -> String {
-        if message.count <= 48 { return message }
+        if message.count <= 48 {
+            return message
+        }
         return String(message.prefix(45)) + "…"
     }
 }

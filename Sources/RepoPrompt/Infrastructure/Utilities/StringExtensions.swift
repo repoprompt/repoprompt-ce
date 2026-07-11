@@ -885,8 +885,12 @@ public extension String {
     }
 
     internal func isFuzzyMatch(to other: String, threshold: Double = 0.65) -> Bool {
-        if range(of: other, options: .caseInsensitive) != nil { return true }
-        if abs(count - other.count) > 6 { return false }
+        if range(of: other, options: .caseInsensitive) != nil {
+            return true
+        }
+        if abs(count - other.count) > 6 {
+            return false
+        }
         return diceCoefficientFast(self, other) >= threshold
     }
 
@@ -1025,7 +1029,9 @@ public extension String {
         replaceRaw: String? = nil
     ) -> Bool {
         let ext = (path as NSString).pathExtension.lowercased()
-        if latexLikeExtensions.contains(ext) { return false }
+        if latexLikeExtensions.contains(ext) {
+            return false
+        }
 
         func hasLaTeXMarkers(_ s: String) -> Bool {
             s.contains("\\documentclass")
@@ -1034,8 +1040,12 @@ public extension String {
                 || s.contains("\\end{")
         }
 
-        if let s = searchRaw, hasLaTeXMarkers(s) { return false }
-        if let r = replaceRaw, hasLaTeXMarkers(r) { return false }
+        if let s = searchRaw, hasLaTeXMarkers(s) {
+            return false
+        }
+        if let r = replaceRaw, hasLaTeXMarkers(r) {
+            return false
+        }
 
         return true
     }

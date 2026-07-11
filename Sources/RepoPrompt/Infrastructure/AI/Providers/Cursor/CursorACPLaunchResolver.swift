@@ -251,7 +251,9 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         do {
             identity = try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: entryPath)
         } catch {
-            if preserveValidationError { throw error }
+            if preserveValidationError {
+                throw error
+            }
             throw CursorACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
 

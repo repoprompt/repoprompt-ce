@@ -1150,7 +1150,9 @@ public actor UnixSocketMCPTransport: Transport {
             let result = poll(&pfd, 1, pollTimeout)
 
             if result < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 let err = errno
                 let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
                 closeAfterSendFailure(error, cause: .writeFailure, errno: err)

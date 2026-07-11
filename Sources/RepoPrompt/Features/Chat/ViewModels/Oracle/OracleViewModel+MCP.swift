@@ -443,9 +443,15 @@ extension OracleViewModel {
         guard isSupported else {
             // Build list of supported modes
             var supportedModesList: [String] = []
-            if supportedModes.chat { supportedModesList.append("chat") }
-            if supportedModes.plan { supportedModesList.append("plan") }
-            if supportedModes.review { supportedModesList.append("review") }
+            if supportedModes.chat {
+                supportedModesList.append("chat")
+            }
+            if supportedModes.plan {
+                supportedModesList.append("plan")
+            }
+            if supportedModes.review {
+                supportedModesList.append("review")
+            }
 
             let supportedModesStr = supportedModesList.isEmpty ?
                 "no modes" :
@@ -783,13 +789,19 @@ extension OracleViewModel {
                 return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
             }
             guard let agentModeRunID else { return 0 }
-            if session.agentModeRunID == agentModeRunID { return 0 }
-            if session.agentModeRunID == nil, allowUnownedLegacy { return 1 }
+            if session.agentModeRunID == agentModeRunID {
+                return 0
+            }
+            if session.agentModeRunID == nil, allowUnownedLegacy {
+                return 1
+            }
             return nil
         }
 
         if let agentModeRunID {
-            if session.agentModeRunID == agentModeRunID { return 0 }
+            if session.agentModeRunID == agentModeRunID {
+                return 0
+            }
             return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
         }
 

@@ -125,8 +125,12 @@ actor GitBlobCodeMapLocatorStore {
         let name = identity.storageDigestHex
         let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
-            if errno == ENOENT { return .miss }
-            if errno == ELOOP { throw GitBlobCodeMapLocatorStoreError.insecureLeaf }
+            if errno == ENOENT {
+                return .miss
+            }
+            if errno == ELOOP {
+                throw GitBlobCodeMapLocatorStoreError.insecureLeaf
+            }
             throw Self.ioError("record-open")
         }
         defer { Darwin.close(descriptor) }
@@ -280,7 +284,9 @@ actor GitBlobCodeMapLocatorStore {
                 O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
             )
             guard existingDescriptor >= 0 else {
-                if errno == ELOOP { throw GitBlobCodeMapLocatorStoreError.insecureLeaf }
+                if errno == ELOOP {
+                    throw GitBlobCodeMapLocatorStoreError.insecureLeaf
+                }
                 throw Self.ioError("replacement-open")
             }
             defer { Darwin.close(existingDescriptor) }
@@ -390,7 +396,9 @@ actor GitBlobCodeMapLocatorStore {
             else { continue }
             let remaining = limit - examined
             let fileListing = try Self.directoryEntryNames(shard, maximumCount: remaining + 1)
-            if fileListing.truncated { hasMore = true }
+            if fileListing.truncated {
+                hasMore = true
+            }
             for name in fileListing.names {
                 guard examined < limit else {
                     hasMore = true
@@ -478,8 +486,12 @@ actor GitBlobCodeMapLocatorStore {
     ) throws -> Bool {
         let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
-            if errno == ENOENT { return false }
-            if errno == ELOOP { throw GitBlobCodeMapLocatorStoreError.insecureLeaf }
+            if errno == ENOENT {
+                return false
+            }
+            if errno == ELOOP {
+                throw GitBlobCodeMapLocatorStoreError.insecureLeaf
+            }
             throw Self.ioError("record-open")
         }
         defer { Darwin.close(descriptor) }
@@ -529,7 +541,9 @@ actor GitBlobCodeMapLocatorStore {
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
         if descriptor < 0 {
-            if errno == ENOENT || errno == ELOOP { return .ignored }
+            if errno == ENOENT || errno == ELOOP {
+                return .ignored
+            }
             throw Self.ioError("maintenance-record-open")
         }
         defer { Darwin.close(descriptor) }
@@ -647,8 +661,12 @@ actor GitBlobCodeMapLocatorStore {
             descriptor = openat(parent.rawValue, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         }
         if descriptor < 0 {
-            if errno == ENOENT, !create { return nil }
-            if errno == ELOOP { throw GitBlobCodeMapLocatorStoreError.insecureDirectory }
+            if errno == ENOENT, !create {
+                return nil
+            }
+            if errno == ELOOP {
+                throw GitBlobCodeMapLocatorStoreError.insecureDirectory
+            }
             throw ioError("directory-open")
         }
         do {
@@ -773,7 +791,9 @@ actor GitBlobCodeMapLocatorStore {
         }
         var pathStatus = stat()
         guard fstatat(parent.rawValue, name, &pathStatus, AT_SYMLINK_NOFOLLOW) == 0 else {
-            if errno == ENOENT { return .missing }
+            if errno == ENOENT {
+                return .missing
+            }
             throw ioError("record-path-stat")
         }
         let pathIdentity = GitBlobLocatorFileIdentity(pathStatus)
@@ -794,7 +814,9 @@ actor GitBlobCodeMapLocatorStore {
         let descriptorIdentity = GitBlobLocatorFileIdentity(descriptorStatus)
         var pathStatus = stat()
         guard fstatat(parent.rawValue, name, &pathStatus, AT_SYMLINK_NOFOLLOW) == 0 else {
-            if errno == ENOENT { return .missing }
+            if errno == ENOENT {
+                return .missing
+            }
             throw ioError("record-path-stat")
         }
         let pathIdentity = GitBlobLocatorFileIdentity(pathStatus)
@@ -883,7 +905,9 @@ actor GitBlobCodeMapLocatorStore {
             if openError == ENOENT, !layoutIsCurrent(layout, rootURL: rootURL) {
                 throw GitBlobLocatorStaleLayoutError()
             }
-            if openError == ELOOP { throw GitBlobCodeMapLocatorStoreError.insecureLeaf }
+            if openError == ELOOP {
+                throw GitBlobCodeMapLocatorStoreError.insecureLeaf
+            }
             errno = openError
             throw ioError("maintenance-lock-open")
         }
@@ -946,7 +970,9 @@ actor GitBlobCodeMapLocatorStore {
             let name = withUnsafePointer(to: &entry.pointee.d_name) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
             }
-            if name == "." || name == ".." { continue }
+            if name == "." || name == ".." {
+                continue
+            }
             if names.count >= maximumCount {
                 truncated = true
                 break

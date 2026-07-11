@@ -136,7 +136,9 @@ struct AgentModeWorkflowsSettingsView: View {
                     VStack(spacing: 0) {
                         ForEach(Array(workflowStore.featuredWorkflows.enumerated()), id: \.element.id) { index, workflow in
                             featuredRow(workflow, index: index)
-                            if index < workflowStore.featuredWorkflows.count - 1 { Divider() }
+                            if index < workflowStore.featuredWorkflows.count - 1 {
+                                Divider()
+                            }
                         }
                     }
                 }
@@ -156,7 +158,9 @@ struct AgentModeWorkflowsSettingsView: View {
                 VStack(spacing: 0) {
                     ForEach(AgentWorkflow.displayOrder) { workflow in
                         builtInRow(workflow)
-                        if workflow.id != AgentWorkflow.displayOrder.last?.id { Divider() }
+                        if workflow.id != AgentWorkflow.displayOrder.last?.id {
+                            Divider()
+                        }
                     }
                 }
             }
@@ -182,7 +186,9 @@ struct AgentModeWorkflowsSettingsView: View {
                     VStack(spacing: 0) {
                         ForEach(Array(workflowStore.customWorkflows.enumerated()), id: \.element.id) { index, workflow in
                             customRow(workflow)
-                            if index < workflowStore.customWorkflows.count - 1 { Divider() }
+                            if index < workflowStore.customWorkflows.count - 1 {
+                                Divider()
+                            }
                         }
                     }
                 }
@@ -424,9 +430,15 @@ struct AgentModeWorkflowsSettingsView: View {
     }
 
     private func featureHelpText(isFeatured: Bool, canFeature: Bool, isEnabled: Bool) -> String {
-        if !isEnabled { return "Show this built-in workflow before featuring it." }
-        if isFeatured { return "Remove from featured workflows." }
-        if canFeature { return "Add to featured workflows." }
+        if !isEnabled {
+            return "Show this built-in workflow before featuring it."
+        }
+        if isFeatured {
+            return "Remove from featured workflows."
+        }
+        if canFeature {
+            return "Add to featured workflows."
+        }
         return "Featured workflows are limited to \(AgentWorkflowStore.maxFeaturedWorkflowCount)."
     }
 
@@ -434,7 +446,9 @@ struct AgentModeWorkflowsSettingsView: View {
         Binding(
             get: { workflowPendingDeletion != nil },
             set: { isPresented in
-                if !isPresented { workflowPendingDeletion = nil }
+                if !isPresented {
+                    workflowPendingDeletion = nil
+                }
             }
         )
     }
@@ -443,7 +457,9 @@ struct AgentModeWorkflowsSettingsView: View {
         Binding(
             get: { errorMessage != nil },
             set: { isPresented in
-                if !isPresented { errorMessage = nil }
+                if !isPresented {
+                    errorMessage = nil
+                }
             }
         )
     }

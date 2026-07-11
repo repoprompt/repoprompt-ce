@@ -180,13 +180,17 @@ actor TokenCalculationService {
         switch direction {
         case .backward:
             while cursor > utf8.startIndex {
-                if let aligned = String.Index(cursor, within: text) { return aligned }
+                if let aligned = String.Index(cursor, within: text) {
+                    return aligned
+                }
                 cursor = utf8.index(before: cursor)
             }
             return text.startIndex
         case .forward:
             while cursor < utf8.endIndex {
-                if let aligned = String.Index(cursor, within: text) { return aligned }
+                if let aligned = String.Index(cursor, within: text) {
+                    return aligned
+                }
                 cursor = utf8.index(after: cursor)
             }
             return text.endIndex
@@ -197,7 +201,9 @@ actor TokenCalculationService {
     @inline(__always)
     private static func joinWithNewlines(_ parts: [String]) -> String {
         guard !parts.isEmpty else { return "" }
-        if parts.count == 1 { return parts[0] }
+        if parts.count == 1 {
+            return parts[0]
+        }
 
         var totalBytes = 0
         for part in parts {
@@ -256,7 +262,9 @@ actor TokenCalculationService {
         let unresolvedCodemapEntries = fileEntries.filter { $0.isCodemapRequested && $0.codeMapContent == nil }
 
         let sliceAssemblies = Self.buildSliceAssemblies(for: contentEntries)
-        if Task.isCancelled { return PromptEntriesEvaluation.empty }
+        if Task.isCancelled {
+            return PromptEntriesEvaluation.empty
+        }
 
         let codeMapComposed: (content: String, fileCount: Int, tokenCount: Int) = {
             var snippets: [String] = []
@@ -304,7 +312,9 @@ actor TokenCalculationService {
 
         currentCalculationTask = Task.detached {
             let evaluation = Self.evaluatePromptEntries(snapshot.promptEntries)
-            if Task.isCancelled { return Self.defaultResult }
+            if Task.isCancelled {
+                return Self.defaultResult
+            }
 
             let fileTreeContent: String = switch snapshot.fileTree {
             case .none:
@@ -373,7 +383,9 @@ actor TokenCalculationService {
         var result: [UUID: FileViewModel.SliceAssembly] = [:]
         result.reserveCapacity(candidates.count)
         for entry in candidates {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
             guard let content = entry.loadedContent else { continue }
             result[entry.fileID] = FileViewModel.buildSliceAssembly(from: content, ranges: entry.ranges)
         }
@@ -411,7 +423,9 @@ actor TokenCalculationService {
         var codemapTokens = 0
 
         for entry in contentEntries {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
 
             let assembly = sliceAssemblies[entry.fileID]
             let renderMode: PromptEntriesEvaluation.RenderMode
@@ -452,7 +466,9 @@ actor TokenCalculationService {
         }
 
         for entry in codemapEntries {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
 
             let apiTokens = entry.availableCodeMapTokenCount
             codemapCount += 1
@@ -469,7 +485,9 @@ actor TokenCalculationService {
         }
 
         for entry in unresolvedCodemapEntries {
-            if entryResultsByFileID[entry.fileID] != nil { continue }
+            if entryResultsByFileID[entry.fileID] != nil {
+                continue
+            }
             codemapCount += 1
             entryResultsByFileID[entry.fileID] = .init(
                 fileID: entry.fileID,

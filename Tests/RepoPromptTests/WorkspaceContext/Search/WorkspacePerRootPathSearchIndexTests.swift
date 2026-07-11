@@ -547,7 +547,9 @@ import XCTest
         ) async throws {
             let deadline = Date().addingTimeInterval(timeout)
             while Date() < deadline {
-                if await service.indexedGeneration == expected { return }
+                if await service.indexedGeneration == expected {
+                    return
+                }
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
             XCTFail("Timed out waiting for indexed generation \(expected)", file: file, line: line)
@@ -562,7 +564,9 @@ import XCTest
         ) async throws {
             let deadline = Date().addingTimeInterval(timeout)
             while Date() < deadline {
-                if await service.pendingGeneration == expected { return }
+                if await service.pendingGeneration == expected {
+                    return
+                }
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
             XCTFail("Timed out waiting for pending generation \(expected)", file: file, line: line)
@@ -606,7 +610,9 @@ import XCTest
         }
 
         func waitUntilEntered() async -> UInt64? {
-            if enteredGeneration != nil { return enteredGeneration }
+            if enteredGeneration != nil {
+                return enteredGeneration
+            }
             return await withCheckedContinuation { continuation in
                 enteredWaiters.append(continuation)
             }

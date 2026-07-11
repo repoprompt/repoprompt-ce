@@ -1057,7 +1057,9 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         while Date() < deadline {
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
             let result = Darwin.poll(&descriptor, 1, 50)
-            if result < 0, errno == EINTR { continue }
+            if result < 0, errno == EINTR {
+                continue
+            }
             guard result > 0 else { continue }
 
             var byte: UInt8 = 0
@@ -1194,8 +1196,12 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
             var byte: UInt8 = 0
             let count = Darwin.recv(fd, &byte, 1, Int32(MSG_PEEK | MSG_DONTWAIT))
-            if count == 0 { return true }
-            if count < 0, errno != EAGAIN, errno != EWOULDBLOCK { return false }
+            if count == 0 {
+                return true
+            }
+            if count < 0, errno != EAGAIN, errno != EWOULDBLOCK {
+                return false
+            }
         }
         return false
     }
@@ -1221,7 +1227,9 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if await condition() { return true }
+            if await condition() {
+                return true
+            }
             try? await Task.sleep(for: .milliseconds(20))
         }
         return await condition()

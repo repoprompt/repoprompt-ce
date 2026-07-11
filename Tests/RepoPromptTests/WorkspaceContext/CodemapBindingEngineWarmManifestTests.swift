@@ -1191,11 +1191,15 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         _ = await gate.waitUntilEntered()
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/FanIn.swift", owner: secondOwner)) }
         for _ in 0 ..< 200 {
-            if await fixture.engine.accounting().activeRequestCount == 2 { break }
+            if await fixture.engine.accounting().activeRequestCount == 2 {
+                break
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         for _ in 0 ..< 200 {
-            if await runtime.coordinator.accounting().counters.joins > 0 { break }
+            if await runtime.coordinator.accounting().counters.joins > 0 {
+                break
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         let joinedCount = await runtime.coordinator.accounting().counters.joins
@@ -1244,13 +1248,27 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
             ))
         }
         for _ in 0 ..< 200 {
-            if await runtime.coordinator.accounting().counters.joins > 0 { break }
+            if await runtime.coordinator.accounting().counters.joins > 0 {
+                break
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         await gate.release()
         let results = await [first.value, second.value]
-        XCTAssertEqual(results.count(where: { if case .ready = $0 { true } else { false } }), 1)
-        XCTAssertEqual(results.count(where: { if case .alreadyReady = $0 { true } else { false } }), 1)
+        XCTAssertEqual(results.count(where: {
+            if case .ready = $0 {
+                true
+            } else {
+                false
+            }
+        }), 1)
+        XCTAssertEqual(results.count(where: {
+            if case .alreadyReady = $0 {
+                true
+            } else {
+                false
+            }
+        }), 1)
 
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.overlayReadyPublications, 1)

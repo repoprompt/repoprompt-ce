@@ -60,7 +60,9 @@ struct ModelOverridesSettingsView: View {
                 try? await Task.sleep(nanoseconds: 150_000_000)
             }
             let sections = Self.computeSections(from: models)
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
             await MainActor.run {
                 providerSections = sections
                 guard updateExpanded else { return }
@@ -260,24 +262,23 @@ private struct ModelOverrideRow: View {
         )
     }
 
+    @ViewBuilder
     private var responsesToggle: some View {
         // Only render the toggle for custom provider models
-        Group {
-            switch model {
-            case .customProvider(_, _, _), .customProviderUser:
-                LabeledToggle(
-                    label: "Use Responses-API",
-                    isOn: Binding(
-                        get: {
-                            overrides.responsesOverride(for: model.rawValue) ?? false
-                        },
-                        set: { overrides.setResponsesOverride(for: model.rawValue, value: $0) }
-                    ),
-                    fontPreset: fontPreset
-                )
-            default:
-                EmptyView()
-            }
+        switch model {
+        case .customProvider(_, _, _), .customProviderUser:
+            LabeledToggle(
+                label: "Use Responses-API",
+                isOn: Binding(
+                    get: {
+                        overrides.responsesOverride(for: model.rawValue) ?? false
+                    },
+                    set: { overrides.setResponsesOverride(for: model.rawValue, value: $0) }
+                ),
+                fontPreset: fontPreset
+            )
+        default:
+            EmptyView()
         }
     }
 

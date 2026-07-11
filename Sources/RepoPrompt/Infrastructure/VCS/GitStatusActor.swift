@@ -587,7 +587,9 @@ actor GitStatusActor {
         pollingTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    break
+                }
 
                 guard inclusionMode != .none else { break }
                 _ = await refresh(trigger: .backgroundPoll)

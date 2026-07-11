@@ -103,7 +103,9 @@ struct MCPSettingsView: View {
             updateActiveToolCount()
         }
         .onChange(of: vm.activeToolName) { _, newValue in
-            if newValue != nil { didCancelTool = false }
+            if newValue != nil {
+                didCancelTool = false
+            }
         }
         .onChange(of: toolStore.disabledTools) { updateActiveToolCount() }
         .onChange(of: toolStore.toolSummaries.count) { updateActiveToolCount() }
@@ -740,7 +742,9 @@ struct MCPSettingsView: View {
             }
 
             if let event = vm.recentExternalClientEvent {
-                if vm.lastErrorMessage != nil { Divider() }
+                if vm.lastErrorMessage != nil {
+                    Divider()
+                }
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {

@@ -1944,7 +1944,9 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
 
         XCTAssertTrue(merged.orderedEntries.isEmpty)
         XCTAssertTrue(merged.issues.contains {
-            if case .unavailable(_, .gitTerminal(.nonGit)) = $0 { return true }
+            if case .unavailable(_, .gitTerminal(.nonGit)) = $0 {
+                return true
+            }
             return false
         })
         XCTAssertEqual(fixture.providerAccessCount.value, 0)

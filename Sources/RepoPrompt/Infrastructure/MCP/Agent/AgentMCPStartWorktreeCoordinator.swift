@@ -358,7 +358,9 @@ struct AgentMCPStartWorktreeCoordinator {
         targetSessionID: UUID?,
         agentModeVM: AgentModeViewModel
     ) -> Error {
-        if error is CancellationError { return error }
+        if error is CancellationError {
+            return error
+        }
         guard let targetSessionID else { return error }
         let bindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID)
         guard let binding = bindings.first else { return error }
@@ -664,8 +666,12 @@ struct AgentMCPStartWorktreeCoordinator {
     }
 
     private func preparationError(_ error: Error) -> Error {
-        if error is CancellationError { return error }
-        if error is MCPError { return error }
+        if error is CancellationError {
+            return error
+        }
+        if error is MCPError {
+            return error
+        }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         return MCPError.invalidParams("\(operationName) worktree preparation failed: \(message)")
     }

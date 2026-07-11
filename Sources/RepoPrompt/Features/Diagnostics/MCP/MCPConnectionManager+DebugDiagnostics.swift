@@ -357,7 +357,9 @@ import MCP
         }
 
         static func debugOptionalValue(_ value: (some Any)?) -> Any {
-            if let value { return value }
+            if let value {
+                return value
+            }
             return NSNull()
         }
 
@@ -405,29 +407,67 @@ import MCP
         }
 
         private nonisolated static func debugJSONCompatibleValue(_ value: Any) -> Any {
-            if value is NSNull { return NSNull() }
-            if let value = value as? String { return value }
-            if let value = value as? Bool { return value }
-            if let value = value as? Int { return value }
-            if let value = value as? Int8 { return Int(value) }
-            if let value = value as? Int16 { return Int(value) }
-            if let value = value as? Int32 { return Int(value) }
-            if let value = value as? Int64 { return value }
-            if let value = value as? UInt { return NSNumber(value: value) }
-            if let value = value as? UInt8 { return Int(value) }
-            if let value = value as? UInt16 { return Int(value) }
-            if let value = value as? UInt32 { return NSNumber(value: value) }
-            if let value = value as? UInt64 { return NSNumber(value: value) }
-            if let value = value as? Float { return value.isFinite ? Double(value) : NSNull() }
-            if let value = value as? Double { return value.isFinite ? value : NSNull() }
+            if value is NSNull {
+                return NSNull()
+            }
+            if let value = value as? String {
+                return value
+            }
+            if let value = value as? Bool {
+                return value
+            }
+            if let value = value as? Int {
+                return value
+            }
+            if let value = value as? Int8 {
+                return Int(value)
+            }
+            if let value = value as? Int16 {
+                return Int(value)
+            }
+            if let value = value as? Int32 {
+                return Int(value)
+            }
+            if let value = value as? Int64 {
+                return value
+            }
+            if let value = value as? UInt {
+                return NSNumber(value: value)
+            }
+            if let value = value as? UInt8 {
+                return Int(value)
+            }
+            if let value = value as? UInt16 {
+                return Int(value)
+            }
+            if let value = value as? UInt32 {
+                return NSNumber(value: value)
+            }
+            if let value = value as? UInt64 {
+                return NSNumber(value: value)
+            }
+            if let value = value as? Float {
+                return value.isFinite ? Double(value) : NSNull()
+            }
+            if let value = value as? Double {
+                return value.isFinite ? value : NSNull()
+            }
             if let value = value as? NSNumber {
                 let double = value.doubleValue
                 return double.isFinite ? value : NSNull()
             }
-            if let value = value as? Date { return AgentMCPToolHelpers.timestamp(value) }
-            if let value = value as? UUID { return value.uuidString }
-            if let value = value as? [String: Any] { return debugJSONCompatibleObject(value) }
-            if let value = value as? [Any] { return value.map(debugJSONCompatibleValue) }
+            if let value = value as? Date {
+                return AgentMCPToolHelpers.timestamp(value)
+            }
+            if let value = value as? UUID {
+                return value.uuidString
+            }
+            if let value = value as? [String: Any] {
+                return debugJSONCompatibleObject(value)
+            }
+            if let value = value as? [Any] {
+                return value.map(debugJSONCompatibleValue)
+            }
             if let value = value as? NSDictionary {
                 var dictionary: [String: Any] = [:]
                 dictionary.reserveCapacity(value.count)

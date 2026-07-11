@@ -116,7 +116,9 @@ struct CodeMapArtifactFileStore {
             key.storageDigestHex,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
-        if descriptor < 0, errno == ENOENT { return nil }
+        if descriptor < 0, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else { throw Self.ioError("maintenance-cost-open") }
         defer { Darwin.close(descriptor) }
         let identity = try Self.validatedFileIdentity(
@@ -198,7 +200,9 @@ struct CodeMapArtifactFileStore {
             candidate.digest,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
-        if descriptor < 0, errno == ENOENT { return .miss }
+        if descriptor < 0, errno == ENOENT {
+            return .miss
+        }
         guard descriptor >= 0 else { throw Self.ioError("orphan-open") }
         defer { Darwin.close(descriptor) }
         let identity = try Self.validatedFileIdentity(
@@ -276,7 +280,9 @@ struct CodeMapArtifactFileStore {
             candidate.digest,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
-        if descriptor < 0, errno == ENOENT { return nil }
+        if descriptor < 0, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else { throw Self.ioError("orphan-quarantine-open") }
         defer { Darwin.close(descriptor) }
         let identity = try Self.validatedFileIdentity(
@@ -413,7 +419,9 @@ struct CodeMapArtifactFileStore {
                         ?? CodeMapSecureFileRemoval.privateRemovalPID(name),
                         !Self.processIsActive(pid)
                     else { continue }
-                    if try removeValidatedTemporaryFile(parent: shard, name: name) { removed += 1 }
+                    if try removeValidatedTemporaryFile(parent: shard, name: name) {
+                        removed += 1
+                    }
                 }
                 try Self.synchronize(shard.rawValue, operation: "temp-directory-fsync")
             }
@@ -455,7 +463,9 @@ struct CodeMapArtifactFileStore {
             }
         }
         let descriptor = openat(parent.rawValue, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        if descriptor < 0, !create, errno == ENOENT { return nil }
+        if descriptor < 0, !create, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else {
             throw Self.ioError("directory-open")
         }
@@ -554,7 +564,9 @@ struct CodeMapArtifactFileStore {
     private func readLeaf(parent: DirectoryDescriptor, key: CodeMapArtifactKey) throws -> LeafRead {
         let name = key.storageDigestHex
         let descriptor = openat(parent.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        if descriptor < 0, errno == ENOENT { return .missing }
+        if descriptor < 0, errno == ENOENT {
+            return .missing
+        }
         guard descriptor >= 0 else { throw Self.ioError("artifact-open") }
         defer { Darwin.close(descriptor) }
 
@@ -667,7 +679,9 @@ struct CodeMapArtifactFileStore {
             UInt32(RENAME_EXCL)
         )
         guard renameResult == 0 else {
-            if errno == EEXIST { return false }
+            if errno == EEXIST {
+                return false
+            }
             throw Self.ioError("artifact-rename")
         }
         let publishedIdentity = try Self.validatedFileIdentity(
@@ -700,7 +714,9 @@ struct CodeMapArtifactFileStore {
             key.storageDigestHex,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
-        if sourceDescriptor < 0, errno == ENOENT { return }
+        if sourceDescriptor < 0, errno == ENOENT {
+            return
+        }
         guard sourceDescriptor >= 0 else { throw Self.ioError("quarantine-source-open") }
         defer { Darwin.close(sourceDescriptor) }
         guard try Self.validatedFileIdentity(
@@ -738,8 +754,12 @@ struct CodeMapArtifactFileStore {
                 try Self.synchronize(shard.rawValue, operation: "quarantine-destination-fsync")
                 return
             }
-            if errno == ENOENT { return }
-            if errno != EEXIST { throw Self.ioError("quarantine-rename") }
+            if errno == ENOENT {
+                return
+            }
+            if errno != EEXIST {
+                throw Self.ioError("quarantine-rename")
+            }
         }
         throw CodeMapArtifactFileStoreError.ioFailure(operation: "quarantine-retry", code: EBUSY)
     }
@@ -758,7 +778,9 @@ struct CodeMapArtifactFileStore {
             artifactName,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
-        if sourceDescriptor < 0, errno == ENOENT { return nil }
+        if sourceDescriptor < 0, errno == ENOENT {
+            return nil
+        }
         guard sourceDescriptor >= 0 else { throw Self.ioError("orphan-quarantine-source-open") }
         defer { Darwin.close(sourceDescriptor) }
         guard try Self.validatedFileIdentity(
@@ -797,8 +819,12 @@ struct CodeMapArtifactFileStore {
                     byteCount: UInt64(identity.size)
                 )
             }
-            if errno == ENOENT { return nil }
-            if errno != EEXIST { throw Self.ioError("orphan-quarantine-rename") }
+            if errno == ENOENT {
+                return nil
+            }
+            if errno != EEXIST {
+                throw Self.ioError("orphan-quarantine-rename")
+            }
         }
         throw CodeMapArtifactFileStoreError.ioFailure(operation: "orphan-quarantine-retry", code: EBUSY)
     }
@@ -899,7 +925,9 @@ struct CodeMapArtifactFileStore {
             let name = withUnsafePointer(to: &entry.pointee.d_name) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
             }
-            if name != ".", name != ".." { result.append(name) }
+            if name != ".", name != ".." {
+                result.append(name)
+            }
             errno = 0
         }
         guard errno == 0 else { throw Self.ioError("directory-read") }
@@ -1184,8 +1212,12 @@ struct CodeMapArtifactFileStore {
     }
 
     private static func processIsActive(_ pid: pid_t) -> Bool {
-        if pid == getpid() { return true }
-        if kill(pid, 0) == 0 { return true }
+        if pid == getpid() {
+            return true
+        }
+        if kill(pid, 0) == 0 {
+            return true
+        }
         return errno != ESRCH
     }
 

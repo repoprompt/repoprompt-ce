@@ -11,7 +11,9 @@ enum DebugFlags { static var parser = false }
 @inline(__always)
 func dprint(_ msg: @autoclosure () -> String) {
     #if DEBUG
-        if DebugFlags.parser { print(msg()) }
+        if DebugFlags.parser {
+            print(msg())
+        }
     #endif
 }
 
@@ -159,7 +161,9 @@ enum DiffParserUtils {
     /// **left-side** inner spaces and dropping the right-side pre-fence spaces.
     /// This avoids touching real `===` operators in code.
     static func stripInlineFenceWrappersIfSingleLine(_ s: String) -> String {
-        if s.contains("\n") || s.contains("\r") { return s }
+        if s.contains("\n") || s.contains("\r") {
+            return s
+        }
         let pattern = #"^[ \t]*=+([^\r\n]*?)[ \t]*=+[ \t]*$"#
         guard let rx = cachedRegex(pattern, options: []) else { return s }
         let ns = s as NSString
@@ -172,7 +176,9 @@ enum DiffParserUtils {
     /// strip the leading `=` fence but **preserve** the inner whitespace right
     /// after the fence (e.g. "===    code" → "    code").
     static func stripLeadingInlineFenceIfSingleLinePreservingInnerSpace(_ s: String) -> String {
-        if s.contains("\n") || s.contains("\r") { return s }
+        if s.contains("\n") || s.contains("\r") {
+            return s
+        }
         let pattern = #"^[ \t]*=+([ \t]*)([^\r\n]*)$"#
         guard let rx = cachedRegex(pattern, options: []) else { return s }
         let ns = s as NSString
@@ -186,7 +192,9 @@ enum DiffParserUtils {
     /// If the entire payload is a single line and ends with an inline fence,
     /// strip the trailing fence (and any whitespace right before it).
     static func stripTrailingInlineFenceIfSingleLine(_ s: String) -> String {
-        if s.contains("\n") || s.contains("\r") { return s }
+        if s.contains("\n") || s.contains("\r") {
+            return s
+        }
         let pattern = #"^([^\r\n]*?)[ \t]*=+[ \t]*$"#
         guard let rx = cachedRegex(pattern, options: []) else { return s }
         let ns = s as NSString
@@ -1103,11 +1111,18 @@ class DiffParser {
     ///   otherwise        -> keeps the newestAction
     private func mergedAction(_ previous: FileAction, _ newest: FileAction) -> FileAction {
         if (previous == .delete && newest == .create) ||
-            (previous == .create && newest == .delete) { return .rewrite }
-        if previous == .rewrite || newest == .rewrite { return .rewrite }
+            (previous == .create && newest == .delete)
+        {
+            return .rewrite
+        }
+        if previous == .rewrite || newest == .rewrite {
+            return .rewrite
+        }
         // Special case: create + modify should stay as create
         // (you can't modify a file that will be created)
-        if previous == .create, newest == .modify { return .create }
+        if previous == .create, newest == .modify {
+            return .create
+        }
         return newest // fallback: latest wins
     }
 

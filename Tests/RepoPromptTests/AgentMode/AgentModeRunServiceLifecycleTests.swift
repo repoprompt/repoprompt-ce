@@ -2705,7 +2705,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         condition: @escaping @MainActor () -> Bool
     ) async throws {
         for _ in 0 ..< 500 {
-            if condition() { return }
+            if condition() {
+                return
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         throw LifecycleTimeoutError(operation: message, timeoutSeconds: 0.5)

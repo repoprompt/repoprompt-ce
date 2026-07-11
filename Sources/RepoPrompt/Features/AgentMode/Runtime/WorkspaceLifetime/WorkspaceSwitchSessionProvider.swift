@@ -96,7 +96,9 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
             // gone. Process termination below does not depend on `self`.
             if let delegate = self?.delegate {
                 for target in targets {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled {
+                        break
+                    }
                     await delegate.teardownMCPControlForDiscardedSession(
                         target.session,
                         cleanupSessionStore: true,
@@ -115,7 +117,9 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
             // Process termination must run even if the provider is deallocated.
             // Coordinators were captured before the yield.
             for target in targets {
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    break
+                }
                 await Self.disposeDetachedTarget(
                     target,
                     codexCoordinator: codexCoordinator,

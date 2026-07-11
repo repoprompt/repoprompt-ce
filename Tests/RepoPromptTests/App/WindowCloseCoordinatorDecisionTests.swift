@@ -566,7 +566,9 @@ private final class GitContextRefreshGate: @unchecked Sendable {
     }
 
     func waitUntilCancellationObserved(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
-        if observedCancellation { return }
+        if observedCancellation {
+            return
+        }
         do {
             try await AsyncTestWait.waitUntil(
                 "git context refresh cancellation observed",

@@ -2266,7 +2266,9 @@ struct AgentModeChatDetailView: View {
         .accessibilityIdentifier("agentTranscript.scrollView")
         .coordinateSpace(name: "AgentTranscriptScrollSpace")
         .transaction { txn in
-            if didChatChange { txn.disablesAnimations = true }
+            if didChatChange {
+                txn.disablesAnimations = true
+            }
         }
         .onScrollGeometryChange(for: AgentTranscriptScrollMetrics.self, of: { geometry in
             scrollMetrics(from: geometry)
@@ -2336,7 +2338,9 @@ struct AgentModeChatDetailView: View {
         .accessibilityIdentifier("agentTranscript.scrollView")
         .coordinateSpace(name: "AgentTranscriptScrollSpace")
         .transaction { txn in
-            if didChatChange { txn.disablesAnimations = true }
+            if didChatChange {
+                txn.disablesAnimations = true
+            }
         }
     }
 
@@ -2893,9 +2897,15 @@ struct AgentModeChatDetailView: View {
 
     private func collapsedSummaryStatus(for toolSummary: AgentTranscriptClusterSummary?) -> AgentTranscriptCollapsedSummaryStatus {
         guard let toolSummary else { return .neutral }
-        if toolSummary.containsFailure { return .failure }
-        if toolSummary.containsWarning { return .warning }
-        if toolSummary.containsRunningWork { return .running }
+        if toolSummary.containsFailure {
+            return .failure
+        }
+        if toolSummary.containsWarning {
+            return .warning
+        }
+        if toolSummary.containsRunningWork {
+            return .running
+        }
         return .neutral
     }
 

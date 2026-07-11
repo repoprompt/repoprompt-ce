@@ -460,12 +460,16 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
                 let b = buf[i]
                 if b == 0x0A { // \n
                     lines += 1
-                    if lines > limit { return lines }
+                    if lines > limit {
+                        return lines
+                    }
                     i = buf.index(after: i)
                     continue
                 } else if b == 0x0D { // \r
                     lines += 1
-                    if lines > limit { return lines }
+                    if lines > limit {
+                        return lines
+                    }
                     i = buf.index(after: i)
                     if i < end, buf[i] == 0x0A { // swallow \r\n
                         i = buf.index(after: i)
@@ -477,7 +481,9 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
             return nil
         }) {
             // res is Int? produced by the closure; return if limit exceeded
-            if let exceeded = res { return exceeded }
+            if let exceeded = res {
+                return exceeded
+            }
             // else fall through to return nil below
             return nil
         }
@@ -489,12 +495,16 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
             let byte = utf8[index]
             if byte == 0x0A { // \n
                 lines += 1
-                if lines > limit { return lines }
+                if lines > limit {
+                    return lines
+                }
                 index = utf8.index(after: index)
                 continue
             } else if byte == 0x0D { // \r
                 lines += 1
-                if lines > limit { return lines }
+                if lines > limit {
+                    return lines
+                }
                 let next = utf8.index(after: index)
                 if next < utf8.endIndex, utf8[next] == 0x0A {
                     index = utf8.index(after: next)
@@ -548,7 +558,9 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
 
         withTreeSitterExecution {
             for languageType in Set(optimizedQueries.keys).union(codeMapQueries.keys).sorted() {
-                if collectPerf { startupStats.warmCacheLanguageCount += 1 }
+                if collectPerf {
+                    startupStats.warmCacheLanguageCount += 1
+                }
                 if languageConfigs[languageType] == nil,
                    let config = createLanguageConfig(for: languageType, startupStats: &startupStats, collectPerf: collectPerf)
                 {
@@ -573,7 +585,9 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
     }
 
     private func languageConfigUnlocked(for language: LanguageType) -> LanguageConfiguration? {
-        if let config = languageConfigs[language] { return config }
+        if let config = languageConfigs[language] {
+            return config
+        }
         if let newConfig = createLanguageConfig(for: language) {
             languageConfigs[language] = newConfig
             return newConfig
@@ -659,7 +673,9 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
         startupStats: inout CodeMapSyntaxStartupPerfStats,
         collectPerf: Bool
     ) -> LanguageConfiguration? {
-        if collectPerf { startupStats.languageConfigCreateCount += 1 }
+        if collectPerf {
+            startupStats.languageConfigCreateCount += 1
+        }
         let createStart = collectPerf ? CodeMapPerfRuntime.currentTime() : nil
         defer {
             if let createStart {
@@ -674,11 +690,15 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
         }
         guard let language else {
             print("No language pointer for \(name).")
-            if collectPerf { startupStats.languageConfigFailureCount += 1 }
+            if collectPerf {
+                startupStats.languageConfigFailureCount += 1
+            }
             return nil
         }
 
-        if collectPerf { startupStats.languageConfigSuccessCount += 1 }
+        if collectPerf {
+            startupStats.languageConfigSuccessCount += 1
+        }
         return LanguageConfiguration(language, name: name, queries: [:])
     }
 
@@ -848,7 +868,9 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
             syntaxPerf.oversizeGuardDuration += CodeMapPerfRuntime.durationSince(oversizeGuardStart)
         }
         if let reason = oversizeReason {
-            if collectSyntaxPerf { syntaxPerf.oversized += 1 }
+            if collectSyntaxPerf {
+                syntaxPerf.oversized += 1
+            }
             print("[SyntaxManager] Skipping code map parse for \(diagnosticLabel): \(reason)")
             return .oversize(Self.artifactOversizeReason(reason))
         }
@@ -860,7 +882,9 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
                 syntaxPerf.languageLookupDuration += CodeMapPerfRuntime.durationSince(configLookupStart)
             }
             guard let config else {
-                if collectSyntaxPerf { syntaxPerf.unsupported += 1 }
+                if collectSyntaxPerf {
+                    syntaxPerf.unsupported += 1
+                }
                 if missingConfigurationReturnsEmptyCaptures {
                     return .captures([])
                 }
@@ -890,11 +914,15 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
                 syntaxPerf.parseDuration += CodeMapPerfRuntime.durationSince(parseStart)
             }
             guard let tree else {
-                if collectSyntaxPerf { syntaxPerf.parseNilTree += 1 }
+                if collectSyntaxPerf {
+                    syntaxPerf.parseNilTree += 1
+                }
                 return .parseFailed(.parserReturnedNilTree)
             }
             guard let root = tree.rootNode else {
-                if collectSyntaxPerf { syntaxPerf.parseNilRoot += 1 }
+                if collectSyntaxPerf {
+                    syntaxPerf.parseNilRoot += 1
+                }
                 return .parseFailed(.parserReturnedNilRoot)
             }
 

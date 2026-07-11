@@ -256,9 +256,13 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
                 connect(fd, socketAddress, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        if result == 0 { return .live }
+        if result == 0 {
+            return .live
+        }
         let code = errno
-        if code == ECONNREFUSED || code == ENOENT { return .stale }
+        if code == ECONNREFUSED || code == ENOENT {
+            return .stale
+        }
         throw OwnershipError.socketProbeFailed(path: url.path, errno: code)
     }
 }

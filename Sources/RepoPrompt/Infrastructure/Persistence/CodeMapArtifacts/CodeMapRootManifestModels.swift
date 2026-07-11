@@ -154,7 +154,9 @@ struct CodeMapRootManifestNamespace: Hashable {
 
     func contains(repositoryRelativePath: String) -> Bool {
         guard Self.isRepositoryRelativePath(repositoryRelativePath, allowEmpty: false) else { return false }
-        if repositoryRelativeLoadedRootPrefix.isEmpty { return true }
+        if repositoryRelativeLoadedRootPrefix.isEmpty {
+            return true
+        }
         return repositoryRelativePath.hasPrefix(repositoryRelativeLoadedRootPrefix + "/")
     }
 
@@ -164,7 +166,9 @@ struct CodeMapRootManifestNamespace: Hashable {
               !value.hasPrefix("/"),
               !value.hasSuffix("/")
         else { return false }
-        if value.isEmpty { return allowEmpty }
+        if value.isEmpty {
+            return allowEmpty
+        }
         return value.split(separator: "/", omittingEmptySubsequences: false).allSatisfy {
             !$0.isEmpty && $0 != "." && $0 != ".."
         }

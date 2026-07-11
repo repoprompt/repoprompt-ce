@@ -186,7 +186,7 @@ import MCP
             if includeSessions {
                 struct CapturedSession {
                     var payload: [String: Any]
-                    let codexController: CodexNativeSessionController?
+                    let codexController: (any CodexSessionControlling)?
                     let claudeController: (any NativeAgentRuntimeControlling)?
                     let acpController: ACPAgentSessionController?
                 }

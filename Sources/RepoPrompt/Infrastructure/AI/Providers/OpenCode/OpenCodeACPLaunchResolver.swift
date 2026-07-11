@@ -272,7 +272,9 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
         guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory) else {
             return "missing"
         }
-        if isDirectory.boolValue { return "directory" }
+        if isDirectory.boolValue {
+            return "directory"
+        }
         guard FileManager.default.isExecutableFile(atPath: candidate) else {
             return "not executable"
         }

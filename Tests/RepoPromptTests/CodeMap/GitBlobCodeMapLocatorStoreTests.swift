@@ -581,7 +581,13 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             first.read(identity: identities[0]),
             first.read(identity: identities[1])
         ]
-        XCTAssertEqual(reads.count(where: { if case .hit = $0 { true } else { false } }), 1)
+        XCTAssertEqual(reads.count(where: {
+            if case .hit = $0 {
+                true
+            } else {
+                false
+            }
+        }), 1)
     }
 
     func testMaintenanceClosesEachRecordDescriptorDuringLargePass() async throws {

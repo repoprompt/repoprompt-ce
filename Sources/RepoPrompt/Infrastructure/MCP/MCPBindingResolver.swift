@@ -111,8 +111,12 @@ struct MCPBindingResolver {
         }.sorted {
             let lhsNameKey = $0.workspaceName.lowercased()
             let rhsNameKey = $1.workspaceName.lowercased()
-            if lhsNameKey != rhsNameKey { return lhsNameKey < rhsNameKey }
-            if $0.workspaceName != $1.workspaceName { return $0.workspaceName < $1.workspaceName }
+            if lhsNameKey != rhsNameKey {
+                return lhsNameKey < rhsNameKey
+            }
+            if $0.workspaceName != $1.workspaceName {
+                return $0.workspaceName < $1.workspaceName
+            }
             return $0.tabID.uuidString < $1.tabID.uuidString
         }
         guard resolutions.count == 1, let resolution = resolutions.first else {
@@ -123,11 +127,17 @@ struct MCPBindingResolver {
     }
 
     private static func logicalContextRepresentativeSort(_ lhs: MCPContextBindingMatch, _ rhs: MCPContextBindingMatch) -> Bool {
-        if lhs.windowID != rhs.windowID { return lhs.windowID < rhs.windowID }
+        if lhs.windowID != rhs.windowID {
+            return lhs.windowID < rhs.windowID
+        }
         let lhsNameKey = lhs.workspaceName.lowercased()
         let rhsNameKey = rhs.workspaceName.lowercased()
-        if lhsNameKey != rhsNameKey { return lhsNameKey < rhsNameKey }
-        if lhs.workspaceName != rhs.workspaceName { return lhs.workspaceName < rhs.workspaceName }
+        if lhsNameKey != rhsNameKey {
+            return lhsNameKey < rhsNameKey
+        }
+        if lhs.workspaceName != rhs.workspaceName {
+            return lhs.workspaceName < rhs.workspaceName
+        }
         return lhs.workspaceID.uuidString < rhs.workspaceID.uuidString
     }
 

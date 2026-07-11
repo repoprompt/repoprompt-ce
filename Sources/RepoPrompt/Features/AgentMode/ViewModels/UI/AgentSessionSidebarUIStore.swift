@@ -90,7 +90,9 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         markedAt: Date = Date()
     ) -> Bool {
         guard Self.isAttentionEligible(state) else { return false }
-        if snapshot.attentionRunStateByTabID[tabID] == state { return false }
+        if snapshot.attentionRunStateByTabID[tabID] == state {
+            return false
+        }
         var next = snapshot
         next.attentionRunStateByTabID[tabID] = state
         next.attentionMarkedAtByTabID[tabID] = markedAt

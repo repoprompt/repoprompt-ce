@@ -809,7 +809,9 @@ public extension VCSService {
         sourceHead: String
     ) -> String {
         let trimmed = requested?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let trimmed, !trimmed.isEmpty { return trimmed }
+        if let trimmed, !trimmed.isEmpty {
+            return trimmed
+        }
         let sourceLabel = source.branch ?? source.displayName
         let targetLabel = target.branch ?? target.displayName
         return "Merge \(sourceLabel) into \(targetLabel)\n\nRepoPrompt-Source-Head: \(sourceHead)"

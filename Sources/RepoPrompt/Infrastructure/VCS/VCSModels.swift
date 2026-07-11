@@ -186,7 +186,9 @@ public extension [VCSBranch] {
 
     private func sortedByRecentBranchActivity() -> [VCSBranch] {
         sorted { lhs, rhs in
-            if lhs.isCurrent != rhs.isCurrent { return lhs.isCurrent }
+            if lhs.isCurrent != rhs.isCurrent {
+                return lhs.isCurrent
+            }
             switch (lhs.lastCommitDate, rhs.lastCommitDate) {
             case let (left?, right?) where left != right:
                 return left > right

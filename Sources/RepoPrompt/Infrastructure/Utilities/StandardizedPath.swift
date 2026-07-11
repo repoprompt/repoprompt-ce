@@ -77,7 +77,9 @@ enum StandardizedPath {
 
     @inline(__always)
     static func isDescendant(_ standardizedPath: String, of standardizedParent: String) -> Bool {
-        if standardizedPath == standardizedParent { return true }
+        if standardizedPath == standardizedParent {
+            return true
+        }
         let prefix = standardizedParent.hasSuffix("/") ? standardizedParent : standardizedParent + "/"
         return standardizedPath.hasPrefix(prefix)
     }

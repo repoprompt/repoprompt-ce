@@ -280,11 +280,15 @@ struct WorkspaceSelectionMutationService {
             var pathsMissingRanges: [String] = []
             var seenMissing = Set<String>()
             for path in paths.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }) where !path.isEmpty && !pathsWithRanges.contains(path) {
-                if seenMissing.insert(path).inserted { pathsMissingRanges.append(path) }
+                if seenMissing.insert(path).inserted {
+                    pathsMissingRanges.append(path)
+                }
             }
             for entry in sliceInputs where SliceRangeMath.normalize(entry.ranges).isEmpty {
                 let path = entry.path.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !path.isEmpty, seenMissing.insert(path).inserted { pathsMissingRanges.append(path) }
+                if !path.isEmpty, seenMissing.insert(path).inserted {
+                    pathsMissingRanges.append(path)
+                }
             }
             if !pathsMissingRanges.isEmpty {
                 return WorkspaceBuildSelectionResult(
@@ -420,7 +424,11 @@ struct WorkspaceSelectionMutationService {
             }
             for (full, ranges) in aggregated {
                 let normalized = SliceRangeMath.normalize(ranges)
-                if normalized.isEmpty { slices.removeValue(forKey: full) } else { slices[full] = normalized }
+                if normalized.isEmpty {
+                    slices.removeValue(forKey: full)
+                } else {
+                    slices[full] = normalized
+                }
             }
         case .setPaths:
             var aggregated: [String: [LineRange]] = [:]
@@ -430,7 +438,11 @@ struct WorkspaceSelectionMutationService {
             }
             for (full, ranges) in aggregated {
                 let normalized = SliceRangeMath.normalize(ranges)
-                if normalized.isEmpty { slices.removeValue(forKey: full) } else { slices[full] = normalized }
+                if normalized.isEmpty {
+                    slices.removeValue(forKey: full)
+                } else {
+                    slices[full] = normalized
+                }
             }
         case .add:
             for (index, entry) in entries.enumerated() {
@@ -438,7 +450,11 @@ struct WorkspaceSelectionMutationService {
                 let normalized = SliceRangeMath.normalize(entry.ranges)
                 guard !normalized.isEmpty else { continue }
                 let next = SliceRangeMath.coalesce(slices[file.standardizedFullPath] ?? [], normalized)
-                if next.isEmpty { slices.removeValue(forKey: file.standardizedFullPath) } else { slices[file.standardizedFullPath] = next }
+                if next.isEmpty {
+                    slices.removeValue(forKey: file.standardizedFullPath)
+                } else {
+                    slices[file.standardizedFullPath] = next
+                }
             }
         case .remove:
             for (index, entry) in entries.enumerated() {
@@ -452,12 +468,18 @@ struct WorkspaceSelectionMutationService {
                 let removal = SliceRangeMath.normalize(entry.ranges)
                 guard !baseRanges.isEmpty else { continue }
                 let next = removal.isEmpty ? [] : SliceRangeMath.subtract(baseRanges, removing: removal)
-                if next.isEmpty { slices.removeValue(forKey: full) } else { slices[full] = next }
+                if next.isEmpty {
+                    slices.removeValue(forKey: full)
+                } else {
+                    slices[full] = next
+                }
             }
         }
 
         for (full, ranges) in slices where !ranges.isEmpty {
-            if selectedSet.insert(full).inserted { selectedPaths.append(full) }
+            if selectedSet.insert(full).inserted {
+                selectedPaths.append(full)
+            }
         }
         let nextSelection = StoredSelection(
             selectedPaths: selectedPaths,
@@ -505,7 +527,9 @@ struct WorkspaceSelectionMutationService {
                 let path = file.standardizedFullPath
                 selectedPaths.removeAll { $0 == path }
                 slices.removeValue(forKey: path)
-                if manualSet.insert(path).inserted { manualPaths.append(path) }
+                if manualSet.insert(path).inserted {
+                    manualPaths.append(path)
+                }
             }
             let selection = StoredSelection(
                 selectedPaths: selectedPaths,
@@ -630,7 +654,9 @@ struct WorkspaceSelectionMutationService {
                 mutated = true
             }
             manualCodemapPaths.removeAll { $0 == path }
-            if removeSliceEntries(for: file, in: &slices) { mutated = true }
+            if removeSliceEntries(for: file, in: &slices) {
+                mutated = true
+            }
         }
 
         let selection = StoredSelection(
@@ -670,7 +696,9 @@ struct WorkspaceSelectionMutationService {
             let path = file.standardizedFullPath
             selectedPaths.removeAll { $0 == path }
             _ = removeSliceEntries(for: file, in: &slices)
-            if manualSet.insert(path).inserted { manualCodemapPaths.append(path) }
+            if manualSet.insert(path).inserted {
+                manualCodemapPaths.append(path)
+            }
         }
         let selection = StoredSelection(
             selectedPaths: selectedPaths,
@@ -712,8 +740,12 @@ struct WorkspaceSelectionMutationService {
         for key in preflight {
             let raw = rawLookup[key] ?? key
             if let file = resolved[key] {
-                if seen.insert(file.standardizedFullPath).inserted { candidates.append(file) }
-                if resolvedMap[raw] == nil { resolvedMap[raw] = await displayPath(for: file, rootScope: rootScope) }
+                if seen.insert(file.standardizedFullPath).inserted {
+                    candidates.append(file)
+                }
+                if resolvedMap[raw] == nil {
+                    resolvedMap[raw] = await displayPath(for: file, rootScope: rootScope)
+                }
                 continue
             }
             if expandFolders {
@@ -772,7 +804,9 @@ struct WorkspaceSelectionMutationService {
             let raw = rawLookup[key] ?? key
             if let file = resolved[key] {
                 if supportsCodemap(file) {
-                    if seen.insert(file.standardizedFullPath).inserted { candidates.append(file) }
+                    if seen.insert(file.standardizedFullPath).inserted {
+                        candidates.append(file)
+                    }
                 } else {
                     await unavailable.append("codemap unavailable: \(displayPath(for: file, rootScope: rootScope))")
                 }
@@ -785,13 +819,19 @@ struct WorkspaceSelectionMutationService {
                 let folder = await store.expandFolderInputToFiles(key, rootScope: rootScope)
                 if folder.handled {
                     if folder.files.isEmpty {
-                        if let issue = folder.issue { invalid.append(PathResolutionIssueRenderer.message(for: issue)) } else { invalid.append(raw) }
+                        if let issue = folder.issue {
+                            invalid.append(PathResolutionIssueRenderer.message(for: issue))
+                        } else {
+                            invalid.append(raw)
+                        }
                     } else {
                         var supported = 0
                         var unsupported = 0
                         for file in folder.files {
                             if supportsCodemap(file) {
-                                if seen.insert(file.standardizedFullPath).inserted { candidates.append(file) }
+                                if seen.insert(file.standardizedFullPath).inserted {
+                                    candidates.append(file)
+                                }
                                 supported += 1
                             } else {
                                 unsupported += 1
@@ -1842,7 +1882,9 @@ struct WorkspaceSelectionMutationService {
         var normalized: [String: [LineRange]] = [:]
         for (path, ranges) in slices {
             let value = SliceRangeMath.normalize(ranges)
-            if !value.isEmpty { normalized[path] = value }
+            if !value.isEmpty {
+                normalized[path] = value
+            }
         }
         return normalized
     }

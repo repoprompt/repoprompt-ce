@@ -1363,7 +1363,9 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if condition() { return }
+            if condition() {
+                return
+            }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for condition", file: file, line: line)
@@ -1471,7 +1473,9 @@ private actor WorkspaceSwitchManualSleeper {
     private var cancelledWaiterIDs: Set<UUID> = []
 
     func sleep(nanoseconds: UInt64) async {
-        if releasedNanoseconds.contains(nanoseconds) { return }
+        if releasedNanoseconds.contains(nanoseconds) {
+            return
+        }
         let waiterID = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -1537,14 +1541,18 @@ private actor WorkspaceSwitchRecoveryGate {
     }
 
     func waitUntilArrived() async {
-        if arrived { return }
+        if arrived {
+            return
+        }
         await withCheckedContinuation { continuation in
             arrivalContinuations.append(continuation)
         }
     }
 
     func waitUntilCompleted() async {
-        if completed { return }
+        if completed {
+            return
+        }
         await withCheckedContinuation { continuation in
             completionContinuations.append(continuation)
         }

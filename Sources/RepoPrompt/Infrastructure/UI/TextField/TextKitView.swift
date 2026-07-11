@@ -291,7 +291,9 @@ struct TextKitView: NSViewRepresentable {
         let wasFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
 
         if textView.string != text {
-            if textView.hasMarkedText() { return }
+            if textView.hasMarkedText() {
+                return
+            }
             if wasFirstResponder, !shouldForce {
                 // Do not overwrite in-flight user edits; let delegate drive the binding.
             } else {

@@ -1968,7 +1968,9 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             var data = Data()
             while data.count < 32 {
                 guard let byte = try stdout.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else { break }
-                if byte == Data([0x0A]) { break }
+                if byte == Data([0x0A]) {
+                    break
+                }
                 data.append(byte)
             }
             guard let text = String(data: data, encoding: .utf8),

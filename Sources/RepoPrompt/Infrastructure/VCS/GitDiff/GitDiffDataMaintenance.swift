@@ -374,7 +374,9 @@ actor GitDiffDataMaintenance {
 
     private func retentionEntries(workspaceDirectory: URL) -> [SnapshotRetentionEntry] {
         let key = workspaceKey(workspaceDirectory)
-        if let cached = retentionEntriesByWorkspace[key] { return cached }
+        if let cached = retentionEntriesByWorkspace[key] {
+            return cached
+        }
         if let persisted = readRetentionIndex(workspaceDirectory: workspaceDirectory) {
             retentionEntriesByWorkspace[key] = persisted
             return persisted

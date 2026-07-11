@@ -1723,7 +1723,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             return $0.identity.fileID.uuidString < $1.identity.fileID.uuidString
         }
         let contributedCount = UInt64(entries.count(where: {
-            if case .contributed = $0.outcome { return true }
+            if case .contributed = $0.outcome {
+                return true
+            }
             return false
         }))
         let emptyCount = UInt64(entries.count) - contributedCount

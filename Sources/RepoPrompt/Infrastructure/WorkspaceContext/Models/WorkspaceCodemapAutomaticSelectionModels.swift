@@ -285,7 +285,9 @@ func workspaceCodemapRootEpochPrecedes(
     _ lhs: WorkspaceCodemapRootEpoch,
     _ rhs: WorkspaceCodemapRootEpoch
 ) -> Bool {
-    if lhs.rootID != rhs.rootID { return lhs.rootID.uuidString < rhs.rootID.uuidString }
+    if lhs.rootID != rhs.rootID {
+        return lhs.rootID.uuidString < rhs.rootID.uuidString
+    }
     return lhs.rootLifetimeID.uuidString < rhs.rootLifetimeID.uuidString
 }
 

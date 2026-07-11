@@ -1163,7 +1163,9 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             var waited: UInt64 = 0
             while waited < timeoutNanoseconds {
                 let snapshot = await snapshotProvider()
-                if predicate(snapshot) { return snapshot }
+                if predicate(snapshot) {
+                    return snapshot
+                }
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }

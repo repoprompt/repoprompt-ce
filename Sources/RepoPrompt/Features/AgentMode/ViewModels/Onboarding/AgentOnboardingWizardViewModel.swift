@@ -375,7 +375,9 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
 
     func openMCPServerPopover(windowID: Int? = nil) {
         var userInfo: [String: Any] = [:]
-        if let id = windowID { userInfo["windowID"] = id }
+        if let id = windowID {
+            userInfo["windowID"] = id
+        }
         NotificationCenter.default.post(name: .showMCPServerPopover, object: nil, userInfo: userInfo)
     }
 
@@ -383,25 +385,33 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
 
     func openCLIProviders(windowID: Int? = nil) {
         var userInfo: [String: Any] = [:]
-        if let id = windowID { userInfo["windowID"] = id }
+        if let id = windowID {
+            userInfo["windowID"] = id
+        }
         NotificationCenter.default.post(name: .showCLIProvidersTab, object: nil, userInfo: userInfo)
     }
 
     func openMCPSettings(windowID: Int? = nil) {
         var userInfo: [String: Any] = [:]
-        if let id = windowID { userInfo["windowID"] = id }
+        if let id = windowID {
+            userInfo["windowID"] = id
+        }
         NotificationCenter.default.post(name: .showMCPSettingsTab, object: nil, userInfo: userInfo)
     }
 
     func openContextBuilderSettings(windowID: Int? = nil) {
         var userInfo: [String: Any] = [:]
-        if let id = windowID { userInfo["windowID"] = id }
+        if let id = windowID {
+            userInfo["windowID"] = id
+        }
         NotificationCenter.default.post(name: .showContextBuilderSettingsTab, object: nil, userInfo: userInfo)
     }
 
     func openUpdatesSettings(windowID: Int? = nil) {
         var userInfo: [String: Any] = [:]
-        if let id = windowID { userInfo["windowID"] = id }
+        if let id = windowID {
+            userInfo["windowID"] = id
+        }
         NotificationCenter.default.post(name: .showLicenseUpdatesTab, object: nil, userInfo: userInfo)
     }
 

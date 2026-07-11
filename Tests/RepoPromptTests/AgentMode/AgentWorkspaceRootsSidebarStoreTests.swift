@@ -489,7 +489,9 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
     ) async {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if condition() { return }
+            if condition() {
+                return
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         XCTFail("Timed out waiting for condition")

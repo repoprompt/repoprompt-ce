@@ -146,7 +146,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let deadline = clock.now + timeout
             while clock.now < deadline {
                 let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
-                if waiterCount == expectedCount { return true }
+                if waiterCount == expectedCount {
+                    return true
+                }
                 try? await Task.sleep(for: .milliseconds(10))
             }
             return false
@@ -1060,7 +1062,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         ) async throws -> DebugToolInvocation {
             let result = await networkManager.handleDebugDiagnosticsTool(connectionID: callerID, arguments: arguments)
             let serializedText = result.content.compactMap { content -> String? in
-                if case let .text(text, _, _) = content { return text }
+                if case let .text(text, _, _) = content {
+                    return text
+                }
                 return nil
             }.joined()
             for rawSessionToken in rawSessionTokens {
@@ -1316,7 +1320,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let deadline = clock.now.advanced(by: timeout)
             while clock.now < deadline {
                 let snapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
-                if snapshot.isIdle { return snapshot }
+                if snapshot.isIdle {
+                    return snapshot
+                }
                 try? await Task.sleep(for: .milliseconds(5))
             }
             return await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
@@ -1490,9 +1496,15 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 if let constructedFixture {
                     await constructedFixture.cleanup()
                 } else {
-                    if let contextB { await cleanupContext(contextB) }
-                    if let contextA { await cleanupContext(contextA) }
-                    if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
+                    if let contextB {
+                        await cleanupContext(contextB)
+                    }
+                    if let contextA {
+                        await cleanupContext(contextA)
+                    }
+                    if let ownedRoutingService {
+                        ServiceRegistry.unregister(ownedRoutingService)
+                    }
                     WindowStatesManager.shared.unregisterWindowState(windowB)
                     WindowStatesManager.shared.unregisterWindowState(windowA)
                     try? FileManager.default.removeItem(at: rootURL)
@@ -1610,7 +1622,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
-            if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
+            if let ownedRoutingService {
+                ServiceRegistry.unregister(ownedRoutingService)
+            }
             try? FileManager.default.removeItem(at: rootURL)
         }
 
@@ -2067,7 +2081,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                         written += result
                         continue
                     }
-                    if result < 0, errno == EINTR { continue }
+                    if result < 0, errno == EINTR {
+                        continue
+                    }
                     throw ClientError.posix(operation: "write", code: errno)
                 }
             }
@@ -2081,12 +2097,18 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 var descriptor = pollfd(fd: activeFD, events: Int16(POLLIN), revents: 0)
                 let pollResult = Darwin.poll(&descriptor, 1, 100)
                 if pollResult == 0 {
-                    if withStateLock({ isClosed }) { return }
+                    if withStateLock({ isClosed }) {
+                        return
+                    }
                     continue
                 }
                 if pollResult < 0 {
-                    if errno == EINTR { continue }
-                    if withStateLock({ isClosed }) { return }
+                    if errno == EINTR {
+                        continue
+                    }
+                    if withStateLock({ isClosed }) {
+                        return
+                    }
                     close(with: ClientError.posix(operation: "poll", code: errno))
                     return
                 }
@@ -2096,7 +2118,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     close(with: ClientError.closed)
                     return
                 }
-                if withStateLock({ isClosed }) { return }
+                if withStateLock({ isClosed }) {
+                    return
+                }
                 var bytes = [UInt8](repeating: 0, count: 4096)
                 let readCount = bytes.withUnsafeMutableBytes { storage in
                     Darwin.read(activeFD, storage.baseAddress, storage.count)
@@ -2114,8 +2138,12 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     close(with: ClientError.closed)
                     return
                 }
-                if errno == EINTR { continue }
-                if withStateLock({ isClosed }) { return }
+                if errno == EINTR {
+                    continue
+                }
+                if withStateLock({ isClosed }) {
+                    return
+                }
                 close(with: ClientError.posix(operation: "read", code: errno))
                 return
             }
@@ -2184,7 +2212,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 interceptingResponses[id] = response
                 return false
             }
-            if shouldCancelTask { task.cancel() }
+            if shouldCancelTask {
+                task.cancel()
+            }
         }
 
         private func takeIntercepting(
@@ -2246,7 +2276,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
         @discardableResult
         private func failRequest(id: Int, error: Error) -> Bool {
-            if failPending(id: id, error: error) { return true }
+            if failPending(id: id, error: error) {
+                return true
+            }
             return failIntercepting(id: id, error: error)
         }
 
@@ -2276,7 +2308,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 }
                 return (activeFD, pendingContinuations, interceptingContinuations, tasks)
             }
-            if snapshot.activeFD >= 0 { Darwin.close(snapshot.activeFD) }
+            if snapshot.activeFD >= 0 {
+                Darwin.close(snapshot.activeFD)
+            }
             snapshot.tasks.forEach { $0.cancel() }
             for continuation in snapshot.pendingContinuations + snapshot.interceptingContinuations {
                 continuation.resume(throwing: error)

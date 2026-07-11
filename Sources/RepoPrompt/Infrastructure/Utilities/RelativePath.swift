@@ -15,7 +15,9 @@ enum RelativePath {
         standardizedRootPath root: String
     ) -> String {
         guard !root.isEmpty else { return abs }
-        if abs == root { return "" }
+        if abs == root {
+            return ""
+        }
 
         // Boundary-safe prefix match (prevents "/a/bc" being treated as inside "/a/b").
         let rootPrefix = root.hasSuffix("/") ? root : root + "/"

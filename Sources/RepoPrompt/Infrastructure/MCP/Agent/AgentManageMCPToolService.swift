@@ -237,8 +237,12 @@ struct AgentManageMCPToolService {
                     ?? object["agent"]?.stringValue
                     ?? ""
             ).lowercased()
-            if let agentFilter, agent != agentFilter { return false }
-            if let stateFilter, !sessionStateMatches(object: object, filter: stateFilter) { return false }
+            if let agentFilter, agent != agentFilter {
+                return false
+            }
+            if let stateFilter, !sessionStateMatches(object: object, filter: stateFilter) {
+                return false
+            }
             return true
         }
         .sorted {

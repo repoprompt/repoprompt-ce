@@ -502,8 +502,12 @@ import Foundation
             }
 
             let windowRecords = records.filter { record in
-                if let lowerBoundSequence, record.sequence <= lowerBoundSequence { return false }
-                if let upperBoundSequence, record.sequence > upperBoundSequence { return false }
+                if let lowerBoundSequence, record.sequence <= lowerBoundSequence {
+                    return false
+                }
+                if let upperBoundSequence, record.sequence > upperBoundSequence {
+                    return false
+                }
                 return true
             }
             return MetricWindowResult(

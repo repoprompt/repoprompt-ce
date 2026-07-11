@@ -373,14 +373,22 @@ struct GitContextBranchSwitchCapsule: View {
         }
 
         private var iconName: String {
-            if branch.isCurrent { return "checkmark.circle.fill" }
-            if branch.isCheckedOutInAnotherWorktree { return "lock.fill" }
+            if branch.isCurrent {
+                return "checkmark.circle.fill"
+            }
+            if branch.isCheckedOutInAnotherWorktree {
+                return "lock.fill"
+            }
             return "circle"
         }
 
         private var iconColor: Color {
-            if branch.isCurrent { return .accentColor }
-            if branch.isCheckedOutInAnotherWorktree { return .orange }
+            if branch.isCurrent {
+                return .accentColor
+            }
+            if branch.isCheckedOutInAnotherWorktree {
+                return .orange
+            }
             return .secondary
         }
 
@@ -393,7 +401,9 @@ struct GitContextBranchSwitchCapsule: View {
         }
 
         private var helpText: String {
-            if branch.isCurrent { return "Already on \(branch.name)" }
+            if branch.isCurrent {
+                return "Already on \(branch.name)"
+            }
             if let checkedOutWorktree = branch.checkedOutWorktree {
                 if let label = branch.checkedOutWorktreeLabel {
                     return "Already checked out in worktree \(label) at \(checkedOutWorktree.worktreePath)"

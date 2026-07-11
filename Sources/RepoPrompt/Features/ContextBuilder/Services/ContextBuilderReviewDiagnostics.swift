@@ -38,11 +38,21 @@ struct ContextBuilderReviewDiagnosticEvent: Equatable, CustomStringConvertible {
             "resolved_count=\(resolvedCount)",
             "unresolved_count=\(unresolvedCount)"
         ]
-        if let sessionID { fields.append("session_id=\(sessionID.uuidString)") }
-        if let rootID { fields.append("root_id=\(rootID.uuidString)") }
-        if let ownershipGeneration { fields.append("ownership_generation=\(ownershipGeneration)") }
-        if let lifetimeID { fields.append("lifetime_id=\(lifetimeID.uuidString)") }
-        if let mismatch { fields.append("mismatch=\(mismatch.rawValue)") }
+        if let sessionID {
+            fields.append("session_id=\(sessionID.uuidString)")
+        }
+        if let rootID {
+            fields.append("root_id=\(rootID.uuidString)")
+        }
+        if let ownershipGeneration {
+            fields.append("ownership_generation=\(ownershipGeneration)")
+        }
+        if let lifetimeID {
+            fields.append("lifetime_id=\(lifetimeID.uuidString)")
+        }
+        if let mismatch {
+            fields.append("mismatch=\(mismatch.rawValue)")
+        }
         return fields.joined(separator: " ")
     }
 }

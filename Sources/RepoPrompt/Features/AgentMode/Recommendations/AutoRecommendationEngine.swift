@@ -820,7 +820,9 @@ final class AutoRecommendationEngine {
         let current = currentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let recommended = recommendedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !current.isEmpty, !recommended.isEmpty else { return false }
-        if current.caseInsensitiveCompare(recommended) == .orderedSame { return true }
+        if current.caseInsensitiveCompare(recommended) == .orderedSame {
+            return true
+        }
         guard let currentCodex = codexChatModelIdentity(for: current),
               let recommendedCodex = codexChatModelIdentity(for: recommended),
               currentCodex.baseModel == recommendedCodex.baseModel

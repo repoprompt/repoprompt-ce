@@ -203,8 +203,12 @@ struct ContextBuilderResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if phase == .running || phase == .generatingPlan { return .running }
-        if item.toolIsError == true { return .failure }
+        if phase == .running || phase == .generatingPlan {
+            return .running
+        }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
             switch dto.status?.lowercased() {
             case "error": return .failure

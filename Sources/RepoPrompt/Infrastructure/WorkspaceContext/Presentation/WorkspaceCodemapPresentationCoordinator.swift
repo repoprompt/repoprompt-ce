@@ -223,7 +223,9 @@ struct WorkspaceCodemapPresentationCoordinator {
                 if let reason = retryableStaleReason(in: result.issues) {
                     lastStaleReason = reason
                     await release(ownership)
-                    if attempt == 0, clock.now < deadline { continue }
+                    if attempt == 0, clock.now < deadline {
+                        continue
+                    }
                     let value = try await operation(incompletePublication(reason: reason))
                     try Task.checkCancellation()
                     return value
@@ -253,7 +255,9 @@ struct WorkspaceCodemapPresentationCoordinator {
                     case let .stale(reason):
                         lastStaleReason = reason
                         await release(ownership)
-                        if attempt == 0, clock.now < deadline { continue }
+                        if attempt == 0, clock.now < deadline {
+                            continue
+                        }
                         let fallbackValue = try await operation(incompletePublication(reason: reason))
                         try Task.checkCancellation()
                         return fallbackValue
@@ -263,7 +267,9 @@ struct WorkspaceCodemapPresentationCoordinator {
                 return value
             } catch {
                 await release(ownership)
-                if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                if Task.isCancelled || error is CancellationError {
+                    throw CancellationError()
+                }
                 throw error
             }
         }
@@ -931,7 +937,9 @@ struct WorkspaceCodemapPresentationCoordinator {
                     hasPending = true
                 case let .unavailable(.busy(milliseconds)):
                     hasPending = true
-                    if let milliseconds { retryAfter.append(milliseconds) }
+                    if let milliseconds {
+                        retryAfter.append(milliseconds)
+                    }
                     busyCandidates.append((candidate, ticketsByFileID[fileID]))
                 case .ready, .unavailable:
                     break
@@ -1050,14 +1058,20 @@ struct WorkspaceCodemapPresentationCoordinator {
                 case let .pending(ticket):
                     let refreshed = await store.codemapArtifactDemandStatus(ticket)
                     results[fileID] = refreshed
-                    if case .pending = refreshed { hasPending = true }
+                    if case .pending = refreshed {
+                        hasPending = true
+                    }
                     if case let .unavailable(.busy(milliseconds)) = refreshed {
                         hasPending = true
-                        if let milliseconds { retryAfter.append(milliseconds) }
+                        if let milliseconds {
+                            retryAfter.append(milliseconds)
+                        }
                     }
                 case let .unavailable(.busy(milliseconds)):
                     hasPending = true
-                    if let milliseconds { retryAfter.append(milliseconds) }
+                    if let milliseconds {
+                        retryAfter.append(milliseconds)
+                    }
                 case .ready, .unavailable:
                     break
                 }
@@ -1204,14 +1218,20 @@ struct WorkspaceCodemapPresentationCoordinator {
                 case let .pending(ticket):
                     let refreshed = await store.codemapArtifactDemandStatus(ticket)
                     results[fileID] = refreshed
-                    if case .pending = refreshed { hasPending = true }
+                    if case .pending = refreshed {
+                        hasPending = true
+                    }
                     if case let .unavailable(.busy(milliseconds)) = refreshed {
                         hasPending = true
-                        if let milliseconds { retryAfter.append(milliseconds) }
+                        if let milliseconds {
+                            retryAfter.append(milliseconds)
+                        }
                     }
                 case let .unavailable(.busy(milliseconds)):
                     hasPending = true
-                    if let milliseconds { retryAfter.append(milliseconds) }
+                    if let milliseconds {
+                        retryAfter.append(milliseconds)
+                    }
                 case .ready, .unavailable:
                     break
                 }
@@ -1456,9 +1476,13 @@ struct WorkspaceCodemapPresentationCoordinator {
         issues: [WorkspaceCodemapOperationIssue]
     ) -> WorkspaceCodemapOperationPresentationCoverage {
         guard !issues.isEmpty else { return .complete }
-        if !renderedEntries.isEmpty { return .partial(issues) }
+        if !renderedEntries.isEmpty {
+            return .partial(issues)
+        }
         if issues.contains(where: { issue in
-            if case .pending = issue { return true }
+            if case .pending = issue {
+                return true
+            }
             if case let .automatic(coverage) = issue {
                 switch coverage {
                 case .pending, .provisional:
@@ -1619,7 +1643,9 @@ extension WorkspaceCodemapPresentationCoordinator {
                 }
             } catch {
                 await release(ownership)
-                if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                if Task.isCancelled || error is CancellationError {
+                    throw CancellationError()
+                }
                 throw error
             }
         }
@@ -1789,7 +1815,9 @@ extension WorkspaceCodemapPresentationCoordinator {
         }
 
         let seedHasPending = seedDemand.resultsByFileID.values.contains { result in
-            if case .pending = result { return true }
+            if case .pending = result {
+                return true
+            }
             return false
         }
         let seedBusyDelays = seedDemand.resultsByFileID.values.compactMap { result -> Int? in
@@ -2140,7 +2168,9 @@ extension WorkspaceCodemapPresentationCoordinator {
                     }
 
                     let targetHasPending = targetDemand.resultsByFileID.values.contains { result in
-                        if case .pending = result { return true }
+                        if case .pending = result {
+                            return true
+                        }
                         return false
                     }
                     let targetBusyDelays = targetDemand.resultsByFileID.values.compactMap { result -> Int? in
@@ -2330,10 +2360,14 @@ extension WorkspaceCodemapPresentationCoordinator {
         orderedCandidates.sort { lhs, rhs in
             let lhsSeed = seedSet.contains(lhs.fileID)
             let rhsSeed = seedSet.contains(rhs.fileID)
-            if lhsSeed != rhsSeed { return lhsSeed }
+            if lhsSeed != rhsSeed {
+                return lhsSeed
+            }
             let lhsDepth = provenanceByFileID[lhs.fileID]?.depth ?? .max
             let rhsDepth = provenanceByFileID[rhs.fileID]?.depth ?? .max
-            if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+            if lhsDepth != rhsDepth {
+                return lhsDepth < rhsDepth
+            }
             if lhs.logicalPath.displayPath != rhs.logicalPath.displayPath {
                 return lhs.logicalPath.displayPath.utf8.lexicographicallyPrecedes(
                     rhs.logicalPath.displayPath.utf8

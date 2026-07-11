@@ -7029,7 +7029,9 @@ final class CodexNativeSessionController {
 
         if let string = value as? String {
             let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { return nil }
+            if trimmed.isEmpty {
+                return nil
+            }
             if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") || trimmed.hasPrefix("\""),
                let data = trimmed.data(using: .utf8),
                let nested = try? JSONSerialization.jsonObject(with: data, options: []),
@@ -7045,7 +7047,9 @@ final class CodexNativeSessionController {
                first == "\"" || first == "'"
             {
                 let inner = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !inner.isEmpty { return inner }
+                if !inner.isEmpty {
+                    return inner
+                }
             }
             return trimmed
         }
@@ -7340,7 +7344,9 @@ final class CodexNativeSessionController {
         for key in identifyingKeys {
             guard let value = candidate[key] as? String else { continue }
             let lowered = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if lowered.isEmpty { continue }
+            if lowered.isEmpty {
+                continue
+            }
             if lowered.hasPrefix(mcpPrefix) {
                 return true
             }
@@ -7471,7 +7477,9 @@ final class CodexNativeSessionController {
         for key in AgentWebToolPayloadKeys.resultWrapperKeys {
             guard let value = candidate[key] else { continue }
             if let array = value as? [Any] {
-                if !array.isEmpty { object[searchArrayKey(forWrapper: key)] = array }
+                if !array.isEmpty {
+                    object[searchArrayKey(forWrapper: key)] = array
+                }
                 copySearchPayloadFields(from: candidate, into: &object)
                 normalizeSearchContentArrays(in: &object)
                 return jsonString(from: object)
@@ -7578,7 +7586,9 @@ final class CodexNativeSessionController {
     }
 
     private func webReadResultIndicatesFailure(_ candidate: [String: Any]) -> Bool {
-        if boolValue(from: candidate, keys: ["isError", "is_error"]) == true { return true }
+        if boolValue(from: candidate, keys: ["isError", "is_error"]) == true {
+            return true
+        }
         if let status = stringValue(from: candidate, keys: ["status"])?.lowercased(),
            ["error", "failed", "failure"].contains(status)
         {
@@ -7588,13 +7598,19 @@ final class CodexNativeSessionController {
     }
 
     private func compactWebReadResultValue(_ value: Any) -> Any? {
-        if let text = value as? String { return compactWebText(text) }
-        if value is NSNumber { return value }
+        if let text = value as? String {
+            return compactWebText(text)
+        }
+        if value is NSNumber {
+            return value
+        }
         return nil
     }
 
     private func compactWebReadErrorValue(_ value: Any) -> Any? {
-        if let compact = compactWebReadResultValue(value) { return compact }
+        if let compact = compactWebReadResultValue(value) {
+            return compact
+        }
         guard let error = value as? [String: Any] else { return nil }
         var compactError: [String: Any] = [:]
         for key in ["message", "type", "code", "param", "status"] {
@@ -7607,7 +7623,9 @@ final class CodexNativeSessionController {
     private func isSearchWebReadOrFindPayload(_ object: [String: Any]) -> Bool {
         let rawAction = stringValue(from: object, keys: AgentWebToolPayloadKeys.operationKeys)
         let action = AgentWebToolCanonicalNames.canonicalWebActionType(rawAction) ?? rawAction?.lowercased()
-        if ["open", "open_page", "read", "fetch", "find", "find_in_page"].contains(action ?? "") { return true }
+        if ["open", "open_page", "read", "fetch", "find", "find_in_page"].contains(action ?? "") {
+            return true
+        }
         let hasTarget = stringValue(from: object, keys: AgentWebToolPayloadKeys.urlTargetKeys + AgentWebToolPayloadKeys.refTargetKeys) != nil
         let hasFind = stringValue(from: object, keys: AgentWebToolPayloadKeys.findKeys) != nil
         return hasTarget && hasFind
@@ -7667,7 +7685,9 @@ final class CodexNativeSessionController {
         if let text = value as? String {
             return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.count <= 500
         }
-        if value is NSNumber { return true }
+        if value is NSNumber {
+            return true
+        }
         return false
     }
 
@@ -7793,7 +7813,9 @@ final class CodexNativeSessionController {
     private func hasNonEmptyErrorSignal(in candidate: [String: Any]) -> Bool {
         for key in ["error", "errors", "error_message", "errorMessage"] {
             guard let value = candidate[key] else { continue }
-            if hasNonEmptyErrorValue(value) { return true }
+            if hasNonEmptyErrorValue(value) {
+                return true
+            }
         }
         return false
     }
@@ -7806,10 +7828,14 @@ final class CodexNativeSessionController {
             return array.contains { hasNonEmptyErrorValue($0) }
         }
         if let object = value as? [String: Any] {
-            if object.isEmpty { return false }
+            if object.isEmpty {
+                return false
+            }
             for key in ["message", "detail", "description", "code", "error", "error_message", "errorMessage"] {
                 guard let nested = object[key] else { continue }
-                if hasNonEmptyErrorValue(nested) { return true }
+                if hasNonEmptyErrorValue(nested) {
+                    return true
+                }
             }
             return object.values.contains { value in
                 if value is [String: Any] || value is [Any] {

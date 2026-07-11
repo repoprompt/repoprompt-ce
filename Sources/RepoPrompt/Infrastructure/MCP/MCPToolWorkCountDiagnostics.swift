@@ -166,14 +166,18 @@ enum MCPToolWorkCountDiagnostics {
             func append(_ snapshot: GitInvocationSnapshot) {
                 lock.lock()
                 git.append(snapshot)
-                if git.count > limit { git.removeFirst(git.count - limit) }
+                if git.count > limit {
+                    git.removeFirst(git.count - limit)
+                }
                 lock.unlock()
             }
 
             func append(_ snapshot: ReadFileInvocationSnapshot) {
                 lock.lock()
                 readFile.append(snapshot)
-                if readFile.count > limit { readFile.removeFirst(readFile.count - limit) }
+                if readFile.count > limit {
+                    readFile.removeFirst(readFile.count - limit)
+                }
                 lock.unlock()
             }
 

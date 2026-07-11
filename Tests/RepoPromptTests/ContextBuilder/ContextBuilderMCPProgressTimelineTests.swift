@@ -759,9 +759,15 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
     }
 
     func waitUntilSleeping(timeout: TimeInterval = TestFenceDefaults.enterWait) async throws -> TimeInterval {
-        if let seconds = peekSleepingSeconds { return seconds }
-        if isCancelled { throw CancellationError() }
-        if let terminal = terminalError { throw terminal }
+        if let seconds = peekSleepingSeconds {
+            return seconds
+        }
+        if isCancelled {
+            throw CancellationError()
+        }
+        if let terminal = terminalError {
+            throw terminal
+        }
 
         let timeoutError = AsyncTestConditionTimeout(
             description: "context builder soft-bound sleep gate",
@@ -795,7 +801,9 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
     }
 
     func waitUntilCancelled(timeout: TimeInterval = TestFenceDefaults.enterWait) async throws {
-        if isCancelled { return }
+        if isCancelled {
+            return
+        }
         try await AsyncTestWait.waitUntil(
             "context builder soft-bound cancellation",
             timeout: timeout

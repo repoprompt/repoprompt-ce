@@ -284,7 +284,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     #if !DEBUG
                         // Suppress known non-actionable abort side-effect errors (e.g. JSON parse
                         // errors from killed tool processes) in release builds.
-                        if Self.isKnownNonActionableStreamError(trimmed) { continue eventLoop }
+                        if Self.isKnownNonActionableStreamError(trimmed) {
+                            continue eventLoop
+                        }
                     #endif
                     let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(errorItem)

@@ -392,7 +392,9 @@ struct CustomTextField: NSViewRepresentable {
         // IME FIX: Avoid stomping marked text (composition) with programmatic writes.
         if textView.string != text {
             // If an IME composition is active, DO NOT overwrite.
-            if textView.hasMarkedText() { return }
+            if textView.hasMarkedText() {
+                return
+            }
 
             context.coordinator.internalUpdateInProgress = true
 
@@ -447,7 +449,9 @@ struct CustomTextField: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
-            if internalUpdateInProgress { return }
+            if internalUpdateInProgress {
+                return
+            }
             guard isActive, let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
 
@@ -472,7 +476,9 @@ struct CustomTextField: NSViewRepresentable {
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             // IME FIX: if composing, let IME handle keys (Return/space/numbers etc.)
-            if textView.hasMarkedText() { return false }
+            if textView.hasMarkedText() {
+                return false
+            }
             guard isActive else { return false }
             if slashSkillHelper.handleCommandIfNeeded(
                 textView: textView,
@@ -500,7 +506,9 @@ struct CustomTextField: NSViewRepresentable {
                 return true
             }
             // Some keyboards/IMEs use insertLineBreak for Shift+Return; let it fall through to newline.
-            if commandSelector == #selector(NSResponder.insertLineBreak(_:)) { return false }
+            if commandSelector == #selector(NSResponder.insertLineBreak(_:)) {
+                return false
+            }
             if commandSelector == #selector(NSText.paste(_:)) {
                 if let imageAwareTextView = textView as? ImageAwareTextView {
                     return imageAwareTextView.imagePasteHandler?(NSPasteboard.general) == true

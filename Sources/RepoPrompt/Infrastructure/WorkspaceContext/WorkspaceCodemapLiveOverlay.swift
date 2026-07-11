@@ -193,7 +193,9 @@ actor WorkspaceCodemapLiveOverlay {
     @discardableResult
     func unregister(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
         let removed = roots.removeValue(forKey: rootEpoch) != nil
-        if removed { removeAdmissionReservations(rootEpoch: rootEpoch) }
+        if removed {
+            removeAdmissionReservations(rootEpoch: rootEpoch)
+        }
         return removed
     }
 
@@ -1356,7 +1358,9 @@ actor WorkspaceCodemapLiveOverlay {
         return result.sorted {
             let lhs = $0.binding.identity.standardizedRelativePath
             let rhs = $1.binding.identity.standardizedRelativePath
-            if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
+            if lhs != rhs {
+                return lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
+            }
             return $0.binding.identity.fileID.uuidString < $1.binding.identity.fileID.uuidString
         }
     }
@@ -1752,7 +1756,9 @@ actor WorkspaceCodemapLiveOverlay {
     private func ensureAccessOrdinalCapacity(requiredCount: Int) {
         guard requiredCount > 0, let required = UInt64(exactly: requiredCount) else { return }
         let (_, overflow) = nextAccessOrdinal.addingReportingOverflow(required)
-        if overflow { rebaseAccessOrdinals() }
+        if overflow {
+            rebaseAccessOrdinals()
+        }
     }
 
     private func rebaseAccessOrdinals() {
@@ -1800,9 +1806,15 @@ actor WorkspaceCodemapLiveOverlay {
             }
         }
         items.sort {
-            if $0.ordinal != $1.ordinal { return $0.ordinal < $1.ordinal }
-            if $0.rootEpoch != $1.rootEpoch { return rootEpochPrecedes($0.rootEpoch, $1.rootEpoch) }
-            if $0.path != $1.path { return $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
+            if $0.ordinal != $1.ordinal {
+                return $0.ordinal < $1.ordinal
+            }
+            if $0.rootEpoch != $1.rootEpoch {
+                return rootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
+            }
+            if $0.path != $1.path {
+                return $0.path.utf8.lexicographicallyPrecedes($1.path.utf8)
+            }
             return ($0.fileID?.uuidString ?? "") < ($1.fileID?.uuidString ?? "")
         }
         for (offset, item) in items.enumerated() {
@@ -2021,7 +2033,9 @@ actor WorkspaceCodemapLiveOverlay {
     }
 
     private func loadedRootRelativePath(repositoryRelativePath: String, prefix: String) -> String? {
-        if prefix.isEmpty { return validatedRelativePath(repositoryRelativePath) }
+        if prefix.isEmpty {
+            return validatedRelativePath(repositoryRelativePath)
+        }
         let expectedPrefix = prefix + "/"
         guard repositoryRelativePath.hasPrefix(expectedPrefix) else { return nil }
         return validatedRelativePath(String(repositoryRelativePath.dropFirst(expectedPrefix.count)))

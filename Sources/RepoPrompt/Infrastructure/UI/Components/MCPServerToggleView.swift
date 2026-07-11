@@ -268,7 +268,9 @@ struct MCPServerPopoverContent: View {
         .frame(maxHeight: popoverMaxHeight)
         .onChange(of: server.activeToolName) { _, newValue in
             // reset UI flag when a new tool starts
-            if newValue != nil { didCancelTool = false }
+            if newValue != nil {
+                didCancelTool = false
+            }
         }
         .onAppear {
             server.setDashboardUpdatesVisible(true, consumer: .toolbarPopover)

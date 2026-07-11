@@ -491,7 +491,9 @@ final class CodexSteerAckTrackerTests: XCTestCase {
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if await condition() { return true }
+            if await condition() {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return await condition()
@@ -647,7 +649,9 @@ private actor AckTrackerSteerGate {
 
     func waitUntilStarted() async -> Bool {
         for _ in 0 ..< Self.waitPollLimit {
-            if started { return true }
+            if started {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return started
@@ -660,7 +664,9 @@ private actor AckTrackerSteerGate {
 
     func waitUntilCompleted() async -> Bool {
         for _ in 0 ..< Self.waitPollLimit {
-            if completed { return true }
+            if completed {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return completed

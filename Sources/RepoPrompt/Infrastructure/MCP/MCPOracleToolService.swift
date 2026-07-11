@@ -453,9 +453,15 @@ struct MCPOracleToolService {
         func bracketedModes(_ supportedModes: ToolResultDTOs.SupportedModesInfo?) -> String {
             let modes = supportedModes ?? ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
             var items: [String] = []
-            if modes.chat { items.append("Chat") }
-            if modes.plan { items.append("Plan") }
-            if modes.review { items.append("Review") }
+            if modes.chat {
+                items.append("Chat")
+            }
+            if modes.plan {
+                items.append("Plan")
+            }
+            if modes.review {
+                items.append("Review")
+            }
             return "[\(items.joined(separator: ", "))]"
         }
 

@@ -159,7 +159,9 @@ public enum CatalogRegularFileEligibility: Sendable, Equatable {
     case ineligible(CatalogRegularFileIneligibilityReason)
 
     public var isEligible: Bool {
-        if case .eligible = self { return true }
+        if case .eligible = self {
+            return true
+        }
         return false
     }
 }

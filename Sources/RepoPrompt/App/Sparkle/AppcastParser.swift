@@ -61,7 +61,9 @@ final class AppcastParser: NSObject, XMLParserDelegate {
             {
                 return lhsBuild < rhsBuild
             }
-            if isVersion(lhs.version, newerThan: rhs.version) { return false }
+            if isVersion(lhs.version, newerThan: rhs.version) {
+                return false
+            }
             return isVersion(rhs.version, newerThan: lhs.version)
         }
     }
@@ -89,8 +91,12 @@ final class AppcastParser: NSObject, XMLParserDelegate {
             let v1Part = i < v1Components.count ? v1Components[i] : 0
             let v2Part = i < v2Components.count ? v2Components[i] : 0
 
-            if v1Part > v2Part { return true }
-            if v1Part < v2Part { return false }
+            if v1Part > v2Part {
+                return true
+            }
+            if v1Part < v2Part {
+                return false
+            }
         }
         return false
     }

@@ -264,7 +264,9 @@ enum DurableArtifactSecureIO {
         let descriptor = openat(parent.descriptor.rawValue, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw ioError("directory-open") }
         do {
-            if created, fchmod(descriptor, directoryMode) != 0 { throw ioError("directory-mode") }
+            if created, fchmod(descriptor, directoryMode) != 0 {
+                throw ioError("directory-mode")
+            }
             let value = try identity(descriptor)
             guard value.isDirectory,
                   value.owner == geteuid(),
@@ -272,7 +274,9 @@ enum DurableArtifactSecureIO {
                   value.device == parent.identity.device,
                   try pathIdentity(parent: parent, name: name) == value
             else { throw DurableArtifactStoreError.insecureEntry }
-            if created { try synchronize(parent.descriptor.rawValue, operation: "directory-parent-sync") }
+            if created {
+                try synchronize(parent.descriptor.rawValue, operation: "directory-parent-sync")
+            }
             return DurableArtifactDirectory(descriptor: descriptor, identity: value)
         } catch {
             Darwin.close(descriptor)
@@ -283,7 +287,9 @@ enum DurableArtifactSecureIO {
     static func optionalOwnedDirectory(parent: DurableArtifactDirectory, name: String) throws -> DurableArtifactDirectory? {
         guard isSafeComponent(name) else { throw DurableArtifactStoreError.insecureEntry }
         let descriptor = openat(parent.descriptor.rawValue, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        if descriptor < 0, errno == ENOENT { return nil }
+        if descriptor < 0, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else { throw ioError("directory-open") }
         do {
             let value = try identity(descriptor)
@@ -326,9 +332,13 @@ enum DurableArtifactSecureIO {
         }
         guard descriptor >= 0 else { throw ioError("file-open-or-create") }
         do {
-            if created, fchmod(descriptor, fileMode) != 0 { throw ioError("file-mode") }
+            if created, fchmod(descriptor, fileMode) != 0 {
+                throw ioError("file-mode")
+            }
             let lockIdentity = try validateRegularFile(descriptor: descriptor, parent: parent, name: name)
-            if created { try synchronize(parent.descriptor.rawValue, operation: "file-parent-sync") }
+            if created {
+                try synchronize(parent.descriptor.rawValue, operation: "file-parent-sync")
+            }
             try ensureStableLockBinding(
                 parent: parent,
                 lockName: name,
@@ -442,7 +452,9 @@ enum DurableArtifactSecureIO {
         guard isSafeComponent(name) else { throw DurableArtifactStoreError.insecureEntry }
         let access = writable ? O_RDWR : O_RDONLY
         let descriptor = openat(parent.descriptor.rawValue, name, access | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        if descriptor < 0, errno == ENOENT { return nil }
+        if descriptor < 0, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else { throw ioError("regular-file-open") }
         do {
             let value = try validateRegularFile(descriptor: descriptor, parent: parent, name: name)
@@ -516,8 +528,12 @@ enum DurableArtifactSecureIO {
     ) throws -> T? {
         let operation = (exclusive ? LOCK_EX : LOCK_SH) | (nonBlocking ? LOCK_NB : 0)
         while flock(descriptor.rawValue, operation) != 0 {
-            if errno == EINTR { continue }
-            if nonBlocking, errno == EWOULDBLOCK || errno == EAGAIN { return nil }
+            if errno == EINTR {
+                continue
+            }
+            if nonBlocking, errno == EWOULDBLOCK || errno == EAGAIN {
+                return nil
+            }
             throw ioError("flock")
         }
         defer { _ = flock(descriptor.rawValue, LOCK_UN) }
@@ -538,7 +554,9 @@ enum DurableArtifactSecureIO {
         )
         let operation = (exclusive ? LOCK_EX : LOCK_SH) | (nonBlocking ? LOCK_NB : 0)
         while flock(descriptor.rawValue, operation) != 0 {
-            if errno == EINTR { continue }
+            if errno == EINTR {
+                continue
+            }
             if nonBlocking, errno == EWOULDBLOCK || errno == EAGAIN {
                 descriptor.close()
                 return nil
@@ -562,7 +580,9 @@ enum DurableArtifactSecureIO {
             var offset = 0
             while offset < buffer.count {
                 let result = Darwin.write(descriptor, base.advanced(by: offset), buffer.count - offset)
-                if result < 0, errno == EINTR { continue }
+                if result < 0, errno == EINTR {
+                    continue
+                }
                 guard result > 0 else { throw ioError("write") }
                 offset += result
             }
@@ -579,7 +599,9 @@ enum DurableArtifactSecureIO {
                 let (position, overflow) = offset.addingReportingOverflow(off_t(consumed))
                 guard !overflow else { throw DurableArtifactStoreError.invalidFraming }
                 let result = Darwin.pread(descriptor, base.advanced(by: consumed), count - consumed, position)
-                if result < 0, errno == EINTR { continue }
+                if result < 0, errno == EINTR {
+                    continue
+                }
                 guard result > 0 else { throw DurableArtifactStoreError.invalidFraming }
                 consumed += result
             }
@@ -591,8 +613,12 @@ enum DurableArtifactSecureIO {
         var byte: UInt8 = 0
         while true {
             let result = Darwin.pread(descriptor, &byte, 1, offset)
-            if result < 0, errno == EINTR { continue }
-            if result < 0 { throw ioError("pread-eof") }
+            if result < 0, errno == EINTR {
+                continue
+            }
+            if result < 0 {
+                throw ioError("pread-eof")
+            }
             return result == 0
         }
     }
@@ -619,7 +645,9 @@ enum DurableArtifactSecureIO {
 
     static func synchronize(_ descriptor: Int32, operation: String) throws {
         while fsync(descriptor) != 0 {
-            if errno == EINTR { continue }
+            if errno == EINTR {
+                continue
+            }
             throw ioError(operation)
         }
     }
@@ -637,8 +665,12 @@ enum DurableArtifactSecureIO {
             to,
             UInt32(RENAME_EXCL)
         )
-        if result == 0 { return true }
-        if errno == EEXIST { return false }
+        if result == 0 {
+            return true
+        }
+        if errno == EEXIST {
+            return false
+        }
         throw ioError("rename-no-replace")
     }
 
@@ -655,7 +687,9 @@ enum DurableArtifactSecureIO {
 
         return try withDirectoryMutationAuthority(destinationParent) {
             if fclonefileat(sourceDescriptor, destinationParent.descriptor.rawValue, destinationName, 0) != 0 {
-                if errno == EEXIST { return nil }
+                if errno == EEXIST {
+                    return nil
+                }
                 throw ioError("descriptor-clone-install")
             }
 
@@ -783,7 +817,9 @@ enum DurableArtifactSecureIO {
             return false
         }
         guard unlinkat(parent.descriptor.rawValue, capturedName, 0) == 0 else {
-            if errno == ENOENT { return false }
+            if errno == ENOENT {
+                return false
+            }
             throw ioError("captured-unlink")
         }
         try synchronize(parent.descriptor.rawValue, operation: "captured-unlink-parent-sync")
@@ -819,7 +855,9 @@ enum DurableArtifactSecureIO {
             return false
         }
         guard unlinkat(parent.descriptor.rawValue, capturedName, AT_REMOVEDIR) == 0 else {
-            if errno == ENOENT { return false }
+            if errno == ENOENT {
+                return false
+            }
             throw ioError("captured-directory-unlink")
         }
         try synchronize(parent.descriptor.rawValue, operation: "captured-directory-parent-sync")
@@ -867,8 +905,12 @@ enum DurableArtifactSecureIO {
 
     private static func entryIsMissing(parent: DurableArtifactDirectory, name: String) throws -> Bool {
         var status = stat()
-        if fstatat(parent.descriptor.rawValue, name, &status, AT_SYMLINK_NOFOLLOW) == 0 { return false }
-        if errno == ENOENT { return true }
+        if fstatat(parent.descriptor.rawValue, name, &status, AT_SYMLINK_NOFOLLOW) == 0 {
+            return false
+        }
+        if errno == ENOENT {
+            return true
+        }
         throw ioError("captured-original-check")
     }
 
@@ -887,7 +929,9 @@ enum DurableArtifactSecureIO {
             throw DurableArtifactStoreError.insecureEntry
         }
         while flock(authority, LOCK_EX) != 0 {
-            if errno == EINTR { continue }
+            if errno == EINTR {
+                continue
+            }
             throw ioError("directory-authority-flock")
         }
         defer { _ = flock(authority, LOCK_UN) }
@@ -924,7 +968,9 @@ enum DurableArtifactSecureIO {
                     String(cString: $0)
                 }
             }
-            if name == "." || name == ".." { continue }
+            if name == "." || name == ".." {
+                continue
+            }
             try body(name)
             errno = 0
         }

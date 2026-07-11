@@ -152,7 +152,9 @@ final class DurableArtifactInstallationIdentity: @unchecked Sendable {
                 name: "installation.salt"
             )
         } catch let error as DurableArtifactStoreError {
-            if case .simulatedCrash = error { preserve = true }
+            if case .simulatedCrash = error {
+                preserve = true
+            }
             throw error
         }
     }

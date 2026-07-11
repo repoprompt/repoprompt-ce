@@ -23,8 +23,12 @@ final class OpenPanelService {
         panel.canCreateDirectories = true
         panel.prompt = "Choose"
         panel.title = title
-        if let message { panel.message = message }
-        if let startingDirectory { panel.directoryURL = startingDirectory }
+        if let message {
+            panel.message = message
+        }
+        if let startingDirectory {
+            panel.directoryURL = startingDirectory
+        }
 
         // Prefer sheet modal to avoid runModal() blocking the main run loop.
         if let window = NSApp.keyWindow ?? NSApp.mainWindow {
@@ -60,8 +64,12 @@ final class OpenPanelService {
         panel.allowedContentTypes = [.image]
         panel.prompt = "Attach"
         panel.title = title
-        if let message { panel.message = message }
-        if let startingDirectory { panel.directoryURL = startingDirectory }
+        if let message {
+            panel.message = message
+        }
+        if let startingDirectory {
+            panel.directoryURL = startingDirectory
+        }
 
         if let window = window ?? NSApp.keyWindow ?? NSApp.mainWindow {
             return await withCheckedContinuation { cont in

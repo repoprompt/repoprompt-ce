@@ -133,7 +133,9 @@ enum AppSettingsCardPresentationBuilder {
         let applied = bool(result, key: "applied")
         let notApplied = changed == true && applied == false
         var parts = ["set"]
-        if let key { parts.append(key) }
+        if let key {
+            parts.append(key)
+        }
         if let changed {
             parts.append(changed ? "changed" : "unchanged")
         }
@@ -235,8 +237,12 @@ enum AppSettingsCardPresentationBuilder {
 
     private static func stringArray(_ value: Any?) -> [String]? {
         (value as? [Any])?.compactMap { element in
-            if let string = element as? String { return trimmed(string) }
-            if let number = element as? NSNumber { return trimmed(number.stringValue) }
+            if let string = element as? String {
+                return trimmed(string)
+            }
+            if let number = element as? NSNumber {
+                return trimmed(number.stringValue)
+            }
             return nil
         }
     }

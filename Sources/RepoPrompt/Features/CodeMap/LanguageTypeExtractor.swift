@@ -762,9 +762,15 @@ enum LanguageTypeExtractor {
 
         func asDictionary(language: LanguageType) -> [String: String] {
             var dict: [String: String] = [:]
-            if let name, !name.isEmpty { dict["name"] = name }
-            if let paramList, !paramList.isEmpty { dict["paramList"] = paramList }
-            if let returnType, !returnType.isEmpty { dict["returnType"] = returnType }
+            if let name, !name.isEmpty {
+                dict["name"] = name
+            }
+            if let paramList, !paramList.isEmpty {
+                dict["paramList"] = paramList
+            }
+            if let returnType, !returnType.isEmpty {
+                dict["returnType"] = returnType
+            }
             if let parameterTypes, !parameterTypes.isEmpty {
                 let joined = parameterTypes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.joined(separator: ", ")
                 dict["parameterTypes"] = joined
@@ -931,10 +937,14 @@ enum LanguageTypeExtractor {
         var i = startIndex
         while i < text.endIndex {
             let ch = text[i]
-            if ch == "(" { depth += 1 }
+            if ch == "(" {
+                depth += 1
+            }
             if ch == ")" {
                 depth -= 1
-                if depth == 0 { return i }
+                if depth == 0 {
+                    return i
+                }
             }
             i = text.index(after: i)
         }
@@ -946,10 +956,14 @@ enum LanguageTypeExtractor {
         var i = startIndex
         while i < text.endIndex {
             let ch = text[i]
-            if ch == "{" { depth += 1 }
+            if ch == "{" {
+                depth += 1
+            }
             if ch == "}" {
                 depth -= 1
-                if depth == 0 { return i }
+                if depth == 0 {
+                    return i
+                }
             }
             i = text.index(after: i)
         }
@@ -1028,8 +1042,12 @@ enum LanguageTypeExtractor {
         let eqIndex = firstTopLevelAssignmentEquals(in: trimmed, startingAt: typeStart)
         let semiIndex = firstTopLevelIndex(of: ";", in: trimmed, startingAt: typeStart)
         var endIndex = trimmed.endIndex
-        if let eqIndex, eqIndex < endIndex { endIndex = eqIndex }
-        if let semiIndex, semiIndex < endIndex { endIndex = semiIndex }
+        if let eqIndex, eqIndex < endIndex {
+            endIndex = eqIndex
+        }
+        if let semiIndex, semiIndex < endIndex {
+            endIndex = semiIndex
+        }
         return trimTSType(trimmed[typeStart ..< endIndex])
     }
 
@@ -1713,7 +1731,9 @@ enum LanguageTypeExtractor {
         var results = [String]()
 
         for chunk in chunks {
-            if chunk.isEmpty { continue }
+            if chunk.isEmpty {
+                continue
+            }
             // skip varargs
             if chunk.contains("...") {
                 results.append("varargs")
@@ -1747,7 +1767,9 @@ enum LanguageTypeExtractor {
         var results = [String]()
 
         for chunk in chunks {
-            if chunk.isEmpty { continue }
+            if chunk.isEmpty {
+                continue
+            }
             var cleanChunk = chunk
 
             // Remove possible modifiers
@@ -1794,7 +1816,9 @@ enum LanguageTypeExtractor {
 
         for chunk in chunks {
             var cleaned = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
-            if cleaned.isEmpty { continue }
+            if cleaned.isEmpty {
+                continue
+            }
 
             while cleaned.hasPrefix("{") || cleaned.hasPrefix("[") {
                 cleaned.removeFirst()
