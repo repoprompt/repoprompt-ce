@@ -23,6 +23,40 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_debug_provenance_uses_json_validation_and_rejects_truncated_output(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        validator = SCRIPT_DIR / "validate_json.py"
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        provenance = temp_dir / "RepoPromptDebugProvenance.json"
+
+        self.assertIn(
+            'run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_json.py" \\\n        "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"',
+            package_script,
+        )
+        self.assertNotIn(
+            'plutil -lint "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"',
+            package_script,
+        )
+
+        provenance.write_text('{"version": 1}\n', encoding="utf-8")
+        valid = subprocess.run(
+            [sys.executable, str(validator), str(provenance)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        self.assertEqual(valid.stdout.strip(), f"Valid JSON: {provenance}")
+
+        provenance.write_text('{"version":', encoding="utf-8")
+        truncated = subprocess.run(
+            [sys.executable, str(validator), str(provenance)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(truncated.returncode, 1)
+        self.assertIn(f"error: invalid JSON file {provenance}:", truncated.stderr)
+
     def test_runtime_signing_policy_matches_release_metadata_and_entitlement_templates(self) -> None:
         root = SCRIPT_DIR.parent
         metadata = {}
