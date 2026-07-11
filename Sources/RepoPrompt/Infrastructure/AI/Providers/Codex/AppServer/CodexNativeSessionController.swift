@@ -129,6 +129,7 @@ final class CodexNativeSessionController {
     private static let maxCanonicalCompletionTurnIDs = 128
     private static let maxPendingTurnFailures = 64
     private static let computerUseMCPServerName = "computer-use"
+    private var configuredContextWindow: Int?
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
     private static let removedSyntheticNotificationMethods: Set<String> = [
         "item/file_change/output_delta",
@@ -463,6 +464,13 @@ final class CodexNativeSessionController {
         /// Does NOT apply to turn/start, which can block for extended model reasoning.
         var requestTimeout: TimeInterval?
         var configOverridesProvider: () async -> [String: Any]
+        var launchEnvironmentProvider: () async -> [String: String] = {
+            let result = await ProcessEnvironmentBuilder.build(
+                ProcessEnvironmentRequest(purpose: .codexAppServer)
+            )
+            return result.environment
+        }
+
         var approvalPolicyProvider: () -> CodexAgentToolPreferences.ApprovalPolicy
         var sandboxModeProvider: () -> CodexAgentToolPreferences.SandboxMode
         var approvalReviewerProvider: () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() }
@@ -1062,6 +1070,11 @@ final class CodexNativeSessionController {
             }
             await client.updateWorkingDirectory(workspacePath)
             await updateClientProcessLaunchPolicy()
+            let launchEnvironment = await options.launchEnvironmentProvider()
+            configuredContextWindow = CodexContextWindowResolver.resolve(
+                launchEnvironment: launchEnvironment,
+                workingDirectory: workspacePath
+            ).configuredContextWindow
             try await client.startIfNeeded()
             await ensureInboundStreamsStarted()
 
@@ -3381,8 +3394,11 @@ final class CodexNativeSessionController {
             )
         }
 
-        static func test_parseTokenUsage(from params: [String: Any]) -> AgentContextUsage? {
-            parseTokenUsagePayload(from: params)
+        static func test_parseTokenUsage(
+            from params: [String: Any],
+            configuredContextWindow: Int? = nil
+        ) -> AgentContextUsage? {
+            parseTokenUsagePayload(from: params, configuredContextWindow: configuredContextWindow)
         }
 
         static func test_parseErrorNotification(from params: [String: Any]) -> ErrorNotification? {
@@ -4403,10 +4419,13 @@ final class CodexNativeSessionController {
     }
 
     private func parseTokenUsage(from params: [String: Any]) -> AgentContextUsage? {
-        Self.parseTokenUsagePayload(from: params)
+        Self.parseTokenUsagePayload(from: params, configuredContextWindow: configuredContextWindow)
     }
 
-    private static func parseTokenUsagePayload(from params: [String: Any]) -> AgentContextUsage? {
+    private static func parseTokenUsagePayload(
+        from params: [String: Any],
+        configuredContextWindow: Int? = nil
+    ) -> AgentContextUsage? {
         let tokenUsage = tokenUsageObject(from: params)
         guard let tokenUsage else { return nil }
 
@@ -4431,6 +4450,7 @@ final class CodexNativeSessionController {
         }
         return AgentContextUsage(
             modelContextWindow: contextWindow,
+            configuredContextWindow: configuredContextWindow,
             lastTotalTokens: lastTotal,
             totalTotalTokens: totalTotal
         )

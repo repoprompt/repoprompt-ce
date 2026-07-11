@@ -306,6 +306,7 @@ struct AgentRuntimeSidebarView: View {
                     sourceLabel: runtimeVM.snapshot.usedTokens != nil
                         ? runtimeVM.snapshot.usageSource.label
                         : "Estimated",
+                    isContextWindowKnown: runtimeVM.snapshot.displayContextWindowTokens != nil,
                     style: .labeled
                 )
                 .sidebarCard()

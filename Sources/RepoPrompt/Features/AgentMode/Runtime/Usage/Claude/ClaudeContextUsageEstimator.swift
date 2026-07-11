@@ -89,9 +89,9 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let prompt = max(0, promptTokens ?? 0)
         let existing = session.codexContextUsage
         let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow
-        let contextUsed = normalizedContextUsedTokens(
+        let contextUsed = ClaudeContextUsedTokensBound.normalizedReading(
             contextUsedTokens,
-            modelContextWindow: resolvedWindow
+            canonicalWindow: resolvedWindow
         ) ?? 0
 
         // Record exact stream-derived context in the per-turn accumulator so
@@ -116,6 +116,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
 
         session.codexContextUsage = AgentContextUsage(
             modelContextWindow: resolvedWindow,
+            configuredContextWindow: session.claudeConfiguredContextWindow,
             lastTotalTokens: resolvedUsed,
             totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens
         )
@@ -135,15 +136,16 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
     ) -> ContextUsageSnapshot? {
         let existing = session.codexContextUsage
         let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow
-        let resolvedContextUsed = normalizedContextUsedTokens(
+        let resolvedContextUsed = ClaudeContextUsedTokensBound.normalizedReading(
             contextUsedTokens,
-            modelContextWindow: resolvedWindow
+            canonicalWindow: resolvedWindow
         ) ?? 0
         let resolvedUsed = resolvedContextUsed > 0 ? resolvedContextUsed : existing?.lastTotalTokens
         guard resolvedUsed != nil || resolvedWindow != nil else { return nil }
 
         session.codexContextUsage = AgentContextUsage(
             modelContextWindow: resolvedWindow,
+            configuredContextWindow: session.claudeConfiguredContextWindow,
             lastTotalTokens: resolvedUsed,
             totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens
         )
@@ -198,9 +200,9 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let estimatedUser = accumulator?.estimatedUserInputTokens ?? 0
         let estimatedToolInput = accumulator?.estimatedToolInputTokens ?? 0
         let estimatedToolOutput = accumulator?.estimatedToolOutputTokens ?? 0
-        let resolvedContextUsed = normalizedContextUsedTokens(
+        let resolvedContextUsed = ClaudeContextUsedTokensBound.normalizedReading(
             contextUsedTokens,
-            modelContextWindow: session.codexContextUsage?.modelContextWindow
+            canonicalWindow: session.codexContextUsage?.modelContextWindow
         ) ?? 0
         let hasUsage = prompt > 0
             || completion > 0
@@ -213,7 +215,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
             if !session.providerTokenUsageByTurn.isEmpty, session.codexContextUsage == nil {
                 session.codexContextUsage = contextUsageBuilder(
                     session.providerTokenUsageByTurn,
-                    nil
+                    nil,
+                    session.claudeConfiguredContextWindow
                 )
                 _ = updateSnapshot(
                     from: session.codexContextUsage,
@@ -247,7 +250,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let existingUsage = session.codexContextUsage
         let rebuilt = contextUsageBuilder(
             session.providerTokenUsageByTurn,
-            existingUsage?.modelContextWindow
+            existingUsage?.modelContextWindow,
+            session.claudeConfiguredContextWindow
         )
         if let rebuilt {
             session.codexContextUsage = rebuilt
@@ -260,19 +264,6 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         )
         session.isDirty = true
         return true
-    }
-
-    private func normalizedContextUsedTokens(
-        _ contextUsedTokens: Int?,
-        modelContextWindow: Int?
-    ) -> Int? {
-        let normalized = max(0, contextUsedTokens ?? 0)
-        guard normalized > 0 else { return nil }
-        let maxAllowed = max(1, modelContextWindow ?? 200_000)
-        if normalized > maxAllowed {
-            return nil
-        }
-        return normalized
     }
 
     private func updateSnapshot(

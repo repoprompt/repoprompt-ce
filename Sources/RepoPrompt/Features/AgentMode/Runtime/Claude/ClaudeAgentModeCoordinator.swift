@@ -258,6 +258,7 @@ final class ClaudeAgentModeCoordinator {
         let runID = session.runID ?? UUID()
         session.runID = runID
         let launchModelRaw = session.selectedModelRaw
+        let launchKey = viewModel?.provisionalClaudeContextWindowKey(for: session)
         let runtimeVariant = session.selectedAgent.claudeRuntimeVariant ?? .standard
         let runtimePermission = effectiveClaudeRuntimePermission(for: session)
         let effectivePermissionMode = effectiveClaudePermissionResolution(
@@ -356,6 +357,13 @@ final class ClaudeAgentModeCoordinator {
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
                 effectiveMCPStrictMode: effectiveMCPStrictMode
             )
+            if let launchKey {
+                viewModel?.syncSpawnResolvedClaudeConfiguredContextWindow(
+                    sessionRef.configuredContextWindow,
+                    launchKey: launchKey,
+                    for: session
+                )
+            }
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
         } catch ControllerLifecycleError.superseded {
             return

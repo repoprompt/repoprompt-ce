@@ -462,6 +462,8 @@ extension AgentModeViewModel {
         // Provider session ID for resumption (e.g., Claude CLI session_id)
         var providerSessionID: String?
         var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
+        var claudeConfiguredContextWindow: Int?
+        var claudeConfiguredContextWindowKey: ClaudeProvisionalContextWindowResolver.Key?
         var pendingNonCodexUserInputTokenQueue: [Int] = []
         var activeNonCodexTurnTokenAccumulator: NonCodexTurnTokenAccumulator?
 

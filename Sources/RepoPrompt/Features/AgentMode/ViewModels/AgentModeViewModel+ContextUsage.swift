@@ -73,26 +73,23 @@ extension AgentModeViewModel {
 
     nonisolated static func contextUsageFromClaudeProviderTokens(
         _ usage: [AgentTokenUsagePersist],
-        modelContextWindow: Int?
+        modelContextWindow: Int?,
+        configuredContextWindow: Int?
     ) -> AgentContextUsage? {
         guard !usage.isEmpty else { return nil }
-        let defaultClaudeContextWindow = 200_000
-        let maxContextTokens = max(1, modelContextWindow ?? defaultClaudeContextWindow)
         // Only trust exact stream-derived context snapshots (contextUsedTokens).
         // Do NOT fall back to promptTokens — those are billed-turn aggregates that
         // include internal tool sub-steps and cause inflated context estimates.
         let latestContextUsed = usage.reversed().compactMap { turn -> Int? in
-            if let contextUsed = turn.contextUsedTokens,
-               contextUsed > 0,
-               contextUsed <= maxContextTokens
-            {
-                return contextUsed
-            }
-            return nil
+            ClaudeContextUsedTokensBound.normalizedReading(
+                turn.contextUsedTokens,
+                canonicalWindow: modelContextWindow
+            )
         }.first
         if let latestContextUsed {
             return AgentContextUsage(
                 modelContextWindow: modelContextWindow,
+                configuredContextWindow: configuredContextWindow,
                 lastTotalTokens: latestContextUsed,
                 totalTotalTokens: latestContextUsed
             )
@@ -100,6 +97,7 @@ extension AgentModeViewModel {
         guard modelContextWindow != nil else { return nil }
         return AgentContextUsage(
             modelContextWindow: modelContextWindow,
+            configuredContextWindow: configuredContextWindow,
             lastTotalTokens: nil,
             totalTotalTokens: nil
         )

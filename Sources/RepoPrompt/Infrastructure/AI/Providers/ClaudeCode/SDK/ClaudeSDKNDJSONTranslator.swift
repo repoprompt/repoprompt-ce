@@ -56,6 +56,10 @@ struct ClaudeSDKNDJSONTranslator {
         )
     }
 
+    mutating func resetMainModelTracking() {
+        providerTranslator.resetMainModelTracking()
+    }
+
     mutating func parseNDJSONLine(_ lineData: Data) -> [AIStreamResult] {
         providerTranslator.parseNDJSONLine(lineData).map {
             ClaudeCompatibleProviderRuntimeBridge.streamResult(from: $0)
