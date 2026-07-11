@@ -70,6 +70,9 @@ enum PromptPackagingService {
 
         // 2️⃣  Copy conversation and rebuild the final user entry once
         var updatedConversation = conversation
+        // Capture the raw last user message before it is wrapped below; display titles
+        // (e.g. fresh Codex thread names) read this via `AIMessage.rawLastUserMessage`.
+        let rawLastUserMessage = conversation.last(where: { $0.role == .user })?.content ?? ""
         if let lastUserIndex = updatedConversation.lastIndex(where: { $0.role == .user }) {
             let lastUserEntry = updatedConversation[lastUserIndex]
             var newContent = lastUserEntry.content
@@ -96,6 +99,7 @@ enum PromptPackagingService {
             fileBlocks: fileContents,
             gitDiff: gitDiff,
             conversationMessages: updatedConversation,
+            rawLastUserMessage: rawLastUserMessage,
             temperature: temperature,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,

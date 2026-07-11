@@ -32,6 +32,11 @@ struct AIMessage {
     /// NEW: Full conversation array, user + AI in order
     let conversationMessages: [ConversationEntry]
 
+    /// The unmodified last user message, captured *before* prompt packaging wraps it in
+    /// `<user_instructions>`. Display titles/previews (e.g. fresh Codex thread names) read
+    /// this so they reflect what the user typed, not the packaged prompt envelope.
+    let rawLastUserMessage: String
+
     let temperature: Double?
     let disableTemperatureOverrides: Bool
 
@@ -119,6 +124,7 @@ struct AIMessage {
         fileBlocks: [String] = [],
         gitDiff: String? = nil,
         conversationMessages: [ConversationEntry] = [],
+        rawLastUserMessage: String = "",
         temperature: Double?,
         disableTemperatureOverrides: Bool = false,
         promptSectionsOrder: [PromptSection],
@@ -131,6 +137,7 @@ struct AIMessage {
         self.fileBlocks = fileBlocks
         self.gitDiff = gitDiff
         self.conversationMessages = conversationMessages
+        self.rawLastUserMessage = rawLastUserMessage
         self.temperature = temperature
         self.disableTemperatureOverrides = disableTemperatureOverrides
         self.promptSectionsOrder = promptSectionsOrder
@@ -152,6 +159,8 @@ struct AIMessage {
         conversationMessages = [
             ConversationEntry(role: .user, content: userMessage)
         ]
+        // Raw last user message is the un-wrapped user message itself.
+        rawLastUserMessage = userMessage
         // Use library defaults for prompt ordering
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
         disabledPromptSections = []
