@@ -28,6 +28,7 @@ struct WindowContentView: View {
             // default app-name title over the workspace name whenever it refreshes the
             // window chrome (visible in both window titles and native tab names).
             .navigationTitle(windowState.displayedWindowTitle)
+            .removingSystemToolbarTitle()
             .background(
                 WindowAccessor { newWindow in
                     // IMPORTANT: do not mutate SwiftUI @State here.
@@ -72,5 +73,16 @@ struct WindowContentView: View {
             .sheet(isPresented: $versionManager.shouldShowVersionPopup) {
                 VersionPopupView(isPresented: $versionManager.shouldShowVersionPopup)
             }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func removingSystemToolbarTitle() -> some View {
+        if #available(macOS 15.0, *) {
+            toolbar(removing: .title)
+        } else {
+            self
+        }
     }
 }
