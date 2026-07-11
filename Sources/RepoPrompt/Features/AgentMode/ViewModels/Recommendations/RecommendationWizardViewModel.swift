@@ -560,7 +560,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             shouldReapplyProviderSensitiveRecommendations = false
         case .contextBuilder:
             if let rec = recommendations.contextBuilder {
-                engine.applyContextBuilderRecommendation(rec)
+                engine.applyContextBuilderRecommendation(rec, workspaceID: wsID)
             }
         case .presets:
             if let rec = recommendations.mcpPresetExposure {
@@ -692,7 +692,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             shouldReapplyProviderSensitiveRecommendations = false
         }
         if let rec = recommendations.contextBuilder, !rec.alreadySatisfied, !rec.isMuted {
-            engine.applyContextBuilderRecommendation(rec)
+            engine.applyContextBuilderRecommendation(rec, workspaceID: wsID)
             applied.contextBuilder = rec
         }
         if let rec = recommendations.mcpPresetExposure, !rec.alreadySatisfied, !rec.isMuted {

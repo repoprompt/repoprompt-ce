@@ -39,21 +39,26 @@ When active, RepoPrompt can send:
 
 - crash reports and unhandled exception diagnostics with stack traces,
 - app-hang reports when **App hang reports** is enabled; this sub-option defaults off for release safety,
-- app version/build, OS version, release distribution, and SDK metadata,
+- app version/build, OS version, environment, and SDK metadata,
 - a conservative sample of app startup performance traces when **Performance timing and tracing** is enabled.
 
-Production performance tracing defaults to off. Manual tool-stack breadcrumbs, metrics, per-message
-transcript hooks, MCP tool execution spans, and agent-run state metrics are disabled/deferred in this
-telemetry pass.
+Production performance tracing defaults to off. Sentry Cocoa automatic release-health session tracking
+is explicitly disabled because the pinned SDK stores and sends a persistent installation identifier as
+the session `did`; RepoPrompt prefers not to collect that stable identifier. Manual tool-stack
+breadcrumbs, metrics, per-message transcript hooks, MCP tool execution spans, and agent-run state
+metrics are disabled/deferred in this telemetry pass.
 
 The runtime configuration is deliberately conservative:
 
 - `sendDefaultPii` is false,
-- no session replay, MetricKit, structured logs, automatic network breadcrumbs, automatic network
-  tracking, automatic file I/O tracing, or Core Data tracing,
+- no session replay, release-health auto sessions, MetricKit, structured logs, automatic failed-request
+  capture, automatic network breadcrumbs, automatic network tracking, automatic file I/O tracing, or
+  Core Data tracing,
 - a small bounded Sentry cache and breadcrumb limit,
-- a `beforeSend` scrubber that removes user identifiers/server name and redacts obvious secrets,
-  local home paths, and IP-like values from event fields exposed by Sentry Cocoa.
+- a `beforeSend` scrubber that removes the Sentry request object, request payload fields, user and
+  geo fields, server names, stable device identifiers, installation/vendor/advertising identifiers,
+  and redacts obvious secrets, local home paths, and IP-like values from event fields exposed by
+  Sentry Cocoa.
 
 ## What is not sent
 
@@ -65,15 +70,17 @@ RepoPrompt CE does not intentionally send:
 - AI provider request/response bodies,
 - API keys, tokens, bearer credentials, passwords, or environment variables,
 - workspace names, run IDs, tool invocation IDs, or raw model names,
-- screenshots, view hierarchy, or session replay.
+- screenshots, view hierarchy, session replay, or automatic release-health session identifiers.
 
 Native crash reports may include SDK-provided crash context such as stack traces, exception messages,
-app/OS versions, device model, locale, and memory values. RepoPrompt disables default PII and applies
-its own scrubber before events are sent.
+app/OS versions, device model, locale, and memory values. RepoPrompt disables default PII, disables
+Sentry's automatic failed-request and release-health session capture, and applies its own scrubber
+before events are sent. RepoPrompt explicitly clears Sentry `dist` at SDK startup for new events; older cached crashes from
+previous builds may retain the distribution value originally attached by those builds.
 
 ## Processor
 
 Telemetry data is processed by Sentry (a third-party SaaS provider) acting as a data processor on
-behalf of the RepoPrompt CE project. Sentry project-side data scrubbing is also configured as
-defense-in-depth; RepoPrompt's primary privacy boundary is avoiding sensitive data collection in the
-app before upload.
+behalf of the RepoPrompt CE project. Sentry project-side data scrubbing is maintained as additional
+defense-in-depth where available; RepoPrompt's primary privacy boundary is avoiding sensitive data
+collection in the app before upload.
