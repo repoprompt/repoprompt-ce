@@ -63,6 +63,9 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         let nestedRunID = UUID()
         let nested = context.nestedDiscoveryTabContext(runID: nestedRunID)
         XCTAssertEqual(nested.runID, nestedRunID)
+        XCTAssertEqual(nested.role, .contextBuilderDiscovery)
+        XCTAssertEqual(nested.discoveryBaseSelection, snapshot.selection)
+        XCTAssertEqual(nested.privateSelectionRevision, 0)
         XCTAssertEqual(nested.activeAgentSessionID, sessionID)
         XCTAssertEqual(nested.worktreeBindings, [binding])
         XCTAssertEqual(nested.promptText, snapshot.promptText)
@@ -436,6 +439,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(Set(frozenRoots.map(\.standardizedFullPath)), Set([logicalRoot.standardizedFileURL.path]))
 
         let nested = context.nestedDiscoveryTabContext(runID: UUID())
+        XCTAssertEqual(nested.role, .contextBuilderDiscovery)
         XCTAssertEqual(nested.frozenLookupContext, context.lookupContext)
         let nestedLookupContext = try XCTUnwrap(nested.frozenLookupContext)
         let nestedRoots = await store.rootRefs(scope: nestedLookupContext.rootScope)
@@ -495,6 +499,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(context.providerWorkspacePath, selected.standardizedFileURL.path)
         XCTAssertFalse(target.initialOrdinarySelectionIdentities.contains(classicFile.path))
         let nested = context.nestedDiscoveryTabContext(runID: UUID())
+        XCTAssertEqual(nested.role, .contextBuilderDiscovery)
         XCTAssertEqual(nested.selectionRevision, 37)
         XCTAssertEqual(nested.contextBuilderReviewTargetResolution, context.reviewTargetResolution)
 

@@ -561,6 +561,20 @@ actor WorkspaceFileContextStore {
         let rootEpoch: WorkspaceCodemapRootEpoch
     }
 
+    enum CodemapPathInvalidationStage: String, CaseIterable {
+        case rootMutationFence = "root_mutation_fence"
+        case cleanupFlight = "cleanup_flight"
+        case predecessorFlight = "predecessor_flight"
+        case graphPublication = "graph_publication"
+        case projectionRecoveryObserver = "projection_recovery_observer"
+        case graphContributionFence = "graph_contribution_fence"
+        case graphWorker = "graph_worker"
+        case setup
+        case engineInvalidation = "engine_invalidation"
+        case engineFreeze = "engine_freeze"
+        case completionPublication = "completion_publication"
+    }
+
     private struct CodemapPathInvalidationFlight {
         let id: UUID
         let rootEpoch: WorkspaceCodemapRootEpoch
@@ -2275,6 +2289,8 @@ actor WorkspaceFileContextStore {
             (@Sendable (WorkspaceCodemapRootEpoch, Int) async -> Void)?
         private var codemapProjectionRecoveryObserverWillWaitHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
+        private var codemapPathInvalidationStageHandlerForTesting:
+            (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
     #endif
     private var codemapCleanupFlightsByRootID: [UUID: CodemapCleanupFlight] = [:]
     private var codemapPathInvalidationFlightsByRootEpoch: [
@@ -5626,6 +5642,24 @@ actor WorkspaceFileContextStore {
     }
 
     #if DEBUG
+        func replayPublisherFileSystemDeltasForCodemapIndependenceTesting(
+            rootID: UUID,
+            deltas: [FileSystemDelta],
+            servicePublicationSequence: UInt64
+        ) async throws {
+            let state = try state(for: rootID)
+            let preparedDeltas = prepareObservedFileSystemDeltas(deltas, root: state.root)
+            await applyPreparedIndexDeltas(
+                rootID: rootID,
+                deltas: preparedDeltas,
+                expectedLifetimeID: state.lifetimeID,
+                watcherAcceptedWatermark: nil,
+                servicePublicationSequence: servicePublicationSequence,
+                publicationCorrelation: nil,
+                diagnosticRootToken: state.service.diagnosticRootToken
+            )
+        }
+
         func replayFileSystemPublicationForInvalidationDiagnosticsForTesting(
             rootID: UUID,
             deltas: [FileSystemDelta]
@@ -5796,6 +5830,8 @@ actor WorkspaceFileContextStore {
                 expectedLifetimeID: expectedLifetimeID,
                 watcherAcceptedWatermark: watcherAcceptedWatermark,
                 servicePublicationSequence: servicePublicationSequence,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
         #else
@@ -5803,6 +5839,9 @@ actor WorkspaceFileContextStore {
                 rootID: root.id,
                 deltas: preparedDeltas,
                 expectedLifetimeID: expectedLifetimeID,
+                servicePublicationSequence: servicePublicationSequence,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
         #endif
@@ -8045,6 +8084,18 @@ actor WorkspaceFileContextStore {
             .id
         guard let containingRootID else { return [] }
         return await awaitAppliedIngress(rootIDs: [containingRootID])
+    }
+
+    func awaitAppliedIngressForExplicitRequest(
+        userPath: String,
+        fallbackScope: WorkspaceLookupRootScope,
+        timeout: Duration
+    ) async throws -> [WorkspaceIngressBarrierSample] {
+        try await awaitAppliedIngressForExplicitRequest(
+            userPath: userPath,
+            fallbackRootRefs: rootRefs(scope: fallbackScope),
+            timeout: timeout
+        )
     }
 
     func awaitAppliedIngressForExplicitRequest(
@@ -15556,6 +15607,12 @@ actor WorkspaceFileContextStore {
             codemapProjectionRecoveryObserverWillWaitHandlerForTesting = handler
         }
 
+        func setCodemapPathInvalidationStageHandlerForTesting(
+            _ handler: (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
+        ) {
+            codemapPathInvalidationStageHandlerForTesting = handler
+        }
+
         func revokeReadyCodemapArtifactContributionForTesting(
             _ ticket: WorkspaceCodemapArtifactDemandTicket
         ) async -> Bool {
@@ -17716,9 +17773,10 @@ actor WorkspaceFileContextStore {
         relativePath: String
     ) -> Bool {
         let path = StandardizedPath.relative(relativePath)
-        return codemapPathFenceTokensByID.values.contains {
-            $0.rootEpoch == rootEpoch && $0.standardizedRelativePaths.contains(path)
-        }
+        return codemapPathInvalidationFlightsByRootEpoch[rootEpoch] != nil
+            || codemapPathFenceTokensByID.values.contains {
+                $0.rootEpoch == rootEpoch && $0.standardizedRelativePaths.contains(path)
+            }
     }
 
     private func standardizedCodemapInvalidationCommand(
@@ -17763,35 +17821,37 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         commands rawCommands: [CodemapInvalidationCommand]
     ) async -> CodemapPathFenceToken? {
+        let launch = beginCodemapPathInvalidation(rootID: rootID, commands: rawCommands)
+        await launch.task?.value
+        return launch.token
+    }
+
+    /// Revokes path-level authority immediately for an explicit file mutation without making
+    /// disk I/O wait behind retained publisher-derived codemap convergence. The returned token
+    /// and retained flight continue fencing demand/projection admission until derived work settles.
+    private func beginCodemapPathFence(
+        rootID: UUID,
+        commands: [CodemapInvalidationCommand]
+    ) -> CodemapPathFenceToken? {
+        beginCodemapPathInvalidation(rootID: rootID, commands: commands).token
+    }
+
+    /// Invalidates codemap projection authority synchronously, while letting publisher ingress
+    /// commit the basic catalog without awaiting derived engine/graph convergence.
+    private func beginCodemapPathInvalidation(
+        rootID: UUID,
+        commands rawCommands: [CodemapInvalidationCommand],
+        publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        diagnosticRootToken: UUID? = nil,
+        servicePublicationSequence: UInt64? = nil
+    ) -> (token: CodemapPathFenceToken?, task: Task<Void, Never>?) {
         let commands = rawCommands.compactMap(standardizedCodemapInvalidationCommand)
         let paths = codemapPaths(in: commands)
-        guard !paths.isEmpty,
-              let state = rootStatesByID[rootID]
-        else { return nil }
-        let rootEpoch = WorkspaceCodemapRootEpoch(
-            rootID: rootID,
-            rootLifetimeID: state.lifetimeID
-        )
+        guard !paths.isEmpty, let state = rootStatesByID[rootID] else { return (nil, nil) }
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
 
-        guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch) else {
-            return nil
-        }
-
-        if let cleanup = codemapCleanupFlightsByRootID[rootID] {
-            await cleanup.task.value
-            return nil
-        }
-        if let existing = codemapPathInvalidationFlightsByRootEpoch[rootEpoch] {
-            await existing.task.value
-            guard rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID,
-                  codemapSessionsByRootEpoch[rootEpoch] != nil
-            else { return nil }
-            return await fenceCodemapPaths(rootID: rootID, commands: commands)
-        }
         advanceCodemapProjectionInvalidationGeneration(rootEpoch: rootEpoch)
-        _ = cancelCodemapProjectionPreloadLaunchForInvalidation(
-            rootEpoch: rootEpoch
-        )
+        _ = cancelCodemapProjectionPreloadLaunchForInvalidation(rootEpoch: rootEpoch)
 
         let token = CodemapPathFenceToken(
             id: UUID(),
@@ -17801,8 +17861,38 @@ actor WorkspaceFileContextStore {
         )
         codemapPathFenceTokensByID[token.id] = token
 
+        let predecessorTask = codemapPathInvalidationFlightsByRootEpoch[rootEpoch]?.task
+        let cleanupTask = codemapCleanupFlightsByRootID[rootID]?.task
         guard var session = codemapSessionsByRootEpoch[rootEpoch] else {
-            return token
+            #if DEBUG
+                guard codemapPathInvalidationStageHandlerForTesting != nil else {
+                    return (token, nil)
+                }
+                let flightID = UUID()
+                let task = Task { [weak self] in
+                    guard let self else { return }
+                    await reportCodemapPathInvalidationStage(
+                        .rootMutationFence,
+                        rootEpoch: rootEpoch,
+                        flightID: flightID,
+                        publicationCorrelation: publicationCorrelation,
+                        diagnosticRootToken: diagnosticRootToken,
+                        servicePublicationSequence: servicePublicationSequence
+                    )
+                    await finishCodemapPathInvalidationWithoutAuthority(
+                        flightID: flightID,
+                        rootEpoch: rootEpoch
+                    )
+                }
+                codemapPathInvalidationFlightsByRootEpoch[rootEpoch] = CodemapPathInvalidationFlight(
+                    id: flightID,
+                    rootEpoch: rootEpoch,
+                    task: task
+                )
+                return (token, task)
+            #else
+                return (token, nil)
+            #endif
         }
 
         let removedMarkerReadiness = session.markerReadinessByFileID.values
@@ -17839,9 +17929,7 @@ actor WorkspaceFileContextStore {
         }
 
         var affectedRecords: [CodemapDemandRecord] = []
-        for (fileID, record) in session.demandsByFileID
-            where paths.contains(record.identity.standardizedRelativePath)
-        {
+        for (fileID, record) in session.demandsByFileID where paths.contains(record.identity.standardizedRelativePath) {
             affectedRecords.append(record)
             session.demandsByFileID.removeValue(forKey: fileID)
             session.bundlesByRequestID.removeValue(forKey: record.ticket.requestID)?.close()
@@ -17887,6 +17975,44 @@ actor WorkspaceFileContextStore {
         let flightID = UUID()
         let task = Task { [weak self] in
             guard let self else { return }
+            await reportCodemapPathInvalidationStage(
+                .rootMutationFence,
+                rootEpoch: rootEpoch,
+                flightID: flightID,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
+                servicePublicationSequence: servicePublicationSequence
+            )
+            guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch) else {
+                await finishCodemapPathInvalidation(flightID: flightID, authority: session.authority, snapshot: nil)
+                return
+            }
+            if let cleanupTask {
+                await reportCodemapPathInvalidationStage(
+                    .cleanupFlight,
+                    rootEpoch: rootEpoch,
+                    flightID: flightID,
+                    publicationCorrelation: publicationCorrelation,
+                    diagnosticRootToken: diagnosticRootToken,
+                    servicePublicationSequence: servicePublicationSequence
+                )
+                await cleanupTask.value
+            }
+            if let predecessorTask {
+                await reportCodemapPathInvalidationStage(
+                    .predecessorFlight,
+                    rootEpoch: rootEpoch,
+                    flightID: flightID,
+                    publicationCorrelation: publicationCorrelation,
+                    diagnosticRootToken: diagnosticRootToken,
+                    servicePublicationSequence: servicePublicationSequence
+                )
+                await predecessorTask.value
+            }
+            guard await codemapAuthorityIsCurrent(session.authority) else {
+                await finishCodemapPathInvalidation(flightID: flightID, authority: session.authority, snapshot: nil)
+                return
+            }
             await performCodemapPathInvalidation(
                 flightID: flightID,
                 authority: session.authority,
@@ -17896,17 +18022,18 @@ actor WorkspaceFileContextStore {
                 projectionRecoveryObserverTask: projectionRecoveryObserverTask,
                 graph: graph,
                 graphWorkerTask: graphWorkerTask,
-                commands: commands
+                commands: commands,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
+                servicePublicationSequence: servicePublicationSequence
             )
         }
-        let flight = CodemapPathInvalidationFlight(
+        codemapPathInvalidationFlightsByRootEpoch[rootEpoch] = CodemapPathInvalidationFlight(
             id: flightID,
             rootEpoch: rootEpoch,
             task: task
         )
-        codemapPathInvalidationFlightsByRootEpoch[rootEpoch] = flight
-        await task.value
-        return token
+        return (token, task)
     }
 
     private func performCodemapPathInvalidation(
@@ -17918,41 +18045,94 @@ actor WorkspaceFileContextStore {
         projectionRecoveryObserverTask: Task<Void, Never>?,
         graph: WorkspaceCodemapSelectionGraph?,
         graphWorkerTask: Task<Void, Never>?,
-        commands: [CodemapInvalidationCommand]
+        commands: [CodemapInvalidationCommand],
+        publicationCorrelation: EditFlowPerf.LifecycleCorrelation?,
+        diagnosticRootToken: UUID?,
+        servicePublicationSequence: UInt64?
     ) async {
+        func report(_ stage: CodemapPathInvalidationStage) async {
+            await reportCodemapPathInvalidationStage(
+                stage,
+                rootEpoch: authority.rootEpoch,
+                flightID: flightID,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
+                servicePublicationSequence: servicePublicationSequence
+            )
+        }
+
         if let graphPublicationTask {
+            await report(.graphPublication)
             await graphPublicationTask.value
         }
         if let projectionRecoveryObserverTask {
+            await report(.projectionRecoveryObserver)
             await projectionRecoveryObserverTask.value
         }
         if let graph {
-            _ = await graph.fenceContributionsForPathInvalidation(
-                rootEpoch: authority.rootEpoch
-            )
+            await report(.graphContributionFence)
+            _ = await graph.fenceContributionsForPathInvalidation(rootEpoch: authority.rootEpoch)
         }
         if let graphWorkerTask {
+            await report(.graphWorker)
             await graphWorkerTask.value
         }
         if let setupTask {
+            await report(.setup)
             _ = await setupTask.value
         }
         let resolvedEngine = engine ?? codemapSessionsByRootEpoch[authority.rootEpoch]?.engine
         if let resolvedEngine {
+            await report(.engineInvalidation)
             await applyCodemapInvalidationCommands(
                 commands,
                 rootEpoch: authority.rootEpoch,
                 engine: resolvedEngine
             )
         }
+        await report(.engineFreeze)
         let bundle = await resolvedEngine?.freeze(rootEpoch: authority.rootEpoch)
         let snapshot = try? bundle?.graphSnapshot()
+        await report(.completionPublication)
         await finishCodemapPathInvalidation(
             flightID: flightID,
             authority: authority,
             snapshot: snapshot
         )
         bundle?.close()
+    }
+
+    private func reportCodemapPathInvalidationStage(
+        _ stage: CodemapPathInvalidationStage,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        flightID: UUID,
+        publicationCorrelation: EditFlowPerf.LifecycleCorrelation?,
+        diagnosticRootToken: UUID?,
+        servicePublicationSequence: UInt64?
+    ) async {
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.WorkspaceIngress.codemapInvalidationStage,
+            correlation: publicationCorrelation,
+            EditFlowPerf.Dimensions(
+                outcome: stage.rawValue,
+                rootToken: diagnosticRootToken?.uuidString,
+                barrierSequence: servicePublicationSequence,
+                observerToken: flightID.uuidString
+            )
+        )
+        #if DEBUG
+            await codemapPathInvalidationStageHandlerForTesting?(rootEpoch, flightID, stage)
+        #endif
+    }
+
+    private func finishCodemapPathInvalidationWithoutAuthority(
+        flightID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard codemapPathInvalidationFlightsByRootEpoch[rootEpoch]?.id == flightID else { return }
+        codemapPathInvalidationFlightsByRootEpoch.removeValue(forKey: rootEpoch)
+        scheduleDirtyCodemapGraphPublicationIfUnfenced(rootEpoch: rootEpoch)
+        schedulePendingCodemapProjectionPreloadIfFullyUnfenced(rootEpoch: rootEpoch)
     }
 
     private func finishCodemapPathInvalidation(
@@ -18499,7 +18679,7 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let expectedLifetimeID = state.lifetimeID
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
-        let codemapFence = await fenceCodemapPaths(
+        let codemapFence = beginCodemapPathFence(
             rootID: rootID,
             commands: [.modified([standardizedRelativePath])]
         )
@@ -18596,7 +18776,7 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let oldPath = StandardizedPath.relative(oldRelativePath)
         let newPath = StandardizedPath.relative(newRelativePath)
-        let codemapFence = await fenceCodemapPaths(
+        let codemapFence = beginCodemapPathFence(
             rootID: rootID,
             commands: [.renamed(from: oldPath, to: newPath)]
         )
@@ -18639,7 +18819,7 @@ actor WorkspaceFileContextStore {
     func deleteFile(rootID: UUID, relativePath: String) async throws {
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
-        let codemapFence = await fenceCodemapPaths(
+        let codemapFence = beginCodemapPathFence(
             rootID: rootID,
             commands: [.deleted([standardizedRelativePath])]
         )
@@ -18689,7 +18869,7 @@ actor WorkspaceFileContextStore {
         } else {
             [standardizedRelativePath]
         }
-        let codemapFence = await fenceCodemapPaths(
+        let codemapFence = beginCodemapPathFence(
             rootID: rootID,
             commands: [.deleted(affectedPaths)]
         )
@@ -19437,6 +19617,8 @@ actor WorkspaceFileContextStore {
             expectedLifetimeID: UUID? = nil,
             watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?,
             servicePublicationSequence: UInt64?,
+            publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+            diagnosticRootToken: UUID? = nil,
             requiresFullResync: Bool = false
         ) async {
             guard let servicePublicationSequence else {
@@ -19444,6 +19626,8 @@ actor WorkspaceFileContextStore {
                     rootID: rootID,
                     deltas: deltas,
                     expectedLifetimeID: expectedLifetimeID,
+                    publicationCorrelation: publicationCorrelation,
+                    diagnosticRootToken: diagnosticRootToken,
                     requiresFullResync: requiresFullResync
                 )
                 return
@@ -19452,6 +19636,9 @@ actor WorkspaceFileContextStore {
                 rootID: rootID,
                 deltas: deltas,
                 expectedLifetimeID: expectedLifetimeID,
+                servicePublicationSequence: servicePublicationSequence,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
             guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
@@ -19467,6 +19654,9 @@ actor WorkspaceFileContextStore {
             rootID: UUID,
             deltas: [PreparedFileSystemDelta],
             expectedLifetimeID: UUID? = nil,
+            servicePublicationSequence: UInt64? = nil,
+            publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+            diagnosticRootToken: UUID? = nil,
             requiresFullResync: Bool = false
         ) async -> PublicationInvalidationRecorder {
             let recorder = PublicationInvalidationRecorder(preparedDeltaCount: deltas.count)
@@ -19475,6 +19665,9 @@ actor WorkspaceFileContextStore {
                     rootID: rootID,
                     deltas: deltas,
                     expectedLifetimeID: expectedLifetimeID,
+                    servicePublicationSequence: servicePublicationSequence,
+                    publicationCorrelation: publicationCorrelation,
+                    diagnosticRootToken: diagnosticRootToken,
                     requiresFullResync: requiresFullResync
                 )
             }
@@ -19485,12 +19678,18 @@ actor WorkspaceFileContextStore {
             rootID: UUID,
             deltas: [PreparedFileSystemDelta],
             expectedLifetimeID: UUID? = nil,
+            servicePublicationSequence: UInt64? = nil,
+            publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+            diagnosticRootToken: UUID? = nil,
             requiresFullResync: Bool = false
         ) async {
             await applyPreparedIndexDeltasBody(
                 rootID: rootID,
                 deltas: deltas,
                 expectedLifetimeID: expectedLifetimeID,
+                servicePublicationSequence: servicePublicationSequence,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
         }
@@ -19534,6 +19733,9 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         deltas: [PreparedFileSystemDelta],
         expectedLifetimeID: UUID? = nil,
+        servicePublicationSequence: UInt64? = nil,
+        publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        diagnosticRootToken: UUID? = nil,
         requiresFullResync: Bool = false
     ) async {
         guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
@@ -19571,7 +19773,12 @@ actor WorkspaceFileContextStore {
                 requiresFullResync: requiresFullResync
             )
             didCommitRepositoryMutation = repositoryMutationFence != nil
-            await awaitCodemapCleanupFlights(rootIDs: [rootID])
+            // Publisher application has already revoked the old root codemap authority. Keep the
+            // derived cleanup flight retained/fenced, but do not hold the basic catalog publication
+            // open on its completion. Direct codemap-sensitive callers retain the synchronous fence.
+            if servicePublicationSequence == nil {
+                await awaitCodemapCleanupFlights(rootIDs: [rootID])
+            }
             if repositoryMutationFence == nil, let current = rootStatesByID[rootID] {
                 scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: WorkspaceCodemapRootEpoch(
                     rootID: rootID,
@@ -19592,10 +19799,20 @@ actor WorkspaceFileContextStore {
             return
         }
 
-        let token = await fenceCodemapPaths(
-            rootID: rootID,
-            commands: invalidation.pathCommands
-        )
+        let token: CodemapPathFenceToken? = if let servicePublicationSequence {
+            beginCodemapPathInvalidation(
+                rootID: rootID,
+                commands: invalidation.pathCommands,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken,
+                servicePublicationSequence: servicePublicationSequence
+            ).token
+        } else {
+            await fenceCodemapPaths(
+                rootID: rootID,
+                commands: invalidation.pathCommands
+            )
+        }
         var didCommitPathMutation = false
         defer {
             releaseCodemapPathFence(token, didCommitMutation: didCommitPathMutation)

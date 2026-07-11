@@ -2830,7 +2830,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                             workspaceID: identity.workspaceID,
                             tabID: identity.tabID
                         ),
-                        usedAgentOutputAsPrompt: usedAgentOutputAsPrompt
+                        usedAgentOutputAsPrompt: usedAgentOutputAsPrompt,
+                        selectionConflictResolution: .discoverySelectionCommitted
                     )
                     guard record.installCommittedTabSnapshot(snapshot) else {
                         return MCPServerViewModel.ContextBuilderTabContextCommitResult(

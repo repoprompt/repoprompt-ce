@@ -25,6 +25,8 @@ import XCTest
                     filePath: fixture.contextA.fileURL.path,
                     tabID: fixture.contextA.tabID
                 )
+                let canonicalSelectionBefore = fixture.contextA.window.workspaceManager
+                    .composeTab(with: fixture.contextA.tabID)?.selection
                 let recorder = NestedContextBuilderExecutionTraceRecorder()
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
                 defer { MCPToolExecutionTracer.setTestSink(nil) }
@@ -52,6 +54,10 @@ import XCTest
                     XCTAssertEqual(deliverySnapshot.terminalReason, "fault_injected_fail_destination_write")
                     XCTAssertFalse(deliverySnapshot.canReconnect)
                     XCTAssertTrue(try Self.toolResultText(response).contains("failed:"))
+                    XCTAssertEqual(
+                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)?.selection,
+                        canonicalSelectionBefore
+                    )
 
                     let outerContracts = events.filter {
                         $0.connectionID == outerEndpoint.connectionID &&

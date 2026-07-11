@@ -260,6 +260,25 @@ final class WorkspaceSelectionCoordinator {
         )
     }
 
+    /// Protects an already-persisted MCP selection from UI snapshots that were queued before
+    /// the canonical write. Context Builder publishes its isolated discovery selection together
+    /// with prompt/tab state, so it cannot use `persistSelection` for that atomic stored write.
+    /// Installing the same presentation fence here gives terminal publication the stale-UI
+    /// protection used by ordinary MCP selection mutations.
+    func protectCanonicalMCPSelectionFromDeferredUISnapshots(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity
+    ) {
+        guard let workspaceManager,
+              workspaceManager.composeTab(for: identity)?.selection == selection
+        else { return }
+        updateMCPSelectionPresentation(
+            selection,
+            for: identity,
+            workspaceManager: workspaceManager
+        )
+    }
+
     func selectionSnapshot(
         for identity: WorkspaceSelectionIdentity,
         flushPendingUIIfActive: Bool = true

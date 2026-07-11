@@ -390,7 +390,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         )
                     }
                     let committedSnapshotIsCurrent: Bool = if responseType == .review {
-                        canonicalState.1 == committedTab.selectionRevision
+                        // Stored/live projection can advance the revision for a semantic no-op.
+                        // Review authority is the exact committed selection, not revision equality.
+                        canonicalState.1 >= committedTab.selectionRevision
                             && canonicalState.0?.selection == committedTab.tab.selection
                     } else {
                         canonicalState.1 >= committedTab.selectionRevision

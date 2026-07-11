@@ -56,7 +56,8 @@ extension MCPServerViewModel {
 
     @MainActor
     func stabilizedVirtualContext(for context: TabScopedContext) async -> TabScopedContext {
-        // For any tab-bound virtual context (including runs), prefer latest stored tab selection.
+        guard context.role != .contextBuilderDiscovery else { return context }
+        // For ordinary tab-bound virtual contexts, prefer latest stored tab selection.
         // This prevents resurrecting stale slices from the run snapshot after the user clears them.
         guard let canonical = canonicalSelectionReadSnapshot(for: context) else { return context }
         var stabilized = context
@@ -69,7 +70,9 @@ extension MCPServerViewModel {
     func stabilizedSelectionReadSnapshot(
         _ resolved: ResolvedTabContextSnapshot
     ) throws -> ResolvedTabContextSnapshot {
-        guard !resolved.usesActiveTabCompatibility else { return resolved }
+        guard !resolved.usesActiveTabCompatibility,
+              resolved.snapshot.role != .contextBuilderDiscovery
+        else { return resolved }
         guard let canonical = canonicalSelectionReadSnapshot(for: resolved.snapshot) else {
             throw StabilizedSelectionReadSnapshotError.canonicalTabUnavailable(
                 workspaceID: resolved.snapshot.workspaceID,

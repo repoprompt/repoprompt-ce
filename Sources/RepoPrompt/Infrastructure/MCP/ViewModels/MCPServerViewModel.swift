@@ -1454,9 +1454,9 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return "Window deallocated while resolving selection inputs." }
             return await makeSelectionHintError(paths: paths, operation: operation, lookupContext: lookupContext)
         },
-        performFileAction: { [weak self] action, path, content, newPath, ifExists in
+        performFileAction: { [weak self] action, path, content, newPath, ifExists, operationID in
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
-            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
+            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists, operationID: operationID)
         },
         buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
@@ -4458,6 +4458,9 @@ final class MCPServerViewModel: ObservableObject {
         _ batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) async -> MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult {
+        if readFileAutoSelectionContext(for: key)?.role == .contextBuilderDiscovery {
+            return await applyContextBuilderDiscoveryAutoSelectionBatch(batch, for: key)
+        }
         let certificateLookup = await lookupReadFileAutoSelectionCoverageCertificate(batch: batch, for: key)
         if certificateLookup == .hit {
             return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(
@@ -4600,6 +4603,77 @@ final class MCPServerViewModel: ObservableObject {
             changed: false,
             missReason: missReason
         )
+    }
+
+    @MainActor
+    private func applyContextBuilderDiscoveryAutoSelectionBatch(
+        _ batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
+        for key: MCPReadFileAutoSelectionCoordinator.ContextKey
+    ) async -> MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult {
+        for attempt in 0 ..< 3 {
+            if attempt > 0 { await Task.yield() }
+            guard !Task.isCancelled,
+                  isReadFileAutoSelectionContextCurrent(key),
+                  let initialContext = readFileAutoSelectionContext(for: key),
+                  initialContext.role == .contextBuilderDiscovery
+            else { return .unchanged }
+
+            let metadata = RequestMetadata(
+                connectionID: {
+                    if case let .bound(connectionID, _) = key.route { return connectionID }
+                    return nil
+                }(),
+                clientName: nil,
+                windowID: key.windowID
+            )
+            let lookupContext = await contextBuilderDiscoveryLookupContext(
+                initialContext: initialContext,
+                metadata: metadata
+            )
+            let candidateSelection = await readFileAutoSelectionCandidate(
+                batch: batch,
+                base: initialContext.selection,
+                lookupRootScope: lookupContext.rootScope
+            )
+            let candidate = lookupContext.logicalizeSelection(candidateSelection)
+            guard MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
+                initialContext.selection,
+                isPreservedBy: candidate
+            ) else { return .unchanged }
+            guard !Task.isCancelled,
+                  isReadFileAutoSelectionContextCurrent(key),
+                  case let .bound(connectionID, _) = key.route,
+                  var latest = tabContextByConnectionID[connectionID],
+                  latest.role == .contextBuilderDiscovery,
+                  latest.runID == initialContext.runID,
+                  latest.privateSelectionRevision == initialContext.privateSelectionRevision,
+                  latest.readFileAutoSelectionGeneration == initialContext.readFileAutoSelectionGeneration
+            else { return .unchanged }
+            guard latest.selection == initialContext.selection else { continue }
+
+            let changed = latest.selection != candidate
+            latest.selection = candidate
+            if changed {
+                latest.privateSelectionRevision &+= 1
+            }
+            tabContextByConnectionID[connectionID] = latest
+            return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(
+                mirrorKey: nil,
+                disposition: changed ? .changed : .semanticNoOp
+            )
+        }
+        return .unchanged
+    }
+
+    @MainActor
+    private func contextBuilderDiscoveryLookupContext(
+        initialContext: TabScopedContext,
+        metadata: RequestMetadata
+    ) async -> WorkspaceLookupContext {
+        if let frozen = initialContext.frozenLookupContext {
+            return frozen
+        }
+        return await resolveFileToolLookupContext(from: metadata)
     }
 
     @MainActor
@@ -5808,8 +5882,9 @@ final class MCPServerViewModel: ObservableObject {
         path: String,
         content: String? = nil,
         newPath: String? = nil,
-        ifExists: String? = nil
-    ) async throws -> String? {
+        ifExists: String? = nil,
+        operationID: String
+    ) async throws -> MCPFileActionMutationAcknowledgement {
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks)
         // Enforce workspace presence in multi-window mode
@@ -5821,6 +5896,13 @@ final class MCPServerViewModel: ObservableObject {
             toolName: MCPWindowToolName.fileActions,
             policy: .allowLegacyImplicitRouting
         )
+        if !resolvedContext.usesActiveTabCompatibility,
+           let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
+               for: resolvedContext.snapshot
+           )
+        {
+            throw failure
+        }
         let lookupContext = await resolveFileToolLookupContext(from: metadata)
         if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
             for: lookupContext,
@@ -5836,15 +5918,21 @@ final class MCPServerViewModel: ObservableObject {
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)
-        _ = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: effectivePath,
-            fallbackScope: lookupContext.rootScope
-        )
-        if let effectiveNewPath {
-            _ = await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectiveNewPath,
-                fallbackScope: lookupContext.rootScope
+        do {
+            _ = try await store.awaitAppliedIngressForExplicitRequest(
+                userPath: effectivePath,
+                fallbackScope: lookupContext.rootScope,
+                timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
             )
+            if let effectiveNewPath {
+                _ = try await store.awaitAppliedIngressForExplicitRequest(
+                    userPath: effectiveNewPath,
+                    fallbackScope: lookupContext.rootScope,
+                    timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
+                )
+            }
+        } catch is WorkspaceAppliedIngressWaitError {
+            throw MCPMutationRetryableFailure.workspaceFreshnessUnavailable()
         }
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility, transition: .completed)
         try Task.checkCancellation()
@@ -5882,7 +5970,6 @@ final class MCPServerViewModel: ObservableObject {
             default:
                 throw MCPError.invalidParams("invalid action: \(action). Must be 'create', 'delete', or 'move'")
             }
-            try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
         } catch is CancellationError {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
@@ -5900,56 +5987,101 @@ final class MCPServerViewModel: ObservableObject {
             throw MCPError.invalidParams("File action '\(action)' failed: \(error.localizedDescription)")
         }
 
-        // Ensure resulting synthetic publications are canonical before returning.
-        try Task.checkCancellation()
+        // The filesystem mutation is durable. From this point cancellation must not be
+        // misreported as a safe-to-retry pre-mutation failure.
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog)
-        _ = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: effectivePath,
-            fallbackScope: lookupContext.rootScope
-        )
-        if let effectiveNewPath {
-            _ = await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectiveNewPath,
-                fallbackScope: lookupContext.rootScope
+        var freshness = "fresh"
+        do {
+            _ = try await store.awaitAppliedIngressForExplicitRequest(
+                userPath: effectivePath,
+                fallbackScope: lookupContext.rootScope,
+                timeout: .seconds(2)
             )
+            if let effectiveNewPath {
+                _ = try await store.awaitAppliedIngressForExplicitRequest(
+                    userPath: effectiveNewPath,
+                    fallbackScope: lookupContext.rootScope,
+                    timeout: .seconds(2)
+                )
+            }
+        } catch {
+            freshness = "pending"
         }
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)
-        try Task.checkCancellation()
+        var acknowledgementWarnings: [String] = []
+        if freshness == "pending" {
+            acknowledgementWarnings.append(
+                "The filesystem mutation is durable, but workspace freshness is still pending. Inspect the filesystem with read_file or file_search and use operation ID \(operationID) only to correlate this result; do not blindly replay the mutation."
+            )
+        }
+        if Task.isCancelled {
+            acknowledgementWarnings.append(
+                "Reply delivery was cancelled after the durable mutation. Inspect the filesystem and use operation ID \(operationID) only to correlate this result; do not blindly replay."
+            )
+        }
         if action.lowercased() == "create", !resolvedContext.usesActiveTabCompatibility {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection)
+            let baseSelection = resolvedContext.snapshot.selection
             let addResult = await addStoredSelectionPaths(
-                existing: resolvedContext.snapshot.selection,
+                existing: baseSelection,
                 paths: [effectivePath],
                 rawPaths: [path],
                 mode: "full",
                 lookupRootScope: lookupContext.rootScope
             )
-            try Task.checkCancellation()
-            guard addResult.selection != resolvedContext.snapshot.selection else {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                return nil
-            }
-            resolvedContext.snapshot.selection = addResult.selection
-            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
-            try Task.checkCancellation()
-            do {
-                _ = try MCPSelectionToolProvider.requireCanonicalSelection(
-                    verification,
-                    requested: addResult.selection,
-                    tabID: resolvedContext.snapshot.tabID,
-                    operation: "file_actions create selection update",
-                    recovery: "Retry manage_selection for the same context_id."
+            var requestedSelection = addResult.selection
+            if freshness == "pending",
+               resolvedContext.snapshot.role == .contextBuilderDiscovery,
+               requestedSelection == baseSelection,
+               let standardizedCreatedPath = StoredSelectionPathNormalization.standardizedPath(effectivePath)
+            {
+                var selectedPaths = StoredSelectionPathNormalization.standardizedPaths(baseSelection.selectedPaths)
+                if !selectedPaths.contains(standardizedCreatedPath) {
+                    selectedPaths.append(standardizedCreatedPath)
+                }
+                requestedSelection = StoredSelection(
+                    selectedPaths: selectedPaths,
+                    manualCodemapPaths: baseSelection.manualCodemapPaths.filter { $0 != standardizedCreatedPath },
+                    slices: baseSelection.slices,
+                    codemapAutoEnabled: baseSelection.codemapAutoEnabled
                 )
-            } catch is CancellationError {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                throw CancellationError()
-            } catch {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                return "The file was created, but its selection was not confirmed. \(error)"
+                acknowledgementWarnings.append(
+                    "The created path was recorded in the private discovery selection, but catalog-backed selection resolution remains unconfirmed until workspace freshness catches up."
+                )
+            }
+            if requestedSelection != baseSelection {
+                resolvedContext.snapshot.selection = requestedSelection
+                let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+                do {
+                    _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                        verification,
+                        requested: requestedSelection,
+                        tabID: resolvedContext.snapshot.tabID,
+                        operation: "file_actions create selection update",
+                        recovery: "Retry manage_selection for the same context_id."
+                    )
+                } catch is CancellationError {
+                    acknowledgementWarnings.append(
+                        "The created path selection update was cancelled and was not confirmed."
+                    )
+                } catch {
+                    acknowledgementWarnings.append(
+                        "The file was created, but its selection was not confirmed. \(error)"
+                    )
+                }
+            } else if freshness == "pending" {
+                acknowledgementWarnings.append(
+                    "The created path selection was not confirmed while workspace freshness was pending."
+                )
             }
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
         }
-        return nil
+        return MCPFileActionMutationAcknowledgement(
+            warning: acknowledgementWarnings.isEmpty ? nil : acknowledgementWarnings.joined(separator: " "),
+            operationID: operationID,
+            mutationState: "applied",
+            freshness: freshness
+        )
     }
 
     /// Creates a **new** file, with optional overwrite behavior.

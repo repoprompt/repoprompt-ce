@@ -1812,6 +1812,34 @@ final class TabContextRoutingTests: XCTestCase {
         ))
     }
 
+    func testWrappedMutationArgumentsPreserveOperationIdentity() {
+        let applyEdits = MCPToolArgsNormalizer.normalize(
+            params: [
+                "apply_edits": .object([
+                    "path": .string("Sources/App.swift"),
+                    "rewrite": .string("struct App {}")
+                ]),
+                "operation_id": .string("edit-123")
+            ],
+            originalToolName: "apply_edits",
+            canonicalToolName: "apply_edits"
+        )
+        XCTAssertEqual(applyEdits.payload["operation_id"]?.stringValue, "edit-123")
+
+        let fileActions = MCPToolArgsNormalizer.normalize(
+            params: [
+                "file_actions": .object([
+                    "action": .string("create"),
+                    "path": .string("Sources/New.swift")
+                ]),
+                "operation_id": .string("create-123")
+            ],
+            originalToolName: "file_actions",
+            canonicalToolName: "file_actions"
+        )
+        XCTAssertEqual(fileActions.payload["operation_id"]?.stringValue, "create-123")
+    }
+
     #if DEBUG
         @MainActor
         func testRequestMetadataBridgesExplicitWindowHintWithoutInferringFromEffectiveAffinity() async throws {
