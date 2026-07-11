@@ -1742,6 +1742,17 @@ fi
         self.assertNotIn('BUILD_NUMBER="$TIP_BUILD_NUMBER"', tip_script)
         self.assertIn("stage|sign|publish-tip", tip_script)
 
+        sign_tip = tip_script.split("sign_tip() {", 1)[1].split("\n}", 1)[0]
+        generate_appcast = sign_tip.index('"$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast"')
+        validate_appcast = sign_tip.index("validate_generated_tip_appcast")
+        write_checksums = sign_tip.index('shasum -a 256', validate_appcast)
+        self.assertLess(generate_appcast, validate_appcast)
+        self.assertLess(validate_appcast, write_checksums)
+        self.assertIn('fail "Tip appcast enclosure is missing an EdDSA signature"', tip_script)
+        self.assertIn('fail "Tip Sparkle private key does not match the app bundle SUPublicEDKey"', tip_script)
+        self.assertIn('fail "Tip Sparkle private key does not reproduce the generated appcast signature"', tip_script)
+        self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"', tip_script)
+
         capture_override = package_script.index(
             'RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"'
         )
