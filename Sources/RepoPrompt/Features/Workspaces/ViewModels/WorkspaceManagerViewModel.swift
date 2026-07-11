@@ -7432,6 +7432,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard var latestState = workspaceSaveStateByWorkspaceID[workspaceID] else { break }
             switch finalOutcome {
             case let .committed(version):
+                let latestVersion = stateVersionByWorkspaceID[workspaceID, default: request.requestedVersion]
                 if let pending = latestState.pendingLatest,
                    pending.requestedVersion < version ||
                    (pending.requestedVersion == version && pending.sequence <= request.sequence)
@@ -7439,7 +7440,19 @@ class WorkspaceManagerViewModel: ObservableObject {
                     latestState.pendingLatest = nil
                     latestState.firstDeferredRequestAt = nil
                 }
-                if latestState.pendingLatest == nil {
+                if latestVersion > request.requestedVersion,
+                   latestState.pendingLatest?.requestedVersion ?? Int.min < latestVersion
+                {
+                    latestState.pendingLatest = WorkspaceSaveRequest(
+                        workspaceID: workspaceID,
+                        requestedVersion: latestVersion,
+                        source: request.source,
+                        urgency: latestState.requiresBoundaryFlush ? .flushBeforeBoundary : request.urgency,
+                        requestedAt: ContinuousClock.now,
+                        sequence: nextWorkspaceSaveRequestSequence
+                    )
+                    nextWorkspaceSaveRequestSequence &+= 1
+                } else if latestState.pendingLatest == nil {
                     lastSavedVersionByWorkspaceID[workspaceID] = max(
                         lastSavedVersionByWorkspaceID[workspaceID, default: -1],
                         version

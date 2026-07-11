@@ -224,6 +224,39 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
         XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), committedVersion)
     }
 
+    func testMutationDuringAtomicWriteFlushesNewestStateBeforeCompleting() async throws {
+        let storageRoot = try makeTestDirectory(named: "MutationDuringAtomicWrite")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let manager = makeManager(storageRoot: storageRoot)
+        defer { manager.prepareForWindowClose() }
+        var workspace = representativeWorkspace(storageRoot: storageRoot)
+        workspace.currentPromptText = "before"
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+        manager.markWorkspaceDirty()
+        let gate = WorkspaceSavePreparationGate()
+        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.setAtomicWriteGateForTesting {
+            await gate.pauseFirstPreparation()
+        }
+
+        manager.test_scheduleWorkspaceSave(source: "test.blockedAtomicWrite")
+        let flushTask = Task {
+            await manager.test_flushWorkspaceSave(workspaceID: workspace.id, source: "test.boundaryFlush")
+        }
+        await gate.waitUntilPaused()
+        manager.workspaces[0].currentPromptText = "after"
+        manager.workspaces[0].dateModified = Date()
+        manager.markWorkspaceDirty()
+        await gate.release()
+
+        let committedVersion = try unwrapCommittedVersion(await flushTask.value)
+        let fileURL = try XCTUnwrap(workspace.customStoragePath?.appendingPathComponent("workspace.json"))
+        let decoded = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL)
+        XCTAssertEqual(decoded.currentPromptText, "after")
+        XCTAssertEqual(manager.test_lastSavedVersion(workspaceID: workspace.id), committedVersion)
+        XCTAssertEqual(manager.test_workspaceSavePreparationCount(workspaceID: workspace.id), 2)
+    }
+
     func testFailedAtomicWriteIsObservableAndDoesNotAdvanceSavedVersion() async throws {
         let storageRoot = try makeTestDirectory(named: "FailedWrite")
         defer { try? FileManager.default.removeItem(at: storageRoot) }
