@@ -383,14 +383,15 @@ struct AgentRunMCPToolService {
         }
 
         // Compute the default task label before target creation. Omitted `model_id`
-        // for agent_run.start resolves through the global Pair role default.
+        // for agent_run.start resolves through the effective workspace Pair role default.
         let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
 
-        // Validate model selection before creating a target. Role labels resolve through global role defaults.
+        // Validate model selection before creating a target. Role labels resolve through effective workspace/global role defaults.
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: defaultTaskLabel,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
         )
 
         #if DEBUG
