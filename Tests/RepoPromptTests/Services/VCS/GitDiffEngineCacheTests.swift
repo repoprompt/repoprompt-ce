@@ -228,7 +228,7 @@ import XCTest
                 files: [
                     "A.swift": "let a = 1\n",
                     "B.swift": "let b = 1\n",
-                    "C.swift": "let c = 1\n",
+                    "C.swift": "let c = 1\n"
                 ]
             )
             try fixture.write("let a = 2\n", to: "A.swift", at: repo)
@@ -246,7 +246,7 @@ import XCTest
                 (.all, []),
                 (.selected, [pathA]),
                 (.selected, [pathB]),
-                (.selected, [pathC]),
+                (.selected, [pathC])
             ]
 
             let maximumBytes = 1024 * 1024

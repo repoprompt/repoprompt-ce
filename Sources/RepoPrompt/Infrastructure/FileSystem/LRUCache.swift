@@ -151,7 +151,9 @@ struct LRUCache<Key: Hashable, Value> {
         node.prev = nil
         head?.prev = node
         head = node
-        if tail == nil { tail = node }
+        if tail == nil {
+            tail = node
+        }
     }
 
     private mutating func removeNode(_ node: Node) {
@@ -159,8 +161,12 @@ struct LRUCache<Key: Hashable, Value> {
         let next = node.next
         prev?.next = next
         next?.prev = prev
-        if head === node { head = next }
-        if tail === node { tail = prev }
+        if head === node {
+            head = next
+        }
+        if tail === node {
+            tail = prev
+        }
         node.prev = nil
         node.next = nil
     }
