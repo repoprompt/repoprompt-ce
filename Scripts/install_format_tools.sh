@@ -99,19 +99,13 @@ install_missing_tools(){
         fail "Homebrew is required to install SwiftFormat and SwiftLint. Install Homebrew first, then rerun 'make install-format-tools'."
     fi
 
-    if has_tool swiftformat; then
-        echo "SwiftFormat already installed."
-    else
-        echo "Installing SwiftFormat with Homebrew..."
-        brew install swiftformat
-    fi
+    echo "Installing/upgrading SwiftFormat with Homebrew..."
+    brew install swiftformat
+    brew upgrade swiftformat 2>/dev/null || true
 
-    if has_tool swiftlint; then
-        echo "SwiftLint already installed."
-    else
-        echo "Installing SwiftLint with Homebrew..."
-        brew install swiftlint
-    fi
+    echo "Installing/upgrading SwiftLint with Homebrew..."
+    brew install swiftlint
+    brew upgrade swiftlint 2>/dev/null || true
 
     check_tools
 }
