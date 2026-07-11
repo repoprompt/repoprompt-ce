@@ -249,7 +249,7 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
         manager.markWorkspaceDirty()
         await gate.release()
 
-        let committedVersion = try unwrapCommittedVersion(await flushTask.value)
+        let committedVersion = try await unwrapCommittedVersion(flushTask.value)
         let fileURL = try XCTUnwrap(workspace.customStoragePath?.appendingPathComponent("workspace.json"))
         let decoded = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL)
         XCTAssertEqual(decoded.currentPromptText, "after")
