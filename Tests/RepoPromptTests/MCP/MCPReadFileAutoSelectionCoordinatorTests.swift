@@ -771,7 +771,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
 
     private func waitUntil(
         timeout: Duration = .seconds(5),
-        condition: @escaping @Sendable () async -> Bool
+        condition: @escaping () async -> Bool
     ) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)

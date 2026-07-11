@@ -457,7 +457,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             "\(minimumCount) recorded \(method) requests",
             timeout: timeout
         ) {
-            try recordedRequests(for: method, at: recordURL).count >= minimumCount
+            try self.recordedRequests(for: method, at: recordURL).count >= minimumCount
         }
         return try recordedRequests(for: method, at: recordURL).count
     }

@@ -1223,7 +1223,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
     private static func waitUntil(
         timeout: TimeInterval = 2,
-        condition: () async -> Bool
+        condition: @escaping () async -> Bool
     ) async -> Bool {
         do {
             try await AsyncTestWait.waitUntil("MCP socket descriptor condition", timeout: timeout) {

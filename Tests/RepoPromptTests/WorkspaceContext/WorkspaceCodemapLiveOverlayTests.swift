@@ -1691,7 +1691,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         assertEqualValue(terminalAccounting.entryCount, 0)
         assertEqualValue(terminalAccounting.shadowEntryCount, 0)
         assertEqualValue(terminalAccounting.leaseCount, 0)
-        try await eventually {
+        try await AsyncTestWait.waitUntil("artifact store active lease drain") {
             await fixture.artifactStore.accounting().activeLeaseCount == 0
         }
     }

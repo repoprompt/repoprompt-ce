@@ -167,6 +167,22 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
             sharedMCPService: MCPService()
         )
     }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async throws {
+        do {
+            try await AsyncTestWait.waitUntil("workspace switch presentation condition", timeout: timeout) {
+                await MainActor.run { condition() }
+            }
+        } catch {
+            XCTFail("Timed out waiting for workspace switch presentation condition: \(error)", file: file, line: line)
+            throw error
+        }
+    }
 }
 
 @MainActor
