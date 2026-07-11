@@ -106,7 +106,8 @@ final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
         return Result(
             payload: retainedEntries.isEmpty ? nil : FSEventCallbackPayload(
                 entries: retainedEntries,
-                ingressEvidence: payload.ingressEvidence
+                ingressEvidence: payload.ingressEvidence,
+                isTruncated: payload.isTruncated
             ),
             filteredEntryCount: filteredCount
         )

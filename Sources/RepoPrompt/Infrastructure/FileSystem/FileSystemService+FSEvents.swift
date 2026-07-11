@@ -13,13 +13,16 @@ struct FSEventCallbackEntry {
 struct FSEventCallbackPayload {
     let entries: [FSEventCallbackEntry]
     let ingressEvidence: FileSystemWatcherIngressEvidence
+    let isTruncated: Bool
 
     init(
         entries: [FSEventCallbackEntry],
-        ingressEvidence: FileSystemWatcherIngressEvidence = .empty
+        ingressEvidence: FileSystemWatcherIngressEvidence = .empty,
+        isTruncated: Bool = false
     ) {
         self.entries = entries
         self.ingressEvidence = ingressEvidence
+        self.isTruncated = isTruncated
     }
 
     var count: Int {
@@ -537,7 +540,8 @@ extension FileSystemService {
         }
 
         if entries.isEmpty, availableCount <= safeCount { return nil }
-        if availableCount > safeCount {
+        let isTruncated = availableCount > safeCount
+        if isTruncated {
             // Do not synchronously walk an unbounded burst. The sentinel preserves the
             // highest callback event ID and forces the existing whole-root recovery path.
             entries.append(FSEventCallbackEntry(
@@ -547,7 +551,7 @@ extension FileSystemService {
                 id: eventIds[availableCount - 1]
             ))
         }
-        return FSEventCallbackPayload(entries: entries)
+        return FSEventCallbackPayload(entries: entries, isTruncated: isTruncated)
     }
 
     /// The static callback that FSEvents uses to report changes. We hand off to Task to enter the actor context.
@@ -602,7 +606,8 @@ extension FileSystemService {
         )
         let analyzedPayload = FSEventCallbackPayload(
             entries: payload.entries,
-            ingressEvidence: evidence
+            ingressEvidence: evidence,
+            isTruncated: payload.isTruncated
         )
         // A wrapped journal can never be proven safe by path filtering. Preserve
         // the signal so strict seeded replay rejects it even when its path would
@@ -622,7 +627,8 @@ extension FileSystemService {
         guard let filteredPayload = filterResult.payload else { return }
         let retainedPayload = FSEventCallbackPayload(
             entries: filteredPayload.entries,
-            ingressEvidence: evidence
+            ingressEvidence: evidence,
+            isTruncated: filteredPayload.isTruncated
         )
 
         let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
@@ -671,6 +677,13 @@ extension FileSystemService {
                 ingressSequence: payload.acceptedHighWatermark.rawValue
             )
         )
+
+        // A truncated payload may have dropped ignore-control deletions in the
+        // discarded tail; conservatively rebuild all ignore rules before any later
+        // reconciliation or full resync.
+        if payload.isTruncated {
+            overflowChangedIgnoreDirs.insert("")
+        }
 
         switch payload.contents {
         case let .entries(entries):

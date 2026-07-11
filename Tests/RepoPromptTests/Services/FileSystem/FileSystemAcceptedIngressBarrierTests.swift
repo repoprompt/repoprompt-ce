@@ -46,10 +46,74 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
             flags: flags,
             ids: ids
         )
-        XCTAssertEqual(payload?.paths.count, 4097)
+        XCTAssertEqual(payload?.entries.count, 4097)
+        XCTAssertTrue(payload?.isTruncated ?? false)
         let mustScanSubdirectories = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
-        XCTAssertNotEqual((payload?.flags.last ?? 0) & mustScanSubdirectories, 0)
-        XCTAssertEqual(payload?.ids.last, FSEventStreamEventId(count))
+        XCTAssertNotEqual((payload?.entries.last?.flags ?? 0) & mustScanSubdirectories, 0)
+        XCTAssertEqual(payload?.entries.last?.id, FSEventStreamEventId(count))
+    }
+
+    func testLargeCallbackWithTrailingIgnoreFileDeletionRebuildsIgnoreRules() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "LargeCallbackIgnoreDeletion")
+        let gitignoreURL = root.appendingPathComponent(".gitignore")
+        let ignoredURL = root.appendingPathComponent("ignored.txt")
+        try "*.txt\n".write(to: gitignoreURL, atomically: true, encoding: .utf8)
+        try "ignored".write(to: ignoredURL, atomically: true, encoding: .utf8)
+
+        let service = try await makeService(root: root)
+        let publications = LockedPublications()
+        let publisher = await service.publisherForChanges()
+        let cancellable = publisher.sink { publications.append($0) }
+        defer { cancellable.cancel() }
+
+        // Delete the ignore control file on disk before the truncated callback arrives.
+        try FileManager.default.removeItem(at: gitignoreURL)
+
+        let count = 5000
+        let rootPath = root.path
+        var paths: [AnyObject] = (0 ..< count).map { index in
+            if index == count - 1 {
+                return (rootPath + "/.gitignore") as NSString
+            }
+            return (rootPath + "/filler-\(index)") as NSString
+        }
+        var flags = Array(repeating: createdFileFlags, count: count)
+        flags[count - 1] = removedFileFlags
+        let ids = (1 ... count).map { FSEventStreamEventId($0) }
+
+        let payload = try XCTUnwrap(FileSystemService.buildOwnedFSEventPayloadFromCFArrayForTesting(
+            pathObjects: paths,
+            flags: flags,
+            ids: ids
+        ))
+        XCTAssertEqual(payload.entries.count, 4097)
+        XCTAssertTrue(payload.isTruncated)
+
+        let events = payload.entries.map { entry in
+            (absolutePath: entry.path, flags: entry.flags, eventId: entry.id)
+        }
+        await service.acceptWatcherPayloadForTesting(events, isTruncated: payload.isTruncated)
+        _ = await service.flushPendingEventsNow()
+
+        let allDeltas = publications.snapshot().flatMap(\.deltas)
+        let addedPaths = allDeltas.compactMap { delta -> String? in
+            if case let .fileAdded(path) = delta {
+                return path
+            }
+            return nil
+        }
+        let removedPaths = allDeltas.compactMap { delta -> String? in
+            if case let .fileRemoved(path) = delta {
+                return path
+            }
+            return nil
+        }
+
+        XCTAssertTrue(
+            addedPaths.contains("ignored.txt"),
+            "Truncated callback must rebuild ignore rules so the previously ignored file becomes visible"
+        )
+        XCTAssertTrue(removedPaths.contains(".gitignore"))
     }
 
     func testAcceptedBeforeAndAfterCaptureCutsPublishIndependentWatermarks() async throws {
@@ -700,6 +764,10 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
 
     private var modifiedFileFlags: FSEventStreamEventFlags {
         FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile)
+    }
+
+    private var removedFileFlags: FSEventStreamEventFlags {
+        FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemIsFile)
     }
 
     private func callbackPayload(path: String, eventID: FSEventStreamEventId) -> FSEventCallbackPayload {

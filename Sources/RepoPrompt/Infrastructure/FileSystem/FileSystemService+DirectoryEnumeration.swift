@@ -96,9 +96,6 @@ extension FileSystemService {
             }
         #endif
 
-        let originalVisitedInventory = visitedInventory.captureState()
-        let originalPathComponentsCache = pathCompsCache
-
         var missingFolderDeltas: [FileSystemDelta] = []
         var existingFolders: [String] = []
         existingFolders.reserveCapacity(cappedFolders.count)
@@ -109,6 +106,9 @@ extension FileSystemService {
                 existingFolders.append(folder)
             }
         }
+
+        let originalVisitedInventory = visitedInventory.captureState()
+        let originalPathComponentsCache = pathCompsCache
 
         guard !existingFolders.isEmpty else {
             return FolderScanBatchResult(deltas: missingFolderDeltas, scannedFolders: scannedFolders)
@@ -144,7 +144,10 @@ extension FileSystemService {
             ) {
                 var deltas: [FileSystemDelta] = []
                 for folder in existingFolders {
-                    let folderDeltas = try await scanOneLevelAndDiff(folder)
+                    let folderDeltas = try await scanOneLevelAndDiff(
+                        folder,
+                        expectedWatcherIngressGeneration: expectedWatcherIngressGeneration
+                    )
                     deltas.append(contentsOf: folderDeltas)
                 }
                 return FolderScanBatchResult(deltas: missingFolderDeltas + deltas, scannedFolders: scannedFolders)
@@ -280,9 +283,7 @@ extension FileSystemService {
                 }
             }
         } catch {
-            if expectedWatcherIngressGeneration == nil || expectedWatcherIngressGeneration == watcherIngressGeneration {
-                restoreScanState(inventory: originalVisitedInventory, pathCompsCache: originalPathComponentsCache)
-            }
+            restoreScanState(inventory: originalVisitedInventory, pathCompsCache: originalPathComponentsCache)
             throw error
         }
 
@@ -298,9 +299,7 @@ extension FileSystemService {
         do {
             return try await operation()
         } catch {
-            if expectedWatcherIngressGeneration == nil || expectedWatcherIngressGeneration == watcherIngressGeneration {
-                restoreScanState(inventory: inventory, pathCompsCache: pathCompsCache)
-            }
+            restoreScanState(inventory: inventory, pathCompsCache: pathCompsCache)
             throw error
         }
     }
@@ -323,6 +322,23 @@ extension FileSystemService {
     func scanOneLevelAndDiff(
         _ folderRelPath: String,
         expectedWatcherIngressGeneration: UInt64? = nil
+    ) async throws -> [FileSystemDelta] {
+        let originalVisitedInventory = visitedInventory.captureState()
+        let originalPathComponentsCache = pathCompsCache
+        do {
+            return try await scanOneLevelAndDiffUnsafe(
+                folderRelPath,
+                expectedWatcherIngressGeneration: expectedWatcherIngressGeneration
+            )
+        } catch {
+            restoreScanState(inventory: originalVisitedInventory, pathCompsCache: originalPathComponentsCache)
+            throw error
+        }
+    }
+
+    private func scanOneLevelAndDiffUnsafe(
+        _ folderRelPath: String,
+        expectedWatcherIngressGeneration: UInt64?
     ) async throws -> [FileSystemDelta] {
         #if DEBUG
             if let remaining = folderScanFailuresRemainingForTesting[folderRelPath], remaining > 0 {
@@ -418,6 +434,11 @@ extension FileSystemService {
             childIsDir[childRel] = isDirEntry
         }
 
+        if let expectedWatcherIngressGeneration,
+           expectedWatcherIngressGeneration != watcherIngressGeneration
+        {
+            throw CancellationError()
+        }
         mergeIgnoreCache(deltaCache)
 
         let actualSet = Set(actualChildren)
@@ -502,7 +523,8 @@ extension FileSystemService {
         let actualItems = try await gatherPathsUsingEnumerator(
             rootURL: rootURL,
             skipSymlinks: skipSymlinks,
-            baseRelativePath: ""
+            baseRelativePath: "",
+            expectedWatcherIngressGeneration: expectedWatcherIngressGeneration
         )
         var reconciledItems = actualItems
         for relativePath in explicitlyManagedIgnoredFilePaths
@@ -568,7 +590,8 @@ extension FileSystemService {
         let subtreeItems = try await gatherPathsUsingEnumerator(
             rootURL: URL(fileURLWithPath: absFolder),
             skipSymlinks: skipSymlinks,
-            baseRelativePath: folderRelPath
+            baseRelativePath: folderRelPath,
+            expectedWatcherIngressGeneration: expectedWatcherIngressGeneration
         )
         if let expectedWatcherIngressGeneration,
            expectedWatcherIngressGeneration != watcherIngressGeneration
@@ -1282,7 +1305,8 @@ extension FileSystemService {
     func gatherPathsUsingEnumerator(
         rootURL: URL,
         skipSymlinks: Bool,
-        baseRelativePath: String
+        baseRelativePath: String,
+        expectedWatcherIngressGeneration: UInt64? = nil
     ) async throws -> [String: Bool] {
         #if DEBUG
             if let overrideFS = fileManagerOverride, !(overrideFS is FileManager) {
@@ -1397,6 +1421,12 @@ extension FileSystemService {
                     respectCursorignore: respectCursorignore
                 )
             #endif
+
+            if let expectedWatcherIngressGeneration,
+               expectedWatcherIngressGeneration != watcherIngressGeneration
+            {
+                throw CancellationError()
+            }
 
             if !result.ignoreCacheDelta.isEmpty {
                 mergeIgnoreCache(result.ignoreCacheDelta)

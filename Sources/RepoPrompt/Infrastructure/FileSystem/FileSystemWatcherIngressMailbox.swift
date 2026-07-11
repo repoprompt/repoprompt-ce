@@ -33,6 +33,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         let contents: Contents
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
         let ingressEvidence: FileSystemWatcherIngressEvidence
+        let isTruncated: Bool
 
         var rawEntryCount: Int {
             switch contents {
@@ -141,7 +142,8 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
             acceptedHighWatermark: watermark,
             contents: .entries(payload.entries),
             lifecycleCorrelation: lifecycleCorrelation,
-            ingressEvidence: payload.ingressEvidence
+            ingressEvidence: payload.ingressEvidence,
+            isTruncated: payload.isTruncated
         )
         appendOrCollapse(acceptedPayload)
         if let scheduleDrain {
@@ -204,10 +206,12 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         var highestEventID: FSEventStreamEventId = 0
         var changedIgnoreAbsolutePaths = Set<String>()
         var ingressEvidence = FileSystemWatcherIngressEvidence.empty
+        var isTruncated = false
         for queuedPayload in payloads {
             lowestAcceptedWatermark = min(lowestAcceptedWatermark, queuedPayload.lowestAcceptedWatermark)
             acceptedHighWatermark = max(acceptedHighWatermark, queuedPayload.acceptedHighWatermark)
             ingressEvidence = ingressEvidence.merging(queuedPayload.ingressEvidence)
+            isTruncated = isTruncated || queuedPayload.isTruncated
             switch queuedPayload.contents {
             case let .entries(entries):
                 for entry in entries {
@@ -233,7 +237,8 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
                 changedIgnoreAbsolutePaths: changedIgnoreAbsolutePaths
             ),
             lifecycleCorrelation: payload.lifecycleCorrelation,
-            ingressEvidence: ingressEvidence
+            ingressEvidence: ingressEvidence,
+            isTruncated: isTruncated
         )]
         queuedPayloadHead = 0
         queuedRawEntryCount = 1
