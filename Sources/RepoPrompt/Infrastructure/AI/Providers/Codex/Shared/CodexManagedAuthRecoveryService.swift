@@ -164,16 +164,14 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         if let inFlightLoginTask {
             return await inFlightLoginTask.value
         }
-        if let inFlightRefreshTask {
-            switch await inFlightRefreshTask.value {
-            case let .executableUnavailable(message):
-                return .executableUnavailable(message: message)
-            case .recovered, .requiresUserLogin:
-                break
-            }
-        }
-
+        let pendingAccountReadTasks = [inFlightRefreshTask, inFlightCheckTask].compactMap(\.self)
         let task = Task<CodexManagedChatgptLoginResult, Never> { [clientFactory, refreshRequestTimeout, loginValidationTimeout, loginPollInterval] in
+            for accountReadTask in pendingAccountReadTasks {
+                if case let .executableUnavailable(message) = await accountReadTask.value {
+                    return .executableUnavailable(message: message)
+                }
+            }
+
             let client = clientFactory()
             defer {
                 Task { await client.stop() }
