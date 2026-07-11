@@ -126,12 +126,16 @@ struct GitDiffSnapshotStore {
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         if let destination = try? fileManager.destinationOfSymbolicLink(atPath: url.path) {
             let trimmed = destination.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { return nil }
+            if trimmed.isEmpty {
+                return nil
+            }
             if trimmed.hasPrefix("/") {
                 let root = snapshotsRoot(workspaceDirectory: workspaceDirectory).path
                 if trimmed.hasPrefix(root) || trimmed.lowercased().hasPrefix(root.lowercased()) {
                     var rel = String(trimmed.dropFirst(root.count))
-                    if rel.hasPrefix("/") { rel.removeFirst() }
+                    if rel.hasPrefix("/") {
+                        rel.removeFirst()
+                    }
                     return rel.isEmpty ? nil : rel
                 }
             }
@@ -369,11 +373,19 @@ struct GitDiffSnapshotStore {
 
         var results: Set<URL> = []
         for case let fileURL as URL in enumerator {
-            if fileURL.lastPathComponent != "manifest.json" { continue }
+            if fileURL.lastPathComponent != "manifest.json" {
+                continue
+            }
             let path = fileURL.path
-            if path.contains("/repos/") { continue }
-            if path.contains("/diff-snapshots/") { continue }
-            if (try? fileURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true { continue }
+            if path.contains("/repos/") {
+                continue
+            }
+            if path.contains("/diff-snapshots/") {
+                continue
+            }
+            if (try? fileURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                continue
+            }
             results.insert(fileURL.deletingLastPathComponent())
         }
         return results
@@ -392,12 +404,16 @@ struct GitDiffSnapshotStore {
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         if let destination = try? fileManager.destinationOfSymbolicLink(atPath: url.path) {
             let trimmed = destination.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { return nil }
+            if trimmed.isEmpty {
+                return nil
+            }
             if trimmed.hasPrefix("/") {
                 let rootPath = root.path
                 if trimmed.hasPrefix(rootPath) || trimmed.lowercased().hasPrefix(rootPath.lowercased()) {
                     var rel = String(trimmed.dropFirst(rootPath.count))
-                    if rel.hasPrefix("/") { rel.removeFirst() }
+                    if rel.hasPrefix("/") {
+                        rel.removeFirst()
+                    }
                     return rel.isEmpty ? nil : rel
                 }
             }
@@ -633,12 +649,22 @@ struct GitDiffSnapshotStore {
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
         for case let fileURL as URL in enumerator {
-            if fileURL.lastPathComponent != "manifest.json" { continue }
-            if fileURL.path.contains("/CURRENT/") { continue }
-            if !allowLegacyPaths, fileURL.path.contains("/diff-snapshots/") { continue }
+            if fileURL.lastPathComponent != "manifest.json" {
+                continue
+            }
+            if fileURL.path.contains("/CURRENT/") {
+                continue
+            }
+            if !allowLegacyPaths, fileURL.path.contains("/diff-snapshots/") {
+                continue
+            }
             // Skip repos subdirectory when listing legacy root
-            if repoKey == nil, fileURL.path.contains("/repos/") { continue }
-            if (try? fileURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true { continue }
+            if repoKey == nil, fileURL.path.contains("/repos/") {
+                continue
+            }
+            if (try? fileURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                continue
+            }
             let snapshotDir = fileURL.deletingLastPathComponent()
             let snapshotID = relativePath(from: root, to: snapshotDir)
             guard let data = try? Data(contentsOf: fileURL),
@@ -765,14 +791,18 @@ struct GitDiffSnapshotStore {
         let targetPath = (url.path as NSString).standardizingPath
         if targetPath.hasPrefix(basePath) {
             var rel = String(targetPath.dropFirst(basePath.count))
-            if rel.hasPrefix("/") { rel.removeFirst() }
+            if rel.hasPrefix("/") {
+                rel.removeFirst()
+            }
             return rel
         }
         let baseLower = basePath.lowercased()
         let targetLower = targetPath.lowercased()
         if targetLower.hasPrefix(baseLower) {
             var rel = String(targetPath.dropFirst(basePath.count))
-            if rel.hasPrefix("/") { rel.removeFirst() }
+            if rel.hasPrefix("/") {
+                rel.removeFirst()
+            }
             return rel
         }
         return url.path
@@ -1209,15 +1239,33 @@ enum GitDiffMapBuilder {
 
         lines.append("")
         lines.append("SECTION: ARTIFACTS")
-        if let manifest = inputs.artifacts["manifest"] { lines.append("ARTIFACT_MANIFEST: \(manifest)") }
-        if let map = inputs.artifacts["map"] { lines.append("ARTIFACT_MAP: \(map)") }
-        if let filesTsv = inputs.artifacts["files_tsv"] { lines.append("ARTIFACT_FILES_TSV: \(filesTsv)") }
-        if let changedLines = inputs.artifacts["changed_lines"] { lines.append("ARTIFACT_CHANGED_LINES: \(changedLines)") }
-        if let tree = inputs.artifacts["tree"] { lines.append("ARTIFACT_TREE: \(tree)") }
-        if let selection = inputs.artifacts["selection_paths"] { lines.append("ARTIFACT_SELECTION_PATHS: \(selection)") }
-        if let allPatch = inputs.artifacts["all_patch"] { lines.append("ARTIFACT_ALL_PATCH: \(allPatch)") }
-        if let deepHunks = inputs.artifacts["deep_hunks"] { lines.append("ARTIFACT_DEEP_HUNKS: \(deepHunks)") }
-        if let deepChanged = inputs.artifacts["deep_changed_lines"] { lines.append("ARTIFACT_DEEP_CHANGED_LINES: \(deepChanged)") }
+        if let manifest = inputs.artifacts["manifest"] {
+            lines.append("ARTIFACT_MANIFEST: \(manifest)")
+        }
+        if let map = inputs.artifacts["map"] {
+            lines.append("ARTIFACT_MAP: \(map)")
+        }
+        if let filesTsv = inputs.artifacts["files_tsv"] {
+            lines.append("ARTIFACT_FILES_TSV: \(filesTsv)")
+        }
+        if let changedLines = inputs.artifacts["changed_lines"] {
+            lines.append("ARTIFACT_CHANGED_LINES: \(changedLines)")
+        }
+        if let tree = inputs.artifacts["tree"] {
+            lines.append("ARTIFACT_TREE: \(tree)")
+        }
+        if let selection = inputs.artifacts["selection_paths"] {
+            lines.append("ARTIFACT_SELECTION_PATHS: \(selection)")
+        }
+        if let allPatch = inputs.artifacts["all_patch"] {
+            lines.append("ARTIFACT_ALL_PATCH: \(allPatch)")
+        }
+        if let deepHunks = inputs.artifacts["deep_hunks"] {
+            lines.append("ARTIFACT_DEEP_HUNKS: \(deepHunks)")
+        }
+        if let deepChanged = inputs.artifacts["deep_changed_lines"] {
+            lines.append("ARTIFACT_DEEP_CHANGED_LINES: \(deepChanged)")
+        }
 
         if inputs.artifacts["changed_lines"] != nil {
             lines.append("")
@@ -1349,7 +1397,9 @@ enum GitDiffMapBuilder {
         }
         for section in sections {
             if let block = sectionBlocks[section] {
-                if !output.isEmpty { output.append("") }
+                if !output.isEmpty {
+                    output.append("")
+                }
                 output.append(contentsOf: block)
             }
         }

@@ -57,7 +57,9 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
             pageCount += 1
             catalogPathByteCount += page.pathByteCount
             cursor = page.nextCursor
-            if page.isEnd { break }
+            if page.isEnd {
+                break
+            }
         }
         let catalogToken = try XCTUnwrap(token)
         let graph = try XCTUnwrap(graphProbe.graph(rootEpoch: ticket.rootEpoch))
@@ -1560,7 +1562,9 @@ final class CodemapManifestWriteAttemptLatch: @unchecked Sendable {
     }
 
     func waitForAttemptCount(_ count: Int, timeout: Duration) async -> Bool {
-        if currentAttemptCount >= count { return true }
+        if currentAttemptCount >= count {
+            return true
+        }
         let stream = attemptStream()
         return await withTaskGroup(of: Bool.self) { group in
             group.addTask {
@@ -1689,7 +1693,9 @@ actor CodemapAutomaticSelectionSequenceHarness {
         _ expectedCount: Int,
         timeout: Duration = .seconds(10)
     ) async -> [WorkspaceCodemapArtifactDemandTicket]? {
-        if demandTickets.count >= expectedCount { return demandTickets }
+        if demandTickets.count >= expectedCount {
+            return demandTickets
+        }
         do {
             try await AsyncTestWait.waitUntil(
                 "codemap automatic selection demand count \(expectedCount)",
@@ -1705,7 +1711,9 @@ actor CodemapAutomaticSelectionSequenceHarness {
     }
 
     func waitUntilWaitCount(_ expectedCount: Int, timeout: Duration = .seconds(10)) async -> Bool {
-        if waiterInvocationCount >= expectedCount { return true }
+        if waiterInvocationCount >= expectedCount {
+            return true
+        }
         do {
             try await AsyncTestWait.waitUntil(
                 "codemap automatic selection wait count \(expectedCount)",
@@ -1806,7 +1814,9 @@ actor CodemapRetrySleepGate {
                 timeout: WorkspaceFileContextStoreCodemapSeamTestSupport.timeInterval(timeout)
             )
         } catch {
-            if let delay = delays.first { return delay }
+            if let delay = delays.first {
+                return delay
+            }
             XCTFail(error.localizedDescription)
             return nil
         }
@@ -1877,7 +1887,9 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
     }
 
     func waitForFirstDelay(timeout: TimeInterval) async throws -> UInt64? {
-        if let delay = delays.first { return delay }
+        if let delay = delays.first {
+            return delay
+        }
         let waiterID = UUID()
         do {
             return try await withThrowingTaskGroup(of: UInt64?.self) { group in
@@ -1899,7 +1911,9 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
                 return try await group.next() ?? nil
             }
         } catch {
-            if let delay = delays.first { return delay }
+            if let delay = delays.first {
+                return delay
+            }
             throw error
         }
     }

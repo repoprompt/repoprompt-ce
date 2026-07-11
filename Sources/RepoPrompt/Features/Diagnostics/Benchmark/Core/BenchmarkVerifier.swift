@@ -132,7 +132,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         let lineCount = meta["rawLineCount"]?.intValue ?? 0
         let charOver = max(0, charCount - 10000)
         let lineOver = max(0, lineCount - 200)
-        if charOver == 0 && lineOver == 0 { return result }
+        if charOver == 0 && lineOver == 0 {
+            return result
+        }
         let charPenalty = 1.0 / (1.0 + Double(charOver) / 5000.0)
         let linePenalty = 1.0 / (1.0 + Double(lineOver) / 100.0)
         let penalty = min(charPenalty, linePenalty)
@@ -307,15 +309,29 @@ struct BenchmarkVerifier: BenchmarkVerifying {
 
         // Scoring: 0.4 braces balanced + 0.4 prints correct + 0.2 no collateral
         var score = 0.0
-        if balanced { score += 0.4 }
-        if printsOutside == 1, printsInside == 0 { score += 0.4 }
-        if unchangedOutside { score += 0.2 }
+        if balanced {
+            score += 0.4
+        }
+        if printsOutside == 1, printsInside == 0 {
+            score += 0.4
+        }
+        if unchangedOutside {
+            score += 0.2
+        }
 
         let reason: String = {
-            if !balanced { return "braceUnbalanced" }
-            if printsInside > 0 { return "printCallInsideLoop" }
-            if printsOutside != 1 { return "printCallCountMismatch" }
-            if !unchangedOutside { return "collateralChange" }
+            if !balanced {
+                return "braceUnbalanced"
+            }
+            if printsInside > 0 {
+                return "printCallInsideLoop"
+            }
+            if printsOutside != 1 {
+                return "printCallCountMismatch"
+            }
+            if !unchangedOutside {
+                return "collateralChange"
+            }
             return ""
         }()
 
@@ -392,7 +408,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
                     balance += 1
                 } else if char == "}" {
                     balance -= 1
-                    if balance < 0 { return false }
+                    if balance < 0 {
+                        return false
+                    }
                 }
 
             case .lineComment:
@@ -539,7 +557,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
                         blockStart = current
                     }
                 } else if char == "}" {
-                    if !seenOpen { return nil }
+                    if !seenOpen {
+                        return nil
+                    }
                     depth -= 1
                     if depth == 0 {
                         guard let startIndex = blockStart else { return nil }
@@ -785,13 +805,23 @@ struct BenchmarkVerifier: BenchmarkVerifying {
                 let outsideUnchanged = outsideUnchangedGlobal
 
                 var score = 0.0
-                if placedAfter { score += 0.5 }
-                if outsideUnchanged { score += 0.3 }
-                if sameFunctionContent { score += 0.2 }
+                if placedAfter {
+                    score += 0.5
+                }
+                if outsideUnchanged {
+                    score += 0.3
+                }
+                if sameFunctionContent {
+                    score += 0.2
+                }
                 totalScore += score
 
-                if !placedAfter { detailReasons.append("\(from):notAfterTarget") }
-                if !outsideUnchanged { detailReasons.append("\(from):collateralChange") }
+                if !placedAfter {
+                    detailReasons.append("\(from):notAfterTarget")
+                }
+                if !outsideUnchanged {
+                    detailReasons.append("\(from):collateralChange")
+                }
                 if !sameFunctionContent {
                     detailReasons.append("\(from):functionChanged")
                     anyContentChanged = true
@@ -871,14 +901,26 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         }
 
         var score = 0.0
-        if placedAfter { score += 0.5 }
-        if outsideUnchanged { score += 0.3 }
-        if sameFunctionContent { score += 0.2 }
+        if placedAfter {
+            score += 0.5
+        }
+        if outsideUnchanged {
+            score += 0.3
+        }
+        if sameFunctionContent {
+            score += 0.2
+        }
 
         let reason: String = {
-            if !placedAfter { return "notAfterTarget" }
-            if !outsideUnchanged { return "collateralChange" }
-            if !sameFunctionContent { return "functionChanged" }
+            if !placedAfter {
+                return "notAfterTarget"
+            }
+            if !outsideUnchanged {
+                return "collateralChange"
+            }
+            if !sameFunctionContent {
+                return "functionChanged"
+            }
             return ""
         }()
 
@@ -981,12 +1023,20 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         }
 
         var score = 0.0
-        if placedAboveFooter { score += 0.6 }
-        if outsideUnchanged { score += 0.4 }
+        if placedAboveFooter {
+            score += 0.6
+        }
+        if outsideUnchanged {
+            score += 0.4
+        }
 
         let reason: String = {
-            if !placedAboveFooter { return "wrongPlacement" }
-            if !outsideUnchanged { return "collateralChange" }
+            if !placedAboveFooter {
+                return "wrongPlacement"
+            }
+            if !outsideUnchanged {
+                return "collateralChange"
+            }
             return ""
         }()
 
@@ -1188,7 +1238,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
             let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
             for line in lines {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.isEmpty { continue }
+                if trimmed.isEmpty {
+                    continue
+                }
                 // Get leading whitespace
                 var leading = ""
                 for ch in line {
@@ -1230,9 +1282,15 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         }
 
         var score = 0.0
-        if snippetFound { score += 0.5 }
-        if afterPatternOk { score += 0.3 }
-        if unchangedOutside { score += 0.2 }
+        if snippetFound {
+            score += 0.5
+        }
+        if afterPatternOk {
+            score += 0.3
+        }
+        if unchangedOutside {
+            score += 0.2
+        }
 
         let reason = if !snippetFound {
             "snippetMissing"
@@ -1393,8 +1451,12 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         let unchangedOutside = withoutSnippet.trimmingCharacters(in: .whitespacesAndNewlines) == baselineSegment.trimmingCharacters(in: .whitespacesAndNewlines)
         let anyGuard = finalSegment.contains("if (") && finalSegment.contains("return ")
         var score = 0.0
-        if snippetFound { score += 0.7 }
-        if unchangedOutside { score += 0.3 }
+        if snippetFound {
+            score += 0.7
+        }
+        if unchangedOutside {
+            score += 0.3
+        }
         if !snippetFound, anyGuard, policy.lenient {
             score = max(score, 0.3)
         }
@@ -1439,7 +1501,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
             let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
             for line in lines {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.isEmpty { continue }
+                if trimmed.isEmpty {
+                    continue
+                }
                 // Get leading whitespace
                 var leading = ""
                 for ch in line {
@@ -1498,8 +1562,12 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         let signatureOK = finalBody.contains("\(functionName)(") && snippet.contains("\(functionName)(")
         let similarity = jaccard(tokens(finalBodyNormalized), tokens(snippetNormalized))
         var score = 0.0
-        if signatureOK { score += 0.4 }
-        if unchangedOutside { score += 0.2 }
+        if signatureOK {
+            score += 0.4
+        }
+        if unchangedOutside {
+            score += 0.2
+        }
         score += 0.4 * similarity
         let clamped = clampScore(score)
 
@@ -1617,7 +1685,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         let signatureOK = block.contains("block2(") && target.contains("block2(")
         let similarity = jaccard(tokens(block), tokens(target))
         var score = 0.0
-        if signatureOK { score += 0.4 }
+        if signatureOK {
+            score += 0.4
+        }
         score += 0.6 * similarity
         let clamped = clampScore(score)
 
@@ -1692,7 +1762,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
     }
 
     private func jaccard(_ lhs: Set<String>, _ rhs: Set<String>) -> Double {
-        if lhs.isEmpty, rhs.isEmpty { return 1.0 }
+        if lhs.isEmpty, rhs.isEmpty {
+            return 1.0
+        }
         let intersection = lhs.intersection(rhs).count
         let union = lhs.union(rhs).count
         guard union > 0 else { return 0.0 }
@@ -1896,9 +1968,14 @@ struct BenchmarkVerifier: BenchmarkVerifying {
         let returnExact = body.contains(expectedReturn)
         let returnContainsTarget = !returnExact && body.contains("return \"\(target)")
         var score = 0.0
-        if doneInsideFunction { score += 0.6 }
-        if returnExact { score += 0.4 }
-        else if returnContainsTarget, policy.lenient { score += 0.15 }
+        if doneInsideFunction {
+            score += 0.6
+        }
+        if returnExact {
+            score += 0.4
+        } else if returnContainsTarget, policy.lenient {
+            score += 0.15
+        }
         if !doneInsideFunction, hasAltMarker, policy.lenient {
             score = max(score, 0.3)
         }
@@ -2115,7 +2192,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
     }
 
     static func humanReadableReason(_ reason: String) -> String {
-        if reason.isEmpty { return "" }
+        if reason.isEmpty {
+            return ""
+        }
         let mapping: [String: String] = [
             "missingTargetFile": "Edited output did not include the required file.",
             "nearMissChanged": "Similar identifiers (such as call_x or CALL_XY) were changed—only remove CALL_X.",
@@ -2215,7 +2294,9 @@ struct BenchmarkVerifier: BenchmarkVerifying {
 
     private static func fallbackReasonMessage(for code: String) -> String {
         let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "" }
+        if trimmed.isEmpty {
+            return ""
+        }
         var result = ""
         for character in trimmed {
             if character == "_" || character == "-" {

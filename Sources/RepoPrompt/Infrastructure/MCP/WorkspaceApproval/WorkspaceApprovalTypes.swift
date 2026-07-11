@@ -213,10 +213,14 @@ public struct WorkspaceApprovalSettings: Codable, Sendable {
     /// Check if an operation should be auto-approved.
     public func shouldAutoApprove(operation: WorkspaceApprovalOperation, clientID: String) -> Bool {
         // Global auto-approve
-        if autoApproveAll { return true }
+        if autoApproveAll {
+            return true
+        }
 
         // Per-operation global setting
-        if autoApproveOperations.contains(operation) { return true }
+        if autoApproveOperations.contains(operation) {
+            return true
+        }
 
         return clientPolicies.contains { storedClientID, policy in
             MCPClientIdentity.matches(storedClientID, clientID) && policy.allows(operation)
@@ -233,7 +237,9 @@ public enum WorkspaceApprovalResult: Sendable {
     case timeout
 
     public var isApproved: Bool {
-        if case .approved = self { return true }
+        if case .approved = self {
+            return true
+        }
         return false
     }
 }

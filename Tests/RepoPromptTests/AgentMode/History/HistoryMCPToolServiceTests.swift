@@ -1619,8 +1619,11 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let prior = UserDefaults.standard.object(forKey: key)
         UserDefaults.standard.set(100_000, forKey: key)
         defer {
-            if let prior { UserDefaults.standard.set(prior, forKey: key) }
-            else { UserDefaults.standard.removeObject(forKey: key) }
+            if let prior {
+                UserDefaults.standard.set(prior, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
         }
 
         XCTAssertEqual(try HistoryMCPToolService.resolveIdleThreshold(nil), 1440)
@@ -1815,27 +1818,37 @@ final class HistoryMCPToolServiceTests: XCTestCase {
     // MARK: - Reply Unwrapping Helpers
 
     private func listReply(_ reply: HistoryToolReply) throws -> HistoryListSessionsReply {
-        if case let .listSessions(dto) = reply { return dto }
+        if case let .listSessions(dto) = reply {
+            return dto
+        }
         return try XCTUnwrap(nil as HistoryListSessionsReply?, "expected .listSessions reply, got \(reply)")
     }
 
     private func searchReply(_ reply: HistoryToolReply) throws -> HistorySearchReply {
-        if case let .search(dto) = reply { return dto }
+        if case let .search(dto) = reply {
+            return dto
+        }
         return try XCTUnwrap(nil as HistorySearchReply?, "expected .search reply, got \(reply)")
     }
 
     private func timeReply(_ reply: HistoryToolReply) throws -> HistoryTimeReply {
-        if case let .time(dto) = reply { return dto }
+        if case let .time(dto) = reply {
+            return dto
+        }
         return try XCTUnwrap(nil as HistoryTimeReply?, "expected .time reply, got \(reply)")
     }
 
     private func getSessionReply(_ reply: HistoryToolReply) throws -> HistoryGetSessionReply {
-        if case let .getSession(dto) = reply { return dto }
+        if case let .getSession(dto) = reply {
+            return dto
+        }
         return try XCTUnwrap(nil as HistoryGetSessionReply?, "expected .getSession reply, got \(reply)")
     }
 
     private func errorReply(_ reply: HistoryToolReply) throws -> String {
-        if case let .error(dto) = reply { return dto.error }
+        if case let .error(dto) = reply {
+            return dto.error
+        }
         return try XCTUnwrap(nil as String?, "expected .error reply, got \(reply)")
     }
 

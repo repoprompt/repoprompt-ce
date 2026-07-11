@@ -655,7 +655,9 @@ class OracleViewModel: ObservableObject {
             else { return nil }
             return stableScopedSession(loaded)
         }
-        if targetUUID != nil, !initialIdentityMatches.isEmpty { return nil }
+        if targetUUID != nil, !initialIdentityMatches.isEmpty {
+            return nil
+        }
 
         let persistedLookup: ChatSessionLookupResult
         do {
@@ -677,7 +679,9 @@ class OracleViewModel: ObservableObject {
         case .ambiguous:
             return nil
         }
-        if let persisted, !matchesRequestedTab(persisted) { return nil }
+        if let persisted, !matchesRequestedTab(persisted) {
+            return nil
+        }
 
         let refreshedIdentityMatches = sessions.filter(matchesIdentity)
         let refreshedScopedMatches = refreshedIdentityMatches.filter(matchesRequestedTab)
@@ -694,7 +698,9 @@ class OracleViewModel: ObservableObject {
             else { return nil }
             return stableScopedSession(loaded)
         }
-        if targetUUID != nil, !refreshedIdentityMatches.isEmpty { return nil }
+        if targetUUID != nil, !refreshedIdentityMatches.isEmpty {
+            return nil
+        }
         guard let persisted else { return nil }
 
         sessions.append(persisted)
@@ -779,9 +785,15 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     private func ensureSessionStorage(_ sessionID: UUID) {
-        if messageStore[sessionID] == nil { messageStore[sessionID] = [] }
-        if runStateBySession[sessionID] == nil { runStateBySession[sessionID] = SessionRunState() }
-        if nextSequenceIndexBySession[sessionID] == nil { nextSequenceIndexBySession[sessionID] = 0 }
+        if messageStore[sessionID] == nil {
+            messageStore[sessionID] = []
+        }
+        if runStateBySession[sessionID] == nil {
+            runStateBySession[sessionID] = SessionRunState()
+        }
+        if nextSequenceIndexBySession[sessionID] == nil {
+            nextSequenceIndexBySession[sessionID] = 0
+        }
     }
 
     @MainActor
@@ -3272,7 +3284,9 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func clearChat() async {
-        if messages.isEmpty { return }
+        if messages.isEmpty {
+            return
+        }
         if let sessionID = currentSessionID {
             await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
         }

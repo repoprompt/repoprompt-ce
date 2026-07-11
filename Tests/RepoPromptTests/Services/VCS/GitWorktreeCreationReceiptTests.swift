@@ -536,7 +536,9 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
             switch record.disposition {
             case .ordinaryFile:
                 plannedFiles.insert(path)
-                if record.baseAction == .overlay { overlayFiles.insert(path) }
+                if record.baseAction == .overlay {
+                    overlayFiles.insert(path)
+                }
             case .ordinaryDirectory:
                 plannedFolders.insert(path)
             case .policyIgnoredTrackedFile:
@@ -1101,7 +1103,9 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
                 additionalAuthorityPaths: [externalB],
                 expectedAcceptedWatermark: replacementWatermark
             )
-            if exactReplacementIsCurrent { break }
+            if exactReplacementIsCurrent {
+                break
+            }
             await Task.yield()
         }
         let mismatchedReplacementIsCurrent = await authority.metadataObservationIsCurrent(

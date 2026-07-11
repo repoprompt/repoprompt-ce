@@ -292,7 +292,9 @@ actor CodeMapRootManifestStore {
         let name = namespace.storageDigestHex
         let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
-            if errno == ENOENT || errno == ELOOP { return .miss }
+            if errno == ENOENT || errno == ELOOP {
+                return .miss
+            }
             throw Self.ioError("manifest-open")
         }
         defer { Darwin.close(descriptor) }
@@ -683,7 +685,9 @@ actor CodeMapRootManifestStore {
         var temporaryExists = true
         defer {
             Darwin.close(descriptor)
-            if temporaryExists { _ = unlinkat(shard.rawValue, temporaryName, 0) }
+            if temporaryExists {
+                _ = unlinkat(shard.rawValue, temporaryName, 0)
+            }
         }
         let initial = try Self.validatedFileIdentity(
             descriptor,
@@ -807,8 +811,12 @@ actor CodeMapRootManifestStore {
         let name = namespace.storageDigestHex
         let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
-            if errno == ENOENT { return false }
-            if errno == ELOOP { throw CodeMapRootManifestStoreError.insecureLeaf }
+            if errno == ENOENT {
+                return false
+            }
+            if errno == ELOOP {
+                throw CodeMapRootManifestStoreError.insecureLeaf
+            }
             throw Self.ioError("remove-open")
         }
         defer { Darwin.close(descriptor) }
@@ -897,8 +905,12 @@ actor CodeMapRootManifestStore {
     ) throws -> (identity: ManifestFileIdentity?, snapshot: CodeMapRootManifestSnapshot?) {
         let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
-            if errno == ENOENT { return (nil, nil) }
-            if errno == ELOOP { throw CodeMapRootManifestStoreError.insecureLeaf }
+            if errno == ENOENT {
+                return (nil, nil)
+            }
+            if errno == ELOOP {
+                throw CodeMapRootManifestStoreError.insecureLeaf
+            }
             throw Self.ioError("existing-open")
         }
         defer { Darwin.close(descriptor) }
@@ -942,7 +954,9 @@ actor CodeMapRootManifestStore {
         else { return }
         let quarantineName = "\(name).corrupt.\(UUID().uuidString.lowercased())"
         guard renameat(shard.rawValue, name, layout.quarantine.rawValue, quarantineName) == 0 else {
-            if errno == ENOENT { return }
+            if errno == ENOENT {
+                return
+            }
             throw Self.ioError("quarantine-rename")
         }
         guard let moved = try Self.fileIdentityAt(parent: layout.quarantine, name: quarantineName),
@@ -1010,7 +1024,9 @@ actor CodeMapRootManifestStore {
             }
             return lhs.digest < rhs.digest
         }) where projectedCount > policy.maximumManifestCount || projectedBytes > policy.maximumStoreByteCount {
-            if entry.digest == protectingDigest { continue }
+            if entry.digest == protectingDigest {
+                continue
+            }
             guard let shard = try Self.openOwnedDirectory(
                 parent: layout.manifests,
                 name: entry.shard,
@@ -1172,7 +1188,9 @@ actor CodeMapRootManifestStore {
             }
             result.observedShards[shardName] = shard.identity
             let listing = try Self.directoryEntryNames(shard, maximumCount: remaining + 1)
-            if listing.truncated { result.hasMore = true }
+            if listing.truncated {
+                result.hasMore = true
+            }
             for name in listing.names {
                 guard remaining > 0 else {
                     result.hasMore = true
@@ -1247,7 +1265,9 @@ actor CodeMapRootManifestStore {
         }
 
         let quarantineListing = try Self.directoryEntryNames(layout.quarantine, maximumCount: remaining + 1)
-        if quarantineListing.truncated { result.hasMore = true }
+        if quarantineListing.truncated {
+            result.hasMore = true
+        }
         var quarantineEntries: [(String, ManifestFileIdentity)] = []
         for name in quarantineListing.names where remaining > 0 {
             remaining -= 1
@@ -1272,7 +1292,9 @@ actor CodeMapRootManifestStore {
                 expectedMode: Self.fileMode
             )
             Darwin.close(descriptor)
-            if let identity { quarantineEntries.append((name, identity)) }
+            if let identity {
+                quarantineEntries.append((name, identity))
+            }
         }
         result.quarantineCount = quarantineEntries.count
         if mutate, quarantineEntries.count > policy.maximumQuarantineCount {
@@ -1305,7 +1327,9 @@ actor CodeMapRootManifestStore {
                 }
             }
         }
-        if remaining == 0 { result.hasMore = true }
+        if remaining == 0 {
+            result.hasMore = true
+        }
         result.manifestsMutation = try Self.directoryMutationIdentity(layout.manifests.rawValue)
         result.quarantineMutation = try Self.directoryMutationIdentity(layout.quarantine.rawValue)
         return result
@@ -1388,7 +1412,9 @@ actor CodeMapRootManifestStore {
             let next = openat(descriptor, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             Darwin.close(descriptor)
             guard next >= 0 else {
-                if errno == ELOOP { throw CodeMapRootManifestStoreError.insecureDirectory }
+                if errno == ELOOP {
+                    throw CodeMapRootManifestStoreError.insecureDirectory
+                }
                 throw ioError("root-parent-component-open")
             }
             descriptor = next
@@ -1425,7 +1451,9 @@ actor CodeMapRootManifestStore {
             let next = openat(descriptor, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             Darwin.close(descriptor)
             guard next >= 0 else {
-                if errno == ELOOP { throw CodeMapRootManifestStoreError.insecureDirectory }
+                if errno == ELOOP {
+                    throw CodeMapRootManifestStoreError.insecureDirectory
+                }
                 throw ioError("root-component-open")
             }
             descriptor = next
@@ -1454,8 +1482,12 @@ actor CodeMapRootManifestStore {
         }
         let descriptor = openat(parent.rawValue, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
-            if !create, errno == ENOENT { return nil }
-            if errno == ELOOP || errno == ENOTDIR { throw CodeMapRootManifestStoreError.insecureDirectory }
+            if !create, errno == ENOENT {
+                return nil
+            }
+            if errno == ELOOP || errno == ENOTDIR {
+                throw CodeMapRootManifestStoreError.insecureDirectory
+            }
             throw ioError("directory-open")
         }
         let identity = try directoryIdentity(descriptor)
@@ -1502,8 +1534,12 @@ actor CodeMapRootManifestStore {
             created = true
         }
         guard descriptor >= 0 else {
-            if !create, errno == ENOENT { throw CodeMapRootManifestStoreError.insecureDirectory }
-            if errno == ELOOP { throw CodeMapRootManifestStoreError.insecureLeaf }
+            if !create, errno == ENOENT {
+                throw CodeMapRootManifestStoreError.insecureDirectory
+            }
+            if errno == ELOOP {
+                throw CodeMapRootManifestStoreError.insecureLeaf
+            }
             throw ioError("maintenance-open")
         }
         let identity = try validatedFileIdentity(
@@ -1555,7 +1591,9 @@ actor CodeMapRootManifestStore {
         if fstatat(parent.rawValue, name, &status, AT_SYMLINK_NOFOLLOW) == 0 {
             return ManifestDirectoryIdentity(status)
         }
-        if errno == ENOENT { return nil }
+        if errno == ENOENT {
+            return nil
+        }
         throw ioError("directory-fstatat")
     }
 
@@ -1582,7 +1620,9 @@ actor CodeMapRootManifestStore {
         if fstatat(parent.rawValue, name, &status, AT_SYMLINK_NOFOLLOW) == 0 {
             return ManifestFileIdentity(status)
         }
-        if errno == ENOENT { return nil }
+        if errno == ENOENT {
+            return nil
+        }
         throw ioError("file-fstatat")
     }
 
@@ -1613,7 +1653,9 @@ actor CodeMapRootManifestStore {
         else { return false }
         let quarantineName = "\(name).corrupt.\(UUID().uuidString.lowercased())"
         guard renameat(shard.rawValue, name, quarantine.rawValue, quarantineName) == 0 else {
-            if errno == ENOENT { return false }
+            if errno == ENOENT {
+                return false
+            }
             throw ioError("maintenance-quarantine")
         }
         guard let moved = try fileIdentityAt(parent: quarantine, name: quarantineName),
@@ -1633,7 +1675,9 @@ actor CodeMapRootManifestStore {
         name: String
     ) throws -> Bool {
         let descriptor = openat(parent.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        if descriptor < 0 { return false }
+        if descriptor < 0 {
+            return false
+        }
         defer { Darwin.close(descriptor) }
         _ = try validatedFileIdentity(descriptor, parent: parent, name: name, expectedMode: fileMode)
         return try secureRemove(parent: parent, name: name, descriptor: descriptor)
@@ -1696,7 +1740,9 @@ actor CodeMapRootManifestStore {
                     String(cString: $0)
                 }
             }
-            if name == "." || name == ".." { continue }
+            if name == "." || name == ".." {
+                continue
+            }
             if names.count >= maximumCount {
                 truncated = true
                 break

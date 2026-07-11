@@ -481,7 +481,9 @@ struct GitRepoTargetResolver {
     private func matchesBranch(_ requested: String, headRef: String) -> Bool {
         let trimmed = requested.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        if headRef == trimmed { return true }
+        if headRef == trimmed {
+            return true
+        }
         if headRef.hasPrefix("refs/heads/") {
             let short = String(headRef.dropFirst("refs/heads/".count))
             return short == trimmed

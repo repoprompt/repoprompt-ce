@@ -36,7 +36,9 @@ enum SimpleUnifiedPatchApplier {
 
         // Enforce deterministic order: sort by oldStart (stable), tie-break on newStart
         hunks.sort { lhs, rhs in
-            if lhs.oldStart == rhs.oldStart { return lhs.newStart < rhs.newStart }
+            if lhs.oldStart == rhs.oldStart {
+                return lhs.newStart < rhs.newStart
+            }
             return lhs.oldStart < rhs.oldStart
         }
         if debug {
@@ -56,7 +58,9 @@ enum SimpleUnifiedPatchApplier {
             log("applied hunk[\(idx)] ok; new delta=\(delta)")
         }
         var output = lines.joined(separator: "\n")
-        if hadTrailingNewline { output += "\n" }
+        if hadTrailingNewline {
+            output += "\n"
+        }
         return output
     }
 
@@ -84,7 +88,9 @@ enum SimpleUnifiedPatchApplier {
                 var ops: [Op] = []
                 while index < allLines.count {
                     let payload = allLines[index]
-                    if payload.hasPrefix("@@") { break }
+                    if payload.hasPrefix("@@") {
+                        break
+                    }
                     if payload.hasPrefix("---") || payload.hasPrefix("+++") {
                         index += 1
                         continue
@@ -108,13 +114,17 @@ enum SimpleUnifiedPatchApplier {
                     }
                     index += 1
                 }
-                if debug { log("collected ops: \(ops.count)") }
+                if debug {
+                    log("collected ops: \(ops.count)")
+                }
                 hunks.append(Hunk(oldStart: header.oldStart, oldCount: header.oldCount, newStart: header.newStart, newCount: header.newCount, ops: ops))
             } else {
                 index += 1
             }
         }
-        if debug { log("parse finished: hunks=\(hunks.count)") }
+        if debug {
+            log("parse finished: hunks=\(hunks.count)")
+        }
         return hunks.isEmpty ? nil : hunks
     }
 
@@ -245,7 +255,9 @@ enum SimpleUnifiedPatchApplier {
             switch op {
             case let .context(value):
                 out.append(value)
-                if out.count >= maxCount { return out }
+                if out.count >= maxCount {
+                    return out
+                }
             default:
                 return out
             }
@@ -287,7 +299,9 @@ enum SimpleUnifiedPatchApplier {
     private static func findLineIndex(lines: [String], value: String, around expected: Int, window: Int = 48) -> Int? {
         let lower = max(0, expected - window)
         let upper = min(lines.count - 1, expected + window)
-        if lower > upper { return nil }
+        if lower > upper {
+            return nil
+        }
         // Prefer proximity: search outward from expected index
         var left = expected
         var right = expected + 1
@@ -305,8 +319,12 @@ enum SimpleUnifiedPatchApplier {
     }
 
     private static func clamp(_ value: Int, _ range: ClosedRange<Int>) -> Int {
-        if value < range.lowerBound { return range.lowerBound }
-        if value > range.upperBound { return range.upperBound }
+        if value < range.lowerBound {
+            return range.lowerBound
+        }
+        if value > range.upperBound {
+            return range.upperBound
+        }
         return value
     }
 }

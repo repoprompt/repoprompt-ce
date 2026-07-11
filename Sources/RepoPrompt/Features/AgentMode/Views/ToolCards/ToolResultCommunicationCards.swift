@@ -29,7 +29,9 @@ struct ChatSendResultCard: View {
     private var summary: String {
         guard let dto else { return "" }
         var parts: [String] = []
-        if let mode = dto.mode { parts.append(mode) }
+        if let mode = dto.mode {
+            parts.append(mode)
+        }
         if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {
             parts.append(chatID)
         }
@@ -40,9 +42,13 @@ struct ChatSendResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
-            if let errors = dto.errors, !errors.isEmpty { return .failure }
+            if let errors = dto.errors, !errors.isEmpty {
+                return .failure
+            }
             if dto.response == nil || dto.response?.isEmpty == true,
                let diffs = dto.diffs,
                !diffs.isEmpty
@@ -123,7 +129,9 @@ struct ChatsResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
             if dto.action?.lowercased() == "log" {
                 return .success
@@ -178,7 +186,9 @@ struct ListModelsResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
             return dto.total > 0 ? .success : .neutral
         }
@@ -259,7 +269,9 @@ struct ManageWorkspacesResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto, let status = dto.status, let mapped = ToolResultStatusResolver.mapStatusWord(status) {
             return mapped
         }

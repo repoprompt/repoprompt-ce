@@ -962,7 +962,9 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
 
     private func waitForEntryCount(_ expected: Int, gate: CapabilityResolutionGate) async {
         for _ in 0 ..< 500 {
-            if await gate.entryCount() >= expected { return }
+            if await gate.entryCount() >= expected {
+                return
+            }
             try? await Task.sleep(for: .milliseconds(2))
         }
         XCTFail("Timed out waiting for \(expected) capability resolution entries")
@@ -973,7 +975,9 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         service: WorkspaceCodemapGitCapabilityService
     ) async {
         for _ in 0 ..< 500 {
-            if await service.snapshotForTesting().waiterCount == expected { return }
+            if await service.snapshotForTesting().waiterCount == expected {
+                return
+            }
             try? await Task.sleep(for: .milliseconds(2))
         }
         XCTFail("Timed out waiting for \(expected) capability waiters")

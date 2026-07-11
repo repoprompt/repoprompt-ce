@@ -770,47 +770,45 @@ struct ContextBuilderAgentView: View {
     }
 
     private var headerSection: some View {
-        Group {
-            HStack(spacing: 8) {
-                // Nested Agent/Model menu picker
-                StableMenuButton(
-                    items: contextBuilderAgentModelMenuItems,
-                    triggerStyle: .borderless
-                ) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "cpu")
-                            .font(.callout)
-                            .foregroundColor(.secondary)
-                        AgentModelSelectionSummaryLabel(
-                            agentKind: viewModel.selectedAgent,
-                            rawModel: viewModel.selectedModelRaw,
-                            title: "\(viewModel.selectedAgent.displayName) · \(viewModel.selectedModelDisplayName)",
-                            iconFont: .caption
-                        )
+        HStack(spacing: 8) {
+            // Nested Agent/Model menu picker
+            StableMenuButton(
+                items: contextBuilderAgentModelMenuItems,
+                triggerStyle: .borderless
+            ) {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
                         .font(.callout)
-                    }
+                        .foregroundColor(.secondary)
+                    AgentModelSelectionSummaryLabel(
+                        agentKind: viewModel.selectedAgent,
+                        rawModel: viewModel.selectedModelRaw,
+                        title: "\(viewModel.selectedAgent.displayName) · \(viewModel.selectedModelDisplayName)",
+                        iconFont: .caption
+                    )
+                    .font(.callout)
                 }
-                .disabled(isContextBuilderRunningForTab)
-                .hoverTooltip("Select agent and model for Context Builder")
-
-                // Context Builder Prompts button
-                ContextBuilderPromptsButton(
-                    selectedPromptIDs: $viewModel.selectedContextBuilderPromptIDs,
-                    showOverlay: $showPromptsOverlay,
-                    storage: promptStorage
-                )
-                .disabled(isContextBuilderRunningForTab)
-                .hoverTooltip("Prompts to include for this Context Builder run")
-
-                Spacer()
             }
-            .sheet(isPresented: $showPromptsOverlay) {
-                ContextBuilderPromptsOverlay(
-                    isVisible: $showPromptsOverlay,
-                    selectedPromptIDs: $viewModel.selectedContextBuilderPromptIDs,
-                    storage: promptStorage
-                )
-            }
+            .disabled(isContextBuilderRunningForTab)
+            .hoverTooltip("Select agent and model for Context Builder")
+
+            // Context Builder Prompts button
+            ContextBuilderPromptsButton(
+                selectedPromptIDs: $viewModel.selectedContextBuilderPromptIDs,
+                showOverlay: $showPromptsOverlay,
+                storage: promptStorage
+            )
+            .disabled(isContextBuilderRunningForTab)
+            .hoverTooltip("Prompts to include for this Context Builder run")
+
+            Spacer()
+        }
+        .sheet(isPresented: $showPromptsOverlay) {
+            ContextBuilderPromptsOverlay(
+                isVisible: $showPromptsOverlay,
+                selectedPromptIDs: $viewModel.selectedContextBuilderPromptIDs,
+                storage: promptStorage
+            )
         }
     }
 

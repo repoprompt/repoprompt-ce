@@ -32,8 +32,12 @@ enum GitCardPresentationBuilder {
     }
 
     private static func status(dto: ToolResultDTOs.GitToolReplyDTO) -> ToolCardStatus {
-        if hasText(dto.error) { return .failure }
-        if hasText(dto.emptyReason) || hasText(dto.warning) || isLimited(dto) { return .warning }
+        if hasText(dto.error) {
+            return .failure
+        }
+        if hasText(dto.emptyReason) || hasText(dto.warning) || isLimited(dto) {
+            return .warning
+        }
         return .success
     }
 
@@ -224,7 +228,9 @@ enum GitCardPresentationBuilder {
     }
 
     private static func shortenedMessage(_ message: String) -> String {
-        if message.count <= 48 { return message }
+        if message.count <= 48 {
+            return message
+        }
         return String(message.prefix(45)) + "…"
     }
 

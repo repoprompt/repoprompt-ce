@@ -127,7 +127,9 @@ final class WorkspaceRootTargetSeedPlanManifestTests: XCTestCase {
                 batch.removeAll(keepingCapacity: true)
             }
         }
-        if !batch.isEmpty { try await writer.append(contentsOf: batch) }
+        if !batch.isEmpty {
+            try await writer.append(contentsOf: batch)
+        }
         let lease = try await writer.finish()
         let reader = try lease.makeReader()
         var readCount = 0

@@ -313,7 +313,9 @@ enum TypeScriptCodeMapStrategy {
         var smallestContaining: ContainerBoundary? = nil
         for i in stride(from: endIdx - 1, through: 0, by: -1) {
             let boundary = containerBoundaries[i]
-            if let k = kind, boundary.kind != k { continue }
+            if let k = kind, boundary.kind != k {
+                continue
+            }
             if rangeContains(boundary.range, range),
                smallestContaining == nil || isBetter(boundary.range, than: smallestContaining!.range)
             {
@@ -534,12 +536,16 @@ enum TypeScriptCodeMapStrategy {
             guard head[index...].hasPrefix(keyword) else { return false }
             if index > head.startIndex {
                 let before = head[head.index(before: index)]
-                if !before.isWhitespace { return false }
+                if !before.isWhitespace {
+                    return false
+                }
             }
             let endIndex = head.index(index, offsetBy: keyword.count)
             if endIndex < head.endIndex {
                 let after = head[endIndex]
-                if !after.isWhitespace { return false }
+                if !after.isWhitespace {
+                    return false
+                }
             }
             return true
         }

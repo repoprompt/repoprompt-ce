@@ -381,7 +381,9 @@ private enum ToolCardSubtitleBuilder {
                     }
                     return op
                 }
-                if let path = args.path, !path.isEmpty { return shortenPath(path) }
+                if let path = args.path, !path.isEmpty {
+                    return shortenPath(path)
+                }
             }
         case "ask_oracle":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.AskOracleArgs.self, from: argsJSON) {
@@ -401,8 +403,12 @@ private enum ToolCardSubtitleBuilder {
             }
         case "chats":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.ChatsArgs.self, from: argsJSON) {
-                if let action = args.action, !action.isEmpty { return action }
-                if let chatID = args.chatID, !chatID.isEmpty { return chatID }
+                if let action = args.action, !action.isEmpty {
+                    return action
+                }
+                if let chatID = args.chatID, !chatID.isEmpty {
+                    return chatID
+                }
             }
         case "bind_context":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.BindContextArgs.self, from: argsJSON) {
@@ -413,12 +419,18 @@ private enum ToolCardSubtitleBuilder {
                 if let windowID = args.windowID {
                     return op.isEmpty ? "window \(windowID)" : "\(op) • window \(windowID)"
                 }
-                if !op.isEmpty { return op }
+                if !op.isEmpty {
+                    return op
+                }
             }
         case "manage_workspaces":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.ManageWorkspacesArgs.self, from: argsJSON) {
-                if let action = args.action, !action.isEmpty { return action }
-                if let workspace = args.workspace, !workspace.isEmpty { return workspace }
+                if let action = args.action, !action.isEmpty {
+                    return action
+                }
+                if let workspace = args.workspace, !workspace.isEmpty {
+                    return workspace
+                }
             }
         case "git":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.GitArgs.self, from: argsJSON),
@@ -492,7 +504,9 @@ private enum ToolCardSubtitleBuilder {
                 let op = args.op?.lowercased() ?? "start"
                 let workflowLabel: String? = {
                     let name = args.workflowName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    if !name.isEmpty { return name }
+                    if !name.isEmpty {
+                        return name
+                    }
                     let id = args.workflowID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     return id.isEmpty ? nil : id
                 }()
@@ -554,8 +568,12 @@ private enum ToolCardSubtitleBuilder {
                     return op.replacingOccurrences(of: "_", with: " ")
                 case "list_sessions":
                     var filters: [String] = []
-                    if let name = args.name, !name.isEmpty { filters.append(name) }
-                    if let state = args.state, !state.isEmpty { filters.append(state) }
+                    if let name = args.name, !name.isEmpty {
+                        filters.append(name)
+                    }
+                    if let state = args.state, !state.isEmpty {
+                        filters.append(state)
+                    }
                     let suffix = filters.isEmpty ? nil : filters.joined(separator: " • ")
                     return (["list sessions"] + [suffix].compactMap(\.self)).joined(separator: " • ")
                 case "get_log":
@@ -568,8 +586,12 @@ private enum ToolCardSubtitleBuilder {
                     }
                     return parts.joined(separator: " • ")
                 case "create_session":
-                    if let name = args.sessionName, !name.isEmpty { return "create • \(name)" }
-                    if let agent = args.agent, !agent.isEmpty { return "create • \(agent)" }
+                    if let name = args.sessionName, !name.isEmpty {
+                        return "create • \(name)"
+                    }
+                    if let agent = args.agent, !agent.isEmpty {
+                        return "create • \(agent)"
+                    }
                     return "create session"
                 case "resume_session":
                     if let sessionID = args.sessionID, !sessionID.isEmpty {
@@ -651,7 +673,9 @@ private enum ToolCardSubtitleBuilder {
     private static func stringArgument(from argsJSON: String?, keys: [String]) -> String? {
         guard let argsJSON else { return nil }
         let trimmed = argsJSON.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return nil }
+        if trimmed.isEmpty {
+            return nil
+        }
         if !trimmed.hasPrefix("{"), !trimmed.hasPrefix("[") {
             return unquotedString(trimmed) ?? trimmed
         }
@@ -674,7 +698,9 @@ private enum ToolCardSubtitleBuilder {
                 }
                 if let number = dictionary[key] as? NSNumber {
                     let text = number.stringValue
-                    if !text.isEmpty { return text }
+                    if !text.isEmpty {
+                        return text
+                    }
                 }
                 if let nested = dictionary[key],
                    let joined = joinedStringArrayValue(from: nested)

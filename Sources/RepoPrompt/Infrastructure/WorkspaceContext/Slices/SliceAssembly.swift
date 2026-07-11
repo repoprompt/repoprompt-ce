@@ -93,11 +93,15 @@ enum SliceAssemblyBuilder {
         for range in ranges {
             let start = max(1, range.start)
             let end = min(max(start, range.end), maxLine)
-            if start > maxLine { continue }
+            if start > maxLine {
+                continue
+            }
             cleaned.append(LineRange(start: start, end: end, description: range.description))
         }
 
-        if cleaned.isEmpty { return [] }
+        if cleaned.isEmpty {
+            return []
+        }
 
         cleaned.sort { lhs, rhs in
             if lhs.start == rhs.start {

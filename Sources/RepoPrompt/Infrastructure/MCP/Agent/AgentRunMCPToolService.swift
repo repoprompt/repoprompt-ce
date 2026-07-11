@@ -947,8 +947,12 @@ struct AgentRunMCPToolService {
 
         // Steer-and-wait: optionally block until the agent reaches an interesting state
         let shouldWait: Bool = {
-            if let explicit = parseBool(args["wait"]) { return explicit }
-            if args["timeout_seconds"] != nil { return true }
+            if let explicit = parseBool(args["wait"]) {
+                return explicit
+            }
+            if args["timeout_seconds"] != nil {
+                return true
+            }
             return false
         }()
         let rawSteerTimeoutSeconds = args["timeout_seconds"]

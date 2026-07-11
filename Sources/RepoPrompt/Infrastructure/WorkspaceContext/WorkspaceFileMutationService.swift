@@ -69,7 +69,9 @@ struct WorkspaceFileMutationService {
         }
         switch try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope) {
         case let .some(.materialized(file)):
-            if let current = await store.validateCatalogFileStillPresent(file) { return current }
+            if let current = await store.validateCatalogFileStillPresent(file) {
+                return current
+            }
         case .some(.ambiguous):
             throw FileManagerError.fileSystemServiceNotFoundWithContext(
                 "Path '\(userPath)' matches multiple workspace roots. Use a root-qualified or absolute path."

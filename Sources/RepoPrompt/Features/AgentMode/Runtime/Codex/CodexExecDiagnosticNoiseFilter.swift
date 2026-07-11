@@ -31,9 +31,15 @@ enum CodexExecDiagnosticNoiseFilter {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return true }
 
-        if looksLikeTimestampedLog(trimmed) { return true }
-        if looksLikeGoSourceReference(trimmed) { return true }
-        if looksLikeProtocolJSON(trimmed) { return true }
+        if looksLikeTimestampedLog(trimmed) {
+            return true
+        }
+        if looksLikeGoSourceReference(trimmed) {
+            return true
+        }
+        if looksLikeProtocolJSON(trimmed) {
+            return true
+        }
 
         let lowered = trimmed.lowercased()
         return lifecycleMarkers.contains(where: lowered.contains)
@@ -69,8 +75,12 @@ enum CodexExecDiagnosticNoiseFilter {
         }
 
         // Keep structured errors visible
-        if object["error"] != nil { return false }
-        if let message = object["message"] as? String, !message.isEmpty { return false }
+        if object["error"] != nil {
+            return false
+        }
+        if let message = object["message"] as? String, !message.isEmpty {
+            return false
+        }
 
         // Suppress JSON-RPC and protocol-shaped messages
         return object["jsonrpc"] != nil

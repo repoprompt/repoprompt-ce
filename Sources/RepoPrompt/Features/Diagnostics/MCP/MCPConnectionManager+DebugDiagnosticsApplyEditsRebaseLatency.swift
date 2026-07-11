@@ -1147,7 +1147,9 @@ import RepoPromptShared
         private static func debugApplyEditsProbeLineCount(_ content: String) -> Int {
             guard !content.isEmpty else { return 0 }
             return content.reduce(into: 1) { count, character in
-                if character == "\n" { count += 1 }
+                if character == "\n" {
+                    count += 1
+                }
             }
         }
     }

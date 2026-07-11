@@ -128,7 +128,9 @@ enum NonBlockingFDWriter {
             }
 
             let err = errno
-            if err == EINTR { continue }
+            if err == EINTR {
+                continue
+            }
             if err == EPIPE {
                 throw NonBlockingFDWriteError.brokenPipe(bytesWritten: totalWritten, totalBytes: data.count)
             }
@@ -180,11 +182,15 @@ enum NonBlockingFDWriter {
             let result = poll(&pfd, 1, timeoutMs)
 
             if result < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw NonBlockingFDWriteError.pollFailed(errno: errno)
             }
 
-            if result == 0 { continue }
+            if result == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
                 throw NonBlockingFDWriteError.brokenPipe(bytesWritten: bytesWritten, totalBytes: totalBytes)

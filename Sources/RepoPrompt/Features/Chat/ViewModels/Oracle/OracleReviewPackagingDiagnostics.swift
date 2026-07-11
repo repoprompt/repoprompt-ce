@@ -134,7 +134,11 @@ enum OracleSendOrigin: String {
                     canonicalWorkspaceRootPathHashes: $0.canonicalWorkspaceRootPaths.map(identityHash)
                 )
             }
-            let delegationID: UUID? = if case let .delegated(id) = packaging.provenance { id } else { nil }
+            let delegationID: UUID? = if case let .delegated(id) = packaging.provenance {
+                id
+            } else {
+                nil
+            }
             let snapshot = OracleReviewPackagingFrozenSnapshot(
                 origin: tabContext.origin,
                 conversationTabID: tabContext.tabID,

@@ -368,7 +368,9 @@ enum StoreBackedWorkspaceSearch {
             let filterTask = Task.detached(priority: .userInitiated) { [snapshots, spec = parsed.spec] in
                 filterPathIndicesResult(snapshots: snapshots, spec: spec)
             }
-            if Task.isCancelled { filterTask.cancel() }
+            if Task.isCancelled {
+                filterTask.cancel()
+            }
             let filterResult = await withTaskCancellationHandler {
                 await filterTask.value
             } onCancel: {

@@ -85,9 +85,15 @@ final class OpenCodeCLIProvider: AIProvider {
                 }
             case "message_stop":
                 sawMessageStop = true
-                if let value = result.promptTokens { promptTokens = value }
-                if let value = result.completionTokens { completionTokens = value }
-                if let value = result.cost { cost = value }
+                if let value = result.promptTokens {
+                    promptTokens = value
+                }
+                if let value = result.completionTokens {
+                    completionTokens = value
+                }
+                if let value = result.cost {
+                    cost = value
+                }
             case "error":
                 throw AIProviderError.invalidConfiguration(detail: result.text ?? "OpenCode ACP reported an error")
             default:

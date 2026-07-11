@@ -267,7 +267,9 @@ struct ContextBuilderReviewTargetResolver {
                 )
             )
             let rejectedCount = authorization.dispositions.reduce(into: 0) { count, disposition in
-                if case .rejected = disposition { count += 1 }
+                if case .rejected = disposition {
+                    count += 1
+                }
             }
             let authorizedArtifacts = authorization.dispositions.compactMap { disposition
                 -> ContextBuilderFinalSelectedArtifactAuthorization? in
@@ -546,8 +548,12 @@ struct ContextBuilderReviewTargetResolver {
                 if lhs.logicalWorkspaceRoot.name != rhs.logicalWorkspaceRoot.name {
                     return lhs.logicalWorkspaceRoot.name < rhs.logicalWorkspaceRoot.name
                 }
-                if lhs.repoKey != rhs.repoKey { return lhs.repoKey < rhs.repoKey }
-                if lhs.repositoryID != rhs.repositoryID { return lhs.repositoryID < rhs.repositoryID }
+                if lhs.repoKey != rhs.repoKey {
+                    return lhs.repoKey < rhs.repoKey
+                }
+                if lhs.repositoryID != rhs.repositoryID {
+                    return lhs.repositoryID < rhs.repositoryID
+                }
                 return lhs.worktreeID < rhs.worktreeID
             }
         guard !targets.isEmpty else { return .unavailable(.emptySelection) }

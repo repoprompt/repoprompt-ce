@@ -238,7 +238,9 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         do {
             try await server.notify(ToolListChangedNotification.message())
         } catch {
-            if isClosing { return }
+            if isClosing {
+                return
+            }
             bootstrapLog.error("Failed to notify bootstrap client of tool list change: \(error)")
             await parentManager.removeConnection(
                 connectionID,

@@ -153,9 +153,15 @@ actor TaskManager {
         }
 
         // Keep the latest non-nil token counts and cost
-        if let p = promptTokens { buffer.promptTokens = p }
-        if let c = completionTokens { buffer.completionTokens = c }
-        if let costValue = cost { buffer.cost = costValue } // NEW
+        if let p = promptTokens {
+            buffer.promptTokens = p
+        }
+        if let c = completionTokens {
+            buffer.completionTokens = c
+        }
+        if let costValue = cost {
+            buffer.cost = costValue
+        } // NEW
 
         let now = Date()
         let elapsed = now.timeIntervalSince(buffer.lastFlushTime)
@@ -395,7 +401,9 @@ public class AIQueriesService {
                             if result.type == "message_stop" || shouldYield {
                                 let (combinedText, combinedReasoning, bufferedTokenInfo, _) = await self.taskManager.flushBuffer(for: taskId)
                                 let isFinal = (result.type == "message_stop")
-                                if isFinal { sawMessageStop = true }
+                                if isFinal {
+                                    sawMessageStop = true
+                                }
 
                                 // Prefer buffered counts; fall back to this chunk's counts
                                 let tokenInfo = bufferedTokenInfo ?? chunkTokenInfo

@@ -137,7 +137,9 @@ enum WorkspaceAliasResolver {
         for aliasLength in stride(from: components.count, through: lowerBound, by: -1) {
             let alias = components.prefix(aliasLength).joined(separator: "/")
             let remainder = components.dropFirst(aliasLength).joined(separator: "/")
-            if options.requireRemainder, remainder.isEmpty { continue }
+            if options.requireRemainder, remainder.isEmpty {
+                continue
+            }
             guard let matches = aliasByRoot[alias.lowercased()] else { continue }
             if matches.count > 1 {
                 return .ambiguous(alias: alias, matchingRoots: matches)

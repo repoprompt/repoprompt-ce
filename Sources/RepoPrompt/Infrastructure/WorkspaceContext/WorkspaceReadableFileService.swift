@@ -269,8 +269,12 @@ struct WorkspaceReadableFileService {
                 EditFlowPerf.Stage.ReadFile.generalLookupFallback,
                 generalLookupFallback,
                 EditFlowPerf.Dimensions(outcome: {
-                    if lookup?.file != nil { return "file" }
-                    if lookup?.folder != nil { return "folder" }
+                    if lookup?.file != nil {
+                        return "file"
+                    }
+                    if lookup?.folder != nil {
+                        return "folder"
+                    }
                     return "noCandidate"
                 }())
             )

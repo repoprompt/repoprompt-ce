@@ -73,7 +73,9 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
             }
             return url
         }
-        if let error = errorBox.error { throw error }
+        if let error = errorBox.error {
+            throw error
+        }
         return nil
     }
 
@@ -550,7 +552,9 @@ actor GitService {
                 return true
             }
             let parent = directory.deletingLastPathComponent()
-            if parent.path == directory.path { return false }
+            if parent.path == directory.path {
+                return false
+            }
             directory = parent
         }
         return false
@@ -804,8 +808,12 @@ actor GitService {
                 }
                 do {
                     var args = ["worktree", "add"]
-                    if request.force { args.append("--force") }
-                    if request.detach { args.append("--detach") }
+                    if request.force {
+                        args.append("--force")
+                    }
+                    if request.detach {
+                        args.append("--detach")
+                    }
                     if let lockReason = request.lockReason {
                         args.append("--lock")
                         if !lockReason.isEmpty {
@@ -818,7 +826,9 @@ actor GitService {
                         args.append(branch)
                     }
                     args.append(request.path.standardizedFileURL.path)
-                    if let baseRef = request.baseRef, !baseRef.isEmpty { args.append(baseRef) }
+                    if let baseRef = request.baseRef, !baseRef.isEmpty {
+                        args.append(baseRef)
+                    }
 
                     #if DEBUG
                         let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
@@ -1549,8 +1559,12 @@ actor GitService {
             ["merge-base", "--is-ancestor", ancestor, descendant],
             at: repoURL
         )
-        if exitCode == 0 { return true }
-        if exitCode == 1 { return false }
+        if exitCode == 0 {
+            return true
+        }
+        if exitCode == 1 {
+            return false
+        }
         throw GitError(message: "git merge-base --is-ancestor failed: \(stderr)")
     }
 
@@ -2108,7 +2122,9 @@ actor GitService {
             }
             if !stdout.isEmpty {
                 combined += stdout
-                if !combined.hasSuffix("\n") { combined += "\n" }
+                if !combined.hasSuffix("\n") {
+                    combined += "\n"
+                }
             }
         }
         return combined
@@ -2275,7 +2291,9 @@ actor GitService {
             if isQuoted {
                 if ch == "\\" {
                     let next = input.index(after: idx)
-                    if next >= input.endIndex { break }
+                    if next >= input.endIndex {
+                        break
+                    }
                     let escaped = input[next]
                     if let octal = parseOctalEscape(escaped, input: input, start: next) {
                         current.append(octal.character)
@@ -2436,7 +2454,9 @@ actor GitService {
                 }
                 if !stdout.isEmpty {
                     combined += stdout
-                    if !combined.hasSuffix("\n") { combined += "\n" }
+                    if !combined.hasSuffix("\n") {
+                        combined += "\n"
+                    }
                 }
             }
             return combined
@@ -2537,7 +2557,9 @@ actor GitService {
             }
             if !stdout.isEmpty {
                 combined += stdout
-                if !combined.hasSuffix("\n") { combined += "\n" }
+                if !combined.hasSuffix("\n") {
+                    combined += "\n"
+                }
             }
         }
         return combined
@@ -3736,7 +3758,9 @@ actor GitService {
                 "status", "--porcelain=v2", "-z",
                 includeUntracked ? "--untracked-files=all" : "--untracked-files=no"
             ]
-            if includeIgnored { arguments.append("--ignored=matching") }
+            if includeIgnored {
+                arguments.append("--ignored=matching")
+            }
             appendLiteralPrefix(prefix, to: &arguments)
             let sealed = try await runSealedTargetEvidenceCommand(
                 arguments,
@@ -4261,8 +4285,12 @@ actor GitService {
     }
 
     nonisolated static func targetEvidenceCollectionError(_ error: any Error) -> any Error {
-        if error is CancellationError { return CancellationError() }
-        if let error = error as? GitTargetEvidenceCollectionError { return error }
+        if error is CancellationError {
+            return CancellationError()
+        }
+        if let error = error as? GitTargetEvidenceCollectionError {
+            return error
+        }
         if let error = error as? GitTargetEvidenceManifestError {
             return GitTargetEvidenceCollectionError.artifact(error)
         }
@@ -5827,9 +5855,13 @@ actor GitService {
         while true {
             try Task.checkCancellation()
             let amount = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
-            if amount == 0 { break }
+            if amount == 0 {
+                break
+            }
             if amount < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             let (nextCount, overflow) = byteCount.addingReportingOverflow(amount)
@@ -5953,7 +5985,9 @@ actor GitService {
             guard let kind = controlKinds[url.lastPathComponent] else { continue }
             try addCandidate(url, kind: kind)
         }
-        if let enumerationError { throw enumerationError }
+        if let enumerationError {
+            throw enumerationError
+        }
 
         var result: [GitWorkspacePrefixControlIdentity] = []
         var totalBytes = 0
@@ -6304,7 +6338,9 @@ actor GitService {
         )
         let (autoCRLF, eol, filters) = try await (autoCRLFResult, eolResult, filtersResult)
         func optionalValue(_ result: (String, String, Int32), name: String) throws -> String? {
-            if result.2 == 1 { return nil }
+            if result.2 == 1 {
+                return nil
+            }
             guard result.2 == 0 else {
                 throw GitError(message: "git config --get \(name) failed: \(result.1)")
             }
@@ -6358,7 +6394,9 @@ actor GitService {
         )
 
         func optionalValue(_ result: (String, String, Int32), name: String) throws -> String? {
-            if result.2 == 1 { return nil }
+            if result.2 == 1 {
+                return nil
+            }
             guard result.2 == 0 else {
                 throw GitError(message: "git config --get \(name) failed")
             }
@@ -7264,14 +7302,18 @@ actor GitService {
         let outCollector = Task(priority: .userInitiated) { () -> Data in
             var buf = Data()
             for await chunk in outStream {
-                if !chunk.isEmpty { buf.append(chunk) }
+                if !chunk.isEmpty {
+                    buf.append(chunk)
+                }
             }
             return buf
         }
         let errCollector = Task(priority: .userInitiated) { () -> Data in
             var buf = Data()
             for await chunk in errStream {
-                if !chunk.isEmpty { buf.append(chunk) }
+                if !chunk.isEmpty {
+                    buf.append(chunk)
+                }
             }
             return buf
         }
@@ -7736,7 +7778,9 @@ actor GitService {
     }()
 
     private func parseGitDate(_ s: String) -> Date? {
-        if let d = Self.gitDateFormatter.date(from: s) { return d }
+        if let d = Self.gitDateFormatter.date(from: s) {
+            return d
+        }
         return Self.rfc3339Formatter.date(from: s)
     }
 

@@ -359,7 +359,9 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
     }
 
     private static func hasExplicitFileRows(_ selection: StoredSelection) -> Bool {
-        if !selection.selectedPaths.isEmpty { return true }
+        if !selection.selectedPaths.isEmpty {
+            return true
+        }
         return selection.slices.contains { !$0.value.isEmpty }
     }
 

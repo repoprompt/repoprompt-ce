@@ -1096,7 +1096,9 @@ enum EditFlowPerf {
             }
 
             func startTimestampIfActive() -> DebugCaptureStart? {
-                if let active = activeHint.loadIfAvailable(), !active { return nil }
+                if let active = activeHint.loadIfAvailable(), !active {
+                    return nil
+                }
                 lock.lock()
                 defer { lock.unlock() }
                 guard active else { return nil }
@@ -1104,7 +1106,9 @@ enum EditFlowPerf {
             }
 
             func activeEpochIfActive() -> UInt64? {
-                if let active = activeHint.loadIfAvailable(), !active { return nil }
+                if let active = activeHint.loadIfAvailable(), !active {
+                    return nil
+                }
                 lock.lock()
                 defer { lock.unlock() }
                 return active ? captureEpoch : nil
@@ -1112,7 +1116,9 @@ enum EditFlowPerf {
 
             func shouldRecordLifecycleEvent(_ correlation: LifecycleCorrelation) -> Bool {
                 guard let correlationEpoch = correlation.captureEpoch else { return false }
-                if let active = activeHint.loadIfAvailable(), !active { return false }
+                if let active = activeHint.loadIfAvailable(), !active {
+                    return false
+                }
                 lock.lock()
                 defer { lock.unlock() }
                 return active && correlationEpoch == captureEpoch

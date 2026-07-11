@@ -90,7 +90,9 @@ struct ContextBuilderAssistantOutputAccumulator {
         for character in text {
             guard character.isNewline else { break }
             count += 1
-            if count >= 2 { break }
+            if count >= 2 {
+                break
+            }
         }
         return count
     }

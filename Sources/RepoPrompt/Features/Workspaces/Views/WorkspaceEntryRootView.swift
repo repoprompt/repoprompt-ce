@@ -29,24 +29,23 @@ struct WorkspaceEntryRootView: View {
 
     // MARK: - Full-Screen Onboarding
 
+    @ViewBuilder
     private var setupGuideContent: some View {
-        Group {
-            if let vm = onboardingViewModel {
-                AgentOnboardingWizardView(
-                    viewModel: vm,
-                    windowID: windowState.windowID,
-                    onDismiss: {
-                        // Skip All / Get Started → go to workspace chooser
-                        tab = .workspaces
-                    },
-                    onContinueToMain: {
-                        onContinueToMain()
-                    }
-                )
-            } else {
-                Color.clear
-                    .onAppear { onCreateOnboardingViewModelIfNeeded() }
-            }
+        if let vm = onboardingViewModel {
+            AgentOnboardingWizardView(
+                viewModel: vm,
+                windowID: windowState.windowID,
+                onDismiss: {
+                    // Skip All / Get Started → go to workspace chooser
+                    tab = .workspaces
+                },
+                onContinueToMain: {
+                    onContinueToMain()
+                }
+            )
+        } else {
+            Color.clear
+                .onAppear { onCreateOnboardingViewModelIfNeeded() }
         }
     }
 

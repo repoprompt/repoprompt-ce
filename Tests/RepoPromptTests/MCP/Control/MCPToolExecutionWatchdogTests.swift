@@ -242,7 +242,9 @@ private actor ExecutionWatchdogCallbackGate {
     }
 
     func waitUntilPaused() async {
-        if isPaused { return }
+        if isPaused {
+            return
+        }
         await withCheckedContinuation { continuation in
             pauseWaiters.append(continuation)
         }

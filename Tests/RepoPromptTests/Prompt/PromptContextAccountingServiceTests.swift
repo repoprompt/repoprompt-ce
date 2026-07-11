@@ -442,7 +442,9 @@ final class PromptContextAccountingServiceTests: XCTestCase {
             return XCTFail("Expected typed unavailable presentation coverage")
         }
         XCTAssertTrue(issues.contains { issue in
-            if case .unavailable(_, .gitTerminal(.nonGit)) = issue { return true }
+            if case .unavailable(_, .gitTerminal(.nonGit)) = issue {
+                return true
+            }
             return false
         })
     }

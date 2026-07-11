@@ -138,8 +138,12 @@ final class FileSystemSeededInventoryChangeSegment: @unchecked Sendable {
         let reader = try makeReader(startingAt: offset)
         while let entry = try reader.next() {
             let entryBytes = Data(entry.relativePath.utf8)
-            if entryBytes == target { return entry }
-            if !entryBytes.lexicographicallyPrecedes(target) { return nil }
+            if entryBytes == target {
+                return entry
+            }
+            if !entryBytes.lexicographicallyPrecedes(target) {
+                return nil
+            }
         }
         return nil
     }
@@ -203,7 +207,9 @@ final class FileSystemSeededInventoryChangeSegmentReader {
                     off_t(offset + UInt64(completed))
                 )
             }
-            if amount < 0, errno == EINTR { continue }
+            if amount < 0, errno == EINTR {
+                continue
+            }
             guard amount > 0 else { throw FileSystemSeedReplayError.inventoryNotInstalled }
             completed += amount
         }
@@ -289,7 +295,9 @@ private final class FileSystemSeededInventoryChangeSegmentWriter {
             var written = 0
             while written < raw.count {
                 let amount = Darwin.write(descriptor, base.advanced(by: written), raw.count - written)
-                if amount < 0, errno == EINTR { continue }
+                if amount < 0, errno == EINTR {
+                    continue
+                }
                 guard amount > 0 else { throw FileSystemSeedReplayError.inventoryNotInstalled }
                 written += amount
             }
@@ -333,7 +341,9 @@ struct FileSystemSeededInventoryChangeOverlay {
         {
             try sealMutableSegment()
         }
-        if mutableChanges[pathData] == nil { mutablePathBytes += retainedPathBytes }
+        if mutableChanges[pathData] == nil {
+            mutablePathBytes += retainedPathBytes
+        }
         mutableChanges[pathData] = FileSystemSeededInventoryChangeEntry(
             relativePath: relativePath,
             change: change,
@@ -341,20 +351,28 @@ struct FileSystemSeededInventoryChangeOverlay {
         )
         nextSequence += 1
         peakMutablePathBytes = max(peakMutablePathBytes, mutablePathBytes)
-        if mutablePathBytes >= Self.maximumMutablePathBytes { try sealMutableSegment() }
+        if mutablePathBytes >= Self.maximumMutablePathBytes {
+            try sealMutableSegment()
+        }
     }
 
     func change(relativePath: String) throws -> FileSystemSeededInventoryChange? {
-        if let entry = mutableChanges[Data(relativePath.utf8)] { return entry.change }
+        if let entry = mutableChanges[Data(relativePath.utf8)] {
+            return entry.change
+        }
         for segment in segments.reversed() {
-            if let entry = try segment.entry(relativePath: relativePath) { return entry.change }
+            if let entry = try segment.entry(relativePath: relativePath) {
+                return entry.change
+            }
         }
         return nil
     }
 
     mutating func snapshot() throws -> FileSystemSeededInventoryChangeOverlaySnapshot {
         try sealMutableSegment()
-        if segments.count > 1 { try compactSegments() }
+        if segments.count > 1 {
+            try compactSegments()
+        }
         return FileSystemSeededInventoryChangeOverlaySnapshot(segments: segments)
     }
 
@@ -385,7 +403,9 @@ struct FileSystemSeededInventoryChangeOverlay {
         peakOpenSegmentCount = max(peakOpenSegmentCount, segments.count)
         mutableChanges.removeAll(keepingCapacity: true)
         mutablePathBytes = 0
-        if segments.count > Self.maximumSegmentCount { try compactSegments() }
+        if segments.count > Self.maximumSegmentCount {
+            try compactSegments()
+        }
     }
 
     private mutating func compactSegments() throws {
@@ -426,7 +446,9 @@ struct FileSystemSeededInventoryChangeOverlay {
                 guard let entry = lookahead[index] else { continue }
                 residentPathBytes += entry.relativePath.utf8.count
                 guard Data(entry.relativePath.utf8) == selectedPathBytes else { continue }
-                if winner.map({ entry.sequence > $0.sequence }) ?? true { winner = entry }
+                if winner.map({ entry.sequence > $0.sequence }) ?? true {
+                    winner = entry
+                }
                 lookahead[index] = try readers[index].next()
             }
             guard let winner else { throw FileSystemSeedReplayError.inventoryNotInstalled }
@@ -484,7 +506,9 @@ final class FileSystemSeededInventoryChangeOverlayIterator {
             guard let entry = lookahead[index],
                   Data(entry.relativePath.utf8) == chosenPathBytes
             else { continue }
-            if newestMatch.map({ entry.sequence > $0.sequence }) ?? true { newestMatch = entry }
+            if newestMatch.map({ entry.sequence > $0.sequence }) ?? true {
+                newestMatch = entry
+            }
             lookahead[index] = try readers[index].next()
         }
         return newestMatch

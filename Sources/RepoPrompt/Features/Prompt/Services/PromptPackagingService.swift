@@ -231,7 +231,9 @@ enum PromptPackagingService {
         var contentBlocks: [String] = []
 
         for record in detailed {
-            if record.text.isEmpty { continue }
+            if record.text.isEmpty {
+                continue
+            }
             if record.isCodemap {
                 codemapBlocks.append(record.text)
             } else {

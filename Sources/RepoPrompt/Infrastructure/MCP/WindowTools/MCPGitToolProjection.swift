@@ -373,7 +373,9 @@ enum MCPGitToolProjection {
         from hunks: [GitDiffPatchParsing.ParsedHunk],
         nilWhenEmpty: Bool
     ) -> [Reply.DiffHunkDTO]? {
-        if nilWhenEmpty, hunks.isEmpty { return nil }
+        if nilWhenEmpty, hunks.isEmpty {
+            return nil
+        }
         return hunks.map { hunk in
             Reply.DiffHunkDTO(
                 header: hunk.header,

@@ -248,7 +248,9 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             let queueDeadline = Date().addingTimeInterval(2)
             repeat {
                 queued = await HeadlessAgentConnectionGate.shared.debugWaitingCount() == 1
-                if queued { break }
+                if queued {
+                    break
+                }
                 try await Task.sleep(for: .milliseconds(10))
             } while Date() < queueDeadline
             let activeBeforeCleanup = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()

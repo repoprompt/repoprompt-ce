@@ -37,7 +37,9 @@ enum MCPWindowWorkspaceToolHelpers {
         allRoots: [WorkspaceRootRef]
     ) -> String {
         let visible = ClientPathFormatter.displayAbsolutePath(fullPath: path, visibleRoots: visibleRoots)
-        if visible != StandardizedPath.absolute(path) { return visible }
+        if visible != StandardizedPath.absolute(path) {
+            return visible
+        }
         return ClientPathFormatter.displayAbsolutePath(fullPath: path, visibleRoots: allRoots)
     }
 
@@ -88,7 +90,9 @@ enum MCPWindowWorkspaceToolHelpers {
 
     static func parseContextAlias(_ args: [String: Value]) -> Int? {
         if let alias = args["-C"] {
-            if let value = alias.intValue { return value }
+            if let value = alias.intValue {
+                return value
+            }
             if let string = alias.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                let parsed = Int(string)
             {
@@ -101,7 +105,9 @@ enum MCPWindowWorkspaceToolHelpers {
             guard lower.hasPrefix("-c") else { continue }
 
             if lower == "-c" {
-                if let intValue = value.intValue { return intValue }
+                if let intValue = value.intValue {
+                    return intValue
+                }
                 if let string = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                    let parsed = Int(string)
                 {

@@ -78,8 +78,12 @@ class ChangeManager {
 
             var newStart = changes[i].startLine + difference
             // Clamp so we never go out of bounds after large deletions/insertions
-            if newStart < 0 { newStart = 0 }
-            if newStart > fileContent.count { newStart = fileContent.count }
+            if newStart < 0 {
+                newStart = 0
+            }
+            if newStart > fileContent.count {
+                newStart = fileContent.count
+            }
 
             changes[i] = FileChange(
                 id: changes[i].id,

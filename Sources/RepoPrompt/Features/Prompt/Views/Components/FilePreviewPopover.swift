@@ -171,14 +171,18 @@ struct FilePreviewPopover: View {
 
             // Load the full content first
             let fullContent = await file.latestContent ?? "Error loading file content"
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
 
             // Trigger syntax highlighting only when snapshot mode needs it
             let previewSnapshot = await MainActor.run { file.previewSnapshot }
             let shouldLoadHighlight = (previewSnapshot?.mode ?? .syntaxHighlighted) == .syntaxHighlighted
             if shouldLoadHighlight {
                 _ = await file.latestNamedRanges
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    return
+                }
             }
 
             // Decide whether to show slices or full content

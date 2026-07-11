@@ -144,7 +144,9 @@ struct AgentExploreMCPToolService {
         }
 
         var isBatch: Bool {
-            if case .batch = self { return true }
+            if case .batch = self {
+                return true
+            }
             return false
         }
     }
@@ -282,7 +284,9 @@ struct AgentExploreMCPToolService {
                 await context.agentModeVM.mcpDiscardSessionTarget(target)
                 let remainingTargets = Array(targets.dropFirst(index + 1))
                 await discardTargets(remainingTargets, agentModeVM: context.agentModeVM)
-                if error is CancellationError { throw error }
+                if error is CancellationError {
+                    throw error
+                }
                 guard !started.isEmpty else { throw error }
                 let startedIDs = started.map(\.outcome.snapshot.sessionID.uuidString).joined(separator: ", ")
                 throw MCPError.internalError(

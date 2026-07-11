@@ -203,7 +203,9 @@ final class PathSearchIndex: @unchecked Sendable {
         }
         defer { search_result_destroy(result) }
 
-        if stats.cancelled { return .cancelled(diagnostics) }
+        if stats.cancelled {
+            return .cancelled(diagnostics)
+        }
 
         let resultPointer = UnsafePointer<search_result_t>(result)
         let count = Int(resultPointer.pointee.count)
@@ -646,7 +648,9 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
                         guard !suppressedEntryIDs.contains(entry.id) else { return nil }
                         return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
                     } ?? []
-                if !candidates.isEmpty { candidateLists.append(candidates) }
+                if !candidates.isEmpty {
+                    candidateLists.append(candidates)
+                }
                 suppressedEntryIDs.formUnion(leaf.affectedEntryIDs)
             }
             segment = current.previous
@@ -666,7 +670,9 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
                     tieBreakKey: candidate.tieBreakKey
                 )
             }
-        if !baseCandidates.isEmpty { candidateLists.append(baseCandidates) }
+        if !baseCandidates.isEmpty {
+            candidateLists.append(baseCandidates)
+        }
 
         var candidateOffsets = Array(repeating: 0, count: candidateLists.count)
         var results: [Candidate] = []
@@ -745,7 +751,9 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
     }
 
     private static func candidatePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
-        if lhs.score != rhs.score { return lhs.score > rhs.score }
+        if lhs.score != rhs.score {
+            return lhs.score > rhs.score
+        }
         switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
         case .orderedAscending:
             return true
@@ -830,7 +838,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
             case let .memory(paths):
                 return paths.contains(relativePath)
             case let .seeded(changed, entries):
-                if (try? changed.contains(relativePath)) == true { return true }
+                if (try? changed.contains(relativePath)) == true {
+                    return true
+                }
                 return WorkspaceProjectedPathSearchIndex.entryIndex(
                     relativePath: relativePath,
                     entries: entries
@@ -1007,7 +1017,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     switch record.baseAction {
                     case .reuse:
                         if try additionalChanged.contains(standardizedRelativePath) {
-                            if let matchedEntry { overlayEntries.append(matchedEntry) }
+                            if let matchedEntry {
+                                overlayEntries.append(matchedEntry)
+                            }
                         } else {
                             guard let matchedEntry,
                                   let baseOrdinal = record.baseOrdinal,
@@ -1036,7 +1048,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     planChangedPathCount += 1
                     if try additionalChanged.contains(standardizedRelativePath) {
                         remainingAdditionalChangedCount -= 1
-                        if let matchedEntry { overlayEntries.append(matchedEntry) }
+                        if let matchedEntry {
+                            overlayEntries.append(matchedEntry)
+                        }
                     } else if matchedEntry != nil {
                         return nil
                     }
@@ -1046,7 +1060,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                         overlayEntries.append(matchedEntry)
                     }
                 }
-                if matchedEntry != nil { authoritativeIndex += 1 }
+                if matchedEntry != nil {
+                    authoritativeIndex += 1
+                }
             }
         } catch {
             return nil
@@ -1294,7 +1310,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     isShadowed = true
                     break
                 }
-                if !isShadowed { result += 1 }
+                if !isShadowed {
+                    result += 1
+                }
             }
         }
         return result
@@ -1336,7 +1354,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
             else { return nil }
             return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
         }
-        if !baseCandidates.isEmpty { candidateLists.append(baseCandidates) }
+        if !baseCandidates.isEmpty {
+            candidateLists.append(baseCandidates)
+        }
         return Self.merge(candidateLists, limit: limit)
     }
 
@@ -1381,7 +1401,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
             }
         }
         guard !Task.isCancelled else { return .cancelled(diagnostics) }
-        if !baseCandidates.isEmpty { candidateLists.append(baseCandidates) }
+        if !baseCandidates.isEmpty {
+            candidateLists.append(baseCandidates)
+        }
         return .completed(Self.merge(candidateLists, limit: limit), diagnostics)
     }
 
@@ -1414,7 +1436,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     }
                     return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
                 } ?? []
-                if !candidates.isEmpty { candidateLists.append(candidates) }
+                if !candidates.isEmpty {
+                    candidateLists.append(candidates)
+                }
                 suppressedRelativePaths.append(leaf.affectedRelativePaths)
             }
             segment = current.previous
@@ -1450,7 +1474,9 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
     }
 
     private static func candidatePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
-        if lhs.score != rhs.score { return lhs.score > rhs.score }
+        if lhs.score != rhs.score {
+            return lhs.score > rhs.score
+        }
         switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
         case .orderedAscending:
             return true

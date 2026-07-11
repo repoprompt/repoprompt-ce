@@ -158,7 +158,9 @@ enum BenchmarkDiffApplier {
         var generatedChunks: [DiffChunk] = []
 
         for change in parsedFile.changes where change.isSelected {
-            if Task.isCancelled { continue }
+            if Task.isCancelled {
+                continue
+            }
             guard let newContent = change.content, !newContent.isEmpty else { continue }
             guard let searchBlock = change.searchBlock, !searchBlock.isEmpty else {
                 throw BenchmarkDiffApplicationError.editApplicationFailed(path: normalizedPath, reason: "missingSearchBlock")

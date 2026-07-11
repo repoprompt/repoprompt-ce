@@ -233,7 +233,9 @@ actor HistorySessionScanner: HistorySessionScanning {
 
         for scan in scanResults {
             // Skip workspaces whose index schema doesn't match the current version.
-            if scan.indexSchemaVersion != nil { continue }
+            if scan.indexSchemaVersion != nil {
+                continue
+            }
 
             // Workspace name filter: match against workspace name or workspace ID string
             if let workspace {

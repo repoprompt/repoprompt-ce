@@ -95,7 +95,9 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
         for _ in 0 ..< 100 {
-            if condition() { return }
+            if condition() {
+                return
+            }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for condition")

@@ -66,10 +66,14 @@ enum CodeHighlighter {
         /// Return the correct cache; build it the first time it is requested.
         static func compiled(darkMode: Bool) -> [(NSRegularExpression, NSColor)] {
             if darkMode {
-                if darkCache.isEmpty { darkCache = buildCache(dark: true) }
+                if darkCache.isEmpty {
+                    darkCache = buildCache(dark: true)
+                }
                 return darkCache
             } else {
-                if lightCache.isEmpty { lightCache = buildCache(dark: false) }
+                if lightCache.isEmpty {
+                    lightCache = buildCache(dark: false)
+                }
                 return lightCache
             }
         }
@@ -265,7 +269,9 @@ enum CodeHighlighter {
         var examined = 0
         var angleCount = 0
         for scalar in s.unicodeScalars {
-            if examined >= sampleLimit { break }
+            if examined >= sampleLimit {
+                break
+            }
             examined &+= 1
             if scalar.value == 60 || scalar.value == 62 {
                 angleCount &+= 1
@@ -285,7 +291,9 @@ enum CodeHighlighter {
             let endExclusive = min(start + chunkSizeUTF16, len)
             ranges.append(NSRange(location: start, length: endExclusive - start))
 
-            if endExclusive == len { break }
+            if endExclusive == len {
+                break
+            }
             start = max(endExclusive - chunkOverlapUTF16, start + 1)
         }
         return ranges

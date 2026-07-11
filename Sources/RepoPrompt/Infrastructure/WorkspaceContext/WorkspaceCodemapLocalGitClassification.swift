@@ -211,8 +211,12 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
         refs: WorkspaceCodemapNonGitFilesystemProof.EntryWitness
     ) -> Bool {
         guard case .present = head else { return false }
-        if case .present = objects { return true }
-        if case .present = refs { return true }
+        if case .present = objects {
+            return true
+        }
+        if case .present = refs {
+            return true
+        }
         return false
     }
 }

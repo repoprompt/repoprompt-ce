@@ -143,7 +143,9 @@ enum BenchmarkJSONValue: Codable, Equatable {
     }
 
     var stringValue: String? {
-        if case let .string(value) = self { return value }
+        if case let .string(value) = self {
+            return value
+        }
         return nil
     }
 
@@ -172,8 +174,12 @@ enum BenchmarkJSONValue: Codable, Equatable {
         case let .double(value): return value != 0
         case let .string(value):
             let lowered = value.lowercased()
-            if lowered == "true" { return true }
-            if lowered == "false" { return false }
+            if lowered == "true" {
+                return true
+            }
+            if lowered == "false" {
+                return false
+            }
             return nil
         default:
             return nil
@@ -181,12 +187,16 @@ enum BenchmarkJSONValue: Codable, Equatable {
     }
 
     var objectValue: [String: BenchmarkJSONValue]? {
-        if case let .object(value) = self { return value }
+        if case let .object(value) = self {
+            return value
+        }
         return nil
     }
 
     var arrayValue: [BenchmarkJSONValue]? {
-        if case let .array(value) = self { return value }
+        if case let .array(value) = self {
+            return value
+        }
         return nil
     }
 }

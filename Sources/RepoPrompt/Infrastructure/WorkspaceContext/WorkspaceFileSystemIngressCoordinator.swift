@@ -609,7 +609,9 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
     }
 
     private func rootState(for rootID: UUID) -> RootState {
-        if let state = rootStatesByID[rootID] { return state }
+        if let state = rootStatesByID[rootID] {
+            return state
+        }
         let state = RootState()
         rootStatesByID[rootID] = state
         return state

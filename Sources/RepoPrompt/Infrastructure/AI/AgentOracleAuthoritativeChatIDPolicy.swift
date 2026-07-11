@@ -39,7 +39,9 @@ enum AgentOracleAuthoritativeChatIDPolicy {
                     }
                     return true
                 }
-                if containsChatID(in: nested) { return true }
+                if containsChatID(in: nested) {
+                    return true
+                }
             }
         } else if let array = value as? [Any] {
             return array.contains { containsChatID(in: $0) }

@@ -836,13 +836,17 @@ final class WorkspaceCodemapSelectionGraphModelStore {
         }
 
         let orderedTargets = resolvedTargets.sorted {
-            if $0.source != $1.source { return $0.source < $1.source }
+            if $0.source != $1.source {
+                return $0.source < $1.source
+            }
             return $0.target < $1.target
         }
         let targets = Array(Set(orderedTargets.map(\.target))).sorted()
         let orderedCoverage = sourceCoverage.sorted { $0.source < $1.source }
         let orderedFailures = referenceFailures.sorted {
-            if $0.source != $1.source { return $0.source < $1.source }
+            if $0.source != $1.source {
+                return $0.source < $1.source
+            }
             return utf8Precedes($0.referencedName, $1.referencedName)
         }
         return WorkspaceCodemapSelectionGraphQueryResult(

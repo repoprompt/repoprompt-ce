@@ -351,7 +351,9 @@ import MCP
         }
 
         static func debugOptionalValue(_ value: (some Any)?) -> Any {
-            if let value { return value }
+            if let value {
+                return value
+            }
             return NSNull()
         }
 

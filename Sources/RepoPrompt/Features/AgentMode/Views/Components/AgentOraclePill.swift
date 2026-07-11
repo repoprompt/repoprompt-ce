@@ -71,10 +71,14 @@ enum AgentOraclePillLogic {
 
         if let activeRunID {
             let exactRunMatches = renderable.filter { matchesAgent($0) && $0.agentModeRunID == activeRunID }
-            if !exactRunMatches.isEmpty { return exactRunMatches }
+            if !exactRunMatches.isEmpty {
+                return exactRunMatches
+            }
 
             let sameAgentLegacyRunMatches = renderable.filter { matchesAgent($0) && $0.agentModeSessionID != nil && $0.agentModeRunID == nil }
-            if !sameAgentLegacyRunMatches.isEmpty { return sameAgentLegacyRunMatches }
+            if !sameAgentLegacyRunMatches.isEmpty {
+                return sameAgentLegacyRunMatches
+            }
 
             if let activeAgentSessionID,
                renderable.contains(where: { $0.agentModeSessionID == activeAgentSessionID })
@@ -86,7 +90,9 @@ enum AgentOraclePillLogic {
 
         if let activeAgentSessionID {
             let sameAgentMatches = renderable.filter { $0.agentModeSessionID == activeAgentSessionID }
-            if !sameAgentMatches.isEmpty { return sameAgentMatches }
+            if !sameAgentMatches.isEmpty {
+                return sameAgentMatches
+            }
         }
 
         return renderable.filter(isUnownedLegacy)

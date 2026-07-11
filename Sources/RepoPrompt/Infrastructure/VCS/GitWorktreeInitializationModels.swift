@@ -366,8 +366,12 @@ struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
     ) -> WorkspaceRootSeedFallbackReason? {
         guard nowUptimeNanoseconds <= expiresAtUptimeNanoseconds else { return .expiredReceipt }
         guard witnessCoverage.provesCreationInterval else {
-            if witnessCoverage.overflowed { return .witnessOverflow }
-            if witnessCoverage.hadDrop { return .witnessDrop }
+            if witnessCoverage.overflowed {
+                return .witnessOverflow
+            }
+            if witnessCoverage.hadDrop {
+                return .witnessDrop
+            }
             return .witnessGap
         }
         guard destinationIsAppManaged else { return .unsupportedDestination }

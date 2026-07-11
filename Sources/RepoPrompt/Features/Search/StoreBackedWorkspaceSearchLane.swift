@@ -523,7 +523,9 @@ actor StoreBackedWorkspaceSearchLane {
     }
 
     private static func waitOutcome(for error: Error) -> String {
-        if error is CancellationError { return "cancelled" }
+        if error is CancellationError {
+            return "cancelled"
+        }
         guard let error = error as? StoreBackedWorkspaceSearchAdmissionError else { return "error" }
         switch error {
         case .queueFull:

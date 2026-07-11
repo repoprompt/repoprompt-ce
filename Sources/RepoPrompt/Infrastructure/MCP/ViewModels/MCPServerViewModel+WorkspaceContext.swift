@@ -201,7 +201,9 @@ extension MCPServerViewModel {
     private func resolvedContextForExportSelectedFiles(
         _ resolvedContext: ResolvedTabContextSnapshot?
     ) async throws -> ResolvedTabContextSnapshot? {
-        if let resolvedContext { return resolvedContext }
+        if let resolvedContext {
+            return resolvedContext
+        }
         let metadata = await captureRequestMetadata()
         return try resolveTabContextSnapshot(
             from: metadata,

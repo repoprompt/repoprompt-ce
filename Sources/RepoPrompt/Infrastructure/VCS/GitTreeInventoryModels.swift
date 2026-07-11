@@ -56,7 +56,9 @@ struct GitRepositoryRelativeRootPrefix: Hashable {
         let pathBytes = Array(repositoryRelativePath.utf8)
         let prefixBytes = Array(value.utf8)
         guard !prefixBytes.isEmpty else { return true }
-        if pathBytes == prefixBytes { return true }
+        if pathBytes == prefixBytes {
+            return true
+        }
         return pathBytes.starts(with: prefixBytes + [UInt8(ascii: "/")])
     }
 }

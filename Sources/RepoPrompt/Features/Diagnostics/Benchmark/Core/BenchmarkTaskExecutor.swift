@@ -133,7 +133,9 @@ final class BenchmarkTaskExecutor {
             return file.changes.contains { change in
                 guard change.isSelected else { return false }
                 let content = change.content ?? []
-                if content.isEmpty { return true }
+                if content.isEmpty {
+                    return true
+                }
                 return content.allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             }
         }

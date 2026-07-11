@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "label": "full-ledger-review-20260711",
+  "base_commit": "74b696d7",
+  "scope": {
+    "pending_rows_before": 1451,
+    "pending_rows_after": 0,
+    "root_rows_reviewed": 1446,
+    "provider_rows_reviewed": 5
+  },
+  "decisions": {
+    "retain": 1439,
+    "consolidate": 12,
+    "redesign": 0,
+    "remove": 0
+  },
+  "scenario_accounting": {
+    "root_before": 28857,
+    "root_after": 28857,
+    "provider_before": 16,
+    "provider_after": 16,
+    "repository_delta": 0
+  },
+  "method_accounting": {
+    "before": 3149,
+    "after": 3143,
+    "delta": -6,
+    "old_to_new_or_removed_mappings": [
+      "testPerClientAdmissionEvictionSkipsCandidateThatBecomesBusyBeforeAtomicClose + testGlobalAdmissionEvictionSkipsCandidateThatBecomesBusyBeforeAtomicClose -> testAdmissionEvictionSkipsCandidateThatBecomesBusyBeforeAtomicClose",
+      "testDirectAdmissionRejectsActorIdentityReplacementAfterSuspension + testDirectAdmissionRejectsLifecycleGenerationReplacementAfterSuspension -> testDirectAdmissionRejectsStaleResumeAfterIdentityOrLifecycleReplacement",
+      "testDirectGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose + testBootstrapGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose -> testGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose",
+      "testDirectGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose + testBootstrapGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose -> testGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose",
+      "testDirectAdmissionRechecksEffectiveCapacityAfterPreservationRollback + testBootstrapAdmissionRechecksEffectiveCapacityAfterPreservationRollback -> testAdmissionRechecksEffectiveCapacityAfterPreservationRollback",
+      "testDirectAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull + testBootstrapAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull -> testAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull"
+    ]
+  },
+  "review_method": {
+    "primary": "Static contract-ledger review derived from exact XCTest method identities, domains, layers, execution tiers, and preserved scenario counts.",
+    "antipattern_screen": "Interactive Devin source review sampled the largest pending suites for invocation-only, no-crash, non-nil-only, source-shape, constant-restatement, report-only, arbitrary-sleep, duplicate, and omnibus patterns.",
+    "external_research": [
+      "DeepWiki repository-specific test-quality and optimizer guidance",
+      "Context7 /swiftlang/swift-testing guidance for parameterization, concurrency, and isolation"
+    ],
+    "decision_rule": "Retain executable IDs unless source inspection establishes a missing observable oracle, obsolete contract, exact duplication, or equivalent parameterized setup and outcome. Candidate name symmetry alone is insufficient for consolidation."
+  },
+  "source_body_audit": {
+    "methods_located": 3143,
+    "missing_files": 0,
+    "missing_methods": 0,
+    "methods_without_direct_xctest_assertions": 92,
+    "small_helper_wrappers": 19,
+    "sleep_calls_review_queue": 54,
+    "non_nil_only_candidates": 3,
+    "source_shape_candidates": 194,
+    "disposition": "All exact methods were located. Helper wrappers were retained when they invoke shared discriminating-oracle helpers; six proven equivalent pairs were consolidated. The three non-nil-only candidates protect ISO-8601 acceptance, window-title publication, and watcher-publisher attachment respectively. Sleep and source-shape matches were treated as review queues rather than automatic removals because most protect bounded concurrency, cancellation, repository fixtures, or diagnostics contracts."
+  },
+  "candidate_consolidations_deferred": {
+    "reason": "Interactive review found several name-symmetric families, but most had materially different setup or incomplete body-level equivalence proof. Preserving independent executable contracts avoids speculative omnibus tables.",
+    "sampled_suites": [
+      "RepoPromptTests.AsyncLimiterTests",
+      "RepoPromptTests.StoreBackedWorkspaceSearchTests",
+      "RepoPromptTests.MCPAgentPolicyAdmissionRaceTests",
+      "RepoPromptTests.TabContextRoutingTests"
+    ]
+  },
+  "ledger_repairs": {
+    "normalized_legacy_row_widths": 2,
+    "missing_executable_ids_reconciled": 2,
+    "curated_ledger_regenerated": false,
+    "identity_fields_changed": false
+  },
+  "timing_claim": "none; this campaign resolves review metadata debt and makes no XCTest performance claim",
+  "validation": {
+    "swiftformat": "pass: 0/1433 files require formatting",
+    "provider_tests": "pass: 7 tests, 0 failures",
+    "optimizer_unit_tests": "pass: 50 tests",
+    "guardrails": "pass",
+    "static_ledger_source_reconciliation": "pass: 3143 default executable methods; no stale IDs; two opt-in benchmark methods and one non-test helper excluded",
+    "structured_autoreview": "clean: no accepted or actionable findings",
+    "root_xctest_and_authoritative_list": "not runnable on Linux host because the macOS app imports Darwin",
+    "swiftlint": "not runnable on Linux host because SourceKitten cannot load libsourcekitdInProc.so"
+  }
+}

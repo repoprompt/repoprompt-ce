@@ -370,8 +370,12 @@ final class SparkleUpdaterManager: ObservableObject {
             let v1Part = i < v1Components.count ? v1Components[i] : 0
             let v2Part = i < v2Components.count ? v2Components[i] : 0
 
-            if v1Part > v2Part { return true }
-            if v1Part < v2Part { return false }
+            if v1Part > v2Part {
+                return true
+            }
+            if v1Part < v2Part {
+                return false
+            }
         }
         return false
     }
@@ -634,8 +638,12 @@ final class SparkleUpdaterManager: ObservableObject {
             for index in 0 ..< maxLength {
                 let lhsPart = index < lhsComponents.count ? lhsComponents[index] : 0
                 let rhsPart = index < rhsComponents.count ? rhsComponents[index] : 0
-                if lhsPart > rhsPart { return true }
-                if lhsPart < rhsPart { return false }
+                if lhsPart > rhsPart {
+                    return true
+                }
+                if lhsPart < rhsPart {
+                    return false
+                }
             }
             return false
         }

@@ -1174,8 +1174,12 @@ enum TypeCleaner {
 
     private static func isTSLiteralType(_ typeName: String) -> Bool {
         let trimmed = typeName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return false }
-        if ["true", "false"].contains(trimmed.lowercased()) { return true }
+        if trimmed.isEmpty {
+            return false
+        }
+        if ["true", "false"].contains(trimmed.lowercased()) {
+            return true
+        }
         if (trimmed.hasPrefix("\"") && trimmed.hasSuffix("\""))
             || (trimmed.hasPrefix("'") && trimmed.hasSuffix("'"))
             || (trimmed.hasPrefix("`") && trimmed.hasSuffix("`"))
@@ -1198,16 +1202,24 @@ enum TypeCleaner {
             cleaned.removeLast()
             cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if cleaned.hasPrefix("{") { cleaned.removeFirst() }
-        if cleaned.hasSuffix("}") { cleaned.removeLast() }
+        if cleaned.hasPrefix("{") {
+            cleaned.removeFirst()
+        }
+        if cleaned.hasSuffix("}") {
+            cleaned.removeLast()
+        }
         cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleaned.isEmpty { return [] }
+        if cleaned.isEmpty {
+            return []
+        }
 
         let members = splitByTopLevelOperator(cleaned, operators: [";", ","])
         var results: [String] = []
         for member in members {
             let trimmed = member.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
+            if trimmed.isEmpty {
+                continue
+            }
             var signature = trimmed
             if signature.hasPrefix("<"),
                let gtIndex = findMatchingAngleBracket(in: signature, startIndex: signature.startIndex)
@@ -1282,16 +1294,24 @@ enum TypeCleaner {
             cleaned.removeLast()
             cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if cleaned.hasPrefix("{") { cleaned.removeFirst() }
-        if cleaned.hasSuffix("}") { cleaned.removeLast() }
+        if cleaned.hasPrefix("{") {
+            cleaned.removeFirst()
+        }
+        if cleaned.hasSuffix("}") {
+            cleaned.removeLast()
+        }
         cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleaned.isEmpty { return [] }
+        if cleaned.isEmpty {
+            return []
+        }
 
         let members = splitByTopLevelOperator(cleaned, operators: [";", ","])
         var results: [String] = []
         for member in members {
             let trimmed = member.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
+            if trimmed.isEmpty {
+                continue
+            }
             var signature = trimmed
             if signature.hasPrefix("<"),
                let gtIndex = findMatchingAngleBracket(in: signature, startIndex: signature.startIndex)

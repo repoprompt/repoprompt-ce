@@ -1282,7 +1282,9 @@ private enum AppSettingsMCPRegistry {
     }
 
     private static func optionalString(from value: Value) throws -> String? {
-        if case .null = value { return nil }
+        if case .null = value {
+            return nil
+        }
         return try requiredString(from: value)
     }
 
@@ -1459,8 +1461,12 @@ private enum AppSettingsMCPRegistry {
             .sorted { lhs, rhs in
                 let lhsProvider = providerRawValue(lhs.providerType)
                 let rhsProvider = providerRawValue(rhs.providerType)
-                if lhsProvider != rhsProvider { return lhsProvider < rhsProvider }
-                if lhs.displayName != rhs.displayName { return lhs.displayName < rhs.displayName }
+                if lhsProvider != rhsProvider {
+                    return lhsProvider < rhsProvider
+                }
+                if lhs.displayName != rhs.displayName {
+                    return lhs.displayName < rhs.displayName
+                }
                 return lhs.rawValue < rhs.rawValue
             }
 

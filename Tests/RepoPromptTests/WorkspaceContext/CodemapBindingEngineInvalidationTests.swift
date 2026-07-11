@@ -608,7 +608,9 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         guard case .cancelled = await task.value else { return XCTFail("Expected read cancellation.") }
         guard case .ready = await queued.value else { return XCTFail("Expected queued request completion.") }
         for _ in 0 ..< 200 {
-            if await fixture.engine.accounting().activeRequestCount == 0 { break }
+            if await fixture.engine.accounting().activeRequestCount == 0 {
+                break
+            }
             await Task.yield()
         }
         let buildCount = await buildCounter.value

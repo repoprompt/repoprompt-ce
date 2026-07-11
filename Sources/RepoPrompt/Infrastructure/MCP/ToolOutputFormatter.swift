@@ -25,9 +25,15 @@ enum ToolOutputFormatter {
 
     static func bracketedModeList(chat: Bool, plan: Bool, review: Bool) -> String {
         var items: [String] = []
-        if chat { items.append("Chat") }
-        if plan { items.append("Plan") }
-        if review { items.append("Review") }
+        if chat {
+            items.append("Chat")
+        }
+        if plan {
+            items.append("Plan")
+        }
+        if review {
+            items.append("Review")
+        }
         return "[\(items.joined(separator: ", "))]"
     }
 
@@ -111,7 +117,9 @@ enum ToolOutputFormatter {
         let perFileTotals = dto.perFileTotals ?? dto.perFileCounts
         if !perFileTotals.isEmpty {
             let sortedTotals = perFileTotals.sorted { lhs, rhs in
-                if lhs.count != rhs.count { return lhs.count > rhs.count }
+                if lhs.count != rhs.count {
+                    return lhs.count > rhs.count
+                }
                 return lhs.path < rhs.path
             }
 
@@ -249,7 +257,9 @@ enum ToolOutputFormatter {
                 var mergedLines = existing.lines
                 mergedLines.append(contentsOf: group.lines)
                 mergedLines.sort {
-                    if $0.lineNumber != $1.lineNumber { return $0.lineNumber < $1.lineNumber }
+                    if $0.lineNumber != $1.lineNumber {
+                        return $0.lineNumber < $1.lineNumber
+                    }
                     return $0.lineText < $1.lineText
                 }
                 groupsLookup[group.path] = ToolResultDTOs.SearchResultDTO.ContentMatchGroup(path: group.path, lines: mergedLines)
@@ -404,7 +414,9 @@ enum ToolOutputFormatter {
         if usesLegend {
             out.append("\n(* denotes selected files)\n(+ denotes code-map available)")
         }
-        if !tree.isEmpty { out.append("\n" + tree) }
+        if !tree.isEmpty {
+            out.append("\n" + tree)
+        }
         return out.joined(separator: "\n")
     }
 
@@ -438,7 +450,9 @@ enum ToolOutputFormatter {
         out.append("## File Read \(statusIcon(success: true))")
         out.append("- **Path**: `\(path)`")
         out.append("- **Lines**: \(first)–\(last) of \(total)")
-        if let m = message, !m.isEmpty { out.append("- **Note**: \(m)") }
+        if let m = message, !m.isEmpty {
+            out.append("- **Note**: \(m)")
+        }
         out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
         out.append("")
         out.append("```\(language)\n\(content)\n```")
@@ -514,10 +528,18 @@ enum ToolOutputFormatter {
         var out: [String] = []
         out.reserveCapacity(diff?.isEmpty == false ? 12 : 8)
         out.append("## Apply Edits \(statusIcon(success: isFailure ? false : (isWarning ? nil : isSuccess), warning: isWarning))")
-        if let requested = editsRequested { out.append("- **Requested**: \(requested)") }
-        if let applied = editsApplied { out.append("- **Applied**: \(applied)") }
-        if let l = linesChanged { out.append("- **Lines changed**: \(l)") }
-        if let c = chunks { out.append("- **Chunks**: \(c)") }
+        if let requested = editsRequested {
+            out.append("- **Requested**: \(requested)")
+        }
+        if let applied = editsApplied {
+            out.append("- **Applied**: \(applied)")
+        }
+        if let l = linesChanged {
+            out.append("- **Lines changed**: \(l)")
+        }
+        if let c = chunks {
+            out.append("- **Chunks**: \(c)")
+        }
         if let d = diff, !d.isEmpty {
             out.append("")
             out.append("### Unified Diff")
@@ -532,7 +554,9 @@ enum ToolOutputFormatter {
         var out: [String] = []
         out.reserveCapacity(6 + diffs.count * 2)
         out.append("## Chat Send \(statusIcon(success: true))")
-        if let id = chatId, let m = mode { out.append("- **Chat**: `\(id)` | **Mode**: \(m)") }
+        if let id = chatId, let m = mode {
+            out.append("- **Chat**: `\(id)` | **Mode**: \(m)")
+        }
         if let resp = response, !resp.isEmpty {
             out.append("")
             out.append("### Response")
@@ -557,7 +581,9 @@ enum ToolOutputFormatter {
         var out: [String] = []
         out.reserveCapacity(6 + diffs.count * 2)
         out.append("## Ask Oracle \(statusIcon(success: true))")
-        if let id = chatId, let m = mode { out.append("- **Chat**: `\(id)` | **Mode**: \(m)") }
+        if let id = chatId, let m = mode {
+            out.append("- **Chat**: `\(id)` | **Mode**: \(m)")
+        }
         if let resp = response, !resp.isEmpty {
             out.append("")
             out.append("### Response")
@@ -583,7 +609,8 @@ enum ToolOutputFormatter {
         out.reserveCapacity(6 + blocks.count)
         out.append("## Selected Files \(statusIcon(success: count > 0))")
         out.append("- **Files**: \(count)")
-        if !blocks.isEmpty { out.append("")
+        if !blocks.isEmpty {
+            out.append("")
             out.append(blocks.joined(separator: "\n\n"))
         }
         return out.joined(separator: "\n")
@@ -638,9 +665,15 @@ enum ToolOutputFormatter {
         case let .object(obj):
             out.append("- **Fields**: \(obj.keys.count)")
             let scalarKeys = obj.keys.sorted().filter { key in
-                if case .string = obj[key]! { return true }
-                if case .int = obj[key]! { return true }
-                if case .bool = obj[key]! { return true }
+                if case .string = obj[key]! {
+                    return true
+                }
+                if case .int = obj[key]! {
+                    return true
+                }
+                if case .bool = obj[key]! {
+                    return true
+                }
                 return false
             }
             if !scalarKeys.isEmpty {
@@ -969,8 +1002,12 @@ extension ToolOutputFormatter {
             let sessions = object["sessions"]?.arrayValue ?? []
             lines.append("## History Sessions \(statusIcon(success: true))")
             lines.append("- **Total sessions**: \(total) • **Returned**: \(sessions.count)")
-            if total == 0 { lines.append("- **Status**: No matching sessions found") }
-            if object["truncated"]?.boolValue == true { lines.append("- **More sessions available**: increase `limit` to return more") }
+            if total == 0 {
+                lines.append("- **Status**: No matching sessions found")
+            }
+            if object["truncated"]?.boolValue == true {
+                lines.append("- **More sessions available**: increase `limit` to return more")
+            }
             if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
                 lines.append("- **Hint**: `touched_file` matches basenames, suffixes, repo-relative paths, and absolute/worktree paths.")
             }
@@ -987,7 +1024,9 @@ extension ToolOutputFormatter {
                 if !files.isEmpty {
                     suffix += ", files: \(files.prefix(3).joined(separator: ", "))"
                     let omittedFiles = max(0, filesTouchedCount - files.count)
-                    if omittedFiles > 0 { suffix += " (+\(omittedFiles) more)" }
+                    if omittedFiles > 0 {
+                        suffix += " (+\(omittedFiles) more)"
+                    }
                 }
                 lines.append("- `\(session["session_id"]?.stringValue ?? "")` **\(name)** (\(workspace)) — \(suffix)")
             }
@@ -996,8 +1035,12 @@ extension ToolOutputFormatter {
             let results = object["results"]?.arrayValue ?? []
             lines.append("## History Search \(statusIcon(success: true))")
             lines.append("- **Total matches**: \(total) • **Returned**: \(results.count)")
-            if total == 0 { lines.append("- **Status**: No matching turns found") }
-            if object["truncated"]?.boolValue == true { lines.append("- **More matches available**: increase `limit` to return more") }
+            if total == 0 {
+                lines.append("- **Status**: No matching turns found")
+            }
+            if object["truncated"]?.boolValue == true {
+                lines.append("- **More matches available**: increase `limit` to return more")
+            }
             appendHistoryScanMetadata(object, to: &lines)
             for resultValue in results {
                 guard let result = resultValue.objectValue else { continue }
@@ -1006,8 +1049,12 @@ extension ToolOutputFormatter {
                 let source = nonEmpty(result["source"]?.stringValue) ?? "match"
                 let snippet = nonEmpty(result["snippet"]?.stringValue) ?? ""
                 var line = "- `\(sessionID)` **\(session)** turn \(result["turn_index"]?.intValue ?? 0) [\(source)]"
-                if let role = nonEmpty(result["role"]?.stringValue) { line += " \(role)" }
-                if let timestamp = nonEmpty(result["timestamp"]?.stringValue) { line += " @ \(timestamp)" }
+                if let role = nonEmpty(result["role"]?.stringValue) {
+                    line += " \(role)"
+                }
+                if let timestamp = nonEmpty(result["timestamp"]?.stringValue) {
+                    line += " @ \(timestamp)"
+                }
                 line += " — \(snippet)"
                 if let turnRequestText = nonEmpty(result["turn_request_text"]?.stringValue) {
                     line += "\n  - request: \(turnRequestText)"
@@ -1020,8 +1067,12 @@ extension ToolOutputFormatter {
             let groups = object["groups"]?.arrayValue ?? []
             lines.append("## History Time \(statusIcon(success: true))")
             lines.append("- **Total sessions**: \(totalSessions) • **Active duration**: \(totalDuration)s • **Groups**: \(groups.count)")
-            if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
-            if object["truncated"]?.boolValue == true { lines.append("- **More groups available**: increase `limit` to return more") }
+            if totalSessions == 0 {
+                lines.append("- **Status**: No matching sessions found")
+            }
+            if object["truncated"]?.boolValue == true {
+                lines.append("- **More groups available**: increase `limit` to return more")
+            }
             appendHistoryScanMetadata(object, to: &lines)
             for groupValue in groups {
                 guard let group = groupValue.objectValue else { continue }
@@ -1056,14 +1107,22 @@ extension ToolOutputFormatter {
             lines.append("## History Session \(statusIcon(success: true))")
             lines.append("- `\(sessionID)` **\(sessionName)** (\(workspaceName))")
             lines.append("- **Turns**: \(start)–\(end) of \(totalTurns)")
-            if let targetTurn { lines.append("- **Target turn**: \(targetTurn)") }
-            if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
+            if let targetTurn {
+                lines.append("- **Target turn**: \(targetTurn)")
+            }
+            if object["truncated"]?.boolValue == true {
+                lines.append("- **Truncated**: yes")
+            }
 
             let orderedTurns = turns.sorted { lhs, rhs in
                 let leftIndex = lhs.objectValue?["turn_index"]?.intValue ?? Int.max
                 let rightIndex = rhs.objectValue?["turn_index"]?.intValue ?? Int.max
-                if leftIndex == targetTurn { return true }
-                if rightIndex == targetTurn { return false }
+                if leftIndex == targetTurn {
+                    return true
+                }
+                if rightIndex == targetTurn {
+                    return false
+                }
                 return leftIndex < rightIndex
             }
             for turnValue in orderedTurns {
@@ -1121,7 +1180,9 @@ extension ToolOutputFormatter {
     }
 
     private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
-        if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
+        if let scanned = object["sessions_scanned"]?.intValue {
+            lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")")
+        }
         let skipped = object["skipped_workspaces"]?.arrayValue?.compactMap(\.stringValue) ?? []
         if !skipped.isEmpty {
             lines.append(historySkippedWorkspacesSummary(skipped))
@@ -1225,7 +1286,9 @@ extension ToolOutputFormatter {
             let visibleSettings = sortedSettings.prefix(allowedInGroup)
             for setting in visibleSettings {
                 if detailed {
-                    if setting["allowed_aliases"] != nil { aliasesDetected = true }
+                    if setting["allowed_aliases"] != nil {
+                        aliasesDetected = true
+                    }
                     lines.append(appSettingsCatalogLine(setting))
                     if let currentLine = appSettingsCurrentValueLine(setting) {
                         lines.append(currentLine)
@@ -1305,8 +1368,12 @@ extension ToolOutputFormatter {
         }
         if setting["value_preview"] != nil {
             var previewObject: [String: Value] = [:]
-            if let preview = setting["value_preview"] { previewObject["value_preview"] = preview }
-            if let length = setting["value_length"] { previewObject["value_length"] = length }
+            if let preview = setting["value_preview"] {
+                previewObject["value_preview"] = preview
+            }
+            if let length = setting["value_length"] {
+                previewObject["value_length"] = length
+            }
             return .object(previewObject)
         }
         return nil
@@ -1360,7 +1427,9 @@ extension ToolOutputFormatter {
                 }
                 lines.append("")
             }
-            if lines.last == "" { lines.removeLast() }
+            if lines.last == "" {
+                lines.removeLast()
+            }
             let omitted = max(0, sortedKeys.count - visibleKeys.count)
             if omitted > 0 {
                 lines.append("")
@@ -1522,10 +1591,18 @@ extension ToolOutputFormatter {
     /// switch `formatAppSettingsOptions` into the richer per-candidate layout
     /// without depending on request arguments alone.
     private static func appSettingsOptionCarriesDetailedFields(_ candidate: [String: Value]) -> Bool {
-        if trimmedAppSettingsString(candidate["description"]?.stringValue) != nil { return true }
-        if trimmedAppSettingsString(candidate["reasoning_effort"]?.stringValue) != nil { return true }
-        if candidate["context_window_tokens"]?.intValue != nil { return true }
-        if let tags = candidate["tags"]?.arrayValue, !tags.isEmpty { return true }
+        if trimmedAppSettingsString(candidate["description"]?.stringValue) != nil {
+            return true
+        }
+        if trimmedAppSettingsString(candidate["reasoning_effort"]?.stringValue) != nil {
+            return true
+        }
+        if candidate["context_window_tokens"]?.intValue != nil {
+            return true
+        }
+        if let tags = candidate["tags"]?.arrayValue, !tags.isEmpty {
+            return true
+        }
         return false
     }
 
@@ -1846,7 +1923,9 @@ extension ToolOutputFormatter {
             let useCompactFormat = !isFiltered && windows.count > 1
             for window in windows {
                 var title = "- Window `\(window.windowID)`"
-                if window.isCurrentWindow { title += " [current]" }
+                if window.isCurrentWindow {
+                    title += " [current]"
+                }
                 if let workspaceName = window.workspace?.name, !workspaceName.isEmpty {
                     title += " • workspace: \(workspaceName)"
                 }
@@ -1881,8 +1960,12 @@ extension ToolOutputFormatter {
                     }
                     for tab in window.tabs {
                         var flags: [String] = []
-                        if tab.isActive { flags.append("active") }
-                        if tab.isBound { flags.append("bound") }
+                        if tab.isActive {
+                            flags.append("active")
+                        }
+                        if tab.isBound {
+                            flags.append("bound")
+                        }
                         let flagSuffix = flags.isEmpty ? "" : " [\(flags.joined(separator: ", "))]"
                         out.append("  • \(tab.name)\(flagSuffix) — context_id: `\(tab.contextID)`")
                         if let repoPath = tab.repoPaths?.first, !repoPath.isEmpty {
@@ -2021,9 +2104,15 @@ extension ToolOutputFormatter {
         // Build human-readable log with text + optional diffs
         var out: [String] = []
         out.append("## Chat Log \(statusIcon(success: true))")
-        if let chatID, !chatID.isEmpty { out.append("- **Chat**: `\(chatID)`") }
-        if let scope, !scope.isEmpty { out.append("- **Scope**: \(scope)") }
-        if let contextID, !contextID.isEmpty { out.append("- **Context**: `\(contextID)`") }
+        if let chatID, !chatID.isEmpty {
+            out.append("- **Chat**: `\(chatID)`")
+        }
+        if let scope, !scope.isEmpty {
+            out.append("- **Scope**: \(scope)")
+        }
+        if let contextID, !contextID.isEmpty {
+            out.append("- **Context**: `\(contextID)`")
+        }
         for (i, e) in entries.enumerated() {
             out.append("")
             out.append("### Message #\(i + 1) — \(e.role)")
@@ -2119,7 +2208,9 @@ extension ToolOutputFormatter {
                 let preview = files.prefix(5)
                 let extra = filesCount - preview.count
                 let filesPreviewText: String = {
-                    if filesCount == 0 { return "files=0" }
+                    if filesCount == 0 {
+                        return "files=0"
+                    }
                     let list = preview.joined(separator: ", ")
                     return extra > 0 ? "files=\(filesCount): \(list) … (+\(extra) more)" : "files=\(filesCount): \(list)"
                 }()
@@ -2358,8 +2449,11 @@ extension ToolOutputFormatter {
             oracleExportInstruction = obj["oracle_export_instruction"]?.stringValue
             // Nested result support
             if response == nil, let res = obj["result"] {
-                if let s = res.stringValue { response = s }
-                else if let arr = res.objectValue?["diffs"]?.arrayValue { diffs = parseDiffArray(arr) }
+                if let s = res.stringValue {
+                    response = s
+                } else if let arr = res.objectValue?["diffs"]?.arrayValue {
+                    diffs = parseDiffArray(arr)
+                }
             }
         case let .array(arr):
             // Could be an array of patch objects
@@ -2444,8 +2538,11 @@ extension ToolOutputFormatter {
             oracleExportPath = obj["oracle_export_path"]?.stringValue
             oracleExportInstruction = obj["oracle_export_instruction"]?.stringValue
             if response == nil, let res = obj["result"] {
-                if let s = res.stringValue { response = s }
-                else if let arr = res.objectValue?["diffs"]?.arrayValue { diffs = parseDiffArray(arr) }
+                if let s = res.stringValue {
+                    response = s
+                } else if let arr = res.objectValue?["diffs"]?.arrayValue {
+                    diffs = parseDiffArray(arr)
+                }
             }
         case let .array(arr):
             diffs = parseDiffArray(arr)
@@ -2801,13 +2898,27 @@ extension ToolOutputFormatter {
 
             // What's included
             var includes: [String] = []
-            if includesFiles { includes.append("Files") }
-            if dto.includesFileTree == true { includes.append("File Tree") }
-            if dto.includesCodemaps == true { includes.append("Code Maps") }
-            if dto.includesGitDiff == true { includes.append("Git Diff") }
-            if dto.includesUserPrompt == true { includes.append("User Prompt") }
-            if dto.includesMetaPrompts == true { includes.append("Meta Prompts") }
-            if dto.includesStoredPrompts == true { includes.append("Stored Prompts") }
+            if includesFiles {
+                includes.append("Files")
+            }
+            if dto.includesFileTree == true {
+                includes.append("File Tree")
+            }
+            if dto.includesCodemaps == true {
+                includes.append("Code Maps")
+            }
+            if dto.includesGitDiff == true {
+                includes.append("Git Diff")
+            }
+            if dto.includesUserPrompt == true {
+                includes.append("User Prompt")
+            }
+            if dto.includesMetaPrompts == true {
+                includes.append("Meta Prompts")
+            }
+            if dto.includesStoredPrompts == true {
+                includes.append("Stored Prompts")
+            }
 
             if !includes.isEmpty {
                 out.append("- **Includes**: \(includes.joined(separator: ", "))")
@@ -2880,11 +2991,15 @@ extension ToolOutputFormatter {
             out.append("### Issues")
             for issue in dto.issues {
                 var detail = "- `\(issue.code)` (\(issue.phase)): \(issue.message)"
-                if let path = issue.path { detail += " [`\(path)`]" }
+                if let path = issue.path {
+                    detail += " [`\(path)`]"
+                }
                 if let attempted = issue.attempted, let limit = issue.limit {
                     detail += " (attempted \(attempted), limit \(limit))"
                 }
-                if issue.retryable { detail += " — retryable" }
+                if issue.retryable {
+                    detail += " — retryable"
+                }
                 out.append(detail)
             }
         }
@@ -2915,9 +3030,15 @@ extension ToolOutputFormatter {
                     let modesText: String
                     if let sm = m.supportedModes {
                         var modes: [String] = []
-                        if sm.chat { modes.append("chat") }
-                        if sm.plan { modes.append("plan") }
-                        if sm.review { modes.append("review") }
+                        if sm.chat {
+                            modes.append("chat")
+                        }
+                        if sm.plan {
+                            modes.append("plan")
+                        }
+                        if sm.review {
+                            modes.append("review")
+                        }
                         modesText = modes.isEmpty ? "unknown" : modes.joined(separator: ", ")
                     } else {
                         modesText = "unknown"
@@ -2938,7 +3059,9 @@ extension ToolOutputFormatter {
                     let id = o["id"]?.stringValue ?? ""
                     let name = o["name"]?.stringValue ?? ""
                     let desc = o["description"]?.stringValue
-                    if id.isEmpty, name.isEmpty { return nil }
+                    if id.isEmpty, name.isEmpty {
+                        return nil
+                    }
                     return (id, name, desc)
                 }
                 return nil
@@ -2970,8 +3093,12 @@ extension ToolOutputFormatter {
         guard fileCount > 0 else { return false }
         guard totalTokens.map({ $0 == 0 }) ?? true else { return false }
         guard let accounting else { return false }
-        if accounting.status == "incomplete" { return true }
-        if accounting.incompleteComponents?.isEmpty == false { return true }
+        if accounting.status == "incomplete" {
+            return true
+        }
+        if accounting.incompleteComponents?.isEmpty == false {
+            return true
+        }
         let pendingSources: Set = [
             "active_tab_published",
             "bound_tab_cached_state",
@@ -3110,7 +3237,9 @@ extension ToolOutputFormatter {
 
                 // Count visible vs hidden files
                 let visibleFiles = dto.files?.count(where: { file in
-                    if let cp = file.copyPreset, cp.renderMode == "hidden" { return false }
+                    if let cp = file.copyPreset, cp.renderMode == "hidden" {
+                        return false
+                    }
                     return true
                 }) ?? fileCount
                 let hiddenFiles = fileCount - visibleFiles
@@ -3136,8 +3265,12 @@ extension ToolOutputFormatter {
                     let hasFilesBreakdown = (ts.filesContent != nil && ts.filesContent! > 0) || (ts.codemaps != nil && ts.codemaps! > 0)
                     if hasFilesBreakdown {
                         var parts: [String] = []
-                        if let fc = ts.filesContent, fc > 0 { parts.append("\(formatTokenCount(fc)) full") }
-                        if let cm = ts.codemaps, cm > 0 { parts.append("\(formatTokenCount(cm)) codemaps") }
+                        if let fc = ts.filesContent, fc > 0 {
+                            parts.append("\(formatTokenCount(fc)) full")
+                        }
+                        if let cm = ts.codemaps, cm > 0 {
+                            parts.append("\(formatTokenCount(cm)) codemaps")
+                        }
                         out.append("  (auto view: \(formatTokenCount(ts.files)) = \(parts.joined(separator: " + ")))")
                     }
                 } else {
@@ -3147,8 +3280,12 @@ extension ToolOutputFormatter {
                         out.append("Files: pending (\(fileCount) file\(fileCount == 1 ? "" : "s"))")
                     } else if hasFilesBreakdown {
                         var parts: [String] = []
-                        if let fc = ts.filesContent, fc > 0 { parts.append("\(formatTokenCount(fc)) full") }
-                        if let cm = ts.codemaps, cm > 0 { parts.append("\(formatTokenCount(cm)) codemaps") }
+                        if let fc = ts.filesContent, fc > 0 {
+                            parts.append("\(formatTokenCount(fc)) full")
+                        }
+                        if let cm = ts.codemaps, cm > 0 {
+                            parts.append("\(formatTokenCount(cm)) codemaps")
+                        }
                         out.append("Files: \(formatTokenCount(ts.files)) (\(parts.joined(separator: " + ")))")
                     } else if ts.files > 0 {
                         out.append("Files: \(formatTokenCount(ts.files))")
@@ -3157,10 +3294,18 @@ extension ToolOutputFormatter {
 
                 // Other components (compact single line)
                 var otherParts: [String] = []
-                if let prompt = ts.prompt, prompt > 0 { otherParts.append("prompt \(formatTokenCount(prompt))") }
-                if let fileTree = ts.fileTree, fileTree > 0 { otherParts.append("tree \(formatTokenCount(fileTree))") }
-                if let meta = ts.meta, meta > 0 { otherParts.append("stored \(formatTokenCount(meta))") }
-                if let git = ts.git, git > 0 { otherParts.append("git \(formatTokenCount(git))") }
+                if let prompt = ts.prompt, prompt > 0 {
+                    otherParts.append("prompt \(formatTokenCount(prompt))")
+                }
+                if let fileTree = ts.fileTree, fileTree > 0 {
+                    otherParts.append("tree \(formatTokenCount(fileTree))")
+                }
+                if let meta = ts.meta, meta > 0 {
+                    otherParts.append("stored \(formatTokenCount(meta))")
+                }
+                if let git = ts.git, git > 0 {
+                    otherParts.append("git \(formatTokenCount(git))")
+                }
                 if !otherParts.isEmpty {
                     out.append("Other: \(otherParts.joined(separator: ", "))")
                 }
@@ -3221,7 +3366,9 @@ extension ToolOutputFormatter {
         if case let .object(obj) = value {
             var out: [String] = []
             out.append("## Selection")
-            if let status = obj["status"]?.stringValue { out.append("Status: \(status)") }
+            if let status = obj["status"]?.stringValue {
+                out.append("Status: \(status)")
+            }
             if let total = obj["total_tokens"]?.intValue ?? Int(obj["totalTokens"]?.stringValue ?? "") {
                 out.append("Total tokens: \(total)")
             }
@@ -3232,7 +3379,9 @@ extension ToolOutputFormatter {
                     if let o = v.objectValue {
                         let p = o["path"]?.stringValue ?? ""
                         let t = o["tokens"]?.intValue ?? 0
-                        if !p.isEmpty { out.append("  \(p) \u{2014} \(t) tokens") }
+                        if !p.isEmpty {
+                            out.append("  \(p) \u{2014} \(t) tokens")
+                        }
                     } else if let p = v.stringValue {
                         out.append("  \(p)")
                     }
@@ -3241,7 +3390,9 @@ extension ToolOutputFormatter {
             if let invalidArr = obj["invalid_paths"]?.arrayValue, !invalidArr.isEmpty {
                 out.append("")
                 for v in invalidArr {
-                    if let p = v.stringValue { out.append("Invalid: \(p)") }
+                    if let p = v.stringValue {
+                        out.append("Invalid: \(p)")
+                    }
                 }
             }
             return [.text(out.joined(separator: "\n"))]
@@ -4001,25 +4152,51 @@ extension ToolOutputFormatter {
             out.append("## File Action \(statusIcon(success: ok))")
             out.append("- Action: \(dto.action)")
             out.append("- Path: `\(dto.path)`")
-            if let np = dto.newPath { out.append("- New path: `\(np)`") }
-            if dto.action.lowercased() == "delete", ok { out.append("- Result: Moved to macOS Trash") }
-            if let warning = dto.warning, !warning.isEmpty { out.append("- Warning: \(warning)") }
-            if let message = dto.errorMessage, !message.isEmpty { out.append("- Error: \(message)") }
-            if let code = dto.errorCode, !code.isEmpty { out.append("- **Code**: \(code)") }
-            if dto.retryable == true { out.append("- Retryable: yes") }
-            if let retryAfter = dto.retryAfterMilliseconds { out.append("- Retry after: \(retryAfter) ms") }
-            if let suggestion = dto.suggestion, !suggestion.isEmpty { out.append("- Suggestion: \(suggestion)") }
+            if let np = dto.newPath {
+                out.append("- New path: `\(np)`")
+            }
+            if dto.action.lowercased() == "delete", ok {
+                out.append("- Result: Moved to macOS Trash")
+            }
+            if let warning = dto.warning, !warning.isEmpty {
+                out.append("- Warning: \(warning)")
+            }
+            if let message = dto.errorMessage, !message.isEmpty {
+                out.append("- Error: \(message)")
+            }
+            if let code = dto.errorCode, !code.isEmpty {
+                out.append("- **Code**: \(code)")
+            }
+            if dto.retryable == true {
+                out.append("- Retryable: yes")
+            }
+            if let retryAfter = dto.retryAfterMilliseconds {
+                out.append("- Retry after: \(retryAfter) ms")
+            }
+            if let suggestion = dto.suggestion, !suggestion.isEmpty {
+                out.append("- Suggestion: \(suggestion)")
+            }
             return [.text(out.joined(separator: "\n"))]
         }
         if case let .object(obj) = value {
             var out: [String] = []
             out.append("## File Action \(statusIcon(success: true))")
             let action = obj["action"]?.stringValue
-            if let a = action { out.append("- Action: \(a)") }
-            if let p = obj["path"]?.stringValue { out.append("- Path: `\(p)`") }
-            if let np = obj["new_path"]?.stringValue { out.append("- New path: `\(np)`") }
-            if action?.lowercased() == "delete" { out.append("- Result: Moved to macOS Trash") }
-            if let st = obj["status"]?.stringValue { out.append("- Status: \(st)") }
+            if let a = action {
+                out.append("- Action: \(a)")
+            }
+            if let p = obj["path"]?.stringValue {
+                out.append("- Path: `\(p)`")
+            }
+            if let np = obj["new_path"]?.stringValue {
+                out.append("- New path: `\(np)`")
+            }
+            if action?.lowercased() == "delete" {
+                out.append("- Result: Moved to macOS Trash")
+            }
+            if let st = obj["status"]?.stringValue {
+                out.append("- Status: \(st)")
+            }
             return [.text(out.joined(separator: "\n"))]
         }
         if let s = value.stringValue {
@@ -4159,11 +4336,19 @@ extension ToolOutputFormatter {
         out.append("- **Worktree ID**: `\(worktree.worktreeID)`")
         out.append("- **Specifier**: `\(worktree.specifier)`")
         out.append("- **Path**: `\(worktree.path)`")
-        if let branch = worktree.branch { out.append("- **Branch**: `\(branch)`") }
-        if let head = worktree.head { out.append("- **HEAD**: `\(head)`") }
+        if let branch = worktree.branch {
+            out.append("- **Branch**: `\(branch)`")
+        }
+        if let head = worktree.head {
+            out.append("- **HEAD**: `\(head)`")
+        }
         out.append("- **Kind**: \(worktree.isMain ? "main" : "linked")\(worktree.isDetached ? " · detached" : "")")
-        if worktree.isLocked { out.append("- **Locked**: \(worktree.lockReason ?? "yes")") }
-        if worktree.isPrunable { out.append("- **Prunable**: \(worktree.prunableReason ?? "yes")") }
+        if worktree.isLocked {
+            out.append("- **Locked**: \(worktree.lockReason ?? "yes")")
+        }
+        if worktree.isPrunable {
+            out.append("- **Prunable**: \(worktree.prunableReason ?? "yes")")
+        }
         if let visual = worktree.visual {
             out.append("- **Visual**: \(visual.label ?? "worktree") · \(visual.colorHex) · \(visual.iconName) · \(visual.markerStyle)")
         }
@@ -4200,9 +4385,15 @@ extension ToolOutputFormatter {
         out.append("### \(title)")
         out.append("- **Logical root**: `\(binding.logicalRootName ?? binding.logicalRootPath)`")
         out.append("- **Worktree**: `\(binding.worktreeID)` at `\(binding.worktreeRootPath)`")
-        if let branch = binding.branch { out.append("- **Branch**: `\(branch)`") }
-        if let label = binding.visualLabel { out.append("- **Label**: \(label)") }
-        if let color = binding.visualColorHex { out.append("- **Color**: \(color)") }
+        if let branch = binding.branch {
+            out.append("- **Branch**: `\(branch)`")
+        }
+        if let label = binding.visualLabel {
+            out.append("- **Label**: \(label)")
+        }
+        if let color = binding.visualColorHex {
+            out.append("- **Color**: \(color)")
+        }
         out.append("- **Source**: \(binding.source)")
     }
 
@@ -4217,8 +4408,12 @@ extension ToolOutputFormatter {
         out.append("")
         out.append("### Merge")
         out.append("- **Status**: `\(dto.status)`")
-        if let operationID = dto.operationID { out.append("- **Operation ID**: `\(operationID)`") }
-        if let sessionID = dto.sessionID { out.append("- **Session ID**: `\(sessionID)`") }
+        if let operationID = dto.operationID {
+            out.append("- **Operation ID**: `\(operationID)`")
+        }
+        if let sessionID = dto.sessionID {
+            out.append("- **Session ID**: `\(sessionID)`")
+        }
 
         if let source = dto.source, let target = dto.target {
             out.append("")
@@ -4246,15 +4441,21 @@ extension ToolOutputFormatter {
             out.append("- **Blocked**: \(preflight.blocked ? "yes" : "no")")
             if let prediction = preflight.conflictPrediction {
                 var line = "- **Conflict prediction**: `\(prediction.status)`"
-                if !prediction.files.isEmpty { line += " (\(prediction.files.count) file\(prediction.files.count == 1 ? "" : "s"))" }
+                if !prediction.files.isEmpty {
+                    line += " (\(prediction.files.count) file\(prediction.files.count == 1 ? "" : "s"))"
+                }
                 out.append(line)
-                if let message = prediction.message, !message.isEmpty { out.append("  - \(message)") }
+                if let message = prediction.message, !message.isEmpty {
+                    out.append("  - \(message)")
+                }
             }
             if !preflight.blockers.isEmpty {
                 out.append("- **Blockers**:")
                 for blocker in preflight.blockers {
                     var line = "  - `\(blocker.code)`: \(blocker.message)"
-                    if !blocker.paths.isEmpty { line += " (\(blocker.paths.joined(separator: ", ")))" }
+                    if !blocker.paths.isEmpty {
+                        line += " (\(blocker.paths.joined(separator: ", ")))"
+                    }
                     out.append(line)
                 }
             }
@@ -4281,7 +4482,9 @@ extension ToolOutputFormatter {
             out.append("- **Snapshot**: `\(artifacts.snapshotID)`")
             out.append("- **Directory**: `\(artifacts.snapshotDirectory)`")
             out.append("- **MAP**: `\(artifacts.mapPath)`")
-            if let patch = artifacts.allPatchPath { out.append("- **Patch**: `\(patch)`") }
+            if let patch = artifacts.allPatchPath {
+                out.append("- **Patch**: `\(patch)`")
+            }
             out.append("- **Metadata**: `\(artifacts.sidecarPath)`")
         }
 
@@ -4300,7 +4503,9 @@ extension ToolOutputFormatter {
         if let error = dto.error, !error.isEmpty {
             out.append("")
             out.append("> ❌ \(error)")
-            if let errorCode = dto.errorCode { out.append("> error_code: `\(errorCode)`") }
+            if let errorCode = dto.errorCode {
+                out.append("> error_code: `\(errorCode)`")
+            }
         }
         if let postMerge = dto.postMerge {
             out.append("")
@@ -4327,7 +4532,9 @@ extension ToolOutputFormatter {
         endpoint: ToolResultDTOs.ManageWorktreeReplyDTO.MergeDTO.EndpointDTO
     ) {
         var line = "- **\(title)**: \(endpoint.label) (`\(endpoint.worktreeID)`)"
-        if let branch = endpoint.branch { line += " branch `\(branch)`" }
+        if let branch = endpoint.branch {
+            line += " branch `\(branch)`"
+        }
         line += " @ `\(endpoint.shortHead)`"
         out.append(line)
         out.append("  - path: `\(endpoint.path)`")
@@ -4346,10 +4553,18 @@ extension ToolOutputFormatter {
 
     private static func worktreeMergeResultLines(_ dto: ToolResultDTOs.ManageWorktreeReplyDTO.MergeDTO) -> [String] {
         var lines: [String] = []
-        if let sourceHead = dto.sourceHead { lines.append("- **Source HEAD**: `\(sourceHead)`") }
-        if let targetHeadBefore = dto.targetHeadBefore { lines.append("- **Target before**: `\(targetHeadBefore)`") }
-        if let targetHeadAfter = dto.targetHeadAfter { lines.append("- **Target after**: `\(targetHeadAfter)`") }
-        if let mergeCommit = dto.mergeCommit { lines.append("- **Merge commit**: `\(mergeCommit)`") }
+        if let sourceHead = dto.sourceHead {
+            lines.append("- **Source HEAD**: `\(sourceHead)`")
+        }
+        if let targetHeadBefore = dto.targetHeadBefore {
+            lines.append("- **Target before**: `\(targetHeadBefore)`")
+        }
+        if let targetHeadAfter = dto.targetHeadAfter {
+            lines.append("- **Target after**: `\(targetHeadAfter)`")
+        }
+        if let mergeCommit = dto.mergeCommit {
+            lines.append("- **Merge commit**: `\(mergeCommit)`")
+        }
         return lines
     }
 
@@ -4365,7 +4580,9 @@ extension ToolOutputFormatter {
             var out: [String] = []
             out.append("## Git \(dto.op.capitalized) ❌")
             out.append("- **Error**: \(error)")
-            if let warning = dto.warning { out.append("- **Warning**: \(warning)") }
+            if let warning = dto.warning {
+                out.append("- **Warning**: \(warning)")
+            }
             return [.text(out.joined(separator: "\n"))]
         }
 
@@ -4442,9 +4659,15 @@ extension ToolOutputFormatter {
 
         // Summary counts
         var counts: [String] = []
-        if !status.staged.isEmpty { counts.append("\(status.staged.count) staged") }
-        if !status.modified.isEmpty { counts.append("\(status.modified.count) modified") }
-        if !status.untracked.isEmpty { counts.append("\(status.untracked.count) untracked") }
+        if !status.staged.isEmpty {
+            counts.append("\(status.staged.count) staged")
+        }
+        if !status.modified.isEmpty {
+            counts.append("\(status.modified.count) modified")
+        }
+        if !status.untracked.isEmpty {
+            counts.append("\(status.untracked.count) untracked")
+        }
         if counts.isEmpty {
             out.append("_No changes_")
         } else {
@@ -4531,9 +4754,15 @@ extension ToolOutputFormatter {
 
                 // Summary counts
                 var counts: [String] = []
-                if !status.staged.isEmpty { counts.append("\(status.staged.count) staged") }
-                if !status.modified.isEmpty { counts.append("\(status.modified.count) modified") }
-                if !status.untracked.isEmpty { counts.append("\(status.untracked.count) untracked") }
+                if !status.staged.isEmpty {
+                    counts.append("\(status.staged.count) staged")
+                }
+                if !status.modified.isEmpty {
+                    counts.append("\(status.modified.count) modified")
+                }
+                if !status.untracked.isEmpty {
+                    counts.append("\(status.untracked.count) untracked")
+                }
                 if counts.isEmpty {
                     out.append("_No changes_")
                 } else {
@@ -5130,7 +5359,9 @@ extension ToolOutputFormatter {
 
         var block: [String] = []
         for (index, segment) in merged.enumerated() {
-            if index > 0 { block.append("") }
+            if index > 0 {
+                block.append("")
+            }
             let ordered = segment.lines.keys.sorted()
             var previousLine: Int?
             for lineNumber in ordered {
@@ -5390,7 +5621,9 @@ extension ToolOutputFormatter {
     private static func agentRunWorktreeObjects(from object: [String: Value]) -> [[String: Value]] {
         if let bindings = object["worktree_bindings"]?.arrayValue {
             let objects = bindings.compactMap(\.objectValue)
-            if !objects.isEmpty { return objects }
+            if !objects.isEmpty {
+                return objects
+            }
         }
         if let worktree = object["worktree"]?.objectValue {
             return [worktree]
@@ -5736,7 +5969,9 @@ extension ToolOutputFormatter {
 
                 for family in families {
                     if family.efforts.isEmpty {
-                        if family.base == "default" { continue }
+                        if family.base == "default" {
+                            continue
+                        }
                         lines.append("  `\(agentPrefix)\(family.base)` — \(family.name)")
                     } else {
                         let effortList = family.efforts.joined(separator: "|")
@@ -5757,8 +5992,12 @@ extension ToolOutputFormatter {
                 if let sessionID = session["session_id"]?.stringValue, !sessionID.isEmpty {
                     parts.append("`\(sessionID)`")
                 }
-                if !state.isEmpty { parts.append(state) }
-                if !agent.isEmpty { parts.append(agent) }
+                if !state.isEmpty {
+                    parts.append(state)
+                }
+                if !agent.isEmpty {
+                    parts.append(agent)
+                }
                 lines.append("  - \(parts.joined(separator: " · "))")
             }
         }
@@ -5957,17 +6196,29 @@ extension ToolOutputFormatter {
 
     private static func selectionCountBreakdownText(_ summary: ToolResultDTOs.SelectionSummary) -> String {
         var parts: [String] = []
-        if summary.fullCount > 0 { parts.append("\(summary.fullCount) full") }
-        if summary.sliceCount > 0 { parts.append("\(summary.sliceCount) slice") }
-        if summary.codemapCount > 0 { parts.append("\(summary.codemapCount) codemap") }
+        if summary.fullCount > 0 {
+            parts.append("\(summary.fullCount) full")
+        }
+        if summary.sliceCount > 0 {
+            parts.append("\(summary.sliceCount) slice")
+        }
+        if summary.codemapCount > 0 {
+            parts.append("\(summary.codemapCount) codemap")
+        }
         return parts.joined(separator: ", ")
     }
 
     private static func selectionTokenBreakdownText(_ summary: ToolResultDTOs.SelectionSummary) -> String {
         var parts: [String] = []
-        if summary.fullTokens > 0 { parts.append("full \(summary.fullTokens)") }
-        if summary.sliceTokens > 0 { parts.append("slice \(summary.sliceTokens)") }
-        if summary.codemapTokens > 0 { parts.append("codemap \(summary.codemapTokens)") }
+        if summary.fullTokens > 0 {
+            parts.append("full \(summary.fullTokens)")
+        }
+        if summary.sliceTokens > 0 {
+            parts.append("slice \(summary.sliceTokens)")
+        }
+        if summary.codemapTokens > 0 {
+            parts.append("codemap \(summary.codemapTokens)")
+        }
         return parts.joined(separator: ", ")
     }
 

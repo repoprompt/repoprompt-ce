@@ -241,7 +241,9 @@ final class AgentSelectedFilePreviewLifecycleTests: XCTestCase {
     @MainActor
     private func waitForPreviewText(_ expected: String, in coordinator: AgentSelectedFilePreviewLoadCoordinator) async -> Bool {
         for _ in 0 ..< 500 {
-            if coordinator.previewText == expected { return true }
+            if coordinator.previewText == expected {
+                return true
+            }
             await Task.yield()
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
@@ -271,7 +273,9 @@ private actor PreviewLoadGate {
 
     func waitUntilStarted() async -> Bool {
         for _ in 0 ..< 500 {
-            if started { return true }
+            if started {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return started
@@ -284,7 +288,9 @@ private actor PreviewLoadGate {
 
     func waitUntilCompleted() async -> Bool {
         for _ in 0 ..< 500 {
-            if completed { return true }
+            if completed {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return completed
@@ -305,7 +311,9 @@ private actor MultiPreviewLoadGate {
 
     func waitUntilStarted(_ displayName: String) async -> Bool {
         for _ in 0 ..< 500 {
-            if started.contains(displayName) { return true }
+            if started.contains(displayName) {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return started.contains(displayName)
@@ -318,7 +326,9 @@ private actor MultiPreviewLoadGate {
 
     func waitUntilCompleted(_ displayName: String) async -> Bool {
         for _ in 0 ..< 500 {
-            if completed.contains(displayName) { return true }
+            if completed.contains(displayName) {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return completed.contains(displayName)

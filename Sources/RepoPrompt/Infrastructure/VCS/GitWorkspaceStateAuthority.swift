@@ -669,7 +669,9 @@ actor GitWorkspaceStateAuthority {
 
         if initial.isCancelled {
             let pending = takePendingPrefixControlAdmission(key, flightID: flightID)
-            if let pending { await metadataMonitor.release(pending.observationToken) }
+            if let pending {
+                await metadataMonitor.release(pending.observationToken)
+            }
             return
         }
 
@@ -677,7 +679,9 @@ actor GitWorkspaceStateAuthority {
         case let .failure(error):
             let pending = takePendingPrefixControlAdmission(key, flightID: flightID)
             pending?.waiters.values.forEach { $0.resume(throwing: error) }
-            if let pending { await metadataMonitor.release(pending.observationToken) }
+            if let pending {
+                await metadataMonitor.release(pending.observationToken)
+            }
         case let .success(evidence):
             #if DEBUG
                 let admissionSpan = WorktreeStartupPreparationInstrumentation.currentRecorder?
@@ -689,7 +693,9 @@ actor GitWorkspaceStateAuthority {
                 pending?.waiters.values.forEach {
                     $0.resume(throwing: GitPrefixControlEvidenceCacheError.corruptFooter)
                 }
-                if let pending { await metadataMonitor.release(pending.observationToken) }
+                if let pending {
+                    await metadataMonitor.release(pending.observationToken)
+                }
                 #if DEBUG
                     WorktreeStartupPreparationInstrumentation.currentRecorder?.recordReason(.failure)
                 #endif
@@ -716,7 +722,9 @@ actor GitWorkspaceStateAuthority {
                 removed?.waiters.values.forEach {
                     $0.resume(throwing: GitPrefixControlEvidenceCacheError.invalidatedDuringCollection)
                 }
-                if let removed { await metadataMonitor.release(removed.observationToken) }
+                if let removed {
+                    await metadataMonitor.release(removed.observationToken)
+                }
                 #if DEBUG
                     WorktreeStartupPreparationInstrumentation.currentRecorder?
                         .increment(.prefixCacheInvalidations)
@@ -1664,7 +1672,9 @@ actor GitWorkspaceStateAuthority {
         prefixControlCacheArtifactBytes = prefixControlCacheArtifactBytes >= removed.artifactBytes
             ? prefixControlCacheArtifactBytes - removed.artifactBytes
             : 0
-        if invalidated { prefixControlCacheInvalidationCount &+= 1 }
+        if invalidated {
+            prefixControlCacheInvalidationCount &+= 1
+        }
         await metadataMonitor.release(removed.observationToken)
     }
 

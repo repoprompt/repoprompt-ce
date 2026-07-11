@@ -31,7 +31,9 @@ enum GitWorktreeTestSupport {
                 lastError = error
             }
 
-            if ContinuousClock.now >= deadline { break }
+            if ContinuousClock.now >= deadline {
+                break
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
 
@@ -147,8 +149,12 @@ enum GitWorktreeTestSupport {
     ) -> Bool {
         guard descriptor.gitDir != nil || descriptor.isMain else { return false }
         guard let head = descriptor.head, !head.isEmpty else { return false }
-        if let expectedHead, head != expectedHead { return false }
-        if let expectedBranch, descriptor.branch != expectedBranch { return false }
+        if let expectedHead, head != expectedHead {
+            return false
+        }
+        if let expectedBranch, descriptor.branch != expectedBranch {
+            return false
+        }
         return true
     }
 

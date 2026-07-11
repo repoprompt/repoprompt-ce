@@ -624,7 +624,9 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         XCTAssertTrue(presentation.entries.isEmpty)
         XCTAssertEqual(presentation.resolvedSeedCount, 0)
         XCTAssertTrue(presentation.issues.contains {
-            if case .seedDemandLimit(attempted: 2, limit: 1) = $0 { return true }
+            if case .seedDemandLimit(attempted: 2, limit: 1) = $0 {
+                return true
+            }
             return false
         })
         let operationsAfter = await store.codemapPresentationOperationCountsForTesting()
@@ -705,7 +707,9 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         )
 
         XCTAssertFalse(presentation.issues.contains {
-            if case .seedDemandLimit = $0 { return true }
+            if case .seedDemandLimit = $0 {
+                return true
+            }
             return false
         })
         XCTAssertTrue(presentation.issues.contains {
@@ -721,7 +725,9 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
             return false
         })
         XCTAssertTrue(presentation.issues.contains {
-            if case .tokenLimit = $0 { return true }
+            if case .tokenLimit = $0 {
+                return true
+            }
             return false
         })
         let operationsAfter = await store.codemapPresentationOperationCountsForTesting()
@@ -966,7 +972,9 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         XCTAssertEqual(structureAttempts.values, [0, 1])
         XCTAssertEqual(publicationCount.value, 1)
         XCTAssertTrue(presentation.issues.contains {
-            if case .publicationStale = $0 { return true }
+            if case .publicationStale = $0 {
+                return true
+            }
             return false
         })
     }
@@ -1195,7 +1203,9 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
             return XCTFail("Expected typed pending coverage")
         }
         let ticket = try XCTUnwrap(issues.compactMap { issue -> WorkspaceCodemapArtifactDemandTicket? in
-            if case let .pending(_, ticket) = issue { return ticket }
+            if case let .pending(_, ticket) = issue {
+                return ticket
+            }
             return nil
         }.first)
         XCTAssertTrue(presentation.orderedEntries.isEmpty)

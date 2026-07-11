@@ -451,7 +451,9 @@ private final class CodeMapArtifactBuildCoordinatorHookDispatcher: @unchecked Se
         // Overflow deterministically drops the newest submission. Already accepted events remain
         // bounded by `maximumPendingEventCount` and are delivered in FIFO order.
         guard pending.count < maximumPendingEventCount else {
-            if droppedEventCount < UInt64.max { droppedEventCount += 1 }
+            if droppedEventCount < UInt64.max {
+                droppedEventCount += 1
+            }
             lock.unlock()
             return
         }
@@ -587,10 +589,18 @@ actor CodeMapArtifactBuildCoordinator {
         }
 
         var intent: LocatorIntent? {
-            if waiterCounts[.corrupt, default: 0] > 0 { return .corrupt }
-            if waiterCounts[.stale, default: 0] > 0 { return .stale }
-            if waiterCounts[.missing, default: 0] > 0 { return .missing }
-            if waiterCounts[.existing, default: 0] > 0 { return .existing }
+            if waiterCounts[.corrupt, default: 0] > 0 {
+                return .corrupt
+            }
+            if waiterCounts[.stale, default: 0] > 0 {
+                return .stale
+            }
+            if waiterCounts[.missing, default: 0] > 0 {
+                return .missing
+            }
+            if waiterCounts[.existing, default: 0] > 0 {
+                return .existing
+            }
             return nil
         }
 
@@ -985,7 +995,9 @@ actor CodeMapArtifactBuildCoordinator {
         guard waiterCount < policy.maximumTotalWaiterCount,
               flight.waiters.count < policy.maximumWaitersPerFlight
         else {
-            if !joined { flights.removeValue(forKey: key) }
+            if !joined {
+                flights.removeValue(forKey: key)
+            }
             throw busyError()
         }
         if let locatorIdentity,
@@ -993,7 +1005,9 @@ actor CodeMapArtifactBuildCoordinator {
            flight.locatorIntents[locatorIdentity] == nil
         {
             guard flight.locatorIntents.count < policy.maximumLocatorIdentitiesPerFlight else {
-                if !joined { flights.removeValue(forKey: key) }
+                if !joined {
+                    flights.removeValue(forKey: key)
+                }
                 throw busyError()
             }
         }
@@ -1003,7 +1017,9 @@ actor CodeMapArtifactBuildCoordinator {
                       existing.language == input.language,
                       existing.pipelineIdentity == input.pipelineIdentity
                 else {
-                    if !joined { flights.removeValue(forKey: key) }
+                    if !joined {
+                        flights.removeValue(forKey: key)
+                    }
                     increment(&counters.failures)
                     throw CodeMapArtifactBuildCoordinatorError.conflictingBuildInput
                 }
@@ -1011,7 +1027,9 @@ actor CodeMapArtifactBuildCoordinator {
                 do {
                     try reserveRetainedInput(for: flight, byteCount: input.source.rawByteCount)
                 } catch {
-                    if !joined { flights.removeValue(forKey: key) }
+                    if !joined {
+                        flights.removeValue(forKey: key)
+                    }
                     throw error
                 }
                 flight.input = input
@@ -1180,7 +1198,9 @@ actor CodeMapArtifactBuildCoordinator {
             )
             recordQueueTiming(queueDuration)
             activeBuildCount += 1
-            if !buildingKeys.insert(key).inserted { increment(&counters.duplicateBuilds) }
+            if !buildingKeys.insert(key).inserted {
+                increment(&counters.duplicateBuilds)
+            }
             increment(&counters.buildsStarted)
             transition(flight, to: .buildingNonPreemptive)
             emit(.buildAdmitted, flight: flight)
@@ -1592,7 +1612,9 @@ actor CodeMapArtifactBuildCoordinator {
     private func removeFlight(_ flight: Flight, hook: CodeMapArtifactBuildCoordinatorHookKind) {
         guard flights[flight.key]?.id == flight.id else { return }
         queuedBuildKeys.removeAll { $0 == flight.key }
-        if buildingKeys.contains(flight.key) { finishActiveBuild(flight.key) }
+        if buildingKeys.contains(flight.key) {
+            finishActiveBuild(flight.key)
+        }
         waiterCount -= flight.waiters.count
         releaseRetainedInputReservation(for: flight)
         flight.task = nil
@@ -1708,7 +1730,9 @@ actor CodeMapArtifactBuildCoordinator {
         return pool.min { lhs, rhs in
             let lhsGrant = ownerLastAdmission[lhs.2.ownerID] ?? 0
             let rhsGrant = ownerLastAdmission[rhs.2.ownerID] ?? 0
-            if lhsGrant != rhsGrant { return lhsGrant < rhsGrant }
+            if lhsGrant != rhsGrant {
+                return lhsGrant < rhsGrant
+            }
             return lhs.1.enqueueOrdinal < rhs.1.enqueueOrdinal
         }?.0
     }
@@ -1852,7 +1876,9 @@ actor CodeMapArtifactBuildCoordinator {
         let waiterOrder = flights.values.flatMap { flight in
             flight.waiters.values.map { (flight, $0) }
         }.sorted { lhs, rhs in
-            if lhs.1.ordinal != rhs.1.ordinal { return lhs.1.ordinal < rhs.1.ordinal }
+            if lhs.1.ordinal != rhs.1.ordinal {
+                return lhs.1.ordinal < rhs.1.ordinal
+            }
             return lhs.1.id.uuidString < rhs.1.id.uuidString
         }
         for (flight, waiter) in waiterOrder {
@@ -1865,7 +1891,9 @@ actor CodeMapArtifactBuildCoordinator {
 
         var flightOrdinal: UInt64 = 1
         for flight in flights.values.sorted(by: { lhs, rhs in
-            if lhs.enqueueOrdinal != rhs.enqueueOrdinal { return lhs.enqueueOrdinal < rhs.enqueueOrdinal }
+            if lhs.enqueueOrdinal != rhs.enqueueOrdinal {
+                return lhs.enqueueOrdinal < rhs.enqueueOrdinal
+            }
             return lhs.key.storageDigestHex < rhs.key.storageDigestHex
         }) {
             flight.enqueueOrdinal = flightOrdinal
@@ -1875,7 +1903,9 @@ actor CodeMapArtifactBuildCoordinator {
 
         var ownerOrdinal: UInt64 = 1
         for (owner, _) in ownerLastAdmission.sorted(by: { lhs, rhs in
-            if lhs.value != rhs.value { return lhs.value < rhs.value }
+            if lhs.value != rhs.value {
+                return lhs.value < rhs.value
+            }
             return lhs.key.uuidString < rhs.key.uuidString
         }) {
             ownerLastAdmission[owner] = ownerOrdinal

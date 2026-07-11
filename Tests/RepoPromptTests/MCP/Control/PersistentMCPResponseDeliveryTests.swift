@@ -1615,14 +1615,22 @@ private actor ManualBridgeSocketPoller {
     }
 
     func waitUntilStdinClosed() async -> Bool {
-        if stdinClosed { return true }
-        if bridgeCompleted { return false }
+        if stdinClosed {
+            return true
+        }
+        if bridgeCompleted {
+            return false
+        }
         return await withCheckedContinuation { stdinClosedWaiters.append($0) }
     }
 
     func waitUntilWaiting(count: Int) async -> Bool {
-        if waitingCount >= count { return true }
-        if bridgeCompleted { return false }
+        if waitingCount >= count {
+            return true
+        }
+        if bridgeCompleted {
+            return false
+        }
         return await withCheckedContinuation { continuation in
             waitingCountWaiters.append((count, continuation))
         }
@@ -2049,10 +2057,14 @@ private extension PersistentMCPResponseDeliveryTests {
             let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             let revents = Int32(pfd.revents)
             if revents & POLLNVAL != 0 {
@@ -2064,9 +2076,13 @@ private extension PersistentMCPResponseDeliveryTests {
             if revents & POLLIN != 0 {
                 var byte: UInt8 = 0
                 let peeked = Darwin.recv(fd, &byte, 1, MSG_PEEK)
-                if peeked == 0 { return true }
+                if peeked == 0 {
+                    return true
+                }
                 if peeked < 0 {
-                    if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                    if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK {
+                        continue
+                    }
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
             }
@@ -2089,9 +2105,15 @@ private extension PersistentMCPResponseDeliveryTests {
             let result = payload.withUnsafeBytes { bytes in
                 Darwin.write(fd, bytes.baseAddress, bytes.count)
             }
-            if result > 0 { continue }
-            if result < 0, errno == EINTR { continue }
-            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
+            if result > 0 {
+                continue
+            }
+            if result < 0, errno == EINTR {
+                continue
+            }
+            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
@@ -2120,7 +2142,9 @@ private extension PersistentMCPResponseDeliveryTests {
             let result = Darwin.read(fd, &byte, 1)
             if result == 1 {
                 data.append(byte)
-                if byte == UInt8(ascii: "\n") { return data }
+                if byte == UInt8(ascii: "\n") {
+                    return data
+                }
             } else if result < 0, errno == EINTR {
                 continue
             } else if result == 0 {
@@ -2141,10 +2165,14 @@ private extension PersistentMCPResponseDeliveryTests {
             let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0, data.isEmpty {
                 throw POSIXError(.ECONNRESET)
@@ -2153,7 +2181,9 @@ private extension PersistentMCPResponseDeliveryTests {
             let result = Darwin.read(fd, &byte, 1)
             if result == 1 {
                 data.append(byte)
-                if byte == UInt8(ascii: "\n") { return data }
+                if byte == UInt8(ascii: "\n") {
+                    return data
+                }
             } else if result < 0, errno == EINTR {
                 continue
             } else if result < 0, errno == EAGAIN {
@@ -2188,7 +2218,9 @@ private extension PersistentMCPResponseDeliveryTests {
         let deadline = Date().addingTimeInterval(timeout)
         var result = await replayState.replayPlan()
         while Date() < deadline {
-            if case .success = result { return result }
+            if case .success = result {
+                return result
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
             result = await replayState.replayPlan()
         }

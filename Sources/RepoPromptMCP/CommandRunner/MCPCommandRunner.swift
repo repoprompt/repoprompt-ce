@@ -512,9 +512,15 @@ actor MCPCommandRunner {
 
         // Settings summary
         var flags: [String] = []
-        if settings.prettyJSON { flags.append("pretty") }
-        if settings.colors { flags.append("colors") }
-        if settings.verbose { flags.append("verbose") }
+        if settings.prettyJSON {
+            flags.append("pretty")
+        }
+        if settings.colors {
+            flags.append("colors")
+        }
+        if settings.verbose {
+            flags.append("verbose")
+        }
         await output("  Settings:   \(flags.joined(separator: ", "))", isError: false)
 
         await output("──────────────", isError: false)

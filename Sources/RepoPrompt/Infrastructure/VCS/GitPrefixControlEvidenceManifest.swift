@@ -175,8 +175,11 @@ private struct GitPrefixControlEvidenceSpillFormat: SpillBackedSortedArtifactFor
         accumulator.recordPayloadByteCount = try GitPrefixControlEvidenceCodec.add(accumulator.recordPayloadByteCount, UInt64(encodedRecordByteCount))
         accumulator.pathPayloadByteCount = try GitPrefixControlEvidenceCodec.add(accumulator.pathPayloadByteCount, UInt64(record.repositoryRelativePathBytes.count))
         let canonical = GitPrefixControlEvidenceCodec.canonicalDigestRecord(record)
-        if record.kind == .gitAttributes { accumulator.attributes.digest.update(data: canonical) }
-        else { accumulator.ignore.digest.update(data: canonical) }
+        if record.kind == .gitAttributes {
+            accumulator.attributes.digest.update(data: canonical)
+        } else {
+            accumulator.ignore.digest.update(data: canonical)
+        }
     }
 
     func makeFinalFooter(accumulator: FinalAccumulator, digest: Data) throws -> Footer {
@@ -349,8 +352,11 @@ actor GitPrefixControlEvidenceManifestReader {
             accumulator.recordPayloadByteCount = try GitPrefixControlEvidenceCodec.add(accumulator.recordPayloadByteCount, UInt64(length))
             accumulator.pathPayloadByteCount = try GitPrefixControlEvidenceCodec.add(accumulator.pathPayloadByteCount, UInt64(record.repositoryRelativePathBytes.count))
             let canonical = GitPrefixControlEvidenceCodec.canonicalDigestRecord(record)
-            if record.kind == .gitAttributes { accumulator.attributes.digest.update(data: canonical) }
-            else { accumulator.ignore.digest.update(data: canonical) }
+            if record.kind == .gitAttributes {
+                accumulator.attributes.digest.update(data: canonical)
+            } else {
+                accumulator.ignore.digest.update(data: canonical)
+            }
             return record
         } catch { validationState = .failed
             throw error
@@ -434,7 +440,9 @@ private enum GitPrefixControlEvidenceCodec {
     }
 
     static func compare(_ lhs: Data, _ rhs: Data) -> SpillBackedSortedArtifactOrdering {
-        if lhs == rhs { return .same }
+        if lhs == rhs {
+            return .same
+        }
         return lhs.lexicographicallyPrecedes(rhs) ? .ascending : .descending
     }
 
@@ -476,9 +484,14 @@ private enum GitPrefixControlEvidenceCodec {
         while result.count < count {
             var buffer = Data(count: count - result.count)
             let n = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
-            if n > 0 { buffer.removeSubrange(n ..< buffer.count)
+            if n > 0 {
+                buffer.removeSubrange(n ..< buffer.count)
                 result.append(buffer)
-            } else if n < 0, errno == EINTR { continue } else { throw GitPrefixControlEvidenceManifestError.corrupt("truncated") }
+            } else if n < 0, errno == EINTR {
+                continue
+            } else {
+                throw GitPrefixControlEvidenceManifestError.corrupt("truncated")
+            }
         }
         return result
     }

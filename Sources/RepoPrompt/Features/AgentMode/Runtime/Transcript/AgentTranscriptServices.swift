@@ -425,21 +425,35 @@ enum ToolRawJSON {
     }
 
     static func string(_ object: [String: Any], key: String) -> String? {
-        if let value = object[key] as? String { return value }
-        if let number = object[key] as? NSNumber { return number.stringValue }
+        if let value = object[key] as? String {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.stringValue
+        }
         return nil
     }
 
     static func bool(_ object: [String: Any], key: String) -> Bool? {
-        if let value = object[key] as? Bool { return value }
-        if let number = object[key] as? NSNumber { return number.boolValue }
+        if let value = object[key] as? Bool {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.boolValue
+        }
         return nil
     }
 
     static func int(_ object: [String: Any], key: String) -> Int? {
-        if let value = object[key] as? Int { return value }
-        if let number = object[key] as? NSNumber { return number.intValue }
-        if let string = object[key] as? String { return Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if let value = object[key] as? Int {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.intValue
+        }
+        if let string = object[key] as? String {
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
         return nil
     }
 }
@@ -767,17 +781,27 @@ enum BashToolResultParser {
         let isSummaryOnly = scanText.range(of: #""summary_only"\s*:\s*true"#, options: [.regularExpression, .caseInsensitive]) != nil
             || scanText.range(of: #""summaryOnly"\s*:\s*true"#, options: [.regularExpression, .caseInsensitive]) != nil
         let isRunning: Bool = {
-            if plainTextHint.isRunning { return true }
-            if AgentTranscriptToolStatusSemantics.isRunningStatusWord(statusWord) { return true }
-            if hasSuccessFlag || hasErrorText { return false }
-            if let exitCode, exitCode >= 0 { return false }
+            if plainTextHint.isRunning {
+                return true
+            }
+            if AgentTranscriptToolStatusSemantics.isRunningStatusWord(statusWord) {
+                return true
+            }
+            if hasSuccessFlag || hasErrorText {
+                return false
+            }
+            if let exitCode, exitCode >= 0 {
+                return false
+            }
             if let statusWord, AgentTranscriptToolStatusSemantics.isTerminalStatusWord(statusWord) {
                 if exitCode != nil, exitCode ?? 0 < 0, processID?.isEmpty == false, !hasDurationHint {
                     return true
                 }
                 return false
             }
-            if exitCode != nil { return false }
+            if exitCode != nil {
+                return false
+            }
             return processID?.isEmpty == false
         }()
         return Metadata(
@@ -1033,8 +1057,12 @@ enum BashToolResultParser {
         if let array = value as? [Any] {
             let parts = array
                 .compactMap { element -> String? in
-                    if let string = element as? String { return string }
-                    if let number = element as? NSNumber { return number.stringValue }
+                    if let string = element as? String {
+                        return string
+                    }
+                    if let number = element as? NSNumber {
+                        return number.stringValue
+                    }
                     return nil
                 }
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1088,15 +1116,21 @@ enum BashToolResultParser {
         ] {
             if let value = stringValue(object, key: key) {
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return value }
+                if !trimmed.isEmpty {
+                    return value
+                }
             }
         }
         return nil
     }
 
     private static func stringValue(_ object: [String: Any], key: String) -> String? {
-        if let value = object[key] as? String { return value }
-        if let number = object[key] as? NSNumber { return number.stringValue }
+        if let value = object[key] as? String {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.stringValue
+        }
         if let array = object[key] as? [Any] {
             let parts = array
                 .compactMap { $0 as? String }
@@ -1841,7 +1875,9 @@ enum AgentTranscriptSummaryTextFormatter {
         var seenTools = Set<String>()
         let uniqueTools = summary.toolNames.filter { toolName in
             let key = toolName.lowercased()
-            if seenTools.contains(key) { return false }
+            if seenTools.contains(key) {
+                return false
+            }
             seenTools.insert(key)
             return true
         }
@@ -1880,9 +1916,15 @@ enum AgentTranscriptSummaryTextFormatter {
 
     private static func collapsedStatus(for summary: AgentTranscriptClusterSummary?) -> AgentTranscriptCollapsedSummaryStatus {
         guard let summary else { return .neutral }
-        if summary.containsFailure { return .failure }
-        if summary.containsWarning { return .warning }
-        if summary.containsRunningWork { return .running }
+        if summary.containsFailure {
+            return .failure
+        }
+        if summary.containsWarning {
+            return .warning
+        }
+        if summary.containsRunningWork {
+            return .running
+        }
         return .neutral
     }
 
@@ -3616,7 +3658,9 @@ enum AgentTranscriptIO {
             for idx in nonEssentialSorted {
                 dropIndices.insert(idx)
                 currentRendered = renderedOutputCount(excluding: dropIndices)
-                if currentRendered <= maxTranscriptItems { break }
+                if currentRendered <= maxTranscriptItems {
+                    break
+                }
             }
 
             // Step 2: If still over budget, drop essential items in whole-turn groups
@@ -3627,7 +3671,9 @@ enum AgentTranscriptIO {
                 var essentialByTurn: [UUID: [Int]] = [:]
                 for idx in forkItems.indices where forkItems[idx].dropPriority == .essential {
                     guard let turnID = forkItems[idx].turnID else { continue }
-                    if essentialByTurn[turnID] == nil { turnOrder.append(turnID) }
+                    if essentialByTurn[turnID] == nil {
+                        turnOrder.append(turnID)
+                    }
                     essentialByTurn[turnID, default: []].append(idx)
                 }
                 for turnID in turnOrder {
@@ -4008,7 +4054,9 @@ enum AgentTranscriptIO {
                 let entry = entries[i]
                 if isDisplayableAssistantEntry(entry) {
                     assistantIndices.append(i)
-                    if toolBeforeSeen { hasToolBefore.insert(i) }
+                    if toolBeforeSeen {
+                        hasToolBefore.insert(i)
+                    }
                 } else if entry.isToolBoundary {
                     toolBeforeSeen = true
                 }
@@ -4020,7 +4068,9 @@ enum AgentTranscriptIO {
             for i in segment.reversed() {
                 let entry = entries[i]
                 if isDisplayableAssistantEntry(entry) {
-                    if toolAfterSeen { hasToolAfter.insert(i) }
+                    if toolAfterSeen {
+                        hasToolAfter.insert(i)
+                    }
                 } else if entry.isToolBoundary {
                     toolAfterSeen = true
                 }
@@ -4048,7 +4098,9 @@ enum AgentTranscriptIO {
 
         logHandoffDebug("filterIntermediateAssistant dropped=\(dropIndices.count) truncated=\(truncateIndices.count)")
         return entries.enumerated().compactMap { index, entry in
-            if dropIndices.contains(index) { return nil }
+            if dropIndices.contains(index) {
+                return nil
+            }
             if truncateIndices.contains(index) {
                 return truncateAssistantEntry(entry)
             }

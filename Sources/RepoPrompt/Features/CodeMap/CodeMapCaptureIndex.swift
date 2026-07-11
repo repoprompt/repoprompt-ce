@@ -43,7 +43,9 @@ struct CodeMapCaptureIndex {
         for i in startIdx ..< candidates.count {
             let cap = candidates[i]
             // If we've gone past the parent range, stop
-            if cap.range.location >= NSMaxRange(parent) { break }
+            if cap.range.location >= NSMaxRange(parent) {
+                break
+            }
             // Check containment
             if rangeContains(parent, cap.range) {
                 return cap
@@ -64,7 +66,9 @@ struct CodeMapCaptureIndex {
         for i in startIdx ..< candidates.count {
             let cap = candidates[i]
             // If we've gone past the parent range, stop
-            if cap.range.location >= NSMaxRange(parent) { break }
+            if cap.range.location >= NSMaxRange(parent) {
+                break
+            }
             // Check containment
             if rangeContains(parent, cap.range) {
                 results.append(cap)
@@ -83,7 +87,9 @@ struct CodeMapCaptureIndex {
         for i in startIdx ..< all.count {
             let cap = all[i]
             // If we've gone past the parent range, stop
-            if cap.range.location >= NSMaxRange(parent) { break }
+            if cap.range.location >= NSMaxRange(parent) {
+                break
+            }
             // Check containment
             if rangeContains(parent, cap.range) {
                 results.append(cap)

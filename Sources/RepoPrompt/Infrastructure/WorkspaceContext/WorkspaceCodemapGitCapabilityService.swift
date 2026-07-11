@@ -146,7 +146,9 @@ struct WorkspaceCodemapSourceAuthorityToken: Hashable {
     }
 
     private static func standardizedPrefix(_ prefix: String) -> String? {
-        if prefix.isEmpty { return "" }
+        if prefix.isEmpty {
+            return ""
+        }
         return standardizedSafeRelativePath(prefix)
     }
 
@@ -313,8 +315,12 @@ actor WorkspaceCodemapGitCapabilityService {
     }
 
     func state(for rootEpoch: WorkspaceCodemapRootEpoch) -> WorkspaceCodemapGitCapabilityState {
-        if let state = records[rootEpoch]?.state { return state }
-        if historicalRecords[rootEpoch] != nil { return .terminalUnavailable(.releasedRootEpoch) }
+        if let state = records[rootEpoch]?.state {
+            return state
+        }
+        if historicalRecords[rootEpoch] != nil {
+            return .terminalUnavailable(.releasedRootEpoch)
+        }
         return .unresolved
     }
 
@@ -464,7 +470,9 @@ actor WorkspaceCodemapGitCapabilityService {
         let task = Task(priority: Task.currentPriority) { [weak self] in
             guard let self else { return Resolution.transient(.runtimeUnavailable) }
             await hooks.beforeResolution()
-            if Task.isCancelled { return .transient(.runtimeUnavailable) }
+            if Task.isCancelled {
+                return .transient(.runtimeUnavailable)
+            }
             return await resolveCandidate(loadedRootURL: loadedRootURL)
         }
         flights[request.rootEpoch] = RootFlight(
@@ -559,7 +567,9 @@ actor WorkspaceCodemapGitCapabilityService {
                 record.binding.worktreeID = worktreeID
                 if record.stableAuthority != authority {
                     record.authorityGeneration &+= 1
-                    if record.authorityGeneration == 0 { record.authorityGeneration = 1 }
+                    if record.authorityGeneration == 0 {
+                        record.authorityGeneration = 1
+                    }
                     record.stableAuthority = authority
                 }
                 let token = WorkspaceCodemapRepositoryAuthorityToken(
@@ -634,7 +644,9 @@ actor WorkspaceCodemapGitCapabilityService {
     private static func restorableState(
         _ state: WorkspaceCodemapGitCapabilityState
     ) -> WorkspaceCodemapGitCapabilityState {
-        if case .resolving = state { return .unresolved }
+        if case .resolving = state {
+            return .unresolved
+        }
         return state
     }
 
@@ -736,7 +748,9 @@ actor WorkspaceCodemapGitCapabilityService {
               activeCapability == capability,
               let stableAuthority = record.stableAuthority
         else { return false }
-        if tokens.isEmpty { return true }
+        if tokens.isEmpty {
+            return true
+        }
 
         var candidatePaths = Set<String>()
         for token in tokens {
@@ -902,7 +916,9 @@ actor WorkspaceCodemapGitCapabilityService {
                     prefix: prefix
                 )
                 guard pre == post else {
-                    if attempt == 0 { continue }
+                    if attempt == 0 {
+                        continue
+                    }
                     return .transient(.repositoryChanging)
                 }
 
@@ -1070,14 +1086,18 @@ actor WorkspaceCodemapGitCapabilityService {
     }
 
     private static func transientReason(for error: Error) -> WorkspaceCodemapGitTransientUnavailableReason {
-        if error is CancellationError { return .runtimeUnavailable }
+        if error is CancellationError {
+            return .runtimeUnavailable
+        }
         let nsError = error as NSError
         if nsError.domain == NSPOSIXErrorDomain,
            nsError.code == Int(EACCES) || nsError.code == Int(EPERM)
         {
             return .permissionFailure
         }
-        if error is GitService.GitError { return .gitProcessUnavailable }
+        if error is GitService.GitError {
+            return .gitProcessUnavailable
+        }
         if let captureError = error as? CapabilityCaptureError {
             switch captureError {
             case .layoutChanged: return .repositoryChanging
@@ -1115,7 +1135,9 @@ actor WorkspaceCodemapGitCapabilityService {
     private static func layoutState(_ layout: GitRepositoryLayout) -> DirectoryState {
         for directory in [layout.workTreeRoot, layout.gitDir, layout.commonDir] {
             let state = directoryState(at: directory)
-            if state != .valid { return state }
+            if state != .valid {
+                return state
+            }
         }
         return .valid
     }
@@ -1126,7 +1148,9 @@ actor WorkspaceCodemapGitCapabilityService {
         guard loadedPath == rootPath || StandardizedPath.isDescendant(loadedPath, of: rootPath) else {
             return nil
         }
-        if loadedPath == rootPath { return "" }
+        if loadedPath == rootPath {
+            return ""
+        }
         return String(loadedPath.dropFirst(rootPath.count + 1))
     }
 
@@ -1175,7 +1199,9 @@ actor WorkspaceCodemapGitCapabilityService {
         let target = loadedRoot.resolvingSymlinksInPath().standardizedFileURL
         while true {
             urls.append(directory.appendingPathComponent(".gitattributes"))
-            if directory.path == target.path { break }
+            if directory.path == target.path {
+                break
+            }
             let relative = String(target.path.dropFirst(directory.path.count))
                 .split(separator: "/", omittingEmptySubsequences: true)
             guard let next = relative.first else { break }
@@ -1314,7 +1340,9 @@ actor WorkspaceCodemapGitCapabilityService {
                 fstatat(parentDescriptor, name, &linkStat, AT_SYMLINK_NOFOLLOW)
             }
             guard status == 0 else {
-                if missingAllowed, errno == ENOENT || errno == ENOTDIR { return nil }
+                if missingAllowed, errno == ENOENT || errno == ENOTDIR {
+                    return nil
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             guard (linkStat.st_mode & S_IFMT) != S_IFLNK else {
@@ -1322,7 +1350,9 @@ actor WorkspaceCodemapGitCapabilityService {
             }
             let isLeaf = index == components.count - 1
             if !isLeaf, (linkStat.st_mode & S_IFMT) != S_IFDIR {
-                if missingAllowed { return nil }
+                if missingAllowed {
+                    return nil
+                }
                 throw POSIXError(.ENOTDIR)
             }
             let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK |
@@ -1331,7 +1361,9 @@ actor WorkspaceCodemapGitCapabilityService {
                 openat(parentDescriptor, name, flags)
             }
             guard descriptor >= 0 else {
-                if missingAllowed, errno == ENOENT || errno == ENOTDIR { return nil }
+                if missingAllowed, errno == ENOENT || errno == ENOTDIR {
+                    return nil
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             descriptors.append(descriptor)
@@ -1394,9 +1426,13 @@ actor WorkspaceCodemapGitCapabilityService {
             let count = buffer.withUnsafeMutableBytes { bytes in
                 Darwin.read(descriptor, bytes.baseAddress, bytes.count)
             }
-            if count == 0 { return data }
+            if count == 0 {
+                return data
+            }
             if count < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             guard Int64(data.count) <= maximumByteCount - Int64(count) else {
@@ -1438,8 +1474,12 @@ actor WorkspaceCodemapGitCapabilityService {
     /// those aliases; repository-controlled symlinks remain forbidden by descriptor traversal.
     private static func normalizedSystemAliasPath(_ path: String) -> String {
         for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
-            if path == alias { return target }
-            if path.hasPrefix(alias + "/") { return target + path.dropFirst(alias.count) }
+            if path == alias {
+                return target
+            }
+            if path.hasPrefix(alias + "/") {
+                return target + path.dropFirst(alias.count)
+            }
         }
         return path
     }

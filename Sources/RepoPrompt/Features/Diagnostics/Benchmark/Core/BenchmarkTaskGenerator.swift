@@ -308,7 +308,9 @@ struct BenchmarkTaskGenerator {
     }
 
     private func targetLineCount(_ config: BenchConfig) -> Int {
-        if let override = config.sizeLines { return max(override, 40) }
+        if let override = config.sizeLines {
+            return max(override, 40)
+        }
         switch config.size {
         case .small: return 120
         case .medium: return 320
@@ -7739,7 +7741,9 @@ struct BenchmarkTaskGenerator {
                 return rng.nextInt(upperBound: 2) == 0 ? .named : .alias
             case .hard, .veryHard:
                 let pick = rng.nextInt(upperBound: 3)
-                if pick == 0 { return .named }
+                if pick == 0 {
+                    return .named
+                }
                 return pick == 1 ? .alias : .namespace
             }
         }
@@ -7989,9 +7993,13 @@ struct BenchmarkTaskGenerator {
         while end < base.count, base[end] != "}" {
             end += 1
         }
-        if end >= base.count { return nil }
+        if end >= base.count {
+            return nil
+        }
         // Include trailing blank line if present
-        if end + 1 < base.count, base[end + 1].isEmpty { end += 1 }
+        if end + 1 < base.count, base[end + 1].isEmpty {
+            end += 1
+        }
         return start ... end
     }
 
@@ -8002,9 +8010,13 @@ struct BenchmarkTaskGenerator {
         while end < base.count, base[end] != "}" {
             end += 1
         }
-        if end >= base.count { return nil }
+        if end >= base.count {
+            return nil
+        }
         // Include trailing blank line if present
-        if end + 1 < base.count, base[end + 1].isEmpty { end += 1 }
+        if end + 1 < base.count, base[end + 1].isEmpty {
+            end += 1
+        }
         return start ... end
     }
 
@@ -8015,9 +8027,13 @@ struct BenchmarkTaskGenerator {
         while end < base.count, base[end] != "}" {
             end += 1
         }
-        if end >= base.count { return nil }
+        if end >= base.count {
+            return nil
+        }
         // Include trailing blank line if present
-        if end + 1 < base.count, base[end + 1].isEmpty { end += 1 }
+        if end + 1 < base.count, base[end + 1].isEmpty {
+            end += 1
+        }
         return start ... end
     }
 

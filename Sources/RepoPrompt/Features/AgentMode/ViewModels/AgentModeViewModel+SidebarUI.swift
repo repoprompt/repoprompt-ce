@@ -383,18 +383,32 @@ extension AgentModeViewModel {
             guard previous != self else { return Self.makeDebugDelta(categories: ["none"]) }
 
             var categories = Set<String>()
-            if previous.currentTabID != currentTabID { categories.insert("currentTabID") }
-            if previous.sessionListCacheReady != sessionListCacheReady { categories.insert("sessionListCacheReady") }
-            if previous.tabsWithActiveAgentRun != tabsWithActiveAgentRun { categories.insert("tabsWithActiveAgentRun") }
-            if previous.mcpControlledTabIDs != mcpControlledTabIDs { categories.insert("mcpControlledTabIDs") }
-            if previous.sidebarRestoreFrozenOrderByTabID != sidebarRestoreFrozenOrderByTabID { categories.insert("sidebarRestoreFrozenOrder") }
+            if previous.currentTabID != currentTabID {
+                categories.insert("currentTabID")
+            }
+            if previous.sessionListCacheReady != sessionListCacheReady {
+                categories.insert("sessionListCacheReady")
+            }
+            if previous.tabsWithActiveAgentRun != tabsWithActiveAgentRun {
+                categories.insert("tabsWithActiveAgentRun")
+            }
+            if previous.mcpControlledTabIDs != mcpControlledTabIDs {
+                categories.insert("mcpControlledTabIDs")
+            }
+            if previous.sidebarRestoreFrozenOrderByTabID != sidebarRestoreFrozenOrderByTabID {
+                categories.insert("sidebarRestoreFrozenOrder")
+            }
 
             let tabChanges = debugTabMetadataChanges(from: previous, categories: &categories)
             let sessionChanges = debugSessionSignatureChanges(from: previous, categories: &categories)
             let sessionIndexChanged = previous.sessionIndex != sessionIndex
             let sortDatesChanged = previous.sessionListSortDates != sessionListSortDates
-            if sessionIndexChanged { categories.insert("sessionIndex") }
-            if sortDatesChanged { categories.insert("sessionListSortDates") }
+            if sessionIndexChanged {
+                categories.insert("sessionIndex")
+            }
+            if sortDatesChanged {
+                categories.insert("sessionListSortDates")
+            }
 
             return AgentSidebarFingerprintDeltaDiagnostics(
                 categories: Self.orderedCategories(from: categories),
@@ -443,8 +457,12 @@ extension AgentModeViewModel {
             categories: inout Set<String>
         ) -> DebugTabMetadataChanges {
             var changes = DebugTabMetadataChanges()
-            if previous.tabMetadataSignatures.count != tabMetadataSignatures.count { categories.insert("tabMetadata.count") }
-            if previous.tabMetadataSignatures.map(\.tabID) != tabMetadataSignatures.map(\.tabID) { categories.insert("tabMetadata.order") }
+            if previous.tabMetadataSignatures.count != tabMetadataSignatures.count {
+                categories.insert("tabMetadata.count")
+            }
+            if previous.tabMetadataSignatures.map(\.tabID) != tabMetadataSignatures.map(\.tabID) {
+                categories.insert("tabMetadata.order")
+            }
 
             let previousByID = Dictionary(uniqueKeysWithValues: previous.tabMetadataSignatures.map { ($0.tabID, $0) })
             let currentByID = Dictionary(uniqueKeysWithValues: tabMetadataSignatures.map { ($0.tabID, $0) })
@@ -454,7 +472,8 @@ extension AgentModeViewModel {
                     continue
                 }
                 var changed = false
-                if previousTab.order != currentTab.order { categories.insert("tabMetadata.order")
+                if previousTab.order != currentTab.order {
+                    categories.insert("tabMetadata.order")
                     changed = true
                 }
                 if previousTab.normalizedName != currentTab.normalizedName {
@@ -462,10 +481,12 @@ extension AgentModeViewModel {
                     changes.changedNameCount += 1
                     changed = true
                 }
-                if previousTab.activeAgentSessionID != currentTab.activeAgentSessionID { categories.insert("tabMetadata.activeAgentSessionID")
+                if previousTab.activeAgentSessionID != currentTab.activeAgentSessionID {
+                    categories.insert("tabMetadata.activeAgentSessionID")
                     changed = true
                 }
-                if previousTab.isPinned != currentTab.isPinned { categories.insert("tabMetadata.isPinned")
+                if previousTab.isPinned != currentTab.isPinned {
+                    categories.insert("tabMetadata.isPinned")
                     changed = true
                 }
                 if previousTab.lastModified != currentTab.lastModified {
@@ -473,7 +494,9 @@ extension AgentModeViewModel {
                     changes.changedLastModifiedCount += 1
                     changed = true
                 }
-                if changed { changes.changedMetadataCount += 1 }
+                if changed {
+                    changes.changedMetadataCount += 1
+                }
             }
             return changes
         }
@@ -483,7 +506,9 @@ extension AgentModeViewModel {
             categories: inout Set<String>
         ) -> DebugSessionSignatureChanges {
             var changes = DebugSessionSignatureChanges()
-            if previous.sessionSignatures.count != sessionSignatures.count { categories.insert("session.count") }
+            if previous.sessionSignatures.count != sessionSignatures.count {
+                categories.insert("session.count")
+            }
 
             let previousByID = Dictionary(uniqueKeysWithValues: previous.sessionSignatures.map { ($0.tabID, $0) })
             let currentByID = Dictionary(uniqueKeysWithValues: sessionSignatures.map { ($0.tabID, $0) })
@@ -493,16 +518,20 @@ extension AgentModeViewModel {
                     continue
                 }
                 var changed = false
-                if previousSession.activeAgentSessionID != currentSession.activeAgentSessionID { categories.insert("session.activeAgentSessionID")
+                if previousSession.activeAgentSessionID != currentSession.activeAgentSessionID {
+                    categories.insert("session.activeAgentSessionID")
                     changed = true
                 }
-                if previousSession.parentSessionID != currentSession.parentSessionID { categories.insert("session.parentSessionID")
+                if previousSession.parentSessionID != currentSession.parentSessionID {
+                    categories.insert("session.parentSessionID")
                     changed = true
                 }
-                if previousSession.hasLoadedPersistedState != currentSession.hasLoadedPersistedState { categories.insert("session.hasLoadedPersistedState")
+                if previousSession.hasLoadedPersistedState != currentSession.hasLoadedPersistedState {
+                    categories.insert("session.hasLoadedPersistedState")
                     changed = true
                 }
-                if previousSession.itemsIsEmpty != currentSession.itemsIsEmpty { categories.insert("session.itemsIsEmpty")
+                if previousSession.itemsIsEmpty != currentSession.itemsIsEmpty {
+                    categories.insert("session.itemsIsEmpty")
                     changed = true
                 }
                 if previousSession.runState != currentSession.runState {
@@ -520,7 +549,9 @@ extension AgentModeViewModel {
                     changes.changedLastUserMessageCount += 1
                     changed = true
                 }
-                if changed { changes.changedSignatureCount += 1 }
+                if changed {
+                    changes.changedSignatureCount += 1
+                }
             }
             return changes
         }

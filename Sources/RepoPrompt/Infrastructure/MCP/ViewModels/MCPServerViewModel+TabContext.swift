@@ -122,7 +122,9 @@ extension MCPServerViewModel {
             timeoutSeconds: TimeInterval
         ) async -> ContextBuilderTeardownPublicationOutcome {
             let key = Key(runID: runID, connectionID: connectionID)
-            if let outcome = retainedOutcomes[key] { return outcome }
+            if let outcome = retainedOutcomes[key] {
+                return outcome
+            }
 
             let waiterID = UUID()
             return await withTaskCancellationHandler {
@@ -395,7 +397,9 @@ extension MCPServerViewModel {
         case activeTabCompatibility
 
         var snapshot: TabContextSnapshot? {
-            if case let .tabContextSnapshot(snapshot, _) = self { return snapshot }
+            if case let .tabContextSnapshot(snapshot, _) = self {
+                return snapshot
+            }
             return nil
         }
     }
@@ -738,7 +742,9 @@ extension MCPServerViewModel {
 
     @MainActor
     private func beginMirroringForConnection(_ connectionID: UUID, context: TabScopedContext) {
-        if tabContextCancellablesByConnectionID[connectionID] != nil { return }
+        if tabContextCancellablesByConnectionID[connectionID] != nil {
+            return
+        }
 
         guard let manager = workspaceManager else {
             tabContextLog("beginMirroring skipped - no workspace manager connectionID=\(connectionID)")
@@ -1079,7 +1085,9 @@ extension MCPServerViewModel {
         flushActiveSelection: Bool
     ) -> TabContextSnapshot {
         let resolvedWorkspaceID: UUID? = {
-            if let requestedWorkspaceID { return requestedWorkspaceID }
+            if let requestedWorkspaceID {
+                return requestedWorkspaceID
+            }
             return workspaceManager?.workspaces.first(where: { workspace in
                 workspace.composeTabs.contains(where: { $0.id == composeSnapshot.id })
             })?.id ?? workspaceManager?.activeWorkspace?.id
@@ -2926,8 +2934,12 @@ extension MCPServerViewModel {
 
     private static func hint(_ hint: TabContextHint, matches context: TabContextSnapshot) -> Bool {
         guard hint.tabID == context.tabID else { return false }
-        if let workspaceID = hint.workspaceID, context.workspaceID != workspaceID { return false }
-        if let windowID = hint.windowID, context.windowID != windowID { return false }
+        if let workspaceID = hint.workspaceID, context.workspaceID != workspaceID {
+            return false
+        }
+        if let windowID = hint.windowID, context.windowID != windowID {
+            return false
+        }
         return true
     }
 
@@ -2968,7 +2980,9 @@ extension MCPServerViewModel {
         tabContextByConnectionID[connectionID] = rebound
         windowIDByConnection[connectionID] = rebound.windowID
         let mappingOK = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
-        if let clientName { recordLastContext(clientName: clientName, context: rebound) }
+        if let clientName {
+            recordLastContext(clientName: clientName, context: rebound)
+        }
         beginMirroringForConnection(connectionID, context: rebound)
         tabContextLog("resolveTabContext handover: runID=\(runID) \(previousConnection) -> \(connectionID) mappingOK=\(mappingOK) window=\(providedWindowID?.description ?? "nil")")
         return rebound
@@ -3024,7 +3038,9 @@ extension MCPServerViewModel {
                 }
                 tabContextLog("resolveTabContext using bound context connectionID=\(connectionID) runID=\(bound.runID?.uuidString ?? "nil") tab=\(bound.tabID)")
                 let source: TabContextSnapshotSource = {
-                    if bound.runID != nil { return .runInstall }
+                    if bound.runID != nil {
+                        return .runInstall
+                    }
                     return bound.explicitlyBound ? .explicitBinding : .implicitBindingCompatibility
                 }()
                 return .tabContextSnapshot(bound, source: source)

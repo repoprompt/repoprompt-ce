@@ -592,11 +592,15 @@ extension AgentModeViewModel {
             earliestChangedIndex = changedRange?.lowerBound ?? 0
             latestChangedIndex = changedRange?.upperBound ?? Int.max
             containsRemoval = {
-                if case .remove = mutation { return true }
+                if case .remove = mutation {
+                    return true
+                }
                 return false
             }()
             containsReplaceAll = {
-                if case .replaceAll = mutation { return true }
+                if case .replaceAll = mutation {
+                    return true
+                }
                 return false
             }()
             containsUserMutation = mutation.touchesUserItem

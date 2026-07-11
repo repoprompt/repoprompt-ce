@@ -126,7 +126,9 @@ struct OptimizedModelPicker: View {
         for backendID in grouped.keys.sorted(by: {
             let lhsRank = backendSortOrder[$0] ?? Int.max
             let rhsRank = backendSortOrder[$1] ?? Int.max
-            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            if lhsRank != rhsRank {
+                return lhsRank < rhsRank
+            }
             return compatibleClaudeBackendTopLevelDisplayName(for: $0).localizedCaseInsensitiveCompare(
                 compatibleClaudeBackendTopLevelDisplayName(for: $1)
             ) == .orderedAscending

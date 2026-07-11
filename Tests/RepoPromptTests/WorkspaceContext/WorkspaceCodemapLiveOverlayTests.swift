@@ -196,7 +196,11 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let snapshot = try unwrapValue(snapshotValue)
         assertEqualValue(snapshot.entries.count, 2)
         assertTrueValue(snapshot.entries.allSatisfy {
-            if case .shadowed(.renamed) = $0.state { true } else { false }
+            if case .shadowed(.renamed) = $0.state {
+                true
+            } else {
+                false
+            }
         })
         let graphValue = await fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
         try assertTrueValue(unwrapValue(graphValue).bindings.isEmpty)

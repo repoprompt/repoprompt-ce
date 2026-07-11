@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 public struct ClaudeSDKNDJSONTranslator {
@@ -728,8 +729,12 @@ public struct ClaudeSDKNDJSONTranslator {
         }
 
         if let exitCode = intValue(in: object, keys: ["exitCode", "exit_code", "code"]) {
-            if exitCode == 0 { return false }
-            if exitCode > 0 { return true }
+            if exitCode == 0 {
+                return false
+            }
+            if exitCode > 0 {
+                return true
+            }
         }
 
         if let error = firstString(in: object, keys: ["error", "error_message", "errorMessage"]),
@@ -861,7 +866,9 @@ public struct ClaudeSDKNDJSONTranslator {
         case let string as String:
             return string
         case let dict as [String: Any]:
-            if let text = dict["text"] as? String { return text }
+            if let text = dict["text"] as? String {
+                return text
+            }
             return nil
         case let array as [Any]:
             return array.compactMap { extractString($0) }.joined(separator: "")
@@ -931,7 +938,9 @@ public struct ClaudeSDKNDJSONTranslator {
             guard double.isFinite else { return nil }
             return Int(exactly: double)
         case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                return nil
+            }
             if let exactInteger = Int(number.stringValue) {
                 return exactInteger
             }

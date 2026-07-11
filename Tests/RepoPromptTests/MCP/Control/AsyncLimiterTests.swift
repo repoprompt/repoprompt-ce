@@ -1187,12 +1187,10 @@ import XCTest
             XCTAssertTrue(evictableAfterDeferredClears)
         }
 
-        func testPerClientAdmissionEvictionSkipsCandidateThatBecomesBusyBeforeAtomicClose() async {
-            await assertAdmissionEvictionFallsBackToNextCandidate(scope: .perClient)
-        }
-
-        func testGlobalAdmissionEvictionSkipsCandidateThatBecomesBusyBeforeAtomicClose() async {
-            await assertAdmissionEvictionFallsBackToNextCandidate(scope: .global)
+        func testAdmissionEvictionSkipsCandidateThatBecomesBusyBeforeAtomicClose() async {
+            for scope in [AdmissionEvictionScope.perClient, .global] {
+                await assertAdmissionEvictionFallsBackToNextCandidate(scope: scope)
+            }
         }
 
         func testGlobalAdmissionEvictionIgnoresRemovingSiblingBeforeClosingProtectedVictim() async {
@@ -1414,18 +1412,13 @@ import XCTest
             await manager.debugRemoveConnection(victimID)
         }
 
-        func testDirectAdmissionRejectsActorIdentityReplacementAfterSuspension() async {
-            await assertDirectAdmissionRejectsStaleResume(
-                advanceLifecycleGeneration: false,
-                replaceConnectionActor: true
-            )
-        }
-
-        func testDirectAdmissionRejectsLifecycleGenerationReplacementAfterSuspension() async {
-            await assertDirectAdmissionRejectsStaleResume(
-                advanceLifecycleGeneration: true,
-                replaceConnectionActor: false
-            )
+        func testDirectAdmissionRejectsStaleResumeAfterIdentityOrLifecycleReplacement() async {
+            for scenario in [(advanceLifecycleGeneration: false, replaceConnectionActor: true), (true, false)] {
+                await assertDirectAdmissionRejectsStaleResume(
+                    advanceLifecycleGeneration: scenario.advanceLifecycleGeneration,
+                    replaceConnectionActor: scenario.replaceConnectionActor
+                )
+            }
         }
 
         func testDirectAdmissionRejectsRemovalCommittedWhileSuspended() async {
@@ -1712,20 +1705,16 @@ import XCTest
             )
         }
 
-        func testDirectGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose() async throws {
-            try await assertGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose(path: .direct)
+        func testGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose() async throws {
+            for path in [GlobalAdmissionPath.direct, .bootstrap] {
+                try await assertGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose(path: path)
+            }
         }
 
-        func testBootstrapGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose() async throws {
-            try await assertGlobalAdmissionPreservesCandidateWhenRemovalCreatesHeadroomBeforeClose(path: .bootstrap)
-        }
-
-        func testDirectGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose() async throws {
-            try await assertGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose(path: .direct)
-        }
-
-        func testBootstrapGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose() async throws {
-            try await assertGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose(path: .bootstrap)
+        func testGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose() async throws {
+            for path in [GlobalAdmissionPath.direct, .bootstrap] {
+                try await assertGlobalAdmissionRestoresClosedCandidateWhenRemovalCreatesHeadroomDuringClose(path: path)
+            }
         }
 
         func testPerClientAdmissionAcceptsWhenConcurrentRemovalCreatesCapacityWithoutClosingCandidate() async {
@@ -3217,20 +3206,16 @@ import XCTest
             await assertCompletion(removal, description: "genuine connection removal")
         }
 
-        func testDirectAdmissionRechecksEffectiveCapacityAfterPreservationRollback() async throws {
-            try await assertAdmissionRechecksEffectiveCapacityAfterPreservationRollback(path: .direct)
+        func testAdmissionRechecksEffectiveCapacityAfterPreservationRollback() async throws {
+            for path in [GlobalAdmissionPath.direct, .bootstrap] {
+                try await assertAdmissionRechecksEffectiveCapacityAfterPreservationRollback(path: path)
+            }
         }
 
-        func testBootstrapAdmissionRechecksEffectiveCapacityAfterPreservationRollback() async throws {
-            try await assertAdmissionRechecksEffectiveCapacityAfterPreservationRollback(path: .bootstrap)
-        }
-
-        func testDirectAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull() async {
-            await assertAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull(path: .direct)
-        }
-
-        func testBootstrapAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull() async {
-            await assertAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull(path: .bootstrap)
+        func testAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull() async {
+            for path in [GlobalAdmissionPath.direct, .bootstrap] {
+                await assertAdmissionRejectsWhenEffectiveLiveCapacityRemainsFull(path: path)
+            }
         }
 
         func testPreResolvedCallDoesNotRetryRestoredBundleAfterTaskCancellation() async {
@@ -3837,7 +3822,9 @@ import XCTest
             let deadline = clock.now.advanced(by: timeout)
             while clock.now < deadline {
                 let snapshot = await limiter.debugSnapshot()
-                if predicate(snapshot) { return snapshot }
+                if predicate(snapshot) {
+                    return snapshot
+                }
                 try? await Task.sleep(for: .milliseconds(5))
             }
             let snapshot = await limiter.debugSnapshot()
@@ -3873,7 +3860,9 @@ import XCTest
 
         private func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in
-                if case let .text(text, _, _) = content { return text }
+                if case let .text(text, _, _) = content {
+                    return text
+                }
                 return nil
             }.joined()
             let data = try XCTUnwrap(text.data(using: .utf8))
@@ -4104,7 +4093,9 @@ import XCTest
         }
 
         func waitUntil(_ target: Int, timeout: Duration) async -> Int? {
-            if value >= target { return value }
+            if value >= target {
+                return value
+            }
             let waiterID = UUID()
             return await withCheckedContinuation { continuation in
                 waiters[waiterID] = Waiter(target: target, continuation: continuation)
