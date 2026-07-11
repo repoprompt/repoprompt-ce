@@ -172,18 +172,14 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let cancellationFiles = await store.files(inRoot: cancellationLoaded.id)
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
         XCTAssertEqual(cancellationFiles.count, 2)
-        let firstCancellationTicket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: cancellationFiles[0].id)
-        )
-        _ = try await readyResult(
-            settledResult(store: store, ticket: firstCancellationTicket)
-        )
-        let secondCancellationTicket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: cancellationFiles[1].id)
-        )
-        _ = try await readyResult(
-            settledResult(store: store, ticket: secondCancellationTicket)
-        )
+        let firstCancellationTicket = try await readyArtifactDemand(
+            store: store,
+            forFileID: cancellationFiles[0].id
+        ).ticket
+        let secondCancellationTicket = try await readyArtifactDemand(
+            store: store,
+            forFileID: cancellationFiles[1].id
+        ).ticket
         let cancellationBundle = try await frozenPresentationBundle(
             store.freezeCodemapPresentation([
                 WorkspaceCodemapPresentationRequest(
