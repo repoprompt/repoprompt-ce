@@ -1577,41 +1577,6 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
     }
 }
 
-#if DEBUG
-    private actor AsyncGate {
-        private var started = false
-        private var released = false
-        private var startWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-
-        func markStartedAndWaitForRelease() async {
-            started = true
-            let waiters = startWaiters
-            startWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
-            }
-        }
-
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                startWaiters.append(continuation)
-            }
-        }
-
-        func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-        }
-    }
-#endif
-
 private extension Sequence {
     func asyncMap<T>(_ transform: (Element) async throws -> T) async rethrows -> [T] {
         var values: [T] = []

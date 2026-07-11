@@ -541,31 +541,27 @@ import XCTest
         private func waitForIndexedGeneration(
             _ expected: UInt64,
             service: WorkspaceSearchService,
-            timeout: TimeInterval = 2.0,
-            file: StaticString = #filePath,
-            line: UInt = #line
+            timeout: TimeInterval = 2.0
         ) async throws {
-            let deadline = Date().addingTimeInterval(timeout)
-            while Date() < deadline {
-                if await service.indexedGeneration == expected { return }
-                try await Task.sleep(nanoseconds: 10_000_000)
+            try await AsyncTestWait.waitUntil(
+                "per-root indexed workspace search generation \(expected)",
+                timeout: timeout
+            ) {
+                await service.indexedGeneration == expected
             }
-            XCTFail("Timed out waiting for indexed generation \(expected)", file: file, line: line)
         }
 
         private func waitForPendingGeneration(
             _ expected: UInt64,
             service: WorkspaceSearchService,
-            timeout: TimeInterval = 2.0,
-            file: StaticString = #filePath,
-            line: UInt = #line
+            timeout: TimeInterval = 2.0
         ) async throws {
-            let deadline = Date().addingTimeInterval(timeout)
-            while Date() < deadline {
-                if await service.pendingGeneration == expected { return }
-                try await Task.sleep(nanoseconds: 10_000_000)
+            try await AsyncTestWait.waitUntil(
+                "per-root pending workspace search generation \(expected)",
+                timeout: timeout
+            ) {
+                await service.pendingGeneration == expected
             }
-            XCTFail("Timed out waiting for pending generation \(expected)", file: file, line: line)
         }
 
         private func makeTemporaryRoot(name: String) throws -> URL {
@@ -606,7 +602,9 @@ import XCTest
         }
 
         func waitUntilEntered() async -> UInt64? {
-            if enteredGeneration != nil { return enteredGeneration }
+            if enteredGeneration != nil {
+                return enteredGeneration
+            }
             return await withCheckedContinuation { continuation in
                 enteredWaiters.append(continuation)
             }

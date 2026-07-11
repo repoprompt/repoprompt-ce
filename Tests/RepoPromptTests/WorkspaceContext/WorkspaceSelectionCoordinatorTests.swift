@@ -901,20 +901,18 @@ private actor SelectionMirrorGate {
     private var started = false
     private var released = false
 
-    func markStartedAndWaitForRelease(timeout: Duration = .seconds(5)) async {
+    func markStartedAndWaitForRelease(timeout: TimeInterval = 5) async {
         started = true
-        let deadline = ContinuousClock.now + timeout
-        while !released, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(10))
-        }
+        try? await AsyncTestWait.waitUntil("selection mirror gate release", timeout: timeout) { await self.released }
     }
 
-    func waitUntilStarted(timeout: Duration = .seconds(2)) async -> Bool {
-        let deadline = ContinuousClock.now + timeout
-        while !started, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(10))
+    func waitUntilStarted(timeout: TimeInterval = 2) async -> Bool {
+        do {
+            try await AsyncTestWait.waitUntil("selection mirror gate start", timeout: timeout) { await self.started }
+            return true
+        } catch {
+            return false
         }
-        return started
     }
 
     func release() {
@@ -934,12 +932,15 @@ private actor SelectionMirrorCompletion {
         completedCount += 1
     }
 
-    func waitUntilComplete(timeout: Duration = .seconds(2)) async -> Bool {
-        let deadline = ContinuousClock.now + timeout
-        while completedCount < expectedCount, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(10))
+    func waitUntilComplete(timeout: TimeInterval = 2) async -> Bool {
+        do {
+            try await AsyncTestWait.waitUntil("selection mirror completion", timeout: timeout) {
+                await self.completedCount == self.expectedCount
+            }
+            return true
+        } catch {
+            return false
         }
-        return completedCount == expectedCount
     }
 }
 

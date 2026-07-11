@@ -330,37 +330,27 @@ final class WorkspaceSearchServiceTests: XCTestCase {
     private func waitForIndexedGeneration(
         _ expectedGeneration: UInt64,
         service: WorkspaceSearchService,
-        timeout: TimeInterval = 2.0,
-        file: StaticString = #filePath,
-        line: UInt = #line
+        timeout: TimeInterval = 2.0
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await service.indexedGeneration == expectedGeneration {
-                return
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        try await AsyncTestWait.waitUntil(
+            "indexed workspace search generation \(expectedGeneration)",
+            timeout: timeout
+        ) {
+            await service.indexedGeneration == expectedGeneration
         }
-        let actual = await service.indexedGeneration
-        XCTFail("Timed out waiting for indexed generation \(expectedGeneration); actual=\(String(describing: actual))", file: file, line: line)
     }
 
     private func waitForPendingGeneration(
         _ expectedGeneration: UInt64,
         service: WorkspaceSearchService,
-        timeout: TimeInterval = 2.0,
-        file: StaticString = #filePath,
-        line: UInt = #line
+        timeout: TimeInterval = 2.0
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await service.pendingGeneration == expectedGeneration {
-                return
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        try await AsyncTestWait.waitUntil(
+            "pending workspace search generation \(expectedGeneration)",
+            timeout: timeout
+        ) {
+            await service.pendingGeneration == expectedGeneration
         }
-        let actual = await service.pendingGeneration
-        XCTFail("Timed out waiting for pending generation \(expectedGeneration); actual=\(String(describing: actual))", file: file, line: line)
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {

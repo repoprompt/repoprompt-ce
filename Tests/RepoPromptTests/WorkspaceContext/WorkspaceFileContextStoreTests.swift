@@ -4,24 +4,6 @@ import CryptoKit
 @testable import RepoPromptApp
 import XCTest
 
-private enum CodemapInitializationResetBoundary: String, CaseIterable {
-    case cancelAll
-    case checkoutMutation
-    case cacheClear
-}
-
-private actor UUIDRecorder {
-    private var values: [UUID] = []
-
-    func append(_ value: UUID) {
-        values.append(value)
-    }
-
-    func snapshot() -> [UUID] {
-        values
-    }
-}
-
 final class WorkspaceFileContextStoreTests: XCTestCase {
     private var cancellables = Set<AnyCancellable>()
 
@@ -3428,7 +3410,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             for _ in 0 ..< 1000 {
                 let stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
-                if await flushGate.startCount() >= 3 || stats.coalescedSuccessorCount == 1 { break }
+                if await flushGate.startCount() >= 3 || stats.coalescedSuccessorCount == 1 {
+                    break
+                }
                 await Task.yield()
             }
             clock.advance(milliseconds: 175)
@@ -3539,7 +3523,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await store.awaitAppliedIngressForAllRoots()
             }
             for _ in 0 ..< 1000 {
-                if await flushGate.startCount() >= 8 { break }
+                if await flushGate.startCount() >= 8 {
+                    break
+                }
                 await Task.yield()
             }
             for _ in 0 ..< 50 {
@@ -7746,7 +7732,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             private var cancelledWaiterIDs: Set<UUID> = []
 
             func sleep(nanoseconds: UInt64) async {
-                if releasedNanoseconds.contains(nanoseconds) { return }
+                if releasedNanoseconds.contains(nanoseconds) {
+                    return
+                }
                 let waiterID = UUID()
                 await withTaskCancellationHandler {
                     await withCheckedContinuation { continuation in
@@ -7854,7 +7842,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let clock = ContinuousClock()
             let deadline = clock.now.advanced(by: timeout)
             while clock.now < deadline {
-                if await condition() { return true }
+                if await condition() {
+                    return true
+                }
                 await Task.yield()
             }
             return await condition()
@@ -7983,28 +7973,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             }
         }
 
-        @MainActor
-        private func waitUntilRootFolderVisible(
-            manager: WorkspaceFilesViewModel,
-            timeout: TimeInterval = 5,
-            file: StaticString = #filePath,
-            line: UInt = #line
-        ) async throws {
-            let deadline = Date().addingTimeInterval(timeout)
-            while Date() < deadline {
-                if !manager.rootFolders.isEmpty {
-                    return
-                }
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            XCTFail("Timed out waiting for partial root UI append", file: file, line: line)
-        }
-
-        private func readWorkspaceFilesViewModelSource() throws -> String {
-            let root = try RepoRoot.url()
-            let url = root.appendingPathComponent("Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift")
-            return try String(contentsOf: url, encoding: .utf8)
-        }
     #endif
 
     func testValidatedReadAndSearchSnapshotsPublishExactPreEditSourceAndFenceFileIdentity() async throws {
@@ -8033,7 +8001,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             var events: [WorkspaceAppliedIndexBatchEvent] = []
             for await event in stream where !event.modifiedFileIDs.isEmpty {
                 events.append(event)
-                if events.count == 3 { return events }
+                if events.count == 3 {
+                    return events
+                }
             }
             return events
         }
@@ -8112,7 +8082,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         let file = try XCTUnwrap(manager.findFileByFullPath(fullPath))
-        if let id { XCTAssertEqual(file.id, id) }
+        if let id {
+            XCTAssertEqual(file.id, id)
+        }
         return file
     }
 
@@ -8125,7 +8097,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         let folder = try XCTUnwrap(manager.findFolderByFullPath(fullPath))
-        if let id { XCTAssertEqual(folder.id, id) }
+        if let id {
+            XCTAssertEqual(folder.id, id)
+        }
         return folder
     }
 

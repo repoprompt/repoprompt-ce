@@ -461,7 +461,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let lookupFailure = CoordinatorFailOnce()
         let lookupClient = CodeMapArtifactStoreClient(
             lookup: { key in
-                if await lookupFailure.take() { throw CoordinatorTestError.transient }
+                if await lookupFailure.take() {
+                    throw CoordinatorTestError.transient
+                }
                 return try await fixture.artifactStore.lookup(key: key)
             },
             insert: { try await fixture.artifactStore.insert(key: $0, deterministicOutcome: $1) },
@@ -480,7 +482,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let buildInput = try makeInput("retry-build", root: fixture.root)
         let buildFailure = CoordinatorFailOnce()
         let buildCoordinator = makeCoordinator(fixture: fixture) { _, _, _ in
-            if await buildFailure.take() { throw CoordinatorTestError.transient }
+            if await buildFailure.take() {
+                throw CoordinatorTestError.transient
+            }
             return .readyNoSymbols
         }
         await assertTransientFailure { try await buildCoordinator.resolve(request(buildInput)) }
@@ -492,7 +496,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let persistClient = CodeMapArtifactStoreClient(
             lookup: { try await fixture.artifactStore.lookup(key: $0) },
             insert: { key, outcome in
-                if await persistFailure.take() { throw CoordinatorTestError.transient }
+                if await persistFailure.take() {
+                    throw CoordinatorTestError.transient
+                }
                 return try await fixture.artifactStore.insert(key: key, deterministicOutcome: outcome)
             },
             lease: { try await fixture.artifactStore.lease(handle: $0) },
@@ -923,7 +929,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             policy: policy(maximumConcurrentBuildCount: 1, maximumQueuedBuildCount: 4)
         ) { input, _, _ in
             await order.record(input.artifactKey.storageDigestHex)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let ownerA = UUID()
@@ -964,7 +972,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             clock: clock.clock
         ) { input, _, _ in
             await order.record(input.artifactKey.storageDigestHex)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let owner = UUID()
@@ -1014,7 +1024,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             clock: clock.clock
         ) { input, ownerID, priority in
             await builds.record(key: input.artifactKey, ownerID: ownerID, priority: priority)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let backgroundOwner = UUID()
@@ -1062,7 +1074,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             policy: policy(maximumConcurrentBuildCount: 1, maximumQueuedBuildCount: 2)
         ) { input, ownerID, priority in
             await builds.record(key: input.artifactKey, ownerID: ownerID, priority: priority)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let backgroundOwner = UUID()
@@ -1123,7 +1137,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             clock: clock.clock
         ) { input, _, _ in
             await order.record(input.artifactKey.storageDigestHex)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let owner = UUID()
@@ -1189,7 +1205,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             clock: clock.clock
         ) { input, _, _ in
             await order.record(input.artifactKey.storageDigestHex)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let repeatedOwner = UUID()
@@ -1240,7 +1258,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             clock: testClock.clock
         ) { input, _, _ in
             await order.record(input.artifactKey.storageDigestHex)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let repeatedOwner = UUID()
@@ -1288,7 +1308,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             )
         ) { input, _, _ in
             await order.record(input.artifactKey.storageDigestHex)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let blockerTask = Task { try await coordinator.resolve(request(blocker, priority: .explicit)) }
@@ -1332,7 +1354,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             policy: policy(maximumConcurrentBuildCount: 1, maximumQueuedBuildCount: 2)
         ) { input, _, _ in
             await order.record(input.artifactKey.storageDigestHex)
-            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            if input.artifactKey == blocker.artifactKey {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
         let repeatedOwner = UUID()
@@ -1379,7 +1403,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
                 maximumRetainedInputByteCount: firstInput.source.rawByteCount
             )
         ) { _, _, _ in
-            if await blockFirstBuild.take() { await gate.enter() }
+            if await blockFirstBuild.take() {
+                await gate.enter()
+            }
             return .readyNoSymbols
         }
 
@@ -1493,7 +1519,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
                 maximumRetainedInputByteCount: budget
             )
         ) { _, _, _ in
-            if await failure.take() { throw CoordinatorTestError.transient }
+            if await failure.take() {
+                throw CoordinatorTestError.transient
+            }
             return .readyNoSymbols
         }
         await assertTransientFailure {
@@ -1572,7 +1600,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             ),
             hooks: CodeMapArtifactBuildCoordinatorHooks { event in
                 await events.append(event)
-                if event.kind == .flightCreated { await consumerGate.enter() }
+                if event.kind == .flightCreated {
+                    await consumerGate.enter()
+                }
             }
         )
 
@@ -1619,7 +1649,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let failure = CoordinatorFailOnce()
         let locatorClient = GitBlobCodeMapLocatorStoreClient(
             read: { identity in
-                if await failure.take() { throw CoordinatorTestError.transient }
+                if await failure.take() {
+                    throw CoordinatorTestError.transient
+                }
                 return try await fixture.locatorStore.read(identity: identity)
             },
             write: { try await fixture.locatorStore.write(association: $0) }
@@ -2029,16 +2061,6 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         )
     }
 
-    private func gitBlobOID(_ bytes: Data, format: GitObjectFormat) -> String {
-        var canonical = Data("blob \(bytes.count)\0".utf8)
-        canonical.append(bytes)
-        let digest = switch format {
-        case .sha1: Data(Insecure.SHA1.hash(data: canonical))
-        case .sha256: Data(SHA256.hash(data: canonical))
-        }
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
     private func writeUncheckedLocatorRecord(
         identity: GitBlobCodeMapLocatorIdentity,
         key: CodeMapArtifactKey,
@@ -2150,12 +2172,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
-        for _ in 0 ..< 10000 {
-            if await predicate() { return }
-            await Task.yield()
+        do {
+            try await AsyncTestWait.waitUntil("CodeMap artifact coordinator condition", condition: predicate)
+        } catch {
+            XCTFail("condition was not reached: \(error)", file: file, line: line)
+            throw error
         }
-        XCTFail("condition was not reached", file: file, line: line)
-        throw CoordinatorTestError.transient
     }
 
     private func makeSecureRoot() throws -> URL {

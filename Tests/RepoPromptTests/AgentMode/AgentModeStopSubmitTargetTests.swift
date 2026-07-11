@@ -317,12 +317,11 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         timeout: TimeInterval = 2,
         _ predicate: @escaping () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if predicate() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for asynchronous Codex submission")
+        try await AsyncTestWait.waitUntil(
+            "asynchronous Codex submission",
+            timeout: timeout,
+            condition: predicate
+        )
     }
 
     func testGuardedFirstSendRejectsReusedSourceTargetBeforeCreatingAnotherDestination() async throws {

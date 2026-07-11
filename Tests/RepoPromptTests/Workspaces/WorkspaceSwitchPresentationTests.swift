@@ -167,20 +167,6 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
             sharedMCPService: MCPService()
         )
     }
-
-    private func waitUntil(
-        timeout: TimeInterval = 3,
-        file: StaticString = #filePath,
-        line: UInt = #line,
-        _ condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
-    }
 }
 
 @MainActor

@@ -1085,8 +1085,8 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             await executionCancelled.waitUntilArrived()
             await executionTask.value
             await fulfillment(of: [providerDisposeFinished], timeout: 1)
-            for _ in 0 ..< 100 where record.teardownFinishedAt == nil {
-                await Task.yield()
+            try await AsyncTestWait.waitUntil("stale Context Builder run teardown to finish") {
+                await MainActor.run { record.teardownFinishedAt != nil }
             }
 
             let disposeCallCount = await provider.disposeCallCount()
@@ -1574,13 +1574,14 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
     }
 
     private func waitForRoutingWaiter(runID: UUID) async -> Bool {
-        for _ in 0 ..< 1000 {
-            if await MCPRoutingWaiter.debugContinuationCount(runID: runID) == 1 {
-                return true
+        do {
+            try await AsyncTestWait.waitUntil("MCP routing waiter registration", timeout: 2) {
+                await MCPRoutingWaiter.debugContinuationCount(runID: runID) == 1
             }
-            await Task.yield()
+            return true
+        } catch {
+            return false
         }
-        return false
     }
 
     #if DEBUG
@@ -1625,7 +1626,9 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             var data = Data()
             while data.count < 32 {
                 guard let byte = try stdout.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else { break }
-                if byte == Data([0x0A]) { break }
+                if byte == Data([0x0A]) {
+                    break
+                }
                 data.append(byte)
             }
             guard let text = String(data: data, encoding: .utf8),

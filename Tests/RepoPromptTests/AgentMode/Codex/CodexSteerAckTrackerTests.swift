@@ -472,29 +472,18 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         }
     }
 
-    private func assertSteeringRequested(
-        _ disposition: AgentRunSessionStore.WaitDisposition,
-        sessionID: UUID,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        guard case let .noteworthySnapshot(snapshot, reason) = disposition else {
-            return XCTFail("Expected steering wake, got \(disposition)", file: file, line: line)
-        }
-        XCTAssertEqual(reason, .steeringRequested, file: file, line: line)
-        XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
-    }
-
     private func waitUntil(
         timeout: TimeInterval = 5,
         _ condition: @escaping @MainActor () async -> Bool
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("Codex steer acknowledgement condition", timeout: timeout) {
+                await condition()
+            }
+            return true
+        } catch {
+            return false
         }
-        return await condition()
     }
 
     func testSerialDispatchGatePreservesIssuedOrderAcrossSuspension() async {
@@ -631,8 +620,6 @@ private final class AckTrackerCodexController: CodexSessionControlling {
 }
 
 private actor AckTrackerSteerGate {
-    private static let waitPollLimit = 5000
-
     private var started = false
     private var completed = false
     private var releaseContinuation: CheckedContinuation<Void, Never>?
@@ -646,11 +633,12 @@ private actor AckTrackerSteerGate {
     }
 
     func waitUntilStarted() async -> Bool {
-        for _ in 0 ..< Self.waitPollLimit {
-            if started { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("ack tracker steer gate start", timeout: 5) { await self.started }
+            return true
+        } catch {
+            return false
         }
-        return started
     }
 
     func release() {
@@ -659,10 +647,11 @@ private actor AckTrackerSteerGate {
     }
 
     func waitUntilCompleted() async -> Bool {
-        for _ in 0 ..< Self.waitPollLimit {
-            if completed { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("ack tracker steer gate completion", timeout: 5) { await self.completed }
+            return true
+        } catch {
+            return false
         }
-        return completed
     }
 }

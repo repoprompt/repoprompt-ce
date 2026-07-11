@@ -361,12 +361,14 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         promptText: String,
         in coordinator: AgentSelectedFilesModelCoordinator
     ) async -> Bool {
-        for _ in 0 ..< 500 {
-            if coordinator.model?.source.promptText == promptText, !coordinator.isLoading { return true }
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("selected-files model \(promptText)") {
+                coordinator.model?.source.promptText == promptText && !coordinator.isLoading
+            }
+            return true
+        } catch {
+            return coordinator.model?.source.promptText == promptText && !coordinator.isLoading
         }
-        return coordinator.model?.source.promptText == promptText && !coordinator.isLoading
     }
 
     @MainActor
@@ -374,12 +376,14 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         promptText: String,
         in coordinator: AgentSelectedFilesModelCoordinator
     ) async -> Bool {
-        for _ in 0 ..< 500 {
-            if coordinator.model?.source.promptText == promptText { return true }
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("displayed selected-files model \(promptText)") {
+                coordinator.model?.source.promptText == promptText
+            }
+            return true
+        } catch {
+            return coordinator.model?.source.promptText == promptText
         }
-        return coordinator.model?.source.promptText == promptText
     }
 
     private func makeRequest(
@@ -445,11 +449,14 @@ private actor GatedModelResolver {
     }
 
     func waitUntilStartCount(_ key: String, count: Int) async -> Bool {
-        for _ in 0 ..< 500 {
-            if startedCounts[key, default: 0] >= count { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("\(count) gated model resolver starts for \(key)") {
+                await self.startCount(for: key) >= count
+            }
+            return true
+        } catch {
+            return startedCounts[key, default: 0] >= count
         }
-        return startedCounts[key, default: 0] >= count
     }
 
     func releaseNext(_ key: String) {
@@ -461,6 +468,10 @@ private actor GatedModelResolver {
 
     func startCount() -> Int {
         starts
+    }
+
+    private func startCount(for key: String) -> Int {
+        startedCounts[key, default: 0]
     }
 }
 
@@ -483,11 +494,14 @@ private actor ProgressiveCodemapModelResolver {
 
     func waitUntilStartCount(_ usage: CodeMapUsage, count: Int) async -> Bool {
         let key = usage.rawValue
-        for _ in 0 ..< 500 {
-            if startedCounts[key, default: 0] >= count { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("\(count) progressive codemap resolver starts for \(key)") {
+                await self.startCount(for: key) >= count
+            }
+            return true
+        } catch {
+            return startedCounts[key, default: 0] >= count
         }
-        return startedCounts[key, default: 0] >= count
     }
 
     func releaseNext(_ usage: CodeMapUsage) {
@@ -500,6 +514,10 @@ private actor ProgressiveCodemapModelResolver {
 
     func startedUsages() -> [CodeMapUsage] {
         usages
+    }
+
+    private func startCount(for key: String) -> Int {
+        startedCounts[key, default: 0]
     }
 }
 

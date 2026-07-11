@@ -34,7 +34,11 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             XCTAssertEqual(activeWorkspace.id, workspace.id)
 
-            try await waitForDisplayedTitle(window, and: nsWindow, endingWith: workspaceName)
+            try await waitForDisplayedTitle(
+                window,
+                and: nsWindow,
+                expectedDescription: "suffix \"\(workspaceName)\""
+            ) { $0.hasSuffix(workspaceName) }
         } catch {
             await cleanup(window: window, rootURL: rootURL)
             throw error
@@ -75,8 +79,10 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
             try await waitForDisplayedTitle(
                 window,
                 and: nsWindow,
-                equalTo: "Renamed Agent Session — \(workspaceName)"
-            )
+                expectedDescription: "\"Renamed Agent Session — \(workspaceName)\""
+            ) {
+                $0 == "Renamed Agent Session — \(workspaceName)"
+            }
         } catch {
             await cleanup(window: window, rootURL: rootURL)
             throw error
@@ -101,46 +107,22 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
         try? FileManager.default.removeItem(at: rootURL)
     }
 
-    /// The displayed title is published from a deferred task, so poll briefly instead of
-    /// asserting immediately after the workspace switch returns. The title may carry an
-    /// Agent session prefix ("T1 — <workspace>"), so only the workspace suffix is asserted.
+    /// The displayed title is published from a deferred task, so wait for both title surfaces.
     private func waitForDisplayedTitle(
         _ window: WindowState,
         and nsWindow: NSWindow,
-        endingWith expectedSuffix: String,
-        timeout: TimeInterval = 5
+        expectedDescription: String,
+        matches: @escaping (String) -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if window.displayedWindowTitle.hasSuffix(expectedSuffix),
-               nsWindow.title.hasSuffix(expectedSuffix)
-            {
-                return
+        do {
+            try await AsyncTestWait.waitUntil("both displayed window titles to match \(expectedDescription)", timeout: 5) {
+                matches(window.displayedWindowTitle) && matches(nsWindow.title)
             }
-            try await Task.sleep(nanoseconds: 50_000_000)
+        } catch {
+            XCTFail(
+                "displayedWindowTitle was \"\(window.displayedWindowTitle)\" and NSWindow.title was \"\(nsWindow.title)\", expected \(expectedDescription)"
+            )
+            throw error
         }
-        XCTFail(
-            "displayedWindowTitle was \"\(window.displayedWindowTitle)\" and NSWindow.title was \"\(nsWindow.title)\", expected suffix \"\(expectedSuffix)\""
-        )
-    }
-
-    private func waitForDisplayedTitle(
-        _ window: WindowState,
-        and nsWindow: NSWindow,
-        equalTo expected: String,
-        timeout: TimeInterval = 5
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if window.displayedWindowTitle == expected,
-               nsWindow.title == expected
-            {
-                return
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        XCTFail(
-            "displayedWindowTitle was \"\(window.displayedWindowTitle)\" and NSWindow.title was \"\(nsWindow.title)\", expected \"\(expected)\""
-        )
     }
 }

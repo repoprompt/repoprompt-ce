@@ -196,7 +196,11 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let snapshot = try unwrapValue(snapshotValue)
         assertEqualValue(snapshot.entries.count, 2)
         assertTrueValue(snapshot.entries.allSatisfy {
-            if case .shadowed(.renamed) = $0.state { true } else { false }
+            if case .shadowed(.renamed) = $0.state {
+                true
+            } else {
+                false
+            }
         })
         let graphValue = await fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
         try assertTrueValue(unwrapValue(graphValue).bindings.isEmpty)
@@ -3097,19 +3101,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
     }
 
-    private func eventually(
-        timeoutNanoseconds: UInt64 = 2_000_000_000,
-        condition: @escaping @Sendable () async -> Bool
-    ) async throws {
-        let start = ContinuousClock.now
-        while await !condition() {
-            if ContinuousClock.now - start > .nanoseconds(Int64(timeoutNanoseconds)) {
-                throw TestError.timeout
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-    }
-
     private func uuid(_ value: String) -> UUID {
         UUID(uuidString: value)!
     }
@@ -3202,5 +3193,4 @@ private enum TestError: Error {
     case artifactMissing
     case artifactOutcomeMismatch
     case cleanSourceExpected
-    case timeout
 }

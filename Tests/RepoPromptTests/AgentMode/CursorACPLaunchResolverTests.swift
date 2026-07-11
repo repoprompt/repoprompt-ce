@@ -809,12 +809,14 @@ final class CursorACPLaunchResolverTests: XCTestCase {
     }
 
     private func waitUntilFileExists(_ url: URL, timeout: TimeInterval = 2) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        repeat {
-            if FileManager.default.fileExists(atPath: url.path) { return true }
-            await Task.yield()
-        } while Date() < deadline
-        return false
+        do {
+            try await AsyncTestWait.waitUntil("Cursor launch marker file", timeout: timeout) {
+                FileManager.default.fileExists(atPath: url.path)
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 }
 

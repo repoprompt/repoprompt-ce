@@ -79,7 +79,7 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         try await waitUntil { provider.callCount == 2 }
         helper.clickSuggestionForTesting(at: 1)
         provider.completeRefresh()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitUntil { helper.suggestionsForTesting == [refreshed] }
 
         let handled = helper.handleCommandIfNeeded(
             textView: textView,
@@ -94,11 +94,9 @@ final class TextFieldMentionHelpersTests: XCTestCase {
     private func waitUntil(
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
-        for _ in 0 ..< 100 {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition")
+        try await AsyncTestWait.waitUntil(
+            "text-field mention condition"
+        ) { await MainActor.run { condition() } }
     }
 }
 
