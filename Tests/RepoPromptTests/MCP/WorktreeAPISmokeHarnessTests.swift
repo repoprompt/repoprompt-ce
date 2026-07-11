@@ -901,7 +901,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let workspace = window.workspaceManager.createWorkspace(
             name: "Worktree API Smoke \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
-            ephemeral: false
+            ephemeral: true
         )
         await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "worktreeAPISmokeHarness")
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)

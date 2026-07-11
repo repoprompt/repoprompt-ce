@@ -1460,7 +1460,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let workspace = window.workspaceManager.createWorkspace(
             name: "Code Structure Worktree \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
-            ephemeral: false
+            ephemeral: true
         )
         await window.workspaceManager.switchWorkspace(
             to: workspace,

@@ -81,6 +81,8 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         workspace.isEphemeral = true
         let session = ChatSession(name: "Unsaved", messages: [])
 
+        let existingSessions = try? await ChatDataService().listChatSessions(for: workspace)
+        XCTAssertEqual(existingSessions, [])
         await XCTAssertThrowsErrorAsync {
             try await ChatDataService().saveChatSession(session, for: workspace)
         } errorHandler: { error in
@@ -90,7 +92,7 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testEphemeralAgentSessionLookupFailsBeforeCreatingSidecars() async {
+    func testEphemeralAgentSessionLookupFailsBeforeCreatingSidecars() async throws {
         let storageRoot = temporaryStorageRoot()
         defer { try? FileManager.default.removeItem(at: storageRoot) }
 
@@ -101,11 +103,10 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         )
         workspace.isEphemeral = true
 
-        await XCTAssertThrowsErrorAsync {
-            try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
-        } errorHandler: { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        let sessions = try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
+        XCTAssertEqual(sessions, [])
+        let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: UUID(), for: workspace)
+        XCTAssertNil(loaded)
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 

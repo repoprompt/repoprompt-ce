@@ -1671,7 +1671,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 name: "Distinct MCP Connection \(label)",
                 repoPaths: [rootURL.path]
             )
-            configuredWorkspace.isEphemeral = false
+            configuredWorkspace.isEphemeral = true
             configuredWorkspace.composeTabs = [
                 ComposeTabState(id: tabID, name: "Distinct MCP Connection \(label)")
             ]

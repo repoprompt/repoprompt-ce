@@ -282,6 +282,7 @@ actor ChatDataService {
 
     /// Returns a list of "ChatSession-xxx.json" files in the workspace’s Chats folder, sorted by mod date desc.
     func listChatSessions(for workspace: WorkspaceModel) async throws -> [URL] {
+        guard workspace.persistenceDisposition == .persistent else { return [] }
         let chatsFolder = try ensureChatsFolder(for: workspace)
 
         let contents = try FileManager.default.contentsOfDirectory(
