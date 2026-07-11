@@ -2734,7 +2734,8 @@ struct AgentModeChatDetailView: View {
             promptManager: promptManager,
             handoffConfig: runInteractionSnapshot.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
-            rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation.rawToolResultPayloadRenderRevision,
+            rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation
+                .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
             showRunScopedToolCancel: showCancel,
             cancelActiveToolsAction: cancelAction,
             codexManagedLoginAction: codexManagedLoginAction

@@ -1,6 +1,6 @@
 import Combine
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -46,6 +46,33 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         XCTAssertLessThan(storeEmissions, 5, "cross-window re-sync must not feedback-loop into store writes")
         XCTAssertEqual(windowA.planningModelName, "sonnet")
         XCTAssertEqual(windowB.planningModelName, "sonnet")
+    }
+
+    func testContextBuilderPickerExplicitCommitPersistsDisplayedRuntimeFallback() async throws {
+        let previousCodexConnected = UserDefaults.standard.object(forKey: "CodexCLIConnected")
+        defer {
+            if let previousCodexConnected {
+                UserDefaults.standard.set(previousCodexConnected, forKey: "CodexCLIConnected")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "CodexCLIConnected")
+            }
+        }
+        UserDefaults.standard.set(true, forKey: "CodexCLIConnected")
+
+        let store = try makeIsolatedStore()
+        let prompt = makePromptViewModel(windowID: 1, store: store)
+        prompt.apiSettingsViewModel?.test_completeContextBuilderProviderValidation(
+            verifiedProviders: [.codexExec]
+        )
+        await drainMainQueue()
+
+        prompt.contextBuilderAgent = .codexExec
+        prompt.selectContextBuilderAgentModel(rawModel: AgentModel.gpt55CodexLow.rawValue)
+        prompt.commitContextBuilderSettings()
+
+        let persisted = store.persistedGlobalContextBuilderAgentSelection()
+        XCTAssertEqual(persisted.agentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(persisted.modelRaw, AgentModel.gpt55CodexLow.rawValue)
     }
 
     // NOTE: Context Builder agent propagation is exercised compositionally — the store-side

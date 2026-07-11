@@ -208,7 +208,8 @@ struct AgentExploreMCPToolService {
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: nil,
             defaultTaskLabel: .explore,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
         )
         return ExploreStartContext(
             metadata: metadata,

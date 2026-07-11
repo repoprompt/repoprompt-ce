@@ -219,7 +219,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Used to suppress automatic follow-up generation even if the run exits as completed.
         var didUserCancelActiveContextBuilderRun: Bool = false
         @Published var runHistory: [AgentRun]
-        /// Agent/model selection moved to workspace-scoped settings (not tab-specific)
+        /// Agent/model selection is global and shared across workspaces and tabs.
         @Published var contextBuilderInstructions: String
         /// Selected context builder prompt IDs for this tab
         @Published var selectedContextBuilderPromptIDs: Set<UUID> = []
@@ -464,6 +464,23 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         func isRunTeardownPendingForTesting(runID: UUID) -> Bool {
             runRegistry.record(runID: runID)?.isTeardownPending == true
         }
+
+        func replaceSessionForTesting(tabID: UUID) {
+            sessions[tabID] = TabSession(tabID: tabID)
+        }
+
+        func retireStaleRunRecordForTesting(
+            _ record: ContextBuilderRunRecord,
+            waiterResolution: ContextBuilderRunWaiterResolution = .snapshot,
+            cancelExecution: Bool = true
+        ) {
+            retireContextBuilderRunRecordWithoutPublishing(
+                record,
+                waiterResolution: waiterResolution,
+                cancelExecution: cancelExecution,
+                source: "contextBuilder.testing.staleRetirement"
+            )
+        }
     #endif
 
     // MARK: - Published session-scoped proxies
@@ -490,7 +507,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 isRestoringState = false
             }
             updateDynamicModelPolling()
-            persistAgentModelGlobally()
+            persistAgentModelToEffectiveProfile()
             if let session = activeSession {
                 persistSessionConfig(session)
             }
@@ -514,7 +531,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 selectedModel = resolvedKnownModel
                 isRestoringState = false
             }
-            persistAgentModelGlobally()
+            persistAgentModelToEffectiveProfile()
             if let session = activeSession {
                 persistSessionConfig(session)
             }
@@ -538,7 +555,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 selectedModelRaw = raw
                 isRestoringState = false
             } else {
-                persistAgentModelGlobally()
+                persistAgentModelToEffectiveProfile()
                 if let session = activeSession {
                     persistSessionConfig(session)
                 }
@@ -904,7 +921,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     // Note: ContextBuilderAgentViewModel uses GlobalSettingsStore directly (no overlay),
                     // so no need to discard - just re-apply from workspace
                 }
-                applyGlobalAgentModel()
+                applyEffectiveAgentModel()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.handleAgentModelsSettingsDidChange(notification)
             }
             .store(in: &cancellables)
 
@@ -917,7 +941,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             .sink { [weak self] _ in
                 guard let self else { return }
                 guard !isRestoringState else { return }
-                applyGlobalAgentModel()
+                applyEffectiveAgentModel()
             }
             .store(in: &cancellables)
 
@@ -986,19 +1010,32 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
     }
 
-    private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {
+    private func resolvedPersistedContextBuilderSelection(workspaceID: UUID? = nil) -> AgentModelCatalog.NormalizedAgentSelection? {
         guard let apiSettingsViewModel = promptManager.apiSettingsViewModel,
               apiSettingsViewModel.isContextBuilderProviderValidationComplete
         else {
             return nil
         }
-        let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
+        let profile = settingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID ?? currentWorkspaceID)
+        let agentRaw = profile.contextBuilderAgentRaw
+        let modelRaw = agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
         return AutoRecommendationEngine.resolveContextBuilderSelection(
-            persistedAgentRaw: persisted.agentRaw,
-            persistedModelRaw: persisted.modelRaw,
+            persistedAgentRaw: agentRaw,
+            persistedModelRaw: modelRaw,
             availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
             enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
+    }
+
+    private func handleAgentModelsSettingsDidChange(_ notification: Notification) {
+        let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+        let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+        if scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+           workspaceID != currentWorkspaceID
+        {
+            return
+        }
+        applyEffectiveAgentModel()
     }
 
     private func refreshAvailableAgents() {
@@ -1168,7 +1205,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         selectedModelRaw = preferredModelRaw
         selectedModel = AgentModel.resolvedModel(forRaw: preferredModelRaw, agentKind: agent) ?? .defaultModel
         isRestoringState = false
-        persistAgentModelGlobally()
+        persistAgentModelToEffectiveProfile()
         if let session = activeSession {
             persistSessionConfig(session)
         }
@@ -1182,7 +1219,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         lastProcessedTabID = id
         guard let id else {
             clearBindings()
-            applyGlobalAgentModel()
+            applyEffectiveAgentModel()
             applyWorkspaceDiscoverySettings(from: workspaceManager?.activeWorkspace)
             return
         }
@@ -1196,7 +1233,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     func refreshActiveSessionBindings() {
         guard let tabID = currentTabID else {
             clearBindings()
-            applyGlobalAgentModel()
+            applyEffectiveAgentModel()
             applyWorkspaceDiscoverySettings(from: workspaceManager?.activeWorkspace)
             return
         }
@@ -1226,9 +1263,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // Load tab-specific context builder prompt IDs
         session.selectedContextBuilderPromptIDs = Set(tabState.contextBuilder.selectedContextBuilderPromptIDs)
 
-        // Agent/model selection: always from GLOBAL settings (not workspace, not tab)
-        // This ensures consistent behavior across all workspaces and tabs
-        let normalizedAgentSelection = resolvedPersistedContextBuilderSelection()
+        // Agent/model selection comes from the effective Agent Models profile (global or workspace override).
+        let normalizedAgentSelection = resolvedPersistedContextBuilderSelection(
+            workspaceID: manager.activeWorkspace?.id ?? currentWorkspaceID
+        )
 
         // Load workspace-scoped settings (tokenBudget, enhancementMode, etc.).
         // Reading settings for a workspace ID seeds-and-saves defaults for unseen IDs,
@@ -1277,7 +1315,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // Plan token budget: workspace setting only, defaults to 120k
         planTokenBudget = workspaceSettings?.discoveryPlanTokenBudget ?? 120_000
 
-        // Apply agent/model from global settings when a configured provider is currently available.
+        // Apply agent/model from the effective Agent Models profile when a configured provider is currently available.
         if let normalizedAgentSelection {
             selectedAgent = normalizedAgentSelection.agent
             selectedModelRaw = normalizedAgentSelection.modelRaw
@@ -1310,7 +1348,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         autoGeneratePlan = session.autoGeneratePlan
         // Per-tab selected follow-up type
         selectedFollowUpType = session.selectedFollowUpType
-        // Agent/model/tokenBudget/enhancementMode are workspace-scoped, not tab-scoped
+        // Agent/model are global; token budget and enhancement mode are workspace-scoped.
         contextBuilderInstructions = session.contextBuilderInstructions
         selectedContextBuilderPromptIDs = session.selectedContextBuilderPromptIDs
         isRestoringState = false
@@ -1427,7 +1465,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         guard let workspace else { return }
         // Apply workspace defaults after clearing bindings (will be overridden by tab-specific settings when tab loads)
-        applyGlobalAgentModel()
+        applyEffectiveAgentModel()
         applyWorkspaceDiscoverySettings(from: workspace)
         // Manually trigger tab reload since $activeComposeTabID uses .removeDuplicates()
         // and won't emit if the tab ID hasn't changed. Since we just set lastProcessedTabID = nil,
@@ -1460,8 +1498,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 session.followUpOracleSessionID = nil
             }
 
-            // 3. Logically cancel the active run without waiting for teardown.
-            if let record = runRegistry.activeRecord(tabID: tabID) {
+            // 3. Logically cancel every registered run for the tab without waiting for teardown.
+            // A superseded record may no longer own the active slot but still owns a provider,
+            // execution task, waiter, and launch-config lease that tab close must retire.
+            for record in runRegistry.records(tabID: tabID) where !record.isTerminal {
                 debugLog("handleComposeTabsWillClose: cancelling run \(record.runID) for tab \(tabID)")
                 cancelRun(
                     record,
@@ -1478,13 +1518,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
-    /// Load agent/model defaults from workspace settings.
+    /// Load agent/model defaults from the effective Agent Models profile.
     /// Used during workspace switch to initialize defaults before tab-specific settings are loaded.
-    /// Apply global Context Builder agent/model selection.
-    /// Used during workspace switch to initialize agent/model from global settings.
-    private func applyGlobalAgentModel() {
-        // Agent/model are now GLOBAL (not workspace-scoped)
-        guard let normalized = resolvedPersistedContextBuilderSelection() else {
+    private func applyEffectiveAgentModel(workspaceID: UUID? = nil) {
+        guard let normalized = resolvedPersistedContextBuilderSelection(workspaceID: workspaceID) else {
             refreshAvailableAgents()
             return
         }
@@ -1522,24 +1559,39 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         isRestoringState = false
     }
 
-    /// Update GLOBAL agent/model selection.
-    /// Agent/model are now global (shared across all workspaces), not workspace-scoped.
-    private func persistAgentModelGlobally() {
+    /// Update the effective Agent Models profile's Context Builder selection.
+    private func persistAgentModelToEffectiveProfile() {
         guard !isRestoringState else { return }
 
-        // Update global settings (single source of truth)
-        settingsManager.setGlobalContextBuilderAgentSelection(
-            agentRaw: selectedAgent.rawValue,
-            modelRaw: selectedModelRaw,
-            markUserDefined: true
-        )
+        var profile = settingsManager.effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+        profile.contextBuilderAgentRaw = selectedAgent.rawValue
+        profile = profile.replacingContextBuilderModel(selectedModelRaw, for: selectedAgent.rawValue)
 
-        // Notify recommendation system that inputs have changed
-        // This triggers wizard recompute without affecting PromptVM overlays
+        let wroteWorkspaceID: UUID? = if let workspaceID = currentWorkspaceID,
+                                         settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        {
+            workspaceID
+        } else {
+            nil
+        }
+        if let wroteWorkspaceID {
+            settingsManager.setWorkspaceAgentModelsProfile(workspaceID: wroteWorkspaceID, profile: profile)
+        } else {
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: .userInitiated
+            )
+        }
+
+        // Notify recommendation system that inputs have changed.
+        var userInfo: [String: Any] = ["reason": "discoverAgentChanged"]
+        if let wroteWorkspaceID {
+            userInfo["workspaceID"] = wroteWorkspaceID
+        }
         NotificationCenter.default.post(
             name: .recommendationsShouldRefresh,
             object: nil,
-            userInfo: ["reason": "discoverAgentChanged"]
+            userInfo: userInfo
         )
     }
 
@@ -1619,8 +1671,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
               let manager = workspaceManager,
               var tab = manager.composeTab(with: session.tabID) else { return }
 
-        // Persist tab-specific settings only (not agent/model which are workspace-scoped)
-        // Agent/model and token settings are intentionally not persisted per tab.
+        // Persist tab-specific settings only. Agent/model are global, while token settings
+        // are workspace-scoped; neither belongs in the tab configuration.
         tab.contextBuilder = ContextBuilderTabConfig(
             instructions: session.contextBuilderInstructions,
             autoGeneratePlan: session.autoGeneratePlan,
@@ -1939,9 +1991,20 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         saveHistory: Bool,
         source: String
     ) -> Bool {
-        guard acceptsEvents(from: record) else { return false }
+        guard acceptsEvents(from: record) else {
+            retireContextBuilderRunRecordWithoutPublishing(
+                record,
+                waiterResolution: waiterResolution,
+                cancelExecution: cancelExecution,
+                source: source
+            )
+            return false
+        }
         flushAssistantPreview(for: record)
-        guard record.claimTerminal(outcome) else { return false }
+        guard record.claimTerminal(outcome) else {
+            scheduleRunTeardown(record, cancelExecution: cancelExecution)
+            return false
+        }
 
         let session = record.session
         session.lastAgentOutput = record.output.fullOutput()
@@ -2018,6 +2081,47 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             continuation?.resume(throwing: CancellationError())
         }
         return true
+    }
+
+    /// Retires records that have lost active ownership before their terminal path runs.
+    ///
+    /// Superseded/stale records must not publish previews, mutate current tab state, or
+    /// restore run-start configuration over a newer run. They still own provider/process
+    /// resources, continuations, and possibly a registry record, so retirement must always
+    /// schedule teardown and resolve any waiter exactly once.
+    private func retireContextBuilderRunRecordWithoutPublishing(
+        _ record: ContextBuilderRunRecord,
+        waiterResolution: ContextBuilderRunWaiterResolution,
+        cancelExecution: Bool,
+        source: String
+    ) {
+        record.previewPublicationTask?.cancel()
+        record.previewPublicationTask = nil
+
+        let didClaimTerminal = record.claimTerminal(.cancelled)
+        record.session.endRunAttempt(ifCurrent: record.ownership, source: "\(source).staleRetirement")
+        if runRegistry.releaseActiveSlot(for: record) {
+            tabsWithActiveContextBuilderRun.remove(record.tabID)
+        }
+
+        let continuation = didClaimTerminal ? record.takeContinuation() : nil
+        let completion = MCPContextBuilderRunCompletion(
+            runID: record.runID,
+            tabID: record.tabID,
+            terminalDisposition: .cancelled,
+            agentOutput: record.output.fullOutput(),
+            usedAgentOutputAsPrompt: false,
+            committedTab: nil
+        )
+
+        scheduleRunTeardown(record, cancelExecution: cancelExecution)
+
+        switch waiterResolution {
+        case .snapshot:
+            continuation?.resume(returning: completion)
+        case .cancellationError:
+            continuation?.resume(throwing: CancellationError())
+        }
     }
 
     private func scheduleRunTeardown(
@@ -2319,6 +2423,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 )
                 guard !Task.isCancelled, acceptsEvents(from: record) else { return .cancelled }
                 debugLog("Routing result for run \(runID): routed=\(routed)")
+                if routed {
+                    record.finalContextConnectionIDForDiagnostics =
+                        mcpServer.contextBuilderFinalContextConnectionID(runID: runID)
+                }
 
                 if !routed, record.origin.isMCP {
                     let timeoutSeconds = TimeInterval(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000
@@ -2544,7 +2652,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         waiterResolution: ContextBuilderRunWaiterResolution,
         saveHistory: Bool
     ) {
-        guard acceptsEvents(from: record) else { return }
+        guard acceptsEvents(from: record) else {
+            retireContextBuilderRunRecordWithoutPublishing(
+                record,
+                waiterResolution: waiterResolution,
+                cancelExecution: true,
+                source: "contextBuilder.cancel.staleRetirement"
+            )
+            return
+        }
         guard record.canAcceptCancellation else {
             debugLog("Cancel ignored after final context commit claim for run \(record.runID)")
             return
@@ -2729,7 +2845,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 }
             #endif
             return MCPServerViewModel.ContextBuilderTabContextCommitResult(
-                outcome: .missingFinalContext(runID: runID, connectionID: nil),
+                outcome: .missingFinalContext(
+                    runID: runID,
+                    connectionID: record.finalContextConnectionIDForDiagnostics
+                ),
                 committedTab: nil
             )
         }
@@ -2783,7 +2902,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                         #endif
                         return result
                     },
-                    isAuthoritativePeerEOFDetached: {
+                    isAuthoritativeDetached: {
                         mcpServer.isDetachedContextBuilderConnection(
                             connectionID: cid,
                             runID: runID

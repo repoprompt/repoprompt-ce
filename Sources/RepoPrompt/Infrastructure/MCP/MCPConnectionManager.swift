@@ -150,6 +150,16 @@ private actor MCPConnectionStopRace {
     }
 }
 
+struct MCPResponseDeliverySnapshot: Equatable {
+    let pendingRequestCount: Int
+    let waiterCount: Int
+    let isTerminal: Bool
+
+    var acceptedRequestsFullyResponded: Bool {
+        pendingRequestCount == 0
+    }
+}
+
 protocol MCPServerConnection: Actor {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
@@ -161,6 +171,7 @@ protocol MCPServerConnection: Actor {
     func isViableForRetention() -> Bool
     func secondsSinceLastActivity() async -> TimeInterval
     func transportIngressSnapshot() async -> MCPTransportIngressSnapshot?
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot?
     func waitUntilResponseDeliveryDrained() async -> Bool
     /// Whether this is a legacy filesystem-backed connection (deprecated)
     nonisolated var isFilesystemBacked: Bool { get }
@@ -185,6 +196,10 @@ protocol MCPServerConnection: Actor {
 }
 
 extension MCPServerConnection {
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        nil
+    }
+
     func waitUntilResponseDeliveryDrained() async -> Bool {
         true
     }
@@ -5872,7 +5887,8 @@ actor ServerNetworkManager {
         assignedWindowID: Int?,
         contextBuilderRunID: UUID?,
         detachContextBuilderRunID: UUID?,
-        closeContext: MCPConnectionCloseContext
+        closeContext: MCPConnectionCloseContext,
+        responseDeliverySnapshot: MCPResponseDeliverySnapshot?
     ) async -> Bool {
         let windows = WindowStatesManager.shared.allWindows
         let targets: [WindowState]
@@ -5895,7 +5911,7 @@ actor ServerNetworkManager {
         var didDetachContextBuilderContext = false
         if let detachContextBuilderRunID {
             for state in targets {
-                didDetachContextBuilderContext = state.mcpServer.detachContextBuilderTabContextForPeerEOF(
+                didDetachContextBuilderContext = state.mcpServer.detachContextBuilderTabContextForDiscoveryTeardown(
                     connectionID: connectionID,
                     runID: detachContextBuilderRunID
                 ) || didDetachContextBuilderContext
@@ -5910,15 +5926,26 @@ actor ServerNetworkManager {
             )
         }
         if let contextBuilderRunID {
+            let isOrderlyPeerEOF = closeContext.reason == MCPTransportTerminalCause.peerEOF.rawValue
+                && closeContext.initiator == .peer
             for state in targets {
                 let wasDetached = state.mcpServer.isDetachedContextBuilderConnection(
                     connectionID: connectionID,
                     runID: contextBuilderRunID
                 )
+                let outcome: MCPServerViewModel.ContextBuilderTeardownPublicationOutcome = if wasDetached {
+                    if isOrderlyPeerEOF {
+                        .peerEOFDetached
+                    } else if responseDeliverySnapshot?.acceptedRequestsFullyResponded == true {
+                        .detachedAfterResponseDeliveryDrained(reason: closeContext.reason)
+                    } else {
+                        .detachedWithoutOrderlyPeerEOF(reason: closeContext.reason)
+                    }
+                } else {
+                    .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason)
+                }
                 state.mcpServer.contextBuilderTeardownPublicationCoordinator.publish(
-                    wasDetached
-                        ? .peerEOFDetached
-                        : .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason),
+                    outcome,
                     runID: contextBuilderRunID,
                     connectionID: connectionID
                 )
@@ -5985,17 +6012,15 @@ actor ServerNetworkManager {
         persistAcceptedSocketTerminalRecord(connectionID: id, context: context)
 
         // Capture run ownership before any suspension or connection-dictionary cleanup.
-        // Only orderly peer EOF from a discover-run child may transfer final context ownership.
+        // A discovery child can finish successfully and then disappear through several
+        // transport shapes (server terminate, write hangup/stall, read error, TTL, etc.).
+        // Preserve its final tab context for commit whenever the connection still has
+        // authoritative discover-run ownership; cancellation/staleness is enforced later
+        // by the commit path's isStillCurrent checks.
         let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
         let cleanupRunID = runIDByConnectionID[id]
-        let detachContextBuilderRunID: UUID? = if context.reason == MCPTransportTerminalCause.peerEOF.rawValue,
-                                                  context.initiator == .peer,
-                                                  cleanupRunPurpose == .discoverRun
-        {
-            cleanupRunID
-        } else {
-            nil
-        }
+        let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
+        let responseDeliverySnapshot = await connections[id]?.responseDeliverySnapshot()
 
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
@@ -6056,7 +6081,8 @@ actor ServerNetworkManager {
             assignedWindowID: assignedWindowID,
             contextBuilderRunID: cleanupRunPurpose == .discoverRun ? cleanupRunID : nil,
             detachContextBuilderRunID: detachContextBuilderRunID,
-            closeContext: context
+            closeContext: context,
+            responseDeliverySnapshot: responseDeliverySnapshot
         )
         #if DEBUG
             if cleanupRunPurpose == .discoverRun, let cleanupRunID {

@@ -184,9 +184,9 @@ final class AgentCodexModelRegistry {
     private func shouldBackfillRecommendedDefaults(_ options: [AgentModelOption]) -> Bool {
         let keys = Set(options.flatMap { codexEquivalenceKeys(for: $0.rawValue) })
         let requiredKeyGroups: [[String]] = [
-            ["gpt-5.5-low"],
-            ["gpt-5.5-medium"],
-            ["gpt-5.5-high"],
+            ["gpt-5.6-sol-low", "gpt-5.6-low"],
+            ["gpt-5.6-sol-medium", "gpt-5.6-medium"],
+            ["gpt-5.6-sol-high", "gpt-5.6-high"],
             ["gpt-5.3-codex"]
         ]
         return requiredKeyGroups.contains { group in
@@ -199,10 +199,26 @@ final class AgentCodexModelRegistry {
         guard !normalized.isEmpty else { return [] }
         var keys: Set<String> = [normalized]
         let specifier = CodexModelSpecifier(raw: normalized)
-        if specifier.baseModel?.lowercased() == "gpt-5.3-codex",
-           specifier.reasoningEffort == nil || specifier.reasoningEffort == .medium
-        {
-            keys.insert("gpt-5.3-codex")
+        if let base = specifier.baseModel?.lowercased() {
+            if base == "gpt-5.3-codex",
+               specifier.reasoningEffort == nil || specifier.reasoningEffort == .medium
+            {
+                keys.insert("gpt-5.3-codex")
+            }
+            if base == "gpt-5.6" || base == "gpt-5.6-sol" {
+                let canonicalBase = "gpt-5.6-sol"
+                if let effort = specifier.reasoningEffort {
+                    keys.insert("\(canonicalBase)-\(effort.rawValue)")
+                    keys.insert("gpt-5.6-\(effort.rawValue)")
+                } else {
+                    keys.insert(canonicalBase)
+                    keys.insert("gpt-5.6")
+                    for effort in [CodexReasoningEffort.low, .medium, .high] {
+                        keys.insert("\(canonicalBase)-\(effort.rawValue)")
+                        keys.insert("gpt-5.6-\(effort.rawValue)")
+                    }
+                }
+            }
         }
         return keys
     }

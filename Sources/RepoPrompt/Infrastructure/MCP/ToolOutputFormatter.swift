@@ -5505,6 +5505,96 @@ extension ToolOutputFormatter {
         return [.text(lines.joined(separator: "\n"))]
     }
 
+    private static func agentListGroupingEffort(modelID: String, reasoningEffort: String?) -> String? {
+        if let normalizedEffort = normalizedAgentListReasoningEffort(reasoningEffort) {
+            return normalizedEffort
+        }
+        return CodexModelSpecifier(raw: modelID).reasoningEffort?.rawValue
+    }
+
+    private static func normalizedAgentListReasoningEffort(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return CodexReasoningEffort.parse(trimmed)?.rawValue ?? trimmed.lowercased()
+    }
+
+    private static func agentListFamilyBase(modelID: String, groupingEffort: String?) -> String {
+        guard let groupingEffort,
+              let stripped = stripAgentListEffortSuffix(from: modelID, groupingEffort: groupingEffort)
+        else {
+            return modelID
+        }
+        return stripped
+    }
+
+    private static func stripAgentListEffortSuffix(from value: String, groupingEffort: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lowered = trimmed.lowercased()
+        for suffix in agentListEffortIDMarkers(for: groupingEffort) where lowered.hasSuffix(suffix) {
+            let stripped = String(trimmed.dropLast(suffix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return stripped.isEmpty ? nil : stripped
+        }
+        return nil
+    }
+
+    private static func agentListEffortIDMarkers(for groupingEffort: String) -> [String] {
+        let normalized = groupingEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return [] }
+        var markers = ["-\(normalized)"]
+        let hyphenated = normalized
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+        if hyphenated != normalized {
+            markers.append("-\(hyphenated)")
+        }
+        switch CodexReasoningEffort.parse(normalized) {
+        case .some(.xhigh):
+            markers.append("-x-high")
+        case .some(.max):
+            markers.append("-maximum")
+        case .some(.medium):
+            markers.append("-med")
+        default:
+            break
+        }
+        return Array(Set(markers))
+    }
+
+    private static func agentListFamilyDisplayName(
+        _ modelName: String,
+        modelID: String,
+        groupingEffort: String
+    ) -> String {
+        let fallback = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = trimmed.isEmpty ? fallback : trimmed
+        guard !candidate.isEmpty else { return modelName }
+        let lowered = candidate.lowercased()
+        for suffix in agentListEffortDisplayMarkers(for: groupingEffort) where lowered.hasSuffix(suffix) {
+            let stripped = String(candidate.dropLast(suffix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return stripped.isEmpty ? candidate : stripped
+        }
+        return candidate
+    }
+
+    private static func agentListEffortDisplayMarkers(for groupingEffort: String) -> [String] {
+        let normalized = groupingEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return [] }
+        let readableFallback = normalized
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+        var labels = [normalized, readableFallback]
+        if let parsed = CodexReasoningEffort.parse(normalized) {
+            labels.append(parsed.displayName)
+            if parsed == .xhigh {
+                labels.append("X-High")
+            }
+        }
+        return Array(Set(labels.map { " \($0.lowercased())" }))
+    }
+
     static func formatAgentManage(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
         guard let object = value.objectValue else {
             return formatGeneric(value: value)
@@ -5609,32 +5699,29 @@ extension ToolOutputFormatter {
                     let modelName = m["name"]?.stringValue ?? ""
                     let effort = m["reasoning_effort"]?.stringValue
 
-                    // Extract base: everything after "agentRaw:" minus the effort suffix
+                    // Extract base: everything after "agentRaw:" minus an explicit or supported effort suffix.
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
-                    let effortSuffixes = ["-low", "-medium", "-high", "-xhigh", "-none", "-minimal"]
-                    var base = afterColon
-                    for suffix in effortSuffixes where base.lowercased().hasSuffix(suffix) {
-                        base = String(base.dropLast(suffix.count))
-                        break
-                    }
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
+                    let groupingEffort = agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
+                    let base = agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
                     let familyKey = agentPrefix + base
 
-                    if let effort, seen.contains(familyKey) {
+                    if let groupingEffort, seen.contains(familyKey) {
                         // Add effort to existing family
-                        if let idx = families.firstIndex(where: { familyKey == "\(agentPrefix)\($0.base)" }) {
-                            families[idx].efforts.append(effort)
+                        if let idx = families.firstIndex(where: { familyKey == "\(agentPrefix)\($0.base)" }),
+                           !families[idx].efforts.contains(groupingEffort)
+                        {
+                            families[idx].efforts.append(groupingEffort)
                         }
-                    } else if effort != nil, !seen.contains(familyKey) {
+                    } else if let groupingEffort, !seen.contains(familyKey) {
                         // New family with efforts
                         seen.insert(familyKey)
-                        let baseName = modelName
-                            .replacingOccurrences(of: " Low", with: "")
-                            .replacingOccurrences(of: " Medium", with: "")
-                            .replacingOccurrences(of: " High", with: "")
-                            .replacingOccurrences(of: " XHigh", with: "")
-                            .trimmingCharacters(in: .whitespaces)
-                        families.append((base: base, name: baseName, efforts: [effort!]))
+                        let baseName = agentListFamilyDisplayName(
+                            modelName,
+                            modelID: afterColon,
+                            groupingEffort: groupingEffort
+                        )
+                        families.append((base: base, name: baseName, efforts: [groupingEffort]))
                     } else {
                         // Simple model (no effort variants)
                         families.append((base: base, name: modelName, efforts: []))

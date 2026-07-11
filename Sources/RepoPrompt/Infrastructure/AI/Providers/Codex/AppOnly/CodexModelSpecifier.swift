@@ -32,24 +32,31 @@ struct CodexModelSpecifier: Equatable {
             return (nil, nil, nil)
         }
 
-        // First strip any reasoning effort suffix
-        let suffixes: [(suffix: String, effort: ReasoningEffort)] = [
-            ("-xhigh", .xhigh),
-            ("-medium", .medium),
-            ("-minimal", .minimal),
-            ("-high", .high),
-            ("-none", .none),
-            ("-low", .low)
+        // First strip any reasoning effort suffix. Legacy efforts remain broadly decoded for
+        // stored selections such as `gpt-5.5-xhigh` and `gpt-5.1-codex-max-low`.
+        // Extended efforts are gated to known GPT-5.6 families so the legitimate base ID
+        // `gpt-5.1-codex-max` is not misread as `gpt-5.1-codex` + max effort.
+        let suffixes: [(suffix: String, effort: ReasoningEffort, requiresKnownFamilySupport: Bool)] = [
+            ("-xhigh", .xhigh, false),
+            ("-maximum", .max, true),
+            ("-ultra", .ultra, true),
+            ("-max", .max, true),
+            ("-medium", .medium, false),
+            ("-minimal", .minimal, false),
+            ("-high", .high, false),
+            ("-none", .none, false),
+            ("-low", .low, false)
         ]
         var base = raw
         var effort: ReasoningEffort? = nil
         let lowered = raw.lowercased()
-        for (suffix, e) in suffixes where lowered.hasSuffix(suffix) {
+        for (suffix, candidateEffort, requiresKnownFamilySupport) in suffixes where lowered.hasSuffix(suffix) {
             let candidate = String(raw.dropLast(suffix.count))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !candidate.isEmpty {
+            guard !candidate.isEmpty else { break }
+            if !requiresKnownFamilySupport || Self.supportsExtendedEffort(candidateEffort, forBaseCandidate: candidate) {
                 base = candidate
-                effort = e
+                effort = candidateEffort
             }
             break
         }
@@ -72,6 +79,37 @@ struct CodexModelSpecifier: Equatable {
         }
 
         return (base, effort, tier)
+    }
+
+    private static func supportsExtendedEffort(_ effort: ReasoningEffort, forBaseCandidate candidate: String) -> Bool {
+        let supportBase = serviceTierStrippedBase(candidate).lowercased()
+        let supported: Set<ReasoningEffort>
+        switch supportBase {
+        case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
+            supported = [.max, .ultra]
+        case "gpt-5.6-luna":
+            supported = [.max]
+        default:
+            return false
+        }
+        return supported.contains(effort)
+    }
+
+    private static func serviceTierStrippedBase(_ candidate: String) -> String {
+        var base = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseLowered = base.lowercased()
+        for knownTier in [CodexServiceTierVariantCatalog.fastServiceTier] {
+            let tierSuffix = "-\(knownTier)"
+            if baseLowered.hasSuffix(tierSuffix) {
+                let stripped = String(base.dropLast(tierSuffix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !stripped.isEmpty {
+                    base = stripped
+                    break
+                }
+            }
+        }
+        return base
     }
 
     var cliModelArgs: [String] {
