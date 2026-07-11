@@ -23,6 +23,25 @@ struct ContextUsageSnapshot: Codable, Equatable {
     var compactedAt: Date?
 }
 
+enum AgentContextWindowDenominator {
+    static func effectiveContextWindowTokens(
+        configured: Int?,
+        canonical: Int?,
+        fallback: Int
+    ) -> Int {
+        if let configured, let canonical {
+            return min(configured, canonical)
+        }
+        if let configured {
+            return configured
+        }
+        if let canonical {
+            return canonical
+        }
+        return fallback
+    }
+}
+
 extension ContextUsageSnapshot {
     static func fromAgentContextUsage(
         _ usage: AgentContextUsage?,
@@ -43,7 +62,11 @@ extension ContextUsageSnapshot {
     }
 }
 
-typealias ProviderTurnContextUsageBuilder = (_ turns: [AgentTokenUsagePersist], _ modelContextWindow: Int?) -> AgentContextUsage?
+typealias ProviderTurnContextUsageBuilder = (
+    _ turns: [AgentTokenUsagePersist],
+    _ modelContextWindow: Int?,
+    _ configuredContextWindow: Int?
+) -> AgentContextUsage?
 
 @MainActor
 protocol ContextUsageEstimating: AnyObject {

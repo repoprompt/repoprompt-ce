@@ -160,6 +160,18 @@ enum CodexIntegrationConfiguration {
         mcpServerEntries().map(\.normalizedName)
     }
 
+    static func rootTableIntegerValue(forKey key: String, in content: String) -> Int? {
+        let lines = splitTOMLLines(content)
+        let firstHeaderIndex = lines.firstIndex(where: isTOMLHeaderLine) ?? lines.endIndex
+        for line in lines[..<firstHeaderIndex] {
+            guard let assignment = parseTOMLAssignment(line), assignment.isSingleKey(key) else { continue }
+            if let value = parseTOMLIntegerValue(assignment.valueText) {
+                return value
+            }
+        }
+        return nil
+    }
+
     /// Installs the RepoPrompt MCP server into Codex CLI (`~/.codex/config.toml`).
     ///
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is

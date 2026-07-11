@@ -4,6 +4,14 @@ public struct ClaudeSDKNDJSONTranslator {
     public private(set) var cliSessionID: String?
     private var toolNameByToolUseID: [String: String] = [:]
     private var invocationIDByToolUseID: [String: UUID] = [:]
+    // Per-stream main-model attribution state for canonical `modelUsage.contextWindow`
+    // selection. The init `model` (e.g. "claude-opus-4-8[1m]") anchors tracking; a top-level
+    // assistant `message.model` is a fallback anchor only when tracking is still unset. The
+    // controller resets this state explicitly for each process stream (including shutdown/EOF
+    // reuse), and a new init also re-anchors it.
+    private var trackedMainModelID: String?
+    private var lastMatchedMainContextWindow: Int?
+    private var didLogModelUsageNoMatchFallback = false
     private let enableDebugLogging: Bool
     private let treatsToolResultErrorsAsHostOwned: @Sendable (String) -> Bool
 
@@ -13,6 +21,12 @@ public struct ClaudeSDKNDJSONTranslator {
     ) {
         self.enableDebugLogging = enableDebugLogging
         self.treatsToolResultErrorsAsHostOwned = treatsToolResultErrorsAsHostOwned
+    }
+
+    public mutating func resetMainModelTracking() {
+        trackedMainModelID = nil
+        lastMatchedMainContextWindow = nil
+        didLogModelUsageNoMatchFallback = false
     }
 
     #if DEBUG
@@ -93,6 +107,14 @@ public struct ClaudeSDKNDJSONTranslator {
         if subtype == "init" {
             if let sessionID = firstString(in: json, keys: ["session_id", "sessionId"]) {
                 cliSessionID = sessionID
+            }
+            // The init `model` is the exact `modelUsage` key for the main model and
+            // authoritatively anchors attribution for this stream. It overwrites tracking
+            // unconditionally and re-anchors sticky/no-match state for a new stream.
+            if let initModel = firstString(in: json, keys: ["model"]) {
+                trackedMainModelID = initModel
+                lastMatchedMainContextWindow = nil
+                didLogModelUsageNoMatchFallback = false
             }
             return [ClaudeProviderStreamResult(type: ClaudeProviderStreamResult.lifecycleType, text: "initialized")]
         }
@@ -185,6 +207,17 @@ public struct ClaudeSDKNDJSONTranslator {
 
     private mutating func parseAssistantMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         let payload = (json["message"] as? [String: Any]) ?? json
+        // A top-level assistant `message.model` is a fallback main-model anchor. It SETS
+        // tracking only when currently unset (so it never downgrades an init-tracked exact id
+        // such as "claude-opus-4-8[1m]" to the assistant base id "claude-opus-4-8"), and only
+        // from a non-sidechain event. Sidechain/subagent assistant events carry a non-null
+        // `parent_tool_use_id` and must not retarget main-model tracking.
+        if trackedMainModelID == nil,
+           !isSidechainAssistantEvent(json),
+           let assistantModel = firstString(in: payload, keys: ["model"])
+        {
+            trackedMainModelID = assistantModel
+        }
         let usageResult: ClaudeProviderStreamResult? = {
             guard let usage = parseUsage(payload["usage"] as? [String: Any]) else { return nil }
             return ClaudeProviderStreamResult(
@@ -874,15 +907,107 @@ public struct ClaudeSDKNDJSONTranslator {
         value as? [String: Any] ?? [:]
     }
 
-    private func parseModelContextWindow(_ value: [String: Any]?) -> Int? {
-        guard let value else { return nil }
-        for (_, usageAny) in value {
-            guard let usage = usageAny as? [String: Any] else { continue }
-            if let contextWindow = numberToInt(usage["contextWindow"]), contextWindow > 0 {
-                return contextWindow
+    /// Selects the canonical `contextWindow` by deterministic main-model attribution
+    /// instead of the first positive entry of an unordered `modelUsage` map. Selection order:
+    ///   1. exact match on the tracked main-model id
+    ///   2. deterministic MAX within the first non-empty candidate tier: normalized equality,
+    ///      then segment-boundary base-prefix
+    ///   3. sticky last-matched main-model window (never downgraded by background-only events)
+    ///   4. deterministic global MAX only when neither candidate tier matched and sticky is unset
+    /// A disagreeing candidate-tier MAX may transiently over-report until a later exact/equality
+    /// anchor overwrites sticky. Numerator/usage parsing is untouched.
+    private mutating func parseModelContextWindow(_ value: [String: Any]?) -> Int? {
+        guard let value, !value.isEmpty else {
+            // No `modelUsage` this event: preserve the sticky main-model window.
+            return lastMatchedMainContextWindow
+        }
+
+        var positiveWindows: [String: Int] = [:]
+        for (key, usageAny) in value {
+            guard let usage = usageAny as? [String: Any],
+                  let contextWindow = numberToInt(usage["contextWindow"]),
+                  contextWindow > 0
+            else { continue }
+            positiveWindows[key] = contextWindow
+        }
+        guard !positiveWindows.isEmpty else {
+            return lastMatchedMainContextWindow
+        }
+
+        if let trackedMainModelID {
+            // 1. Exact match on the tracked main-model id.
+            if let window = positiveWindows[trackedMainModelID] {
+                lastMatchedMainContextWindow = window
+                return window
+            }
+            // 2. Resolve within the strongest non-empty normalized candidate tier.
+            if let window = attributedCandidateContextWindow(for: trackedMainModelID, in: positiveWindows) {
+                lastMatchedMainContextWindow = window
+                return window
             }
         }
-        return nil
+
+        // 3. Sticky last-matched main-model window; non-candidate background-only events preserve it.
+        if let sticky = lastMatchedMainContextWindow {
+            return sticky
+        }
+
+        // 4. Deterministic MAX across positive entries (never blind first-positive).
+        let maxWindow = positiveWindows.values.max()
+        if enableDebugLogging, !didLogModelUsageNoMatchFallback, let maxWindow {
+            didLogModelUsageNoMatchFallback = true
+            print("[DEBUG] ClaudeSDKTranslator: modelUsage main-model attribution found no match for tracked id \(trackedMainModelID ?? "<none>"); using deterministic MAX contextWindow \(maxWindow) across \(positiveWindows.count) entries.")
+        }
+        return maxWindow
+    }
+
+    /// Resolves the strongest non-empty normalized candidate tier. Equality is stronger than
+    /// segment-boundary prefix attribution; ambiguity resolves to the tier's deterministic MAX.
+    private func attributedCandidateContextWindow(for trackedID: String, in positiveWindows: [String: Int]) -> Int? {
+        let normalizedTracked = normalizeModelID(trackedID)
+
+        // 2a. Normalized equality after stripping one trailing bracketed suffix from each side.
+        let equalMatches = positiveWindows.filter { normalizeModelID($0.key) == normalizedTracked }
+        if !equalMatches.isEmpty { return equalMatches.values.max() }
+
+        // 2b. Segment-boundary base-prefix candidates are considered only when equality is empty.
+        let prefixMatches = positiveWindows.filter { entry in
+            prefixMatchHasAcceptedBoundary(normalizedTracked, normalizeModelID(entry.key))
+        }
+        return prefixMatches.values.max()
+    }
+
+    private func prefixMatchHasAcceptedBoundary(_ left: String, _ right: String) -> Bool {
+        guard left != right else { return false }
+        let shorter: String
+        let longer: String
+        if left.count <= right.count {
+            shorter = left
+            longer = right
+        } else {
+            shorter = right
+            longer = left
+        }
+        guard longer.hasPrefix(shorter), shorter.count < longer.count else { return false }
+        let boundary = longer[longer.index(longer.startIndex, offsetBy: shorter.count)]
+        return boundary == "-" || boundary == "["
+    }
+
+    /// Strips a single trailing bracketed group such as `[1m]` (e.g. "claude-opus-4-8[1m]" ->
+    /// "claude-opus-4-8"). Non-bracketed ids are returned unchanged.
+    private func normalizeModelID(_ id: String) -> String {
+        guard id.hasSuffix("]"), let open = id.lastIndex(of: "[") else { return id }
+        return String(id[id.startIndex ..< open])
+    }
+
+    /// A non-null `parent_tool_use_id` marks a subagent/sidechain assistant event.
+    private func isSidechainAssistantEvent(_ json: [String: Any]) -> Bool {
+        guard let parent = json["parent_tool_use_id"] else { return false }
+        if parent is NSNull { return false }
+        if let identifier = parent as? String {
+            return !identifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return true
     }
 
     private func parseUsage(_ value: [String: Any]?) -> TokenUsage? {

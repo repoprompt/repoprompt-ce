@@ -27,6 +27,9 @@ struct AgentRuntimeContextSection: View {
                 contextWindowTokens: snapshot.effectiveContextWindowTokens,
                 usedTokens: snapshot.usedTokens,
                 sourceLabel: usageSubtitle,
+                // Gate the standalone window fact so pre-usage sessions with an
+                // unknown denominator show an em-dash placeholder, not the fabricated fallback.
+                isContextWindowKnown: snapshot.displayContextWindowTokens != nil,
                 style: .labeled
             )
 

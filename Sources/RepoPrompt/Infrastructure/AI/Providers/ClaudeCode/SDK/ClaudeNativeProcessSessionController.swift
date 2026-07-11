@@ -79,6 +79,7 @@ final actor ClaudeNativeProcessSessionController {
 
     struct SessionRef {
         var sessionID: String?
+        var configuredContextWindow: Int?
     }
 
     /// Outcome of an interrupt control request, used by the coordinator to decide
@@ -163,6 +164,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private var initialFlagSettingsRequest: [String: Any]?
+    private var activeFlagSettingsBaseModel: String?
     private var latestFlagSettingsIntentGeneration: UInt64 = 0
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
     private var flagSettingsRequestGeneration: UInt64 = 0
@@ -175,6 +177,7 @@ final actor ClaudeNativeProcessSessionController {
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
     private var translator: ClaudeSDKNDJSONTranslator
     private var sessionID: String?
+    private var configuredContextWindow: Int?
     private var turnInFlight: Bool {
         pendingTurnIDHead < pendingTurnIDBuffer.count
     }
@@ -382,7 +385,7 @@ final actor ClaudeNativeProcessSessionController {
         systemPromptOverride: String? = nil
     ) async throws -> SessionRef {
         if process != nil, isInitialized {
-            return SessionRef(sessionID: sessionID)
+            return SessionRef(sessionID: sessionID, configuredContextWindow: configuredContextWindow)
         }
 
         ensureEventsStreamReady()
@@ -401,7 +404,7 @@ final actor ClaudeNativeProcessSessionController {
             try await prepareRuntimeIfNeeded()
             try await startProcessIfNeeded(existingSessionID: existingSessionID, model: model, effortLevel: effortLevel)
             try await initializeIfNeeded(systemPromptOverride: systemPromptOverride)
-            return SessionRef(sessionID: sessionID)
+            return SessionRef(sessionID: sessionID, configuredContextWindow: configuredContextWindow)
         } catch {
             if process != nil || configURL != nil {
                 await shutdown()
@@ -411,7 +414,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     func currentSessionRef() async -> SessionRef {
-        SessionRef(sessionID: sessionID)
+        SessionRef(sessionID: sessionID, configuredContextWindow: configuredContextWindow)
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
@@ -428,6 +431,8 @@ final actor ClaudeNativeProcessSessionController {
             ] as [String: Any])
             throw ControllerError.liveModelSwitchRequiresRestart
         }
+        let previousBaseModel = activeFlagSettingsBaseModel
+        let nextBaseModel = Self.flagSettingsBaseModel(from: resolved.request)
         storeFlagSettingsRequest(resolved.request)
 
         guard process != nil else { return }
@@ -445,6 +450,10 @@ final actor ClaudeNativeProcessSessionController {
             "response": flagSettingsResult,
             "source": "live_update"
         ] as [String: Any])
+        if previousBaseModel != nextBaseModel {
+            translator.resetMainModelTracking()
+        }
+        activeFlagSettingsBaseModel = nextBaseModel
     }
 
     @discardableResult
@@ -537,7 +546,9 @@ final actor ClaudeNativeProcessSessionController {
         }
         await clearExpectedAgentPIDIfNeeded()
         process = nil
+        configuredContextWindow = nil
         activeLaunchEnvironmentSignature = nil
+        activeFlagSettingsBaseModel = nil
         isInitialized = false
         hasCompletedInitialFlagSettings = false
         stdoutFramer = LineFramer()
@@ -589,6 +600,7 @@ final actor ClaudeNativeProcessSessionController {
             preferredBasenames: [config.commandName]
         )
         storeFlagSettingsRequest(resolvedFlags.request)
+        activeFlagSettingsBaseModel = Self.flagSettingsBaseModel(from: resolvedFlags.request)
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         let arguments = buildArguments(
             existingSessionID: existingSessionID,
@@ -596,6 +608,10 @@ final actor ClaudeNativeProcessSessionController {
         )
 
         let workingDirectory = resolvedWorkingDirectory()
+        configuredContextWindow = ClaudeEffectiveContextWindowResolver.resolveConfiguredContextWindow(
+            launchEnvironment: environment,
+            workingDirectory: workingDirectory
+        )
         let spawned = try ProcessLauncher.spawn(
             command: resolvedCommand,
             arguments: arguments,
@@ -610,6 +626,7 @@ final actor ClaudeNativeProcessSessionController {
                 "workingDirectory": workingDirectory
             ] as [String: Any]
         )
+        translator.resetMainModelTracking()
         stdoutFramer = LineFramer()
         stderrTail.removeAll(keepingCapacity: false)
         // Reset authoritative lifecycle state for the new transport instance so we
@@ -718,6 +735,7 @@ final actor ClaudeNativeProcessSessionController {
                 "settings": request["settings"] ?? NSNull(),
                 "response": flagSettingsResult
             ] as [String: Any])
+            activeFlagSettingsBaseModel = Self.flagSettingsBaseModel(from: request)
             guard flagSettingsRequestGeneration != requestGeneration else {
                 hasCompletedInitialFlagSettings = true
                 return
@@ -766,6 +784,16 @@ final actor ClaudeNativeProcessSessionController {
         guard !trimmed.isEmpty else { return nil }
         guard trimmed.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame else { return nil }
         return trimmed
+    }
+
+    private static func flagSettingsBaseModel(from request: [String: Any]?) -> String? {
+        guard let settings = request?["settings"] as? [String: Any],
+              let rawModel = settings["model"] as? String
+        else { return nil }
+        let specifier = ClaudeModelSpecifier(raw: rawModel)
+        let baseModel = specifier.baseModel ?? rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseModel.isEmpty else { return nil }
+        return baseModel.lowercased()
     }
 
     private static func buildSetPermissionModeRequest(permissionMode: String) -> [String: Any]? {

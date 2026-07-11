@@ -1,5 +1,19 @@
 import SwiftUI
 
+enum AgentContextRatioDisplay {
+    static let unknownPlaceholder = "\u{2014}"
+
+    static func displayedPercent(used: Int?, window: Int, isKnown: Bool) -> Int? {
+        guard isKnown, window > 0, let used else { return nil }
+        let percent = min(max((Double(used) / Double(window)) * 100, 0), 100)
+        return Int(percent.rounded())
+    }
+
+    static func denominatorText(window: Int, isKnown: Bool) -> String {
+        isKnown ? AgentContextIndicator.formatTokens(window) : unknownPlaceholder
+    }
+}
+
 struct AgentContextIndicator: View {
     enum Style {
         case compact
@@ -10,38 +24,38 @@ struct AgentContextIndicator: View {
     let usedTokens: Int?
     let sourceLabel: String?
     let style: Style
+    /// Gates standalone `.labeled` "{tokens} window" facts and ratio displays
+    /// on knownness. When false (denominator unknown, e.g. Codex/GPT pre-usage), standalone
+    /// window text and ratio denominators render the shared em-dash placeholder instead of
+    /// the fabricated fallback, and percent/ring displays are suppressed. Defaulted so existing
+    /// callers compile unchanged; the ratio/math `contextWindowTokens` param stays non-optional-typed.
+    let isContextWindowKnown: Bool
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
-    }
-
-    init(contextUsage: AgentContextUsage?, style: Style = .compact) {
-        contextWindowTokens = contextUsage?.modelContextWindow
-        let last = contextUsage?.lastTotalTokens ?? 0
-        let total = contextUsage?.totalTotalTokens ?? 0
-        let used = last > 0 ? last : total
-        usedTokens = used > 0 ? used : nil
-        sourceLabel = nil
-        self.style = style
     }
 
     init(
         contextWindowTokens: Int?,
         usedTokens: Int?,
         sourceLabel: String? = nil,
+        isContextWindowKnown: Bool = true,
         style: Style = .compact
     ) {
         self.contextWindowTokens = contextWindowTokens
         self.usedTokens = usedTokens
         self.sourceLabel = sourceLabel
+        self.isContextWindowKnown = isContextWindowKnown
         self.style = style
     }
 
-    private var contextUsedPercent: Double? {
-        guard let contextWindowTokens, contextWindowTokens > 0, let usedTokens else {
-            return nil
-        }
-        return min(max((Double(usedTokens) / Double(contextWindowTokens)) * 100, 0), 100)
+    private var contextUsedPercent: Int? {
+        guard let contextWindowTokens else { return nil }
+        return AgentContextRatioDisplay.displayedPercent(
+            used: usedTokens,
+            window: contextWindowTokens,
+            isKnown: isContextWindowKnown
+        )
     }
 
     private var warningColor: Color {
@@ -52,18 +66,19 @@ struct AgentContextIndicator: View {
     }
 
     private var tooltipText: String {
-        guard let used = contextUsedPercent else {
-            if let usedTokens {
-                return "Used tokens: \(Self.formatTokens(usedTokens))"
-            }
-            return "Context usage unavailable"
+        guard let usedTokens else { return "Context usage unavailable" }
+        guard let contextWindowTokens else {
+            return "Used tokens: \(Self.formatTokens(usedTokens))"
         }
 
-        var text = "Context used: \(Int(used.rounded()))%"
-        if let usedTokens, let contextWindowTokens {
-            text += "\n\(Self.formatTokens(usedTokens)) / \(Self.formatTokens(contextWindowTokens)) tokens"
+        let denominator = AgentContextRatioDisplay.denominatorText(
+            window: contextWindowTokens,
+            isKnown: isContextWindowKnown
+        )
+        guard let used = contextUsedPercent else {
+            return "\(Self.formatTokens(usedTokens)) / \(denominator) tokens"
         }
-        return text
+        return "Context used: \(used)%\n\(Self.formatTokens(usedTokens)) / \(denominator) tokens"
     }
 
     static func formatTokens(_ count: Int) -> String {
@@ -86,14 +101,21 @@ struct AgentContextIndicator: View {
                     contextRing(size: 24, lineWidth: 3)
                     VStack(alignment: .leading, spacing: 2) {
                         if let usedTokens, let contextWindowTokens {
-                            Text("\(Self.formatTokens(usedTokens)) / \(Self.formatTokens(contextWindowTokens))")
+                            Text("\(Self.formatTokens(usedTokens)) / \(AgentContextRatioDisplay.denominatorText(window: contextWindowTokens, isKnown: isContextWindowKnown))")
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
                         } else if let usedTokens {
                             Text("\(Self.formatTokens(usedTokens)) used")
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
                         } else if let contextWindowTokens {
-                            Text("\(Self.formatTokens(contextWindowTokens)) window")
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                            // Gate the standalone window fact; render an em-dash placeholder
+                            // (persistent row, never removed) rather than the fabricated fallback.
+                            if isContextWindowKnown {
+                                Text("\(Self.formatTokens(contextWindowTokens)) window")
+                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                            } else {
+                                Text(AgentContextRatioDisplay.unknownPlaceholder)
+                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                            }
                         }
 
                         Text(sourceLabel ?? "Context usage")
@@ -107,8 +129,8 @@ struct AgentContextIndicator: View {
 
     @ViewBuilder
     private func contextRing(size: CGFloat, lineWidth: CGFloat) -> some View {
-        let used = contextUsedPercent ?? 0
-        let progress = min(max(used / 100, 0), 1)
+        let used = contextUsedPercent
+        let progress = used.map { min(max(Double($0) / 100, 0), 1) } ?? 0
         ZStack {
             Circle()
                 .stroke(Color.secondary.opacity(0.2), lineWidth: lineWidth)
@@ -119,10 +141,13 @@ struct AgentContextIndicator: View {
                     style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
                 )
                 .rotationEffect(.degrees(-90))
-            Text("\(Int(used.rounded()))")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: size * 0.36, weight: .medium))
-                .foregroundStyle(warningColor)
+            if let used {
+                Text("\(used)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: size * 0.36, weight: .medium))
+                    .foregroundStyle(warningColor)
+            }
         }
         .frame(width: size, height: size)
+        .accessibilityLabel(used == nil ? "Context usage ratio unavailable" : "Context used \(used ?? 0) percent")
     }
 }

@@ -11,7 +11,8 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
         liveSelectedFileCount: Int?,
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind,
-        selectedModelRaw: String
+        selectedModelRaw: String,
+        sessionConfiguredContextWindow: Int? = nil
     ) {
         let previousSnapshot = runtimeVM.snapshot
         runtimeVM.update(
@@ -20,7 +21,8 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
             liveSelectedFileCount: liveSelectedFileCount,
             liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent,
-            selectedModelRaw: selectedModelRaw
+            selectedModelRaw: selectedModelRaw,
+            sessionConfiguredContextWindow: sessionConfiguredContextWindow
         )
         let didPublish = runtimeVM.snapshot != previousSnapshot
         if didPublish {

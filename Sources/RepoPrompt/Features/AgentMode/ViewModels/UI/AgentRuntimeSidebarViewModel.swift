@@ -25,6 +25,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var usedTokens: Int?
         var estimatedTranscriptTokens: Int?
         var contextWindowTokens: Int?
+        var configuredContextWindowTokens: Int?
         var usageSource: UsageSource = .unavailable
         var selectionFileCount: Int?
         var selectionSummary: AgentContextSelectionSummary?
@@ -35,11 +36,11 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var selectedAgent: AgentProviderKind?
         var selectedModelRaw: String?
 
-        /// Context window with agent-specific fallback when the provider hasn't reported one yet.
-        /// With a known agent, encoded selections (`base:effort`) resolve through
-        /// `resolvedModel(forRaw:agentKind:)`; without one, only an exact raw match
-        /// can be trusted because the specifier grammar is agent-specific.
-        var effectiveContextWindowTokens: Int {
+        /// Canonical context window with agent-specific model metadata fallback when the provider
+        /// hasn't reported one yet. With a known agent, encoded selections (`base:effort`)
+        /// resolve through `resolvedModel(forRaw:agentKind:)`; without one, only an exact raw
+        /// match can be trusted because the specifier grammar is agent-specific.
+        var canonicalContextWindowTokens: Int? {
             if let contextWindowTokens { return contextWindowTokens }
             let model: AgentModel? = if let selectedAgent {
                 AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent)
@@ -54,13 +55,36 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             {
                 return compatibleContextWindow
             }
-            if let modelContextWindow = model?.contextWindowTokens {
-                return modelContextWindow
-            }
+            return model?.contextWindowTokens
+        }
+
+        var effectiveContextWindowTokens: Int {
+            AgentContextWindowDenominator.effectiveContextWindowTokens(
+                configured: configuredContextWindowTokens,
+                canonical: canonicalContextWindowTokens,
+                fallback: fallbackContextWindowTokens
+            )
+        }
+
+        /// The effective window ONLY when it is a known value (configured or canonical
+        /// present), else nil. Standalone window-fact surfaces (pill tooltip line, indicator
+        /// `.labeled` window text) gate on this so the hardcoded per-agent `200_000` fallback is
+        /// never surfaced as a fact pre-usage. Computed (not stored): adds no `Equatable`/change
+        /// bookkeeping, and the min-rule/`effectiveContextWindowTokens` math is unchanged — ratios
+        /// still compute over the fallback. Family-agnostic: first-party Claude/GLM are always
+        /// known; only `kimiCode`/`customClaudeCompatible` unknown-raw no-settings and Codex GPT
+        /// pre-usage hit both-nil, and a KNOWN Sonnet `200_000` is non-nil (knownness, not value).
+        var displayContextWindowTokens: Int? {
+            (configuredContextWindowTokens ?? canonicalContextWindowTokens) != nil
+                ? effectiveContextWindowTokens
+                : nil
+        }
+
+        private var fallbackContextWindowTokens: Int {
             switch selectedAgent {
-            case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: return 200_000
-            case .openCode, .cursor: return 200_000
-            case .codexExec, .none: return 200_000
+            case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: 200_000
+            case .openCode, .cursor: 200_000
+            case .codexExec, .none: 200_000
             }
         }
     }
@@ -116,7 +140,8 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         liveSelectedFileCount: Int? = nil,
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind? = nil,
-        selectedModelRaw: String? = nil
+        selectedModelRaw: String? = nil,
+        sessionConfiguredContextWindow: Int? = nil
     ) {
         activeTranscriptFirstItemID = nil
         processedItemIDs.removeAll()
@@ -179,6 +204,8 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         let toolTotalTokens = latestWorkspaceContext?.value.tokenStats?.total ?? latestManageSelection?.value.tokenStats?.total
         next.tokenStatsTotal = toolTotalTokens
 
+        next.configuredContextWindowTokens = codexUsage?.configuredContextWindow ?? sessionConfiguredContextWindow
+
         if let codexUsage {
             let last = codexUsage.lastTotalTokens ?? 0
             let total = codexUsage.totalTotalTokens ?? 0
@@ -229,7 +256,8 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         liveSelectedFileCount: Int? = nil,
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind? = nil,
-        selectedModelRaw: String? = nil
+        selectedModelRaw: String? = nil,
+        sessionConfiguredContextWindow: Int? = nil
     ) {
         resetIfTranscriptChanged(items: items)
         processNewItems(items)
@@ -248,6 +276,8 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
 
         let toolTotalTokens = latestWorkspaceContext?.value.tokenStats?.total ?? latestManageSelection?.value.tokenStats?.total
         next.tokenStatsTotal = toolTotalTokens
+
+        next.configuredContextWindowTokens = codexUsage?.configuredContextWindow ?? sessionConfiguredContextWindow
 
         if let codexUsage {
             let last = codexUsage.lastTotalTokens ?? 0

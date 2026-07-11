@@ -26,6 +26,13 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 
+    /// True only when the effective window is a known value (configured or canonical
+    /// present). Gates standalone window-fact rendering so the hardcoded fallback is never shown
+    /// as a fact pre-usage; ratio math keeps using `contextWindowTokens`.
+    private var isContextWindowKnown: Bool {
+        runtimeVM.snapshot.displayContextWindowTokens != nil
+    }
+
     private var selectionSummary: AgentContextSelectionSummary {
         if let summary = runtimeVM.snapshot.selectionSummary {
             return summary
@@ -61,16 +68,40 @@ struct AgentContextPill: View {
     private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
-        if let usedTokens = estimatedUsedTokens,
-           contextWindowTokens > 0
-        {
-            let usedPercent = min(max((Double(usedTokens) / Double(contextWindowTokens)) * 100, 0), 100)
-            lines.append("Context used: \(Int(usedPercent.rounded()))%")
-            lines.append("\(AgentContextIndicator.formatTokens(usedTokens)) / \(AgentContextIndicator.formatTokens(contextWindowTokens)) tokens")
-        } else if let usedTokens = estimatedUsedTokens {
-            lines.append("Used tokens: \(AgentContextIndicator.formatTokens(usedTokens))")
+        if let usedTokens = estimatedUsedTokens {
+            let usedText = AgentContextIndicator.formatTokens(usedTokens)
+            if let displayWindow = runtimeVM.snapshot.displayContextWindowTokens {
+                if let usedPercent = AgentContextRatioDisplay.displayedPercent(
+                    used: usedTokens,
+                    window: displayWindow,
+                    isKnown: true
+                ) {
+                    lines.append("Context used: \(usedPercent)%")
+                }
+                let denominator = AgentContextRatioDisplay.denominatorText(
+                    window: displayWindow,
+                    isKnown: true
+                )
+                lines.append("\(usedText) / \(denominator) tokens")
+            } else {
+                lines.append("\(usedText) / \(AgentContextRatioDisplay.unknownPlaceholder) tokens")
+            }
         } else {
             lines.append("Context usage unavailable")
+            // Render the effective context-window line ONLY when the denominator is
+            // known (`displayContextWindowTokens != nil`, i.e. configured or canonical present).
+            // When both are nil (e.g. Codex/GPT pre-usage) the line is OMITTED entirely — no
+            // "unknown" label — so the hardcoded per-agent 200K fallback is never surfaced as a
+            // fact.
+            if let displayWindow = runtimeVM.snapshot.displayContextWindowTokens {
+                var windowLine = "Context window: \(AgentContextIndicator.formatTokens(displayWindow))"
+                if let canonical = runtimeVM.snapshot.canonicalContextWindowTokens,
+                   canonical != displayWindow
+                {
+                    windowLine += " (model max \(AgentContextIndicator.formatTokens(canonical)))"
+                }
+                lines.append(windowLine)
+            }
         }
 
         lines.append("Selected: \(detailedFileSummaryText)")
@@ -103,6 +134,7 @@ struct AgentContextPill: View {
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
                     usedTokens: estimatedUsedTokens,
+                    isContextWindowKnown: isContextWindowKnown,
                     style: .compact
                 )
             }
@@ -142,6 +174,7 @@ struct AgentContextPill: View {
                     sourceLabel: runtimeVM.snapshot.usedTokens != nil
                         ? runtimeVM.snapshot.usageSource.label
                         : "Estimated",
+                    isContextWindowKnown: isContextWindowKnown,
                     style: .labeled
                 )
                 Spacer()
