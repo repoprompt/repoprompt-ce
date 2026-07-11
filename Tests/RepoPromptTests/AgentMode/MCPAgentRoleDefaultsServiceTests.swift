@@ -26,13 +26,13 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         )
 
         XCTAssertEqual(resolutions[0].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[0].recommended.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+        XCTAssertEqual(resolutions[0].recommended.modelRaw, AgentModel.gpt56SolLow.rawValue)
         XCTAssertEqual(resolutions[1].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[1].recommended.modelRaw, AgentModel.gpt55CodexMedium.rawValue)
+        XCTAssertEqual(resolutions[1].recommended.modelRaw, AgentModel.gpt56SolMedium.rawValue)
         XCTAssertEqual(resolutions[2].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[2].recommended.modelRaw, AgentModel.gpt55CodexHigh.rawValue)
+        XCTAssertEqual(resolutions[2].recommended.modelRaw, AgentModel.gpt56SolHigh.rawValue)
         XCTAssertEqual(resolutions[3].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[3].recommended.modelRaw, AgentModel.gpt55CodexMedium.rawValue)
+        XCTAssertEqual(resolutions[3].recommended.modelRaw, AgentModel.gpt56SolMedium.rawValue)
     }
 
     func testResolutionsPreferRecommendationAvailabilityWhenItCanResolveRole() throws {
@@ -67,12 +67,56 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         XCTAssertEqual(engineer.effective, engineer.recommended)
     }
 
+    func testWorkspaceOverrideResolvesIndependentlyFromGlobalOverride() throws {
+        let workspaceID = UUID()
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false,
+            codexAvailable: true,
+            openCodeAvailable: false,
+            cursorAvailable: false,
+            zaiConfigured: false,
+            kimiConfigured: false,
+            customClaudeCompatibleConfigured: false
+        )
+        let store = RoleDefaultsStoreStub(
+            overrides: [
+                AgentModelCatalog.TaskLabelKind.explore.rawValue: AgentModelSelectionID(
+                    agentRaw: AgentProviderKind.codexExec.rawValue,
+                    modelRaw: AgentModel.gpt55CodexHigh.rawValue
+                ).rawValue
+            ],
+            workspaceOverrides: [
+                workspaceID: [
+                    AgentModelCatalog.TaskLabelKind.explore.rawValue: AgentModelSelectionID(
+                        agentRaw: AgentProviderKind.codexExec.rawValue,
+                        modelRaw: AgentModel.gpt55CodexMedium.rawValue
+                    ).rawValue
+                ]
+            ]
+        )
+
+        let global = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .explore,
+            availability: availability,
+            settingsStore: store
+        ))
+        let workspace = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .explore,
+            availability: availability,
+            workspaceID: workspaceID,
+            settingsStore: store
+        ))
+
+        XCTAssertEqual(global.effective.modelRaw, AgentModel.gpt55CodexHigh.rawValue)
+        XCTAssertEqual(workspace.effective.modelRaw, AgentModel.gpt55CodexMedium.rawValue)
+    }
+
     /// Regression for the sub-agent role "reset after restart" bug: an explicit role pick
     /// must persist even when it currently equals the (transient, availability-dependent)
     /// recommendation. Previously setSelection dropped the override on a recommendation
     /// match, so nothing was stored and the role silently drifted to a different model when
     /// the recommendation later changed.
-    func testSetSelectionPersistsExplicitPickEvenWhenItMatchesRecommendation() {
+    func testSetSelectionPersistsExplicitPickEvenWhenItMatchesRecommendation() throws {
         let actualAvailability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: false,
             codexAvailable: true,
@@ -91,7 +135,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         // This selection equals the fallback recommendation for `.explore` under this availability.
         let selection = AgentModelCatalog.NormalizedAgentSelection(
             agent: .codexExec,
-            modelRaw: AgentModel.gpt55CodexLow.rawValue
+            modelRaw: AgentModel.gpt56SolLow.rawValue
         )
 
         MCPAgentRoleDefaultsService.setSelection(
@@ -113,40 +157,80 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
             ),
             selection
         )
+
+        let resolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .explore,
+            availability: actualAvailability,
+            settingsStore: store
+        ))
+        XCTAssertTrue(resolution.hasStoredOverride)
+        XCTAssertFalse(resolution.hasCustomOverride)
+        XCTAssertFalse(resolution.overrideUnavailable)
+        XCTAssertEqual(resolution.effective, selection)
     }
 
     /// Guards the persist-always change: reverting a role to recommendation-tracking stays
     /// an explicit action via clearOverride.
-    func testClearOverrideStillRevertsRoleToRecommendedTracking() {
+    func testClearOverrideStillRevertsRoleToRecommendedTracking() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false,
+            codexAvailable: true,
+            openCodeAvailable: false,
+            cursorAvailable: false,
+            zaiConfigured: false,
+            kimiConfigured: false,
+            customClaudeCompatibleConfigured: false
+        )
         let store = RoleDefaultsStoreStub()
         MCPAgentRoleDefaultsService.setSelection(
             AgentModelCatalog.NormalizedAgentSelection(
                 agent: .codexExec,
-                modelRaw: AgentModel.gpt55CodexHigh.rawValue
+                modelRaw: AgentModel.gpt56SolHigh.rawValue
             ),
             for: .engineer,
             settingsStore: store
         )
         XCTAssertNotNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
+        let pinnedResolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .engineer,
+            availability: availability,
+            settingsStore: store
+        ))
+        XCTAssertTrue(pinnedResolution.hasStoredOverride)
+        XCTAssertTrue(pinnedResolution.hasCustomOverride)
 
         MCPAgentRoleDefaultsService.clearOverride(for: .engineer, settingsStore: store)
         XCTAssertNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
+        let clearedResolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .engineer,
+            availability: availability,
+            settingsStore: store
+        ))
+        XCTAssertFalse(clearedResolution.hasStoredOverride)
+        XCTAssertFalse(clearedResolution.hasCustomOverride)
     }
 }
 
 @MainActor
 private final class RoleDefaultsStoreStub: MCPAgentRoleDefaultsStoring {
     private(set) var overrides: [String: String]?
+    private(set) var workspaceOverrides: [UUID: [String: String]]
 
-    init(overrides: [String: String]? = nil) {
+    init(overrides: [String: String]? = nil, workspaceOverrides: [UUID: [String: String]] = [:]) {
         self.overrides = overrides
+        self.workspaceOverrides = workspaceOverrides
     }
 
-    func globalMCPAgentRoleOverrides() -> [String: String]? {
-        overrides
+    func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]? {
+        guard let workspaceID else { return overrides }
+        return workspaceOverrides[workspaceID]
     }
 
-    func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool) {
-        self.overrides = overrides
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, workspaceID: UUID?, commit _: Bool) {
+        guard let workspaceID else {
+            self.overrides = overrides
+            return
+        }
+        workspaceOverrides[workspaceID] = overrides
     }
 }

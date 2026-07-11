@@ -216,6 +216,7 @@ jobs:
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_REQUIRE_HEAD_MATCH: 0
+          REPOPROMPT_ENABLE_SENTRY: "1"
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
@@ -225,6 +226,7 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+          REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT: production
         run: ./trusted-control-plane/Scripts/release.sh publish-staged
 
       - name: Remove ephemeral keychain

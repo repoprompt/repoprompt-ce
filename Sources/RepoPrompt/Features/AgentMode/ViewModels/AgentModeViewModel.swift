@@ -7249,7 +7249,7 @@ final class AgentModeViewModel: ObservableObject {
                 transcript: session.transcript,
                 runState: session.runState
             ),
-            rawToolResultPayloadRenderRevision: session.rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -7485,7 +7485,7 @@ final class AgentModeViewModel: ObservableObject {
             hydratedBindingTransitionGeneration: hydratedTransitionGeneration,
             performanceSnapshot: snapshot.performanceSnapshot,
             metadata: snapshot.metadata,
-            rawToolResultPayloadRenderRevision: snapshot.rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: snapshot.rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -9126,7 +9126,7 @@ final class AgentModeViewModel: ObservableObject {
             analyticsSnapshot: session.transcriptAnalyticsSnapshot,
             sanitizedActivityCount: 0,
             performanceSnapshot: session.transcriptPerformanceSnapshot,
-            rawToolResultPayloadRenderRevision: session.rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -9307,9 +9307,11 @@ final class AgentModeViewModel: ObservableObject {
             #endif
         }
         let visibleRetainedIDs = visibleToolResultIDs(in: baseProjection)
-        let rawToolResultPayloadRenderRevision = visibleRetainedIDs.reduce(0) { current, itemID in
-            max(current, capturedPayloadRevisionByItemID[itemID] ?? 0)
-        }
+        let rawToolResultPayloadRenderRevisionByItemID = Dictionary(
+            uniqueKeysWithValues: visibleRetainedIDs.compactMap { itemID in
+                capturedPayloadRevisionByItemID[itemID].map { (itemID, $0) }
+            }
+        )
         let fullProjection = degradeCollapsedTranscriptBlocksIfNeeded(
             baseProjection,
             isColdLoad: isColdLoad
@@ -9427,7 +9429,7 @@ final class AgentModeViewModel: ObservableObject {
             ),
             sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
             performanceSnapshot: performanceSnapshot,
-            rawToolResultPayloadRenderRevision: rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -9564,7 +9566,7 @@ final class AgentModeViewModel: ObservableObject {
         session.transcriptCanonicalVisibleRowCount = presentation.canonicalVisibleRowCount
         session.transcriptProjectionCounts = presentation.projectionCounts
         session.transcriptAnalyticsSnapshot = presentation.analyticsSnapshot
-        session.rawToolResultPayloadRenderRevision = presentation.rawToolResultPayloadRenderRevision
+        session.rawToolResultPayloadRenderRevisionByItemID = presentation.rawToolResultPayloadRenderRevisionByItemID
         #if DEBUG || EDIT_FLOW_PERF
             session.transcriptPerformanceSnapshot = presentation.performanceSnapshot
         #else

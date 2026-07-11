@@ -79,10 +79,23 @@ public enum AIModel: Equatable, Hashable {
     case gpt5CodexXHigh
 
     // Codex CLI Provider Models
-    case codexCliGpt55CodexLow
-    case codexCliGpt55CodexMedium
-    case codexCliGpt55CodexHigh
-    case codexCliGpt55CodexXHigh
+    case codexCliGpt56SolLow
+    case codexCliGpt56SolMedium
+    case codexCliGpt56SolHigh
+    case codexCliGpt56SolXHigh
+    case codexCliGpt56SolMax
+    case codexCliGpt56SolUltra
+    case codexCliGpt56TerraLow
+    case codexCliGpt56TerraMedium
+    case codexCliGpt56TerraHigh
+    case codexCliGpt56TerraXHigh
+    case codexCliGpt56TerraMax
+    case codexCliGpt56TerraUltra
+    case codexCliGpt56LunaLow
+    case codexCliGpt56LunaMedium
+    case codexCliGpt56LunaHigh
+    case codexCliGpt56LunaXHigh
+    case codexCliGpt56LunaMax
     case codexCliGpt5Low
     case codexCliGpt5Medium
     case codexCliGpt5High
@@ -299,10 +312,23 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .gpt54ProXHigh, rawValue: "gpt-5.4-pro-xhigh", actualName: "gpt-5.4-pro", displayName: "GPT-5.4 Pro XHigh", provider: ProviderIndex.openAI),
 
         // Codex CLI Provider Models
-        ModelInfo(model: .codexCliGpt55CodexLow, rawValue: "codex_cli_gpt-5.5-low", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 Low", provider: ProviderIndex.codex),
-        ModelInfo(model: .codexCliGpt55CodexMedium, rawValue: "codex_cli_gpt-5.5-medium", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 Medium", provider: ProviderIndex.codex),
-        ModelInfo(model: .codexCliGpt55CodexHigh, rawValue: "codex_cli_gpt-5.5-high", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 High", provider: ProviderIndex.codex),
-        ModelInfo(model: .codexCliGpt55CodexXHigh, rawValue: "codex_cli_gpt-5.5-xhigh", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolLow, rawValue: "codex_cli_gpt-5.6-sol-low", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolMedium, rawValue: "codex_cli_gpt-5.6-sol-medium", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolHigh, rawValue: "codex_cli_gpt-5.6-sol-high", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolXHigh, rawValue: "codex_cli_gpt-5.6-sol-xhigh", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolMax, rawValue: "codex_cli_gpt-5.6-sol-max", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolUltra, rawValue: "codex_cli_gpt-5.6-sol-ultra", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Ultra", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraLow, rawValue: "codex_cli_gpt-5.6-terra-low", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraMedium, rawValue: "codex_cli_gpt-5.6-terra-medium", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraHigh, rawValue: "codex_cli_gpt-5.6-terra-high", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraXHigh, rawValue: "codex_cli_gpt-5.6-terra-xhigh", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraMax, rawValue: "codex_cli_gpt-5.6-terra-max", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraUltra, rawValue: "codex_cli_gpt-5.6-terra-ultra", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Ultra", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaLow, rawValue: "codex_cli_gpt-5.6-luna-low", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaMedium, rawValue: "codex_cli_gpt-5.6-luna-medium", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaHigh, rawValue: "codex_cli_gpt-5.6-luna-high", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaXHigh, rawValue: "codex_cli_gpt-5.6-luna-xhigh", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaMax, rawValue: "codex_cli_gpt-5.6-luna-max", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Max", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5Low, rawValue: "codex_cli_gpt-5.2-low", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 Low", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5Medium, rawValue: "codex_cli_gpt-5.2-medium", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 Medium", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5High, rawValue: "codex_cli_gpt-5.2-high", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 High", provider: ProviderIndex.codex),
@@ -698,9 +724,9 @@ public enum AIModel: Equatable, Hashable {
     static let simpleDiffPriority: [AIModel] = [
         // Prioritize practical current CLI variants first
         .claudeCodeSonnet,
-        .codexCliGpt55CodexMedium,
-        .codexCliGpt55CodexLow,
-        .codexCliGpt55CodexHigh,
+        .codexCliGpt56SolMedium,
+        .codexCliGpt56SolLow,
+        .codexCliGpt56SolHigh,
         .gpt54Low,
         .gpt54,
         .gpt54High,
@@ -727,9 +753,9 @@ public enum AIModel: Equatable, Hashable {
     static let mediumDiffPriority: [AIModel] = [
         // Prioritize practical current CLI variants first
         .claudeCodeSonnet,
-        .codexCliGpt55CodexHigh,
-        .codexCliGpt55CodexMedium,
-        .codexCliGpt55CodexLow,
+        .codexCliGpt56SolHigh,
+        .codexCliGpt56SolMedium,
+        .codexCliGpt56SolLow,
         .gpt54,
         .gpt54High,
         .gpt54Low,
@@ -756,9 +782,9 @@ public enum AIModel: Equatable, Hashable {
     static let highDiffPriority: [AIModel] = [
         // Then other top models
         .claudeCodeSonnet,
-        .codexCliGpt55CodexHigh,
-        .codexCliGpt55CodexXHigh,
-        .codexCliGpt55CodexMedium,
+        .codexCliGpt56SolHigh,
+        .codexCliGpt56SolXHigh,
+        .codexCliGpt56SolMedium,
         .gpt54High,
         .gpt54,
         .claude4Sonnet, .openrouterClaude4Sonnet,
@@ -1071,10 +1097,16 @@ public enum AIModel: Equatable, Hashable {
         case .gpt5, .gpt54, .gpt5CodexMed, .o3: return "medium"
         case .gpt5Low, .gpt54Low, .gpt5CodexLow, .o3Low: return "low"
         // Codex CLI models
-        case .codexCliGpt55CodexXHigh, .codexCliGpt5XHigh, .codexCliGpt54XHigh, .codexCliGpt5CodexXHigh: return "xhigh"
-        case .codexCliGpt55CodexHigh, .codexCliGpt5High, .codexCliGpt54High, .codexCliGpt5CodexHigh: return "high"
-        case .codexCliGpt55CodexMedium, .codexCliGpt5Medium, .codexCliGpt54Medium, .codexCliGpt5CodexMedium: return "medium"
-        case .codexCliGpt55CodexLow, .codexCliGpt5Low, .codexCliGpt54Low, .codexCliGpt5CodexLow: return "low"
+        case .codexCliGpt56SolUltra, .codexCliGpt56TerraUltra: return "ultra"
+        case .codexCliGpt56SolMax, .codexCliGpt56TerraMax, .codexCliGpt56LunaMax: return "max"
+        case .codexCliGpt56SolXHigh, .codexCliGpt56TerraXHigh, .codexCliGpt56LunaXHigh,
+             .codexCliGpt5XHigh, .codexCliGpt54XHigh, .codexCliGpt5CodexXHigh: return "xhigh"
+        case .codexCliGpt56SolHigh, .codexCliGpt56TerraHigh, .codexCliGpt56LunaHigh,
+             .codexCliGpt5High, .codexCliGpt54High, .codexCliGpt5CodexHigh: return "high"
+        case .codexCliGpt56SolMedium, .codexCliGpt56TerraMedium, .codexCliGpt56LunaMedium,
+             .codexCliGpt5Medium, .codexCliGpt54Medium, .codexCliGpt5CodexMedium: return "medium"
+        case .codexCliGpt56SolLow, .codexCliGpt56TerraLow, .codexCliGpt56LunaLow,
+             .codexCliGpt5Low, .codexCliGpt54Low, .codexCliGpt5CodexLow: return "low"
         case let .codexCustom(name):
             return CodexModelSpecifier(raw: name).reasoningEffort?.rawValue
         case let .claudeCodeModel(specifier):
@@ -1175,7 +1207,21 @@ public enum AIModel: Equatable, Hashable {
 
         // Handle Codex CLI models with prefix
         if normalizedRawValue.starts(with: "codex_cli_") {
-            return modelDefinitions.first { $0.rawValue == normalizedRawValue }?.model
+            if let model = modelDefinitions.first(where: { $0.rawValue == normalizedRawValue })?.model {
+                return model
+            }
+            switch normalizedRawValue {
+            case "codex_cli_gpt-5.5-low":
+                return .codexCliGpt56SolLow
+            case "codex_cli_gpt-5.5-medium":
+                return .codexCliGpt56SolMedium
+            case "codex_cli_gpt-5.5-high":
+                return .codexCliGpt56SolHigh
+            case "codex_cli_gpt-5.5-xhigh":
+                return .codexCliGpt56SolXHigh
+            default:
+                return nil
+            }
         }
         if normalizedRawValue.starts(with: "codex_custom_") {
             return .codexCustom(name: String(normalizedRawValue.dropFirst("codex_custom_".count)))
@@ -1558,9 +1604,21 @@ public enum AIModel: Equatable, Hashable {
         let specifier = CodexModelSpecifier(raw: trimmed)
         let base = specifier.baseModel ?? trimmed
         let normalizedBase = normalizedSemanticText(base)
-        guard normalizedBase == "gpt-5.5" || normalizedBase == "gpt-5.5" else { return nil }
+        let canonicalBase: String
+        switch normalizedBase {
+        case "gpt-5.6", "gpt-5.6-sol":
+            canonicalBase = "GPT-5.6 Sol"
+        case "gpt-5.6-terra":
+            canonicalBase = "GPT-5.6 Terra"
+        case "gpt-5.6-luna":
+            canonicalBase = "GPT-5.6 Luna"
+        case "gpt-5.5":
+            canonicalBase = "GPT-5.5"
+        default:
+            return nil
+        }
 
-        var label = "GPT-5.5"
+        var label = canonicalBase
         if let serviceTier = specifier.serviceTier {
             label += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier ? " Fast" : " \(serviceTier.capitalized)"
         }
@@ -1574,21 +1632,18 @@ public enum AIModel: Equatable, Hashable {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
-        let suffixes = [
-            "-xhigh", " xhigh", "-x-high", " x-high",
-            "-medium", " medium", "-med", " med",
-            "-minimal", " minimal",
-            "-high", " high",
-            "-none", " none",
-            "-low", " low"
-        ]
-        let lowered = trimmed.lowercased()
-        for suffix in suffixes where lowered.hasSuffix(suffix) {
-            return String(trimmed.dropLast(suffix.count))
-                .trimmingCharacters(in: CharacterSet(charactersIn: " -_/·"))
+        let specifier = codexSpecifierFromSemanticLabel(trimmed)
+        guard specifier.reasoningEffort != nil, let baseModel = specifier.baseModel else {
+            return trimmed
         }
 
-        return trimmed
+        var stripped = humanizedCodexBaseModel(baseModel)
+        if let serviceTier = specifier.serviceTier {
+            stripped += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier
+                ? " Fast"
+                : " \(serviceTier.capitalized)"
+        }
+        return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func semanticModelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
@@ -1706,24 +1761,40 @@ public enum AIModel: Equatable, Hashable {
     }
 
     private static func reasoningEffort(in text: String) -> CodexReasoningEffort? {
-        let tokens = text
-            .lowercased()
+        codexSpecifierFromSemanticLabel(text).reasoningEffort
+    }
+
+    private static func codexSpecifierFromSemanticLabel(_ text: String) -> CodexModelSpecifier {
+        let parseableText = text
+            .replacingOccurrences(of: "CLI·", with: "")
             .replacingOccurrences(of: "(", with: " ")
             .replacingOccurrences(of: ")", with: " ")
-            .replacingOccurrences(of: "·", with: " ")
-            .split { !$0.isLetter && !$0.isNumber }
-            .map(String.init)
-
-        for token in tokens.reversed() {
-            if token == "med" {
-                return .medium
-            }
-            if let parsed = CodexReasoningEffort.parse(token) {
-                return parsed
+        let normalized = normalizedSemanticText(parseableText)
+        let candidates = codexSpecifierCandidates(fromNormalizedSemanticText: normalized)
+        for candidate in candidates {
+            let specifier = CodexModelSpecifier(raw: candidate)
+            if specifier.reasoningEffort != nil {
+                return specifier
             }
         }
+        return CodexModelSpecifier(raw: normalized)
+    }
 
-        return nil
+    private static func codexSpecifierCandidates(fromNormalizedSemanticText normalized: String) -> [String] {
+        guard !normalized.isEmpty else { return [normalized] }
+
+        var candidates: [String] = []
+        func appendAlias(suffix: String, replacement: String) {
+            guard normalized.hasSuffix(suffix) else { return }
+            let base = String(normalized.dropLast(suffix.count))
+            guard !base.isEmpty else { return }
+            candidates.append("\(base)\(replacement)")
+        }
+
+        appendAlias(suffix: "-x-high", replacement: "-xhigh")
+        appendAlias(suffix: "-med", replacement: "-medium")
+        candidates.append(normalized)
+        return candidates
     }
 
     private static func normalizedCodexBaseLabel(_ label: String) -> String {
@@ -1904,10 +1975,23 @@ public enum AIModel: Equatable, Hashable {
         case gpt5CodexMed
         case gpt5CodexHigh
         case gpt5CodexXHigh
-        case codexCliGpt55CodexLow
-        case codexCliGpt55CodexMedium
-        case codexCliGpt55CodexHigh
-        case codexCliGpt55CodexXHigh
+        case codexCliGpt56SolLow
+        case codexCliGpt56SolMedium
+        case codexCliGpt56SolHigh
+        case codexCliGpt56SolXHigh
+        case codexCliGpt56SolMax
+        case codexCliGpt56SolUltra
+        case codexCliGpt56TerraLow
+        case codexCliGpt56TerraMedium
+        case codexCliGpt56TerraHigh
+        case codexCliGpt56TerraXHigh
+        case codexCliGpt56TerraMax
+        case codexCliGpt56TerraUltra
+        case codexCliGpt56LunaLow
+        case codexCliGpt56LunaMedium
+        case codexCliGpt56LunaHigh
+        case codexCliGpt56LunaXHigh
+        case codexCliGpt56LunaMax
         case codexCliGpt5Low
         case codexCliGpt5Medium
         case codexCliGpt5High
@@ -2062,14 +2146,40 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt5CodexHigh)
         case .gpt5CodexXHigh:
             .staticCase(.gpt5CodexXHigh)
-        case .codexCliGpt55CodexLow:
-            .staticCase(.codexCliGpt55CodexLow)
-        case .codexCliGpt55CodexMedium:
-            .staticCase(.codexCliGpt55CodexMedium)
-        case .codexCliGpt55CodexHigh:
-            .staticCase(.codexCliGpt55CodexHigh)
-        case .codexCliGpt55CodexXHigh:
-            .staticCase(.codexCliGpt55CodexXHigh)
+        case .codexCliGpt56SolLow:
+            .staticCase(.codexCliGpt56SolLow)
+        case .codexCliGpt56SolMedium:
+            .staticCase(.codexCliGpt56SolMedium)
+        case .codexCliGpt56SolHigh:
+            .staticCase(.codexCliGpt56SolHigh)
+        case .codexCliGpt56SolXHigh:
+            .staticCase(.codexCliGpt56SolXHigh)
+        case .codexCliGpt56SolMax:
+            .staticCase(.codexCliGpt56SolMax)
+        case .codexCliGpt56SolUltra:
+            .staticCase(.codexCliGpt56SolUltra)
+        case .codexCliGpt56TerraLow:
+            .staticCase(.codexCliGpt56TerraLow)
+        case .codexCliGpt56TerraMedium:
+            .staticCase(.codexCliGpt56TerraMedium)
+        case .codexCliGpt56TerraHigh:
+            .staticCase(.codexCliGpt56TerraHigh)
+        case .codexCliGpt56TerraXHigh:
+            .staticCase(.codexCliGpt56TerraXHigh)
+        case .codexCliGpt56TerraMax:
+            .staticCase(.codexCliGpt56TerraMax)
+        case .codexCliGpt56TerraUltra:
+            .staticCase(.codexCliGpt56TerraUltra)
+        case .codexCliGpt56LunaLow:
+            .staticCase(.codexCliGpt56LunaLow)
+        case .codexCliGpt56LunaMedium:
+            .staticCase(.codexCliGpt56LunaMedium)
+        case .codexCliGpt56LunaHigh:
+            .staticCase(.codexCliGpt56LunaHigh)
+        case .codexCliGpt56LunaXHigh:
+            .staticCase(.codexCliGpt56LunaXHigh)
+        case .codexCliGpt56LunaMax:
+            .staticCase(.codexCliGpt56LunaMax)
         case .codexCliGpt5Low:
             .staticCase(.codexCliGpt5Low)
         case .codexCliGpt5Medium:

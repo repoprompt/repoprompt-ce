@@ -45,14 +45,29 @@ extension MCPServerViewModel {
 
     enum ContextBuilderTeardownPublicationOutcome: Equatable {
         case peerEOFDetached
+        case detachedAfterResponseDeliveryDrained(reason: String)
+        case detachedWithoutOrderlyPeerEOF(reason: String)
         case resolvedWithoutPeerEOFDetachment(reason: String)
         case timedOut
         case cancelled
+
+        var completedDiscoveryCanCommit: Bool {
+            switch self {
+            case .peerEOFDetached, .detachedAfterResponseDeliveryDrained:
+                true
+            case .detachedWithoutOrderlyPeerEOF, .resolvedWithoutPeerEOFDetachment, .timedOut, .cancelled:
+                false
+            }
+        }
 
         var diagnosticSource: String {
             switch self {
             case .peerEOFDetached:
                 "peer_eof_detached"
+            case let .detachedAfterResponseDeliveryDrained(reason):
+                "detached_after_response_delivery_drained:\(reason)"
+            case let .detachedWithoutOrderlyPeerEOF(reason):
+                "detached_without_orderly_peer_eof:\(reason)"
             case let .resolvedWithoutPeerEOFDetachment(reason):
                 "resolved_without_detachment:\(reason)"
             case .timedOut:
@@ -4011,7 +4026,7 @@ extension MCPServerViewModel {
 
     @MainActor
     @discardableResult
-    func detachContextBuilderTabContextForPeerEOF(
+    func detachContextBuilderTabContextForDiscoveryTeardown(
         connectionID: UUID,
         runID: UUID
     ) -> Bool {
@@ -4036,7 +4051,7 @@ extension MCPServerViewModel {
         connectionIDByRunID.removeValue(forKey: runID)
         pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
         connectionIDToRunID.removeValue(forKey: connectionID)
-        tabContextLog("Detached Context Builder context after peer EOF connectionID=\(connectionID) runID=\(runID)")
+        tabContextLog("Detached Context Builder context for discovery teardown connectionID=\(connectionID) runID=\(runID)")
         return true
     }
 

@@ -635,7 +635,7 @@ struct MCPServerPopoverContent: View {
             ) { selectedAgent, selectedOption in
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
-                // Force commit to GlobalSettingsStore so recommendation engine sees the change
+                // Persist even when the user re-selects the displayed runtime fallback.
                 promptViewModel.commitContextBuilderSettings()
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .recommendationsDidApply, object: nil)
