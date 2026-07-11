@@ -46,7 +46,10 @@ class ContributionPreflightTests(unittest.TestCase):
         stub.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
-            f"printf '%s\\n' \"$*\" >> \"${{{log_env_name}:?}}\"\n",
+            f"printf '%s\\n' \"$*\" >> \"${{{log_env_name}:?}}\"\n"
+            "if [[ -n \"${RPCE_STUB_FAIL_MATCH:-}\" && \"$*\" == *\"$RPCE_STUB_FAIL_MATCH\"* ]]; then\n"
+            "  exit \"${RPCE_STUB_FAIL_STATUS:-1}\"\n"
+            "fi\n",
             encoding="utf-8",
         )
         stub.chmod(0o755)
@@ -153,6 +156,21 @@ class ContributionPreflightTests(unittest.TestCase):
                 ],
             )
             self.assertIn("PR-ready preflight passed", result.stdout)
+
+    def test_pr_ready_failing_phase_prints_timing_and_propagates_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, preflight, env = self.create_repo(
+                Path(tmp), outgoing_path="Sources/RepoPrompt/Example.swift"
+            )
+            env["RPCE_STUB_FAIL_MATCH"] = SWIFT_LINT_TARGET
+            env["RPCE_STUB_FAIL_STATUS"] = "23"
+
+            result = self.run_preflight(repo, preflight, env, "pr-ready")
+
+            self.assertEqual(result.returncode, 23, result.stderr + result.stdout)
+            self.assertIn("phase timing: style=", result.stdout)
+            self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, SWIFT_LINT_TARGET])
+            self.assertNotIn("PR-ready preflight passed", result.stdout)
 
     def test_pr_ready_runs_conductor_selftest_for_preflight_control_plane_changes(self) -> None:
         cases = [

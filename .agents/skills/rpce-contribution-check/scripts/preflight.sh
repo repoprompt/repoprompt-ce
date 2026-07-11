@@ -37,8 +37,10 @@ run_phase() {
   local phase="$1"
   shift
   local started=$SECONDS
-  "$@"
+  local status=0
+  "$@" || status=$?
   printf 'phase timing: %s=%ss\n' "$phase" "$((SECONDS - started))"
+  return "$status"
 }
 
 require_tool() {
