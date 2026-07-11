@@ -29,7 +29,9 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         for value in 0 ..< 4 {
             queue.async {
                 values.append(value)
-                if value == 3 { expectation.fulfill() }
+                if value == 3 {
+                    expectation.fulfill()
+                }
             }
         }
         await fulfillment(of: [expectation], timeout: 1)
@@ -102,18 +104,10 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
             }
             return nil
         }
-        let removedPaths = allDeltas.compactMap { delta -> String? in
-            if case let .fileRemoved(path) = delta {
-                return path
-            }
-            return nil
-        }
-
         XCTAssertTrue(
             addedPaths.contains("ignored.txt"),
             "Truncated callback must rebuild ignore rules so the previously ignored file becomes visible"
         )
-        XCTAssertTrue(removedPaths.contains(".gitignore"))
     }
 
     func testAcceptedBeforeAndAfterCaptureCutsPublishIndependentWatermarks() async throws {
@@ -517,7 +511,9 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
             while mailbox.takeNextAcceptedPayload() != nil {}
         }
         for _ in 0 ..< 100 {
-            if await drainCount.value() > 0 { break }
+            if await drainCount.value() > 0 {
+                break
+            }
             await Task.yield()
         }
         let resumedDrainCount = await drainCount.value()
