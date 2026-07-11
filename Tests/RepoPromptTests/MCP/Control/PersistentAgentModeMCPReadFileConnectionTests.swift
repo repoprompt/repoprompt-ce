@@ -518,7 +518,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try await AsyncTestWait.waitUntil("slice rebase is registered after applied ingress") {
                 fixture.window.workspaceManager
                     .composeTab(with: Fixture.tabID)?
-                    .selection.slices[matchingLogicalPath] != originalRanges
+                    .selection.slices[targetLogicalPath] != originalRanges
             }
             let fence = await fixture.window.workspaceFilesViewModel.waitForPendingSliceRebasesAndCaptureFence(
                 affectingCandidatePaths: [physicalURL.path]
