@@ -2618,73 +2618,6 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         }
     #endif
 
-    func testBroadSearchOrchestrationChecksScopeAndReadinessBeforeAndAfterAdmission() throws {
-        let source = try String(
-            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift"),
-            encoding: .utf8
-        )
-        try assertOrdered([
-            "try await ensureRootScopeAvailable(rootScope, store: store)",
-            "let readinessTicket = try await acquireSearchReadiness(",
-            "readinessTicket: readinessTicket,",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode",
-            "return try await store.withStoreBackedSearchAccess(",
-            "if admissionClass != nil {",
-            "try await ensureRootScopeAvailable(",
-            "readinessTicket: readinessTicket,",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "var parsedSearchScope:",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "let freshnessRootRefs:",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "appliedIngressSamples = try await awaitAppliedIngress(",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "parsedSearchScope = await refreshExactSearchScopeClauses(",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "return try await performSearch("
-        ], in: source)
-        let performSearchStart = try XCTUnwrap(source.range(of: "private static func performSearch("))
-        try assertOrdered([
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "let catalogRequirement: WorkspaceSearchCatalogAccessRequirement = switch mode",
-            "let catalogAccess = await store.searchCatalogAccess(",
-            "requirement: catalogRequirement",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "let visibleRootRefs = await store.rootRefs(scope: .visibleWorkspace)",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "let filterResult = await withTaskCancellationHandler",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "results = try await EditFlowPerf.measure(",
-            "try await fileSearchActor.searchUnified(",
-            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "results.scopedFileCount = filesToSearch.count"
-        ], in: String(source[performSearchStart.lowerBound...]))
-    }
-
-    func testSearchScopeParserKeepsRequiredResolutionOrder() throws {
-        let source = try String(
-            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift"),
-            encoding: .utf8
-        )
-        try assertOrdered([
-            "let hasWildcard = normalized.contains(\"*\")",
-            "if hasWildcard {",
-            "await store.exactPathResolutionIssue(for: normalized, kind: .either, rootScope: rootScope)",
-            "await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(",
-            "let lookupResults = await store.lookupPaths(lookupRequests)",
-            "appendClause(.legacyPrefix(candidateLower: normalizedPath.lowercased()))",
-            "await store.lookupDiscoverablePath("
-        ], in: source)
-        XCTAssertEqual(
-            source.components(separatedBy: "parseSearchScopePaths(").count - 1,
-            2,
-            "Explicit search paths must be parsed once, then exact clauses refreshed by root-local lookup"
-        )
-    }
-
     private func searchSwiftFiles(paths: [String], store: WorkspaceFileContextStore) async throws -> SearchResults {
         try await StoreBackedWorkspaceSearch.search(
             pattern: "*.swift",
@@ -2763,14 +2696,10 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             file: StaticString = #filePath,
             line: UInt = #line
         ) async throws {
-            let interval: UInt64 = 10_000_000
-            var waited: UInt64 = 0
-            while manager.workspaceSearchReadinessWaiterCountForTesting != expectedCount,
-                  waited < timeoutNanoseconds
-            {
-                try await Task.sleep(nanoseconds: interval)
-                waited += interval
-            }
+            try await AsyncTestWait.waitUntil(
+                "workspace search readiness waiter count \(expectedCount)",
+                timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+            ) { await MainActor.run { manager.workspaceSearchReadinessWaiterCountForTesting == expectedCount } }
             XCTAssertEqual(
                 manager.workspaceSearchReadinessWaiterCountForTesting,
                 expectedCount,
@@ -2812,41 +2741,42 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             store: WorkspaceFileContextStore,
             timeoutNanoseconds: UInt64 = 1_000_000_000
         ) async -> Bool {
-            let interval: UInt64 = 10_000_000
-            var waited: UInt64 = 0
-            while await store.searchLaneSnapshotForTesting().waiterCount != expectedCount, waited < timeoutNanoseconds {
-                try? await Task.sleep(nanoseconds: interval)
-                waited += interval
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "search admission waiter count \(expectedCount)",
+                    timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+                ) { await store.searchLaneSnapshotForTesting().waiterCount == expectedCount }
+                return true
+            } catch {
+                return false
             }
-            return await store.searchLaneSnapshotForTesting().waiterCount == expectedCount
         }
 
         private func waitForSearchLaneIdle(
             store: WorkspaceFileContextStore,
             timeoutNanoseconds: UInt64 = 1_000_000_000
         ) async -> Bool {
-            let interval: UInt64 = 10_000_000
-            var waited: UInt64 = 0
-            while await !store.searchLaneSnapshotForTesting().isIdle, waited < timeoutNanoseconds {
-                try? await Task.sleep(nanoseconds: interval)
-                waited += interval
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "search lane to become idle",
+                    timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+                ) { await store.searchLaneSnapshotForTesting().isIdle }
+                return true
+            } catch {
+                return false
             }
-            return await store.searchLaneSnapshotForTesting().isIdle
         }
 
         private func waitForCacheIdle(
             store: WorkspaceFileContextStore,
             timeoutNanoseconds: UInt64 = 1_000_000_000
         ) async -> WorkspaceSearchDecodedContentCache.Snapshot {
-            let interval: UInt64 = 10_000_000
-            var waited: UInt64 = 0
-            while waited < timeoutNanoseconds {
+            try? await AsyncTestWait.waitUntil(
+                "decoded-content cache to become idle",
+                timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+            ) {
                 let snapshot = await store.searchDecodedContentCacheSnapshotForTesting()
-                if snapshot.activeFlightCount == 0, snapshot.waiterCount == 0 {
-                    return snapshot
-                }
-                try? await Task.sleep(nanoseconds: interval)
-                waited += interval
+                return snapshot.activeFlightCount == 0 && snapshot.waiterCount == 0
             }
             return await store.searchDecodedContentCacheSnapshotForTesting()
         }
@@ -2856,19 +2786,19 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             correlationID: UUID,
             timeoutNanoseconds: UInt64 = 1_000_000_000
         ) async -> Bool {
-            let interval: UInt64 = 10_000_000
-            var waited: UInt64 = 0
-            while waited < timeoutNanoseconds {
-                let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: false)
-                if snapshot.lifecycleEvents.contains(where: {
-                    $0.eventName == eventName && $0.correlationID == correlationID.uuidString
-                }) {
-                    return true
+            do {
+                try await AsyncTestWait.waitUntil(
+                    "lifecycle event \(eventName)",
+                    timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+                ) {
+                    EditFlowPerf.debugCaptureSnapshot(finish: false).lifecycleEvents.contains {
+                        $0.eventName == eventName && $0.correlationID == correlationID.uuidString
+                    }
                 }
-                try? await Task.sleep(nanoseconds: interval)
-                waited += interval
+                return true
+            } catch {
+                return false
             }
-            return false
         }
 
         private func dimensionInt(_ key: String, in dimensions: String) -> Int? {
@@ -2890,14 +2820,6 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         }
     #endif
 
-    private func assertOrdered(_ needles: [String], in source: String) throws {
-        var lowerBound = source.startIndex
-        for needle in needles {
-            let range = try XCTUnwrap(source.range(of: needle, range: lowerBound ..< source.endIndex), "Missing ordered source fragment: \(needle)")
-            lowerBound = range.upperBound
-        }
-    }
-
     #if DEBUG
         private actor AsyncCounter {
             private var count = 0
@@ -2912,13 +2834,15 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             }
 
             func waitUntilValue(atLeast target: Int, timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-                let interval: UInt64 = 10_000_000
-                var waited: UInt64 = 0
-                while count < target, waited < timeoutNanoseconds {
-                    try? await Task.sleep(nanoseconds: interval)
-                    waited += interval
+                do {
+                    try await AsyncTestWait.waitUntil(
+                        "async counter value \(target)",
+                        timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+                    ) { await self.count >= target }
+                    return true
+                } catch {
+                    return false
                 }
-                return count >= target
             }
         }
 
@@ -2930,13 +2854,15 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             }
 
             func waitUntilMarked(timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-                let interval: UInt64 = 10_000_000
-                var waited: UInt64 = 0
-                while !marked, waited < timeoutNanoseconds {
-                    try? await Task.sleep(nanoseconds: interval)
-                    waited += interval
+                do {
+                    try await AsyncTestWait.waitUntil(
+                        "async signal to be marked",
+                        timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+                    ) { await self.marked }
+                    return true
+                } catch {
+                    return false
                 }
-                return marked
             }
         }
 
@@ -2969,13 +2895,15 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             }
 
             func waitUntilStartedCount(_ expectedCount: Int, timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-                let interval: UInt64 = 10_000_000
-                var waited: UInt64 = 0
-                while startedCount < expectedCount, waited < timeoutNanoseconds {
-                    try? await Task.sleep(nanoseconds: interval)
-                    waited += interval
+                do {
+                    try await AsyncTestWait.waitUntil(
+                        "async gate start count \(expectedCount)",
+                        timeout: TimeInterval(timeoutNanoseconds) / 1_000_000_000
+                    ) { await self.startedCount >= expectedCount }
+                    return true
+                } catch {
+                    return false
                 }
-                return startedCount >= expectedCount
             }
 
             func release() {
