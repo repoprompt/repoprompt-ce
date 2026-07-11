@@ -485,7 +485,16 @@ actor InteractiveMCPClientSession {
                 await self?.markToolsDirty()
             }
 
-            // Register for progress notifications (emit to stderr only when enabled)
+            // Standard MCP progress for calls that carry `_meta.progressToken`.
+            await client.onNotification(ProgressNotification.self) { [weak self] notification in
+                guard await self?.progressEnabled == true else { return }
+                let params = notification.params
+                let message = params.message ?? "Progress \(params.progress)"
+                fputs("[progress] \(message)\n", stderr)
+            }
+
+            // RepoPrompt control progress remains as a compatibility path for
+            // older app builds that do not emit standard MCP progress.
             await client.onNotification(CLIProgressNotification.self) { [weak self] message in
                 guard await self?.progressEnabled == true else { return }
                 let params = message.params
@@ -778,11 +787,15 @@ actor InteractiveMCPClientSession {
         }
 
         logger.debug("Calling tool: \(name)")
+        let requestMetadata = progressEnabled
+            ? Metadata(progressToken: .unique())
+            : nil
         let registeredCall = try await registerAndSendToolCall(
             client: client,
             requestSendBarrier: requestSendBarrier,
             name: name,
-            arguments: args.isEmpty ? nil : args
+            arguments: args.isEmpty ? nil : args,
+            metadata: requestMetadata
         )
         let effectiveTimeout = resolvedTimeout(
             timeout,
@@ -808,7 +821,8 @@ actor InteractiveMCPClientSession {
         client: MCP.Client,
         requestSendBarrier: MCPRequestSendBarrier,
         name: String,
-        arguments: [String: Value]?
+        arguments: [String: Value]?,
+        metadata: Metadata?
     ) async throws -> RegisteredToolCall {
         #if DEBUG
             if let requestSendWillStart {
@@ -816,7 +830,7 @@ actor InteractiveMCPClientSession {
             }
         #endif
         try Task.checkCancellation()
-        let request = CallTool.request(.init(name: name, arguments: arguments))
+        let request = CallTool.request(.init(name: name, arguments: arguments, meta: metadata))
         await requestSendBarrier.register(requestID: request.id)
         do {
             let context = try await client.send(request)

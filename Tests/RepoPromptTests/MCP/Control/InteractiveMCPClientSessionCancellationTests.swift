@@ -253,6 +253,57 @@ import XCTest
             }
         }
 
+        func testProgressEnabledToolCallsRequestStandardMCPProgress() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = CLIProgressTokenRecorder()
+            let server = Server(
+                name: "CLI progress metadata test server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(params._meta?.progressToken)
+                return .init(
+                    content: [.text(text: "ok", annotations: nil, _meta: nil)],
+                    isError: false
+                )
+            }
+            try await server.start(transport: transports.server)
+
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI progress metadata test client", version: "1.0")
+
+            do {
+                _ = try await client.connect(transport: clientTransport)
+                let session = InteractiveMCPClientSession(
+                    connectedClientForTesting: client,
+                    requestSendBarrier: requestSendBarrier
+                )
+                await session.setProgressEnabled(true)
+
+                let result = try await session.callTool(
+                    name: "context_builder",
+                    arguments: nil,
+                    timeout: .none
+                )
+
+                XCTAssertFalse(result.isError == true)
+                let recordedToken = await recorder.recordedToken()
+                XCTAssertNotNil(recordedToken)
+                await client.disconnect()
+                await server.stop()
+            } catch {
+                await client.disconnect()
+                await server.stop()
+                throw error
+            }
+        }
+
         private func makeFixture(
             cancellationBehavior: CLICancellationBehavior = .cooperative,
             requestSendWillStart: (@Sendable () async -> Void)? = nil,
@@ -407,6 +458,18 @@ import XCTest
 
         func isSignalled() -> Bool {
             signalled
+        }
+    }
+
+    private actor CLIProgressTokenRecorder {
+        private var token: ProgressToken?
+
+        func record(_ token: ProgressToken?) {
+            self.token = token
+        }
+
+        func recordedToken() -> ProgressToken? {
+            token
         }
     }
 

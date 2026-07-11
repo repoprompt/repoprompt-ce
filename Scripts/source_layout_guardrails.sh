@@ -405,6 +405,7 @@ allowed_tracked_docs=(
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
+  "docs/mcp-progress.md"
   "docs/open-source-readiness.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"

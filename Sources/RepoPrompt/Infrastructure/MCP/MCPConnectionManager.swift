@@ -160,6 +160,27 @@ struct MCPResponseDeliverySnapshot: Equatable {
     }
 }
 
+/// Request-scoped standard MCP progress state. The progress token is supplied by
+/// the caller in `tools/call` metadata and the sequence increases once per emitted
+/// notification for the lifetime of that request.
+final class MCPRequestProgressState: @unchecked Sendable {
+    let token: ProgressToken
+
+    private let lock = NSLock()
+    private var sequence: Double = 0
+
+    init(token: ProgressToken) {
+        self.token = token
+    }
+
+    func nextSequence() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        sequence += 1
+        return sequence
+    }
+}
+
 protocol MCPServerConnection: Actor {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
@@ -193,6 +214,14 @@ protocol MCPServerConnection: Actor {
     ///   - stage: Current stage name
     ///   - message: Human-readable message
     func sendProgress(tool: String, kind: RepoPromptProgressKind, stage: String, message: String) async
+
+    /// Sends a standard MCP `notifications/progress` message associated with the
+    /// caller-provided request token.
+    func sendMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async
 }
 
 extension MCPServerConnection {
@@ -203,6 +232,12 @@ extension MCPServerConnection {
     func waitUntilResponseDeliveryDrained() async -> Bool {
         true
     }
+
+    func sendMCPProgress(
+        token _: ProgressToken,
+        progress _: Double,
+        message _: String?
+    ) async {}
 }
 
 // MARK: - Dashboard Models
@@ -2056,6 +2091,8 @@ actor ServerNetworkManager {
     @TaskLocal
     static var currentConnectionID: UUID?
     @TaskLocal
+    static var currentProgressState: MCPRequestProgressState?
+    @TaskLocal
     static var currentTabContextHint: MCPServerViewModel.TabContextHint?
     @TaskLocal
     static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
@@ -2666,19 +2703,27 @@ actor ServerNetworkManager {
     nonisolated static func withConnectionID<T>(
         _ connectionID: UUID?,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        progressState: MCPRequestProgressState? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
-        #if DEBUG || EDIT_FLOW_PERF
-            let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
-            guard let effectiveLifecycleCorrelation else {
+        // Nested window-tool dispatches re-establish the connection TaskLocal.
+        // Preserve an already-authorized request progress state unless the caller
+        // supplies a new one for a new top-level request.
+        let effectiveProgressState = progressState
+            ?? (connectionID == currentConnectionID ? currentProgressState : nil)
+        return try await $currentProgressState.withValue(effectiveProgressState) {
+            #if DEBUG || EDIT_FLOW_PERF
+                let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
+                guard let effectiveLifecycleCorrelation else {
+                    return try await $currentConnectionID.withValue(connectionID, operation: operation)
+                }
+                return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(effectiveLifecycleCorrelation) {
+                    try await $currentConnectionID.withValue(connectionID, operation: operation)
+                }
+            #else
                 return try await $currentConnectionID.withValue(connectionID, operation: operation)
-            }
-            return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(effectiveLifecycleCorrelation) {
-                try await $currentConnectionID.withValue(connectionID, operation: operation)
-            }
-        #else
-            return try await $currentConnectionID.withValue(connectionID, operation: operation)
-        #endif
+            #endif
+        }
     }
 
     func clientIdentifier(forConnection id: UUID) -> String? {
@@ -9202,14 +9247,35 @@ actor ServerNetworkManager {
         stage: String,
         message: String
     ) async {
-        guard supportsControlNotifications(connectionID: connectionID) else { return }
+        let standardProgressState = Self.currentConnectionID == connectionID
+            ? Self.currentProgressState
+            : nil
+        let supportsRepoPromptControl = supportsControlNotifications(connectionID: connectionID)
+        guard standardProgressState != nil || supportsRepoPromptControl else { return }
         #if DEBUG
             let clientName = clientIdentifier(forConnection: connectionID) ?? "unknown"
             connectionLog("progress client=\(clientName) connection=\(connectionID) tool=\(tool) kind=\(kind.rawValue) stage=\(stage) message=\(message)")
         #endif
-        if let mgr = connections[connectionID] {
+        guard let mgr = connections[connectionID] else { return }
+        if let standardProgressState {
+            let sequence = standardProgressState.nextSequence()
+            await mgr.sendMCPProgress(
+                token: standardProgressState.token,
+                progress: sequence,
+                message: "\(tool) [\(stage)]: \(message)"
+            )
+        } else if supportsRepoPromptControl {
             await mgr.sendProgress(tool: tool, kind: kind, stage: stage, message: message)
         }
+    }
+
+    /// Returns true when the current request can observe either standard MCP
+    /// progress or the RepoPrompt CLI compatibility notification.
+    func supportsProgressNotifications(connectionID: UUID) -> Bool {
+        if Self.currentConnectionID == connectionID, Self.currentProgressState != nil {
+            return true
+        }
+        return supportsControlNotifications(connectionID: connectionID)
     }
 
     /// RepoPrompt control notifications are only supported by the bundled CLI.
@@ -10715,6 +10781,9 @@ actor ServerNetworkManager {
             let capturedPreResolvedWindowID = preResolvedWindowID
             let capturedArguments = dispatchArguments
             let capturedArgsForFormatter = argsForFormatter
+            let capturedProgressState = params._meta?.progressToken.map {
+                MCPRequestProgressState(token: $0)
+            }
 
             // Snapshot routing state before entering the per-connection limiter.
             // Keep the snapshot local to this call so app-wide tools do not share
@@ -10817,7 +10886,11 @@ actor ServerNetworkManager {
                         EditFlowPerf.Dimensions(toolName: toolName)
                     ) {
                         // Wrap entire call so inner services can query current routing hints.
-                        await Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation) {
+                        await Self.withConnectionID(
+                            connectionID,
+                            lifecycleCorrelation: lifecycleCorrelation,
+                            progressState: capturedProgressState
+                        ) {
                             await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,

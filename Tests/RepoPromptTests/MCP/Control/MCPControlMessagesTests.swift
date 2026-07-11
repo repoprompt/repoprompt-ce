@@ -1,4 +1,6 @@
 import Foundation
+import MCP
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 
@@ -122,4 +124,165 @@ final class MCPControlMessagesTests: XCTestCase {
         XCTAssertEqual(decoded.message, "Cancelled by user")
         XCTAssertEqual(decoded.killedAt, killedAt)
     }
+
+    #if DEBUG
+        func testStandardMCPProgressUsesRequestTokenWhileCLIControlRemainsFallback() async {
+            let manager = ServerNetworkManager()
+            let standardConnectionID = UUID()
+            let standardConnection = ProgressRecordingMCPConnection()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: standardConnectionID,
+                connection: standardConnection,
+                pendingClientID: "Generic MCP host"
+            )
+
+            let progressState = MCPRequestProgressState(token: .string("context-builder-request"))
+            await ServerNetworkManager.withConnectionID(
+                standardConnectionID,
+                progressState: progressState
+            ) {
+                await manager.sendProgress(
+                    for: standardConnectionID,
+                    tool: "context_builder",
+                    kind: .stage,
+                    stage: "discovering",
+                    message: "Running Context Builder agent..."
+                )
+                await ServerNetworkManager.withConnectionID(standardConnectionID) {
+                    await manager.sendProgress(
+                        for: standardConnectionID,
+                        tool: "context_builder",
+                        kind: .heartbeat,
+                        stage: "discovering",
+                        message: "Still building context..."
+                    )
+                }
+            }
+
+            let standardEvents = await standardConnection.standardEvents()
+            XCTAssertEqual(standardEvents.map(\.token), [
+                .string("context-builder-request"),
+                .string("context-builder-request")
+            ])
+            XCTAssertEqual(standardEvents.map(\.progress), [1, 2])
+            XCTAssertTrue(standardEvents[0].message?.contains("context_builder [discovering]") == true)
+            let standardControlEvents = await standardConnection.controlEvents()
+            XCTAssertTrue(standardControlEvents.isEmpty)
+            await manager.debugRemoveConnection(standardConnectionID)
+
+            let compatibilityConnectionID = UUID()
+            let compatibilityConnection = ProgressRecordingMCPConnection()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: compatibilityConnectionID,
+                connection: compatibilityConnection,
+                pendingClientID: "RepoPrompt CLI (compatibility test)"
+            )
+
+            await ServerNetworkManager.withConnectionID(compatibilityConnectionID) {
+                await manager.sendProgress(
+                    for: compatibilityConnectionID,
+                    tool: "context_builder",
+                    kind: .stage,
+                    stage: "starting",
+                    message: "Starting context builder..."
+                )
+            }
+
+            let compatibilityStandardEvents = await compatibilityConnection.standardEvents()
+            XCTAssertTrue(compatibilityStandardEvents.isEmpty)
+            let controlEvents = await compatibilityConnection.controlEvents()
+            XCTAssertEqual(controlEvents.count, 1)
+            XCTAssertEqual(controlEvents.first?.tool, "context_builder")
+            XCTAssertEqual(controlEvents.first?.stage, "starting")
+            await manager.debugRemoveConnection(compatibilityConnectionID)
+        }
+    #endif
 }
+
+#if DEBUG
+    private actor ProgressRecordingMCPConnection: MCPServerConnection {
+        struct StandardEvent {
+            let token: ProgressToken
+            let progress: Double
+            let message: String?
+        }
+
+        struct ControlEvent {
+            let tool: String
+            let kind: RepoPromptProgressKind
+            let stage: String
+            let message: String
+        }
+
+        private var recordedStandardEvents: [StandardEvent] = []
+        private var recordedControlEvents: [ControlEvent] = []
+
+        nonisolated var isFilesystemBacked: Bool {
+            false
+        }
+
+        nonisolated var connectionFolderURL: URL? {
+            nil
+        }
+
+        nonisolated var capabilityToken: String? {
+            nil
+        }
+
+        func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
+        func stop() async {}
+        func abortForExecutionWatchdog() async {}
+        func notifyToolListChanged() async {}
+        func connectionState() -> ConnectionStateSnapshot {
+            .ready
+        }
+
+        func isViableForRetention() -> Bool {
+            true
+        }
+
+        func secondsSinceLastActivity() async -> TimeInterval {
+            0
+        }
+
+        func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+            nil
+        }
+
+        func terminate(reason _: TerminationReason, message _: String?) async {}
+
+        func sendProgress(
+            tool: String,
+            kind: RepoPromptProgressKind,
+            stage: String,
+            message: String
+        ) async {
+            recordedControlEvents.append(ControlEvent(
+                tool: tool,
+                kind: kind,
+                stage: stage,
+                message: message
+            ))
+        }
+
+        func sendMCPProgress(
+            token: ProgressToken,
+            progress: Double,
+            message: String?
+        ) async {
+            recordedStandardEvents.append(StandardEvent(
+                token: token,
+                progress: progress,
+                message: message
+            ))
+        }
+
+        func standardEvents() -> [StandardEvent] {
+            recordedStandardEvents
+        }
+
+        func controlEvents() -> [ControlEvent] {
+            recordedControlEvents
+        }
+    }
+#endif
