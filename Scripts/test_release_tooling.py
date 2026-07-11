@@ -1765,6 +1765,91 @@ fi
             package_script,
         )
 
+    def test_generated_tip_appcast_validation_executes_crypto_and_rejects_missing_signature(self) -> None:
+        root = SCRIPT_DIR.parent
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        app_bundle = temp_dir / "RepoPrompt.app"
+        info_plist = app_bundle / "Contents" / "Info.plist"
+        archive = temp_dir / "RepoPrompt-tip-fixture.zip"
+        appcast = temp_dir / "appcast.xml"
+        private_key_file = temp_dir / "private-key"
+        validator_tmp_dir = temp_dir / "validator-tmp"
+        info_plist.parent.mkdir(parents=True)
+        archive.write_text("signed tip archive\n", encoding="utf-8")
+        private_key = base64.b64encode(bytes(range(32))).decode("ascii")
+        private_key_file.write_text(private_key, encoding="utf-8")
+        public_key = self.run_checked(
+            ["xcrun", "swift", str(SCRIPT_DIR / "derive_sparkle_public_key.swift"), str(private_key_file)]
+        ).stdout.strip()
+        info_plist.write_bytes(plistlib.dumps({"SUPublicEDKey": public_key}))
+        signature = self.run_checked(
+            [
+                str(root / "Vendor" / "Sparkle" / "bin" / "sign_update"),
+                "--ed-key-file",
+                str(private_key_file),
+                "-p",
+                str(archive),
+            ]
+        ).stdout.strip()
+
+        def write_appcast(enclosure_signature: str) -> None:
+            appcast.write_text(
+                f"""<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <item>
+      <sparkle:version>1.2.3</sparkle:version>
+      <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+      <enclosure url="https://example.invalid/tip/{archive.name}"
+                 length="{archive.stat().st_size}"
+                 sparkle:edSignature="{enclosure_signature}" />
+    </item>
+  </channel>
+</rss>
+""",
+                encoding="utf-8",
+            )
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(SCRIPT_DIR),
+                "TIP_COMMIT": "0" * 40,
+                "TIP_BUILD_NUMBER": "1.2.3",
+                "TIP_DOWNLOAD_URL_PREFIX": "https://example.invalid/tip/",
+                "SPARKLE_PRIVATE_KEY": private_key,
+                "VALIDATOR_APP_BUNDLE": str(app_bundle),
+                "VALIDATOR_UPDATE_ZIP": str(archive),
+                "VALIDATOR_APPCAST": str(appcast),
+                "VALIDATOR_TMP_DIR": str(validator_tmp_dir),
+            }
+        )
+        command = [
+            "bash",
+            "-c",
+            """source "$1"
+APP_BUNDLE="$VALIDATOR_APP_BUNDLE"
+UPDATE_ZIP="$VALIDATOR_UPDATE_ZIP"
+APPCAST="$VALIDATOR_APPCAST"
+TMP_DIR="$VALIDATOR_TMP_DIR"
+mkdir -p "$TMP_DIR"
+MARKETING_VERSION="9.8.7"
+validate_generated_tip_appcast""",
+            "tip-appcast-validation",
+            str(SCRIPT_DIR / "main_tip_release.sh"),
+        ]
+
+        write_appcast(signature)
+        accepted = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        write_appcast("")
+        rejected = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected.stderr)
+
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
         package_manifest = (root / "Package.swift").read_text(encoding="utf-8")

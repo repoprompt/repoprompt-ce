@@ -189,11 +189,11 @@ values = [
     item.findtext(f"{{{sparkle}}}version", default=""),
     item.findtext(f"{{{sparkle}}}shortVersionString", default=""),
 ]
-print("\t".join(values))
+print("\x1f".join(values))
 PYTHON
 
     local enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing
-    IFS=$'\t' read -r enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing < "$appcast_values"
+    IFS=$'\x1f' read -r enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing < "$appcast_values"
     [[ "$enclosure_url" == "$TIP_DOWNLOAD_URL_PREFIX$(basename "$UPDATE_ZIP")" ]] ||
         fail "Tip appcast enclosure URL mismatch: $enclosure_url"
     [[ -n "$enclosure_signature" ]] || fail "Tip appcast enclosure is missing an EdDSA signature"
@@ -322,9 +322,11 @@ publish_tip() {
     printf 'OK: published tip update release %s to %s.\n' "$TIP_TAG" "$TIP_UPDATE_REPOSITORY"
 }
 
-case "$MODE" in
-    stage) stage_tip ;;
-    sign) sign_tip ;;
-    publish-tip) publish_tip ;;
-    *) fail "Usage: $0 stage|sign|publish-tip" ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        stage) stage_tip ;;
+        sign) sign_tip ;;
+        publish-tip) publish_tip ;;
+        *) fail "Usage: $0 stage|sign|publish-tip" ;;
+    esac
+fi
