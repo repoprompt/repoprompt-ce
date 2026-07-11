@@ -108,13 +108,16 @@ enum ProcessEnvironmentBuilder {
         )
     }
 
-    private static func preferredShellCaptureMode(for purpose: ProcessLaunchPurpose) -> ShellEnvironmentCaptureMode {
-        switch purpose {
-        case .codexAppServer, .codexPreflight:
-            .loginShell
-        default:
-            .interactiveLoginShell
-        }
+    /// Returns the login-shell capture mode for a launch purpose.
+    ///
+    /// All purposes — including Codex (`.codexAppServer` / `.codexPreflight`) — capture an
+    /// **interactive** login shell so toolchain setup that lives only in `~/.zshrc` (e.g.
+    /// nvm, plus the Homebrew/PATH setup it depends on) is ordinarily included in the captured PATH.
+    /// A non-interactive capture skips `~/.zshrc`, which previously left an nvm-installed
+    /// `codex` unresolvable (issue repoprompt/repoprompt-ce#471). The capture is cached per
+    /// mode by `CLIEnvironmentCache`, so this does not spawn a shell per launch.
+    static func preferredShellCaptureMode(for purpose: ProcessLaunchPurpose) -> ShellEnvironmentCaptureMode {
+        .interactiveLoginShell
     }
 
     private static func shouldUseInheritedEnvironment(
