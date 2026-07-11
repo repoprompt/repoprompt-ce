@@ -1231,6 +1231,108 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertNotIn(token, "\n".join(argv))
         self.assertEqual(token_capture.read_text(encoding="utf-8"), token)
 
+    def run_sentry_prepare_fixture(
+        self,
+        lookup_mode: str,
+        attempts: int = 1,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        call_log = temp_dir / "sentry-calls.log"
+        release_state = temp_dir / "release-created"
+        fake_cli = temp_dir / "sentry-cli"
+        fake_cli.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$SENTRY_CALL_LOG"
+if [[ "$*" == *"releases info"* ]]; then
+    case "$SENTRY_LOOKUP_MODE" in
+        not-found-once)
+            if [[ -f "$SENTRY_RELEASE_STATE" ]]; then
+                exit 0
+            fi
+            printf 'error: release not found (404)\n' >&2
+            exit 1
+            ;;
+        denied)
+            printf 'error: authentication failed\n' >&2
+            exit 2
+            ;;
+        existing)
+            exit 0
+            ;;
+    esac
+fi
+if [[ "$*" == *"releases new"* ]]; then
+    : > "$SENTRY_RELEASE_STATE"
+fi
+""",
+            encoding="utf-8",
+        )
+        fake_cli.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{temp_dir}:{env.get('PATH', '')}",
+                "REPOPROMPT_ENABLE_SENTRY": "1",
+                "SENTRY_AUTH_TOKEN": "fixture-token",
+                "REPOPROMPT_SENTRY_ORG": "fixture-org",
+                "REPOPROMPT_SENTRY_PROJECT": "fixture-project",
+                "SOURCE_GITHUB_REPOSITORY": "fixture/repository",
+                "RELEASE_COMMIT": "0123456789abcdef",
+                "SENTRY_LOOKUP_MODE": lookup_mode,
+                "SENTRY_CALL_LOG": str(call_log),
+                "SENTRY_RELEASE_STATE": str(release_state),
+                "ATTEMPTS": str(attempts),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; for ((attempt = 0; attempt < ATTEMPTS; attempt++)); do prepare_sentry_release; done',
+                "sentry-release-test",
+                str(SCRIPT_DIR / "release.sh"),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        calls = call_log.read_text(encoding="utf-8").splitlines() if call_log.exists() else []
+        return result, calls
+
+    def test_sentry_release_prepare_creates_only_for_not_found_and_is_retry_safe(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("not-found-once", attempts=2)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum("releases info" in call for call in calls), 2)
+        self.assertEqual(sum("releases new" in call for call in calls), 1)
+        self.assertEqual(sum("releases set-commits" in call for call in calls), 2)
+        self.assertTrue(
+            any(
+                "--org fixture-org releases new --project fixture-project "
+                "com.pvncher.repoprompt.ce@" in call
+                for call in calls
+            )
+        )
+        self.assertTrue(
+            all(
+                "--commit fixture/repository@0123456789abcdef" in call
+                for call in calls
+                if "releases set-commits" in call
+            )
+        )
+
+    def test_sentry_release_prepare_does_not_create_after_lookup_failure(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("denied")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sum("releases info" in call for call in calls), 1)
+        self.assertFalse(any("releases new" in call for call in calls))
+        self.assertFalse(any("releases set-commits" in call for call in calls))
+        self.assertIn("refusing to create it", result.stderr)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr)
+
     def test_sentry_symbol_flow_is_explicit_secret_safe_and_release_only_by_default(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         universal_builder = (SCRIPT_DIR / "build_swiftpm_release_products.sh").read_text(encoding="utf-8")
@@ -1251,6 +1353,27 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn('SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"', release_script)
         self.assertIn('ditto "$SENTRY_SYMBOLS_DIR" "$stage_root/.build/sentry-symbols/release"', release_script)
         self.assertIn('upload_required_sentry_symbols', release_script)
+        self.assertIn('SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"', release_script)
+        self.assertIn('require_sentry_publish_configuration() {', release_script)
+        self.assertIn('require_command sentry-cli', release_script)
+        self.assertIn('prepare_sentry_release', release_script)
+        self.assertIn('releases new', release_script)
+        self.assertIn('releases set-commits', release_script)
+        self.assertIn('--commit "$source_repository@$RELEASE_COMMIT"', release_script)
+        self.assertIn('finalize_sentry_release', release_script)
+        self.assertIn('releases finalize "$SENTRY_RELEASE_NAME"', release_script)
+        self.assertIn('record_sentry_production_deploy', release_script)
+        self.assertIn('releases deploys "$SENTRY_RELEASE_NAME" new', release_script)
+        self.assertIn('--env "$SENTRY_DEPLOY_ENVIRONMENT"', release_script)
+        self.assertIn('--name "$RELEASE_TAG"', release_script)
+        self.assertIn('SENTRY_AUTH_TOKEN="$(tr -d', release_script)
+
+        publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}\n\ncase", 1)[0]
+        self.assertLess(publish_staged.index("prepare_sentry_release"), publish_staged.index("upload_required_sentry_symbols"))
+        self.assertLess(publish_staged.index("upload_required_sentry_symbols"), publish_staged.index("gh release view"))
+        self.assertLess(publish_staged.index("gh release view"), publish_staged.index("gh release create"))
+        self.assertLess(publish_staged.index("gh release create"), publish_staged.index("finalize_sentry_release"))
+        self.assertLess(publish_staged.index("finalize_sentry_release"), publish_staged.index("record_sentry_production_deploy"))
 
         stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
         publish_job = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
@@ -1263,8 +1386,10 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
             publish_job.index("Install Sentry CLI when symbol upload is configured"),
             publish_job.index("Sign, notarize, and create draft release"),
         )
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', publish_job)
         self.assertIn("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}", publish_job)
         self.assertIn("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}", publish_job)
+        self.assertIn("REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT: production", publish_job)
 
         self.assertIn('"REPOPROMPT_ENABLE_SENTRY"', conductor)
         self.assertIn('"REPOPROMPT_UPLOAD_SENTRY_SYMBOLS"', conductor)
@@ -1631,9 +1756,21 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn('REPOPROMPT_TELEMETRY_DISABLED', bootstrap_source)
         self.assertIn('GlobalSettingsStore.shared.telemetryEnabled()', bootstrap_source)
         self.assertIn('options.beforeSend', bootstrap_source)
+        self.assertIn('options.enableCaptureFailedRequests = false', bootstrap_source)
+        self.assertIn('options.enableAutoSessionTracking = false', bootstrap_source)
+        self.assertIn('event.request = nil', bootstrap_source)
+        self.assertIn('event.user = nil', bootstrap_source)
+        self.assertIn('event.serverName = nil', bootstrap_source)
+        self.assertIn('deviceIdentifierKeys', bootstrap_source)
+        self.assertIn('geoPayloadKeys', bootstrap_source)
+        self.assertIn('options.dist = nil', bootstrap_source)
         self.assertIn('options.tracesSampleRate = performanceTracingEnabled ? 0.05 : 0', bootstrap_source)
         self.assertIn('#if DEBUG\n                if let value = ProcessInfo.processInfo.environment["REPOPROMPT_SENTRY_DSN"]', bootstrap_source)
         self.assertIn('Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN', release_script)
+        self.assertIn('SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"', release_script)
+        self.assertIn('prepare_sentry_release', release_script)
+        self.assertIn('finalize_sentry_release', release_script)
+        self.assertIn('record_sentry_production_deploy', release_script)
 
         pins = {pin["identity"]: pin for pin in package_resolved["pins"]}
         self.assertEqual(pins["sentry-cocoa"]["state"]["version"], "9.17.1")

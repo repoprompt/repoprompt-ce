@@ -4,6 +4,33 @@ import XCTest
 
 @MainActor
 final class WorkspaceSwitchRecoveryTests: XCTestCase {
+    private var originalMCPAutoStart: Bool?
+    private var originalGlobalCustomStorageURL: Any?
+    private var hadOriginalGlobalCustomStorageURL = false
+
+    override func setUp() {
+        super.setUp()
+        originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        originalGlobalCustomStorageURL = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
+        hadOriginalGlobalCustomStorageURL =
+            UserDefaults.standard.object(forKey: "GlobalCustomStorageURL") != nil
+    }
+
+    override func tearDown() {
+        if let originalMCPAutoStart {
+            GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
+        }
+        if hadOriginalGlobalCustomStorageURL {
+            UserDefaults.standard.set(originalGlobalCustomStorageURL, forKey: "GlobalCustomStorageURL")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+        }
+        originalMCPAutoStart = nil
+        originalGlobalCustomStorageURL = nil
+        hadOriginalGlobalCustomStorageURL = false
+        super.tearDown()
+    }
+
     func testConcurrentStaleRequestReportsActiveSwitchAndForcedUnloadEventuallyClearsGuard() async throws {
         let root = try makeTemporaryDirectory(named: "ForcedUnloadRecovery")
         defer { try? FileManager.default.removeItem(at: root) }

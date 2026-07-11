@@ -21,6 +21,8 @@ APPCAST="$DIST_DIR/appcast.xml"
 CHECKSUMS="$DIST_DIR/SHA256SUMS"
 BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
+SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"
+SENTRY_DEPLOY_ENVIRONMENT="${REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT:-production}"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
 STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
@@ -181,15 +183,69 @@ require_staged_sentry_symbols_when_enabled() {
     fi
 }
 
-require_sentry_publish_symbol_upload_configuration() {
+require_sentry_publish_configuration() {
     sentry_linking_enabled || return 0
-    [[ -n "${SENTRY_AUTH_TOKEN:-}" || -n "${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}" ]] || fail "Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN or REPOPROMPT_SENTRY_AUTH_TOKEN_FILE for debug symbol upload."
+    [[ -n "${SENTRY_AUTH_TOKEN:-}" || -n "${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}" ]] || fail "Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN or REPOPROMPT_SENTRY_AUTH_TOKEN_FILE for Sentry release metadata and debug symbol upload."
     require_env REPOPROMPT_SENTRY_ORG
     require_env REPOPROMPT_SENTRY_PROJECT
+    require_command sentry-cli
+}
+
+load_sentry_auth_token_for_publish() {
+    sentry_linking_enabled || return 0
+    if [[ -z "${SENTRY_AUTH_TOKEN:-}" ]]; then
+        local token_file="${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}"
+        [[ -n "$token_file" ]] || fail "Missing Sentry auth token file"
+        [[ -f "$token_file" ]] || fail "Sentry auth token file does not exist: $token_file"
+        SENTRY_AUTH_TOKEN="$(tr -d '\r\n' < "$token_file")"
+        export SENTRY_AUTH_TOKEN
+    fi
+    [[ -n "$SENTRY_AUTH_TOKEN" ]] || fail "Sentry auth token file was empty"
+}
+
+prepare_sentry_release() {
+    sentry_linking_enabled || return 0
+    load_sentry_auth_token_for_publish
+    local source_repository="${SOURCE_GITHUB_REPOSITORY:-$GITHUB_REPOSITORY}"
+    [[ -n "$source_repository" ]] || fail "Missing SOURCE_GITHUB_REPOSITORY for Sentry commit association"
+    printf 'Preparing Sentry release %s for %s/%s.\n' "$SENTRY_RELEASE_NAME" "$REPOPROMPT_SENTRY_ORG" "$REPOPROMPT_SENTRY_PROJECT"
+    local lookup_error=""
+    if lookup_error="$(sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases info "$SENTRY_RELEASE_NAME" 2>&1 >/dev/null)"; then
+        :
+    else
+        local normalized_lookup_error
+        normalized_lookup_error="$(printf '%s' "$lookup_error" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$normalized_lookup_error" == *"release not found"* ||
+            "$normalized_lookup_error" == *"release does not exist"* ||
+            "$normalized_lookup_error" =~ (^|[^0-9])404([^0-9]|$) ]]; then
+            sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases new \
+                --project "$REPOPROMPT_SENTRY_PROJECT" \
+                "$SENTRY_RELEASE_NAME"
+        else
+            fail "Unable to look up Sentry release $SENTRY_RELEASE_NAME; refusing to create it after an authentication, authorization, or network failure."
+        fi
+    fi
+    sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases set-commits \
+        "$SENTRY_RELEASE_NAME" \
+        --commit "$source_repository@$RELEASE_COMMIT"
+}
+
+finalize_sentry_release() {
+    sentry_linking_enabled || return 0
+    load_sentry_auth_token_for_publish
+    sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases finalize "$SENTRY_RELEASE_NAME"
+}
+
+record_sentry_production_deploy() {
+    sentry_linking_enabled || return 0
+    load_sentry_auth_token_for_publish
+    sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases deploys "$SENTRY_RELEASE_NAME" new \
+        --env "$SENTRY_DEPLOY_ENVIRONMENT" \
+        --name "$RELEASE_TAG"
 }
 
 upload_required_sentry_symbols() {
-    require_sentry_publish_symbol_upload_configuration
+    require_sentry_publish_configuration
     "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" "$SENTRY_SYMBOLS_DIR"
 }
 
@@ -238,7 +294,7 @@ verify_publish_inputs() {
     require_release_tag_matches_metadata
     require_file "$REPOPROMPT_PROVISIONING_PROFILE"
     require_file "$NOTARYTOOL_PRIVATE_KEY"
-    require_sentry_publish_symbol_upload_configuration
+    require_sentry_publish_configuration
 
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
 }
@@ -317,6 +373,7 @@ publish_staged_release() {
     xcrun stapler validate "$APP_BUNDLE"
     write_final_artifact_manifest
     validate_public_app "$APP_BUNDLE" "$FINAL_ARTIFACT_MANIFEST" "Final Developer ID app"
+    prepare_sentry_release
     upload_required_sentry_symbols
 
     local distribution_dir="$TMP_DIR/distribution"
@@ -366,15 +423,24 @@ publish_staged_release() {
         --draft
         --target "$RELEASE_COMMIT"
     )
+    local existing_release_state=""
+    if existing_release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+        fail "GitHub release $RELEASE_TAG already exists (isDraft=$existing_release_state). Refusing to repeat Sentry finalization or deploy publication; inspect the existing draft and Sentry release before manual recovery."
+    fi
     gh release create "${release_args[@]}"
     printf 'Created draft GitHub release assets for %s.\n' "$RELEASE_TAG"
+
+    finalize_sentry_release
+    record_sentry_production_deploy
 }
 
-case "$MODE" in
-    sync-cli-version) sync_mcp_cli_version ;;
-    preflight) run_preflight ;;
-    artifact) package_release_candidate ;;
-    stage-publish) stage_publish_release ;;
-    publish-staged) publish_staged_release ;;
-    *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged" ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        sync-cli-version) sync_mcp_cli_version ;;
+        preflight) run_preflight ;;
+        artifact) package_release_candidate ;;
+        stage-publish) stage_publish_release ;;
+        publish-staged) publish_staged_release ;;
+        *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged" ;;
+    esac
+fi

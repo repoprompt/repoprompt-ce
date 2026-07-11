@@ -1008,7 +1008,7 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
     let hydratedBindingTransitionGeneration: UInt64?
     let performanceSnapshot: AgentTranscriptPerformanceSnapshot
     let metadata: AgentTranscriptPresentationMetadata
-    let rawToolResultPayloadRenderRevision: Int
+    let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
 
     init(
         tabID: UUID? = nil,
@@ -1028,7 +1028,7 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
         hydratedBindingTransitionGeneration: UInt64? = nil,
         performanceSnapshot: AgentTranscriptPerformanceSnapshot = .empty,
         metadata: AgentTranscriptPresentationMetadata = .empty,
-        rawToolResultPayloadRenderRevision: Int = 0
+        rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
     ) {
         self.tabID = tabID
         self.revision = revision
@@ -1047,7 +1047,7 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
         self.hydratedBindingTransitionGeneration = hydratedBindingTransitionGeneration
         self.performanceSnapshot = performanceSnapshot
         self.metadata = metadata
-        self.rawToolResultPayloadRenderRevision = rawToolResultPayloadRenderRevision
+        self.rawToolResultPayloadRenderRevisionByItemID = rawToolResultPayloadRenderRevisionByItemID
     }
 
     func contentEqualsExcludingPerformance(_ other: Self) -> Bool {
@@ -1066,7 +1066,7 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
             && hydratedPersistentBinding == other.hydratedPersistentBinding
             && hydratedBindingTransitionGeneration == other.hydratedBindingTransitionGeneration
             && metadata == other.metadata
-            && rawToolResultPayloadRenderRevision == other.rawToolResultPayloadRenderRevision
+            && rawToolResultPayloadRenderRevisionByItemID == other.rawToolResultPayloadRenderRevisionByItemID
     }
 
     func hasVisiblePresentationDelta(comparedTo other: Self) -> Bool {
@@ -1076,7 +1076,7 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
             || isCompressedHistoryRevealed != other.isCompressedHistoryRevealed
             || isTranscriptWindowExpanded != other.isTranscriptWindowExpanded
             || isWindowCappedWhileActive != other.isWindowCappedWhileActive
-            || rawToolResultPayloadRenderRevision != other.rawToolResultPayloadRenderRevision
+            || rawToolResultPayloadRenderRevisionByItemID != other.rawToolResultPayloadRenderRevisionByItemID
     }
 
     static let empty = AgentTranscriptPresentationSnapshot()

@@ -140,6 +140,9 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertFalse(window.apiSettingsViewModel.test_hasPreparedForWindowClose)
         window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
         guard await waitForSubscriberCount(1, pollingService: pollingService) else { return }
+        // Use Context Builder's product-valid selected-agent path; forcing a Codex
+        // subscription while the selected agent is non-Codex can be stopped by
+        // normal model-polling reconciliation before this assertion runs.
         window.contextBuilderAgentViewModel.selectedAgent = .codexExec
         XCTAssertTrue(window.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask)
         guard await waitForSubscriberCount(2, pollingService: pollingService) else { return }

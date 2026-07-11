@@ -755,7 +755,7 @@ extension AgentModeViewModel {
         let analyticsSnapshot: AgentTranscriptAnalyticsSnapshot
         let sanitizedActivityCount: Int
         let performanceSnapshot: AgentTranscriptPerformanceSnapshot
-        let rawToolResultPayloadRenderRevision: Int
+        let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
     }
 
     enum DerivedTranscriptRefreshReason: String {
