@@ -26,7 +26,7 @@ class CacheInventoryTests(unittest.TestCase):
             (root / "Package.swift").write_text('// swift-tools-version:5.9\n', encoding="utf-8")
             identity = cache_inventory.resolve_swiftpm_cache_identity(root, "debug", {})
         self.assertEqual(identity.source, cache_inventory.CacheSource.DEFAULT)
-        self.assertEqual(identity.effective_path, root / ".build")
+        self.assertEqual(identity.effective_path, root.resolve() / ".build")
         self.assertIsNone(identity.developer_root)
         self.assertIn("debug", identity.key())
 
@@ -38,7 +38,7 @@ class CacheInventoryTests(unittest.TestCase):
             env = {"REPOPROMPT_SWIFTPM_SCRATCH_PATH": str(exact)}
             identity = cache_inventory.resolve_swiftpm_cache_identity(root, "debug", env)
         self.assertEqual(identity.source, cache_inventory.CacheSource.EXACT_ENV)
-        self.assertEqual(identity.effective_path, exact)
+        self.assertEqual(identity.effective_path, exact.resolve())
 
     def test_developer_root_identity_is_keyed_under_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -49,7 +49,7 @@ class CacheInventoryTests(unittest.TestCase):
             env = {"REPOPROMPT_DEVELOPER_SWIFTPM_SCRATCH_ROOT": str(dev_root)}
             identity = cache_inventory.resolve_swiftpm_cache_identity(root, "debug", env)
         self.assertEqual(identity.source, cache_inventory.CacheSource.DEVELOPER_ROOT)
-        self.assertEqual(identity.developer_root, str(dev_root))
+        self.assertEqual(identity.developer_root, str(dev_root.resolve()))
         self.assertTrue(cache_inventory.is_path_within(identity.effective_path, dev_root))
         self.assertIn(cache_inventory.repo_hash(root)[:8], identity.key())
 
@@ -59,7 +59,7 @@ class CacheInventoryTests(unittest.TestCase):
             container = root / ".repoprompt-worktrees" / "group"
             repo_root = container / "wt-a"
             repo_root.mkdir(parents=True)
-            self.assertEqual(cache_inventory.managed_worktree_container(repo_root), container)
+            self.assertEqual(cache_inventory.managed_worktree_container(repo_root), container.resolve())
 
     def test_managed_worktree_repo_roots_includes_siblings_and_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -74,7 +74,7 @@ class CacheInventoryTests(unittest.TestCase):
             (current / ".build").mkdir()
             (sibling / ".build").mkdir()
             roots = cache_inventory.managed_worktree_repo_roots(current)
-        self.assertEqual(roots, [current, sibling])
+        self.assertEqual(roots, [current.resolve(), sibling.resolve()])
 
     def test_cleanup_plan_skips_current_and_marks_siblings_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,14 +92,14 @@ class CacheInventoryTests(unittest.TestCase):
             plan = cache_inventory.plan_build_cache_cleanup(current)
 
         self.assertEqual(len(plan.entries), 2)
-        current_entry = next(e for e in plan.entries if e.repo_root == current)
-        sibling_entry = next(e for e in plan.entries if e.repo_root == sibling)
+        current_entry = next(e for e in plan.entries if e.repo_root == current.resolve())
+        sibling_entry = next(e for e in plan.entries if e.repo_root == sibling.resolve())
         self.assertTrue(current_entry.current)
         self.assertIn("current", current_entry.skip_reasons)
         self.assertFalse(sibling_entry.current)
         self.assertEqual(sibling_entry.skip_reasons, [])
         self.assertEqual(len(plan.eligible_entries), 1)
-        self.assertEqual(plan.eligible_entries[0].repo_root, sibling)
+        self.assertEqual(plan.eligible_entries[0].repo_root, sibling.resolve())
 
     def test_cleanup_plan_respects_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,7 +173,7 @@ class CacheInventoryTests(unittest.TestCase):
             (sibling / ".build").symlink_to(target, target_is_directory=True)
 
             plan = cache_inventory.plan_build_cache_cleanup(sibling)
-            entry = next(e for e in plan.entries if e.path == sibling / ".build")
+            entry = next(e for e in plan.entries if e.path == sibling.resolve() / ".build")
 
         self.assertIn("symlink", entry.skip_reasons)
         self.assertNotEqual(entry.path, target.resolve())
@@ -241,7 +241,7 @@ class CacheInventoryTests(unittest.TestCase):
             )
         self.assertIn("package_app.sh", argv[0])
         expected_path = scratch / cache_inventory.resolve_swiftpm_cache_identity(root, "debug", env).key()
-        self.assertEqual(out_env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"], str(expected_path))
+        self.assertEqual(out_env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"], str(expected_path.resolve()))
 
     def test_conductor_registry_cache_cleanup_delegates_internal_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

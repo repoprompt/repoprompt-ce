@@ -1283,7 +1283,10 @@ class OperationRegistry:
         return cache_inventory.resolve_swiftpm_cache_identity(self.repo_root, configuration, env)
 
     def _default_build_cache_path(self) -> Path:
-        return self.repo_root / ".build"
+        # Cache identities are canonicalized by cache_inventory. Canonicalize
+        # the default as well so macOS's /var -> /private/var alias does not
+        # turn the ordinary in-tree cache into an explicit scratch override.
+        return self.repo_root.resolve() / ".build"
 
     @classmethod
     def client_env_snapshot(cls) -> Dict[str, str]:
@@ -4262,7 +4265,7 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 def operation_swift_build_all(repo_root: Path, args: Dict[str, Any]) -> int:
     scratch_path = args.get("scratchPath")
-    default_path = str(repo_root / ".build")
+    default_path = str(repo_root.resolve() / ".build")
     if scratch_path and scratch_path != default_path:
         base_argv = ["swift", "build", "--scratch-path", scratch_path]
     else:
