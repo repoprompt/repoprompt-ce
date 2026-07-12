@@ -639,7 +639,12 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let tabID = try XCTUnwrap(workspace.activeComposeTabID)
         var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
         composeTab.selection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
-        window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+        XCTAssertTrue(
+            window.workspaceManager.updateComposeTabStoredOnly(
+                composeTab,
+                inWorkspaceID: workspace.id
+            )
+        )
         try await AsyncTestWait.waitUntil("selected code structure candidates are cataloged", timeout: 5) {
             let resolution = await store.resolveSelectedCodeStructureFiles(
                 atPaths: files.map(\.standardizedFullPath),
