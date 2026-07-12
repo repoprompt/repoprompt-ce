@@ -3373,6 +3373,11 @@ final class AgentModeViewModel: ObservableObject {
             tabID: session.tabID,
             sessionID: sessionID
         )
+        postAgentSessionBindingDidChange(
+            tabID: session.tabID,
+            previousSessionID: previousSessionID,
+            sessionID: sessionID
+        )
 
         if session.tabID == currentTabID {
             publishLoadingTranscriptPresentation(tabID: session.tabID)
@@ -3390,6 +3395,23 @@ final class AgentModeViewModel: ObservableObject {
             )
         #endif
         return binding
+    }
+
+    private func postAgentSessionBindingDidChange(
+        tabID: UUID,
+        previousSessionID: UUID?,
+        sessionID: UUID?
+    ) {
+        NotificationCenter.default.post(
+            name: .agentSessionBindingDidChange,
+            object: self,
+            userInfo: [
+                "tabID": tabID,
+                "windowID": windowID,
+                "previousSessionID": previousSessionID as Any,
+                "sessionID": sessionID as Any
+            ]
+        )
     }
 
     /// Single creation point for attaching an Agent session identity to a compose tab.
@@ -15624,6 +15646,14 @@ final class AgentModeViewModel: ObservableObject {
         removeSessionIndex(sessionID: sessionID)
         if let cleanupRegistration {
             await AgentRunSessionStore.cleanup(registration: cleanupRegistration)
+        }
+
+        for tabID in clearedComposeTabIDs.union(clearedStashedTabIDs) {
+            postAgentSessionBindingDidChange(
+                tabID: tabID,
+                previousSessionID: sessionID,
+                sessionID: nil
+            )
         }
 
         let activeTabID = currentTabID
