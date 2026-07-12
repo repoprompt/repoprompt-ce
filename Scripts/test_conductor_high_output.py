@@ -243,6 +243,7 @@ class HighOutputDiagnosticTest(unittest.TestCase):
         peak_child = 0
         peak_daemon = 0
         samples = 0
+        deadline = time.monotonic() + 30.0
         while True:
             snapshot = conductor_diagnostics.process_resource_snapshot()
             if daemon_pid in snapshot:
@@ -254,6 +255,8 @@ class HighOutputDiagnosticTest(unittest.TestCase):
             status = self._request({"type": "job-status", "ticket": ticket}, socket_timeout=2.0)
             if status.get("state") in {"completed", "failed", "canceled"}:
                 break
+            if time.monotonic() > deadline:
+                self.fail("resource polling exceeded deadline")
             time.sleep(0.1)
 
         self._wait_for_terminal(ticket)
