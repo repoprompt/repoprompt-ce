@@ -169,6 +169,15 @@ def _toolchain_id(env: Dict[str, str]) -> str:
 
 
 def _macos_version() -> Optional[str]:
+    # Prefer the in-process platform value. Besides avoiding a needless process
+    # launch on every cache-identity lookup, this keeps the identity resolver
+    # independent from conductor's subprocess transport in lifecycle tests.
+    try:
+        version = platform.mac_ver()[0]
+        if version:
+            return ".".join(version.split(".")[:2])
+    except Exception:
+        pass
     try:
         result = subprocess.run(
             ["sw_vers", "-productVersion"],
@@ -181,12 +190,6 @@ def _macos_version() -> Optional[str]:
         if version:
             return ".".join(version.split(".")[:2])
     except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        version = platform.mac_ver()[0]
-        if version:
-            return ".".join(version.split(".")[:2])
-    except Exception:
         pass
     return None
 

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import cache_inventory
@@ -20,6 +21,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class CacheInventoryTests(unittest.TestCase):
+    def test_macos_version_prefers_platform_value_without_spawning_process(self) -> None:
+        with mock.patch.object(cache_inventory.platform, "mac_ver", return_value=("15.4.1", ("", "", ""), "")), mock.patch.object(
+            cache_inventory.subprocess,
+            "run",
+        ) as run:
+            self.assertEqual(cache_inventory._macos_version(), "15.4")
+
+        run.assert_not_called()
+
     def test_default_identity_points_to_dot_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
