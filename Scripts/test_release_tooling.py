@@ -23,6 +23,40 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_debug_provenance_uses_json_validation_and_rejects_truncated_output(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        validator = SCRIPT_DIR / "validate_json.py"
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        provenance = temp_dir / "RepoPromptDebugProvenance.json"
+
+        self.assertIn(
+            'run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_json.py" \\\n        "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"',
+            package_script,
+        )
+        self.assertNotIn(
+            'plutil -lint "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"',
+            package_script,
+        )
+
+        provenance.write_text('{"version": 1}\n', encoding="utf-8")
+        valid = subprocess.run(
+            [sys.executable, str(validator), str(provenance)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        self.assertEqual(valid.stdout.strip(), f"Valid JSON: {provenance}")
+
+        provenance.write_text('{"version":', encoding="utf-8")
+        truncated = subprocess.run(
+            [sys.executable, str(validator), str(provenance)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(truncated.returncode, 1)
+        self.assertIn(f"error: invalid JSON file {provenance}:", truncated.stderr)
+
     def test_runtime_signing_policy_matches_release_metadata_and_entitlement_templates(self) -> None:
         root = SCRIPT_DIR.parent
         metadata = {}
@@ -1708,6 +1742,17 @@ fi
         self.assertNotIn('BUILD_NUMBER="$TIP_BUILD_NUMBER"', tip_script)
         self.assertIn("stage|sign|publish-tip", tip_script)
 
+        sign_tip = tip_script.split("sign_tip() {", 1)[1].split("\n}", 1)[0]
+        generate_appcast = sign_tip.index('"$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast"')
+        validate_appcast = sign_tip.index("validate_generated_tip_appcast")
+        write_checksums = sign_tip.index('shasum -a 256', validate_appcast)
+        self.assertLess(generate_appcast, validate_appcast)
+        self.assertLess(validate_appcast, write_checksums)
+        self.assertIn('fail "Tip appcast enclosure is missing an EdDSA signature"', tip_script)
+        self.assertIn('fail "Tip Sparkle private key does not match the app bundle SUPublicEDKey"', tip_script)
+        self.assertIn('fail "Tip Sparkle private key does not reproduce the generated appcast signature"', tip_script)
+        self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"', tip_script)
+
         capture_override = package_script.index(
             'RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"'
         )
@@ -1719,6 +1764,264 @@ fi
             'fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"',
             package_script,
         )
+
+    def test_main_tip_setup_uses_anonymous_release_lookup_helper(self) -> None:
+        tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  stage:", 1)[0]
+        before_publish, publish_job = tip_workflow.split("\n  publish:", 1)
+
+        self.assertIn("permissions:\n  contents: read", tip_workflow)
+        self.assertIn("./Scripts/lookup_public_tip_release.sh", setup_job)
+        self.assertNotIn("GITHUB_TOKEN", setup_job)
+        self.assertNotIn("Authorization:", setup_job)
+        self.assertNotIn("api.github.com", setup_job)
+        self.assertNotIn("TIP_UPDATE_REPOSITORY_TOKEN", before_publish)
+        self.assertIn("TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}", publish_job)
+        self.assertEqual(tip_workflow.count("TIP_UPDATE_REPOSITORY_TOKEN"), 1)
+
+    def test_public_tip_release_lookup_helper_handles_github_outcomes_safely(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        tools = root / "tools"
+        tools.mkdir()
+        calls = root / "curl-calls"
+        archive_basename = "RepoPrompt-tip-fixture-1.2.3"
+        fake_curl = tools / "curl"
+        fake_curl.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+
+def option(name):
+    return args[args.index(name) + 1]
+
+request_headers = [args[index + 1] for index, value in enumerate(args) if value == "--header"]
+if any(header.lower().startswith("authorization:") for header in request_headers):
+    raise SystemExit(90)
+if any(option_name in args for option_name in ("--user", "--netrc", "--netrc-file", "-u")):
+    raise SystemExit(91)
+if "Accept: application/vnd.github+json" not in request_headers:
+    raise SystemExit(92)
+if "X-GitHub-Api-Version: 2022-11-28" not in request_headers:
+    raise SystemExit(93)
+if option("--connect-timeout") != "10" or option("--max-time") != "30":
+    raise SystemExit(94)
+
+calls = Path(os.environ["FAKE_CURL_CALLS"])
+with calls.open("a", encoding="utf-8") as handle:
+    handle.write("call\\n")
+
+scenario = os.environ["FAKE_GITHUB_SCENARIO"]
+if scenario == "transport":
+    raise SystemExit(7)
+
+status = {
+    "found": 200,
+    "absent": 404,
+    "rate-403-primary": 403,
+    "rate-403-secondary": 403,
+    "rate-429": 429,
+    "server": 503,
+    "unexpected-403": 403,
+    "redirect-final-unexpected-403": 403,
+    "malformed": 200,
+    "malformed-flags": 200,
+}[scenario]
+remaining = "0" if scenario in {"rate-403-primary", "rate-429"} else "42"
+headers = [
+    f"HTTP/1.1 {status} Fixture",
+    "X-GitHub-Request-Id: fixture-request",
+    f"X-RateLimit-Remaining: {remaining}",
+    "X-RateLimit-Reset: 1234567890",
+]
+if scenario in {"rate-403-primary", "rate-429"}:
+    headers.append("Retry-After: 0")
+if scenario == "redirect-final-unexpected-403":
+    headers = [
+        "HTTP/1.1 302 Fixture",
+        "X-GitHub-Request-Id: intermediate-request",
+        "X-RateLimit-Remaining: 0",
+        "X-RateLimit-Reset: 1111111111",
+        "Retry-After: 30",
+        "",
+        "HTTP/2 403 Fixture",
+        "X-GitHub-Request-Id: final-request",
+    ]
+Path(option("--dump-header")).write_text("\\r\\n".join(headers) + "\\r\\n\\r\\n", encoding="utf-8")
+
+archive = os.environ["FAKE_ARCHIVE_BASENAME"]
+expected = [
+    f"{archive}.zip",
+    f"{archive}.dmg",
+    "appcast.xml",
+    "SHA256SUMS",
+    f"{archive}-artifact-manifest.json",
+    f"{archive}-metadata.json",
+]
+if scenario == "found":
+    body = {"draft": False, "prerelease": False, "assets": [{"name": name} for name in expected]}
+elif scenario == "rate-403-secondary":
+    body = {"message": "You have exceeded a secondary rate limit. SECRET_BODY_MARKER"}
+elif scenario in {"unexpected-403", "redirect-final-unexpected-403"}:
+    body = {"message": "Resource not accessible by integration. SECRET_BODY_MARKER"}
+elif scenario == "malformed":
+    body = []
+elif scenario == "malformed-flags":
+    body = {"assets": [{"name": name} for name in expected]}
+else:
+    body = {"message": "SECRET_BODY_MARKER"}
+Path(option("--output")).write_text(json.dumps(body), encoding="utf-8")
+sys.stdout.write(str(status))
+""",
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+        fake_sleep = tools / "sleep"
+        fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_sleep.chmod(0o755)
+
+        scenarios = (
+            ("found", 0, "found", 1, "found"),
+            ("absent", 0, "not-found", 1, "not-found"),
+            ("rate-403-primary", 1, "", 3, "rate-limited"),
+            ("rate-403-secondary", 1, "", 3, "rate-limited"),
+            ("rate-429", 1, "", 3, "rate-limited"),
+            ("server", 1, "", 3, "server-failure"),
+            ("transport", 1, "", 3, "transport-failure"),
+            ("unexpected-403", 1, "", 1, "unexpected-failure"),
+            ("redirect-final-unexpected-403", 1, "", 1, "unexpected-failure"),
+            ("malformed", 1, "", 1, "malformed"),
+            ("malformed-flags", 1, "", 1, "malformed"),
+        )
+        helper = SCRIPT_DIR / "lookup_public_tip_release.sh"
+        for scenario, returncode, stdout, attempt_count, classification in scenarios:
+            with self.subTest(scenario=scenario):
+                calls.unlink(missing_ok=True)
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "PATH": f"{tools}:{env['PATH']}",
+                        "TMPDIR": str(root),
+                        "FAKE_CURL_CALLS": str(calls),
+                        "FAKE_GITHUB_SCENARIO": scenario,
+                        "FAKE_ARCHIVE_BASENAME": archive_basename,
+                    }
+                )
+                result = subprocess.run(
+                    [str(helper), "example/public-tip", "tip-fixture", archive_basename],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+
+                self.assertEqual(result.returncode, returncode, result.stderr)
+                self.assertEqual(result.stdout.strip(), stdout)
+                self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), attempt_count)
+                self.assertIn(f"classification={classification}", result.stderr)
+                self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
+                if scenario == "redirect-final-unexpected-403":
+                    self.assertNotIn("classification=rate-limited", result.stderr)
+                    self.assertIn(
+                        "request_id=final-request rate_limit_remaining=unavailable "
+                        "rate_limit_reset=unavailable retry_after=unavailable",
+                        result.stderr,
+                    )
+                for diagnostic in result.stderr.splitlines():
+                    self.assertRegex(
+                        diagnostic,
+                        r"^GitHub public tip lookup classification=[a-z-]+ status=[0-9]{3} "
+                        r"request_id=[^ ]+ rate_limit_remaining=[^ ]+ rate_limit_reset=[^ ]+ "
+                        r"retry_after=[^ ]+$",
+                    )
+
+    def test_generated_tip_appcast_validation_executes_crypto_and_rejects_missing_signature(self) -> None:
+        root = SCRIPT_DIR.parent
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        app_bundle = temp_dir / "RepoPrompt.app"
+        info_plist = app_bundle / "Contents" / "Info.plist"
+        archive = temp_dir / "RepoPrompt-tip-fixture.zip"
+        appcast = temp_dir / "appcast.xml"
+        private_key_file = temp_dir / "private-key"
+        validator_tmp_dir = temp_dir / "validator-tmp"
+        info_plist.parent.mkdir(parents=True)
+        archive.write_text("signed tip archive\n", encoding="utf-8")
+        private_key = base64.b64encode(bytes(range(32))).decode("ascii")
+        private_key_file.write_text(private_key, encoding="utf-8")
+        public_key = self.run_checked(
+            ["xcrun", "swift", str(SCRIPT_DIR / "derive_sparkle_public_key.swift"), str(private_key_file)]
+        ).stdout.strip()
+        info_plist.write_bytes(plistlib.dumps({"SUPublicEDKey": public_key}))
+        signature = self.run_checked(
+            [
+                str(root / "Vendor" / "Sparkle" / "bin" / "sign_update"),
+                "--ed-key-file",
+                str(private_key_file),
+                "-p",
+                str(archive),
+            ]
+        ).stdout.strip()
+
+        def write_appcast(enclosure_signature: str) -> None:
+            appcast.write_text(
+                f"""<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <item>
+      <sparkle:version>1.2.3</sparkle:version>
+      <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+      <enclosure url="https://example.invalid/tip/{archive.name}"
+                 length="{archive.stat().st_size}"
+                 sparkle:edSignature="{enclosure_signature}" />
+    </item>
+  </channel>
+</rss>
+""",
+                encoding="utf-8",
+            )
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(SCRIPT_DIR),
+                "TIP_COMMIT": "0" * 40,
+                "TIP_BUILD_NUMBER": "1.2.3",
+                "TIP_DOWNLOAD_URL_PREFIX": "https://example.invalid/tip/",
+                "SPARKLE_PRIVATE_KEY": private_key,
+                "VALIDATOR_APP_BUNDLE": str(app_bundle),
+                "VALIDATOR_UPDATE_ZIP": str(archive),
+                "VALIDATOR_APPCAST": str(appcast),
+                "VALIDATOR_TMP_DIR": str(validator_tmp_dir),
+            }
+        )
+        command = [
+            "bash",
+            "-c",
+            """source "$1"
+APP_BUNDLE="$VALIDATOR_APP_BUNDLE"
+UPDATE_ZIP="$VALIDATOR_UPDATE_ZIP"
+APPCAST="$VALIDATOR_APPCAST"
+TMP_DIR="$VALIDATOR_TMP_DIR"
+mkdir -p "$TMP_DIR"
+MARKETING_VERSION="9.8.7"
+validate_generated_tip_appcast""",
+            "tip-appcast-validation",
+            str(SCRIPT_DIR / "main_tip_release.sh"),
+        ]
+
+        write_appcast(signature)
+        accepted = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        write_appcast("")
+        rejected = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected.stderr)
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
