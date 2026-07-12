@@ -520,9 +520,9 @@ import XCTest
                         },
                         gitText
                     )
-                    let workspaceDirectory = try fixture.contextA.window.workspaceManager.workspaceDirectory(
+                    let workspaceDirectory = try fixture.contextA.window.workspaceManager.featureArtifactStorage(
                         for: XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
-                    )
+                    ).workspaceDirectory
                     let patchPath = workspaceDirectory
                         .appendingPathComponent("_git_data", isDirectory: true)
                         .appendingPathComponent(String(patchAlias.dropFirst("_git_data/".count)))
