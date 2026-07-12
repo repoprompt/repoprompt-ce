@@ -36,11 +36,16 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
+import cache_inventory
+from cache_inventory import (
+    BUILD_CACHE_DIAGNOSTIC_MAX_ROWS,
+    operation_diagnostics_build_cache,
+)
+
 PROTOCOL_VERSION = 10
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
-BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
 SUMMARY_FAILURE_MAX_LINES = 100
@@ -1079,21 +1084,6 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{int(hours)}h {int(minutes)}m {remainder:.0f}s"
 
 
-def format_bytes(byte_count: Optional[int]) -> str:
-    if byte_count is None:
-        return "n/a"
-    value = float(max(0, int(byte_count)))
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    unit = units[0]
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            break
-        value /= 1024
-    if unit == "B":
-        return f"{int(value)} B"
-    return f"{value:.1f} {unit}"
-
-
 @dataclasses.dataclass
 class Job:
     ticket: str
@@ -1241,6 +1231,9 @@ class OperationRegistry:
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
+        "REPOPROMPT_DEVELOPER_SWIFTPM_SCRATCH_ROOT",
+        "REPOPROMPT_SWIFTPM_SCRATCH_PATH",
+        "SWIFT_TARGET_TRIPLE",
     ]
     STYLE_ENV_KEYS = [
         "GITHUB_ACTIONS",
@@ -1282,6 +1275,12 @@ class OperationRegistry:
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
         self.script_path = Path(__file__).resolve()
+
+    def _build_cache_identity(self, configuration: str, env: Dict[str, str]) -> cache_inventory.SwiftPMCacheIdentity:
+        return cache_inventory.resolve_swiftpm_cache_identity(self.repo_root, configuration, env)
+
+    def _default_build_cache_path(self) -> Path:
+        return self.repo_root / ".build"
 
     @classmethod
     def client_env_snapshot(cls) -> Dict[str, str]:
@@ -1351,17 +1350,29 @@ class OperationRegistry:
         if operation == "swift-build":
             product = args.get("product")
             lanes = ["build"]
+            identity = self._build_cache_identity("debug", env)
+            scratch_path = str(identity.effective_path)
+            default_path = str(self._default_build_cache_path())
             if product == "all":
-                return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+                return self._internal_argv("swift_build_all", {"scratchPath": scratch_path}), lanes, cwd, env, effective_timeout
+            if scratch_path == default_path:
+                return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            return ["swift", "build", "--scratch-path", scratch_path, "--product", str(product)], lanes, cwd, env, effective_timeout
         if operation == "build":
+            identity = self._build_cache_identity("debug", env)
+            env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
             config = str(args.get("config"))
             lanes = ["build", "debugArtifact"] + (["release"] if config == "release" else [])
+            identity = self._build_cache_identity(config, env)
+            env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
             argv = ["swift", "test"]
+            identity = self._build_cache_identity("debug", env)
+            if str(identity.effective_path) != str(self._default_build_cache_path()):
+                argv.extend(["--scratch-path", str(identity.effective_path)])
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
@@ -1371,6 +1382,9 @@ class OperationRegistry:
             return argv, ["build"], cwd, env, effective_timeout
         if operation == "provider-test":
             argv = ["swift", "test"]
+            identity = self._build_cache_identity("debug", env)
+            if str(identity.effective_path) != str(self._default_build_cache_path()):
+                argv.extend(["--scratch-path", str(identity.effective_path)])
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
@@ -1379,10 +1393,14 @@ class OperationRegistry:
                 argv.extend(["--filter", str(args["filter"])])
             return argv, ["build"], self.repo_root / "Packages" / "RepoPromptAgentProviders", env, effective_timeout
         if operation == "install-debug-cli":
+            identity = self._build_cache_identity("debug", env)
+            env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
             return [script("install_debug_cli.sh"), "install", "--build"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
         if operation == "run":
+            identity = self._build_cache_identity("debug", env)
+            env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
             return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "app":
             subcommand = args.get("subcommand")
@@ -1394,6 +1412,8 @@ class OperationRegistry:
             if subcommand == "launch-existing":
                 return self._internal_argv("app_launch_existing", dict(args)), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "relaunch":
+                identity = self._build_cache_identity("debug", env)
+                env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
                 return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "smoke":
             lanes = ["debugArtifact", "liveApp"]
@@ -1413,10 +1433,16 @@ class OperationRegistry:
         if operation == "release":
             subcommand = args.get("subcommand")
             if subcommand == "package":
+                identity = self._build_cache_identity("release", env)
+                env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
                 return [script("package_app.sh"), "release"], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
             if subcommand == "local-install":
+                identity = self._build_cache_identity("release", env)
+                env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
                 return [script("install_local_production.sh")], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
             if subcommand == "artifact":
+                identity = self._build_cache_identity("release", env)
+                env["REPOPROMPT_SWIFTPM_SCRATCH_PATH"] = str(identity.effective_path)
                 return [script("release.sh"), "artifact"], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
             if subcommand == "preflight":
                 release_script = self.repo_root / "Scripts" / "release.sh"
@@ -1497,7 +1523,7 @@ class OperationRegistry:
             return RELEASE_TIMEOUT_SECONDS
         if operation == "smoke" and args.get("agentRun"):
             return MEDIUM_TIMEOUT_SECONDS
-        if operation == "diagnostics":
+        if operation in {"diagnostics", "cache"}:
             return SHORT_TIMEOUT_SECONDS
         return MEDIUM_TIMEOUT_SECONDS
 
@@ -4227,9 +4253,19 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
         return _operation_app_stop_unlocked(repo_root, args)
 
 
-def operation_swift_build_all(repo_root: Path) -> int:
+def operation_swift_build_all(repo_root: Path, args: Dict[str, Any]) -> int:
+    scratch_path = args.get("scratchPath")
+    default_path = str(repo_root / ".build")
+    if scratch_path and scratch_path != default_path:
+        base_argv = ["swift", "build", "--scratch-path", scratch_path]
+    else:
+        base_argv = ["swift", "build"]
     for product in ["RepoPrompt", "repoprompt-mcp"]:
-        code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
+        code, _stdout, _stderr = run_operation_command(
+            f"swift build --product {product}",
+            base_argv + ["--product", product],
+            repo_root,
+        )
         if code != 0:
             return code
     return 0
@@ -4354,119 +4390,6 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
     return 0
 
 
-def directory_size_bytes(path: Path) -> Optional[int]:
-    try:
-        if not path.exists():
-            return None
-        if path.is_symlink():
-            path = path.resolve(strict=True)
-    except OSError:
-        return None
-
-    # Prefer the platform disk-usage tool for explicit cache diagnostics. It is
-    # read-only and much faster than Python-level recursive stat walks for large
-    # SwiftPM scratch directories. Fall back to a Python walk for small tests or
-    # unusual environments where `du` is unavailable.
-    try:
-        result = subprocess.run(
-            ["du", "-sk", str(path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if result.returncode == 0:
-            first = result.stdout.strip().split()[0]
-            return int(first) * 1024
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        pass
-
-    total = 0
-    stack = [path]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        stat_result = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(Path(entry.path))
-                    else:
-                        total += stat_result.st_size
-        except NotADirectoryError:
-            try:
-                total += current.stat(follow_symlinks=False).st_size
-            except OSError:
-                pass
-        except OSError:
-            continue
-    return total
-
-
-def latest_mtime(path: Path) -> Optional[float]:
-    try:
-        return path.stat(follow_symlinks=False).st_mtime
-    except OSError:
-        return None
-
-
-def managed_worktree_container(repo_root: Path) -> Optional[Path]:
-    parent = repo_root.parent
-    try:
-        if parent.parent.name == ".repoprompt-worktrees":
-            return parent
-    except IndexError:
-        return None
-    return None
-
-
-def operation_diagnostics_build_cache(repo_root: Path, args: Dict[str, Any]) -> int:
-    limit = int(args.get("limit") or BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
-    limit = max(1, min(limit, 100))
-    current_build = repo_root / ".build"
-
-    print("Build cache diagnostics", flush=True)
-    if current_build.exists():
-        symlink_note = ""
-        if current_build.is_symlink():
-            with contextlib.suppress(OSError):
-                symlink_note = f" -> {current_build.resolve(strict=True)}"
-        print(f"Current .build: {format_bytes(directory_size_bytes(current_build))}{symlink_note}", flush=True)
-    else:
-        print("Current .build: missing", flush=True)
-
-    container = managed_worktree_container(repo_root)
-    if container is None or not container.exists():
-        print("Managed worktree container: not detected", flush=True)
-        return 0
-
-    rows: List[Tuple[int, Optional[float], str]] = []
-    for child in sorted(container.iterdir(), key=lambda item: item.name):
-        if not child.is_dir():
-            continue
-        build_dir = child / ".build"
-        size = directory_size_bytes(build_dir)
-        if size is None:
-            continue
-        rows.append((size, latest_mtime(build_dir), child.name))
-
-    total = sum(size for size, _mtime, _name in rows)
-    print(f"Managed worktree container: {container}", flush=True)
-    print(f"Worktree .build total: {format_bytes(total)} across {len(rows)} build director{'y' if len(rows) == 1 else 'ies'}", flush=True)
-    if not rows:
-        return 0
-
-    print("Top .build directories:", flush=True)
-    for size, mtime, name in sorted(rows, key=lambda row: row[0], reverse=True)[:limit]:
-        mtime_text = "unknown" if mtime is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
-        print(f"  {format_bytes(size):>9}  {name}  modified={mtime_text}", flush=True)
-    return 0
-
-
 def operation_diagnostics_agent_mode_on(repo_root: Path, args: Dict[str, Any]) -> int:
     cli = require_debug_cli()
     if not cli:
@@ -4497,7 +4420,7 @@ def run_operation_runner(payload_json: str) -> int:
     args = payload.get("args") or {}
     repo_root = Path(payload.get("repoRoot") or resolve_repo_root()).resolve()
     if kind == "swift_build_all":
-        return operation_swift_build_all(repo_root)
+        return operation_swift_build_all(repo_root, args)
     if kind == "app_stop":
         return operation_app_stop(repo_root, args)
     if kind == "app_status":
