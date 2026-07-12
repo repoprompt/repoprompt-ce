@@ -433,6 +433,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let allowSyntheticRoutingWithoutFinalContext: Bool
             let resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)?
             let runMCPFollowUp: MCPFollowUpRunner?
+            /// Captures the exact committed tab snapshot at the commit seam so tests can assert the
+            /// authoritative provider provenance instead of the racy live compose-tab UI projection.
+            let committedTabSnapshotCaptured: (
+                (_ runID: UUID, _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot) -> Void
+            )?
 
             init(
                 beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
@@ -440,7 +445,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 teardownCompleted: ((_ runID: UUID) -> Void)?,
                 allowSyntheticRoutingWithoutFinalContext: Bool = false,
                 resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)? = nil,
-                runMCPFollowUp: MCPFollowUpRunner? = nil
+                runMCPFollowUp: MCPFollowUpRunner? = nil,
+                committedTabSnapshotCaptured: (
+                    (_ runID: UUID, _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot) -> Void
+                )? = nil
             ) {
                 self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
                 self.providerEventDisposition = providerEventDisposition
@@ -448,6 +456,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.allowSyntheticRoutingWithoutFinalContext = allowSyntheticRoutingWithoutFinalContext
                 self.resolveMCPFollowUpModel = resolveMCPFollowUpModel
                 self.runMCPFollowUp = runMCPFollowUp
+                self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
             }
         }
 
@@ -2761,6 +2770,21 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         return matches
     }
 
+    /// Retains the exact committed tab snapshot on the owning run record and, in DEBUG, notifies
+    /// the test capture hook at the precise commit seam. Both the synthetic-routing and real
+    /// final-context commits route through here so the observable commit provenance is identical
+    /// across paths. Returns false without notifying when retention fails.
+    private func retainCommittedTabSnapshot(
+        _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot,
+        on record: ContextBuilderRunRecord
+    ) -> Bool {
+        guard record.installCommittedTabSnapshot(snapshot) else { return false }
+        #if DEBUG
+            runTestHooks?.committedTabSnapshotCaptured?(record.runID, snapshot)
+        #endif
+        return true
+    }
+
     private func commitTabContextForAgent(
         record: ContextBuilderRunRecord
     ) async -> MCPServerViewModel.ContextBuilderTabContextCommitResult {
@@ -2832,7 +2856,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                         ),
                         usedAgentOutputAsPrompt: usedAgentOutputAsPrompt
                     )
-                    guard record.installCommittedTabSnapshot(snapshot) else {
+                    guard retainCommittedTabSnapshot(snapshot, on: record) else {
                         return MCPServerViewModel.ContextBuilderTabContextCommitResult(
                             outcome: .failed("Context Builder could not retain its committed tab snapshot."),
                             committedTab: nil
@@ -3008,7 +3032,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 #endif
                 guard result.outcome == .committed,
                       let committedTab = result.committedTab,
-                      record.installCommittedTabSnapshot(committedTab)
+                      retainCommittedTabSnapshot(committedTab, on: record)
                 else { return false }
                 record.session.usedAgentOutputAsPrompt = committedTab.usedAgentOutputAsPrompt
                 return activeAgentRuns.contains(runID) && acceptsEvents(from: record)

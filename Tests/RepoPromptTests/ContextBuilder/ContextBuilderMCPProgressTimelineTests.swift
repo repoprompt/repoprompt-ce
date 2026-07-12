@@ -435,6 +435,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             defer { window.mcpServer.installStageProgressSinkForTesting(nil) }
 
             let followUpRecorder = ContextBuilderFollowUpInvocationRecorder()
+            let committedSnapshotRecorder = ContextBuilderCommittedSnapshotRecorder()
             window.contextBuilderAgentViewModel.installRunTestHooks(
                 ContextBuilderAgentViewModel.RunTestHooks(
                     beforeProcessingProviderEvent: nil,
@@ -455,6 +456,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                             response: "deterministic provider follow-up",
                             errors: nil
                         )
+                    },
+                    committedTabSnapshotCaptured: { runID, snapshot in
+                        committedSnapshotRecorder.record(runID: runID, snapshot: snapshot)
                     }
                 )
             )
@@ -505,8 +509,23 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             }
             XCTAssertEqual(resultObject["prompt"]?.stringValue, expectedPrompt)
 
-            let storedTab = try XCTUnwrap(window.workspaceManager.composeTab(for: tabIdentity))
-            XCTAssertEqual(storedTab.promptText, "Discovery complete")
+            // The MCP path's authoritative promptText contract is the immutable committed provider
+            // snapshot, which the tool provider itself consumes as `resultTab`. The live compose tab
+            // is only a non-authoritative active-tab UI projection here: it can be overwritten by an
+            // empty prompt-editor snapshot after the silent stored-only commit, so reading it back is
+            // racy. Assert the committed provenance captured at the commit seam instead.
+            let committedCaptures = committedSnapshotRecorder.snapshotAll()
+            XCTAssertEqual(
+                committedCaptures.count,
+                1,
+                "Exactly one committed tab snapshot should be retained for the run"
+            )
+            let committed = try XCTUnwrap(committedCaptures.first)
+            XCTAssertEqual(committed.runID, committed.snapshot.nestedRunID)
+            XCTAssertEqual(committed.snapshot.identity, tabIdentity)
+            XCTAssertEqual(committed.snapshot.tab.id, tabID)
+            XCTAssertEqual(committed.snapshot.tab.promptText, "Discovery complete")
+            XCTAssertTrue(committed.snapshot.usedAgentOutputAsPrompt)
         #else
             throw XCTSkip("Provider-path Context Builder injection is DEBUG-only.")
         #endif
@@ -923,6 +942,23 @@ private actor ContextBuilderFollowUpInvocationRecorder {
 
     func snapshot() -> Invocation? {
         invocation
+    }
+}
+
+private final class ContextBuilderCommittedSnapshotRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captures: [(runID: UUID, snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot)] = []
+
+    func record(runID: UUID, snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot) {
+        lock.lock()
+        defer { lock.unlock() }
+        captures.append((runID: runID, snapshot: snapshot))
+    }
+
+    func snapshotAll() -> [(runID: UUID, snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captures
     }
 }
 
