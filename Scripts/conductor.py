@@ -174,6 +174,7 @@ State paths:
   socket default:    /tmp/conductor-<uid>/<repo-root-hash16>.sock (directory mode 0700)
   machine locks:     /tmp/repoprompt-ce-dev-locks-<uid>/ (directory mode 0700; independent of socket overrides)
   heavy slots:       REPOPROMPT_DEV_HEAVY_SLOTS=N (default 1)
+  swift jobs:        REPOPROMPT_SWIFT_JOBS=N (opt-in; when unset, SwiftPM uses the active processor count)
   overrides: REPOPROMPT_DEV_DAEMON_STATE_DIR, REPOPROMPT_DEV_DAEMON_SOCKET (socket parent must be owned 0700)
 
 Protocol version: {PROTOCOL_VERSION}
@@ -409,6 +410,25 @@ def configured_global_heavy_slots(env: Optional[Dict[str, str]] = None) -> int:
 def global_heavy_slot_paths(env: Optional[Dict[str, str]] = None) -> List[Path]:
     root = machine_lock_dir()
     return [root / f"global-heavy-{index}.lock" for index in range(configured_global_heavy_slots(env))]
+
+
+def configured_swift_jobs(env: Optional[Dict[str, str]] = None) -> Optional[int]:
+    source = env if env is not None else os.environ
+    raw = source.get("REPOPROMPT_SWIFT_JOBS")
+    if raw is None or raw == "":
+        return None
+    # Match the shell validation in package_app.sh and build_swiftpm_release_products.sh:
+    # a positive decimal integer with no leading zeros and no sign.
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
+        raise ConductorError("REPOPROMPT_SWIFT_JOBS must be a positive integer")
+    return int(raw)
+
+
+def append_swift_jobs_arg(argv: List[str], env: Optional[Dict[str, str]] = None) -> List[str]:
+    jobs = configured_swift_jobs(env)
+    if jobs is None:
+        return argv
+    return argv + ["--jobs", str(jobs)]
 
 
 def live_app_lock_path() -> Path:
@@ -1256,6 +1276,7 @@ class OperationRegistry:
     ]
     CONDUCTOR_ENV_KEYS = [
         "REPOPROMPT_DEV_HEAVY_SLOTS",
+        "REPOPROMPT_SWIFT_JOBS",
     ]
     TELEMETRY_ENV_KEYS = [
         "REPOPROMPT_ENABLE_SENTRY",
@@ -1353,7 +1374,8 @@ class OperationRegistry:
             lanes = ["build"]
             if product == "all":
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            argv = ["swift", "build", "--product", str(product)]
+            return append_swift_jobs_arg(argv, env), lanes, cwd, env, effective_timeout
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
@@ -1368,7 +1390,7 @@ class OperationRegistry:
                 argv.append("list")
             elif args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
-            return argv, ["build"], cwd, env, effective_timeout
+            return append_swift_jobs_arg(argv, env), ["build"], cwd, env, effective_timeout
         if operation == "provider-test":
             argv = ["swift", "test"]
             if args.get("testProduct"):
@@ -1377,7 +1399,7 @@ class OperationRegistry:
                 argv.append("list")
             elif args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
-            return argv, ["build"], self.repo_root / "Packages" / "RepoPromptAgentProviders", env, effective_timeout
+            return append_swift_jobs_arg(argv, env), ["build"], self.repo_root / "Packages" / "RepoPromptAgentProviders", env, effective_timeout
         if operation == "install-debug-cli":
             return [script("install_debug_cli.sh"), "install", "--build"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "debug-cli-status":
@@ -2024,9 +2046,14 @@ class DaemonState:
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
                     return
+            swift_jobs_limit = configured_swift_jobs(env)
             start_line = f"$ {format_argv(argv)}\n"
             with job.log_path.open("ab") as log_file:
                 with self.lock:
+                    if swift_jobs_limit is not None:
+                        header_line = f"==> Swift jobs limit: {swift_jobs_limit}\n"
+                        self._append_tail_locked(job, header_line)
+                        log_file.write(header_line.encode("utf-8", errors="replace"))
                     self._append_tail_locked(job, start_line)
                 log_file.write(start_line.encode("utf-8", errors="replace"))
                 log_file.flush()
@@ -3704,9 +3731,12 @@ def run_operation_command(
     env: Optional[Dict[str, str]] = None,
     allow_exit_codes: Optional[set[int]] = None,
     timeout: Optional[float] = None,
+    swift_jobs_limit: Optional[int] = None,
 ) -> Tuple[int, str, str]:
     allowed = allow_exit_codes if allow_exit_codes is not None else {0}
     print(f"\n==> {name}", flush=True)
+    if swift_jobs_limit is not None:
+        print(f"==> Swift jobs limit: {swift_jobs_limit}", flush=True)
     print(f"$ {format_argv(argv)}", flush=True)
     try:
         completed = subprocess.run(
@@ -4228,8 +4258,17 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
+    swift_jobs_limit = configured_swift_jobs(os.environ)
     for product in ["RepoPrompt", "repoprompt-mcp"]:
-        code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
+        argv = ["swift", "build", "--product", product]
+        if swift_jobs_limit is not None:
+            argv.extend(["--jobs", str(swift_jobs_limit)])
+        code, _stdout, _stderr = run_operation_command(
+            f"swift build --product {product}",
+            argv,
+            repo_root,
+            swift_jobs_limit=swift_jobs_limit,
+        )
         if code != 0:
             return code
     return 0
