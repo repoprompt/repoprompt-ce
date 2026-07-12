@@ -70,6 +70,13 @@ def format_bytes(byte_count: Optional[int]) -> str:
 
 
 def directory_size_bytes(path: Path) -> Optional[int]:
+    """Return an approximate size in bytes for ``path``.
+
+    Top-level symlinks are resolved before measuring. ``du -sk`` is preferred;
+    if it is unavailable, a manual walk is used. The manual walk does not follow
+    directory symlinks inside the tree, so nested symlinked directories may be
+    undercounted. This is acceptable for the read-only scratch-size estimate.
+    """
     try:
         if not path.exists():
             return None
@@ -449,7 +456,7 @@ def run_focused_build(repo_root: Path, args: Dict[str, Any]) -> int:
     Args:
         repo_root: path to the Swift package root.
         args: operation args from the daemon; may include ``product``,
-            ``testFilter`` (or ``test``), ``runTests``.
+            ``testFilter``, and ``runTests``.
 
     Returns:
         0 if the diagnostic ran (regardless of build/test exit code), or
