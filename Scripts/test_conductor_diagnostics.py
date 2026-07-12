@@ -39,8 +39,10 @@ class FocusedBuildDiagnosticTests(unittest.TestCase):
     def _run_with_path(self, path: Path, args: dict) -> Tuple[int, str]:
         old_path = os.environ.get("PATH")
         try:
-            # Keep only the fake swift directory and /usr/bin for ps/du/bash/cat.
-            os.environ["PATH"] = f"{path}{os.pathsep}/usr/bin"
+            # Keep only the fake swift directory plus the system tools the
+            # fixture needs. macOS keeps bash in /bin, while /usr/bin/env
+            # resolves the fixture's shebang through PATH.
+            os.environ["PATH"] = f"{path}{os.pathsep}/usr/bin{os.pathsep}/bin"
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 code = conductor_diagnostics.run_focused_build(self.repo_root, args)
