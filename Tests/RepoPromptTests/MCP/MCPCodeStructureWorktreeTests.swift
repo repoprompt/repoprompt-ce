@@ -637,9 +637,21 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(files.count, 3)
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         let tabID = try XCTUnwrap(workspace.activeComposeTabID)
-        var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
-        composeTab.selection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
-        window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tabID)
+        let intendedSelection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
+        let persistedSelection = await window.selectionCoordinator.persistSelection(
+            intendedSelection,
+            for: identity,
+            source: .mcpTabContext
+        )
+        XCTAssertEqual(persistedSelection, intendedSelection)
+        XCTAssertEqual(
+            window.selectionCoordinator.selectionSnapshot(
+                for: identity,
+                flushPendingUIIfActive: false
+            )?.selection,
+            intendedSelection
+        )
         try await AsyncTestWait.waitUntil("selected code structure candidates are cataloged", timeout: 5) {
             let resolution = await store.resolveSelectedCodeStructureFiles(
                 atPaths: files.map(\.standardizedFullPath),
@@ -690,6 +702,13 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(admission.uniqueSeedCandidatesVisited, 2)
         XCTAssertEqual(admission.logicalPathComputations, 0)
         XCTAssertEqual(admission.coordinatorInvocations, 0)
+        XCTAssertEqual(
+            window.selectionCoordinator.selectionSnapshot(
+                for: identity,
+                flushPendingUIIfActive: false
+            )?.selection,
+            intendedSelection
+        )
     }
 
     func testSelectedScopeStaleFolderIsIgnoredWhileExactRootAliasResolves() async throws {
