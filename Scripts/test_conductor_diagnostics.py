@@ -96,7 +96,7 @@ class FocusedBuildDiagnosticTests(unittest.TestCase):
         )
         fake_path = self._make_fake_swift(output, exit_code=1)
         code, captured = self._run_with_path(fake_path, {"product": "RepoPrompt"})
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         report = json.loads(captured)
         self.assertEqual(report["swift"]["exitCode"], 1)
         self.assertEqual(report["warnings"]["rawCount"], 2)

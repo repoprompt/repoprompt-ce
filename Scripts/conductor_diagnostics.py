@@ -540,7 +540,10 @@ def run_focused_build(repo_root: Path, args: Dict[str, Any]) -> int:
     report["diagnosticDurationSeconds"] = round(elapsed, 3)
     report["resourceSamples"] = sampler.sample_count if sampler else 0
     print(json.dumps(report, indent=2, sort_keys=True))
-    return exit_code
+    # A non-zero Swift exit is an observed build result recorded in the report,
+    # not a failure of this diagnostic. This lets callers collect diagnostics
+    # for failing builds without the runner discarding the job as unsuccessful.
+    return 0
 
 
 def run_high_output(_repo_root: Path, args: Dict[str, Any]) -> int:
