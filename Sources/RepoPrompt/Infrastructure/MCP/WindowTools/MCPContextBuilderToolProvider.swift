@@ -92,8 +92,100 @@ private struct ContextBuilderToolResult: Codable {
 
 enum ContextBuilderResponseDisposition {
     case contextOnly
-    case generate(HeadlessMode)
+    case generate(HeadlessMode, prompt: String)
     case failed(String)
+}
+
+enum ContextBuilderTypedPromptResolver {
+    private static let openingTag = "<discovery_agent-guidelines>"
+    private static let closingTag = "</discovery_agent-guidelines>"
+    private static let reservedName = "discovery_agent-guidelines"
+
+    static func resolve(
+        effectivePrompt: String,
+        usedAgentOutputAsPrompt: Bool,
+        callerInstructions: String
+    ) -> String? {
+        if !usedAgentOutputAsPrompt,
+           !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return effectivePrompt
+        }
+        return sanitizeCallerInstructions(callerInstructions)
+    }
+
+    private static func sanitizeCallerInstructions(_ instructions: String) -> String? {
+        var sanitized = ""
+        var cursor = instructions.startIndex
+        var insideGuidelines = false
+
+        while cursor < instructions.endIndex {
+            guard instructions[cursor] == "<" else {
+                if !insideGuidelines {
+                    sanitized.append(instructions[cursor])
+                }
+                cursor = instructions.index(after: cursor)
+                continue
+            }
+
+            guard let closingAngle = closingAngleIndex(in: instructions, after: cursor) else {
+                let remainder = instructions[cursor...]
+                guard remainder.range(of: reservedName, options: .caseInsensitive) == nil else {
+                    return nil
+                }
+                if !insideGuidelines {
+                    sanitized.append(contentsOf: remainder)
+                }
+                break
+            }
+
+            let afterTag = instructions.index(after: closingAngle)
+            let tag = instructions[cursor ..< afterTag]
+            if tag == openingTag {
+                guard !insideGuidelines else { return nil }
+                insideGuidelines = true
+            } else if tag == closingTag {
+                guard insideGuidelines else { return nil }
+                insideGuidelines = false
+            } else {
+                // Quote-aware tokenization keeps reserved markup inside attributes from becoming removable blocks.
+                guard tag.range(of: reservedName, options: .caseInsensitive) == nil else {
+                    return nil
+                }
+                if !insideGuidelines {
+                    sanitized.append(contentsOf: tag)
+                }
+            }
+            cursor = afterTag
+        }
+
+        guard !insideGuidelines else { return nil }
+        let result = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.isEmpty ? nil : result
+    }
+
+    private static func closingAngleIndex(
+        in instructions: String,
+        after openingAngle: String.Index
+    ) -> String.Index? {
+        var cursor = instructions.index(after: openingAngle)
+        var activeQuote: Character?
+
+        while cursor < instructions.endIndex {
+            let character = instructions[cursor]
+            if let quote = activeQuote {
+                if character == quote {
+                    activeQuote = nil
+                }
+            } else if character == "\"" || character == "'" {
+                activeQuote = character
+            } else if character == ">" {
+                return cursor
+            }
+            cursor = instructions.index(after: cursor)
+        }
+        return nil
+    }
 }
 
 @MainActor
@@ -444,15 +536,18 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     responseType: responseType,
                     terminalDisposition: snapshot.terminalDisposition,
                     usedAgentOutputAsPrompt: snapshot.usedAgentOutputAsPrompt,
-                    effectivePrompt: effectivePrompt
+                    effectivePrompt: effectivePrompt,
+                    callerInstructions: instructions
                 )
+                var resultPrompt = effectivePrompt
 
                 switch responseDisposition {
                 case .contextOnly:
                     break
                 case let .failed(message):
                     throw MCPError.internalError(message)
-                case let .generate(mode):
+                case let .generate(mode, prompt):
+                    resultPrompt = prompt
                     try Task.checkCancellation()
                     let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
                     if mode == .review, let workspaceContext {
@@ -543,7 +638,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                 tabResolution.agentModeSessionID,
                                 tabResolution.agentModeRunID,
                                 mode,
-                                effectivePrompt,
+                                prompt,
                                 sel,
                                 lookupContext,
                                 tabResolution.reviewGitContext,
@@ -586,7 +681,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     ContextBuilderToolResult(
                         tabID: resultTab.id.uuidString,
                         status: status,
-                        prompt: effectivePrompt,
+                        prompt: resultPrompt,
                         fileCount: fileCount,
                         totalTokens: normalizedTokens,
                         userTotalTokens: userTotalTokens,
@@ -652,7 +747,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         responseType: ContextBuilderResponseType?,
         terminalDisposition: ContextBuilderRunTerminalOutcome,
         usedAgentOutputAsPrompt: Bool,
-        effectivePrompt: String
+        effectivePrompt: String,
+        callerInstructions: String
     ) -> ContextBuilderResponseDisposition {
         guard responseType?.wantsResponse == true else { return .contextOnly }
 
@@ -660,12 +756,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         case .cancelled, .failed:
             return .contextOnly
         case .completed:
-            guard !usedAgentOutputAsPrompt else {
-                return .failed(
-                    "Context Builder completed without a typed direct response for the requested \(responseType?.rawValue ?? "response")"
-                )
-            }
-            guard !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard let prompt = ContextBuilderTypedPromptResolver.resolve(
+                effectivePrompt: effectivePrompt,
+                usedAgentOutputAsPrompt: usedAgentOutputAsPrompt,
+                callerInstructions: callerInstructions
+            ) else {
                 return .failed(
                     "Context Builder completed without a prompt for the requested \(responseType?.rawValue ?? "response")"
                 )
@@ -673,7 +768,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             guard let mode = responseType?.headlessMode else {
                 return .failed("Context Builder requested response mode is unavailable")
             }
-            return .generate(mode)
+            return .generate(mode, prompt: prompt)
         }
     }
 
