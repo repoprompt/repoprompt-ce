@@ -1719,6 +1719,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         func test_setWorkspaceSavePreparationGate(_ gate: (@Sendable (UUID, Int) async -> Void)?) {
             workspaceSavePreparationGate = gate
         }
+
+        func test_markWorkspaceDirty(workspaceID: UUID) {
+            bumpStateVersion(for: workspaceID)
+        }
     #endif
 
     #if DEBUG
