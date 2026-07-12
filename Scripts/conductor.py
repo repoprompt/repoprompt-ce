@@ -41,7 +41,7 @@ TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
-SUMMARY_VERSION = 1
+SUMMARY_VERSION = 2
 SUMMARY_SUCCESS_MAX_LINES = 25
 SUMMARY_FAILURE_MAX_LINES = 100
 SUMMARY_MAX_CHARS = 16000
@@ -796,7 +796,7 @@ class OutputSummarizer:
         re.IGNORECASE,
     )
     SWIFT_ERROR_RE = re.compile(r"(: error:|error: emit-module command failed|Command SwiftCompile failed|Command CompileSwift failed|fatal error:)")
-    WARNING_RE = re.compile(r"(: warning:|^WARNING:)")
+    WARNING_RE = re.compile(r"(: warning:|^WARNING:)", re.IGNORECASE)
     TEST_FAILURE_RE = re.compile(
         r"(Test Case '.*' failed|XCTAssert|: error: .*Test|Executed .* tests?, with .* failures?|Failing tests:|error: Exited with unexpected signal|error: terminated)"
     )
@@ -840,6 +840,7 @@ class OutputSummarizer:
         lines_iterable: Any,
     ) -> Dict[str, Any]:
         del args
+        summary_start = now()
         failure = state in {"failed", "canceled"} or bool(timed_out) or (exit_code not in (None, 0))
         launch_lifecycle = {
             "transitionStarted": False,
@@ -887,7 +888,7 @@ class OutputSummarizer:
 
             if cls.WARNING_RE.search(line):
                 warning_count += 1
-                if failure or line.startswith("WARNING:"):
+                if failure or cls.WARNING_RE.match(line):
                     sections["Warnings"].add(line)
             if cls.SWIFT_ERROR_RE.search(line) or cls.FAILURE_RE.search(line):
                 error_count += 1
@@ -995,6 +996,7 @@ class OutputSummarizer:
             "omittedLineCount": omitted_line_count,
             "errorCount": error_count,
             "warningCount": warning_count,
+            "summaryDurationSeconds": round(now() - summary_start, 6),
             "launchLifecycle": launch_lifecycle,
             "sections": payload_sections,
             "truncated": truncated,
@@ -1024,6 +1026,7 @@ class OutputSummarizer:
             "omittedLineCount": 0,
             "errorCount": 0,
             "warningCount": 0,
+            "summaryDurationSeconds": 0.0,
             "sections": [
                 {
                     "title": "Summary notes",
