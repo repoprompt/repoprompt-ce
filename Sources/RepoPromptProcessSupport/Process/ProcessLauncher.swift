@@ -9,6 +9,22 @@ package struct SpawnedProcess: @unchecked Sendable {
     package let stdinDescriptor: Int32?
     package let stdout: FileHandle
     package let stderr: FileHandle
+
+    package init(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        stdin: FileHandle?,
+        stdinDescriptor: Int32?,
+        stdout: FileHandle,
+        stderr: FileHandle
+    ) {
+        self.pid = pid
+        self.processGroupID = processGroupID
+        self.stdin = stdin
+        self.stdinDescriptor = stdinDescriptor
+        self.stdout = stdout
+        self.stderr = stderr
+    }
 }
 
 package enum ProcessLauncherError: Error {

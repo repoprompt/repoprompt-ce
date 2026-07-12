@@ -7,8 +7,10 @@ included:
   - Sources/RepoPrompt
   - Sources/RepoPromptExecutable
   - Sources/RepoPromptMCP
+  - Sources/RepoPromptProcessSupport
   - Sources/RepoPromptShared
   - Tests/RepoPromptTests
+  - Tests/RepoPromptProcessTests
   - Packages/RepoPromptAgentProviders/Package.swift
   - Packages/RepoPromptAgentProviders/Sources
   - Packages/RepoPromptAgentProviders/Tests
