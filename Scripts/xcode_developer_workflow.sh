@@ -85,9 +85,7 @@ case "$ACTION" in
         BUILD_DIR="$(./Scripts/run_without_github_tokens.sh swift build -c debug --scratch-path "$SWIFTPM_SCRATCH_PATH" --show-bin-path)"
         [[ -x "$BUILD_DIR/repoprompt-mcp" ]] || fail "debug repoprompt-mcp executable is missing"
         mkdir -p "$ROOT_DIR/.build/debug"
-        if [[ ! -x "$ROOT_DIR/.build/debug/repoprompt-mcp" ]]; then
-            ln -sfn "$BUILD_DIR/repoprompt-mcp" "$ROOT_DIR/.build/debug/repoprompt-mcp"
-        fi
+        ln -sfn "$BUILD_DIR/repoprompt-mcp" "$ROOT_DIR/.build/debug/repoprompt-mcp"
         ;;
     test)
         SWIFTPM_SCRATCH_PATH="$(python3 "$ROOT_DIR/Scripts/cache_inventory.py" --repo-root "$ROOT_DIR" --configuration Debug --format path)"

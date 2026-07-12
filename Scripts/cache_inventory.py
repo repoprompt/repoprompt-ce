@@ -564,14 +564,17 @@ def plan_build_cache_cleanup(
         configuration = identity.configuration
 
         def add_entry(path: Path, worktree_root: Path, current: bool) -> None:
-            try:
-                path = path.resolve()
-            except OSError:
-                pass
+            path = path.expanduser().absolute()
+            is_symlink = path.is_symlink()
+            if not is_symlink:
+                try:
+                    path = path.resolve()
+                except OSError:
+                    pass
             if path in seen_paths:
                 return
             seen_paths.add(path)
-            if not path.exists():
+            if not path.exists() and not is_symlink:
                 return
 
             skip_reasons: List[str] = []
@@ -582,17 +585,17 @@ def plan_build_cache_cleanup(
                 roots.append(Path(identity.developer_root))
             if not any(is_path_within(path, r) for r in roots):
                 skip_reasons.append("out-of-scope")
-            if path.is_symlink():
+            if is_symlink:
                 skip_reasons.append("symlink")
-            if is_active_swiftpm_scratch(path):
+            if not is_symlink and is_active_swiftpm_scratch(path):
                 skip_reasons.append("active-lock")
             if is_live_bound_to_path(path, worktree_root):
                 skip_reasons.append("live-bound")
             if is_dirty_worktree(worktree_root):
                 skip_reasons.append("dirty-worktree")
 
-            size = directory_size_bytes(path)
-            mtime = latest_mtime(path)
+            size = 0 if is_symlink else directory_size_bytes(path)
+            mtime = path.lstat().st_mtime if is_symlink else latest_mtime(path)
             entry_identity = resolve_swiftpm_cache_identity(worktree_root, configuration, env)
             entries.append(
                 BuildCacheEntry(

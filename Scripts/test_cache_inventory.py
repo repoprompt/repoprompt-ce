@@ -159,6 +159,25 @@ class CacheInventoryTests(unittest.TestCase):
             self.assertTrue((current / ".build").exists())
             self.assertFalse((sibling / ".build").exists())
 
+    def test_cleanup_plan_skips_symlinked_cache_without_resolving_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            container = Path(tmp) / ".repoprompt-worktrees" / "group"
+            current = container / "wt-a"
+            sibling = container / "wt-b"
+            target = container / "shared-cache"
+            for directory in (current, sibling, target):
+                directory.mkdir(parents=True)
+            (current / "Package.swift").write_text("", encoding="utf-8")
+            (sibling / "Package.swift").write_text("", encoding="utf-8")
+            (current / ".build").mkdir()
+            (sibling / ".build").symlink_to(target, target_is_directory=True)
+
+            plan = cache_inventory.plan_build_cache_cleanup(sibling)
+            entry = next(e for e in plan.entries if e.path == sibling / ".build")
+
+        self.assertIn("symlink", entry.skip_reasons)
+        self.assertNotEqual(entry.path, target.resolve())
+
     def test_diagnostics_build_cache_reports_identity_and_worktrees(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             container = Path(tmp) / ".repoprompt-worktrees" / "group"
