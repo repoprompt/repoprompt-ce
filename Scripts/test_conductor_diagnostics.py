@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Tuple
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -159,9 +160,12 @@ class FocusedBuildDiagnosticTests(unittest.TestCase):
         self.assertEqual(report["timing"]["xctest"]["wallSeconds"], 0.457)
 
     def test_focused_build_missing_swift_returns_one(self) -> None:
-        empty_path = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda p=empty_path: shutil.rmtree(p, ignore_errors=True))
-        code, _ = self._run_with_path(empty_path, {"product": "RepoPrompt"})
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor_diagnostics.subprocess,
+            "Popen",
+            side_effect=FileNotFoundError,
+        ):
+            code, _ = self._run_with_path(Path(tmp), {"product": "RepoPrompt"})
         self.assertEqual(code, 1)
 
     def test_focused_build_reports_scratch_state(self) -> None:
