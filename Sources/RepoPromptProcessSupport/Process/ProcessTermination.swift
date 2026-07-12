@@ -1,10 +1,10 @@
 import Darwin
 import Foundation
 
-enum ProcessTerminationError: Error, LocalizedError {
+package enum ProcessTerminationError: Error, LocalizedError {
     case waitFailed(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .waitFailed(message):
             "waitpid failed: \(message)"
@@ -12,7 +12,7 @@ enum ProcessTerminationError: Error, LocalizedError {
     }
 }
 
-enum ProcessTermination {
+package enum ProcessTermination {
     private struct TerminationTiming {
         let cooperativeWaitTimeout: TimeInterval
         let sigtermGrace: TimeInterval
@@ -31,19 +31,19 @@ enum ProcessTermination {
     private static let terminationModeLock = NSLock()
     private static var appTerminationFastPathEnabled = false
 
-    static func beginAppTerminationFastPath() {
+    package static func beginAppTerminationFastPath() {
         terminationModeLock.lock()
         appTerminationFastPathEnabled = true
         terminationModeLock.unlock()
     }
 
-    static func resetAppTerminationFastPath() {
+    package static func resetAppTerminationFastPath() {
         terminationModeLock.lock()
         appTerminationFastPathEnabled = false
         terminationModeLock.unlock()
     }
 
-    static func cooperativeCancellationWaitTimeout() -> TimeInterval {
+    package static func cooperativeCancellationWaitTimeout() -> TimeInterval {
         currentTiming().cooperativeWaitTimeout
     }
 
@@ -90,8 +90,12 @@ enum ProcessTermination {
 
     @inline(__always)
     private static func normalizedExitCode(_ rawStatus: Int32) -> Int32 {
-        if waitStatusExited(rawStatus) { return waitStatusExitCode(rawStatus) }
-        if waitStatusSignaled(rawStatus) { return 128 &+ waitStatusSignal(rawStatus) }
+        if waitStatusExited(rawStatus) {
+            return waitStatusExitCode(rawStatus)
+        }
+        if waitStatusSignaled(rawStatus) {
+            return 128 &+ waitStatusSignal(rawStatus)
+        }
         return rawStatus
     }
 
@@ -108,25 +112,31 @@ enum ProcessTermination {
 
     private static func processGroupExists(_ processGroupID: pid_t?) -> Bool {
         guard let processGroupID = safeProcessGroupID(processGroupID) else { return false }
-        if killpg(processGroupID, 0) == 0 { return true }
+        if killpg(processGroupID, 0) == 0 {
+            return true
+        }
         return errno == EPERM
     }
 
     @discardableResult
-    static func signalProcessGroupOrPID(
+    package static func signalProcessGroupOrPID(
         pid: pid_t,
         processGroupID: pid_t?,
         signal: Int32,
         logger: (String) -> Void = { _ in }
     ) -> Bool {
         if let processGroupID = safeProcessGroupID(processGroupID) {
-            if killpg(processGroupID, signal) == 0 { return true }
+            if killpg(processGroupID, signal) == 0 {
+                return true
+            }
             if errno != ESRCH {
                 let message = String(cString: strerror(errno))
                 logger("killpg(\(processGroupID), \(signal)) failed: \(message); falling back to pid \(pid)")
             }
         }
-        if kill(pid, signal) == 0 { return true }
+        if kill(pid, signal) == 0 {
+            return true
+        }
         if errno != ESRCH {
             let message = String(cString: strerror(errno))
             logger("kill(\(pid), \(signal)) failed: \(message)")
@@ -226,7 +236,7 @@ enum ProcessTermination {
         return normalizedExitCode(status)
     }
 
-    static func waitForTermination(
+    package static func waitForTermination(
         pid: pid_t,
         processGroupID: pid_t?,
         timeout: TimeInterval?,
@@ -261,7 +271,9 @@ enum ProcessTermination {
                 }
 
                 let r = waitpid(pid, &status, WNOHANG)
-                if r == pid { return (normalizedExitCode(status), false) }
+                if r == pid {
+                    return (normalizedExitCode(status), false)
+                }
                 if r == 0 {
                     if ProcessInfo.processInfo.systemUptime >= deadline {
                         let timing = currentTiming()
@@ -279,8 +291,12 @@ enum ProcessTermination {
                     try? await Task.sleep(nanoseconds: currentPollNs())
                     continue
                 }
-                if r == -1, errno == EINTR { continue }
-                if r == -1, errno == ECHILD { return (normalizedExitCode(status), false) }
+                if r == -1, errno == EINTR {
+                    continue
+                }
+                if r == -1, errno == ECHILD {
+                    return (normalizedExitCode(status), false)
+                }
                 if r == -1 {
                     let message = String(cString: strerror(errno))
                     throw ProcessTerminationError.waitFailed(message)
@@ -304,13 +320,19 @@ enum ProcessTermination {
             }
 
             let r = waitpid(pid, &status, WNOHANG)
-            if r == pid { return (normalizedExitCode(status), false) }
+            if r == pid {
+                return (normalizedExitCode(status), false)
+            }
             if r == 0 {
                 try? await Task.sleep(nanoseconds: currentPollNs())
                 continue
             }
-            if r == -1, errno == EINTR { continue }
-            if r == -1, errno == ECHILD { return (normalizedExitCode(status), false) }
+            if r == -1, errno == EINTR {
+                continue
+            }
+            if r == -1, errno == ECHILD {
+                return (normalizedExitCode(status), false)
+            }
             if r == -1 {
                 let message = String(cString: strerror(errno))
                 throw ProcessTerminationError.waitFailed(message)
@@ -318,7 +340,7 @@ enum ProcessTermination {
         }
     }
 
-    static func terminateAndReap(
+    package static func terminateAndReap(
         pid: pid_t,
         processGroupID: pid_t?,
         sigtermGrace: TimeInterval? = nil,

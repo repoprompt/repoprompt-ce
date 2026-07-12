@@ -2,16 +2,16 @@ import Darwin
 import Foundation
 import RepoPromptShared
 
-struct SpawnedProcess: @unchecked Sendable {
-    let pid: pid_t
-    let processGroupID: pid_t?
-    let stdin: FileHandle?
-    let stdinDescriptor: Int32?
-    let stdout: FileHandle
-    let stderr: FileHandle
+package struct SpawnedProcess: @unchecked Sendable {
+    package let pid: pid_t
+    package let processGroupID: pid_t?
+    package let stdin: FileHandle?
+    package let stdinDescriptor: Int32?
+    package let stdout: FileHandle
+    package let stderr: FileHandle
 }
 
-enum ProcessLauncherError: Error {
+package enum ProcessLauncherError: Error {
     case pipeCreationFailed(String)
     case descriptorConfigurationFailed(label: String, fd: Int32, underlying: POSIXDescriptorConfigurationError)
     case spawnFileActionsFailed(operation: String, errno: Int32)
@@ -20,8 +20,8 @@ enum ProcessLauncherError: Error {
     case spawnFailed(errno: Int32)
 }
 
-enum ProcessLauncher {
-    static func spawn(
+package enum ProcessLauncher {
+    package static func spawn(
         command: String,
         arguments: [String],
         environment: [String: String],
@@ -37,12 +37,12 @@ enum ProcessLauncher {
     }
 
     #if DEBUG
-        enum DebugInitializationFailure {
+        package enum DebugInitializationFailure {
             case fileActions(errno: Int32)
             case attributes(errno: Int32)
         }
 
-        static func debugSpawn(
+        package static func debugSpawn(
             command: String,
             arguments: [String],
             environment: [String: String],
@@ -80,8 +80,12 @@ enum ProcessLauncher {
         var stderrPipe: [Int32] = [-1, -1]
 
         func closePipe(_ pipe: inout [Int32]) {
-            if pipe[0] != -1 { close(pipe[0]) }
-            if pipe[1] != -1 { close(pipe[1]) }
+            if pipe[0] != -1 {
+                close(pipe[0])
+            }
+            if pipe[1] != -1 {
+                close(pipe[1])
+            }
             pipe = [-1, -1]
         }
 

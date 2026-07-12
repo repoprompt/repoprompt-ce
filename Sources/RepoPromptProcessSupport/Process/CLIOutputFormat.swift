@@ -1,11 +1,11 @@
 import Foundation
 
-enum CLIOutputFormat: String {
+package enum CLIOutputFormat: String {
     case text
     case json
     case streamJson = "stream-json"
 
-    var tokens: [String] {
+    package var tokens: [String] {
         ["--output-format", rawValue]
     }
 }

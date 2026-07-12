@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProcessSupport
 import XCTest
 
 final class OpenCodeACPLaunchResolverTests: XCTestCase {
@@ -303,7 +304,9 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
     private func waitUntilFileExists(_ url: URL, timeout: TimeInterval = 2) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         repeat {
-            if FileManager.default.fileExists(atPath: url.path) { return true }
+            if FileManager.default.fileExists(atPath: url.path) {
+                return true
+            }
             await Task.yield()
         } while Date() < deadline
         return false

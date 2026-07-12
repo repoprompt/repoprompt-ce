@@ -114,6 +114,33 @@ if [[ -f "ThirdPartyLicenses/tree-sitter/scanner-support.sha256" ]]; then
   fi
 fi
 
+if [[ -d "Sources/RepoPromptProcessSupport" ]]; then
+  unexpected_repo_prompt_process_support_files="$(find Sources/RepoPromptProcessSupport -type f \
+    ! -path 'Sources/RepoPromptProcessSupport/Concurrency/AsyncScope.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Concurrency/TaskSemaphore.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIEnvironmentCache.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLINativePathDefaults.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIOutputFormat.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIProcessConfiguration.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIProcessLogCollector.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIProcessRunner.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CommandPathResolver.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/FDWriteSupport.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessDebugLogging.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessEnvironmentBuilder.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessEnvironmentSanitizer.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessLaunchContext.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessLauncher.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessRegistry.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessStreamFraming.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessTermination.swift' \
+    -print)"
+  if [[ -n "$unexpected_repo_prompt_process_support_files" ]]; then
+    fail "unexpected file found under narrow RepoPromptProcessSupport canary target"
+    printf '%s\n' "$unexpected_repo_prompt_process_support_files" >&2
+  fi
+fi
+
 if ! tree_sitter_scanner_support_manifest_output="$(python3 <<'PY'
 import json
 import subprocess
@@ -184,11 +211,25 @@ else:
 if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in repo_prompt_app_dependencies):
     errors.append("RepoPromptApp must directly depend on TreeSitterScannerSupport")
 
+repo_prompt_process_support = targets.get("RepoPromptProcessSupport")
+if repo_prompt_process_support is None:
+    errors.append("RepoPromptProcessSupport target missing")
+else:
+    if repo_prompt_process_support.get("type") != "regular":
+        errors.append("RepoPromptProcessSupport target must remain a regular library target")
+    if repo_prompt_process_support.get("path") != "Sources/RepoPromptProcessSupport":
+        errors.append("RepoPromptProcessSupport target path drifted")
+    process_support_dependencies = [d.get("byName", [None])[0] for d in repo_prompt_process_support.get("dependencies", []) if d.get("byName")]
+    if process_support_dependencies != ["RepoPromptShared"]:
+        errors.append("RepoPromptProcessSupport must depend only on RepoPromptShared")
+if not any(dependency.get("byName", [None])[0] == "RepoPromptProcessSupport" for dependency in repo_prompt_app_dependencies):
+    errors.append("RepoPromptApp must directly depend on RepoPromptProcessSupport")
+
 if errors:
     raise SystemExit("\n".join(errors))
 PY
 )"; then
-  fail "TreeSitter grammar pin/product or scanner-support manifest contract drifted"
+  fail "TreeSitter grammar pin/product, scanner-support manifest, or RepoPromptProcessSupport contract drifted"
   printf '%s\n' "$tree_sitter_scanner_support_manifest_output" >&2
 fi
 

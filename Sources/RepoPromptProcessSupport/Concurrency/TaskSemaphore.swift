@@ -7,19 +7,19 @@ import Foundation
 ///   let sem = TaskSemaphore(4)
 ///   await sem.acquire()
 ///   defer { await sem.release() }
-public actor TaskSemaphore {
+package actor TaskSemaphore {
     private let capacity: Int
     private var permits: Int
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    public init(_ permits: Int) {
+    package init(_ permits: Int) {
         precondition(permits > 0, "Semaphore must have at least one permit")
         capacity = permits
         self.permits = permits
     }
 
     /// Suspend until a permit is available, then take it.
-    public func acquire() async {
+    package func acquire() async {
         if permits > 0 {
             permits -= 1
             return
@@ -30,7 +30,7 @@ public actor TaskSemaphore {
     }
 
     /// Return a permit to the pool and resume the next waiter if any.
-    public func release() {
+    package func release() {
         if !waiters.isEmpty {
             let cont = waiters.removeFirst()
             cont.resume()
@@ -43,7 +43,7 @@ public actor TaskSemaphore {
     }
 
     /// Structured helper: acquires, runs `body`, then releases exactly once.
-    public func withPermit<T>(_ body: @Sendable () async throws -> T) async rethrows -> T {
+    package func withPermit<T>(_ body: @Sendable () async throws -> T) async rethrows -> T {
         await acquire()
         defer { release() } // actor-local; no extra Task hop
         return try await body()

@@ -45,6 +45,7 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptProcessSupport",
     "RepoPromptShared",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
     "Sparkle",
@@ -130,6 +131,12 @@ let package = Package(
             path: "Sources/RepoPromptShared",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
+        .target(
+            name: "RepoPromptProcessSupport",
+            dependencies: ["RepoPromptShared"],
+            path: "Sources/RepoPromptProcessSupport",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
         .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),
         // Exact-snapshot scanner ABI fallback for upstream JavaScript/Python products.
@@ -138,12 +145,18 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"],
+            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptShared", "RepoPromptProcessSupport"],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),
                 .copy("CodeMap/Goldens")
             ],
+            swiftSettings: repoPromptTestSwiftSettings
+        ),
+        .testTarget(
+            name: "RepoPromptProcessTests",
+            dependencies: ["RepoPromptProcessSupport"],
+            path: "Tests/RepoPromptProcessTests",
             swiftSettings: repoPromptTestSwiftSettings
         )
     ],

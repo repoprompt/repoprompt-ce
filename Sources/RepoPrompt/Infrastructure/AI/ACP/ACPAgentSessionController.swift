@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptProcessSupport
 
 actor ACPAgentSessionController {
     struct RequestTimeouts {
@@ -2553,7 +2554,9 @@ actor ACPAgentSessionController {
         case let value as Int:
             return .int(value)
         case let value as NSNumber:
-            if CFGetTypeID(value) == CFBooleanGetTypeID() { return nil }
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                return nil
+            }
             let doubleValue = value.doubleValue
             if floor(doubleValue) == doubleValue {
                 return .int(value.intValue)

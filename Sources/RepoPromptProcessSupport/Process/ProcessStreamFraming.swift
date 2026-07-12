@@ -1,7 +1,7 @@
 import Foundation
 
 @inline(__always)
-func appendTail(_ buffer: inout Data, chunk: Data, limit: Int) {
+package func appendTail(_ buffer: inout Data, chunk: Data, limit: Int) {
     guard limit > 0, !chunk.isEmpty else { return }
     buffer.append(chunk)
     if buffer.count > limit {
@@ -11,7 +11,7 @@ func appendTail(_ buffer: inout Data, chunk: Data, limit: Int) {
 }
 
 @inline(__always)
-func makeUTF8Sample(from data: Data, limit: Int) -> (String, Bool)? {
+package func makeUTF8Sample(from data: Data, limit: Int) -> (String, Bool)? {
     guard limit > 0, !data.isEmpty else { return nil }
     var sample = Data(data.prefix(limit))
     while !sample.isEmpty, String(data: sample, encoding: .utf8) == nil {
@@ -41,23 +41,23 @@ func makeUTF8Sample(from data: Data, limit: Int) -> (String, Bool)? {
 /// - Consumer: ClaudeNativeProcessSessionController.handleStdoutChunk
 /// - Codec:    ClaudeSDKProtocolCodec.decodeLine
 /// - Tests:    RepoPromptTests/Process/ProcessCoreTests.swift (LineFramer section)
-struct LineFramer {
-    struct Limits {
+package struct LineFramer {
+    package struct Limits {
         /// Maximum bytes allowed in a single logical line before overflow handling.
-        var maxLineBytes: Int
+        package var maxLineBytes: Int
         /// Maximum bytes the carry buffer may accumulate across chunks before overflow.
-        var maxCarryBytes: Int
+        package var maxCarryBytes: Int
         /// When overflow occurs, retain this many trailing bytes so downstream tail-recovery can still find embedded JSON.
-        var tailRetainBytes: Int
+        package var tailRetainBytes: Int
 
-        static let `default` = Limits(
+        package static let `default` = Limits(
             maxLineBytes: 8 * 1024 * 1024, // 8 MB
             maxCarryBytes: 16 * 1024 * 1024, // 16 MB
             tailRetainBytes: 128 * 1024 // 128 KB
         )
     }
 
-    enum Diagnostic {
+    package enum Diagnostic {
         /// Carry buffer exceeded limits; prefix was discarded, tail retained, quote state reset.
         case overflow(droppedBytes: Int, retainedBytes: Int)
         /// Quote-tracking state was force-reset because the line is not a JSON candidate.
@@ -73,13 +73,13 @@ struct LineFramer {
     /// Whether we've seen the first non-whitespace byte of the current line (to determine JSON candidacy).
     private var hasSeenLineStart = false
 
-    let limits: Limits
+    package let limits: Limits
 
-    init(limits: Limits = .default) {
+    package init(limits: Limits = .default) {
         self.limits = limits
     }
 
-    mutating func feed(_ chunk: Data, onDiagnostic: (Diagnostic) -> Void = { _ in }, onLine: (Data) -> Void) {
+    package mutating func feed(_ chunk: Data, onDiagnostic: (Diagnostic) -> Void = { _ in }, onLine: (Data) -> Void) {
         guard !chunk.isEmpty else { return }
 
         var pending: [Data] = []
@@ -183,7 +183,7 @@ struct LineFramer {
         }
     }
 
-    mutating func flush(_ onLine: (Data) -> Void) {
+    package mutating func flush(_ onLine: (Data) -> Void) {
         if !carry.isEmpty {
             onLine(carry)
             carry.removeAll(keepingCapacity: false)
@@ -213,7 +213,7 @@ struct LineFramer {
 }
 
 @inline(__always)
-func isASCIIWhitespace(_ byte: UInt8) -> Bool {
+package func isASCIIWhitespace(_ byte: UInt8) -> Bool {
     switch byte {
     case 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20:
         true
@@ -223,7 +223,7 @@ func isASCIIWhitespace(_ byte: UInt8) -> Bool {
 }
 
 @inline(__always)
-func trimmedASCIIWhitespace(_ data: Data) -> Data? {
+package func trimmedASCIIWhitespace(_ data: Data) -> Data? {
     var start = data.startIndex
     var end = data.endIndex
     while start < end, isASCIIWhitespace(data[start]) {
@@ -243,7 +243,7 @@ func trimmedASCIIWhitespace(_ data: Data) -> Data? {
 ///
 /// Returns `nil` when no repair is needed or when the payload is not a JSON
 /// candidate (`{...}` / `[...]`).
-func repairJSONStringControlCharacters(_ data: Data) -> Data? {
+package func repairJSONStringControlCharacters(_ data: Data) -> Data? {
     guard !data.isEmpty else { return nil }
     guard data.contains(0x0A) || data.contains(0x0D) else { return nil }
 

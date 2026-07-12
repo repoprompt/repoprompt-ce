@@ -4,9 +4,9 @@ import Foundation
 /// Mirrors the semantics of `TaskSemaphore.withPermit`, but allows callers
 /// to await both the entry and cleanup phases without resorting to launching
 /// detached `Task`s from a `defer`.
-enum AsyncScope {
+package enum AsyncScope {
     @discardableResult
-    static func withCleanup<T>(
+    package static func withCleanup<T>(
         _ enter: () async throws -> Void,
         cleanup: () async -> Void,
         operation: () async throws -> T

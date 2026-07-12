@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcessSupport
 
 struct CursorACPAgentProvider: ACPAgentProvider {
     private let config: CursorAgentConfig

@@ -120,6 +120,13 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 - `App/WindowState.swift` remains the composition root and continues to instantiate/pause the DEBUG-only `AgentChatStressHarness`. This is wiring only; harness implementation lives under Diagnostics.
 - `Infrastructure/Security/EphemeralSecureKeyValueStore.swift` remains with security storage code, not Diagnostics, because it is a required debug-app secure-storage backend rather than a fixture or visible diagnostic harness. It is `#if DEBUG`, in-memory only, and preserves existing debug behavior for ad-hoc/ephemeral secure storage.
 
+### RepoPromptProcessSupport canary target
+
+- `Sources/RepoPromptProcessSupport` is a bounded lower-level internal library target for the Process substrate and the concurrency primitives it depends on (`AsyncScope`, `TaskSemaphore`). It is a one-off modularization canary, not a new general-purpose bucket.
+- Source files moved into this target are: `Process/CLIProcessRunner.swift`, `Process/CLIProcessConfiguration.swift`, `Process/CLIProcessLogCollector.swift`, `Process/CLIOutputFormat.swift`, `Process/CLINativePathDefaults.swift`, `Process/CommandPathResolver.swift`, `Process/ProcessEnvironmentBuilder.swift`, `Process/ProcessEnvironmentSanitizer.swift`, `Process/ProcessLaunchContext.swift`, `Process/CLIEnvironmentCache.swift`, `Process/ProcessDebugLogging.swift`, `Process/ProcessLauncher.swift`, `Process/ProcessRegistry.swift`, `Process/ProcessTermination.swift`, `Process/FDWriteSupport.swift`, `Process/ProcessStreamFraming.swift`, `Concurrency/AsyncScope.swift`, `Concurrency/TaskSemaphore.swift`.
+- `CLIProcessRunnerLifecycleTests` moved to `Tests/RepoPromptProcessTests` to exercise the canary target in isolation. `RepoPromptApp` depends on `RepoPromptProcessSupport`; `RepoPromptTests` and `RepoPromptProcessTests` both depend on it.
+- The remainder of the `Process/` directory and `Concurrency/` directory in `Sources/RepoPrompt` are still owned by `RepoPromptApp`. Do not expand `RepoPromptProcessSupport` beyond its canary scope without a separate plan.
+
 ### Tree-sitter scanner linker compatibility target
 
 - `Sources/TreeSitterScannerSupport` is an internal C linker compatibility target, not a restored local grammar target. It contains byte-for-byte exact-snapshot copies of the upstream JavaScript and Python `scanner.c` implementations plus their required `tree_sitter` helper headers. It does not contain parser copies, grammar definitions, queries, or CE-authored scanner code.

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcessSupport
 
 final class CodexExecAgentProvider: HeadlessAgentProvider {
     private enum StreamRetryAction {
@@ -263,7 +264,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                             }
                                             var sawStopThisChunk = false
                                             framer.feed(chunk) { lineData in
-                                                if sawStopThisChunk { return }
+                                                if sawStopThisChunk {
+                                                    return
+                                                }
                                                 if let streamResult = self.parseJSONLEvent(lineData) {
                                                     if self.enableDebugLogging {
                                                         print("[DEBUG] CodexExec: Parsed event type: \(streamResult.type)")

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptProcessSupport
 
 // MARK: - JJ Command Runner
 
@@ -223,14 +224,18 @@ public actor JJCommandRunner {
         let outCollector = Task(priority: .userInitiated) { () -> Data in
             var buf = Data()
             for await chunk in outStream {
-                if !chunk.isEmpty { buf.append(chunk) }
+                if !chunk.isEmpty {
+                    buf.append(chunk)
+                }
             }
             return buf
         }
         let errCollector = Task(priority: .userInitiated) { () -> Data in
             var buf = Data()
             for await chunk in errStream {
-                if !chunk.isEmpty { buf.append(chunk) }
+                if !chunk.isEmpty {
+                    buf.append(chunk)
+                }
             }
             return buf
         }
@@ -240,12 +245,16 @@ public actor JJCommandRunner {
                 // Drain stdout
                 outPipe.fileHandleForReading.readabilityHandler = { handle in
                     let chunk = handle.availableData
-                    if !chunk.isEmpty { outC.yield(chunk) }
+                    if !chunk.isEmpty {
+                        outC.yield(chunk)
+                    }
                 }
                 // Drain stderr
                 errPipe.fileHandleForReading.readabilityHandler = { handle in
                     let chunk = handle.availableData
-                    if !chunk.isEmpty { errC.yield(chunk) }
+                    if !chunk.isEmpty {
+                        errC.yield(chunk)
+                    }
                 }
 
                 process.terminationHandler = { proc in
@@ -257,8 +266,12 @@ public actor JJCommandRunner {
                     let outTail = outPipe.fileHandleForReading.readDataToEndOfFile()
                     let errTail = errPipe.fileHandleForReading.readDataToEndOfFile()
 
-                    if !outTail.isEmpty { outC.yield(outTail) }
-                    if !errTail.isEmpty { errC.yield(errTail) }
+                    if !outTail.isEmpty {
+                        outC.yield(outTail)
+                    }
+                    if !errTail.isEmpty {
+                        errC.yield(errTail)
+                    }
                     outC.finish()
                     errC.finish()
 
