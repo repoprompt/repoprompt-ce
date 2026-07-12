@@ -2585,7 +2585,8 @@ class DaemonState:
         except Exception as exc:
             with self.condition:
                 current.failure_record_pending = False
-            self._append_system_line_locked(job, f"failure record write failed: {exc}\n")
+                self._append_system_line_locked(job, f"failure record write failed: {exc}\n")
+                self.condition.notify_all()
             return
         with self.condition:
             current.output_summary = summary

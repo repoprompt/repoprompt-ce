@@ -1082,6 +1082,30 @@ class LifecycleQueueTests(LifecycleTestCase):
         write_mock.assert_called_once()
         self.assertTrue(job.failure_record_written)
 
+    def test_failure_record_write_error_updates_job_under_condition_lock(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "ticket", "swift-build", {"product": "RepoPrompt"}, ["build"], job_state="failed")
+        job.exit_code = 1
+        job.finished_at = conductor.now()
+        state.jobs[job.ticket] = job
+        lock_held: list[bool] = []
+        append_system_line = state._append_system_line_locked
+
+        def record_lock_state(current_job: conductor.Job, text: str) -> None:
+            lock_held.append(state.condition._is_owned())
+            append_system_line(current_job, text)
+
+        with mock.patch.object(state.failure_store, "write", side_effect=OSError("fixture write failure")), mock.patch.object(
+            state, "_append_system_line_locked", side_effect=record_lock_state
+        ):
+            state._refresh_output_summary(job)
+
+        self.assertEqual(lock_held, [True])
+        self.assertFalse(job.failure_record_pending)
+        self.assertFalse(job.failure_record_written)
+        self.assertIn("failure record write failed: fixture write failure", job.log_path.read_text(encoding="utf-8"))
+
 
 class XCTestStallWatchdogTests(LifecycleTestCase):
     def make_watchdog_job(
