@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import RepoPromptProcessSupport
 
 /// One cancellation-independent owner for a direct child's destructive reap.
 /// Callers may wait repeatedly, but only the callback-based observation invokes

@@ -5,6 +5,7 @@ import Foundation
 #else
     import Glibc
 #endif
+import RepoPromptProcessSupport
 
 /// Shared defaults and legacy key handling for app-wide ignore preferences.
 ///

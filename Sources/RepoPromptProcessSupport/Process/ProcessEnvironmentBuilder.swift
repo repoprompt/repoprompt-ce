@@ -1,23 +1,23 @@
 import Foundation
 
-enum ShellEnvironmentSource: Equatable {
+package enum ShellEnvironmentSource: Equatable {
     case inheritedRichEnvironment
     case capturedLoginShell
     case previousCapturedFallback
     case enrichedFallback
 }
 
-enum ShellEnvironmentCaptureMode: Hashable, CaseIterable {
+package enum ShellEnvironmentCaptureMode: Hashable, CaseIterable {
     case interactiveLoginShell
     case loginShell
 }
 
-struct CLIEnvironmentSnapshot: Equatable {
-    let environment: [String: String]
-    let source: ShellEnvironmentSource
+package struct CLIEnvironmentSnapshot: Equatable {
+    package let environment: [String: String]
+    package let source: ShellEnvironmentSource
 }
 
-enum ProcessLaunchPurpose: Equatable {
+package enum ProcessLaunchPurpose: Equatable {
     case cliRunner
     case codexAppServer
     case codexPreflight
@@ -28,15 +28,15 @@ enum ProcessLaunchPurpose: Equatable {
     case shellEnvironmentProbe
 }
 
-struct ProcessEnvironmentRequest: Equatable {
-    let purpose: ProcessLaunchPurpose
-    let inheritedEnvironment: [String: String]
-    let overrides: [String: String]
-    let additionalRemovedKeys: Set<String>
-    let forceRefreshShellEnvironment: Bool
-    let enableDebugLogging: Bool
+package struct ProcessEnvironmentRequest: Equatable {
+    package let purpose: ProcessLaunchPurpose
+    package let inheritedEnvironment: [String: String]
+    package let overrides: [String: String]
+    package let additionalRemovedKeys: Set<String>
+    package let forceRefreshShellEnvironment: Bool
+    package let enableDebugLogging: Bool
 
-    init(
+    package init(
         purpose: ProcessLaunchPurpose,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
         overrides: [String: String] = [:],
@@ -53,16 +53,16 @@ struct ProcessEnvironmentRequest: Equatable {
     }
 }
 
-struct ProcessEnvironmentResult: Equatable {
-    let environment: [String: String]
-    let launchContext: ProcessLaunchContext
-    let shellEnvironmentSource: ShellEnvironmentSource
+package struct ProcessEnvironmentResult: Equatable {
+    package let environment: [String: String]
+    package let launchContext: ProcessLaunchContext
+    package let shellEnvironmentSource: ShellEnvironmentSource
 }
 
-enum ProcessEnvironmentBuilder {
-    typealias ShellEnvironmentProvider = @Sendable (_ enableLogging: Bool, _ forceRefresh: Bool) async -> CLIEnvironmentSnapshot
+package enum ProcessEnvironmentBuilder {
+    package typealias ShellEnvironmentProvider = @Sendable (_ enableLogging: Bool, _ forceRefresh: Bool) async -> CLIEnvironmentSnapshot
 
-    static func build(_ request: ProcessEnvironmentRequest) async -> ProcessEnvironmentResult {
+    package static func build(_ request: ProcessEnvironmentRequest) async -> ProcessEnvironmentResult {
         let captureMode = preferredShellCaptureMode(for: request.purpose)
         return await build(request) { enableLogging, forceRefresh in
             await CLIEnvironmentCache.shared.environmentSnapshot(
@@ -73,7 +73,7 @@ enum ProcessEnvironmentBuilder {
         }
     }
 
-    static func build(
+    package static func build(
         _ request: ProcessEnvironmentRequest,
         shellEnvironmentProvider: ShellEnvironmentProvider
     ) async -> ProcessEnvironmentResult {
@@ -132,7 +132,7 @@ enum ProcessEnvironmentBuilder {
         }
     }
 
-    static func composedEnvironment(
+    package static func composedEnvironment(
         base: [String: String],
         inherited: [String: String],
         overrides: [String: String] = [:],
@@ -161,7 +161,7 @@ enum ProcessEnvironmentBuilder {
         )
     }
 
-    static func mergePathValues(primary: String?, secondary: String?) -> String {
+    package static func mergePathValues(primary: String?, secondary: String?) -> String {
         let primaryComponents = (primary ?? "").split(separator: ":").map(String.init)
         let secondaryComponents = (secondary ?? "").split(separator: ":").map(String.init)
         var ordered: [String] = []

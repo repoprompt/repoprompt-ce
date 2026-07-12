@@ -111,6 +111,34 @@ if ! tree_sitter_scanner_support_checksum_output="$(shasum -a 256 -c ThirdPartyL
   printf '%s\n' "$tree_sitter_scanner_support_checksum_output" >&2
 fi
 
+# RepoPromptProcessSupport is a deliberately narrow modularization canary.
+if [[ -d "Sources/RepoPromptProcessSupport" ]]; then
+  unexpected_repo_prompt_process_support_files="$(find Sources/RepoPromptProcessSupport -type f \
+    ! -path 'Sources/RepoPromptProcessSupport/Concurrency/AsyncScope.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Concurrency/TaskSemaphore.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIEnvironmentCache.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLINativePathDefaults.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIOutputFormat.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIProcessConfiguration.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIProcessLogCollector.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CLIProcessRunner.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/CommandPathResolver.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/FDWriteSupport.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessDebugLogging.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessEnvironmentBuilder.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessEnvironmentSanitizer.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessLaunchContext.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessLauncher.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessRegistry.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessStreamFraming.swift' \
+    ! -path 'Sources/RepoPromptProcessSupport/Process/ProcessTermination.swift' \
+    -print)"
+  if [[ -n "$unexpected_repo_prompt_process_support_files" ]]; then
+    fail "unexpected file found under narrow RepoPromptProcessSupport canary target"
+    printf '%s\n' "$unexpected_repo_prompt_process_support_files" >&2
+  fi
+fi
+
 if ! tree_sitter_dependency_manifest_output="$(python3 <<'PY'
 import json
 import re
@@ -250,6 +278,37 @@ if app_by_name_dependencies.count("TreeSitterScannerSupport") != 0:
     errors.append("RepoPromptApp must not directly depend on TreeSitterScannerSupport")
 if app_by_name_dependencies.count("RepoPromptCodeMapCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptCodeMapCore")
+
+repo_prompt_process_support = targets.get("RepoPromptProcessSupport")
+if repo_prompt_process_support is None:
+    errors.append("RepoPromptProcessSupport target missing")
+else:
+    if repo_prompt_process_support.get("type") != "regular":
+        errors.append("RepoPromptProcessSupport target must remain an internal regular target")
+    if repo_prompt_process_support.get("path") != "Sources/RepoPromptProcessSupport":
+        errors.append("RepoPromptProcessSupport target path drifted")
+    process_support_dependencies = [
+        dependency["byName"][0]
+        for dependency in repo_prompt_process_support.get("dependencies", [])
+        if dependency.get("byName")
+    ]
+    if process_support_dependencies != ["RepoPromptShared"] or len(repo_prompt_process_support.get("dependencies", [])) != 1:
+        errors.append("RepoPromptProcessSupport must depend only on RepoPromptShared")
+if app_by_name_dependencies.count("RepoPromptProcessSupport") != 1:
+    errors.append("RepoPromptApp must depend exactly once on RepoPromptProcessSupport")
+repo_prompt_process_tests = targets.get("RepoPromptProcessTests")
+if repo_prompt_process_tests is None:
+    errors.append("RepoPromptProcessTests target missing")
+else:
+    process_test_dependencies = [
+        dependency["byName"][0]
+        for dependency in repo_prompt_process_tests.get("dependencies", [])
+        if dependency.get("byName")
+    ]
+    if repo_prompt_process_tests.get("type") != "test" or repo_prompt_process_tests.get("path") != "Tests/RepoPromptProcessTests":
+        errors.append("RepoPromptProcessTests target path drifted")
+    if process_test_dependencies != ["RepoPromptProcessSupport"] or len(repo_prompt_process_tests.get("dependencies", [])) != 1:
+        errors.append("RepoPromptProcessTests must depend only on RepoPromptProcessSupport")
 
 # M1 headless domain runtime is an internal AppKit-free owner boundary. During the
 # two-commit migration it may be staged in Swift 5 or promoted to Swift 6, but the

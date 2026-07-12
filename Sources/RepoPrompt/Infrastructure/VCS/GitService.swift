@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import OSLog
 import RepoPromptDomainRuntime
+import RepoPromptProcessSupport
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic

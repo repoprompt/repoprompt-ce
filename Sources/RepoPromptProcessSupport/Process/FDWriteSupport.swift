@@ -2,12 +2,12 @@ import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
 
-enum FDWriteError: Error, Equatable {
+package enum FDWriteError: Error, Equatable {
     case brokenPipe(errno: Int32)
     case badDescriptor(errno: Int32)
     case system(errno: Int32)
 
-    var errnoValue: Int32 {
+    package var errnoValue: Int32 {
         switch self {
         case let .brokenPipe(errno), let .badDescriptor(errno), let .system(errno):
             errno
@@ -15,9 +15,9 @@ enum FDWriteError: Error, Equatable {
     }
 }
 
-enum FDWriteSupport {
+package enum FDWriteSupport {
     @discardableResult
-    static func configureNoSigPipe(fd: Int32) -> Bool {
+    package static func configureNoSigPipe(fd: Int32) -> Bool {
         guard fd >= 0 else { return false }
         #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
             return fcntl(fd, F_SETNOSIGPIPE, 1) != -1
@@ -26,7 +26,7 @@ enum FDWriteSupport {
         #endif
     }
 
-    static func writeAll(_ data: Data, to fd: Int32) throws {
+    package static func writeAll(_ data: Data, to fd: Int32) throws {
         guard fd >= 0 else {
             throw FDWriteError.badDescriptor(errno: EBADF)
         }

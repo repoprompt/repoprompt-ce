@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProcessSupport
 import XCTest
 
 final class OpenCodeACPLaunchResolverTests: XCTestCase {

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptProcessSupport
 
 // MARK: - JJ Command Runner
 

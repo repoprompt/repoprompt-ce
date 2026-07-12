@@ -15,7 +15,7 @@ private func commandPathResolverLog(_ message: @autoclosure () -> String) {
     #endif
 }
 
-enum CLIExecutableLaunchability: Equatable {
+package enum CLIExecutableLaunchability: Equatable {
     case launchable
     case bareCommandFallback
     case missingPath
@@ -23,8 +23,8 @@ enum CLIExecutableLaunchability: Equatable {
     case notExecutable
 }
 
-enum CommandPathResolver {
-    enum ShellLookupMode: Equatable {
+package enum CommandPathResolver {
+    package enum ShellLookupMode: Equatable {
         /// Query the user's shell before PATH search. Preserves legacy alias/function-first behavior.
         case preferShell
         /// Search the captured environment PATH first; query the shell only if PATH search misses.
@@ -36,7 +36,9 @@ enum CommandPathResolver {
     /// Heuristic: a basename matches an expected program name if it is equal, or if it
     /// is a versioned variant (e.g., "python3.11" matches "python").
     private static func basenameMatches(_ basename: String, expected: Set<String>) -> Bool {
-        if expected.contains(basename) { return true }
+        if expected.contains(basename) {
+            return true
+        }
         return expected.contains { basename.hasPrefix($0) && basename.dropFirst($0.count).range(of: #"^[0-9._-]+"#, options: .regularExpression) != nil }
     }
 
@@ -49,7 +51,7 @@ enum CommandPathResolver {
     /// IMPORTANT: The environment passed here should NOT have additionalPaths merged into PATH.
     /// This ensures the interactive shell uses the user's actual PATH configuration,
     /// allowing version managers like nvm to work correctly.
-    static func resolve(
+    package static func resolve(
         _ command: String,
         environment: [String: String],
         additionalPaths: [String],
@@ -97,7 +99,7 @@ enum CommandPathResolver {
         return expanded
     }
 
-    static func expandPath(_ path: String, environment: [String: String]) -> String {
+    package static func expandPath(_ path: String, environment: [String: String]) -> String {
         let tildeExpanded: String = if let home = environment["HOME"], !home.isEmpty, path == "~" {
             home
         } else if let home = environment["HOME"], !home.isEmpty, path.hasPrefix("~/") {
@@ -109,7 +111,7 @@ enum CommandPathResolver {
         return expandEnvironmentVariables(in: tildeExpanded, environment: environment)
     }
 
-    static func launchability(of resolvedCommand: String) -> CLIExecutableLaunchability {
+    package static func launchability(of resolvedCommand: String) -> CLIExecutableLaunchability {
         guard resolvedCommand.contains("/") else {
             return .bareCommandFallback
         }
@@ -127,7 +129,7 @@ enum CommandPathResolver {
         return .launchable
     }
 
-    static func mergedPathComponents(environment: [String: String], additionalPaths: [String]) -> [String] {
+    package static func mergedPathComponents(environment: [String: String], additionalPaths: [String]) -> [String] {
         var components: [String] = []
         var seen = Set<String>()
         func append(path: String) {
@@ -267,10 +269,12 @@ enum CommandPathResolver {
             var fallbackCandidate: (String, Bool)?
             for rawLine in lines {
                 let line = String(rawLine)
-                if line == sentinelBegin { betweenSentinels = true
+                if line == sentinelBegin {
+                    betweenSentinels = true
                     continue
                 }
-                if line == sentinelEnd { betweenSentinels = false
+                if line == sentinelEnd {
+                    betweenSentinels = false
                     break
                 }
                 guard betweenSentinels else { continue }
@@ -291,7 +295,9 @@ enum CommandPathResolver {
                 }
 
                 if shouldAcceptImmediately {
-                    if isExecutableRegularFile(expanded) { return (expanded, candidate.isAliasTarget) }
+                    if isExecutableRegularFile(expanded) {
+                        return (expanded, candidate.isAliasTarget)
+                    }
                     return (expanded, candidate.isAliasTarget)
                 }
             }
@@ -441,7 +447,9 @@ enum CommandPathResolver {
         // Some shell outputs wrap in parentheses: ( /path/to/prog )
         if candidate.hasPrefix("("), candidate.hasSuffix(")") {
             let inner = candidate.dropFirst().dropLast()
-            if inner.contains("/") { candidate = String(inner) }
+            if inner.contains("/") {
+                candidate = String(inner)
+            }
         }
 
         let expanded = (candidate as NSString).expandingTildeInPath
@@ -518,16 +526,26 @@ enum CommandPathResolver {
         var filtered: [String] = []
         var skipEnvAssignments = false
         for token in tokens {
-            if token.isEmpty { continue }
+            if token.isEmpty {
+                continue
+            }
             if wrapperCommands.contains(token) {
                 skipEnvAssignments = token == "env" || token.hasSuffix("/env")
                 continue
             }
             // Drop KEY=VAL anywhere (env inline assignments). Keep rare paths with '=' (very unlikely).
-            if isEnvAssignment(token) { continue }
-            if token == "is" || token == "=" { continue }
-            if token.hasPrefix("$") { continue } // $@, $*, $1, etc.
-            if !isAliasTarget, token == originalCommand { continue }
+            if isEnvAssignment(token) {
+                continue
+            }
+            if token == "is" || token == "=" {
+                continue
+            }
+            if token.hasPrefix("$") {
+                continue
+            } // $@, $*, $1, etc.
+            if !isAliasTarget, token == originalCommand {
+                continue
+            }
             filtered.append(token)
         }
         guard !filtered.isEmpty else { return nil }
@@ -549,11 +567,19 @@ enum CommandPathResolver {
             while i < filtered.count {
                 let t = filtered[i]
                 // Stop at arguments and shell metacharacters
-                if t.hasPrefix("$") || t.hasPrefix("-") { break }
-                if t == "|" || t == "||" || t == "&&" || t == ";" || t == "&" { break }
-                if wrapperCommands.contains(t) { break }
+                if t.hasPrefix("$") || t.hasPrefix("-") {
+                    break
+                }
+                if t == "|" || t == "||" || t == "&&" || t == ";" || t == "&" {
+                    break
+                }
+                if wrapperCommands.contains(t) {
+                    break
+                }
                 // Stop at env assignments
-                if isEnvAssignment(t) { break }
+                if isEnvAssignment(t) {
+                    break
+                }
 
                 // Merge tokens up to and including the last token with a slash
                 // This handles paths like "/My Dev Tools/claude" -> ["/My", "Dev", "Tools/claude"]
@@ -608,9 +634,13 @@ enum CommandPathResolver {
         guard s.count >= 2 else { return s }
         let first = s.first!, last = s.last!
         // Standard pairs: '...', "..."
-        if (first == "'" && last == "'") || (first == "\"" && last == "\"") { return s.dropFirst().dropLast() }
+        if (first == "'" && last == "'") || (first == "\"" && last == "\"") {
+            return s.dropFirst().dropLast()
+        }
         // Backtick pairs: `...`  and zsh's odd `...'
-        if first == "`", last == "`" || last == "'" { return s.dropFirst().dropLast() }
+        if first == "`", last == "`" || last == "'" {
+            return s.dropFirst().dropLast()
+        }
         return s
     }
 
@@ -637,11 +667,17 @@ enum CommandPathResolver {
             if escape {
                 escape = false
             } else if ch == "\\" {
-                if !inSingle { escape = true }
+                if !inSingle {
+                    escape = true
+                }
             } else if ch == "'" {
-                if !inDouble { inSingle.toggle() }
+                if !inDouble {
+                    inSingle.toggle()
+                }
             } else if ch == "\"" {
-                if !inSingle { inDouble.toggle() }
+                if !inSingle {
+                    inDouble.toggle()
+                }
             } else if ch == target, !inSingle, !inDouble {
                 return i
             }

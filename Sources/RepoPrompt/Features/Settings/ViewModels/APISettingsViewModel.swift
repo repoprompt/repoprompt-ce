@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptProcessSupport
 import SwiftUI
 
 #if DEBUG

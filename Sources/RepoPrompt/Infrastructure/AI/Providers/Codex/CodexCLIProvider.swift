@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcessSupport
 
 final class CodexCLIProvider: AIProvider {
     private struct StreamAttemptFailure: Error {

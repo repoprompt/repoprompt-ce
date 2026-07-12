@@ -2,16 +2,16 @@ import Darwin
 import Foundation
 import RepoPromptShared
 
-struct SpawnedProcess: @unchecked Sendable {
-    let pid: pid_t
-    let processGroupID: pid_t?
-    let stdin: FileHandle?
-    let stdinDescriptor: Int32?
-    let stdout: FileHandle
-    let stderr: FileHandle
+package struct SpawnedProcess: @unchecked Sendable {
+    package let pid: pid_t
+    package let processGroupID: pid_t?
+    package let stdin: FileHandle?
+    package let stdinDescriptor: Int32?
+    package let stdout: FileHandle
+    package let stderr: FileHandle
 }
 
-enum ProcessLauncherError: Error {
+package enum ProcessLauncherError: Error {
     case pipeCreationFailed(label: String, errno: Int32)
     case descriptorConfigurationFailed(label: String, fd: Int32, underlying: POSIXDescriptorConfigurationError)
     case spawnFileActionsFailed(operation: String, errno: Int32)
@@ -19,7 +19,7 @@ enum ProcessLauncherError: Error {
     case spawnAttributesFailed(operation: String, errno: Int32)
     case spawnFailed(errno: Int32)
 
-    var processLaunchFailure: (domain: String, code: Int) {
+    package var processLaunchFailure: (domain: String, code: Int) {
         let errnoValue: Int32 = switch self {
         case let .pipeCreationFailed(_, errnoValue),
              let .spawnFileActionsFailed(_, errnoValue),
@@ -34,8 +34,8 @@ enum ProcessLauncherError: Error {
     }
 }
 
-enum ProcessLauncher {
-    static func spawn(
+package enum ProcessLauncher {
+    package static func spawn(
         command: String,
         arguments: [String],
         environment: [String: String],
@@ -51,12 +51,12 @@ enum ProcessLauncher {
     }
 
     #if DEBUG
-        enum DebugInitializationFailure {
+        package enum DebugInitializationFailure {
             case fileActions(errno: Int32)
             case attributes(errno: Int32)
         }
 
-        static func debugSpawn(
+        package static func debugSpawn(
             command: String,
             arguments: [String],
             environment: [String: String],

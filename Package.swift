@@ -51,6 +51,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptCodeMapCore",
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
+    "RepoPromptProcessSupport",
     "RepoPromptShared",
     "RepoPromptC", "CSwiftPCRE2",
     "Sparkle",
@@ -82,6 +83,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
     "RepoPromptMCP",
+    "RepoPromptProcessSupport",
     "RepoPromptShared",
     .product(name: "Markdown", package: "swift-markdown")
 ]
@@ -192,6 +194,12 @@ let package = Package(
                 .define("DEBUG", .when(configuration: .debug))
             ]
         ),
+        .target(
+            name: "RepoPromptProcessSupport",
+            dependencies: ["RepoPromptShared"],
+            path: "Sources/RepoPromptProcessSupport",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
         .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),
         // Exact-snapshot scanner ABI fallback for the JavaScript/Python manifests, whose
@@ -232,6 +240,12 @@ let package = Package(
             name: "RepoPromptTests",
             dependencies: repoPromptTestDependencies,
             path: "Tests/RepoPromptTests",
+            swiftSettings: repoPromptTestSwiftSettings
+        ),
+        .testTarget(
+            name: "RepoPromptProcessTests",
+            dependencies: ["RepoPromptProcessSupport"],
+            path: "Tests/RepoPromptProcessTests",
             swiftSettings: repoPromptTestSwiftSettings
         )
     ],
