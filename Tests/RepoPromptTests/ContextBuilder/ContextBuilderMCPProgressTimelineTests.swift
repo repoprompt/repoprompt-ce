@@ -537,7 +537,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let effectivePrompt: String
             let usedAgentOutputAsPrompt: Bool
             let callerInstructions: String
-            let expected: String?
+            let expected: ContextBuilderTypedPromptResolution
         }
 
         let cases = [
@@ -546,14 +546,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 effectivePrompt: "Committed prompt",
                 usedAgentOutputAsPrompt: false,
                 callerInstructions: "<DISCOVERY_AGENT-GUIDELINES>unused",
-                expected: "Committed prompt"
+                expected: .resolved("Committed prompt")
             ),
             Case(
                 name: "plain caller instructions",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<task>Caller task</task>",
-                expected: "<task>Caller task</task>"
+                expected: .resolved("<task>Caller task</task>")
             ),
             Case(
                 name: "exact lowercase block removed",
@@ -564,11 +564,11 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 <discovery_agent-guidelines>hidden</discovery_agent-guidelines>
                 <context>Caller context</context>
                 """,
-                expected: """
+                expected: .resolved("""
                 <task>Caller task</task>
 
                 <context>Caller context</context>
-                """
+                """)
             ),
             Case(
                 name: "repeated sibling blocks removed",
@@ -579,84 +579,98 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 <task>Caller task</task>
                 <discovery_agent-guidelines>second</discovery_agent-guidelines>
                 """,
-                expected: "<task>Caller task</task>"
+                expected: .resolved("<task>Caller task</task>")
             ),
             Case(
                 name: "blank caller instructions",
                 effectivePrompt: "",
                 usedAgentOutputAsPrompt: false,
                 callerInstructions: "  \n",
-                expected: nil
+                expected: .missingCallerTask
             ),
             Case(
                 name: "guidelines only",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<discovery_agent-guidelines>hidden</discovery_agent-guidelines>",
-                expected: nil
+                expected: .discoveryGuidelinesOnly
             ),
             Case(
                 name: "unmatched opening tag",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<task>Caller task</task><discovery_agent-guidelines>hidden",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "unmatched closing tag",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<task>Caller task</task></discovery_agent-guidelines>",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "nested blocks",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<discovery_agent-guidelines>outer<discovery_agent-guidelines>inner</discovery_agent-guidelines></discovery_agent-guidelines>",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "case variant",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<DISCOVERY_AGENT-GUIDELINES>hidden</DISCOVERY_AGENT-GUIDELINES>",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "attribute variant",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<discovery_agent-guidelines scope=\"narrow\">hidden</discovery_agent-guidelines>",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "self-closing variant",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<task>Caller task</task><discovery_agent-guidelines/>",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "quoted greater-than before reserved attribute text",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<task note=\">discovery_agent-guidelines: SECRET\">Caller task</task>",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "exact guideline pair embedded in attribute",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "<task note=\"<discovery_agent-guidelines>hidden</discovery_agent-guidelines>\">Caller task</task>",
-                expected: nil
+                expected: .malformedDiscoveryMarkup
             ),
             Case(
                 name: "reserved name in ordinary prose",
                 effectivePrompt: "Discovery output",
                 usedAgentOutputAsPrompt: true,
                 callerInstructions: "Explain discovery_agent-guidelines behavior.",
-                expected: "Explain discovery_agent-guidelines behavior."
+                expected: .resolved("Explain discovery_agent-guidelines behavior.")
+            ),
+            Case(
+                name: "empty committed prompt falls back to caller instructions",
+                effectivePrompt: "",
+                usedAgentOutputAsPrompt: false,
+                callerInstructions: "<task>Caller task</task>",
+                expected: .resolved("<task>Caller task</task>")
+            ),
+            Case(
+                name: "copied discovery output without independent caller prompt",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "",
+                expected: .onlyCopiedDiscoveryOutput
             )
         ]
 
@@ -738,7 +752,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             }
         }
 
-        guard case let .failed(missingCallerPromptError) = MCPContextBuilderToolProvider.responseDisposition(
+        // Each completed-run failure surfaces the stable "without a prompt" stem plus a distinct, safe reason
+        // that never echoes the withheld caller instructions or discovery-guideline content.
+        guard case let .failed(guidelinesOnlyError) = MCPContextBuilderToolProvider.responseDisposition(
             responseType: .plan,
             terminalDisposition: .completed,
             usedAgentOutputAsPrompt: true,
@@ -747,9 +763,11 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         ) else {
             return XCTFail("Discovery output must not silently satisfy a requested response")
         }
-        XCTAssertTrue(missingCallerPromptError.contains("without a prompt"))
+        XCTAssertTrue(guidelinesOnlyError.contains("without a prompt"))
+        XCTAssertTrue(guidelinesOnlyError.contains("only discovery guidelines"))
+        XCTAssertFalse(guidelinesOnlyError.contains("hidden"))
 
-        guard case let .failed(emptyPromptError) = MCPContextBuilderToolProvider.responseDisposition(
+        guard case let .failed(missingCallerTaskError) = MCPContextBuilderToolProvider.responseDisposition(
             responseType: .review,
             terminalDisposition: .completed,
             usedAgentOutputAsPrompt: false,
@@ -758,7 +776,33 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         ) else {
             return XCTFail("Empty committed prompt must fail a requested response")
         }
-        XCTAssertTrue(emptyPromptError.contains("without a prompt"))
+        XCTAssertTrue(missingCallerTaskError.contains("without a prompt"))
+        XCTAssertTrue(missingCallerTaskError.contains("no caller task or context"))
+
+        guard case let .failed(copiedDiscoveryError) = MCPContextBuilderToolProvider.responseDisposition(
+            responseType: .plan,
+            terminalDisposition: .completed,
+            usedAgentOutputAsPrompt: true,
+            effectivePrompt: "Agent output",
+            callerInstructions: ""
+        ) else {
+            return XCTFail("Copied discovery output without a caller task must fail a requested response")
+        }
+        XCTAssertTrue(copiedDiscoveryError.contains("without a prompt"))
+        XCTAssertTrue(copiedDiscoveryError.contains("only copied discovery output"))
+
+        guard case let .failed(malformedMarkupError) = MCPContextBuilderToolProvider.responseDisposition(
+            responseType: .question,
+            terminalDisposition: .completed,
+            usedAgentOutputAsPrompt: true,
+            effectivePrompt: "Agent output",
+            callerInstructions: "<task>Caller task</task><discovery_agent-guidelines>hidden"
+        ) else {
+            return XCTFail("Malformed reserved markup must fail closed for a requested response")
+        }
+        XCTAssertTrue(malformedMarkupError.contains("without a prompt"))
+        XCTAssertTrue(malformedMarkupError.contains("malformed discovery-guideline markup"))
+        XCTAssertFalse(malformedMarkupError.contains("hidden"))
     }
 
     @MainActor
