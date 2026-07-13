@@ -4,7 +4,7 @@ import Foundation
 
 /// Detailed child termination outcome preserving the exited-vs-signaled
 /// distinction that the normalized `Int32` APIs collapse into `128 + signal`.
-enum ProcessExitStatus: Equatable, Sendable {
+enum ProcessExitStatus: Equatable {
     case exited(code: Int32)
     case uncaughtSignal(signal: Int32)
 
@@ -287,19 +287,18 @@ enum ProcessTermination {
         }
 
         logger("Process \(pid) family did not exit after SIGTERM; sending SIGKILL")
-        let sentSIGKILL: Bool
-        if rootExited {
+        let sentSIGKILL: Bool = if rootExited {
             if let processGroupID = safeProcessGroupID(processGroupID) {
-                sentSIGKILL = signalProcessGroupOnly(
+                signalProcessGroupOnly(
                     processGroupID: processGroupID,
                     signal: SIGKILL,
                     logger: logger
                 )
             } else {
-                sentSIGKILL = false
+                false
             }
         } else {
-            sentSIGKILL = signalProcessGroupOrPID(
+            signalProcessGroupOrPID(
                 pid: pid,
                 processGroupID: processGroupID,
                 signal: SIGKILL,

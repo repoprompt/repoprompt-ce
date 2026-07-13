@@ -10,7 +10,7 @@ final class GitProcessLifecycleController: @unchecked Sendable {
         case terminated
     }
 
-    struct FinalizationState: Equatable, Sendable {
+    struct FinalizationState: Equatable {
         let cancellationRequested: Bool
         let internalTerminationRequested: Bool
 
@@ -115,7 +115,7 @@ final class GitProcessLifecycleController: @unchecked Sendable {
         )
         finalized = true
         committedState = state
-        let target = self.target
+        let target = target
         self.target = nil
         let escalationTask = terminationEscalationTask
         terminationEscalationTask = nil
@@ -140,7 +140,7 @@ final class GitProcessLifecycleController: @unchecked Sendable {
         } else {
             internalTerminationRequested = true
         }
-        let target = self.target
+        let target = target
         if let target {
             armTerminationEscalationLocked(
                 target: target,

@@ -7008,13 +7008,12 @@ actor GitService {
         let spawner = processSpawner
         let gitExecutablePath = gitExecutableURL.path
 
-        let result = try await withTaskCancellationHandler(operation: {
+        return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<
                     (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason),
                     any Error
                 >) in
-
                 let recordCommandOutcome: @Sendable (_ outputByteCount: Int) -> Void = { outputByteCount in
                     commandRecorder(
                         diagnosticRepositoryPath,
@@ -7214,8 +7213,8 @@ actor GitService {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
                     let reapRequiresGroupCleanup: Bool
                     do {
-                        reapOutcome = .success(
-                            try await ProcessTermination.reapChildStatus(
+                        reapOutcome = try await .success(
+                            ProcessTermination.reapChildStatus(
                                 pid: spawned.pid,
                                 onReaped: { target.markTerminated() }
                             )
@@ -7254,15 +7253,15 @@ actor GitService {
                         stdoutResult = .failure(error)
                     }
 
-                    let stdoutFailed: Bool = switch stdoutResult {
+                    let stdoutFailed = switch stdoutResult {
                     case .success: false
                     case .failure: true
                     }
-                    if (outDrain.terminalError != nil
+                    if outDrain.terminalError != nil
                         || errDrain.didExceedByteLimit
-                        || stdoutFailed)
-                        && !finalization.requiresProcessGroupCleanup
-                        && !timeoutController.didTimeOut
+                        || stdoutFailed,
+                        !finalization.requiresProcessGroupCleanup,
+                        !timeoutController.didTimeOut
                     {
                         await ProcessTermination.terminateProcessGroupAfterRootReap(
                             processGroupID: spawned.processGroupID,
@@ -7292,7 +7291,8 @@ actor GitService {
                     } else if case let .failure(reapFailure) = reapOutcome {
                         continuation.resume(throwing: reapFailure)
                     } else if case let .success(stdoutLease) = stdoutResult,
-                              case let .success(exitStatus) = reapOutcome {
+                              case let .success(exitStatus) = reapOutcome
+                    {
                         continuation.resume(returning: (
                             stdoutLease,
                             stderrData,
@@ -7312,7 +7312,6 @@ actor GitService {
             lifecycleController.requestCancellation(terminationGrace: terminationGrace)
             timeoutController.cancel()
         })
-        return result
     }
 
     private nonisolated static func capabilityBoundObjectReadEnvironment(
@@ -7408,10 +7407,9 @@ actor GitService {
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
 
-        let result = try await withTaskCancellationHandler(operation: {
+        return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<(Data, Data, Int32), any Error>) in
-
                 let recordCommandOutcome: @Sendable (_ outputByteCount: Int) -> Void = { outputByteCount in
                     commandRecorder(
                         diagnosticRepositoryPath,
@@ -7610,8 +7608,8 @@ actor GitService {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
                     let reapRequiresGroupCleanup: Bool
                     do {
-                        reapOutcome = .success(
-                            try await ProcessTermination.reapChildStatus(
+                        reapOutcome = try await .success(
+                            ProcessTermination.reapChildStatus(
                                 pid: spawned.pid,
                                 onReaped: { target.markTerminated() }
                             )
@@ -7650,9 +7648,9 @@ actor GitService {
 
                     let stdoutData = await outCollector.value
                     let stderrData = await errCollector.value
-                    if (outDrain.didExceedByteLimit || errDrain.didExceedByteLimit)
-                        && !finalization.requiresProcessGroupCleanup
-                        && !timeoutController.didTimeOut
+                    if outDrain.didExceedByteLimit || errDrain.didExceedByteLimit,
+                       !finalization.requiresProcessGroupCleanup,
+                       !timeoutController.didTimeOut
                     {
                         await ProcessTermination.terminateProcessGroupAfterRootReap(
                             processGroupID: spawned.processGroupID,
@@ -7715,7 +7713,6 @@ actor GitService {
             lifecycleController.requestCancellation(terminationGrace: terminationGrace)
             timeoutController.cancel()
         })
-        return result
     }
 
     static func shouldFallbackFromWorktreeListZError(_ stderr: String) -> Bool {

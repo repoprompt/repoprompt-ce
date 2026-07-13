@@ -85,7 +85,7 @@ import XCTest
             let spawner: GitService.ProcessSpawner = { _, _, environment, workingDirectory in
                 try ProcessLauncher.spawn(
                     command: "/bin/sh",
-                    arguments: ["-c", "kill -TERM $$"],
+                    arguments: ["-c", "kill -KILL $$"],
                     environment: environment,
                     workingDirectory: workingDirectory
                 )
@@ -98,9 +98,11 @@ import XCTest
                 commandTimeout: .seconds(15)
             )
 
-            // Process.terminationStatus parity: an uncaught signal surfaces as
-            // the raw signal number, not a 128+signal shell convention.
-            XCTAssertEqual(exitCode, SIGTERM)
+            // SIGKILL is intentional: unlike SIGTERM, its disposition cannot be
+            // inherited as ignored or blocked from the XCTest host.
+            // Process.terminationStatus parity surfaces the raw signal number,
+            // not a 128+signal shell convention.
+            XCTAssertEqual(exitCode, SIGKILL)
         }
 
         func testSpawnFailureSurfacesLauncherError() async throws {
