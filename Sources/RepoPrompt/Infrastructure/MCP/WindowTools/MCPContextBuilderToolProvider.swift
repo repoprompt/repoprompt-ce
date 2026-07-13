@@ -14,6 +14,8 @@ private struct ContextBuilderToolResult: Codable {
     let tokenBudget: Int?
     let promptMode: String?
     let agent: String?
+    let model: String?
+    let planningModel: String?
     let selection: String
 
     let responseType: String?
@@ -32,7 +34,8 @@ private struct ContextBuilderToolResult: Codable {
         case tokenNote = "token_note"
         case tokenBudget = "token_budget"
         case promptMode = "prompt_mode"
-        case agent
+        case agent, model
+        case planningModel = "planning_model"
         case selection
         case responseType = "response_type"
         case plan
@@ -66,6 +69,12 @@ private struct ContextBuilderToolResult: Codable {
         }
         if let agent {
             obj["agent"] = .string(agent)
+        }
+        if let model {
+            obj["model"] = .string(model)
+        }
+        if let planningModel {
+            obj["planning_model"] = .string(planningModel)
         }
         if let responseType {
             obj["response_type"] = .string(responseType)
@@ -309,9 +318,6 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     ) async throws -> ContextBuilderToolResult {
         let instructions = args["instructions"]?.stringValue ?? ""
         let metadata = await dependencies.captureRequestMetadata()
-        guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
-            throw CancellationError()
-        }
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
         let exportResponse: Bool
         if let value = args["export_response"] {
@@ -327,33 +333,39 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
 
         let targetWindow = try dependencies.requireTargetWindow()
-        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace else {
-            throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
-        }
-        let preferredAgent = targetWindow.promptManager.contextBuilderAgent
-        let preferredModelRaw = targetWindow.promptManager.contextBuilderAgentModelRaw
-
         let tabResolution = try await dependencies.resolveContextBuilderTab(
             args,
             targetWindow,
             connectionID
         )
-        let finalTabID = tabResolution.tabID
-        let workspace = tabResolution.workspaceID.flatMap { workspaceID in
-            targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID })
-        } ?? activeWorkspace
+        let resolvedIdentity = tabResolution.identity
+        let finalTabID = resolvedIdentity.tabID
+        guard let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == resolvedIdentity.workspaceID }) else {
+            throw MCPError.invalidParams("The resolved Context Builder workspace is no longer available.")
+        }
         let workspaceContext = tabResolution.workspaceContext
         let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
-        let resolvedIdentity = WorkspaceSelectionIdentity(
-            workspaceID: tabResolution.workspaceID ?? workspace.id,
-            tabID: finalTabID
-        )
+        if workspaceContext == nil {
+            let scopedRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(
+                scope: lookupContext.rootScope
+            )
+            let scopedPaths = Set(scopedRoots.map(\.standardizedFullPath))
+            let targetPaths = Set(workspace.repoPaths.map {
+                StandardizedPath.absolute(lookupContext.translateInputPath($0))
+            })
+            guard !targetPaths.isEmpty, targetPaths.isSubset(of: scopedPaths) else {
+                throw MCPError.invalidParams(
+                    "The resolved Context Builder workspace projection is unavailable. Reload the target workspace before retrying."
+                )
+            }
+        }
         guard let initialResultTab = targetWindow.workspaceManager.composeTab(for: resolvedIdentity) else {
             throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
         }
         try await workspaceContext?.validateReviewTargetAvailability(
             store: dependencies.promptVM.workspaceFileContextStore
         )
+        let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -361,10 +373,35 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 connectionID,
                 clientName,
                 finalTabID,
-                tabResolution.workspaceID ?? workspace.id,
+                resolvedIdentity.workspaceID,
                 targetWindow.windowID
             )
         }
+
+        let targetMetadata = MCPServerViewModel.RequestMetadata(
+            connectionID: connectionID ?? metadata.connectionID,
+            clientName: metadata.clientName,
+            windowID: targetWindow.windowID,
+            runPurpose: metadata.runPurpose,
+            tabContextHint: MCPServerViewModel.TabContextHint(
+                tabID: resolvedIdentity.tabID,
+                workspaceID: resolvedIdentity.workspaceID,
+                windowID: targetWindow.windowID
+            ),
+            explicitWindowRoutingHint: metadata.explicitWindowRoutingHint
+        )
+        guard await dependencies.drainReadFileAutoSelection(
+            targetMetadata,
+            .mirroredSelectionAndMetrics
+        ) == .completed else {
+            throw CancellationError()
+        }
+        let runAuthority = try await contextBuilderVM.resolveMCPRunAuthority(
+            identity: resolvedIdentity,
+            nestedTabContext: tabResolution.nestedTabContext,
+            workspaceContext: workspaceContext,
+            responseType: responseType?.rawValue
+        )
 
         // swiftformat:disable conditionalAssignment
         let capturedOracleExportDestination: OracleExportDestination?
@@ -382,11 +419,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
         // swiftformat:enable conditionalAssignment
 
-        let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
         let tabIDForCleanup = finalTabID
         let mcpControlToken = try await MainActor.run {
             try contextBuilderVM.beginMCPControlledRun(
                 forTabID: finalTabID,
+                workspaceID: resolvedIdentity.workspaceID,
                 responseType: responseType?.rawValue,
                 planModelName: nil
             )
@@ -401,10 +438,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             }
         }) {
             let wantsResponse = responseType?.wantsResponse ?? false
-            let contextBuilderTokenBudget = await MainActor.run {
-                contextBuilderVM.resolvedMCPContextBuilderBudget(for: workspace.id, wantsResponse: wantsResponse)
-            }
-            let tokenBudgetOverride = contextBuilderTokenBudget
+            let contextBuilderTokenBudget = runAuthority.configuration.effectiveTokenBudget
             let promptManager = targetWindow.promptManager
 
             let planModelName: String? = await wantsResponse ? MainActor.run {
@@ -413,14 +447,16 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 let temporarilyDisabled = settingsStore.mcpTemporarilyDisablePresets()
 
                 if !useModelPresets {
-                    return promptManager.planningModel.displayName
+                    return runAuthority.configuration.planningModelRaw
+                        .flatMap(AIModel.fromModelName)?.displayName
                 }
 
                 let allPresets = ModelPresetsManager.shared.presets
                 let effectivePresets = temporarilyDisabled ? [] : allPresets
 
                 if effectivePresets.isEmpty {
-                    return promptManager.planningModel.displayName
+                    return runAuthority.configuration.planningModelRaw
+                        .flatMap(AIModel.fromModelName)?.displayName
                 }
 
                 let modeFiltered = effectivePresets.filter { preset in
@@ -431,7 +467,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         return preset.model.displayName
                     }
                 }
-                return promptManager.planningModel.displayName
+                return runAuthority.configuration.planningModelRaw
+                    .flatMap(AIModel.fromModelName)?.displayName
             } : nil
 
             let sendStageProgress = dependencies.sendStageProgress
@@ -473,14 +510,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         timeline: progressTimeline
                     ) {
                         try await contextBuilderVM.runContextBuilderForMCP(
-                            tabID: finalTabID,
+                            authority: runAuthority,
                             instructionsOverride: instructions.isEmpty ? nil : instructions,
-                            tokenBudgetOverride: tokenBudgetOverride,
-                            persistTokenBudget: false,
-                            enhancementModeOverride: .fullRewrite,
-                            agentOverride: preferredAgent,
-                            modelOverrideRaw: preferredModelRaw,
-                            responseType: responseType?.rawValue,
                             planModelName: planModelName,
                             workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
@@ -675,7 +706,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         ) {
                             try await dependencies.runMCPPlanOrQuestion(
                                 contextBuilderVM,
-                                resultTab.id,
+                                resolvedIdentity,
                                 tabResolution.agentModeSessionID,
                                 tabResolution.agentModeRunID,
                                 mode,
@@ -729,7 +760,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         tokenNote: tokenNote,
                         tokenBudget: contextBuilderTokenBudget,
                         promptMode: "rewrite",
-                        agent: preferredAgent.rawValue,
+                        agent: snapshot.agentKind?.rawValue ?? runAuthority.agentKind.rawValue,
+                        model: snapshot.modelRaw ?? runAuthority.modelRaw,
+                        planningModel: planModelName,
                         selection: formattedSelection,
                         responseType: responseType?.rawValue,
                         plan: planReply,

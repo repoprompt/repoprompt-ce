@@ -344,6 +344,10 @@ class PromptViewModel: ObservableObject {
         )
     }
 
+    func mcpOracleIsProviderConfigured(for model: AIModel) -> Bool {
+        isProviderConfigured(for: model)
+    }
+
     nonisolated static func mcpOraclePlanningModelErrorMessage(
         for resolution: MCPOraclePlanningModelResolution,
         availabilityGuidance: ((AIModel) -> String)? = nil

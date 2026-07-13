@@ -1113,8 +1113,8 @@ final class MCPServerViewModel: ObservableObject {
                 connectionID: connectionID
             )
             return MCPWindowToolDependencies.ContextBuilderTabResolution(
-                tabID: resolution.tabID,
-                workspaceID: resolution.workspaceID,
+                identity: resolution.identity,
+                nestedTabContext: resolution.nestedTabContext,
                 agentModeSessionID: resolution.agentModeSessionID,
                 agentModeRunID: resolution.agentModeRunID,
                 bindCaller: resolution.bindCaller,
@@ -1180,13 +1180,13 @@ final class MCPServerViewModel: ObservableObject {
                 _ = authorization
             #endif
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
                     return try await override(
                         contextBuilderVM,
-                        tabID,
+                        identity,
                         agentModeSessionID,
                         agentModeRunID,
                         mode,
@@ -1201,7 +1201,7 @@ final class MCPServerViewModel: ObservableObject {
                 }
             #endif
             return try await contextBuilderVM.runMCPPlanOrQuestion(
-                for: tabID,
+                for: identity,
                 oracleViewModel: oracleVM,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
@@ -3450,8 +3450,8 @@ final class MCPServerViewModel: ObservableObject {
         targetWindow: WindowState,
         connectionID: UUID?
     ) async throws -> (
-        tabID: UUID,
-        workspaceID: UUID?,
+        identity: WorkspaceSelectionIdentity,
+        nestedTabContext: TabContextSnapshot,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         bindCaller: Bool,
@@ -3529,10 +3529,34 @@ final class MCPServerViewModel: ObservableObject {
                 workspaceContext = nil
             }
 
-            let lookupContext: WorkspaceLookupContext = if let workspaceContext {
-                workspaceContext.lookupContext
+            let lookupContext: WorkspaceLookupContext
+            if let workspaceContext {
+                lookupContext = workspaceContext.lookupContext
+            } else if let workspaceID = context.workspaceID,
+                      workspaceID != targetWindow.workspaceManager.activeWorkspaceID
+            {
+                guard let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID }) else {
+                    throw MCPError.invalidParams("The inactive Context Builder workspace is no longer available.")
+                }
+                let canonicalPaths = Set(workspace.repoPaths.map(StandardizedPath.absolute))
+                let loadedPaths = await Set(
+                    targetWindow.promptManager.workspaceFileContextStore.rootRefs(scope: .allLoaded)
+                        .map(\.standardizedFullPath)
+                )
+                guard !canonicalPaths.isEmpty, canonicalPaths.isSubset(of: loadedPaths) else {
+                    throw MCPError.invalidParams(
+                        "The resolved Context Builder workspace projection is unavailable. Reload the target workspace before retrying."
+                    )
+                }
+                lookupContext = WorkspaceLookupContext(
+                    rootScope: .sessionBoundWorkspace(
+                        canonicalRootPaths: canonicalPaths,
+                        physicalRootPaths: []
+                    ),
+                    bindingProjection: nil
+                )
             } else {
-                try await targetWindow.mcpServer.resolveFileToolLookupContext(
+                lookupContext = try await targetWindow.mcpServer.resolveFileToolLookupContext(
                     tabID: context.tabID,
                     workspaceID: context.workspaceID
                 )
@@ -3550,9 +3574,14 @@ final class MCPServerViewModel: ObservableObject {
             }
             let agentModeSessionID = purpose == .agentModeRun ? context.activeAgentSessionID : nil
             let agentModeRunID = purpose == .agentModeRun ? context.runID : nil
+            guard let workspaceID = context.workspaceID else {
+                throw MCPError.invalidParams("context_builder resolved a tab without workspace authority.")
+            }
+            var nestedTabContext = context
+            nestedTabContext.frozenLookupContext = lookupContext
             return (
-                context.tabID,
-                context.workspaceID,
+                WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID),
+                nestedTabContext,
                 agentModeSessionID,
                 agentModeRunID,
                 shouldBindCaller,
@@ -3579,9 +3608,26 @@ final class MCPServerViewModel: ObservableObject {
             tabID: createdTab.id,
             base: "HEAD"
         )
+        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace is available for a fresh Context Builder tab.")
+        }
+        var nestedTabContext = TabContextSnapshot(
+            tabID: createdTab.id,
+            windowID: targetWindow.windowID,
+            workspaceID: activeWorkspace.id,
+            promptText: createdTab.promptText,
+            selection: createdTab.selection,
+            selectedMetaPromptIDs: createdTab.selectedMetaPromptIDs,
+            selectedContextBuilderPromptIDs: createdTab.contextBuilder.selectedContextBuilderPromptIDs,
+            tabName: createdTab.name,
+            runID: nil,
+            activeAgentSessionID: createdTab.activeAgentSessionID,
+            explicitlyBound: true
+        )
+        nestedTabContext.frozenLookupContext = .visibleWorkspace
         return (
-            createdTab.id,
-            targetWindow.workspaceManager.activeWorkspace?.id,
+            WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: createdTab.id),
+            nestedTabContext,
             nil,
             nil,
             true,

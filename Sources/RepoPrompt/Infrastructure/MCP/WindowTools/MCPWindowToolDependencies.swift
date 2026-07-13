@@ -14,8 +14,8 @@ struct MCPFileActionMutationAcknowledgement {
 
 struct MCPWindowToolDependencies {
     struct ContextBuilderTabResolution {
-        let tabID: UUID
-        let workspaceID: UUID?
+        let identity: WorkspaceSelectionIdentity
+        let nestedTabContext: MCPServerViewModel.TabContextSnapshot
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
         let bindCaller: Bool
@@ -93,7 +93,7 @@ struct MCPWindowToolDependencies {
     ) async -> Void
     typealias RunMCPPlanOrQuestion = @MainActor @Sendable (
         _ contextBuilderVM: ContextBuilderAgentViewModel,
-        _ tabID: UUID,
+        _ identity: WorkspaceSelectionIdentity,
         _ agentModeSessionID: UUID?,
         _ agentModeRunID: UUID?,
         _ mode: HeadlessMode,

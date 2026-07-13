@@ -305,6 +305,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             )
 
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
@@ -414,6 +418,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             )
 
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
