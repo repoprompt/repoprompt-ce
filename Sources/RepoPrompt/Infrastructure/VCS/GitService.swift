@@ -7664,17 +7664,16 @@ actor GitService {
                         continuation.resume(throwing: GitProcessCaptureError.timedOut)
                         return
                     }
+                    if let cancellationError = finalization.cancellationError {
+                        continuation.resume(throwing: cancellationError)
+                        return
+                    }
                     if outDrain.didExceedByteLimit {
                         continuation.resume(throwing: GitProcessCaptureError.stdoutByteLimitExceeded)
                         return
                     }
                     if errDrain.didExceedByteLimit {
                         continuation.resume(throwing: GitProcessCaptureError.stderrByteLimitExceeded)
-                        return
-                    }
-
-                    if let cancellationError = finalization.cancellationError {
-                        continuation.resume(throwing: cancellationError)
                         return
                     }
                     switch reapOutcome {
