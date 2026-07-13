@@ -294,7 +294,10 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         gitPreflightCount: AsyncCounter,
         root: URL,
         file: WorkspaceFileRecord,
-        timeout: Duration = .seconds(15)
+        // The production Git/codemap path can legitimately consume a full 30-second activity
+        // window before retrying under process-admission pressure. This assertion checks eventual
+        // readiness, not latency, so allow that bounded retry without accepting a non-ready result.
+        timeout: Duration = .seconds(60)
     ) async throws -> WorkspaceCodemapArtifactDemandReady {
         var result = initial
         if case let .pending(ticket) = result {

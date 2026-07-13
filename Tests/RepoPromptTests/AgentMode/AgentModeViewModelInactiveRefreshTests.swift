@@ -49,7 +49,93 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         let retainedRawPayload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: toolResult.id))
         XCTAssertTrue(retainedRawPayload.contains(marker))
         XCTAssertGreaterThan(session.ephemeralToolResultPayloadRevisionByItemID[toolResult.id] ?? 0, 0)
-        XCTAssertGreaterThan(viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevision, 0)
+        XCTAssertGreaterThan(
+            viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevisionByItemID[toolResult.id] ?? 0,
+            0
+        )
+    }
+
+    func testRetainedPayloadRefreshChangesOnlyMatchingResultRenderIdentity() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.runState = .running
+        let invocationA = UUID()
+        let invocationB = UUID()
+        let markerA1 = "RESULT_A_INITIAL_\(UUID().uuidString)"
+        let markerA2 = "RESULT_A_UPDATED_\(UUID().uuidString)"
+        let markerB = "RESULT_B_\(UUID().uuidString)"
+        let rawA1 = retainedApplyEditsPayload(marker: markerA1)
+        let rawA2 = retainedApplyEditsPayload(marker: markerA2)
+        let rawB = retainedApplyEditsPayload(marker: markerB)
+        let callA = AgentChatItem.toolCall(
+            name: "apply_edits",
+            invocationID: invocationA,
+            argsJSON: #"{"path":"A.swift"}"#,
+            sequenceIndex: 1
+        )
+        let callB = AgentChatItem.toolCall(
+            name: "apply_edits",
+            invocationID: invocationB,
+            argsJSON: #"{"path":"B.swift"}"#,
+            sequenceIndex: 3
+        )
+        let resultA = AgentChatItem.toolResult(
+            name: "apply_edits",
+            invocationID: invocationA,
+            resultJSON: rawA1,
+            sequenceIndex: 2
+        )
+        let resultB = AgentChatItem.toolResult(
+            name: "apply_edits",
+            invocationID: invocationB,
+            resultJSON: rawB,
+            sequenceIndex: 4
+        )
+
+        session.replaceItems([
+            .user("Start", sequenceIndex: 0),
+            callA,
+            resultA,
+            callB,
+            resultB,
+            .assistant("Done", sequenceIndex: 5)
+        ])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+
+        let initialRevisions = viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevisionByItemID
+        let initialRevisionA = try XCTUnwrap(initialRevisions[resultA.id])
+        let initialRevisionB = try XCTUnwrap(initialRevisions[resultB.id])
+        XCTAssertTrue(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultA.id)?.contains(markerA1) == true)
+        XCTAssertTrue(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultB.id)?.contains(markerB) == true)
+
+        var updatedResultA = resultA
+        updatedResultA.text = rawA2
+        updatedResultA.toolResultJSON = rawA2
+        session.replaceItems([
+            .user("Start", sequenceIndex: 0),
+            callA,
+            updatedResultA,
+            callB,
+            resultB,
+            .assistant("Done", sequenceIndex: 5)
+        ])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+
+        let updatedRevisions = viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevisionByItemID
+        XCTAssertGreaterThan(try XCTUnwrap(updatedRevisions[resultA.id]), initialRevisionA)
+        XCTAssertEqual(updatedRevisions[resultB.id], initialRevisionB)
+        let updatedPayloadA = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultA.id))
+        let unchangedPayloadB = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultB.id))
+        XCTAssertTrue(updatedPayloadA.contains(markerA2))
+        XCTAssertFalse(updatedPayloadA.contains(markerB))
+        XCTAssertTrue(unchangedPayloadB.contains(markerB))
+        XCTAssertFalse(unchangedPayloadB.contains(markerA2))
     }
 
     func testLiveToolResultRefreshUsesIncrementalRetentionCompaction() async throws {
@@ -1491,6 +1577,17 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertTrue(JSONSerialization.isValidJSONObject(object), file: file, line: line)
         let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         return String(data: data, encoding: .utf8)!
+    }
+
+    private func retainedApplyEditsPayload(marker: String) -> String {
+        jsonString([
+            "status": "success",
+            "edits_requested": 1,
+            "edits_applied": 1,
+            "review_status": "approved",
+            "raw_output": String(repeating: marker, count: 4),
+            "diffs": [["path": "File.swift", "diff": String(repeating: marker, count: 4)]]
+        ])
     }
 
     private func makeTranscriptItems(prefix: String, turnCount: Int) -> [AgentChatItem] {

@@ -72,6 +72,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             inputSchema: .object(
                 properties: [
                     "action": .string(description: "Operation to perform", enum: ["create", "delete", "move"]),
+                    "operation_id": .string(description: "Optional caller-stable correlation ID echoed in the mutation acknowledgement; not a deduplication or status lookup key"),
                     "path": .string(description: "File path"),
                     "content": .string(description: "File content (for create)"),
                     "new_path": .string(description: "New path (for move)"),
@@ -89,18 +90,24 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             let content = args["content"]?.stringValue
             let newPath = args["new_path"]?.stringValue
             let ifExists = args["if_exists"]?.stringValue?.lowercased() ?? "error"
+            let suppliedOperationID = args["operation_id"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
             try Task.checkCancellation()
 
             let reply: ToolResultDTOs.FileActionReply
             do {
-                let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)
+                let acknowledgement = try await dependencies.performFileAction(action, path, content, newPath, ifExists, operationID)
                 reply = ToolResultDTOs.FileActionReply(
                     status: "ok",
                     action: action,
                     path: path,
                     newPath: newPath,
-                    warning: warning
+                    warning: acknowledgement.warning,
+                    operationID: acknowledgement.operationID,
+                    mutationState: acknowledgement.mutationState,
+                    freshness: acknowledgement.freshness
                 )
             } catch let failure as MCPMutationRetryableFailure {
                 reply = ToolResultDTOs.FileActionReply.retryableFailure(
@@ -110,11 +117,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     failure: failure
                 )
             }
-            try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction)
             let value = try Value(reply)
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction, transition: .completed)
-            try Task.checkCancellation()
             return value
         }
     }

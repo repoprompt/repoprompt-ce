@@ -1533,6 +1533,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         )
         XCTAssertEqual(residentResult, .miss)
 
+        await strict.waitForPendingAccessRefreshesForTesting()
         _ = try await permissive.replaceCurrentManifest(
             namespace: resident.namespace,
             authority: resident.authority,

@@ -37,7 +37,7 @@ struct TelemetrySettingsView: View {
 
                         SettingToggle(
                             title: "Share crash reports and diagnostics",
-                            description: "Allows Sentry crash reporting, app hang reports, and optional startup performance traces when this build is configured with telemetry.",
+                            description: "Allows Sentry crash reporting, app hang reports, and optional startup performance traces when this build is configured with telemetry. Automatic release-health sessions are disabled to avoid stable installation identifiers.",
                             isOn: telemetryEnabledBinding
                         )
                         .disabled(!SentryTelemetryBootstrap.currentStatus().sdkCompiledIn)
@@ -64,8 +64,9 @@ struct TelemetrySettingsView: View {
                 ) {
                     VStack(alignment: .leading, spacing: fontPreset.scaledClamped(8, max: 12)) {
                         bullet("Collected: crash diagnostics, app hangs when enabled, release/build metadata, OS/app version, and optional startup performance timing.")
-                        bullet("Never intentionally sent: prompt contents, chat transcripts, selected file contents, API keys, provider tokens, or full local paths.")
-                        bullet("A defense-in-depth scrubber removes obvious secrets, local home paths, user identifiers, server names, and IP-like values from events before upload.")
+                        bullet("Never intentionally sent: prompt contents, chat transcripts, selected file contents, tool payloads, API keys, provider tokens, or full local paths.")
+                        bullet("Automatic failed-request capture and automatic release-health session tracking are disabled.")
+                        bullet("A defense-in-depth scrubber removes request payloads, headers, cookies, query strings, obvious secrets, local home paths, user/geo/server identifiers, stable device identifiers, and IP-like values from events before upload.")
                         bullet("Set REPOPROMPT_TELEMETRY_DISABLED=1 before launch to disable telemetry for the process regardless of Settings.")
                     }
                 }

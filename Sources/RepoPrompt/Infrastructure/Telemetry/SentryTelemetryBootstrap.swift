@@ -27,7 +27,6 @@ enum SentryTelemetryBootstrap {
 
             performanceTracingEnabled = GlobalSettingsStore.shared.telemetryPerformanceTracingEnabled()
             let appHangReportsEnabled = GlobalSettingsStore.shared.telemetryAppHangReportsEnabled()
-            let dist = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
 
             SentrySDK.start { options in
                 options.dsn = dsn
@@ -39,7 +38,8 @@ enum SentryTelemetryBootstrap {
                     options.debug = false
                 #endif
                 options.tracesSampleRate = performanceTracingEnabled ? 0.05 : 0
-                options.dist = dist
+                // Do not let SDK defaults or future configuration attach distribution metadata.
+                options.dist = nil
                 options.add(inAppInclude: "RepoPrompt")
                 options.add(inAppInclude: "RepoPromptMCP")
                 options.add(inAppInclude: "RepoPromptShared")
@@ -57,6 +57,11 @@ enum SentryTelemetryBootstrap {
                 options.enableFileIOTracing = false
                 options.enableCoreDataTracing = false
                 options.enableAutoPerformanceTracing = false
+                options.enableCaptureFailedRequests = false
+                options.enableAutoSessionTracking = false
+                // Sentry 9.17.1 enriches typed crash/hang data and restores `dist`
+                // before this callback. RepoPrompt must not install a later global
+                // event processor that adds unsanitized data after this boundary.
                 options.beforeSend = { event in
                     scrub(event: event)
                 }
@@ -305,50 +310,259 @@ enum SentryTelemetryBootstrap {
 
         private static func scrub(event: Event) -> Event? {
             event.user = nil
+            event.request = nil
             event.serverName = nil
+            event.dist = nil
             if let message = event.message {
                 event.message = SentryMessage(formatted: scrubString(message.formatted))
                 event.message?.message = message.message.map(scrubString)
                 event.message?.params = message.params?.map(scrubString)
             }
+            scrub(stacktrace: event.stacktrace)
+            event.threads?.forEach(scrub(thread:))
             event.exceptions = event.exceptions?.map { exception in
-                exception.value = exception.value.map(scrubString)
-                exception.type = exception.type.map(scrubString)
-                exception.module = exception.module.map(scrubString)
+                scrub(exception: exception)
                 return exception
             }
-            event.tags = event.tags?.mapValues(scrubString)
+            event.debugMeta?.forEach(scrub(debugMeta:))
+            event.tags = event.tags?.reduce(into: [:]) { result, entry in
+                if let value = scrubValue(entry.value, keyPath: [entry.key]) as? String {
+                    result[entry.key] = value
+                }
+            }
             event.context = event.context?.reduce(into: [:]) { result, entry in
-                result[entry.key] = entry.value.reduce(into: [:]) { contextResult, contextEntry in
-                    contextResult[contextEntry.key] = scrubValue(contextEntry.value)
+                guard !shouldDropValue(at: [entry.key]) else { return }
+                let context: [String: Any] = entry.value.reduce(into: [:]) { contextResult, contextEntry in
+                    guard let contextKey = contextEntry.key as? String else { return }
+                    if let value = scrubValue(contextEntry.value, keyPath: [entry.key, contextKey]) {
+                        contextResult[contextKey] = value
+                    }
+                }
+                if !context.isEmpty {
+                    result[entry.key] = context
                 }
             }
             event.extra = event.extra?.reduce(into: [:]) { result, entry in
-                result[entry.key] = scrubValue(entry.value)
+                if let value = scrubValue(entry.value, keyPath: [entry.key]) {
+                    result[entry.key] = value
+                }
             }
             event.breadcrumbs = event.breadcrumbs?.map { breadcrumb in
                 breadcrumb.message = breadcrumb.message.map(scrubString)
                 if let data = breadcrumb.data {
-                    breadcrumb.data = data.mapValues(scrubValue)
+                    breadcrumb.data = data.reduce(into: [:]) { result, entry in
+                        if let value = scrubValue(entry.value, keyPath: [entry.key]) {
+                            result[entry.key] = value
+                        }
+                    }
                 }
                 return breadcrumb
             }
             return event
         }
+
+        private static func scrub(thread: SentryThread) {
+            thread.name = thread.name.map(scrubString)
+            scrub(stacktrace: thread.stacktrace)
+        }
+
+        private static func scrub(exception: Exception) {
+            exception.value = exception.value.map(scrubString)
+            exception.type = exception.type.map(scrubString)
+            exception.module = exception.module.map(scrubString)
+            scrub(stacktrace: exception.stacktrace)
+            scrub(mechanism: exception.mechanism)
+        }
+
+        private static func scrub(mechanism: Mechanism?) {
+            guard let mechanism else { return }
+            mechanism.type = scrubString(mechanism.type)
+            mechanism.desc = mechanism.desc.map(scrubString)
+            mechanism.helpLink = nil
+            if let data = mechanism.data {
+                mechanism.data = scrubValue(data, keyPath: ["mechanism", "data"]) as? [String: Any]
+            }
+            if let meta = mechanism.meta {
+                if let signal = meta.signal {
+                    meta.signal = scrubValue(signal, keyPath: ["mechanism", "meta", "signal"]) as? [String: Any]
+                }
+                if let machException = meta.machException {
+                    meta.machException = scrubValue(
+                        machException,
+                        keyPath: ["mechanism", "meta", "mach_exception"]
+                    ) as? [String: Any]
+                }
+                meta.error?.domain = scrubString(meta.error?.domain ?? "")
+            }
+        }
+
+        private static func scrub(stacktrace: SentryStacktrace?) {
+            guard let stacktrace else { return }
+            stacktrace.frames.forEach(scrub(frame:))
+            stacktrace.registers = stacktrace.registers.reduce(into: [:]) { result, entry in
+                result[entry.key] = scrubString(entry.value)
+            }
+        }
+
+        private static func scrub(frame: Frame) {
+            frame.fileName = scrubPathBearingValue(frame.fileName)
+            frame.package = scrubPathBearingValue(frame.package)
+            frame.function = frame.function.map(scrubString)
+            frame.module = frame.module.map(scrubString)
+            frame.contextLine = frame.contextLine.map(scrubString)
+            frame.preContext = frame.preContext?.map(scrubString)
+            frame.postContext = frame.postContext?.map(scrubString)
+            if let variables = frame.vars {
+                frame.vars = scrubValue(variables, keyPath: ["frame", "vars"]) as? [String: Any]
+            }
+        }
+
+        private static func scrub(debugMeta: DebugMeta) {
+            debugMeta.codeFile = scrubPathBearingValue(debugMeta.codeFile)
+        }
+
+        private static func scrubPathBearingValue(_ value: String?) -> String? {
+            guard let value else { return nil }
+            return isUserLocalPath(value) ? nil : scrubString(value)
+        }
+
+        private static func isUserLocalPath(_ value: String) -> Bool {
+            let path: String = if let url = URL(string: value), url.isFileURL {
+                url.path
+            } else {
+                value
+            }
+            let home = NSHomeDirectory()
+            return path.hasPrefix("/Users/") ||
+                path.hasPrefix("/home/") ||
+                path.hasPrefix("/private/var/folders/") ||
+                path.hasPrefix("/var/folders/") ||
+                (!home.isEmpty && (path == home || path.hasPrefix(home + "/")))
+        }
+
+        static func scrubEventForTesting(_ event: Event) -> Event? {
+            scrub(event: event)
+        }
     #endif
 
-    private static func scrubValue(_ value: Any) -> Any {
-        if let string = value as? String {
-            scrubString(string)
-        } else if let dictionary = value as? [String: Any] {
-            dictionary.reduce(into: [:]) { result, entry in
-                result[entry.key] = scrubValue(entry.value)
+    static func scrubPayloadForTesting(_ value: [String: Any]) -> [String: Any] {
+        value.reduce(into: [:]) { result, entry in
+            if let value = scrubValue(entry.value, keyPath: [entry.key]) {
+                result[entry.key] = value
             }
-        } else if let array = value as? [Any] {
-            array.map(scrubValue)
-        } else {
-            value
         }
+    }
+
+    private static func scrubValue(_ value: Any, keyPath: [String]) -> Any? {
+        guard !shouldDropValue(at: keyPath) else { return nil }
+        if let string = value as? String {
+            return scrubString(string)
+        } else if let dictionary = value as? [String: Any] {
+            let scrubbed = dictionary.reduce(into: [:]) { result, entry in
+                if let value = scrubValue(entry.value, keyPath: keyPath + [entry.key]) {
+                    result[entry.key] = value
+                }
+            }
+            return scrubbed.isEmpty ? nil : scrubbed
+        } else if let array = value as? [Any] {
+            return array.compactMap { scrubValue($0, keyPath: keyPath) }
+        } else {
+            return value
+        }
+    }
+
+    private static func shouldDropValue(at keyPath: [String]) -> Bool {
+        let components = keyPath.map(normalizedTelemetryKey)
+        guard let leaf = components.last else { return false }
+
+        if components.contains(where: requestPayloadKeys.contains) {
+            return true
+        }
+        if components.contains("geo") || geoPayloadKeys.contains(leaf) {
+            return true
+        }
+        if components.contains("user") || userIdentifierKeys.contains(leaf) {
+            return true
+        }
+        if components.contains("device"), deviceIdentifierKeys.contains(leaf) {
+            return true
+        }
+        if stableIdentifierKeys.contains(leaf) {
+            return true
+        }
+        if credentialPayloadKeys.contains(leaf) {
+            return true
+        }
+        return false
+    }
+
+    private static let requestPayloadKeys: Set<String> = [
+        "request",
+        "http",
+        "headers",
+        "cookies",
+        "cookie",
+        "query",
+        "query_string",
+        "body",
+        "url"
+    ]
+
+    private static let geoPayloadKeys: Set<String> = [
+        "city",
+        "region",
+        "country_code",
+        "latitude",
+        "longitude",
+        "location",
+        "user_geo"
+    ]
+
+    private static let userIdentifierKeys: Set<String> = [
+        "user_id",
+        "userid",
+        "username",
+        "email",
+        "ip_address",
+        "ipaddress"
+    ]
+
+    private static let deviceIdentifierKeys: Set<String> = [
+        "id",
+        "name",
+        "identifier",
+        "unique_id",
+        "uniqueid"
+    ]
+
+    private static let stableIdentifierKeys: Set<String> = [
+        "server_name",
+        "servername",
+        "vendor_id",
+        "vendorid",
+        "identifier_for_vendor",
+        "identifierforvendor",
+        "advertising_id",
+        "advertisingid",
+        "installation_id",
+        "installationid",
+        "device_app_hash",
+        "deviceapphash"
+    ]
+
+    private static let credentialPayloadKeys: Set<String> = [
+        "api_key",
+        "apikey",
+        "authorization",
+        "password",
+        "secret",
+        "token"
+    ]
+
+    private static func normalizedTelemetryKey(_ key: String) -> String {
+        key.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
     }
 
     static func scrubStringForTesting(_ value: String) -> String {
@@ -361,10 +575,11 @@ enum SentryTelemetryBootstrap {
         if !home.isEmpty {
             redacted = redacted.replacingOccurrences(of: home, with: "~")
         }
-        let username = NSUserName()
-        if !username.isEmpty {
-            redacted = redacted.replacingOccurrences(of: "/Users/\(username)", with: "~/")
-        }
+        redacted = redacted.replacingOccurrences(
+            of: #"/Users/[^/\s]+"#,
+            with: "~",
+            options: .regularExpression
+        )
         redacted = redacted.replacingOccurrences(
             of: #"(?i)(api[_-]?key|token|secret|password|authorization)[=: ]+(?:(?:bearer|basic|token|dsn)\s+)?[^\s,;]+"#,
             with: "$1=[redacted]",

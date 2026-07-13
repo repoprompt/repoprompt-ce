@@ -521,6 +521,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
             var targetTab = try await Self.createBackgroundTab(in: window, name: "Bound Export Target")
             let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: workspaceID
+            )
             XCTAssertNotEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, targetTab.id)
             targetTab.promptText = "Generate the deterministic worktree export."
             window.workspaceManager.updateComposeTab(targetTab, markDirty: false)

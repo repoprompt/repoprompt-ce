@@ -58,11 +58,18 @@ struct AgentModelsPopoverView: View {
 
     private var roleResolutions: [MCPAgentRoleDefaultsService.RoleDefaultResolution] {
         _ = roleDefaultsRevision
-        return MCPAgentRoleDefaultsService.resolutions(availability: availability)
+        return MCPAgentRoleDefaultsService.resolutions(availability: availability, workspaceID: promptViewModel.currentWorkspaceID)
     }
 
     private var hasRoleOverrides: Bool {
-        roleResolutions.contains(where: \.hasCustomOverride)
+        roleResolutions.contains(where: \.hasStoredOverride)
+    }
+
+    private var editingScope: AgentModelsEditingScope {
+        guard let workspaceID = promptViewModel.currentWorkspaceID,
+              GlobalSettingsStore.shared.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        else { return .global }
+        return .workspace(workspaceID)
     }
 
     private var hasConnectedCLIProvider: Bool {
@@ -112,6 +119,20 @@ struct AgentModelsPopoverView: View {
                 .publisher(for: .recommendationsDidApply)
                 .receive(on: RunLoop.main)
         ) { _ in
+            roleDefaultsRevision &+= 1
+        }
+        .onReceive(
+            NotificationCenter.default
+                .publisher(for: .agentModelsSettingsDidChange)
+                .receive(on: RunLoop.main)
+        ) { notification in
+            let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+            let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+            if scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+               workspaceID != promptViewModel.currentWorkspaceID
+            {
+                return
+            }
             roleDefaultsRevision &+= 1
         }
     }
@@ -244,7 +265,9 @@ struct AgentModelsPopoverView: View {
                 Spacer()
                 if hasRoleOverrides {
                     Button("Reset") {
-                        MCPAgentRoleDefaultsService.clearAllOverrides()
+                        MCPAgentRoleDefaultsService.clearAllOverrides(
+                            scope: editingScope
+                        )
                         bumpRoleDefaults()
                     }
                     .buttonStyle(.plain)
@@ -340,7 +363,7 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+        var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
@@ -356,20 +379,39 @@ struct AgentModelsPopoverView: View {
                 )
                 _ = MCPAgentRoleDefaultsService.setSelection(
                     selection,
-                    for: resolution.role
+                    for: resolution.role,
+                    availability: availability,
+                    scope: editingScope
                 )
                 bumpRoleDefaults()
             }
         }
+        if resolution.hasStoredOverride {
+            items.insert(.separator, at: 0)
+            items.insert(StableMenuItem.action("Use Recommended", imageSystemName: "arrow.counterclockwise") {
+                MCPAgentRoleDefaultsService.clearOverride(
+                    for: resolution.role,
+                    scope: editingScope
+                )
+                bumpRoleDefaults()
+            }, at: 0)
+        }
+        return items
     }
 
     private func bumpRoleDefaults() {
         roleDefaultsRevision &+= 1
         DispatchQueue.main.async {
+            var userInfo: [String: Any] = ["reason": "agentRoleDefaultsChanged"]
+            if let workspaceID = promptViewModel.currentWorkspaceID,
+               GlobalSettingsStore.shared.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+            {
+                userInfo["workspaceID"] = workspaceID
+            }
             NotificationCenter.default.post(
                 name: .recommendationsShouldRefresh,
                 object: nil,
-                userInfo: ["reason": "agentRoleDefaultsChanged", "scope": "global"]
+                userInfo: userInfo
             )
         }
     }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "RepoPrompt CE Maintainer Guidance"
+  short_description: "Apply evidence-led RPCE maintainer principles"
+  default_prompt: "Use $rpce-maintainer-guidance to assess this RepoPrompt CE change against the project’s maintainer principles."

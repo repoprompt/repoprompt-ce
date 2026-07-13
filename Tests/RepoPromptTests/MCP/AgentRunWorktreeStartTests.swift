@@ -445,6 +445,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
     override func tearDown() async throws {
         let failures = await lifecycleFixture?.tearDown() ?? []
         lifecycleFixture = nil
+        WorktreeStartupInstrumentation.resetForTesting()
         if !failures.isEmpty {
             XCTFail("AgentRunWorktreeStartTests lifecycle cleanup failures:\n- \(failures.joined(separator: "\n- "))")
         }
