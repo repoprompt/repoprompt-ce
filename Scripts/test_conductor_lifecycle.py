@@ -1921,6 +1921,18 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
 
 
 class SmokeOperationTests(unittest.TestCase):
+    def test_execution_location_ui_smoke_resolves_process_by_numeric_pid_without_name_fallback(self) -> None:
+        source = (SCRIPT_DIR / "smoke_agent_execution_location_popover.sh").read_text(encoding="utf-8")
+
+        self.assertIn("repeat with candidateProcess in application processes", source)
+        self.assertIn("set candidatePID to (unix id of candidateProcess) as integer", source)
+        self.assertIn("if candidatePID is targetPID then", source)
+        self.assertIn("if ((unix id of resolvedProcess) as integer) is targetPID then return resolvedProcess", source)
+        self.assertIn("set resolvedProcess to candidateProcess", source)
+        self.assertNotIn("first application process whose unix id is targetPID", source)
+        self.assertNotIn("set resolvedProcess to contents of candidateProcess", source)
+        self.assertNotIn("process appProcessName", source)
+
     def test_manage_worktree_list_stage_runs_after_tree_roots_before_agent_manage(self) -> None:
         calls: list[tuple[str, list[str]]] = []
 

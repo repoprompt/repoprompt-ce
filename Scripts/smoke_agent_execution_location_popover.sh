@@ -30,10 +30,21 @@ end accessibilityPermissionPreflight
 
 on targetProcessForPID(targetPID)
     tell application "System Events"
-        try
-            set candidateProcess to first application process whose unix id is targetPID
-            if (unix id of candidateProcess) is targetPID then return candidateProcess
-        end try
+        -- System Events incorrectly resolves a variable inside a `whose unix id`
+        -- filter to the first matching application process on this host. Enumerate
+        -- the process objects and compare their numeric IDs instead; never fall
+        -- back to a process name, which could target another RepoPrompt instance.
+        repeat with candidateProcess in application processes
+            try
+                set candidatePID to (unix id of candidateProcess) as integer
+                if candidatePID is targetPID then
+                    -- Keep the enumerated reference; coercing it with `contents of`
+                    -- loses the PID-qualified object specifier on this host.
+                    set resolvedProcess to candidateProcess
+                    if ((unix id of resolvedProcess) as integer) is targetPID then return resolvedProcess
+                end if
+            end try
+        end repeat
     end tell
     error "Could not find the RepoPrompt debug process with PID " & targetPID
 end targetProcessForPID
