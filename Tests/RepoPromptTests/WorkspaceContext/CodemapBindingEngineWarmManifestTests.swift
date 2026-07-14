@@ -470,6 +470,133 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         XCTAssertEqual(accounting.counters.overlayReadyPublications, 0)
     }
 
+    func testSourceAuthorityDemandSurvivesOrdinaryGitChurnAfterRegistration() async throws {
+        enum FileState: String, CaseIterable {
+            case cleanTracked = "clean"
+            case unstagedTracked = "unstaged"
+            case stagedAndUnstagedTracked = "staged+unstaged"
+            case unrelatedStagedNoise = "unrelated staged noise"
+        }
+
+        enum GitChurn: String, CaseIterable {
+            case none
+            case gitStatusRefresh = "git status"
+            case gitAddUnrelated = "git add unrelated"
+            case gitAddDemandedFile = "git add demanded"
+            case gitCommitStagedChanges = "git commit staged changes"
+            case gitBranchSwitchBack = "git checkout branch and back"
+            case gitConfigWrite = "git config write"
+            case untrackedFileNoStage = "untracked file no stage"
+            case gitInfoAttributesWrite = "git info attributes write"
+            case configuredAttributesFileWrite = "configured attributes file write"
+
+            var cleanOnly: Bool {
+                switch self {
+                case .none, .gitStatusRefresh, .gitAddUnrelated, .gitAddDemandedFile:
+                    false
+                case .gitCommitStagedChanges, .gitBranchSwitchBack, .gitConfigWrite, .untrackedFileNoStage,
+                     .gitInfoAttributesWrite, .configuredAttributesFileWrite:
+                    true
+                }
+            }
+        }
+
+        let targetPath = "Sources/Target.swift"
+
+        for state in FileState.allCases {
+            for churn in GitChurn.allCases where !churn.cleanOnly || state == .cleanTracked {
+                let repository = try makeRepositoryFixture(name: "\(#function)-\(state.rawValue)-\(churn.rawValue)")
+                let root = try repository.makeRepository(
+                    named: "repository",
+                    files: [
+                        targetPath: "struct Target { let value = 1 }\n",
+                        "Sources/Existing.swift": "struct Existing {}\n"
+                    ]
+                )
+                switch state {
+                case .cleanTracked:
+                    break
+                case .unstagedTracked:
+                    try repository.write("struct Target { let unstaged = true }\n", to: targetPath, at: root)
+                case .stagedAndUnstagedTracked:
+                    try repository.write("struct Target { let staged = true }\n", to: targetPath, at: root)
+                    try repository.stage(targetPath, at: root)
+                    try repository.write("struct Target { let unstaged = true }\n", to: targetPath, at: root)
+                case .unrelatedStagedNoise:
+                    try repository.write("struct Noise { let staged = true }\n", to: "Sources/Noise.swift", at: root)
+                    try repository.stage("Sources/Noise.swift", at: root)
+                }
+                if churn == .configuredAttributesFileWrite {
+                    let configuredAttributes = root.appendingPathComponent("source-authority.attributes")
+                    try "*.swift text eol=lf\n".write(to: configuredAttributes, atomically: true, encoding: .utf8)
+                    _ = try repository.runGit(["config", "core.attributesFile", configuredAttributes.path], at: root)
+                }
+
+                let runtime = try CodeMapArtifactRuntime(
+                    rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+                )
+                let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+                guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+                    return XCTFail("Expected registration for \(state.rawValue) / \(churn.rawValue).")
+                }
+
+                switch churn {
+                case .none:
+                    break
+                case .gitStatusRefresh:
+                    _ = try repository.runGit(["status", "--porcelain=v1", "--untracked-files=all"], at: root)
+                case .gitAddUnrelated:
+                    try repository.write("struct Churn { let staged = true }\n", to: "Sources/Churn.swift", at: root)
+                    try repository.stage("Sources/Churn.swift", at: root)
+                case .gitAddDemandedFile:
+                    try repository.stage(targetPath, at: root)
+                case .gitCommitStagedChanges:
+                    try repository.write("struct CommitChurn { let staged = true }\n", to: "Sources/CommitChurn.swift", at: root)
+                    try repository.stage("Sources/CommitChurn.swift", at: root)
+                    try repository.commit("Commit churn", at: root)
+                case .gitBranchSwitchBack:
+                    _ = try repository.runGit(["checkout", "-b", "scratch-branch"], at: root)
+                    _ = try repository.runGit(["checkout", "main"], at: root)
+                case .gitConfigWrite:
+                    _ = try repository.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+                case .untrackedFileNoStage:
+                    try repository.write("struct UntrackedChurn {}\n", to: "Sources/UntrackedChurn.swift", at: root)
+                case .gitInfoAttributesWrite:
+                    try repository.write("*.swift text eol=lf\n", to: ".git/info/attributes", at: root)
+                case .configuredAttributesFileWrite:
+                    let configuredAttributes = root.appendingPathComponent("source-authority.attributes")
+                    try "*.swift text eol=crlf\n".write(to: configuredAttributes, atomically: true, encoding: .utf8)
+                }
+
+                let classificationBatch = await GitBlobIdentityService().classify(
+                    workspaceRoot: root,
+                    relativePaths: [targetPath]
+                )
+                let classification = try XCTUnwrap(classificationBatch.classifications.first)
+                let capability = try await eligible(fixture.capabilityService.state(for: fixture.rootEpoch))
+                let directSourceAuthority = try await fixture.capabilityService.makeSourceAuthority(
+                    capability: capability,
+                    observedRootEpoch: fixture.rootEpoch,
+                    observedRepositoryAuthority: capability.repositoryAuthority,
+                    candidateRepositoryRelativePath: XCTUnwrap(classification.repositoryRelativePath),
+                    observedPathGeneration: 1,
+                    currentPathGeneration: 1,
+                    observedIngressGeneration: 1,
+                    currentIngressGeneration: 1
+                )
+                XCTAssertNotNil(
+                    directSourceAuthority,
+                    "Expected source authority after \(state.rawValue) / \(churn.rawValue)."
+                )
+                let result = await fixture.engine.demand(fixture.demand(path: targetPath))
+                guard isReady(result) else {
+                    return XCTFail("Expected ready demand after \(state.rawValue) / \(churn.rawValue), got \(result).")
+                }
+                await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+            }
+        }
+    }
+
     func testPathInvalidationDuringBlockedWarmAdoptionRemainsRetryable() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(

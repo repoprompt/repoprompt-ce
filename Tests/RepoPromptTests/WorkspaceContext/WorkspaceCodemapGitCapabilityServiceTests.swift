@@ -601,6 +601,209 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         XCTAssertNotEqual(afterNestedAttributes.candidateAttributeGeneration, accepted.candidateAttributeGeneration)
     }
 
+    func testSourceAuthoritySurvivesRootWideGitChurn() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        let path = "Sources/Feature.swift"
+        let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let rootCapability = try await capability(service.resolve(root: request(for: root, seed: 56)))
+        let pathFingerprint = try fingerprint(at: root.appendingPathComponent(path))
+
+        let acceptedCandidate = await sourceAuthority(
+            service: service,
+            capability: rootCapability,
+            path: path
+        )
+        let accepted = try XCTUnwrap(acceptedCandidate)
+        XCTAssertEqual(accepted.acceptedPostPathFingerprint, pathFingerprint)
+
+        let indexURL = root.appendingPathComponent(".git/index")
+        let beforeIndexDescriptorUpdate = try fingerprint(at: indexURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 3600)],
+            ofItemAtPath: indexURL.path
+        )
+        let afterIndexDescriptorUpdateFingerprint = try fingerprint(at: indexURL)
+        XCTAssertNotEqual(afterIndexDescriptorUpdateFingerprint, beforeIndexDescriptorUpdate)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        _ = try fixture.runGit(["status", "--porcelain=v1", "--untracked-files=all"], at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        try fixture.write("let unrelatedCommit = true\n", to: "Sources/UnrelatedCommit.swift", at: root)
+        try fixture.stage("Sources/UnrelatedCommit.swift", at: root)
+        try fixture.commit("Unrelated source authority churn", at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        _ = try fixture.runGit(["checkout", "-b", "source-authority-branch"], at: root)
+        _ = try fixture.runGit(["checkout", "main"], at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        _ = try fixture.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        try fixture.write("let untrackedChurn = true\n", to: "Sources/UntrackedChurn.swift", at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        try fixture.write("*.swift text eol=lf\n", to: ".git/info/attributes", at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        let configuredAttributes = root.appendingPathComponent("source-authority.attributes")
+        try "*.swift text eol=lf\n".write(to: configuredAttributes, atomically: true, encoding: .utf8)
+        _ = try fixture.runGit(["config", "core.attributesFile", configuredAttributes.path], at: root)
+        try "*.swift text eol=crlf\n".write(to: configuredAttributes, atomically: true, encoding: .utf8)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        let relativeAttributes = root.appendingPathComponent("relative-source-authority.attributes")
+        try "*.swift text eol=lf\n".write(to: relativeAttributes, atomically: true, encoding: .utf8)
+        _ = try fixture.runGit(["config", "core.attributesFile", "relative-source-authority.attributes"], at: root)
+        try "*.swift text eol=crlf\n".write(to: relativeAttributes, atomically: true, encoding: .utf8)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        let revalidatedAfterRootWideChurn = await service.revalidateSourceAuthorities(
+            capability: rootCapability,
+            tokens: [accepted]
+        )
+        XCTAssertTrue(revalidatedAfterRootWideChurn)
+    }
+
+    func testSourceAuthorityRejectsGlobalAttributeMutationDuringIssuance() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+
+        let infoRaceRoot = try fixture.makeRepository(named: "info-attributes-race")
+        let infoAttributes = infoRaceRoot.appendingPathComponent(".git/info/attributes").standardizedFileURL
+        let infoAttributesReplacement = AuthorityEvidenceLeafReplacement(
+            target: infoAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let infoRaceService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { infoAttributesReplacement.replaceIfTarget($0) }
+            )
+        )
+        let infoRaceCapability = try await capability(
+            infoRaceService.resolve(root: request(for: infoRaceRoot, seed: 57))
+        )
+        try "*.swift text\n".write(to: infoAttributes, atomically: true, encoding: .utf8)
+        await assertNil(sourceAuthority(
+            service: infoRaceService,
+            capability: infoRaceCapability,
+            path: "Sources/Feature.swift"
+        ))
+
+        let configuredRaceRoot = try fixture.makeRepository(named: "configured-attributes-race")
+        let configuredRaceAttributes = configuredRaceRoot
+            .appendingPathComponent("source-authority-race.attributes")
+            .standardizedFileURL
+        _ = try fixture.runGit(["config", "core.attributesFile", configuredRaceAttributes.path], at: configuredRaceRoot)
+        let configuredRaceReplacement = AuthorityEvidenceLeafReplacement(
+            target: configuredRaceAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let configuredRaceService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { configuredRaceReplacement.replaceIfTarget($0) }
+            )
+        )
+        let configuredRaceCapability = try await capability(
+            configuredRaceService.resolve(root: request(for: configuredRaceRoot, seed: 58))
+        )
+        try "*.swift text\n".write(to: configuredRaceAttributes, atomically: true, encoding: .utf8)
+        await assertNil(sourceAuthority(
+            service: configuredRaceService,
+            capability: configuredRaceCapability,
+            path: "Sources/Feature.swift"
+        ))
+
+        let relativeRaceRoot = try fixture.makeRepository(named: "relative-attributes-race")
+        let relativeRaceAttributes = relativeRaceRoot
+            .appendingPathComponent("relative-source-authority-race.attributes")
+            .standardizedFileURL
+        _ = try fixture.runGit(
+            ["config", "core.attributesFile", "relative-source-authority-race.attributes"],
+            at: relativeRaceRoot
+        )
+        let relativeRaceReplacement = AuthorityEvidenceLeafReplacement(
+            target: relativeRaceAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let relativeRaceService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { relativeRaceReplacement.replaceIfTarget($0) }
+            )
+        )
+        let relativeRaceCapability = try await capability(
+            relativeRaceService.resolve(root: request(for: relativeRaceRoot, seed: 59))
+        )
+        try "*.swift text\n".write(to: relativeRaceAttributes, atomically: true, encoding: .utf8)
+        await assertNil(sourceAuthority(
+            service: relativeRaceService,
+            capability: relativeRaceCapability,
+            path: "Sources/Feature.swift"
+        ))
+    }
+
+    func testSourceAuthorityRejectsGlobalAttributeMutationDuringRevalidation() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        let infoAttributes = root.appendingPathComponent(".git/info/attributes").standardizedFileURL
+        let replacement = AuthorityEvidenceLeafReplacement(
+            target: infoAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let service = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { replacement.replaceIfTarget($0) }
+            )
+        )
+        let rootCapability = try await capability(service.resolve(root: request(for: root, seed: 60)))
+        let tokenCandidate = await sourceAuthority(
+            service: service,
+            capability: rootCapability,
+            path: "Sources/Feature.swift"
+        )
+        let token = try XCTUnwrap(tokenCandidate)
+
+        try "*.swift text\n".write(to: infoAttributes, atomically: true, encoding: .utf8)
+        let revalidatedRace = await service.revalidateSourceAuthorities(
+            capability: rootCapability,
+            tokens: [token]
+        )
+        XCTAssertFalse(revalidatedRace)
+    }
+
+    private func assertSourceAuthorityAvailable(
+        service: WorkspaceCodemapGitCapabilityService,
+        capability: GitCodemapRootCapability,
+        path: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let authority = await sourceAuthority(service: service, capability: capability, path: path)
+        XCTAssertNotNil(authority, file: file, line: line)
+    }
+
+    private func sourceAuthority(
+        service: WorkspaceCodemapGitCapabilityService,
+        capability: GitCodemapRootCapability,
+        path: String
+    ) async -> WorkspaceCodemapSourceAuthorityToken? {
+        await service.makeSourceAuthority(
+            capability: capability,
+            observedRootEpoch: capability.rootEpoch,
+            observedRepositoryAuthority: capability.repositoryAuthority,
+            candidateRepositoryRelativePath: path,
+            observedPathGeneration: 7,
+            currentPathGeneration: 7,
+            observedIngressGeneration: 11,
+            currentIngressGeneration: 11
+        )
+    }
+
     func testSourceAuthorityNoFollowFingerprintRejectsSymlinkAndMutation() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try fixture.makeRepository(named: "repository")

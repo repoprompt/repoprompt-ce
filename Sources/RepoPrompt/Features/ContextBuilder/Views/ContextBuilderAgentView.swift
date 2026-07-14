@@ -1,10 +1,32 @@
 import SwiftUI
 
+enum ContextBuilderGeneratedAnswerActionText {
+    static let useAsPromptTooltip = "Use the generated answer as your prompt"
+    static let copyTooltip = "Copy answer to clipboard"
+    static let previewTooltip = "Preview the generated answer"
+    static let viewInChatTooltip = "Open answer in chat view"
+}
+
 struct ContextBuilderAgentView: View {
     @ObservedObject var viewModel: ContextBuilderAgentViewModel
     @ObservedObject var oracleViewModel: OracleViewModel
     let windowID: Int
     var availableWidth: CGFloat
+    let openGeneratedAnswerChat: (ContextBuilderGeneratedAnswerRoute) -> Void
+
+    init(
+        viewModel: ContextBuilderAgentViewModel,
+        oracleViewModel: OracleViewModel,
+        windowID: Int,
+        availableWidth: CGFloat,
+        openGeneratedAnswerChat: @escaping (ContextBuilderGeneratedAnswerRoute) -> Void
+    ) {
+        _viewModel = ObservedObject(wrappedValue: viewModel)
+        _oracleViewModel = ObservedObject(wrappedValue: oracleViewModel)
+        self.windowID = windowID
+        self.availableWidth = availableWidth
+        self.openGeneratedAnswerChat = openGeneratedAnswerChat
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -203,8 +225,8 @@ struct ContextBuilderAgentView: View {
             }
 
             // Line 3: Plan actions (only when plan is ready)
-            if case let .ready(chatID, previewText) = status {
-                planReadyActions(chatID: chatID, previewText: previewText)
+            if case let .ready(route, previewText) = status {
+                planReadyActions(route: route, previewText: previewText)
             }
         }
         .padding(10)
@@ -507,7 +529,10 @@ struct ContextBuilderAgentView: View {
 
     /// Second line actions when plan is ready
     @ViewBuilder
-    private func planReadyActions(chatID: String, previewText: String?) -> some View {
+    private func planReadyActions(
+        route: ContextBuilderGeneratedAnswerRoute,
+        previewText: String?
+    ) -> some View {
         let fullResponseText = viewModel.generatedPlanResponseText(for: subjectTabID)
         HStack(spacing: 8) {
             // Use as Prompt - primary action
@@ -525,7 +550,7 @@ struct ContextBuilderAgentView: View {
                 height: 28
             ))
             .disabled(previewText == nil)
-            .hoverTooltip("Use the generated plan as your prompt")
+            .hoverTooltip(ContextBuilderGeneratedAnswerActionText.useAsPromptTooltip)
 
             if let text = previewText {
                 Button(action: copyGeneratedPlanToClipboard) {
@@ -542,7 +567,7 @@ struct ContextBuilderAgentView: View {
                     height: 28
                 ))
                 .disabled(fullResponseText == nil)
-                .hoverTooltip("Copy plan to clipboard")
+                .hoverTooltip(ContextBuilderGeneratedAnswerActionText.copyTooltip)
 
                 // Preview
                 Button(action: { showingPlanPreview.toggle() }) {
@@ -558,7 +583,7 @@ struct ContextBuilderAgentView: View {
                     horizontalPadding: 12,
                     height: 28
                 ))
-                .hoverTooltip("Preview the generated plan")
+                .hoverTooltip(ContextBuilderGeneratedAnswerActionText.previewTooltip)
                 .popover(isPresented: $showingPlanPreview) {
                     planPreviewPopover(overrideText: text)
                 }
@@ -567,7 +592,7 @@ struct ContextBuilderAgentView: View {
             Spacer()
 
             // View in Chat
-            Button(action: { viewGeneratedPlan(chatID: chatID) }) {
+            Button(action: { viewGeneratedPlan(route: route) }) {
                 HStack(spacing: 4) {
                     Image(systemName: "bubble.left.and.bubble.right")
                         .font(.callout)
@@ -580,7 +605,7 @@ struct ContextBuilderAgentView: View {
                 horizontalPadding: 12,
                 height: 28
             ))
-            .hoverTooltip("Open plan in chat view")
+            .hoverTooltip(ContextBuilderGeneratedAnswerActionText.viewInChatTooltip)
         }
     }
 
@@ -746,12 +771,12 @@ struct ContextBuilderAgentView: View {
         )
     }
 
-    /// Select the generated plan's Oracle chat session.
-    private func viewGeneratedPlan(chatID: String) {
-        oracleViewModel.selectSession(byShortID: chatID)
+    /// Open the generated answer's Oracle chat session.
+    private func viewGeneratedPlan(route: ContextBuilderGeneratedAnswerRoute) {
+        openGeneratedAnswerChat(route)
     }
 
-    /// Use the generated plan text as the prompt
+    /// Use the generated answer text as the prompt
     private func useAsPrompt() {
         viewModel.useGeneratedPlanAsPrompt()
     }

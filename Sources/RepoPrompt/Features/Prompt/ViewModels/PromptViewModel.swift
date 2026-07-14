@@ -759,8 +759,10 @@ class PromptViewModel: ObservableObject {
     @Published var gitDiffInclusionModeForCopy: GitDiffInclusionMode = .none {
         didSet {
             guard oldValue != gitDiffInclusionModeForCopy else { return }
-            // Git-only light path: update diff tokens immediately
-            tokenCountingViewModel.markGitDiffDirty()
+            let gitViewModelWillPublishChange = gitViewModel.gitDiffInclusionMode != gitDiffInclusionModeForCopy
+            if !gitViewModelWillPublishChange {
+                tokenCountingViewModel.markGitDiffDirty()
+            }
             if !isSyncingSettings {
                 guard let workspaceID = currentWorkspaceID else { return }
                 var settings = settingsManager.copySettings(for: workspaceID)
@@ -2757,24 +2759,24 @@ class PromptViewModel: ObservableObject {
         // Flush pending editor state and snapshot current tab before switching
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
-        await withComposeTabActivationSnapshotSuspended(targetTabID: id, manager: manager) {
-            manager.workspaces[index].activeComposeTabID = id
-            activeComposeTabID = id
+        await withComposeTabSwitching(targetTabID: id) {
+            await withComposeTabActivationSnapshotSuspended(targetTabID: id, manager: manager) {
+                manager.workspaces[index].activeComposeTabID = id
+                activeComposeTabID = id
 
-            loadComposeTabsFromWorkspace(manager.workspaces[index])
-            guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
+                loadComposeTabsFromWorkspace(manager.workspaces[index])
+                guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
 
-            activeTabApplyTask?.cancel()
+                activeTabApplyTask?.cancel()
 
-            let task = Task { [weak self, weak manager] in
-                guard let self, let manager else { return }
-                await withComposeTabSwitching(targetTabID: id) {
-                    await manager.applyComposeTabStateAsync(tab: target, windowID: self.windowID)
+                let task = Task { [weak self, weak manager] in
+                    guard let self, let manager else { return }
+                    await manager.applyComposeTabStateAsync(tab: target, windowID: windowID)
                 }
-            }
 
-            activeTabApplyTask = task
-            await task.value
+                activeTabApplyTask = task
+                await task.value
+            }
         }
     }
 

@@ -56,6 +56,59 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         ))
     }
 
+    func testDrawerBuilderGeneratedAnswerRoutingAndTooltipsUseAnswerWording() throws {
+        let route = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: UUID(),
+            tabID: UUID(),
+            chatID: "  generated-answer-chat  "
+        )
+        let changedWorkspaceID = UUID()
+        let changedTabID = UUID()
+        XCTAssertNotEqual(changedWorkspaceID, route.workspaceID)
+        XCTAssertNotEqual(changedTabID, route.tabID)
+
+        let ready = ContextBuilderPlanStatus.ready(route: route, previewText: "Generated answer")
+        var callbackRoute: ContextBuilderGeneratedAnswerRoute?
+        if case let .ready(readyRoute, _) = ready {
+            let openGeneratedAnswerChat: (ContextBuilderGeneratedAnswerRoute) -> Void = {
+                callbackRoute = $0
+            }
+            openGeneratedAnswerChat(readyRoute)
+        }
+        XCTAssertEqual(callbackRoute, route)
+
+        let userInfo = try XCTUnwrap(agentContextDrawerGeneratedAnswerPopoverUserInfo(
+            windowID: 8,
+            route: route
+        ))
+
+        XCTAssertEqual(Set(userInfo.keys.compactMap { $0 as? String }), [
+            "windowID",
+            "workspaceID",
+            "tabID",
+            "chatID"
+        ])
+        XCTAssertEqual(userInfo["windowID"] as? Int, 8)
+        XCTAssertEqual(userInfo["workspaceID"] as? UUID, route.workspaceID)
+        XCTAssertEqual(userInfo["tabID"] as? UUID, route.tabID)
+        XCTAssertEqual(userInfo["chatID"] as? String, "generated-answer-chat")
+        XCTAssertEqual(AgentOraclePopoverRoute(notificationUserInfo: userInfo)?.chatID, "generated-answer-chat")
+
+        let tooltips = [
+            ContextBuilderGeneratedAnswerActionText.useAsPromptTooltip,
+            ContextBuilderGeneratedAnswerActionText.copyTooltip,
+            ContextBuilderGeneratedAnswerActionText.previewTooltip,
+            ContextBuilderGeneratedAnswerActionText.viewInChatTooltip
+        ]
+        XCTAssertEqual(tooltips, [
+            "Use the generated answer as your prompt",
+            "Copy answer to clipboard",
+            "Preview the generated answer",
+            "Open answer in chat view"
+        ])
+        XCTAssertFalse(tooltips.contains { $0.localizedCaseInsensitiveContains("plan") })
+    }
+
     func testOracleLatestPopoverRouteOmitsChatIDAndPreservesScope() throws {
         let workspaceID = UUID()
         let contextTabID = UUID()

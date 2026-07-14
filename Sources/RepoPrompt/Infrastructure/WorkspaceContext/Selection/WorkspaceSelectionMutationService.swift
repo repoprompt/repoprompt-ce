@@ -168,6 +168,7 @@ struct WorkspaceSelectionMutationService {
         WorkspaceCodemapAutomaticSelectionSourceIdentity,
         WorkspaceCodemapArtifactDemandResult
     ) async throws -> Void
+    let removePathsDidCaptureExistingHook: @Sendable (StoredSelection) async -> Void
 
     init(
         store: WorkspaceFileContextStore,
@@ -178,7 +179,8 @@ struct WorkspaceSelectionMutationService {
         automaticSelectionSourceDemandHook: @escaping @Sendable (
             WorkspaceCodemapAutomaticSelectionSourceIdentity,
             WorkspaceCodemapArtifactDemandResult
-        ) async throws -> Void = { _, _ in }
+        ) async throws -> Void = { _, _ in },
+        removePathsDidCaptureExistingHook: @escaping @Sendable (StoredSelection) async -> Void = { _ in }
     ) {
         self.store = store
         self.codemapsGloballyDisabled = codemapsGloballyDisabled
@@ -186,6 +188,7 @@ struct WorkspaceSelectionMutationService {
         self.automaticSelectionPolicy = automaticSelectionPolicy
         self.automaticSelectionWaiter = automaticSelectionWaiter
         self.automaticSelectionSourceDemandHook = automaticSelectionSourceDemandHook
+        self.removePathsDidCaptureExistingHook = removePathsDidCaptureExistingHook
     }
 
     func buildSelection(
@@ -560,6 +563,7 @@ struct WorkspaceSelectionMutationService {
         mode: String = "full",
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceRemoveSelectionResult {
+        await removePathsDidCaptureExistingHook(existing)
         if mode == "codemap_only" {
             let resolution = await resolveSelectionCandidates(
                 paths: paths,

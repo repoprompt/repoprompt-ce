@@ -355,7 +355,13 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
             source: source,
             store: promptManager.workspaceFileContextStore,
             filePathDisplay: promptManager.filePathDisplayOption,
-            codeMapUsage: codeMapUsage
+            codeMapUsage: codeMapUsage,
+            entryMetricsSnapshot: AgentSelectedFilesRequestMetricsSnapshotResolver.activeTokenMetricsSnapshot(
+                source: source,
+                promptManager: promptManager,
+                codeMapUsage: codeMapUsage,
+                filePathDisplay: promptManager.filePathDisplayOption
+            )
         )
     }
 
@@ -585,7 +591,13 @@ struct AgentSelectedFilesInlineManager: View {
             source: source,
             store: promptManager.workspaceFileContextStore,
             filePathDisplay: promptManager.filePathDisplayOption,
-            codeMapUsage: codeMapUsage
+            codeMapUsage: codeMapUsage,
+            entryMetricsSnapshot: AgentSelectedFilesRequestMetricsSnapshotResolver.activeTokenMetricsSnapshot(
+                source: source,
+                promptManager: promptManager,
+                codeMapUsage: codeMapUsage,
+                filePathDisplay: promptManager.filePathDisplayOption
+            )
         )
     }
 
@@ -900,93 +912,6 @@ private struct AgentSelectedFilesPopover: View {
     }
 }
 
-@MainActor
-final class AgentSelectedFilePreviewLoadCoordinator: ObservableObject {
-    @Published private(set) var activePreviewRowID: ResolvedPromptFileEntryID?
-    @Published private(set) var contentRevision = 0
-    @Published private(set) var previewText: String? {
-        didSet { contentRevision &+= 1 }
-    }
-
-    @Published private(set) var isLoadingPreview = false {
-        didSet { contentRevision &+= 1 }
-    }
-
-    private var activePreviewRow: AgentContextExportRow?
-    private var previewLoadTask: Task<Void, Never>?
-
-    deinit {
-        previewLoadTask?.cancel()
-    }
-
-    var hasPreviewLoadTask: Bool {
-        previewLoadTask != nil
-    }
-
-    func isPreviewPresented(for row: AgentContextExportRow) -> Bool {
-        activePreviewRowID == row.id
-    }
-
-    func isLoadingPreview(for row: AgentContextExportRow) -> Bool {
-        activePreviewRowID == row.id && isLoadingPreview
-    }
-
-    func openPreview(
-        row: AgentContextExportRow,
-        loadContent: @escaping (AgentContextExportRow, AgentContextExportRow.ContentPurpose) async -> String?
-    ) {
-        closeActivePreview()
-        activePreviewRow = row
-        activePreviewRowID = row.id
-        isLoadingPreview = true
-        previewLoadTask = Task { [weak self] in
-            let rowID = row.id
-            let text = await loadContent(row, .preview)
-            guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard self?.activePreviewRow?.id == rowID else { return }
-                self?.previewText = text
-                self?.isLoadingPreview = false
-                self?.previewLoadTask = nil
-            }
-        }
-    }
-
-    func displayText(for row: AgentContextExportRow) -> String {
-        guard activePreviewRowID == row.id else { return "No preview content available" }
-        if isLoadingPreview { return "Loading preview…" }
-        return previewText ?? "No preview content available"
-    }
-
-    func handlePreviewPresentationChanged(row: AgentContextExportRow, isPresented: Bool) {
-        if !isPresented, activePreviewRow == row {
-            closeActivePreview()
-        }
-    }
-
-    func handleRowDisappear(row: AgentContextExportRow) {
-        if activePreviewRow == row {
-            closeActivePreview()
-        }
-    }
-
-    func reconcileVisibleRows(_ rows: [AgentContextExportRow]) {
-        guard let activePreviewRow else { return }
-        if !rows.contains(activePreviewRow) {
-            closeActivePreview()
-        }
-    }
-
-    private func closeActivePreview() {
-        previewLoadTask?.cancel()
-        previewLoadTask = nil
-        activePreviewRow = nil
-        activePreviewRowID = nil
-        isLoadingPreview = false
-        previewText = nil
-    }
-}
-
 private struct AgentSelectedFileRow: View {
     let row: AgentContextExportRow
     let canRemove: Bool
@@ -1224,37 +1149,5 @@ private struct AgentFileRowActionButton: View {
         .onHover { hovering in
             isButtonHovered = hovering
         }
-    }
-}
-
-private struct AgentResolvedFilePreviewPopover: View {
-    let row: AgentContextExportRow
-    @ObservedObject var previewCoordinator: AgentSelectedFilePreviewLoadCoordinator
-
-    private var displayText: String {
-        previewCoordinator.displayText(for: row)
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(row.displayPath)
-                    .font(.headline)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-            }
-            .padding()
-            TextKitView(
-                text: .constant(displayText),
-                isEditable: false,
-                isSpellCheckEnabled: false,
-                useMonospacedFont: true,
-                // Keep this wired to the coordinator: TextKitView avoids overwriting
-                // first-responder AppKit text unless its external update tick changes.
-                externalUpdateTick: previewCoordinator.contentRevision
-            )
-        }
-        .frame(width: 900, height: 650)
     }
 }

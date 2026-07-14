@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import OSLog
 
 struct WorkspaceSelectionIdentity: Hashable {
     let workspaceID: UUID
@@ -116,6 +117,24 @@ extension WorkspaceManagerViewModel: WorkspaceSelectionHost {
 /// selection source while the WorkspaceFiles UI adapter still owns checkbox state.
 @MainActor
 final class WorkspaceSelectionCoordinator {
+    private enum SelectionPersistenceResult {
+        case committed(StoredSelection)
+        case conflict(current: StoredSelection)
+        case targetUnavailable
+    }
+
+    private enum SelectionMutationKind: String {
+        case remove
+        case promote
+        case demote
+        case slices
+    }
+
+    private static let logger = Logger(
+        subsystem: "com.repoprompt.workspace",
+        category: "SelectionPersistence"
+    )
+
     struct Snapshot: Equatable {
         let tabID: UUID?
         let selection: StoredSelection
@@ -270,7 +289,7 @@ final class WorkspaceSelectionCoordinator {
         guard let workspaceManager,
               workspaceManager.composeTab(for: identity)?.selection == selection
         else { return }
-        updateMCPSelectionPresentation(
+        updateSelectionPresentation(
             selection,
             for: identity,
             workspaceManager: workspaceManager
@@ -334,20 +353,47 @@ final class WorkspaceSelectionCoordinator {
         peerSourceRevision: UInt64? = nil,
         peerMutationFence: MCPSelectionPeerMutationFence? = nil
     ) async -> StoredSelection {
+        switch await persistSelectionResult(
+            selection,
+            for: identity,
+            source: source,
+            mirrorToUIIfActive: mirrorToUIIfActive,
+            expectedCurrentSelection: expectedCurrentSelection,
+            peerSourceRevision: peerSourceRevision,
+            peerMutationFence: peerMutationFence
+        ) {
+        case let .committed(committed):
+            committed
+        case let .conflict(current):
+            current
+        case .targetUnavailable:
+            selection
+        }
+    }
+
+    private func persistSelectionResult(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity,
+        source: Source = .runtimeMutation,
+        mirrorToUIIfActive: Bool = true,
+        expectedCurrentSelection: StoredSelection? = nil,
+        peerSourceRevision: UInt64? = nil,
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil
+    ) async -> SelectionPersistenceResult {
         guard let workspaceManager,
               let currentSelection = workspaceManager.composeTab(for: identity)?.selection
-        else { return selection }
+        else { return .targetUnavailable }
         if let expectedCurrentSelection,
            currentSelection != expectedCurrentSelection
         {
-            return currentSelection
+            return .conflict(current: currentSelection)
         }
         if source == .mcpPeerContext {
             guard let peerSourceRevision,
                   let peerMutationFence,
                   workspaceManager.canCommitMCPSelectionPeerMutation(peerMutationFence),
                   workspaceManager.acceptMCPPeerSelectionRevision(peerSourceRevision, for: identity)
-            else { return currentSelection }
+            else { return .conflict(current: currentSelection) }
         }
 
         let propagationRegistration = source == .mcpTabContext
@@ -361,9 +407,9 @@ final class WorkspaceSelectionCoordinator {
                 peerMutationFence,
                 source: source,
                 workspaceManager: workspaceManager
-            ) else { return currentSelection }
-            if source.isMCPSelectionSource {
-                updateMCPSelectionPresentation(
+            ) else { return .conflict(current: currentSelection) }
+            if shouldUpdateSelectionPresentation(source: source, mirrorToUI: mirrorToUI) {
+                updateSelectionPresentation(
                     selection,
                     for: identity,
                     workspaceManager: workspaceManager
@@ -389,7 +435,7 @@ final class WorkspaceSelectionCoordinator {
                     )
                 )
             }
-            return selection
+            return .committed(selection)
         }
 
         let requiredPeerMutationFence = source == .mcpPeerContext ? peerMutationFence : nil
@@ -397,14 +443,14 @@ final class WorkspaceSelectionCoordinator {
             selection,
             for: identity,
             peerMutationFence: requiredPeerMutationFence
-        ) else { return currentSelection }
+        ) else { return .targetUnavailable }
         guard canCommitPeerMutation(
             peerMutationFence,
             source: source,
             workspaceManager: workspaceManager
-        ) else { return selection }
-        if source.isMCPSelectionSource {
-            updateMCPSelectionPresentation(
+        ) else { return .committed(selection) }
+        if shouldUpdateSelectionPresentation(source: source, mirrorToUI: mirrorToUI) {
+            updateSelectionPresentation(
                 selection,
                 for: identity,
                 workspaceManager: workspaceManager
@@ -437,7 +483,7 @@ final class WorkspaceSelectionCoordinator {
                 )
             )
         }
-        return selection
+        return .committed(selection)
     }
 
     /// Applies a synchronous transform to the latest canonical tab selection and stores the
@@ -472,8 +518,8 @@ final class WorkspaceSelectionCoordinator {
             mirrorRevision = persistedRevision
         }
 
-        if source.isMCPSelectionSource {
-            updateMCPSelectionPresentation(after, for: identity, workspaceManager: workspaceManager)
+        if shouldUpdateSelectionPresentation(source: source, mirrorToUI: mirrorToUI) {
+            updateSelectionPresentation(after, for: identity, workspaceManager: workspaceManager)
         }
         if after != before, !mirrorToUI || source.isMCPSelectionSource {
             changeSubject.send(Change(tabID: identity.tabID, selection: after, source: source))
@@ -569,6 +615,283 @@ final class WorkspaceSelectionCoordinator {
             _ = await persistActiveSelection(result.selection, source: .runtimeMutation)
         }
         return result
+    }
+
+    private func mutationPersistenceOutcome(
+        _ result: SelectionPersistenceResult,
+        sourceSelection: StoredSelection,
+        identity: WorkspaceSelectionIdentity,
+        kind: SelectionMutationKind
+    ) -> (selection: StoredSelection, mutated: Bool) {
+        switch result {
+        case let .committed(selection):
+            return (selection, true)
+        case let .conflict(current):
+            Self.logger.debug(
+                """
+                Selection mutation conflict kind=\(kind.rawValue, privacy: .public) \
+                workspaceID=\(identity.workspaceID.uuidString, privacy: .public) \
+                tabID=\(identity.tabID.uuidString, privacy: .public)
+                """
+            )
+            return (current, false)
+        case .targetUnavailable:
+            Self.logger.debug(
+                """
+                Selection mutation target unavailable kind=\(kind.rawValue, privacy: .public) \
+                workspaceID=\(identity.workspaceID.uuidString, privacy: .public) \
+                tabID=\(identity.tabID.uuidString, privacy: .public)
+                """
+            )
+            return (sourceSelection, false)
+        }
+    }
+
+    @discardableResult
+    func removePathsInActiveSelection(
+        paths: [String],
+        mode: String = "full",
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        lookupContext explicitLookupContext: WorkspaceLookupContext? = nil
+    ) async -> WorkspaceRemoveSelectionResult {
+        guard let identity = activeSelectionIdentity() else {
+            return WorkspaceRemoveSelectionResult(selection: StoredSelection(), invalidPaths: [], resolvedMap: [:], mutated: false)
+        }
+        let lookupContext = explicitLookupContext ?? WorkspaceLookupContext(rootScope: rootScope, bindingProjection: nil)
+        let currentSelection = activeSelectionSnapshot(flushPendingUI: true).selection
+        let current = lookupContext.physicalizeSelection(currentSelection)
+        let translatedPaths = lookupContext.translateInputPaths(paths)
+        let result = await mutationService.removePaths(
+            existing: current,
+            paths: translatedPaths,
+            rawPaths: paths,
+            mode: mode,
+            rootScope: lookupContext.rootScope
+        )
+        let logicalSelection = lookupContext.logicalizeSelection(result.selection)
+        guard result.mutated else {
+            return WorkspaceRemoveSelectionResult(
+                selection: logicalSelection,
+                invalidPaths: result.invalidPaths,
+                resolvedMap: result.resolvedMap,
+                mutated: false
+            )
+        }
+        let persistenceResult = await persistSelectionResult(
+            logicalSelection,
+            for: identity,
+            source: .runtimeMutation,
+            expectedCurrentSelection: currentSelection
+        )
+        let outcome = mutationPersistenceOutcome(
+            persistenceResult,
+            sourceSelection: currentSelection,
+            identity: identity,
+            kind: .remove
+        )
+        return WorkspaceRemoveSelectionResult(
+            selection: outcome.selection,
+            invalidPaths: result.invalidPaths,
+            resolvedMap: result.resolvedMap,
+            mutated: outcome.mutated
+        )
+    }
+
+    @discardableResult
+    func promotePathsInActiveSelection(
+        paths: [String],
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        lookupContext explicitLookupContext: WorkspaceLookupContext? = nil
+    ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool) {
+        guard let identity = activeSelectionIdentity() else {
+            return (StoredSelection(), [], false)
+        }
+        let currentSelection = activeSelectionSnapshot(flushPendingUI: true).selection
+        return await promotePathsInSelection(
+            paths: paths,
+            for: identity,
+            expectedCurrentSelection: currentSelection,
+            rootScope: rootScope,
+            lookupContext: explicitLookupContext
+        )
+    }
+
+    @discardableResult
+    func promotePathsInSelection(
+        paths: [String],
+        for identity: WorkspaceSelectionIdentity,
+        expectedCurrentSelection: StoredSelection,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        lookupContext explicitLookupContext: WorkspaceLookupContext? = nil
+    ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool) {
+        let lookupContext = explicitLookupContext ?? WorkspaceLookupContext(rootScope: rootScope, bindingProjection: nil)
+        let current = lookupContext.physicalizeSelection(expectedCurrentSelection)
+        let translatedPaths = lookupContext.translateInputPaths(paths)
+        let result = await mutationService.promotePaths(
+            existing: current,
+            paths: translatedPaths,
+            rawPaths: paths,
+            rootScope: lookupContext.rootScope
+        )
+        let logicalSelection = lookupContext.logicalizeSelection(result.selection)
+        guard result.mutated else {
+            return (logicalSelection, result.invalidPaths, false)
+        }
+        let persistenceResult = await persistSelectionResult(
+            logicalSelection,
+            for: identity,
+            source: .runtimeMutation,
+            expectedCurrentSelection: expectedCurrentSelection
+        )
+        let outcome = mutationPersistenceOutcome(
+            persistenceResult,
+            sourceSelection: expectedCurrentSelection,
+            identity: identity,
+            kind: .promote
+        )
+        return (outcome.selection, result.invalidPaths, outcome.mutated)
+    }
+
+    @discardableResult
+    func demotePathsInActiveSelection(
+        paths: [String],
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        lookupContext explicitLookupContext: WorkspaceLookupContext? = nil
+    ) async -> WorkspaceDemoteSelectionResult {
+        guard let identity = activeSelectionIdentity() else {
+            return WorkspaceDemoteSelectionResult(
+                selection: StoredSelection(),
+                invalidPaths: [],
+                codemapUnavailable: [],
+                mutated: false
+            )
+        }
+        let currentSelection = activeSelectionSnapshot(flushPendingUI: true).selection
+        return await demotePathsInSelection(
+            paths: paths,
+            for: identity,
+            expectedCurrentSelection: currentSelection,
+            rootScope: rootScope,
+            lookupContext: explicitLookupContext
+        )
+    }
+
+    @discardableResult
+    func demotePathsInSelection(
+        paths: [String],
+        for identity: WorkspaceSelectionIdentity,
+        expectedCurrentSelection: StoredSelection,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        lookupContext explicitLookupContext: WorkspaceLookupContext? = nil
+    ) async -> WorkspaceDemoteSelectionResult {
+        let lookupContext = explicitLookupContext ?? WorkspaceLookupContext(rootScope: rootScope, bindingProjection: nil)
+        let current = lookupContext.physicalizeSelection(expectedCurrentSelection)
+        let translatedPaths = lookupContext.translateInputPaths(paths)
+        let result = await mutationService.demotePaths(
+            existing: current,
+            paths: translatedPaths,
+            rawPaths: paths,
+            rootScope: lookupContext.rootScope
+        )
+        let logicalSelection = lookupContext.logicalizeSelection(result.selection)
+        guard result.mutated else {
+            return WorkspaceDemoteSelectionResult(
+                selection: logicalSelection,
+                invalidPaths: result.invalidPaths,
+                codemapUnavailable: result.codemapUnavailable,
+                mutated: false
+            )
+        }
+        let persistenceResult = await persistSelectionResult(
+            logicalSelection,
+            for: identity,
+            source: .runtimeMutation,
+            expectedCurrentSelection: expectedCurrentSelection
+        )
+        let outcome = mutationPersistenceOutcome(
+            persistenceResult,
+            sourceSelection: expectedCurrentSelection,
+            identity: identity,
+            kind: .demote
+        )
+        return WorkspaceDemoteSelectionResult(
+            selection: outcome.selection,
+            invalidPaths: result.invalidPaths,
+            codemapUnavailable: result.codemapUnavailable,
+            mutated: outcome.mutated
+        )
+    }
+
+    @discardableResult
+    func clearSlicesInActiveSelection(
+        paths: [String],
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        lookupContext explicitLookupContext: WorkspaceLookupContext? = nil
+    ) async -> WorkspaceSliceSelectionMutationResult {
+        guard let identity = activeSelectionIdentity() else {
+            return WorkspaceSliceSelectionMutationResult(
+                selection: StoredSelection(),
+                invalidPaths: [],
+                resolvedMap: [:],
+                mutated: false
+            )
+        }
+        let currentSelection = activeSelectionSnapshot(flushPendingUI: true).selection
+        return await clearSlicesInSelection(
+            paths: paths,
+            for: identity,
+            expectedCurrentSelection: currentSelection,
+            rootScope: rootScope,
+            lookupContext: explicitLookupContext
+        )
+    }
+
+    @discardableResult
+    func clearSlicesInSelection(
+        paths: [String],
+        for identity: WorkspaceSelectionIdentity,
+        expectedCurrentSelection: StoredSelection,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        lookupContext explicitLookupContext: WorkspaceLookupContext? = nil
+    ) async -> WorkspaceSliceSelectionMutationResult {
+        let lookupContext = explicitLookupContext ?? WorkspaceLookupContext(rootScope: rootScope, bindingProjection: nil)
+        let current = lookupContext.physicalizeSelection(expectedCurrentSelection)
+        let entries = lookupContext.translateSliceInputs(
+            paths.map { WorkspaceSelectionSliceInput(path: $0, ranges: []) }
+        )
+        let result = await mutationService.mutateSlices(
+            base: current,
+            entries: entries,
+            mode: .remove,
+            rootScope: lookupContext.rootScope
+        )
+        let logicalSelection = lookupContext.logicalizeSelection(result.selection)
+        guard result.mutated else {
+            return WorkspaceSliceSelectionMutationResult(
+                selection: logicalSelection,
+                invalidPaths: result.invalidPaths,
+                resolvedMap: result.resolvedMap,
+                mutated: false
+            )
+        }
+        let persistenceResult = await persistSelectionResult(
+            logicalSelection,
+            for: identity,
+            source: .runtimeMutation,
+            expectedCurrentSelection: expectedCurrentSelection
+        )
+        let outcome = mutationPersistenceOutcome(
+            persistenceResult,
+            sourceSelection: expectedCurrentSelection,
+            identity: identity,
+            kind: .slices
+        )
+        return WorkspaceSliceSelectionMutationResult(
+            selection: outcome.selection,
+            invalidPaths: result.invalidPaths,
+            resolvedMap: result.resolvedMap,
+            mutated: outcome.mutated
+        )
     }
 
     func withApplyingSelectionMirror<T>(_ operation: () async throws -> T) async rethrows -> T {
@@ -750,7 +1073,11 @@ final class WorkspaceSelectionCoordinator {
         return workspaceManager.canCommitMCPSelectionPeerMutation(fence)
     }
 
-    private func updateMCPSelectionPresentation(
+    private func shouldUpdateSelectionPresentation(source: Source, mirrorToUI: Bool) -> Bool {
+        source.isMCPSelectionSource || (source == .runtimeMutation && mirrorToUI)
+    }
+
+    private func updateSelectionPresentation(
         _ selection: StoredSelection,
         for identity: WorkspaceSelectionIdentity,
         workspaceManager: any WorkspaceSelectionHost

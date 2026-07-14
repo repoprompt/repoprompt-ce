@@ -17,6 +17,7 @@ Sources/
       Views/
     Features/
       AgentMode/                 # Agent Mode UI, models, view models, onboarding, recommendations, and shared agent runtime ownership
+        Views/ContextDrawer/     # Compose inspector shell, tabs, selected-context rows, previews, and click-time export context
         Runtime/Providers/       # provider/runtime enum and provider factory shared by Context Builder, Agent Mode, MCP, and recommendations
         History/                 # cross-workspace session history scanner, MCP tool service (history.list_sessions / search / time / get_session)
       Chat/                      # chat/oracle models, services, diff state, view models, and views
@@ -76,7 +77,7 @@ The old native file-tree visualization is no longer a live product surface. Do n
 
 “File tree” remains valid when it refers to compatibility or textual context contracts, including the MCP `get_file_tree` tool, tool result cards, API/persisted symbols such as `FileTreeOption`, historical plans, and prompt/context output such as `<file_map>` / project structure maps. Contributor-facing UI and docs should prefer “project structure map” when describing generated textual context so it is not confused with the removed native UI.
 
-The old IDE-era Prompt selected-files panel is also removed. Do not add back `PresetBottomBar`, `SelectedFilesContentView`, `SelectedFilesPanelViewModel`, or the Prompt-owned copy/chat preset picker helpers. The live compact selected-files UI remains `SelectedFilesGrid` plus `FilePreviewPopover`, and the Settings chat preset picker lives under `Features/Settings`.
+The old IDE-era Prompt selected-files panel is also removed. Do not add back `PresetBottomBar`, `SelectedFilesContentView`, `SelectedFilesPanelViewModel`, or the Prompt-owned copy/chat preset picker helpers. The compact Prompt selected-files UI remains `SelectedFilesGrid` plus `FilePreviewPopover`. Agent Mode owns its current selected-context workflow in the native Compose inspector under `Features/AgentMode/Views/ContextDrawer`; see [`compose.md`](compose.md). The Settings chat preset picker lives under `Features/Settings`.
 
 ## Placement rules for new files
 

@@ -29,6 +29,20 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         }
     }
 
+    private actor InvocationCounter {
+        private var value = 0
+
+        @discardableResult
+        func increment() -> Int {
+            value += 1
+            return value
+        }
+
+        func count() -> Int {
+            value
+        }
+    }
+
     private actor FinalPackagingRetryTrace {
         struct Snapshot: Equatable {
             let operationCount: Int
@@ -116,6 +130,35 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         XCTAssertEqual(result.gitDiff, PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
     }
 
+    func testResolveFullFileTreeIncludesRootsWhenSelectionIsEmptyAndRootFilteringEnabled() async throws {
+        let root = try makeTemporaryRoot(name: "PromptPreAssemblyFullTreeEmptySelection")
+        let sourceURL = root.appendingPathComponent("Sources/App.swift")
+        try FileSystemTestSupport.write("let fullTreeEmptySelectionSentinel = true\n", to: sourceURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .none, fileTreeMode: .files),
+            selection: StoredSelection(),
+            store: store,
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: .automaticOnly(),
+            selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
+            completeGitDiffProvider: { nil }
+        )
+
+        let result = await PromptContextPreAssemblyService.resolve(request)
+
+        let fileTreeContent = try XCTUnwrap(result.fileTreeContent)
+        XCTAssertTrue(fileTreeContent.contains(root.lastPathComponent), fileTreeContent)
+        XCTAssertTrue(fileTreeContent.contains("Sources"), fileTreeContent)
+        XCTAssertTrue(fileTreeContent.contains("App.swift"), fileTreeContent)
+    }
+
     func testResolveSelectedDiffUsesPhysicalizedSelectionAndPolicy() async throws {
         let fixture = try await makeBoundFixture()
         let captured = CapturedPaths()
@@ -146,6 +189,62 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             fixture.worktreeRoot.appendingPathComponent("Sources/Keep.swift").standardizedFileURL.path
         ]))
         XCTAssertFalse(paths.contains(fixture.logicalRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path))
+    }
+
+    func testSelectedGitDiffClipboardUsesSelectedContextPathsOnly() async throws {
+        let fixture = try await makeBoundFixture()
+        let captured = CapturedPaths()
+        let completeProvider = InvocationCounter()
+        let selectedDiff = "diff --git a/Sources/App.swift b/Sources/App.swift\n+let selectedGitSentinel = true"
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .selected),
+            selection: StoredSelection(selectedPaths: ["Sources/App.swift"], codemapAutoEnabled: false),
+            store: fixture.store,
+            lookupContext: fixture.lookupContext,
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            selectedGitDiffLookupProfile: .uiAssisted,
+            reviewGitContext: .automaticOnly(),
+            selectedGitDiffProvider: { automaticRequest in
+                await captured.set(automaticRequest.pathResolution.paths)
+                return Self.automaticResult(selectedDiff)
+            },
+            completeGitDiffProvider: {
+                await completeProvider.increment()
+                return "complete diff must not appear"
+            }
+        )
+
+        let result = await PromptContextPreAssemblyService.resolve(request)
+        let clipboard = await PromptPackagingService.generateClipboardContent(
+            metaInstructions: [],
+            userInstructions: "",
+            files: result.entries,
+            fileTreeContent: result.fileTreeContent,
+            gitDiff: result.gitDiff,
+            includeSavedPrompts: false,
+            includeFiles: true,
+            includeUserPrompt: false,
+            filePathDisplay: .relative,
+            codemapPresentation: result.codemapPresentation,
+            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+            disabledPromptSections: [],
+            duplicateUserInstructionsAtTop: false,
+            displayPathResolver: { entry in
+                result.displayPath(for: entry)
+            }
+        )
+        let paths = await captured.get()
+
+        let completeProviderInvocationCount = await completeProvider.count()
+
+        XCTAssertEqual(paths, [fixture.worktreeRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path])
+        XCTAssertTrue(clipboard.contains("<git_diff>"), clipboard)
+        XCTAssertTrue(clipboard.contains("selectedGitSentinel"), clipboard)
+        XCTAssertFalse(clipboard.contains("complete diff must not appear"), clipboard)
+        XCTAssertEqual(completeProviderInvocationCount, 0)
     }
 
     func testCanonicalAutoCodemapsDrivePreassemblyAndClipboardWithoutHiddenRediscovery() async throws {
@@ -436,7 +535,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             )
             let gate = PreAssemblyContentReadGate()
             let task = Task {
-                try await PromptContextPreAssemblyService.withResolved(request) { _ in
+                try await PromptContextPreAssemblyService.withResolved(
+                    request,
+                    codemapPresentation: .empty
+                ) { _ in
                     await gate.markStartedAndWaitForRelease()
                     try Task.checkCancellation()
                     return "must-not-publish"
@@ -1081,6 +1183,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
 
     private func makeConfig(
         gitInclusion: GitInclusion,
+        fileTreeMode: FileTreeOption = .auto,
         codeMapUsage: CodeMapUsage = .none
     ) -> PromptContextResolved {
         PromptContextResolved(
@@ -1088,7 +1191,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             includeUserPrompt: true,
             includeMetaPrompts: false,
             includeFileTree: true,
-            fileTreeMode: .auto,
+            fileTreeMode: fileTreeMode,
             codeMapUsage: codeMapUsage,
             gitInclusion: gitInclusion,
             storedPromptIds: []

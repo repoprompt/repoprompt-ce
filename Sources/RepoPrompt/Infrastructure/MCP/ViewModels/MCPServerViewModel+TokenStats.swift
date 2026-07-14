@@ -117,13 +117,13 @@ extension MCPServerViewModel {
         if activeTabCompatibility {
             let publishedOverlay = publishedEntryResultsOverlay(
                 collections: collections,
-                base: [:]
+                base: [:],
+                includeSliceDisplayTokens: true
             )
             let published = promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
                 for: effectiveSelection,
                 scheduleRefreshIfNeeded: allowActivePublishedSnapshotRefresh
             )
-
             var incompleteComponents = Self.virtualSnapshotIncompleteComponents(
                 collections: collections,
                 reliableFileIDs: publishedOverlay.reliableFileIDs
@@ -177,7 +177,8 @@ extension MCPServerViewModel {
         let cachedEvaluation = await cachedPromptEntriesEvaluation(collections: collections)
         let publishedOverlay = publishedEntryResultsOverlay(
             collections: collections,
-            base: cachedEvaluation.entryResultsByFileID
+            base: cachedEvaluation.entryResultsByFileID,
+            includeSliceDisplayTokens: false
         )
         let signature = virtualTokenSignature(
             context: context,
@@ -189,11 +190,10 @@ extension MCPServerViewModel {
         if allowVirtualTokenRefresh,
            let cachedSnapshot = mcpVirtualTokenSnapshotsByTabID[context.tabID]?[signature]
         {
-            var incompleteComponents = Self.virtualSnapshotIncompleteComponents(
+            let incompleteComponents = Self.virtualSnapshotIncompleteComponents(
                 collections: collections,
                 reliableFileIDs: Set(cachedSnapshot.entryResultsByFileID.keys)
             )
-            incompleteComponents.formUnion(cachedSnapshot.incompleteComponents ?? [])
             let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
             // The virtual-token signature intentionally captures logical selection and prompt
             // shape, but not file-content, search-catalog, or codemap-authority generations.
@@ -274,7 +274,8 @@ extension MCPServerViewModel {
     @MainActor
     private func publishedEntryResultsOverlay(
         collections: SelectionReplyAssembler.SelectionCollections,
-        base: [UUID: PromptEntriesEvaluation.EntryResult]
+        base: [UUID: PromptEntriesEvaluation.EntryResult],
+        includeSliceDisplayTokens: Bool
     ) -> (
         entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult],
         reliableFileIDs: Set<UUID>
@@ -282,17 +283,26 @@ extension MCPServerViewModel {
         var entryResults = base
         var reliableFileIDs = Set<UUID>()
         for entry in collections.selected {
+            let renderMode: PromptEntriesEvaluation.RenderMode = entry.ranges?.isEmpty == false ? .slice : .full
+            if renderMode == .slice, !includeSliceDisplayTokens {
+                if entryResults[entry.file.id]?.renderMode == .slice {
+                    reliableFileIDs.insert(entry.file.id)
+                }
+                continue
+            }
             guard let info = promptVM.tokenCountingViewModel.latestPublishedTokenInfo(
                 forFullPath: entry.file.standardizedFullPath
             ) else { continue }
-            let renderMode: PromptEntriesEvaluation.RenderMode = entry.ranges?.isEmpty == false ? .slice : .full
+            let existing = entryResults[entry.file.id]
             let displayTokens = renderMode == .slice ? info.count : info.fullCount
             entryResults[entry.file.id] = .init(
                 fileID: entry.file.id,
+                renderedDisplayPath: existing?.renderedDisplayPath ?? entry.file.standardizedRelativePath,
                 renderMode: renderMode,
                 displayTokens: displayTokens,
                 fullTokens: info.fullCount,
-                codemapTokens: info.codemapCount
+                codemapTokens: info.codemapCount,
+                displayLineCount: existing?.displayLineCount
             )
             reliableFileIDs.insert(entry.file.id)
         }
@@ -300,12 +310,15 @@ extension MCPServerViewModel {
             guard let info = promptVM.tokenCountingViewModel.latestPublishedTokenInfo(
                 forFullPath: entry.file.standardizedFullPath
             ) else { continue }
+            let existing = entryResults[entry.file.id]
             entryResults[entry.file.id] = .init(
                 fileID: entry.file.id,
+                renderedDisplayPath: existing?.renderedDisplayPath ?? entry.file.standardizedRelativePath,
                 renderMode: .codemap,
                 displayTokens: info.codemapCount,
                 fullTokens: info.fullCount,
-                codemapTokens: info.codemapCount
+                codemapTokens: info.codemapCount,
+                displayLineCount: existing?.displayLineCount
             )
             reliableFileIDs.insert(entry.file.id)
         }

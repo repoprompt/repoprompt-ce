@@ -5,9 +5,14 @@ import XCTest
 @MainActor
 final class WorkspaceSelectionCoordinatorTests: XCTestCase {
     private var cancellables: Set<AnyCancellable> = []
+    private var temporaryRoots: [URL] = []
 
     override func tearDown() {
         cancellables.removeAll()
+        for url in temporaryRoots {
+            try? FileManager.default.removeItem(at: url)
+        }
+        temporaryRoots.removeAll()
         super.tearDown()
     }
 
@@ -288,8 +293,41 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.manager.mirrorCompletedSelections, [canonical])
         XCTAssertEqual(harness.manager.mirroredSelection, canonical)
 
-        // The fence is not ownership by value: a genuinely newer UI revision must still win.
+        // The fence is not ownership by value: a genuinely newer UI mutation must still win.
         let newerUI = StoredSelection(selectedPaths: ["/tmp/newer-ui.swift"])
+        harness.manager.presentationHandler = nil
+        harness.manager.pendingUISelection = newerUI
+        harness.manager.advanceLiveUISelectionRevision()
+        XCTAssertEqual(
+            coordinator.activeSelectionSnapshot(flushPendingUI: true).selection,
+            newerUI
+        )
+    }
+
+    func testRuntimeActiveSelectionFencesStaleUISnapshotBeforeMirrorCatchesUp() async {
+        let initial = StoredSelection()
+        let canonical = StoredSelection(selectedPaths: ["/tmp/runtime.swift"], codemapAutoEnabled: false)
+        let staleUI = StoredSelection()
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.pendingUISelection = staleUI
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        harness.manager.activeUISnapshotResolver = { selection, tabID in
+            coordinator.selectionForActiveUISnapshot(selection, tabID: tabID)
+        }
+        harness.manager.presentationHandler = {
+            _ = coordinator.activeSelectionSnapshot(flushPendingUI: true)
+        }
+
+        _ = await coordinator.persistActiveSelection(canonical, source: .runtimeMutation)
+
+        XCTAssertEqual(harness.manager.presentedSelection, canonical)
+        XCTAssertEqual(harness.manager.publishSnapshotCallCount, 1)
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, canonical)
+        XCTAssertEqual(coordinator.selectionForActiveUISnapshot(staleUI, tabID: harness.tabID), canonical)
+        XCTAssertTrue(harness.manager.registeredSourceRevisions.isEmpty)
+        XCTAssertTrue(harness.manager.propagatedSelections.isEmpty)
+
+        let newerUI = StoredSelection(selectedPaths: ["/tmp/newer-runtime-ui.swift"])
         harness.manager.presentationHandler = nil
         harness.manager.pendingUISelection = newerUI
         harness.manager.advanceLiveUISelectionRevision()
@@ -759,6 +797,342 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.manager.publishSnapshotCallCount, 0)
     }
 
+    func testRuntimeRowMutationConveniencesDelegateThroughSelectionServiceAndPersistActiveSelection() async throws {
+        let root = try makeTemporaryRoot(name: "RuntimeRowMutations")
+        let demotedURL = root.appendingPathComponent("Demoted.swift")
+        let promotedURL = root.appendingPathComponent("Promoted.swift")
+        let selectedSliceURL = root.appendingPathComponent("SelectedSlice.swift")
+        let sliceOnlyURL = root.appendingPathComponent("SliceOnly.swift")
+        let removedURL = root.appendingPathComponent("Removed.swift")
+        let removedCodemapURL = root.appendingPathComponent("RemovedCodemap.swift")
+        try write("struct Demoted {}", to: demotedURL)
+        try write("struct Promoted {}", to: promotedURL)
+        try write("struct SelectedSlice {}", to: selectedSliceURL)
+        try write("struct SliceOnly {}", to: sliceOnlyURL)
+        try write("struct Removed {}", to: removedURL)
+        try write("struct RemovedCodemap {}", to: removedCodemapURL)
+
+        let initial = StoredSelection(
+            selectedPaths: [demotedURL.path, selectedSliceURL.path, sliceOnlyURL.path, removedURL.path],
+            manualCodemapPaths: [promotedURL.path, removedCodemapURL.path],
+            slices: [
+                demotedURL.path: [LineRange(start: 1, end: 1)],
+                selectedSliceURL.path: [LineRange(start: 1, end: 1)],
+                sliceOnlyURL.path: [LineRange(start: 1, end: 1)],
+                removedURL.path: [LineRange(start: 1, end: 1)]
+            ],
+            codemapAutoEnabled: true
+        )
+        let harness = CoordinatorHarness(initialSelection: initial)
+        _ = try await harness.store.loadRoot(path: root.path)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let demoted = await coordinator.demotePathsInActiveSelection(paths: [demotedURL.path])
+        XCTAssertTrue(demoted.mutated)
+        XCTAssertTrue(demoted.invalidPaths.isEmpty)
+        XCTAssertTrue(demoted.codemapUnavailable.isEmpty)
+        XCTAssertFalse(demoted.selection.selectedPaths.contains(demotedURL.path))
+        XCTAssertTrue(demoted.selection.manualCodemapPaths.contains(demotedURL.path))
+        XCTAssertNil(demoted.selection.slices[demotedURL.path])
+        XCTAssertFalse(demoted.selection.codemapAutoEnabled)
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, demoted.selection)
+
+        let promoted = await coordinator.promotePathsInActiveSelection(paths: [promotedURL.path])
+        XCTAssertTrue(promoted.mutated)
+        XCTAssertTrue(promoted.invalidPaths.isEmpty)
+        XCTAssertTrue(promoted.selection.selectedPaths.contains(promotedURL.path))
+        XCTAssertFalse(promoted.selection.manualCodemapPaths.contains(promotedURL.path))
+        XCTAssertFalse(promoted.selection.codemapAutoEnabled)
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, promoted.selection)
+
+        let clearedSelectedSlices = await coordinator.clearSlicesInActiveSelection(paths: [selectedSliceURL.path])
+        XCTAssertTrue(clearedSelectedSlices.mutated)
+        XCTAssertTrue(clearedSelectedSlices.invalidPaths.isEmpty)
+        XCTAssertTrue(clearedSelectedSlices.selection.selectedPaths.contains(selectedSliceURL.path))
+        XCTAssertNil(clearedSelectedSlices.selection.slices[selectedSliceURL.path])
+        XCTAssertEqual(clearedSelectedSlices.selection.slices[sliceOnlyURL.path], [LineRange(start: 1, end: 1)])
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, clearedSelectedSlices.selection)
+
+        let clearedSliceOnly = await coordinator.clearSlicesInActiveSelection(paths: [sliceOnlyURL.path])
+        XCTAssertTrue(clearedSliceOnly.mutated)
+        XCTAssertTrue(clearedSliceOnly.invalidPaths.isEmpty)
+        XCTAssertTrue(clearedSliceOnly.selection.selectedPaths.contains(sliceOnlyURL.path))
+        XCTAssertNil(clearedSliceOnly.selection.slices[sliceOnlyURL.path])
+        XCTAssertEqual(clearedSliceOnly.selection.slices[removedURL.path], [LineRange(start: 1, end: 1)])
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, clearedSliceOnly.selection)
+
+        let removed = await coordinator.removePathsInActiveSelection(paths: [removedURL.path])
+        XCTAssertTrue(removed.mutated)
+        XCTAssertTrue(removed.invalidPaths.isEmpty)
+        XCTAssertFalse(removed.selection.selectedPaths.contains(removedURL.path))
+        XCTAssertFalse(removed.selection.manualCodemapPaths.contains(removedURL.path))
+        XCTAssertNil(removed.selection.slices[removedURL.path])
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, removed.selection)
+
+        let removedCodemap = await coordinator.removePathsInActiveSelection(
+            paths: [removedCodemapURL.path],
+            mode: "codemap_only"
+        )
+        XCTAssertTrue(removedCodemap.mutated)
+        XCTAssertTrue(removedCodemap.invalidPaths.isEmpty)
+        XCTAssertFalse(removedCodemap.selection.manualCodemapPaths.contains(removedCodemapURL.path))
+        XCTAssertFalse(removedCodemap.selection.selectedPaths.contains(removedCodemapURL.path))
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, removedCodemap.selection)
+        XCTAssertEqual(changes.map(\.source), Array(repeating: .runtimeMutation, count: 6))
+    }
+
+    func testSuspendedRemoveWhenTargetTabIsRemovedReportsNotMutated() async throws {
+        let root = try makeTemporaryRoot(name: "SuspendedRemoveTargetUnavailable")
+        let removedURL = root.appendingPathComponent("Removed.swift")
+        let retainedURL = root.appendingPathComponent("Retained.swift")
+        try write("struct Removed {}", to: removedURL)
+        try write("struct Retained {}", to: retainedURL)
+
+        let initial = StoredSelection(
+            selectedPaths: [removedURL.path, retainedURL.path],
+            codemapAutoEnabled: false
+        )
+        let harness = CoordinatorHarness(initialSelection: initial)
+        _ = try await harness.store.loadRoot(path: root.path)
+        let mutationGate = SelectionMutationGate()
+        let mutationService = WorkspaceSelectionMutationService(
+            store: harness.store,
+            removePathsDidCaptureExistingHook: { selection in
+                await mutationGate.captureAndWait(selection)
+            }
+        )
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: harness.manager,
+            store: harness.store,
+            mutationService: mutationService
+        )
+        let manager = harness.manager
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let mutationTask = Task { @MainActor in
+            await coordinator.removePathsInActiveSelection(paths: [removedURL.path])
+        }
+        let capturedSelection = await mutationGate.waitUntilCaptured()
+        XCTAssertEqual(capturedSelection, initial)
+        manager.removeTab(harness.tabID)
+        XCTAssertNil(manager.composeTab(for: harness.identity))
+        await mutationGate.release()
+        let result = await mutationTask.value
+
+        XCTAssertFalse(result.mutated)
+        XCTAssertEqual(result.selection, initial)
+        XCTAssertNotEqual(result.selection, StoredSelection(selectedPaths: [retainedURL.path], codemapAutoEnabled: false))
+        XCTAssertNil(manager.composeTab(for: harness.identity))
+        XCTAssertEqual(manager.updateStoredOnlyCallCount, 0)
+        XCTAssertNil(manager.presentedSelection)
+        XCTAssertNil(manager.mirroredSelection)
+        XCTAssertTrue(manager.mirrorStartedSelections.isEmpty)
+        XCTAssertTrue(manager.propagatedSelections.isEmpty)
+        XCTAssertTrue(changes.isEmpty)
+    }
+
+    func testIdentityScopedRowMutationsStayOnCapturedTabAfterActiveTabSwitch() async throws {
+        let root = try makeTemporaryRoot(name: "IdentityScopedRowMutations")
+        let promotedURL = root.appendingPathComponent("Promoted.swift")
+        let demotedURL = root.appendingPathComponent("Demoted.swift")
+        let slicedURL = root.appendingPathComponent("Sliced.swift")
+        try write("struct Promoted {}", to: promotedURL)
+        try write("struct Demoted {}", to: demotedURL)
+        try write("struct Sliced {}", to: slicedURL)
+
+        let capturedSelection = StoredSelection(
+            selectedPaths: [demotedURL.path, slicedURL.path],
+            manualCodemapPaths: [promotedURL.path],
+            slices: [slicedURL.path: [LineRange(start: 1, end: 1)]],
+            codemapAutoEnabled: false
+        )
+        let activeSelection = StoredSelection(selectedPaths: ["/tmp/active-tab.swift"])
+        let activeTabID = UUID()
+        let harness = CoordinatorHarness(initialSelection: capturedSelection)
+        harness.manager.appendTab(ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection))
+        harness.manager.setActiveTab(activeTabID)
+        _ = try await harness.store.loadRoot(path: root.path)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let promoted = await coordinator.promotePathsInSelection(
+            paths: [promotedURL.path],
+            for: harness.identity,
+            expectedCurrentSelection: capturedSelection
+        )
+        let demoted = await coordinator.demotePathsInSelection(
+            paths: [demotedURL.path],
+            for: harness.identity,
+            expectedCurrentSelection: promoted.selection
+        )
+        let cleared = await coordinator.clearSlicesInSelection(
+            paths: [slicedURL.path],
+            for: harness.identity,
+            expectedCurrentSelection: demoted.selection
+        )
+
+        XCTAssertTrue(promoted.mutated)
+        XCTAssertTrue(demoted.mutated)
+        XCTAssertTrue(cleared.mutated)
+        XCTAssertTrue(cleared.selection.selectedPaths.contains(promotedURL.path))
+        XCTAssertTrue(cleared.selection.manualCodemapPaths.contains(demotedURL.path))
+        XCTAssertNil(cleared.selection.slices[slicedURL.path])
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, cleared.selection)
+        XCTAssertEqual(harness.manager.composeTab(with: activeTabID)?.selection, activeSelection)
+    }
+
+    func testIdentityScopedRowMutationsAndSnapshotPersistenceRejectPostCaptureSelectionChange() async throws {
+        let root = try makeTemporaryRoot(name: "GuardedRowMutations")
+        let promotedURL = root.appendingPathComponent("Promoted.swift")
+        let slicedURL = root.appendingPathComponent("Sliced.swift")
+        let concurrentURL = root.appendingPathComponent("Concurrent.swift")
+        try write("struct Promoted {}", to: promotedURL)
+        try write("struct Sliced {}", to: slicedURL)
+        try write("struct Concurrent {}", to: concurrentURL)
+
+        let capturedSelection = StoredSelection(
+            selectedPaths: [slicedURL.path],
+            manualCodemapPaths: [promotedURL.path],
+            slices: [slicedURL.path: [LineRange(start: 1, end: 1)]],
+            codemapAutoEnabled: false
+        )
+        let advancedSelection = StoredSelection(
+            selectedPaths: [slicedURL.path, concurrentURL.path],
+            manualCodemapPaths: capturedSelection.manualCodemapPaths,
+            slices: capturedSelection.slices,
+            codemapAutoEnabled: capturedSelection.codemapAutoEnabled
+        )
+        let harness = CoordinatorHarness(initialSelection: capturedSelection)
+        _ = try await harness.store.loadRoot(path: root.path)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        _ = await coordinator.persistSelection(
+            advancedSelection,
+            for: harness.identity,
+            mirrorToUIIfActive: false
+        )
+
+        let promoted = await coordinator.promotePathsInSelection(
+            paths: [promotedURL.path],
+            for: harness.identity,
+            expectedCurrentSelection: capturedSelection
+        )
+        let cleared = await coordinator.clearSlicesInSelection(
+            paths: [slicedURL.path],
+            for: harness.identity,
+            expectedCurrentSelection: capturedSelection
+        )
+        let persisted = await coordinator.persistSelection(
+            StoredSelection(),
+            for: harness.identity,
+            expectedCurrentSelection: capturedSelection
+        )
+
+        XCTAssertFalse(promoted.mutated)
+        XCTAssertEqual(promoted.selection, advancedSelection)
+        XCTAssertFalse(cleared.mutated)
+        XCTAssertEqual(cleared.selection, advancedSelection)
+        XCTAssertEqual(persisted, advancedSelection)
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, advancedSelection)
+    }
+
+    func testViewContextMutationTargetRoutesRemoveAndClearAndRejectsPostCaptureChange() async throws {
+        let root = try makeTemporaryRoot(name: "ViewContextMutationTarget")
+        let removedURL = root.appendingPathComponent("Removed.swift")
+        let clearedURL = root.appendingPathComponent("Cleared.swift")
+        let addedURL = root.appendingPathComponent("Added.swift")
+        let concurrentURL = root.appendingPathComponent("Concurrent.swift")
+        try write("struct Removed {}", to: removedURL)
+        try write("struct Cleared {}", to: clearedURL)
+        try write("struct Added {}", to: addedURL)
+        try write("struct Concurrent {}", to: concurrentURL)
+
+        let sourceSelection = StoredSelection(
+            selectedPaths: [removedURL.path, clearedURL.path],
+            codemapAutoEnabled: false
+        )
+        let selectionAtFirstCapture = StoredSelection(
+            selectedPaths: [removedURL.path, clearedURL.path, addedURL.path],
+            codemapAutoEnabled: false
+        )
+        let activeSelection = StoredSelection(selectedPaths: ["/tmp/active-tab.swift"])
+        let activeTabID = UUID()
+        let harness = CoordinatorHarness(initialSelection: selectionAtFirstCapture)
+        harness.manager.appendTab(ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection))
+        _ = try await harness.store.loadRoot(path: root.path)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        let source = AgentContextExportSource(
+            tabID: harness.tabID,
+            promptText: "",
+            selection: sourceSelection,
+            selectedMetaPromptIDs: [],
+            tabName: "Captured",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let model = try await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: harness.store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+        let removedRow = try XCTUnwrap(model.rows.first { $0.displayPath == "Removed.swift" })
+        let exportContext = AgentContextExportViewContext(
+            promptManager: makePrompt(store: harness.store, windowID: 51003),
+            selectionCoordinator: coordinator,
+            currentTabID: harness.tabID,
+            activeAgentSessionID: nil,
+            worktreeBindingsProvider: nil
+        )
+
+        let removeTarget = try XCTUnwrap(exportContext.activeSelectionMutationTarget(for: source))
+        harness.manager.setActiveTab(activeTabID)
+        let afterRemove = await AgentContextExportResolver.removeRow(
+            removedRow,
+            from: removeTarget.expectedSelection,
+            lookupContext: model.lookupContext,
+            store: harness.store
+        )
+        await exportContext.persistSelection(afterRemove, target: removeTarget)
+
+        XCTAssertEqual(afterRemove.selectedPaths, [clearedURL.path, addedURL.path])
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, afterRemove)
+        XCTAssertEqual(harness.manager.composeTab(with: activeTabID)?.selection, activeSelection)
+
+        harness.manager.setActiveTab(harness.tabID)
+        let clearTarget = try XCTUnwrap(exportContext.activeSelectionMutationTarget(for: source))
+        harness.manager.setActiveTab(activeTabID)
+        let afterClear = AgentContextExportResolver.removeSelectionSnapshot(
+            source.selection,
+            from: clearTarget.expectedSelection
+        )
+        await exportContext.persistSelection(afterClear, target: clearTarget)
+
+        XCTAssertEqual(afterClear.selectedPaths, [addedURL.path])
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, afterClear)
+        XCTAssertEqual(harness.manager.composeTab(with: activeTabID)?.selection, activeSelection)
+
+        harness.manager.setActiveTab(harness.tabID)
+        let staleTarget = try XCTUnwrap(exportContext.activeSelectionMutationTarget(for: source))
+        let advancedSelection = StoredSelection(
+            selectedPaths: [addedURL.path, concurrentURL.path],
+            codemapAutoEnabled: false
+        )
+        _ = await coordinator.persistSelection(
+            advancedSelection,
+            for: harness.identity,
+            mirrorToUIIfActive: false
+        )
+        await exportContext.persistSelection(StoredSelection(), target: staleTarget)
+
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, advancedSelection)
+    }
+
     func testApplyingSelectionMirrorGuardSuppressesFlushPublication() async {
         let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
         let pending = StoredSelection(selectedPaths: ["/tmp/pending.swift"])
@@ -847,6 +1221,38 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
             XCTAssertEqual(decision.owner, .storedComposeTab, scenario.name)
         }
     }
+
+    private func makeTemporaryRoot(name: String) throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "WorkspaceSelectionCoordinatorTests-\(name)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        temporaryRoots.append(root)
+        return root
+    }
+
+    private func write(_ contents: String, to url: URL) throws {
+        let parent = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func makePrompt(store: WorkspaceFileContextStore, windowID: Int) -> PromptViewModel {
+        let secureService = SecureKeysService(secureStorage: TestSecureStorageBackend())
+        let keyManager = KeyManager(secureService: secureService)
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        return PromptViewModel(
+            fileManager: WorkspaceFilesViewModel(workspaceFileContextStore: store),
+            apiSettingsViewModel: apiSettings,
+            windowID: windowID,
+            settingsManager: WindowSettingsManager(windowID: windowID)
+        )
+    }
 }
 
 @MainActor
@@ -894,6 +1300,31 @@ private final class FakeMCPSelectionRevisionLedger {
     func allocate() -> UInt64 {
         defer { nextRevision &+= 1 }
         return nextRevision
+    }
+}
+
+private actor SelectionMutationGate {
+    private var capturedSelection: StoredSelection?
+    private var released = false
+
+    func captureAndWait(_ selection: StoredSelection, timeout: Duration = .seconds(5)) async {
+        capturedSelection = selection
+        let deadline = ContinuousClock.now + timeout
+        while !released, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func waitUntilCaptured(timeout: Duration = .seconds(2)) async -> StoredSelection? {
+        let deadline = ContinuousClock.now + timeout
+        while capturedSelection == nil, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return capturedSelection
+    }
+
+    func release() {
+        released = true
     }
 }
 
@@ -1035,6 +1466,16 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
         guard var workspace = activeWorkspace else { return }
         workspace.composeTabs.append(tab)
         activeWorkspace = workspace
+    }
+
+    func removeTab(_ tabID: UUID) {
+        guard var workspace = activeWorkspace else { return }
+        workspace.composeTabs.removeAll { $0.id == tabID }
+        if workspace.activeComposeTabID == tabID {
+            workspace.activeComposeTabID = workspace.composeTabs.first?.id
+        }
+        activeWorkspace = workspace
+        selectionMirrorContextRevision &+= 1
     }
 
     func setActiveTab(_ tabID: UUID) {

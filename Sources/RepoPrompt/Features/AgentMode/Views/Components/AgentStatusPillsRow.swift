@@ -3,6 +3,7 @@ import SwiftUI
 struct AgentStatusPillsRow: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     @ObservedObject var oracleViewModel: OracleViewModel
     @ObservedObject var promptManager: PromptViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -74,6 +75,7 @@ struct AgentStatusPillsRow: View {
 
                 AgentContextPill(
                     promptManager: promptManager,
+                    openContextDrawerFiles: openContextDrawerFiles,
                     selectionCoordinator: selectionCoordinator,
                     runtimeVM: runtimeVM,
                     currentTabID: snapshot.currentTabID,

@@ -134,29 +134,43 @@ struct AgentModeDetailWithSidebarView: View {
 
     var body: some View {
         #if DEBUG
-            AgentModeChatDetailView(
-                agentModeVM: agentModeVM,
-                transcriptUI: agentModeVM.ui.transcript,
-                runInteractionUI: agentModeVM.ui.runInteraction,
-                statusPillsUI: statusPillsUI,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                isContextBuilderQuestionPresented: isContextBuilderQuestionPresented,
-                oracleViewModel: oracleViewModel,
+            AgentContextInspectorPresenter(
+                drawerStore: agentModeVM.ui.contextDrawer,
                 promptManager: promptManager,
-                workspaceSearchService: workspaceSearchService,
-                selectionCoordinator: selectionCoordinator,
-                stressHarness: stressHarness,
                 runtimeVM: runtimeVM,
+                contextBuilderAgentVM: contextBuilderAgentVM,
+                oracleViewModel: oracleViewModel,
+                selectionCoordinator: selectionCoordinator,
+                activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
+                agentModeVM: agentModeVM,
                 windowID: windowID,
-                currentTabID: currentTabID,
-                codexManagedLoginAction: codexManagedLoginAction
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(alignment: .topTrailing) {
-                if let stressHarness, stressHarness.configuration.showOverlay {
-                    AgentChatStressHarnessPanel(harness: stressHarness, currentTabID: currentTabID)
-                        .padding(.top, 14)
-                        .padding(.trailing, 14)
+                currentTabID: currentTabID
+            ) {
+                AgentModeChatDetailView(
+                    agentModeVM: agentModeVM,
+                    transcriptUI: agentModeVM.ui.transcript,
+                    runInteractionUI: agentModeVM.ui.runInteraction,
+                    statusPillsUI: statusPillsUI,
+                    openContextDrawerFiles: { agentModeVM.ui.contextDrawer.toggle(tab: .files) },
+                    contextBuilderAgentVM: contextBuilderAgentVM,
+                    isContextBuilderQuestionPresented: isContextBuilderQuestionPresented,
+                    oracleViewModel: oracleViewModel,
+                    promptManager: promptManager,
+                    workspaceSearchService: workspaceSearchService,
+                    selectionCoordinator: selectionCoordinator,
+                    stressHarness: stressHarness,
+                    runtimeVM: runtimeVM,
+                    windowID: windowID,
+                    currentTabID: currentTabID,
+                    codexManagedLoginAction: codexManagedLoginAction
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .topTrailing) {
+                    if let stressHarness, stressHarness.configuration.showOverlay {
+                        AgentChatStressHarnessPanel(harness: stressHarness, currentTabID: currentTabID)
+                            .padding(.top, 14)
+                            .padding(.trailing, 14)
+                    }
                 }
             }
             .onAppear {
@@ -188,23 +202,37 @@ struct AgentModeDetailWithSidebarView: View {
             }
             .onDisappear { stressHarness?.pause() }
         #else
-            AgentModeChatDetailView(
-                agentModeVM: agentModeVM,
-                transcriptUI: agentModeVM.ui.transcript,
-                runInteractionUI: agentModeVM.ui.runInteraction,
-                statusPillsUI: statusPillsUI,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                isContextBuilderQuestionPresented: isContextBuilderQuestionPresented,
-                oracleViewModel: oracleViewModel,
+            AgentContextInspectorPresenter(
+                drawerStore: agentModeVM.ui.contextDrawer,
                 promptManager: promptManager,
-                workspaceSearchService: workspaceSearchService,
-                selectionCoordinator: selectionCoordinator,
                 runtimeVM: runtimeVM,
+                contextBuilderAgentVM: contextBuilderAgentVM,
+                oracleViewModel: oracleViewModel,
+                selectionCoordinator: selectionCoordinator,
+                activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
+                agentModeVM: agentModeVM,
                 windowID: windowID,
-                currentTabID: currentTabID,
-                codexManagedLoginAction: codexManagedLoginAction
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                currentTabID: currentTabID
+            ) {
+                AgentModeChatDetailView(
+                    agentModeVM: agentModeVM,
+                    transcriptUI: agentModeVM.ui.transcript,
+                    runInteractionUI: agentModeVM.ui.runInteraction,
+                    statusPillsUI: statusPillsUI,
+                    openContextDrawerFiles: { agentModeVM.ui.contextDrawer.toggle(tab: .files) },
+                    contextBuilderAgentVM: contextBuilderAgentVM,
+                    isContextBuilderQuestionPresented: isContextBuilderQuestionPresented,
+                    oracleViewModel: oracleViewModel,
+                    promptManager: promptManager,
+                    workspaceSearchService: workspaceSearchService,
+                    selectionCoordinator: selectionCoordinator,
+                    runtimeVM: runtimeVM,
+                    windowID: windowID,
+                    currentTabID: currentTabID,
+                    codexManagedLoginAction: codexManagedLoginAction
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             .onAppear {
                 syncContextBuilderQuestionPresentation()
                 agentModeVM.syncComposerUIState(tabID: currentTabID)
@@ -266,6 +294,131 @@ struct AgentModeDetailWithSidebarView: View {
         agentModeVM.syncRuntimeMetricsUIState(
             liveSelectedFileCount: summary.totalExplicitFileCount,
             liveSelectionSummary: summary
+        )
+    }
+}
+
+struct AgentContextInspectorColumnMetrics: Equatable {
+    let minimumWidth: CGFloat
+    let idealWidth: CGFloat
+    let maximumWidth: CGFloat
+}
+
+enum AgentContextInspectorColumnSizing {
+    private static let shellMinimumWidth: CGFloat = 320
+    private static let preferredWidthRatio: CGFloat = 2.0 / 3.0
+    private static let minimumChatColumnWidth: CGFloat = 360
+    private static let absoluteMaximumWidth: CGFloat = 800
+
+    static func metrics(forDetailWidth detailWidth: CGFloat) -> AgentContextInspectorColumnMetrics {
+        guard detailWidth.isFinite, detailWidth > 0 else {
+            return AgentContextInspectorColumnMetrics(
+                minimumWidth: shellMinimumWidth,
+                idealWidth: shellMinimumWidth,
+                maximumWidth: shellMinimumWidth
+            )
+        }
+
+        let availableWidth = detailWidth.rounded(.down)
+        let maximumPreservingChat = availableWidth - minimumChatColumnWidth
+        let maximumWidth = max(shellMinimumWidth, min(absoluteMaximumWidth, maximumPreservingChat))
+        let preferredWidth = availableWidth * preferredWidthRatio
+        let idealWidth = min(max(preferredWidth, shellMinimumWidth), maximumWidth)
+
+        return AgentContextInspectorColumnMetrics(
+            minimumWidth: shellMinimumWidth,
+            idealWidth: idealWidth,
+            maximumWidth: maximumWidth
+        )
+    }
+}
+
+private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
+    let drawerStore: AgentContextDrawerUIStore
+    @ObservedObject var presentationStore: AgentContextDrawerPresentationStore
+    let promptManager: PromptViewModel
+    @ObservedObject var runtimeVM: AgentRuntimeSidebarViewModel
+    let contextBuilderAgentVM: ContextBuilderAgentViewModel
+    let oracleViewModel: OracleViewModel
+    let selectionCoordinator: WorkspaceSelectionCoordinator
+    let activeAgentSessionID: UUID?
+    let agentModeVM: AgentModeViewModel
+    let windowID: Int
+    let currentTabID: UUID?
+    let primaryContent: PrimaryContent
+
+    init(
+        drawerStore: AgentContextDrawerUIStore,
+        promptManager: PromptViewModel,
+        runtimeVM: AgentRuntimeSidebarViewModel,
+        contextBuilderAgentVM: ContextBuilderAgentViewModel,
+        oracleViewModel: OracleViewModel,
+        selectionCoordinator: WorkspaceSelectionCoordinator,
+        activeAgentSessionID: UUID?,
+        agentModeVM: AgentModeViewModel,
+        windowID: Int,
+        currentTabID: UUID?,
+        @ViewBuilder primaryContent: () -> PrimaryContent
+    ) {
+        self.drawerStore = drawerStore
+        _presentationStore = ObservedObject(wrappedValue: drawerStore.presentation)
+        self.promptManager = promptManager
+        _runtimeVM = ObservedObject(wrappedValue: runtimeVM)
+        self.contextBuilderAgentVM = contextBuilderAgentVM
+        self.oracleViewModel = oracleViewModel
+        self.selectionCoordinator = selectionCoordinator
+        self.activeAgentSessionID = activeAgentSessionID
+        self.agentModeVM = agentModeVM
+        self.windowID = windowID
+        self.currentTabID = currentTabID
+        self.primaryContent = primaryContent()
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let metrics = AgentContextInspectorColumnSizing.metrics(forDetailWidth: geometry.size.width)
+
+            primaryContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .inspector(isPresented: presentationBinding) {
+                    AgentContextControlDrawerView(
+                        drawerStore: drawerStore,
+                        detailStore: drawerStore.detail,
+                        isPresented: presentationStore.isPresented,
+                        promptManager: promptManager,
+                        runtimeVM: runtimeVM,
+                        contextBuilderAgentVM: contextBuilderAgentVM,
+                        oracleViewModel: oracleViewModel,
+                        selectionCoordinator: selectionCoordinator,
+                        windowID: windowID,
+                        currentTabID: currentTabID,
+                        activeAgentSessionID: activeAgentSessionID,
+                        worktreeBindingsProvider: { sessionID, tabID in
+                            agentModeVM.worktreeBindings(forAgentSessionID: sessionID, tabID: tabID)
+                        }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(NSColor.windowBackgroundColor))
+                    .clipped()
+                    .inspectorColumnWidth(
+                        min: metrics.minimumWidth,
+                        ideal: metrics.idealWidth,
+                        max: metrics.maximumWidth
+                    )
+                }
+        }
+    }
+
+    private var presentationBinding: Binding<Bool> {
+        Binding(
+            get: { presentationStore.isPresented },
+            set: { isPresented in
+                if isPresented {
+                    drawerStore.open()
+                } else {
+                    drawerStore.close()
+                }
+            }
         )
     }
 }

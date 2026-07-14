@@ -122,6 +122,7 @@ is unchanged and does not use the generated workspace.
   slices, CodeMaps, and Git diffs.
 - **Context Builder**: Let an agent explore the repository, identify relevant
   files, and curate context within a token budget.
+- **Compose inspector**: Review selected files and codemaps, configure prompt packaging and Git context, and copy a fresh model-ready prompt without leaving Agent Mode.
 - **Agent orchestration**: Run and coordinate CLI-backed coding agents from the
   native macOS app. See [`docs/worktrees.md`](docs/worktrees.md) for app-managed
   worktrees and `.worktreeinclude` local file copying.
@@ -148,6 +149,7 @@ third-party notices in
   checks, source placement, and contribution preflight
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): contribution policy and pull request
   steps
+- [`docs/architecture/compose.md`](docs/architecture/compose.md): Compose inspector architecture, invariants, and state ownership
 - [`docs/architecture/source-layout.md`](docs/architecture/source-layout.md):
   source ownership and placement rules
 - [`docs/architecture/provider-plugins.md`](docs/architecture/provider-plugins.md):
