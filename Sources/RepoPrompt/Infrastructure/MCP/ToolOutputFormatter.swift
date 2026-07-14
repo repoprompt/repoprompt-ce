@@ -2205,6 +2205,20 @@ extension ToolOutputFormatter {
                 reviewLines.append("- User approval was required.")
                 outBlocks.append(reviewLines.joined(separator: "\n"))
             }
+            if let operationID = dto.operationID {
+                var acknowledgement = ["### Mutation acknowledgement"]
+                acknowledgement.append("- Operation ID: `\(operationID)`")
+                if let mutationState = dto.mutationState {
+                    acknowledgement.append("- Mutation: \(mutationState)")
+                }
+                if let freshness = dto.freshness {
+                    acknowledgement.append("- Freshness: \(freshness)")
+                    if freshness == "pending" {
+                        acknowledgement.append("- Reconcile with read_file or file_search; do not blindly replay this mutation.")
+                    }
+                }
+                outBlocks.append(acknowledgement.joined(separator: "\n"))
+            }
             if dto.status.lowercased() == "failed" || dto.errorMessage != nil || dto.errorCode != nil {
                 var errorLines: [String] = []
                 errorLines.append("### Error")
@@ -4004,6 +4018,9 @@ extension ToolOutputFormatter {
             if let np = dto.newPath { out.append("- New path: `\(np)`") }
             if dto.action.lowercased() == "delete", ok { out.append("- Result: Moved to macOS Trash") }
             if let warning = dto.warning, !warning.isEmpty { out.append("- Warning: \(warning)") }
+            if let operationID = dto.operationID { out.append("- Operation ID: `\(operationID)`") }
+            if let mutationState = dto.mutationState { out.append("- Mutation: \(mutationState)") }
+            if let freshness = dto.freshness { out.append("- Freshness: \(freshness)") }
             if let message = dto.errorMessage, !message.isEmpty { out.append("- Error: \(message)") }
             if let code = dto.errorCode, !code.isEmpty { out.append("- **Code**: \(code)") }
             if dto.retryable == true { out.append("- Retryable: yes") }

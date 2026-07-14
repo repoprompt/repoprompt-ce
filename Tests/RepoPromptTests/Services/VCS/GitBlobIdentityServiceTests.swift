@@ -648,10 +648,11 @@ final class GitBlobIdentityServiceTests: XCTestCase {
         let oversizedScript = """
         #!/bin/sh
         index=0
-        while [ "$index" -lt 16384 ]; do
+        while [ "$index" -lt 8192 ]; do
           printf '\(outputChunk)'
           index=$((index + 1))
         done
+        /bin/sleep 5
         printf completed > "\(completionMarker.path)"
         """
         try oversizedScript.write(to: executable, atomically: true, encoding: .utf8)

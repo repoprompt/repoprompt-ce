@@ -87,13 +87,22 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
     ])
 ]
 
+var repoPromptTestDependencies: [Target.Dependency] = [
+    "RepoPromptApp",
+    "RepoPromptMCP",
+    "RepoPromptShared"
+]
+
 var repoPromptTestSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug))
 ]
 
 if sentryEnabled {
-    repoPromptAppDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))
+    let sentryDependency = Target.Dependency.product(name: "Sentry", package: "sentry-cocoa")
+    repoPromptAppDependencies.append(sentryDependency)
     repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
+    repoPromptTestDependencies.append(sentryDependency)
+    repoPromptTestSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
 }
 
 if benchmarkTestsEnabled {
@@ -145,7 +154,7 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptShared", "RepoPromptProcessSupport"],
+            dependencies: repoPromptTestDependencies + ["RepoPromptProcessSupport"],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),

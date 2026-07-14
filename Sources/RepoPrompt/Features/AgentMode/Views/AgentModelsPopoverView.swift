@@ -62,7 +62,14 @@ struct AgentModelsPopoverView: View {
     }
 
     private var hasRoleOverrides: Bool {
-        roleResolutions.contains(where: \.hasCustomOverride)
+        roleResolutions.contains(where: \.hasStoredOverride)
+    }
+
+    private var editingScope: AgentModelsEditingScope {
+        guard let workspaceID = promptViewModel.currentWorkspaceID,
+              GlobalSettingsStore.shared.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        else { return .global }
+        return .workspace(workspaceID)
     }
 
     private var hasConnectedCLIProvider: Bool {
@@ -258,7 +265,9 @@ struct AgentModelsPopoverView: View {
                 Spacer()
                 if hasRoleOverrides {
                     Button("Reset") {
-                        MCPAgentRoleDefaultsService.clearAllOverrides(workspaceID: promptViewModel.currentWorkspaceID)
+                        MCPAgentRoleDefaultsService.clearAllOverrides(
+                            scope: editingScope
+                        )
                         bumpRoleDefaults()
                     }
                     .buttonStyle(.plain)
@@ -354,7 +363,7 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+        var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
@@ -372,11 +381,22 @@ struct AgentModelsPopoverView: View {
                     selection,
                     for: resolution.role,
                     availability: availability,
-                    workspaceID: promptViewModel.currentWorkspaceID
+                    scope: editingScope
                 )
                 bumpRoleDefaults()
             }
         }
+        if resolution.hasStoredOverride {
+            items.insert(.separator, at: 0)
+            items.insert(StableMenuItem.action("Use Recommended", imageSystemName: "arrow.counterclockwise") {
+                MCPAgentRoleDefaultsService.clearOverride(
+                    for: resolution.role,
+                    scope: editingScope
+                )
+                bumpRoleDefaults()
+            }, at: 0)
+        }
+        return items
     }
 
     private func bumpRoleDefaults() {

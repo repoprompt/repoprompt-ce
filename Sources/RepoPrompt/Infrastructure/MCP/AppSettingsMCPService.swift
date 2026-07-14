@@ -313,6 +313,8 @@ final class AppSettingsMCPService: Service {
             "corrupt_unrecoverable"
         case .saveFailed:
             "save_failed"
+        case .automaticSchemaNormalizationFailed:
+            "automatic_schema_normalization_failed"
         }
     }
 
@@ -326,6 +328,8 @@ final class AppSettingsMCPService: Service {
             "Setting was applied in memory, but globalSettings.json is unreadable and could not be backed up; it will not persist until the settings file is recovered."
         case .saveFailed:
             "Setting was applied in memory, but RepoPrompt could not write globalSettings.json; it will not persist until saving succeeds."
+        case .automaticSchemaNormalizationFailed:
+            "Setting was applied in memory, but RepoPrompt could not safely back up and normalize the existing globalSettings.json schema header; the original file is preserved and the setting will not persist until explicit recovery."
         }
     }
 

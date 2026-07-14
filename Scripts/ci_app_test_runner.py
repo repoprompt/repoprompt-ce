@@ -1145,6 +1145,10 @@ def batch_suite_entries(
     return groups
 
 
+def effective_strict_ledger(strict_ledger: bool, workers: int) -> bool:
+    return strict_ledger or workers > 1
+
+
 def run_all_suites(
     suites: Iterable[str],
     *,
@@ -1184,7 +1188,7 @@ def run_all_suites(
             flush=True,
             file=output,
         )
-        strict_ledger = True
+    strict_ledger = effective_strict_ledger(strict_ledger, workers)
     serial_plan = suite_plan or build_suite_plan(suite_list, ledger_suites={}, serial_policy={})
     if test_bundle is not None:
         print(
@@ -1447,11 +1451,25 @@ def main(argv: list[str]) -> int:
         if error.stderr:
             print(error.stderr, end="", file=sys.stderr)
         return error.returncode
+    strict_ledger = effective_strict_ledger(args.strict_ledger, args.workers)
     try:
         ledger_suites = read_ledger_suites(args.ledger)
         serial_policy = load_serial_group_policy(args.serial_group_policy)
         suite_plan = build_suite_plan(suites, ledger_suites=ledger_suites, serial_policy=serial_policy)
-    except ValueError as error:
+        if args.print_suite_plan_json and strict_ledger:
+            plan_selected_suites(
+                suites,
+                ledger=args.ledger,
+                shard_count=args.shard_count,
+                shard_index=args.shard_index,
+                strict_ledger=strict_ledger,
+                slow_first=args.slow_first,
+                batch_max_seconds=args.batch_max_seconds,
+                require_runtime_for_batching=(
+                    args.require_runtime_for_batching or args.batch_fast_suites
+                ),
+            )
+    except (OptimizerError, ValueError) as error:
         print(f"::error::{error}", flush=True)
         return 1
 

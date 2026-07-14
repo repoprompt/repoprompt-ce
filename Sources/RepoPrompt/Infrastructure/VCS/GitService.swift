@@ -334,18 +334,39 @@ actor GitService {
     private let workspaceStateAuthority: GitWorkspaceStateAuthority
     private let creationReceiptCoordinator = WorkspaceRootCreationReceiptCoordinator()
     private let processTerminationGrace: Duration
+    private let processSpawner: ProcessSpawner
     private var preparedBaseProcessEnvironment: [String: String]?
     #if DEBUG
         private nonisolated let receiptCreationFailureHook = ReceiptCreationFailureHook()
         private var worktreeMutationLockAcquiredHandlerForTesting: (@Sendable (UUID?) async -> Void)?
         private var targetEvidenceDidSealBeforeCommandHandlerForTesting: (@Sendable () async throws -> Void)?
+        private var drainCreationFailureForTesting: (any Error)?
     #endif
+
+    /// Spawns one git child. Injectable for deterministic launch-failure and
+    /// launch-blocking tests; production always uses `ProcessLauncher`.
+    typealias ProcessSpawner = @Sendable (
+        _ executablePath: String,
+        _ arguments: [String],
+        _ environment: [String: String],
+        _ workingDirectoryPath: String
+    ) throws -> SpawnedProcess
+
+    static let defaultProcessSpawner: ProcessSpawner = { executablePath, arguments, environment, workingDirectoryPath in
+        try ProcessLauncher.spawn(
+            command: executablePath,
+            arguments: arguments,
+            environment: environment,
+            workingDirectory: workingDirectoryPath
+        )
+    }
 
     init(
         gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
         processAdmissionController: GitProcessAdmissionController = .shared,
         workspaceStateAuthority: GitWorkspaceStateAuthority = .shared,
         processTerminationGrace: Duration = GitService.gitProcessTerminationGrace,
+        processSpawner: @escaping ProcessSpawner = GitService.defaultProcessSpawner,
         worktreeLayoutCacheLimit: Int = 128,
         inheritedProcessEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
@@ -354,6 +375,7 @@ actor GitService {
         self.processAdmissionController = processAdmissionController
         self.workspaceStateAuthority = workspaceStateAuthority
         self.processTerminationGrace = processTerminationGrace
+        self.processSpawner = processSpawner
         self.worktreeLayoutCacheLimit = worktreeLayoutCacheLimit
         self.inheritedProcessEnvironment = inheritedProcessEnvironment
     }
@@ -376,6 +398,61 @@ actor GitService {
             _ handler: (@Sendable () async throws -> Void)?
         ) {
             targetEvidenceDidSealBeforeCommandHandlerForTesting = handler
+        }
+
+        /// Test-only injection of a pipe-drain construction failure after a
+        /// successful spawn, to exercise the reap-before-completion invariant.
+        func setDrainCreationFailureForTesting(_ error: (any Error)?) {
+            drainCreationFailureForTesting = error
+        }
+
+        /// Test-only entry to the admitted git-data path with a controllable
+        /// command timeout, stdin, byte limits, and environment overlay.
+        func runGitDataForTesting(
+            _ args: [String],
+            at repoURL: URL,
+            env: [String: String] = [:],
+            stdin: Data? = nil,
+            stdoutByteLimit: Int? = nil,
+            stderrByteLimit: Int? = nil,
+            commandTimeout: Duration = GitService.gitProcessTimeout
+        ) async throws -> (Data, Data, Int32) {
+            try await runGitData(
+                args,
+                at: repoURL,
+                env: env,
+                stdin: stdin,
+                stdoutByteLimit: stdoutByteLimit,
+                stderrByteLimit: stderrByteLimit,
+                commandTimeout: commandTimeout
+            )
+        }
+
+        /// Test-only entry to the spooling implementation without target-
+        /// evidence parsing, so launch, timer, and process-family lifecycle
+        /// contracts can be covered directly.
+        func runGitSpoolingForTesting(
+            _ args: [String],
+            at repoURL: URL,
+            activityTimeout: Duration = .seconds(30)
+        ) async throws -> (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason) {
+            var environment = await processEnvironment()
+            environment["GIT_TERMINAL_PROMPT"] = "0"
+            environment["LC_ALL"] = "C"
+            environment["LANG"] = "C"
+            return try await runAdmittedGitSpooling(
+                args,
+                at: repoURL,
+                environment: environment,
+                diagnosticRepositoryPath: repoURL.standardizedFileURL.path,
+                processQueueWaitMicroseconds: 0,
+                resourcePolicy: GitRawOutputSpoolResourcePolicy(
+                    minimumFreeDiskBytes: 0,
+                    activityTimeout: activityTimeout
+                ),
+                admissionPriority: .rootBootstrap,
+                commandFamily: .repositoryRead
+            )
         }
 
         func waitForWorktreeMutationWaiterForTesting(at repoURL: URL) async {
@@ -4304,6 +4381,13 @@ actor GitService {
         if let error = error as? GitWorktreeInitializationError {
             return GitTargetEvidenceCollectionError.gitInitialization(error)
         }
+        if let error = error as? ProcessLauncherError {
+            let failure = error.processLaunchFailure
+            return GitTargetEvidenceCollectionError.processLaunch(
+                domain: failure.domain,
+                code: failure.code
+            )
+        }
         if let error = error as? GitProcessCaptureError {
             return switch error {
             case .timedOut:
@@ -6881,7 +6965,6 @@ actor GitService {
             return result
         } catch {
             await processAdmissionController.release(lease)
-            try Task.checkCancellation()
             throw error
         }
     }
@@ -6953,197 +7036,30 @@ actor GitService {
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
-        let process = Process()
         let timeoutController = GitProcessActivityTimeoutController()
         let lifecycleController = GitProcessLifecycleController()
         let commandRecorder = MCPToolWorkCountDiagnostics.gitCommandRecorder()
         let spool = try GitRawOutputSpool(resourcePolicy: resourcePolicy)
-        process.executableURL = gitExecutableURL
-        process.arguments = args
-        process.currentDirectoryURL = repoURL
-        process.environment = environment
-
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
-
-        let activityHandler: @Sendable () -> Void = {
-            let identifier = process.processIdentifier
-            guard identifier > 0, process.isRunning else { return }
-            timeoutController.schedule(
-                process: process,
-                processIdentifier: identifier,
-                timeout: resourcePolicy.activityTimeout,
-                terminationGrace: self.processTerminationGrace
-            )
-        }
-        let outDrain = try GitProcessPipeSpoolDrain.make(
-            readingFrom: outPipe.fileHandleForReading,
-            spool: spool,
-            activityHandler: activityHandler
-        )
-        let (errStream, errDrain) = try GitProcessPipeDrain.makeStream(
-            readingFrom: errPipe.fileHandleForReading,
-            byteLimit: 64 * 1024
-        )
-        let errCollector = Task(priority: .userInitiated) { () -> Data in
-            var buffer = Data()
-            for await chunk in errStream where !chunk.isEmpty {
-                buffer.append(chunk)
-            }
-            return buffer
-        }
-
         let processMetrics = GitProcessMetricsBox()
         let commandStartedAt = DispatchTime.now().uptimeNanoseconds
-        let result = try await withTaskCancellationHandler(operation: {
+        let terminationGrace = processTerminationGrace
+        let terminationGraceSeconds = Self.timeInterval(from: processTerminationGrace)
+        let spawner = processSpawner
+        let gitExecutablePath = gitExecutableURL.path
+
+        return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<
                     (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason),
                     any Error
                 >) in
-                outPipe.fileHandleForReading.readabilityHandler = { handle in
-                    if outDrain.consumeAvailableData() {
-                        handle.readabilityHandler = nil
-                    }
-                    if outDrain.terminalError != nil {
-                        lifecycleController.requestCancellation(
-                            process: process,
-                            terminationGrace: self.processTerminationGrace
-                        )
-                    }
-                }
-                errPipe.fileHandleForReading.readabilityHandler = { handle in
-                    if errDrain.consumeAvailableData() {
-                        handle.readabilityHandler = nil
-                    } else {
-                        activityHandler()
-                    }
-                    if errDrain.didExceedByteLimit {
-                        lifecycleController.requestCancellation(
-                            process: process,
-                            terminationGrace: self.processTerminationGrace
-                        )
-                    }
-                }
-
-                process.terminationHandler = { terminatedProcess in
-                    lifecycleController.didTerminate()
-                    timeoutController.cancel()
-                    outPipe.fileHandleForReading.readabilityHandler = nil
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    outDrain.finishReading()
-                    errDrain.finishReading()
-
-                    Task {
-                        let stderrData = await errCollector.value
-                        let stdoutResult: Result<GitRawOutputSpoolLease, any Error>
-                        do {
-                            stdoutResult = try .success(spool.finish())
-                        } catch {
-                            stdoutResult = .failure(error)
-                        }
-                        let stdoutByteCount: UInt64 = switch stdoutResult {
-                        case let .success(lease): lease.byteCount
-                        case .failure: 0
-                        }
-                        let outputByteCount = Int(
-                            clamping: stdoutByteCount + UInt64(stderrData.count)
-                        )
-                        commandRecorder(
-                            diagnosticRepositoryPath,
-                            args,
-                            processQueueWaitMicroseconds,
-                            processMetrics.spawnMicroseconds,
-                            outputByteCount
-                        )
-                        let commandFinishedAt = DispatchTime.now().uptimeNanoseconds
-                        let durationMicroseconds = Int(
-                            clamping: commandFinishedAt >= commandStartedAt
-                                ? (commandFinishedAt - commandStartedAt) / 1000
-                                : 0
-                        )
-                        let wasCancelled = lifecycleController.cancellationErrorIfRequested() != nil
-                        WorktreeStartupInstrumentation.recordGitCommand(
-                            family: commandFamily,
-                            priority: admissionPriority,
-                            queueWaitMicroseconds: processQueueWaitMicroseconds,
-                            durationMicroseconds: durationMicroseconds,
-                            outputByteCount: outputByteCount,
-                            cancelled: wasCancelled
-                        )
-                        #if DEBUG
-                            WorktreeStartupInstrumentation.recordBenchmarkGitCommand(
-                                tag: benchmarkMetricTag,
-                                family: commandFamily,
-                                priority: admissionPriority,
-                                queueWaitMicroseconds: processQueueWaitMicroseconds,
-                                durationMicroseconds: durationMicroseconds,
-                                outputByteCount: outputByteCount,
-                                cancelled: wasCancelled
-                            )
-                        #endif
-
-                        if let error = outDrain.terminalError {
-                            continuation.resume(throwing: error)
-                        } else if case let .failure(error) = stdoutResult {
-                            continuation.resume(throwing: error)
-                        } else if errDrain.didExceedByteLimit {
-                            continuation.resume(throwing: GitProcessCaptureError.stderrByteLimitExceeded)
-                        } else if timeoutController.didTimeOut {
-                            continuation.resume(throwing: GitProcessCaptureError.timedOut)
-                        } else if case let .success(stdoutLease) = stdoutResult {
-                            continuation.resume(returning: (
-                                stdoutLease,
-                                stderrData,
-                                terminatedProcess.terminationStatus,
-                                terminatedProcess.terminationReason
-                            ))
-                        } else {
-                            preconditionFailure("raw spool result was not exhaustive")
-                        }
-                    }
-                }
-
-                do {
-                    try lifecycleController.checkCancellationBeforeSpawn()
-                    let spawnStart = DispatchTime.now().uptimeNanoseconds
-                    try process.run()
-                    let identifier = process.processIdentifier
-                    let spawnState = lifecycleController.didSpawn(
-                        process: process,
-                        processIdentifier: identifier,
-                        terminationGrace: processTerminationGrace
-                    )
-                    if spawnState == .running {
-                        timeoutController.schedule(
-                            process: process,
-                            processIdentifier: identifier,
-                            timeout: resourcePolicy.activityTimeout,
-                            terminationGrace: processTerminationGrace
-                        )
-                        if !lifecycleController.shouldKeepNormalTimeout() {
-                            timeoutController.cancel()
-                        }
-                    }
-                    let spawnEnd = DispatchTime.now().uptimeNanoseconds
-                    processMetrics.spawnMicroseconds = Int(
-                        clamping: spawnEnd >= spawnStart ? (spawnEnd - spawnStart) / 1000 : 0
-                    )
-                } catch {
-                    timeoutController.cancel()
-                    outPipe.fileHandleForReading.readabilityHandler = nil
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    outDrain.cancel()
-                    errDrain.cancel()
-                    spool.cancel()
+                let recordCommandOutcome: @Sendable (_ outputByteCount: Int) -> Void = { outputByteCount in
                     commandRecorder(
                         diagnosticRepositoryPath,
                         args,
                         processQueueWaitMicroseconds,
                         processMetrics.spawnMicroseconds,
-                        0
+                        outputByteCount
                     )
                     let commandFinishedAt = DispatchTime.now().uptimeNanoseconds
                     let durationMicroseconds = Int(
@@ -7157,7 +7073,7 @@ actor GitService {
                         priority: admissionPriority,
                         queueWaitMicroseconds: processQueueWaitMicroseconds,
                         durationMicroseconds: durationMicroseconds,
-                        outputByteCount: 0,
+                        outputByteCount: outputByteCount,
                         cancelled: wasCancelled
                     )
                     #if DEBUG
@@ -7167,24 +7083,274 @@ actor GitService {
                             priority: admissionPriority,
                             queueWaitMicroseconds: processQueueWaitMicroseconds,
                             durationMicroseconds: durationMicroseconds,
-                            outputByteCount: 0,
+                            outputByteCount: outputByteCount,
                             cancelled: wasCancelled
                         )
                     #endif
+                }
+
+                func elapsedMicroseconds(since start: UInt64) -> Int {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    return Int(clamping: now >= start ? (now - start) / 1000 : 0)
+                }
+
+                // Deadline and cancellation accounting starts before the launch
+                // call: posix_spawnp is synchronous and cannot be interrupted, so
+                // intent that accrues while it is in flight is applied immediately
+                // after it returns (`didSpawn` terminates a cancelled child, and
+                // the first activity timeout below is charged from `spawnStartedAt`).
+                let spawned: SpawnedProcess
+                let spawnStartedAt = DispatchTime.now().uptimeNanoseconds
+                do {
+                    try lifecycleController.checkCancellationBeforeSpawn()
+                    let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
+                        family: commandFamily,
+                        priority: admissionPriority
+                    )
+                    do {
+                        spawned = try spawner(gitExecutablePath, args, environment, repoURL.path)
+                    } catch {
+                        GitProcessSpawnDiagnostics.endSpawnInterval(
+                            spawnInterval,
+                            family: commandFamily,
+                            priority: admissionPriority,
+                            spawnMicroseconds: elapsedMicroseconds(since: spawnStartedAt),
+                            success: false
+                        )
+                        throw error
+                    }
+                    let spawnMicroseconds = elapsedMicroseconds(since: spawnStartedAt)
+                    processMetrics.spawnMicroseconds = spawnMicroseconds
+                    GitProcessSpawnDiagnostics.endSpawnInterval(
+                        spawnInterval,
+                        family: commandFamily,
+                        priority: admissionPriority,
+                        spawnMicroseconds: spawnMicroseconds,
+                        success: true
+                    )
+                } catch {
+                    timeoutController.cancel()
+                    spool.cancel()
+                    recordCommandOutcome(0)
                     continuation.resume(
                         throwing: lifecycleController.cancellationErrorIfRequested() ?? error
                     )
+                    return
                 }
+
+                let target = GitProcessLifecycleTarget(
+                    processIdentifier: spawned.pid,
+                    processGroupID: spawned.processGroupID
+                )
+                let spawnState = lifecycleController.didSpawn(
+                    target: target,
+                    terminationGrace: terminationGrace
+                )
+                if spawnState == .running {
+                    // Install the spawn-adjusted generation before drains or
+                    // callbacks can report newer activity. A later callback may
+                    // supersede this generation; the reverse is impossible.
+                    let spawnElapsed = Duration.microseconds(elapsedMicroseconds(since: spawnStartedAt))
+                    let remainingTimeout = max(Duration.zero, resourcePolicy.activityTimeout - spawnElapsed)
+                    lifecycleController.installNormalTimeoutIfActive {
+                        timeoutController.schedule(
+                            target: target,
+                            timeout: remainingTimeout,
+                            terminationGrace: terminationGrace
+                        )
+                    }
+                }
+
+                let activityHandler: @Sendable () -> Void = {
+                    guard target.isRunning else { return }
+                    lifecycleController.installNormalTimeoutIfActive {
+                        timeoutController.schedule(
+                            target: target,
+                            timeout: resourcePolicy.activityTimeout,
+                            terminationGrace: terminationGrace
+                        )
+                    }
+                }
+
+                var partialOutDrain: GitProcessPipeSpoolDrain?
+                let outDrain: GitProcessPipeSpoolDrain
+                let errStream: AsyncStream<Data>
+                let errDrain: GitProcessPipeDrain
+                do {
+                    outDrain = try GitProcessPipeSpoolDrain.make(
+                        readingFrom: spawned.stdout,
+                        spool: spool,
+                        activityHandler: activityHandler
+                    )
+                    partialOutDrain = outDrain
+                    (errStream, errDrain) = try GitProcessPipeDrain.makeStream(
+                        readingFrom: spawned.stderr,
+                        byteLimit: 64 * 1024
+                    )
+                } catch {
+                    // The child is already running. Terminate and reap it (and
+                    // its process group) through the shared authority BEFORE
+                    // resuming: the admission lease is released when this call
+                    // completes and must never outlive a live child.
+                    let createdOutDrain = partialOutDrain
+                    spawned.stdin?.closeFile()
+                    Task.detached(priority: .userInitiated) {
+                        _ = await ProcessTermination.terminateAndReap(
+                            pid: spawned.pid,
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                        target.markTerminated()
+                        timeoutController.cancel()
+                        let finalization = lifecycleController.commitFinalization()
+                        createdOutDrain?.cancel()
+                        spool.cancel()
+                        recordCommandOutcome(0)
+                        if timeoutController.didTimeOut {
+                            continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                        } else {
+                            continuation.resume(
+                                throwing: finalization.cancellationError ?? error
+                            )
+                        }
+                    }
+                    return
+                }
+
+                let errCollector = Task(priority: .userInitiated) { () -> Data in
+                    var buffer = Data()
+                    for await chunk in errStream where !chunk.isEmpty {
+                        buffer.append(chunk)
+                    }
+                    return buffer
+                }
+
+                spawned.stdout.readabilityHandler = { handle in
+                    if outDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
+                    if outDrain.terminalError != nil {
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
+                    }
+                }
+                spawned.stderr.readabilityHandler = { handle in
+                    if errDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    } else {
+                        activityHandler()
+                    }
+                    if errDrain.didExceedByteLimit {
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
+                    }
+                }
+
+                // Blocking waitpid runs on ProcessTermination's dedicated
+                // queue. This task remains the sole reaping authority.
+                Task.detached(priority: .userInitiated) {
+                    let reapOutcome: Result<ProcessExitStatus, any Error>
+                    let reapRequiresGroupCleanup: Bool
+                    do {
+                        reapOutcome = try await .success(
+                            ProcessTermination.reapChildStatus(
+                                pid: spawned.pid,
+                                onReaped: { target.markTerminated() }
+                            )
+                        )
+                        reapRequiresGroupCleanup = false
+                    } catch {
+                        reapOutcome = .failure(error)
+                        reapRequiresGroupCleanup = true
+                        // The sole reaper cannot safely issue a second waitpid
+                        // after an ownership/error result. Close PID signaling
+                        // and constrain recovery to the launcher-owned group.
+                        target.markTerminated()
+                    }
+                    let finalization = lifecycleController.commitFinalization()
+                    timeoutController.cancel()
+                    if finalization.requiresProcessGroupCleanup
+                        || timeoutController.didTimeOut
+                        || reapRequiresGroupCleanup
+                    {
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                    }
+
+                    spawned.stdout.readabilityHandler = nil
+                    spawned.stderr.readabilityHandler = nil
+                    outDrain.finishReading()
+                    errDrain.finishReading()
+
+                    let stderrData = await errCollector.value
+                    let stdoutResult: Result<GitRawOutputSpoolLease, any Error>
+                    do {
+                        stdoutResult = try .success(spool.finish())
+                    } catch {
+                        stdoutResult = .failure(error)
+                    }
+
+                    let stdoutFailed = switch stdoutResult {
+                    case .success: false
+                    case .failure: true
+                    }
+                    if outDrain.terminalError != nil
+                        || errDrain.didExceedByteLimit
+                        || stdoutFailed,
+                        !finalization.requiresProcessGroupCleanup,
+                        !timeoutController.didTimeOut
+                    {
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                    }
+
+                    let stdoutByteCount: UInt64 = switch stdoutResult {
+                    case let .success(lease): lease.byteCount
+                    case .failure: 0
+                    }
+                    let outputByteCount = Int(
+                        clamping: stdoutByteCount + UInt64(stderrData.count)
+                    )
+                    recordCommandOutcome(outputByteCount)
+
+                    if let error = outDrain.terminalError {
+                        continuation.resume(throwing: error)
+                    } else if case let .failure(error) = stdoutResult {
+                        continuation.resume(throwing: error)
+                    } else if errDrain.didExceedByteLimit {
+                        continuation.resume(throwing: GitProcessCaptureError.stderrByteLimitExceeded)
+                    } else if timeoutController.didTimeOut {
+                        continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                    } else if let cancellationError = finalization.cancellationError {
+                        continuation.resume(throwing: cancellationError)
+                    } else if case let .failure(reapFailure) = reapOutcome {
+                        continuation.resume(throwing: reapFailure)
+                    } else if case let .success(stdoutLease) = stdoutResult,
+                              case let .success(exitStatus) = reapOutcome
+                    {
+                        continuation.resume(returning: (
+                            stdoutLease,
+                            stderrData,
+                            exitStatus.terminationStatus,
+                            exitStatus.terminationReason
+                        ))
+                    } else {
+                        preconditionFailure("raw spool result was not exhaustive")
+                    }
+                }
+
+                // Spooling authority commands take no stdin: close immediately so
+                // the child sees EOF rather than waiting on an open pipe.
+                spawned.stdin?.closeFile()
             }
         }, onCancel: {
+            lifecycleController.requestCancellation(terminationGrace: terminationGrace)
             timeoutController.cancel()
-            lifecycleController.requestCancellation(
-                process: process,
-                terminationGrace: processTerminationGrace
-            )
         })
-        try Task.checkCancellation()
-        return result
     }
 
     private nonisolated static func capabilityBoundObjectReadEnvironment(
@@ -7233,6 +7399,11 @@ actor GitService {
         return environment
     }
 
+    private nonisolated static func timeInterval(from duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1e18
+    }
+
     private nonisolated static func commandFamily(for args: [String]) -> GitProcessCommandFamily {
         guard let command = args.first else { return .repositoryRead }
         switch command {
@@ -7262,230 +7433,44 @@ actor GitService {
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
-        let process = Process()
         let timeoutController = GitProcessActivityTimeoutController()
         let lifecycleController = GitProcessLifecycleController()
         let commandRecorder = MCPToolWorkCountDiagnostics.gitCommandRecorder()
-        process.executableURL = gitExecutableURL
-        process.arguments = args
-        process.currentDirectoryURL = repoURL
-        process.environment = environment
-
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
-
-        var inPipe: Pipe?
-        if let _ = stdin {
-            let p = Pipe()
-            process.standardInput = p
-            inPipe = p
-            // Suppress SIGPIPE on this write FD so closed readers won’t crash the app
-            let fd = p.fileHandleForWriting.fileDescriptor
-            _ = fcntl(fd, F_SETNOSIGPIPE, 1)
-        }
-
-        // Build async streams for stdout/stderr and single consumer tasks to collect data.
-        // GitProcessPipeDrain serializes readability callbacks with termination/cancellation
-        // so a final chunk cannot be read by a callback and then dropped after stream closure.
-        let (outStream, outDrain) = try GitProcessPipeDrain.makeStream(
-            readingFrom: outPipe.fileHandleForReading,
-            byteLimit: stdoutByteLimit
-        )
-        let (errStream, errDrain) = try GitProcessPipeDrain.makeStream(
-            readingFrom: errPipe.fileHandleForReading,
-            byteLimit: stderrByteLimit
-        )
-
         let processMetrics = GitProcessMetricsBox()
         let commandStartedAt = DispatchTime.now().uptimeNanoseconds
-        let outCollector = Task(priority: .userInitiated) { () -> Data in
-            var buf = Data()
-            for await chunk in outStream {
-                if !chunk.isEmpty {
-                    buf.append(chunk)
-                }
-            }
-            return buf
-        }
-        let errCollector = Task(priority: .userInitiated) { () -> Data in
-            var buf = Data()
-            for await chunk in errStream {
-                if !chunk.isEmpty {
-                    buf.append(chunk)
-                }
-            }
-            return buf
-        }
+        let terminationGrace = processTerminationGrace
+        let terminationGraceSeconds = Self.timeInterval(from: processTerminationGrace)
+        let spawner = processSpawner
+        let gitExecutablePath = gitExecutableURL.path
+        #if DEBUG
+            let injectedDrainFailure = drainCreationFailureForTesting
+        #endif
 
-        let result = try await withTaskCancellationHandler(operation: {
+        return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<(Data, Data, Int32), any Error>) in
-                // Drain stdout
-                outPipe.fileHandleForReading.readabilityHandler = { handle in
-                    if outDrain.consumeAvailableData() {
-                        handle.readabilityHandler = nil
-                    }
-                    if outDrain.didExceedByteLimit {
-                        lifecycleController.requestCancellation(
-                            process: process,
-                            terminationGrace: self.processTerminationGrace
-                        )
-                    }
-                }
-                // Drain stderr
-                errPipe.fileHandleForReading.readabilityHandler = { handle in
-                    if errDrain.consumeAvailableData() {
-                        handle.readabilityHandler = nil
-                    }
-                    if errDrain.didExceedByteLimit {
-                        lifecycleController.requestCancellation(
-                            process: process,
-                            terminationGrace: self.processTerminationGrace
-                        )
-                    }
-                }
-
-                process.terminationHandler = { proc in
-                    lifecycleController.didTerminate()
-                    timeoutController.cancel()
-
-                    // Stop handlers to break strong reference cycles
-                    outPipe.fileHandleForReading.readabilityHandler = nil
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-
-                    // Drain bytes that arrived between the last readability callback and
-                    // process termination, then close each stream after any in-flight callback.
-                    outDrain.finishReading()
-                    errDrain.finishReading()
-
-                    Task {
-                        let stdoutData = await outCollector.value
-                        let stderrData = await errCollector.value
-
-                        commandRecorder(
-                            diagnosticRepositoryPath,
-                            args,
-                            processQueueWaitMicroseconds,
-                            processMetrics.spawnMicroseconds,
-                            stdoutData.count + stderrData.count
-                        )
-
-                        let commandFinishedAt = DispatchTime.now().uptimeNanoseconds
-                        WorktreeStartupInstrumentation.recordGitCommand(
-                            family: commandFamily,
-                            priority: admissionPriority,
-                            queueWaitMicroseconds: processQueueWaitMicroseconds,
-                            durationMicroseconds: Int(
-                                clamping: commandFinishedAt >= commandStartedAt
-                                    ? (commandFinishedAt - commandStartedAt) / 1000
-                                    : 0
-                            ),
-                            outputByteCount: stdoutData.count + stderrData.count,
-                            cancelled: lifecycleController.cancellationErrorIfRequested() != nil
-                        )
-                        #if DEBUG
-                            WorktreeStartupInstrumentation.recordBenchmarkGitCommand(
-                                tag: benchmarkMetricTag,
-                                family: commandFamily,
-                                priority: admissionPriority,
-                                queueWaitMicroseconds: processQueueWaitMicroseconds,
-                                durationMicroseconds: Int(
-                                    clamping: commandFinishedAt >= commandStartedAt
-                                        ? (commandFinishedAt - commandStartedAt) / 1000
-                                        : 0
-                                ),
-                                outputByteCount: stdoutData.count + stderrData.count,
-                                cancelled: lifecycleController.cancellationErrorIfRequested() != nil
-                            )
-                        #endif
-
-                        if timeoutController.didTimeOut {
-                            continuation.resume(throwing: GitProcessCaptureError.timedOut)
-                            return
-                        }
-
-                        if outDrain.didExceedByteLimit {
-                            continuation.resume(throwing: GitProcessCaptureError.stdoutByteLimitExceeded)
-                            return
-                        }
-                        if errDrain.didExceedByteLimit {
-                            continuation.resume(throwing: GitProcessCaptureError.stderrByteLimitExceeded)
-                            return
-                        }
-
-                        continuation.resume(returning: (stdoutData, stderrData, proc.terminationStatus))
-                    }
-                }
-
-                do {
-                    try lifecycleController.checkCancellationBeforeSpawn()
-                    let spawnStart = DispatchTime.now().uptimeNanoseconds
-                    try process.run()
-                    let processIdentifier = process.processIdentifier
-                    let spawnState = lifecycleController.didSpawn(
-                        process: process,
-                        processIdentifier: processIdentifier,
-                        terminationGrace: processTerminationGrace
-                    )
-                    if spawnState == .running {
-                        timeoutController.schedule(
-                            process: process,
-                            processIdentifier: processIdentifier,
-                            timeout: commandTimeout,
-                            terminationGrace: processTerminationGrace
-                        )
-                        if !lifecycleController.shouldKeepNormalTimeout() {
-                            timeoutController.cancel()
-                        }
-                    }
-                    let spawnEnd = DispatchTime.now().uptimeNanoseconds
-                    processMetrics.spawnMicroseconds = Int(
-                        clamping: spawnEnd >= spawnStart ? (spawnEnd - spawnStart) / 1000 : 0
-                    )
-
-                    // If stdin data was provided, write it after the process starts.
-                    // Use raw FD writes via FDWriteSupport instead of FileHandle.write()
-                    // because FileHandle.write() throws ObjC NSFileHandleOperationException
-                    // on broken pipe, which Swift do/catch cannot intercept.
-                    // If the write fails (e.g. child exited early or task was cancelled),
-                    // we still let the process terminate normally so stderr and exit code
-                    // are collected — this preserves fallback logic in runDiff.
-                    if let stdin {
-                        if let inPipe {
-                            let fd = inPipe.fileHandleForWriting.fileDescriptor
-                            do {
-                                try FDWriteSupport.writeAll(stdin, to: fd)
-                            } catch {
-                                // Broken pipe / bad fd — child exited early or was terminated.
-                                // Swallow the error; the process termination handler will
-                                // still collect stdout, stderr, and exit code normally.
-                                // This preserves runDiff's pathspec fallback behavior.
-                            }
-                            inPipe.fileHandleForWriting.closeFile()
-                        }
-                    }
-                } catch {
+                let recordCommandOutcome: @Sendable (_ outputByteCount: Int) -> Void = { outputByteCount in
                     commandRecorder(
                         diagnosticRepositoryPath,
                         args,
                         processQueueWaitMicroseconds,
                         processMetrics.spawnMicroseconds,
-                        0
+                        outputByteCount
                     )
                     let commandFinishedAt = DispatchTime.now().uptimeNanoseconds
+                    let durationMicroseconds = Int(
+                        clamping: commandFinishedAt >= commandStartedAt
+                            ? (commandFinishedAt - commandStartedAt) / 1000
+                            : 0
+                    )
+                    let wasCancelled = lifecycleController.cancellationErrorIfRequested() != nil
                     WorktreeStartupInstrumentation.recordGitCommand(
                         family: commandFamily,
                         priority: admissionPriority,
                         queueWaitMicroseconds: processQueueWaitMicroseconds,
-                        durationMicroseconds: Int(
-                            clamping: commandFinishedAt >= commandStartedAt
-                                ? (commandFinishedAt - commandStartedAt) / 1000
-                                : 0
-                        ),
-                        outputByteCount: 0,
-                        cancelled: lifecycleController.cancellationErrorIfRequested() != nil
+                        durationMicroseconds: durationMicroseconds,
+                        outputByteCount: outputByteCount,
+                        cancelled: wasCancelled
                     )
                     #if DEBUG
                         WorktreeStartupInstrumentation.recordBenchmarkGitCommand(
@@ -7493,36 +7478,279 @@ actor GitService {
                             family: commandFamily,
                             priority: admissionPriority,
                             queueWaitMicroseconds: processQueueWaitMicroseconds,
-                            durationMicroseconds: Int(
-                                clamping: commandFinishedAt >= commandStartedAt
-                                    ? (commandFinishedAt - commandStartedAt) / 1000
-                                    : 0
-                            ),
-                            outputByteCount: 0,
-                            cancelled: lifecycleController.cancellationErrorIfRequested() != nil
+                            durationMicroseconds: durationMicroseconds,
+                            outputByteCount: outputByteCount,
+                            cancelled: wasCancelled
                         )
                     #endif
-                    // Ensure handlers and collectors are released when launch fails.
-                    timeoutController.cancel()
-                    outPipe.fileHandleForReading.readabilityHandler = nil
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    outDrain.cancel()
-                    errDrain.cancel()
-                    continuation.resume(throwing: lifecycleController.cancellationErrorIfRequested() ?? error)
                 }
+
+                func elapsedMicroseconds(since start: UInt64) -> Int {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    return Int(clamping: now >= start ? (now - start) / 1000 : 0)
+                }
+
+                // Deadline and cancellation accounting starts before the launch
+                // call: posix_spawnp is synchronous and cannot be interrupted, so
+                // intent that accrues while it is in flight is applied immediately
+                // after it returns (`didSpawn` terminates a cancelled child, and
+                // the command timeout below is charged from `spawnStartedAt`).
+                let spawned: SpawnedProcess
+                let spawnStartedAt = DispatchTime.now().uptimeNanoseconds
+                do {
+                    try lifecycleController.checkCancellationBeforeSpawn()
+                    let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
+                        family: commandFamily,
+                        priority: admissionPriority
+                    )
+                    do {
+                        spawned = try spawner(gitExecutablePath, args, environment, repoURL.path)
+                    } catch {
+                        GitProcessSpawnDiagnostics.endSpawnInterval(
+                            spawnInterval,
+                            family: commandFamily,
+                            priority: admissionPriority,
+                            spawnMicroseconds: elapsedMicroseconds(since: spawnStartedAt),
+                            success: false
+                        )
+                        throw error
+                    }
+                    let spawnMicroseconds = elapsedMicroseconds(since: spawnStartedAt)
+                    processMetrics.spawnMicroseconds = spawnMicroseconds
+                    GitProcessSpawnDiagnostics.endSpawnInterval(
+                        spawnInterval,
+                        family: commandFamily,
+                        priority: admissionPriority,
+                        spawnMicroseconds: spawnMicroseconds,
+                        success: true
+                    )
+                } catch {
+                    timeoutController.cancel()
+                    recordCommandOutcome(0)
+                    continuation.resume(throwing: lifecycleController.cancellationErrorIfRequested() ?? error)
+                    return
+                }
+
+                let target = GitProcessLifecycleTarget(
+                    processIdentifier: spawned.pid,
+                    processGroupID: spawned.processGroupID
+                )
+                let spawnState = lifecycleController.didSpawn(
+                    target: target,
+                    terminationGrace: terminationGrace
+                )
+                if spawnState == .running {
+                    // Install the spawn-adjusted timeout before any output
+                    // callback or reaper can observe the child.
+                    let spawnElapsed = Duration.microseconds(elapsedMicroseconds(since: spawnStartedAt))
+                    let remainingTimeout = max(Duration.zero, commandTimeout - spawnElapsed)
+                    lifecycleController.installNormalTimeoutIfActive {
+                        timeoutController.schedule(
+                            target: target,
+                            timeout: remainingTimeout,
+                            terminationGrace: terminationGrace
+                        )
+                    }
+                }
+
+                // Build async streams for stdout/stderr and single consumer tasks to collect data.
+                // GitProcessPipeDrain serializes readability callbacks with termination/cancellation
+                // so a final chunk cannot be read by a callback and then dropped after stream closure.
+                var partialOutDrain: GitProcessPipeDrain?
+                let outStream: AsyncStream<Data>
+                let outDrain: GitProcessPipeDrain
+                let errStream: AsyncStream<Data>
+                let errDrain: GitProcessPipeDrain
+                do {
+                    (outStream, outDrain) = try GitProcessPipeDrain.makeStream(
+                        readingFrom: spawned.stdout,
+                        byteLimit: stdoutByteLimit
+                    )
+                    partialOutDrain = outDrain
+                    #if DEBUG
+                        if let injectedDrainFailure {
+                            throw injectedDrainFailure
+                        }
+                    #endif
+                    (errStream, errDrain) = try GitProcessPipeDrain.makeStream(
+                        readingFrom: spawned.stderr,
+                        byteLimit: stderrByteLimit
+                    )
+                } catch {
+                    // The child is already running. Terminate and reap it (and
+                    // its process group) through the shared authority BEFORE
+                    // resuming: the admission lease is released when this call
+                    // completes and must never outlive a live child.
+                    let createdOutDrain = partialOutDrain
+                    spawned.stdin?.closeFile()
+                    Task.detached(priority: .userInitiated) {
+                        _ = await ProcessTermination.terminateAndReap(
+                            pid: spawned.pid,
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                        target.markTerminated()
+                        timeoutController.cancel()
+                        let finalization = lifecycleController.commitFinalization()
+                        createdOutDrain?.cancel()
+                        recordCommandOutcome(0)
+                        if timeoutController.didTimeOut {
+                            continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                        } else {
+                            continuation.resume(
+                                throwing: finalization.cancellationError ?? error
+                            )
+                        }
+                    }
+                    return
+                }
+
+                let outCollector = Task(priority: .userInitiated) { () -> Data in
+                    var buf = Data()
+                    for await chunk in outStream {
+                        if !chunk.isEmpty { buf.append(chunk) }
+                    }
+                    return buf
+                }
+                let errCollector = Task(priority: .userInitiated) { () -> Data in
+                    var buf = Data()
+                    for await chunk in errStream {
+                        if !chunk.isEmpty { buf.append(chunk) }
+                    }
+                    return buf
+                }
+
+                // Drain stdout
+                spawned.stdout.readabilityHandler = { handle in
+                    if outDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
+                    if outDrain.didExceedByteLimit {
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
+                    }
+                }
+                // Drain stderr
+                spawned.stderr.readabilityHandler = { handle in
+                    if errDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
+                    if errDrain.didExceedByteLimit {
+                        timeoutController.cancel()
+                        lifecycleController.requestInternalTermination(terminationGrace: terminationGrace)
+                    }
+                }
+
+                // Blocking waitpid runs on ProcessTermination's dedicated
+                // queue. This task remains the sole reaping authority.
+                Task.detached(priority: .userInitiated) {
+                    let reapOutcome: Result<ProcessExitStatus, any Error>
+                    let reapRequiresGroupCleanup: Bool
+                    do {
+                        reapOutcome = try await .success(
+                            ProcessTermination.reapChildStatus(
+                                pid: spawned.pid,
+                                onReaped: { target.markTerminated() }
+                            )
+                        )
+                        reapRequiresGroupCleanup = false
+                    } catch {
+                        reapOutcome = .failure(error)
+                        reapRequiresGroupCleanup = true
+                        // Never hand an ownership error to a second waitpid.
+                        // Recovery is process-group-only after PID signaling closes.
+                        target.markTerminated()
+                    }
+
+                    // Commit before cleanup so cancellation is linearized while
+                    // handlers remain active to drain TERM-time output.
+                    let finalization = lifecycleController.commitFinalization()
+                    timeoutController.cancel()
+                    if finalization.requiresProcessGroupCleanup
+                        || timeoutController.didTimeOut
+                        || reapRequiresGroupCleanup
+                    {
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                    }
+
+                    // Stop handlers to break strong reference cycles.
+                    spawned.stdout.readabilityHandler = nil
+                    spawned.stderr.readabilityHandler = nil
+
+                    // Drain bytes that arrived between the last readability callback and
+                    // process termination, then close each stream after any in-flight callback.
+                    outDrain.finishReading()
+                    errDrain.finishReading()
+
+                    let stdoutData = await outCollector.value
+                    let stderrData = await errCollector.value
+                    if outDrain.didExceedByteLimit || errDrain.didExceedByteLimit,
+                       !finalization.requiresProcessGroupCleanup,
+                       !timeoutController.didTimeOut
+                    {
+                        await ProcessTermination.terminateProcessGroupAfterRootReap(
+                            processGroupID: spawned.processGroupID,
+                            sigtermGrace: terminationGraceSeconds
+                        )
+                    }
+
+                    recordCommandOutcome(stdoutData.count + stderrData.count)
+
+                    if timeoutController.didTimeOut {
+                        continuation.resume(throwing: GitProcessCaptureError.timedOut)
+                        return
+                    }
+                    if let cancellationError = finalization.cancellationError {
+                        continuation.resume(throwing: cancellationError)
+                        return
+                    }
+                    if outDrain.didExceedByteLimit {
+                        continuation.resume(throwing: GitProcessCaptureError.stdoutByteLimitExceeded)
+                        return
+                    }
+                    if errDrain.didExceedByteLimit {
+                        continuation.resume(throwing: GitProcessCaptureError.stderrByteLimitExceeded)
+                        return
+                    }
+                    switch reapOutcome {
+                    case let .success(exitStatus):
+                        continuation.resume(returning: (stdoutData, stderrData, exitStatus.terminationStatus))
+                    case let .failure(reapFailure):
+                        continuation.resume(throwing: reapFailure)
+                    }
+                }
+
+                // If stdin data was provided, write it after the process starts.
+                // Use raw FD writes via FDWriteSupport instead of FileHandle.write()
+                // because FileHandle.write() throws ObjC NSFileHandleOperationException
+                // on broken pipe, which Swift do/catch cannot intercept.
+                // If the write fails (e.g. child exited early or task was cancelled),
+                // we still let the process terminate normally so stderr and exit code
+                // are collected — this preserves fallback logic in runDiff.
+                if let stdin, let stdinDescriptor = spawned.stdinDescriptor {
+                    do {
+                        try FDWriteSupport.writeAll(stdin, to: stdinDescriptor)
+                    } catch {
+                        // Broken pipe / bad fd — child exited early or was terminated.
+                        // Swallow the error; the reaper still collects stdout, stderr,
+                        // and the exit code normally, preserving runDiff's pathspec
+                        // fallback behavior.
+                    }
+                }
+                // Always close stdin so a git child never waits on an open pipe:
+                // EOF is prompt both after writing and when no stdin was provided.
+                spawned.stdin?.closeFile()
             }
         }, onCancel: {
-            timeoutController.cancel()
             // Keep stdout/stderr drains active until termination. A child may flush more than
             // pipe capacity while handling SIGTERM; closing the drains here can block that
-            // flush forever and prevent the termination handler from reaping the process.
-            lifecycleController.requestCancellation(
-                process: process,
-                terminationGrace: processTerminationGrace
-            )
+            // flush forever and prevent the reaper from observing process exit.
+            lifecycleController.requestCancellation(terminationGrace: terminationGrace)
+            timeoutController.cancel()
         })
-        try Task.checkCancellation()
-        return result
     }
 
     static func shouldFallbackFromWorktreeListZError(_ stderr: String) -> Bool {
@@ -8158,136 +8386,6 @@ private extension GitService.WorkingStatus {
 
     var changedPaths: [String] {
         Array(Set(staged + modified + untracked)).sorted()
-    }
-}
-
-private final class GitProcessLifecycleController: @unchecked Sendable {
-    enum SpawnState: Equatable {
-        case running
-        case cancellationRequested
-        case terminated
-    }
-
-    private let lock = NSLock()
-    private var cancellationRequested = false
-    private var processIdentifier: pid_t?
-    private var terminated = false
-    private var cancellationEscalationTask: Task<Void, Never>?
-
-    func checkCancellationBeforeSpawn() throws {
-        lock.lock()
-        let shouldCancel = cancellationRequested
-        lock.unlock()
-        if shouldCancel {
-            throw CancellationError()
-        }
-    }
-
-    func didSpawn(
-        process: Process,
-        processIdentifier: pid_t,
-        terminationGrace: Duration
-    ) -> SpawnState {
-        lock.lock()
-        if terminated {
-            let wasCancelled = cancellationRequested
-            lock.unlock()
-            return wasCancelled ? .cancellationRequested : .terminated
-        }
-
-        self.processIdentifier = processIdentifier
-        let shouldTerminate = cancellationRequested
-        if shouldTerminate {
-            armCancellationEscalationLocked(
-                process: process,
-                processIdentifier: processIdentifier,
-                terminationGrace: terminationGrace
-            )
-        }
-        lock.unlock()
-
-        if shouldTerminate, process.isRunning {
-            process.terminate()
-        }
-        return shouldTerminate ? .cancellationRequested : .running
-    }
-
-    func requestCancellation(
-        process: Process,
-        terminationGrace: Duration
-    ) {
-        lock.lock()
-        cancellationRequested = true
-        let processIdentifier = terminated ? nil : processIdentifier
-        if let processIdentifier {
-            armCancellationEscalationLocked(
-                process: process,
-                processIdentifier: processIdentifier,
-                terminationGrace: terminationGrace
-            )
-        }
-        lock.unlock()
-
-        if processIdentifier != nil, process.isRunning {
-            process.terminate()
-        }
-    }
-
-    func shouldKeepNormalTimeout() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return !cancellationRequested && !terminated
-    }
-
-    func cancellationErrorIfRequested() -> CancellationError? {
-        lock.lock()
-        defer { lock.unlock() }
-        return cancellationRequested ? CancellationError() : nil
-    }
-
-    func didTerminate() {
-        lock.lock()
-        terminated = true
-        processIdentifier = nil
-        let escalationTask = cancellationEscalationTask
-        cancellationEscalationTask = nil
-        lock.unlock()
-        escalationTask?.cancel()
-    }
-
-    private func armCancellationEscalationLocked(
-        process: Process,
-        processIdentifier: pid_t,
-        terminationGrace: Duration
-    ) {
-        guard cancellationEscalationTask == nil else { return }
-        cancellationEscalationTask = Task.detached { [self] in
-            do {
-                try await Task.sleep(for: terminationGrace)
-            } catch {
-                return
-            }
-            sendCancellationKillIfNeeded(
-                process: process,
-                processIdentifier: processIdentifier
-            )
-        }
-    }
-
-    private func sendCancellationKillIfNeeded(
-        process: Process,
-        processIdentifier: pid_t
-    ) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard cancellationRequested,
-              !terminated,
-              self.processIdentifier == processIdentifier,
-              process.isRunning
-        else {
-            return
-        }
-        _ = kill(processIdentifier, SIGKILL)
     }
 }
 

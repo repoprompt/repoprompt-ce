@@ -22,7 +22,6 @@ CHECKSUMS="$DIST_DIR/SHA256SUMS"
 BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
 SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"
-SENTRY_DEPLOY_ENVIRONMENT="${REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT:-production}"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
 STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
@@ -236,14 +235,6 @@ finalize_sentry_release() {
     sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases finalize "$SENTRY_RELEASE_NAME"
 }
 
-record_sentry_production_deploy() {
-    sentry_linking_enabled || return 0
-    load_sentry_auth_token_for_publish
-    sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases deploys "$SENTRY_RELEASE_NAME" new \
-        --env "$SENTRY_DEPLOY_ENVIRONMENT" \
-        --name "$RELEASE_TAG"
-}
-
 upload_required_sentry_symbols() {
     require_sentry_publish_configuration
     "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" "$SENTRY_SYMBOLS_DIR"
@@ -425,13 +416,14 @@ publish_staged_release() {
     )
     local existing_release_state=""
     if existing_release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
-        fail "GitHub release $RELEASE_TAG already exists (isDraft=$existing_release_state). Refusing to repeat Sentry finalization or deploy publication; inspect the existing draft and Sentry release before manual recovery."
+        fail "GitHub release $RELEASE_TAG already exists (isDraft=$existing_release_state). Refusing to repeat Sentry finalization; inspect the existing draft and Sentry release before manual recovery."
     fi
     gh release create "${release_args[@]}"
     printf 'Created draft GitHub release assets for %s.\n' "$RELEASE_TAG"
 
+    # Finalization marks release metadata, commits, and uploaded debug symbols ready.
+    # Stable promotion records production availability only after public verification.
     finalize_sentry_release
-    record_sentry_production_deploy
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

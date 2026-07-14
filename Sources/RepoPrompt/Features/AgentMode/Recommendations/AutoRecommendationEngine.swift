@@ -79,10 +79,10 @@ final class AutoRecommendationEngine {
     /// Recommendation satisfaction compares against the targeted profile rather than
     /// raw global settings. Mute/completion state remains workspace-local via `workspaceID`.
     func computeRecommendations(
-        for workspaceID: UUID,
-        scope: AgentModelsEditingScope = .global,
+        for identity: AgentModelsOperationIdentity,
         enabledProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> RecommendationSet {
+        let scope = identity.scope
         let actualStatus = computeProviderStatus()
         let status = actualStatus.filtered(to: enabledProviders)
         let profile = profile(for: scope)
@@ -519,11 +519,10 @@ final class AutoRecommendationEngine {
     /// Apply MCP agent defaults by clearing overrides in the targeted Agent Models scope.
     func applyMCPAgentDefaultsRecommendation(
         _: MCPAgentDefaultsRecommendation,
-        workspaceID _: UUID,
-        scope: AgentModelsEditingScope = .global
+        identity: AgentModelsOperationIdentity
     ) {
         updateProfile(
-            scope: scope,
+            scope: identity.scope,
             contextBuilderWriteIntent: .preserveExistingOwnership
         ) { profile in
             profile.mcpAgentRoleOverrides = nil
@@ -621,13 +620,12 @@ final class AutoRecommendationEngine {
     func applyChatModelRecommendation(
         _ rec: ChatModelRecommendation,
         backend: ChatBackendKind,
-        workspaceID _: UUID,
-        scope: AgentModelsEditingScope = .global
+        identity: AgentModelsOperationIdentity
     ) {
         guard let trimmedModel = recommendedChatModelRaw(rec, backend: backend) else { return }
 
         updateProfile(
-            scope: scope,
+            scope: identity.scope,
             contextBuilderWriteIntent: .preserveExistingOwnership
         ) { profile in
             profile.planningModelRaw = trimmedModel
@@ -638,14 +636,13 @@ final class AutoRecommendationEngine {
     /// Apply context builder recommendation in the target Agent Models profile.
     func applyContextBuilderRecommendation(
         _ rec: ContextBuilderRecommendation,
-        workspaceID _: UUID,
-        scope: AgentModelsEditingScope = .global,
+        identity: AgentModelsOperationIdentity,
         contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .userInitiated
     ) {
         let resolvedModelRaw = recommendedContextBuilderModelRaw(rec)
 
         updateProfile(
-            scope: scope,
+            scope: identity.scope,
             contextBuilderWriteIntent: contextBuilderWriteIntent
         ) { profile in
             profile.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
@@ -664,24 +661,23 @@ final class AutoRecommendationEngine {
     /// SEARCH-HELPER: Agent Models, Apply Recommended Setup, bulk apply
     func applyModelRecommendations(
         _ rec: RecommendationSet,
-        workspaceID: UUID,
-        scope: AgentModelsEditingScope = .global,
+        identity: AgentModelsOperationIdentity,
         includePresetExposure: Bool = false
     ) {
         if let chat = rec.chatModel {
-            applyChatModelRecommendation(chat, backend: chat.defaultBackend, workspaceID: workspaceID, scope: scope)
+            applyChatModelRecommendation(chat, backend: chat.defaultBackend, identity: identity)
         }
         if let cb = rec.contextBuilder {
-            applyContextBuilderRecommendation(cb, workspaceID: workspaceID, scope: scope)
+            applyContextBuilderRecommendation(cb, identity: identity)
         }
         if let agentDefaults = rec.mcpAgentDefaults {
-            applyMCPAgentDefaultsRecommendation(agentDefaults, workspaceID: workspaceID, scope: scope)
+            applyMCPAgentDefaultsRecommendation(agentDefaults, identity: identity)
         }
         if includePresetExposure, let presetExposure = rec.mcpPresetExposure {
             applyMCPPresetExposure(presetExposure)
         }
 
-        postRecommendationsDidApply(workspaceID: workspaceID, scope: scope)
+        postRecommendationsDidApply(workspaceID: identity.sourceWorkspaceID, scope: identity.scope)
     }
 
     /// Apply MCP preset exposure recommendation.
@@ -761,7 +757,8 @@ final class AutoRecommendationEngine {
         }
 
         // Compute recommendations
-        let recs = computeRecommendations(for: workspaceID)
+        let identity = AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global)
+        let recs = computeRecommendations(for: identity)
         var didApply = false
 
         // Apply Context Builder recommendation if global not already configured
@@ -770,8 +767,7 @@ final class AutoRecommendationEngine {
         {
             applyContextBuilderRecommendation(
                 cbRec,
-                workspaceID: workspaceID,
-                scope: .global,
+                identity: identity,
                 contextBuilderWriteIntent: .automaticSeed
             )
             didApply = true

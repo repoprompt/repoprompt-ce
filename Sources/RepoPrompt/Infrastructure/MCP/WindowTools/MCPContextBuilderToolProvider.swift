@@ -15,6 +15,8 @@ private struct ContextBuilderToolResult: Codable {
     let tokenBudget: Int?
     let promptMode: String?
     let agent: String?
+    let model: String?
+    let planningModel: String?
     let selection: String
 
     let responseType: String?
@@ -33,7 +35,8 @@ private struct ContextBuilderToolResult: Codable {
         case tokenNote = "token_note"
         case tokenBudget = "token_budget"
         case promptMode = "prompt_mode"
-        case agent
+        case agent, model
+        case planningModel = "planning_model"
         case selection
         case responseType = "response_type"
         case plan
@@ -68,6 +71,12 @@ private struct ContextBuilderToolResult: Codable {
         if let agent {
             obj["agent"] = .string(agent)
         }
+        if let model {
+            obj["model"] = .string(model)
+        }
+        if let planningModel {
+            obj["planning_model"] = .string(planningModel)
+        }
         if let responseType {
             obj["response_type"] = .string(responseType)
         }
@@ -93,8 +102,141 @@ private struct ContextBuilderToolResult: Codable {
 
 enum ContextBuilderResponseDisposition {
     case contextOnly
-    case generate(HeadlessMode)
+    case generate(HeadlessMode, prompt: String)
     case failed(String)
+}
+
+/// Typed-prompt resolution outcome for a completed Context Builder run. `resolved` carries the prompt
+/// handed to the follow-up model; each failure case names a distinct reason the provider can report
+/// safely, without echoing withheld caller instructions or discovery-guideline content.
+enum ContextBuilderTypedPromptResolution: Equatable {
+    case resolved(String)
+    /// The request carried no caller task or context and no reusable committed prompt existed.
+    case missingCallerTask
+    /// Caller instructions consisted only of discovery guidelines, which are withheld from the follow-up model.
+    case discoveryGuidelinesOnly
+    /// Caller instructions used unsupported or malformed discovery-guideline markup, so resolution failed closed.
+    case malformedDiscoveryMarkup
+    /// Only copied discovery output was committed and no independent caller task exists to answer.
+    case onlyCopiedDiscoveryOutput
+}
+
+enum ContextBuilderTypedPromptResolver {
+    private static let openingTag = "<discovery_agent-guidelines>"
+    private static let closingTag = "</discovery_agent-guidelines>"
+    private static let reservedName = "discovery_agent-guidelines"
+
+    /// Outcome of stripping reserved discovery-guideline markup from caller instructions. The empty and
+    /// guidelines-only cases are kept distinct so resolution can tell "caller supplied nothing" apart from
+    /// "caller supplied only withheld guidelines" without re-parsing.
+    private enum SanitizedCallerInstructions {
+        case prompt(String)
+        case empty
+        case onlyGuidelines
+        case malformed
+    }
+
+    static func resolve(
+        effectivePrompt: String,
+        usedAgentOutputAsPrompt: Bool,
+        callerInstructions: String
+    ) -> ContextBuilderTypedPromptResolution {
+        if !usedAgentOutputAsPrompt,
+           !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return .resolved(effectivePrompt)
+        }
+        switch sanitizeCallerInstructions(callerInstructions) {
+        case let .prompt(prompt):
+            return .resolved(prompt)
+        case .malformed:
+            return .malformedDiscoveryMarkup
+        case .onlyGuidelines:
+            return .discoveryGuidelinesOnly
+        case .empty:
+            // A committed prompt flagged as copied discovery output is deliberately not reused, so an empty
+            // caller fallback means only that copied output exists; otherwise no caller task was provided at all.
+            return usedAgentOutputAsPrompt ? .onlyCopiedDiscoveryOutput : .missingCallerTask
+        }
+    }
+
+    private static func sanitizeCallerInstructions(_ instructions: String) -> SanitizedCallerInstructions {
+        var sanitized = ""
+        var cursor = instructions.startIndex
+        var insideGuidelines = false
+        var removedGuidelines = false
+
+        while cursor < instructions.endIndex {
+            guard instructions[cursor] == "<" else {
+                if !insideGuidelines {
+                    sanitized.append(instructions[cursor])
+                }
+                cursor = instructions.index(after: cursor)
+                continue
+            }
+
+            guard let closingAngle = closingAngleIndex(in: instructions, after: cursor) else {
+                let remainder = instructions[cursor...]
+                guard remainder.range(of: reservedName, options: .caseInsensitive) == nil else {
+                    return .malformed
+                }
+                if !insideGuidelines {
+                    sanitized.append(contentsOf: remainder)
+                }
+                break
+            }
+
+            let afterTag = instructions.index(after: closingAngle)
+            let tag = instructions[cursor ..< afterTag]
+            if tag == openingTag {
+                guard !insideGuidelines else { return .malformed }
+                insideGuidelines = true
+                removedGuidelines = true
+            } else if tag == closingTag {
+                guard insideGuidelines else { return .malformed }
+                insideGuidelines = false
+            } else {
+                // Quote-aware tokenization keeps reserved markup inside attributes from becoming removable blocks.
+                guard tag.range(of: reservedName, options: .caseInsensitive) == nil else {
+                    return .malformed
+                }
+                if !insideGuidelines {
+                    sanitized.append(contentsOf: tag)
+                }
+            }
+            cursor = afterTag
+        }
+
+        guard !insideGuidelines else { return .malformed }
+        let result = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !result.isEmpty {
+            return .prompt(result)
+        }
+        return removedGuidelines ? .onlyGuidelines : .empty
+    }
+
+    private static func closingAngleIndex(
+        in instructions: String,
+        after openingAngle: String.Index
+    ) -> String.Index? {
+        var cursor = instructions.index(after: openingAngle)
+        var activeQuote: Character?
+
+        while cursor < instructions.endIndex {
+            let character = instructions[cursor]
+            if let quote = activeQuote {
+                if character == quote {
+                    activeQuote = nil
+                }
+            } else if character == "\"" || character == "'" {
+                activeQuote = character
+            } else if character == ">" {
+                return cursor
+            }
+            cursor = instructions.index(after: cursor)
+        }
+        return nil
+    }
 }
 
 @MainActor
@@ -177,9 +319,6 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     ) async throws -> ContextBuilderToolResult {
         let instructions = args["instructions"]?.stringValue ?? ""
         let metadata = await dependencies.captureRequestMetadata()
-        guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
-            throw CancellationError()
-        }
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
         let exportResponse: Bool
         if let value = args["export_response"] {
@@ -195,33 +334,39 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
 
         let targetWindow = try dependencies.requireTargetWindow()
-        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace else {
-            throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
-        }
-        let preferredAgent = targetWindow.promptManager.contextBuilderAgent
-        let preferredModelRaw = targetWindow.promptManager.contextBuilderAgentModelRaw
-
         let tabResolution = try await dependencies.resolveContextBuilderTab(
             args,
             targetWindow,
             connectionID
         )
-        let finalTabID = tabResolution.tabID
-        let workspace = tabResolution.workspaceID.flatMap { workspaceID in
-            targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID })
-        } ?? activeWorkspace
+        let resolvedIdentity = tabResolution.identity
+        let finalTabID = resolvedIdentity.tabID
+        guard let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == resolvedIdentity.workspaceID }) else {
+            throw MCPError.invalidParams("The resolved Context Builder workspace is no longer available.")
+        }
         let workspaceContext = tabResolution.workspaceContext
         let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
-        let resolvedIdentity = WorkspaceSelectionIdentity(
-            workspaceID: tabResolution.workspaceID ?? workspace.id,
-            tabID: finalTabID
-        )
+        if workspaceContext == nil {
+            let scopedRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(
+                scope: lookupContext.rootScope
+            )
+            let scopedPaths = Set(scopedRoots.map(\.standardizedFullPath))
+            let targetPaths = Set(workspace.repoPaths.map {
+                StandardizedPath.absolute(lookupContext.translateInputPath($0))
+            })
+            guard !targetPaths.isEmpty, targetPaths.isSubset(of: scopedPaths) else {
+                throw MCPError.invalidParams(
+                    "The resolved Context Builder workspace projection is unavailable. Reload the target workspace before retrying."
+                )
+            }
+        }
         guard let initialResultTab = targetWindow.workspaceManager.composeTab(for: resolvedIdentity) else {
             throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
         }
         try await workspaceContext?.validateReviewTargetAvailability(
             store: dependencies.promptVM.workspaceFileContextStore
         )
+        let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -229,10 +374,35 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 connectionID,
                 clientName,
                 finalTabID,
-                tabResolution.workspaceID ?? workspace.id,
+                resolvedIdentity.workspaceID,
                 targetWindow.windowID
             )
         }
+
+        let targetMetadata = MCPServerViewModel.RequestMetadata(
+            connectionID: connectionID ?? metadata.connectionID,
+            clientName: metadata.clientName,
+            windowID: targetWindow.windowID,
+            runPurpose: metadata.runPurpose,
+            tabContextHint: MCPServerViewModel.TabContextHint(
+                tabID: resolvedIdentity.tabID,
+                workspaceID: resolvedIdentity.workspaceID,
+                windowID: targetWindow.windowID
+            ),
+            explicitWindowRoutingHint: metadata.explicitWindowRoutingHint
+        )
+        guard await dependencies.drainReadFileAutoSelection(
+            targetMetadata,
+            .mirroredSelectionAndMetrics
+        ) == .completed else {
+            throw CancellationError()
+        }
+        let runAuthority = try await contextBuilderVM.resolveMCPRunAuthority(
+            identity: resolvedIdentity,
+            nestedTabContext: tabResolution.nestedTabContext,
+            workspaceContext: workspaceContext,
+            responseType: responseType?.rawValue
+        )
 
         // swiftformat:disable conditionalAssignment
         let capturedOracleExportDestination: OracleExportDestination?
@@ -250,11 +420,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
         // swiftformat:enable conditionalAssignment
 
-        let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
         let tabIDForCleanup = finalTabID
         let mcpControlToken = try await MainActor.run {
             try contextBuilderVM.beginMCPControlledRun(
                 forTabID: finalTabID,
+                workspaceID: resolvedIdentity.workspaceID,
                 responseType: responseType?.rawValue,
                 planModelName: nil
             )
@@ -269,10 +439,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             }
         }) {
             let wantsResponse = responseType?.wantsResponse ?? false
-            let contextBuilderTokenBudget = await MainActor.run {
-                contextBuilderVM.resolvedMCPContextBuilderBudget(for: workspace.id, wantsResponse: wantsResponse)
-            }
-            let tokenBudgetOverride = contextBuilderTokenBudget
+            let contextBuilderTokenBudget = runAuthority.configuration.effectiveTokenBudget
             let promptManager = targetWindow.promptManager
 
             let planModelName: String? = await wantsResponse ? MainActor.run {
@@ -281,14 +448,16 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 let temporarilyDisabled = settingsStore.mcpTemporarilyDisablePresets()
 
                 if !useModelPresets {
-                    return promptManager.planningModel.displayName
+                    return runAuthority.configuration.planningModelRaw
+                        .flatMap(AIModel.fromModelName)?.displayName
                 }
 
                 let allPresets = ModelPresetsManager.shared.presets
                 let effectivePresets = temporarilyDisabled ? [] : allPresets
 
                 if effectivePresets.isEmpty {
-                    return promptManager.planningModel.displayName
+                    return runAuthority.configuration.planningModelRaw
+                        .flatMap(AIModel.fromModelName)?.displayName
                 }
 
                 let modeFiltered = effectivePresets.filter { preset in
@@ -299,7 +468,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         return preset.model.displayName
                     }
                 }
-                return promptManager.planningModel.displayName
+                return runAuthority.configuration.planningModelRaw
+                    .flatMap(AIModel.fromModelName)?.displayName
             } : nil
 
             let sendStageProgress = dependencies.sendStageProgress
@@ -341,14 +511,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         timeline: progressTimeline
                     ) {
                         try await contextBuilderVM.runContextBuilderForMCP(
-                            tabID: finalTabID,
+                            authority: runAuthority,
                             instructionsOverride: instructions.isEmpty ? nil : instructions,
-                            tokenBudgetOverride: tokenBudgetOverride,
-                            persistTokenBudget: false,
-                            enhancementModeOverride: .fullRewrite,
-                            agentOverride: preferredAgent,
-                            modelOverrideRaw: preferredModelRaw,
-                            responseType: responseType?.rawValue,
                             planModelName: planModelName,
                             workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
@@ -445,15 +609,18 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     responseType: responseType,
                     terminalDisposition: snapshot.terminalDisposition,
                     usedAgentOutputAsPrompt: snapshot.usedAgentOutputAsPrompt,
-                    effectivePrompt: effectivePrompt
+                    effectivePrompt: effectivePrompt,
+                    callerInstructions: instructions
                 )
+                var resultPrompt = effectivePrompt
 
                 switch responseDisposition {
                 case .contextOnly:
                     break
                 case let .failed(message):
                     throw MCPError.internalError(message)
-                case let .generate(mode):
+                case let .generate(mode, prompt):
+                    resultPrompt = prompt
                     try Task.checkCancellation()
                     let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
                     if mode == .review, let workspaceContext {
@@ -540,11 +707,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         ) {
                             try await dependencies.runMCPPlanOrQuestion(
                                 contextBuilderVM,
-                                resultTab.id,
+                                resolvedIdentity,
                                 tabResolution.agentModeSessionID,
                                 tabResolution.agentModeRunID,
                                 mode,
-                                effectivePrompt,
+                                prompt,
                                 sel,
                                 lookupContext,
                                 tabResolution.reviewGitContext,
@@ -587,14 +754,16 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     ContextBuilderToolResult(
                         tabID: resultTab.id.uuidString,
                         status: status,
-                        prompt: effectivePrompt,
+                        prompt: resultPrompt,
                         fileCount: fileCount,
                         totalTokens: normalizedTokens,
                         userTotalTokens: userTotalTokens,
                         tokenNote: tokenNote,
                         tokenBudget: contextBuilderTokenBudget,
                         promptMode: "rewrite",
-                        agent: preferredAgent.rawValue,
+                        agent: snapshot.agentKind?.rawValue ?? runAuthority.agentKind.rawValue,
+                        model: snapshot.modelRaw ?? runAuthority.modelRaw,
+                        planningModel: planModelName,
                         selection: formattedSelection,
                         responseType: responseType?.rawValue,
                         plan: planReply,
@@ -653,7 +822,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         responseType: ContextBuilderResponseType?,
         terminalDisposition: ContextBuilderRunTerminalOutcome,
         usedAgentOutputAsPrompt: Bool,
-        effectivePrompt: String
+        effectivePrompt: String,
+        callerInstructions: String
     ) -> ContextBuilderResponseDisposition {
         guard responseType?.wantsResponse == true else { return .contextOnly }
 
@@ -661,21 +831,49 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         case .cancelled, .failed:
             return .contextOnly
         case .completed:
-            guard !usedAgentOutputAsPrompt else {
-                return .failed(
-                    "Context Builder completed without a typed direct response for the requested \(responseType?.rawValue ?? "response")"
-                )
-            }
-            guard !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return .failed(
-                    "Context Builder completed without a prompt for the requested \(responseType?.rawValue ?? "response")"
-                )
+            let prompt: String
+            switch ContextBuilderTypedPromptResolver.resolve(
+                effectivePrompt: effectivePrompt,
+                usedAgentOutputAsPrompt: usedAgentOutputAsPrompt,
+                callerInstructions: callerInstructions
+            ) {
+            case let .resolved(resolvedPrompt):
+                prompt = resolvedPrompt
+            case .missingCallerTask:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "the request included no caller task or context to answer"
+                ))
+            case .onlyCopiedDiscoveryOutput:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "only copied discovery output is available and no independent caller task was provided"
+                ))
+            case .discoveryGuidelinesOnly:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "the caller instructions contained only discovery guidelines, which are withheld from the follow-up model"
+                ))
+            case .malformedDiscoveryMarkup:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "the caller instructions used unsupported or malformed discovery-guideline markup"
+                ))
             }
             guard let mode = responseType?.headlessMode else {
                 return .failed("Context Builder requested response mode is unavailable")
             }
-            return .generate(mode)
+            return .generate(mode, prompt: prompt)
         }
+    }
+
+    /// Composes a safe typed-prompt failure message. `reason` names why resolution failed without echoing
+    /// withheld caller instructions or discovery-guideline content; "without a prompt" stays the stable stem.
+    private nonisolated static func typedPromptFailure(
+        _ responseType: ContextBuilderResponseType?,
+        reason: String
+    ) -> String {
+        "Context Builder completed without a prompt for the requested \(responseType?.rawValue ?? "response"): \(reason)"
     }
 
     private static func withHeartbeat<T: Sendable>(

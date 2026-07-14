@@ -274,7 +274,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             recommendations = RecommendationSet()
             return
         }
-        let raw = engine.computeRecommendations(for: workspaceID, scope: editingScope)
+        let identity = AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: editingScope)
+        let raw = engine.computeRecommendations(for: identity)
         recommendations = engine.applyMutedFlags(raw, workspaceID: workspaceID)
     }
 
