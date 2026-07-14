@@ -141,6 +141,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         MCPAgentRoleDefaultsService.setSelection(
             selection,
             for: .explore,
+            scope: .global,
             settingsStore: store
         )
 
@@ -188,6 +189,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
                 modelRaw: AgentModel.gpt56SolHigh.rawValue
             ),
             for: .engineer,
+            scope: .global,
             settingsStore: store
         )
         XCTAssertNotNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
@@ -199,7 +201,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         XCTAssertTrue(pinnedResolution.hasStoredOverride)
         XCTAssertTrue(pinnedResolution.hasCustomOverride)
 
-        MCPAgentRoleDefaultsService.clearOverride(for: .engineer, settingsStore: store)
+        MCPAgentRoleDefaultsService.clearOverride(for: .engineer, scope: .global, settingsStore: store)
         XCTAssertNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
         let clearedResolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
             for: .engineer,
@@ -208,6 +210,42 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         ))
         XCTAssertFalse(clearedResolution.hasStoredOverride)
         XCTAssertFalse(clearedResolution.hasCustomOverride)
+    }
+
+    func testExplicitWorkspaceResetDoesNotMutateGlobalAndStaleNonCodexPinDoesNotExecute() throws {
+        let workspaceID = UUID()
+        let stale = AgentModelSelectionID(agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: "removed-model").rawValue
+        let global = AgentModelSelectionID(agentRaw: AgentProviderKind.codexExec.rawValue, modelRaw: "dynamic-model").rawValue
+        let store = RoleDefaultsStoreStub(
+            overrides: [AgentModelCatalog.TaskLabelKind.engineer.rawValue: global],
+            workspaceOverrides: [workspaceID: [AgentModelCatalog.TaskLabelKind.engineer.rawValue: stale]]
+        )
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false,
+            cursorAvailable: false,
+            zaiConfigured: false,
+            kimiConfigured: false,
+            customClaudeCompatibleConfigured: false
+        )
+
+        let resolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .engineer,
+            availability: availability,
+            workspaceID: workspaceID,
+            settingsStore: store
+        ))
+        XCTAssertTrue(resolution.overrideUnavailable)
+        XCTAssertNotEqual(resolution.effective.modelRaw, "removed-model")
+
+        MCPAgentRoleDefaultsService.clearOverride(
+            for: .engineer,
+            scope: .workspace(workspaceID),
+            settingsStore: store
+        )
+        XCTAssertEqual(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue], global)
+        XCTAssertNil(store.workspaceOverrides[workspaceID]?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
     }
 }
 
@@ -226,8 +264,17 @@ private final class RoleDefaultsStoreStub: MCPAgentRoleDefaultsStoring {
         return workspaceOverrides[workspaceID]
     }
 
-    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, workspaceID: UUID?, commit _: Bool) {
-        guard let workspaceID else {
+    func mcpAgentRoleOverrides(scope: AgentModelsEditingScope) -> [String: String]? {
+        switch scope {
+        case .global:
+            overrides
+        case let .workspace(workspaceID):
+            workspaceOverrides[workspaceID]
+        }
+    }
+
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope, commit _: Bool) {
+        guard case let .workspace(workspaceID) = scope else {
             self.overrides = overrides
             return
         }

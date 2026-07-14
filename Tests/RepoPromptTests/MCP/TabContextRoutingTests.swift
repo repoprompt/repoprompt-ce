@@ -1433,6 +1433,113 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testInactiveAgentMutationResolutionHydratesPersistedBindingAndProgresses() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let logicalRootURL = try makeTemporaryDirectory(named: "mutation-hydration-logical")
+        let physicalRootURL = try makeTemporaryDirectory(named: "mutation-hydration-physical")
+        defer {
+            try? FileManager.default.removeItem(at: logicalRootURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: physicalRootURL.deletingLastPathComponent())
+        }
+        let controllerTabID = UUID()
+        let agentTabID = UUID()
+        let sessionID = UUID()
+        let connectionID = UUID()
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Mutation Hydration \(UUID().uuidString.prefix(8))",
+            repoPaths: [logicalRootURL.path],
+            ephemeral: true
+        )
+        let workspaceIndex = try XCTUnwrap(
+            window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+        )
+        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+            ComposeTabState(id: controllerTabID, name: "Controller"),
+            ComposeTabState(id: agentTabID, name: "Inactive Agent", activeAgentSessionID: sessionID)
+        ]
+        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = controllerTabID
+        let restoredWorkspace = window.workspaceManager.workspaces[workspaceIndex]
+        await window.workspaceManager.switchWorkspace(
+            to: restoredWorkspace,
+            saveState: false,
+            reason: "inactiveAgentMutationHydration"
+        )
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
+        let physicalRoot = try await window.workspaceFileContextStore.loadRoot(
+            path: physicalRootURL.path,
+            kind: .sessionWorktree
+        )
+        let binding = makeWorktreeBinding(
+            logicalRoot: WorkspaceRootRef(
+                id: logicalRoot.id,
+                name: logicalRoot.name,
+                fullPath: logicalRoot.standardizedFullPath
+            ),
+            physicalRoot: WorkspaceRootRef(
+                id: physicalRoot.id,
+                name: physicalRoot.name,
+                fullPath: physicalRoot.standardizedFullPath
+            )
+        )
+
+        var bindingState = AgentSessionWorktreeBindingState.unhydrated
+        window.mcpServer.registerAgentWorktreeBindingsProvider { requestedSessionID, requestedTabID in
+            guard requestedSessionID == sessionID, requestedTabID == agentTabID else { return .unavailable }
+            return bindingState
+        }
+        window.mcpServer.registerAgentWorktreeBindingsResolver { requestedSessionID, requestedTabID in
+            XCTAssertEqual(requestedSessionID, sessionID)
+            XCTAssertEqual(requestedTabID, agentTabID)
+            bindingState = .hydrated([binding])
+            return bindingState
+        }
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "mutation-hydration-client",
+            tabID: agentTabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID,
+            runID: UUID()
+        )
+        let metadata = MCPServerViewModel.RequestMetadata(
+            connectionID: connectionID,
+            clientName: "mutation-hydration-client",
+            windowID: window.windowID,
+            runPurpose: .agentModeRun
+        )
+        let initialSnapshot = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+        XCTAssertEqual(
+            MCPMutationRetryableFailure.unresolvedRouteFailure(for: initialSnapshot)?.errorCode,
+            "worktree_scope_hydrating"
+        )
+
+        let resolution = try await window.mcpServer.resolveMutationFileToolContext(
+            from: metadata,
+            toolName: MCPWindowToolName.fileActions
+        )
+
+        XCTAssertEqual(resolution.resolvedContext.snapshot.worktreeBindingState, .hydrated([binding]))
+        XCTAssertEqual(
+            resolution.lookupContext.translateInputPath(logicalRootURL.appendingPathComponent("Sources/New.swift").path),
+            physicalRootURL.appendingPathComponent("Sources/New.swift").path
+        )
+        let scopeFailure = await MCPMutationRetryableFailure.mutationScopeFailure(
+            for: resolution.lookupContext,
+            store: window.workspaceFileContextStore
+        )
+        XCTAssertNil(scopeFailure)
+    }
+
+    @MainActor
     func testInactiveAgentBindingHydrationDoesNotOverwriteReboundConnectionContext() async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -1810,6 +1917,34 @@ final class TabContextRoutingTests: XCTestCase {
             explicitWindowID: 7,
             authorization: authorization
         ))
+    }
+
+    func testWrappedMutationArgumentsPreserveOperationIdentity() {
+        let applyEdits = MCPToolArgsNormalizer.normalize(
+            params: [
+                "apply_edits": .object([
+                    "path": .string("Sources/App.swift"),
+                    "rewrite": .string("struct App {}")
+                ]),
+                "operation_id": .string("edit-123")
+            ],
+            originalToolName: "apply_edits",
+            canonicalToolName: "apply_edits"
+        )
+        XCTAssertEqual(applyEdits.payload["operation_id"]?.stringValue, "edit-123")
+
+        let fileActions = MCPToolArgsNormalizer.normalize(
+            params: [
+                "file_actions": .object([
+                    "action": .string("create"),
+                    "path": .string("Sources/New.swift")
+                ]),
+                "operation_id": .string("create-123")
+            ],
+            originalToolName: "file_actions",
+            canonicalToolName: "file_actions"
+        )
+        XCTAssertEqual(fileActions.payload["operation_id"]?.stringValue, "create-123")
     }
 
     #if DEBUG

@@ -9,6 +9,11 @@ import Foundation
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
+    /// Fixed feature-version constants are permanent compatibility boundaries. Add a new
+    /// constant for each schema-requiring feature; never infer an existing feature's minimum
+    /// version from `currentSchemaVersion`.
+    static let baselineSchemaVersion = 2
+    static let workspaceAgentModelsSchemaVersion = 4
     static let currentSchemaVersion = 4
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
@@ -63,6 +68,19 @@ struct GlobalSettingsDocument: Codable {
         Self.decodeUUIDKeyedDictionary(agentModelsSettingsByWorkspaceID ?? [:])
     }
 
+    /// Lowest CE schema version that can faithfully represent this document's content.
+    ///
+    /// Each feature contributes its own fixed introduction version. Future schema bumps must
+    /// add another feature constant and participate in this maximum; they must not change the
+    /// minimum version of content that existing features already know how to represent.
+    var requiredSchemaVersion: Int {
+        var requiredVersion = Self.baselineSchemaVersion
+        if let agentModelsSettingsByWorkspaceID, !agentModelsSettingsByWorkspaceID.isEmpty {
+            requiredVersion = max(requiredVersion, Self.workspaceAgentModelsSchemaVersion)
+        }
+        return requiredVersion
+    }
+
     func replacing(
         copySettings: [UUID: CopyGlobalSettings],
         chatSettings: [UUID: ChatGlobalSettings],
@@ -103,9 +121,34 @@ enum AgentModelsInheritanceMode: String, Codable, Equatable {
     case useWorkspaceOverrides
 }
 
-enum AgentModelsEditingScope: Equatable {
+enum AgentModelsEditingScope: Hashable {
     case global
     case workspace(UUID)
+}
+
+/// Stable identity for one Agent Models operation. The source workspace drives
+/// workspace-local wizard bookkeeping while `scope` is the exact durable profile
+/// the operation may read or mutate.
+struct AgentModelsOperationIdentity: Hashable {
+    let sourceWorkspaceID: UUID
+    let scope: AgentModelsEditingScope
+
+    init(sourceWorkspaceID: UUID, scope: AgentModelsEditingScope) {
+        self.sourceWorkspaceID = sourceWorkspaceID
+        self.scope = scope
+    }
+
+    init(sourceWorkspaceID: UUID, inheritanceMode: AgentModelsInheritanceMode) {
+        self.sourceWorkspaceID = sourceWorkspaceID
+        scope = inheritanceMode == .useWorkspaceOverrides ? .workspace(sourceWorkspaceID) : .global
+    }
+
+    func matches(sourceWorkspaceID: UUID, inheritanceMode: AgentModelsInheritanceMode) -> Bool {
+        self == AgentModelsOperationIdentity(
+            sourceWorkspaceID: sourceWorkspaceID,
+            inheritanceMode: inheritanceMode
+        )
+    }
 }
 
 enum ContextBuilderSettingsWriteIntent {

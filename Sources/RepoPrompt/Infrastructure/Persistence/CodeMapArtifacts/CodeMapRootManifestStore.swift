@@ -979,7 +979,13 @@ actor CodeMapRootManifestStore {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
         var scan = try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: true)
-        let projectionScan = try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
+        let scanMutatedStore = scan.removedTemporaryCount > 0 ||
+            scan.quarantinedCorruptCount > 0 ||
+            scan.removedQuarantineCount > 0 ||
+            scan.prunedShardCount > 0
+        let projectionScan = scanMutatedStore
+            ? try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
+            : scan
         if incomingByteCount > 0 {
             hooks.beforeTerminalAuthorityCheck(.publicationQuota)
             guard scanAuthorityIsCurrent(layout: layout, scan: projectionScan) else {
@@ -1041,7 +1047,9 @@ actor CodeMapRootManifestStore {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
 
-        let finalScan = try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
+        let finalScan = evicted == 0
+            ? projectionScan
+            : try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
         guard scanAuthorityIsCurrent(layout: layout, scan: finalScan) else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }

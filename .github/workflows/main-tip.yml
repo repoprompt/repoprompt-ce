@@ -89,45 +89,20 @@ jobs:
           archive_basename="RepoPrompt-tip-$short_sha-$build_number"
           tag="tip-$short_sha"
 
-          release_json="$RUNNER_TEMP/existing-tip-release.json"
-          status="$(curl --location --silent --show-error \
-            --header 'Accept: application/vnd.github+json' \
-            --output "$release_json" \
-            --write-out '%{http_code}' \
-            "https://api.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/tags/$tag")"
-          case "$status" in
-            200)
-              python3 - "$release_json" "$archive_basename" <<'PYTHON'
-          import json
-          import sys
-
-          release = json.load(open(sys.argv[1], encoding="utf-8"))
-          archive_basename = sys.argv[2]
-          expected = {
-              f"{archive_basename}.zip",
-              f"{archive_basename}.dmg",
-              "appcast.xml",
-              "SHA256SUMS",
-              f"{archive_basename}-artifact-manifest.json",
-              f"{archive_basename}-metadata.json",
-          }
-          actual = {asset["name"] for asset in release.get("assets", [])}
-          if release.get("draft") or release.get("prerelease") or actual != expected:
-              missing = sorted(expected - actual)
-              extra = sorted(actual - expected)
-              raise SystemExit(
-                  "Existing tip release is incomplete or malformed; "
-                  f"missing={missing}, extra={extra}"
-              )
-          PYTHON
+          lookup_classification="$(./Scripts/lookup_public_tip_release.sh \
+            "$TIP_UPDATE_REPOSITORY" \
+            "$tag" \
+            "$archive_basename")"
+          case "$lookup_classification" in
+            found)
               should_publish=false
-              echo "Tip release $tag already exists with the complete asset set; skipping rebuild."
+              echo "Existing tip release response classification=complete; skipping rebuild."
               ;;
-            404)
+            not-found)
               should_publish=true
               ;;
             *)
-              echo "Failed to inspect existing tip release: GitHub returned HTTP $status" >&2
+              echo "GitHub public tip lookup classification=unexpected-helper-output" >&2
               exit 1
               ;;
           esac

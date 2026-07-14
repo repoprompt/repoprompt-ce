@@ -105,6 +105,11 @@ jobs:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: swift build --product RepoPrompt
 
+      - name: Test serialized Sentry privacy boundary
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: swift test --filter SentryTelemetryPrivacyTests
+
   provider-tests:
     name: Provider Tests
     runs-on: macos-26

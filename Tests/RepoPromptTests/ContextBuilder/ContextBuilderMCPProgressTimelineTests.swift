@@ -283,6 +283,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             )
 
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
@@ -360,6 +364,328 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         #endif
     }
 
+    @MainActor
+    func testContextBuilderToolProviderUsesCallerPromptWithoutMutatingDiscoveryFallback() async throws {
+        #if DEBUG
+            let discoveryInputRecorder = ContextBuilderDiscoveryInputRecorder()
+            let provider = ContextBuilderImmediateCompletionProvider(
+                discoveryInputRecorder: discoveryInputRecorder
+            )
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState { _, _, _ in provider }
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            await window.workspaceManager.awaitInitialized()
+
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ContextBuilderProviderPromptTests-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Context Builder provider prompt test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderMCPProgressTimelineTests.providerPrompt"
+            )
+
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let tabIdentity = WorkspaceSelectionIdentity(
+                workspaceID: activeWorkspace.id,
+                tabID: tabID
+            )
+            var initialTab = try XCTUnwrap(window.workspaceManager.composeTab(for: tabIdentity))
+            initialTab.promptText = ""
+            window.workspaceManager.updateComposeTab(initialTab, markDirty: false)
+            window.promptManager.promptText = ""
+            XCTAssertTrue(initialTab.promptText.isEmpty)
+
+            let stageRecorder = ContextBuilderProviderStageRecorder()
+            window.mcpServer.installStageProgressSinkForTesting { _, tool, stage, message in
+                guard tool == MCPWindowToolName.contextBuilder else { return }
+                await stageRecorder.record(stage: stage, message: message)
+            }
+            defer { window.mcpServer.installStageProgressSinkForTesting(nil) }
+
+            let followUpRecorder = ContextBuilderFollowUpInvocationRecorder()
+            let committedSnapshotRecorder = ContextBuilderCommittedSnapshotRecorder()
+            window.contextBuilderAgentViewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: nil,
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    allowSyntheticRoutingWithoutFinalContext: true,
+                    runMCPFollowUp: { mode, prompt, selection in
+                        await followUpRecorder.record(
+                            mode: mode,
+                            prompt: prompt,
+                            selection: selection
+                        )
+                        let chatID = UUID()
+                        return ChatSendReply(
+                            chatId: chatID,
+                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                            mode: mode.mcpModeName,
+                            response: "deterministic provider follow-up",
+                            errors: nil
+                        )
+                    },
+                    committedTabSnapshotCaptured: { runID, snapshot in
+                        committedSnapshotRecorder.record(runID: runID, snapshot: snapshot)
+                    }
+                )
+            )
+            defer { window.contextBuilderAgentViewModel.installRunTestHooks(nil) }
+
+            let task = "<task>Inspect request-local prompt.</task>"
+            let context = "<context>Keep caller context.</context>"
+            let discoverySentinel = "DISCOVERY_ONLY_SENTINEL"
+            let instructions = """
+            \(task)
+            \(context)
+            <discovery_agent-guidelines>\(discoverySentinel)</discovery_agent-guidelines>
+            """
+            let expectedPrompt = """
+            \(task)
+            \(context)
+            """
+
+            let tools = await window.mcpServer.windowMCPTools
+            let contextBuilder = try XCTUnwrap(
+                tools.first { $0.name == MCPWindowToolName.contextBuilder }
+            )
+            let result = try await {
+                do {
+                    return try await contextBuilder([
+                        "instructions": .string(instructions),
+                        "response_type": .string("plan"),
+                        "context_id": .string(tabID.uuidString)
+                    ])
+                } catch {
+                    let stages = await stageRecorder.snapshot().map(\.stage)
+                    XCTFail("Context Builder failed after stages \(stages): \(error)")
+                    throw error
+                }
+            }()
+
+            let discoveryInputs = await discoveryInputRecorder.snapshot()
+            let discoveryInput = try XCTUnwrap(discoveryInputs.last)
+            XCTAssertTrue(discoveryInput.contains(instructions))
+
+            let recordedInvocation = await followUpRecorder.snapshot()
+            let invocation = try XCTUnwrap(recordedInvocation)
+            XCTAssertEqual(invocation.mode, .plan)
+            XCTAssertEqual(invocation.prompt, expectedPrompt)
+
+            guard case let .object(resultObject) = result else {
+                return XCTFail("Expected Context Builder object result")
+            }
+            XCTAssertEqual(resultObject["prompt"]?.stringValue, expectedPrompt)
+
+            // The MCP path's authoritative promptText contract is the immutable committed provider
+            // snapshot, which the tool provider itself consumes as `resultTab`. The live compose tab
+            // is only a non-authoritative active-tab UI projection here: it can be overwritten by an
+            // empty prompt-editor snapshot after the silent stored-only commit, so reading it back is
+            // racy. Assert the committed provenance captured at the commit seam instead.
+            let committedCaptures = committedSnapshotRecorder.snapshotAll()
+            XCTAssertEqual(
+                committedCaptures.count,
+                1,
+                "Exactly one committed tab snapshot should be retained for the run"
+            )
+            let committed = try XCTUnwrap(committedCaptures.first)
+            XCTAssertEqual(committed.runID, committed.snapshot.nestedRunID)
+            XCTAssertEqual(committed.snapshot.identity, tabIdentity)
+            XCTAssertEqual(committed.snapshot.tab.id, tabID)
+            XCTAssertEqual(committed.snapshot.tab.promptText, "Discovery complete")
+            XCTAssertTrue(committed.snapshot.usedAgentOutputAsPrompt)
+        #else
+            throw XCTSkip("Provider-path Context Builder injection is DEBUG-only.")
+        #endif
+    }
+
+    func testTypedPromptResolverEnforcesPrecedenceAndReservedMarkupGrammar() {
+        struct Case {
+            let name: String
+            let effectivePrompt: String
+            let usedAgentOutputAsPrompt: Bool
+            let callerInstructions: String
+            let expected: ContextBuilderTypedPromptResolution
+        }
+
+        let cases = [
+            Case(
+                name: "committed prompt wins without parsing malformed unused instructions",
+                effectivePrompt: "Committed prompt",
+                usedAgentOutputAsPrompt: false,
+                callerInstructions: "<DISCOVERY_AGENT-GUIDELINES>unused",
+                expected: .resolved("Committed prompt")
+            ),
+            Case(
+                name: "plain caller instructions",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<task>Caller task</task>",
+                expected: .resolved("<task>Caller task</task>")
+            ),
+            Case(
+                name: "exact lowercase block removed",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: """
+                <task>Caller task</task>
+                <discovery_agent-guidelines>hidden</discovery_agent-guidelines>
+                <context>Caller context</context>
+                """,
+                expected: .resolved("""
+                <task>Caller task</task>
+
+                <context>Caller context</context>
+                """)
+            ),
+            Case(
+                name: "repeated sibling blocks removed",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: """
+                <discovery_agent-guidelines>first</discovery_agent-guidelines>
+                <task>Caller task</task>
+                <discovery_agent-guidelines>second</discovery_agent-guidelines>
+                """,
+                expected: .resolved("<task>Caller task</task>")
+            ),
+            Case(
+                name: "blank caller instructions",
+                effectivePrompt: "",
+                usedAgentOutputAsPrompt: false,
+                callerInstructions: "  \n",
+                expected: .missingCallerTask
+            ),
+            Case(
+                name: "guidelines only",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<discovery_agent-guidelines>hidden</discovery_agent-guidelines>",
+                expected: .discoveryGuidelinesOnly
+            ),
+            Case(
+                name: "unmatched opening tag",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<task>Caller task</task><discovery_agent-guidelines>hidden",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "unmatched closing tag",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<task>Caller task</task></discovery_agent-guidelines>",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "nested blocks",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<discovery_agent-guidelines>outer<discovery_agent-guidelines>inner</discovery_agent-guidelines></discovery_agent-guidelines>",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "case variant",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<DISCOVERY_AGENT-GUIDELINES>hidden</DISCOVERY_AGENT-GUIDELINES>",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "attribute variant",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<discovery_agent-guidelines scope=\"narrow\">hidden</discovery_agent-guidelines>",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "self-closing variant",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<task>Caller task</task><discovery_agent-guidelines/>",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "quoted greater-than before reserved attribute text",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<task note=\">discovery_agent-guidelines: SECRET\">Caller task</task>",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "exact guideline pair embedded in attribute",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "<task note=\"<discovery_agent-guidelines>hidden</discovery_agent-guidelines>\">Caller task</task>",
+                expected: .malformedDiscoveryMarkup
+            ),
+            Case(
+                name: "reserved name in ordinary prose",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "Explain discovery_agent-guidelines behavior.",
+                expected: .resolved("Explain discovery_agent-guidelines behavior.")
+            ),
+            Case(
+                name: "empty committed prompt falls back to caller instructions",
+                effectivePrompt: "",
+                usedAgentOutputAsPrompt: false,
+                callerInstructions: "<task>Caller task</task>",
+                expected: .resolved("<task>Caller task</task>")
+            ),
+            Case(
+                name: "copied discovery output without independent caller prompt",
+                effectivePrompt: "Discovery output",
+                usedAgentOutputAsPrompt: true,
+                callerInstructions: "",
+                expected: .onlyCopiedDiscoveryOutput
+            )
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                ContextBuilderTypedPromptResolver.resolve(
+                    effectivePrompt: testCase.effectivePrompt,
+                    usedAgentOutputAsPrompt: testCase.usedAgentOutputAsPrompt,
+                    callerInstructions: testCase.callerInstructions
+                ),
+                testCase.expected,
+                testCase.name
+            )
+        }
+
+        let disposition = MCPContextBuilderToolProvider.responseDisposition(
+            responseType: .plan,
+            terminalDisposition: .completed,
+            usedAgentOutputAsPrompt: true,
+            effectivePrompt: "Discovery output",
+            callerInstructions: "<task>Shared caller task</task>"
+        )
+        guard case let .generate(mode, prompt) = disposition else {
+            return XCTFail("Expected plan to generate from caller authority")
+        }
+        XCTAssertEqual(mode, .plan)
+        XCTAssertEqual(prompt, "<task>Shared caller task</task>")
+    }
+
     func testResponseDispositionRoutesRequestedModesAndFailsClosedOnMissingFollowUpState() {
         func assertGenerates(
             _ responseType: ContextBuilderResponseType,
@@ -371,12 +697,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 responseType: responseType,
                 terminalDisposition: .completed,
                 usedAgentOutputAsPrompt: false,
-                effectivePrompt: "Committed prompt"
+                effectivePrompt: "Committed prompt",
+                callerInstructions: ""
             )
-            guard case let .generate(mode) = disposition else {
+            guard case let .generate(mode, prompt) = disposition else {
                 return XCTFail("Expected generate for \(responseType.rawValue)", file: file, line: line)
             }
             XCTAssertEqual(mode.mcpModeName, expectedMode, file: file, line: line)
+            XCTAssertEqual(prompt, "Committed prompt", file: file, line: line)
         }
 
         assertGenerates(.plan, expectedMode: "plan")
@@ -388,7 +716,8 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 responseType: responseType,
                 terminalDisposition: .completed,
                 usedAgentOutputAsPrompt: false,
-                effectivePrompt: "Committed prompt"
+                effectivePrompt: "Committed prompt",
+                callerInstructions: "<DISCOVERY_AGENT-GUIDELINES>unused"
             ) else {
                 return XCTFail("Context-only response type must not generate a follow-up")
             }
@@ -402,31 +731,64 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 responseType: .plan,
                 terminalDisposition: terminalDisposition,
                 usedAgentOutputAsPrompt: false,
-                effectivePrompt: "Committed prompt"
+                effectivePrompt: "Committed prompt",
+                callerInstructions: "<DISCOVERY_AGENT-GUIDELINES>unused"
             ) else {
                 return XCTFail("Failed or cancelled discovery must preserve its terminal result")
             }
         }
 
-        guard case let .failed(directResponseError) = MCPContextBuilderToolProvider.responseDisposition(
+        // Each completed-run failure surfaces the stable "without a prompt" stem plus a distinct, safe reason
+        // that never echoes the withheld caller instructions or discovery-guideline content.
+        guard case let .failed(guidelinesOnlyError) = MCPContextBuilderToolProvider.responseDisposition(
             responseType: .plan,
             terminalDisposition: .completed,
             usedAgentOutputAsPrompt: true,
-            effectivePrompt: "Agent output"
+            effectivePrompt: "Agent output",
+            callerInstructions: "<discovery_agent-guidelines>hidden</discovery_agent-guidelines>"
         ) else {
-            return XCTFail("Untyped agent output must not silently satisfy a requested response")
+            return XCTFail("Discovery output must not silently satisfy a requested response")
         }
-        XCTAssertTrue(directResponseError.contains("typed direct response"))
+        XCTAssertTrue(guidelinesOnlyError.contains("without a prompt"))
+        XCTAssertTrue(guidelinesOnlyError.contains("only discovery guidelines"))
+        XCTAssertFalse(guidelinesOnlyError.contains("hidden"))
 
-        guard case let .failed(emptyPromptError) = MCPContextBuilderToolProvider.responseDisposition(
+        guard case let .failed(missingCallerTaskError) = MCPContextBuilderToolProvider.responseDisposition(
             responseType: .review,
             terminalDisposition: .completed,
             usedAgentOutputAsPrompt: false,
-            effectivePrompt: "  \n"
+            effectivePrompt: "  \n",
+            callerInstructions: ""
         ) else {
             return XCTFail("Empty committed prompt must fail a requested response")
         }
-        XCTAssertTrue(emptyPromptError.contains("without a prompt"))
+        XCTAssertTrue(missingCallerTaskError.contains("without a prompt"))
+        XCTAssertTrue(missingCallerTaskError.contains("no caller task or context"))
+
+        guard case let .failed(copiedDiscoveryError) = MCPContextBuilderToolProvider.responseDisposition(
+            responseType: .plan,
+            terminalDisposition: .completed,
+            usedAgentOutputAsPrompt: true,
+            effectivePrompt: "Agent output",
+            callerInstructions: ""
+        ) else {
+            return XCTFail("Copied discovery output without a caller task must fail a requested response")
+        }
+        XCTAssertTrue(copiedDiscoveryError.contains("without a prompt"))
+        XCTAssertTrue(copiedDiscoveryError.contains("only copied discovery output"))
+
+        guard case let .failed(malformedMarkupError) = MCPContextBuilderToolProvider.responseDisposition(
+            responseType: .question,
+            terminalDisposition: .completed,
+            usedAgentOutputAsPrompt: true,
+            effectivePrompt: "Agent output",
+            callerInstructions: "<task>Caller task</task><discovery_agent-guidelines>hidden"
+        ) else {
+            return XCTFail("Malformed reserved markup must fail closed for a requested response")
+        }
+        XCTAssertTrue(malformedMarkupError.contains("without a prompt"))
+        XCTAssertTrue(malformedMarkupError.contains("malformed discovery-guideline markup"))
+        XCTAssertFalse(malformedMarkupError.contains("hidden"))
     }
 
     @MainActor
@@ -542,11 +904,17 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
 }
 
 private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProvider {
+    private let discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder?
+
+    init(discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder? = nil) {
+        self.discoveryInputRecorder = discoveryInputRecorder
+    }
+
     func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        _ = message
+        await discoveryInputRecorder?.record(message.userMessage)
         let stream = AsyncThrowingStream<AIStreamResult, Error> { continuation in
             continuation.yield(AIStreamResult(type: "content", text: "Discovery complete"))
             continuation.finish()
@@ -558,6 +926,18 @@ private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProv
     }
 
     func dispose() async {}
+}
+
+private actor ContextBuilderDiscoveryInputRecorder {
+    private var inputs: [String] = []
+
+    func record(_ input: String) {
+        inputs.append(input)
+    }
+
+    func snapshot() -> [String] {
+        inputs
+    }
 }
 
 private actor ContextBuilderProviderStageRecorder {
@@ -592,6 +972,23 @@ private actor ContextBuilderFollowUpInvocationRecorder {
 
     func snapshot() -> Invocation? {
         invocation
+    }
+}
+
+private final class ContextBuilderCommittedSnapshotRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captures: [(runID: UUID, snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot)] = []
+
+    func record(runID: UUID, snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot) {
+        lock.lock()
+        defer { lock.unlock() }
+        captures.append((runID: runID, snapshot: snapshot))
+    }
+
+    func snapshotAll() -> [(runID: UUID, snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captures
     }
 }
 

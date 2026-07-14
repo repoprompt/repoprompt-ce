@@ -1,8 +1,16 @@
 import MCP
 @testable import RepoPromptApp
+import RepoPromptShared
 import XCTest
 
 final class MCPMutationRetryableFailureTests: XCTestCase {
+    func testMutationFreshnessTimeoutHasHeadroomBeforeBoundedToolWatchdog() {
+        XCTAssertLessThan(
+            MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeoutSeconds,
+            MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds
+        )
+    }
+
     func testMutationScopeFailureClassifiesFailClosedAndMissingWorktreeScopes() async {
         let store = WorkspaceFileContextStore()
 
@@ -38,6 +46,36 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         XCTAssertTrue(missing?.errorMessage.contains("physical") ?? false, missing?.errorMessage ?? "nil")
     }
 
+    func testWorkspaceFreshnessFailureIsExplicitlyPreMutationAndSafeToRetry() {
+        let failure = MCPMutationRetryableFailure.workspaceFreshnessUnavailable()
+        XCTAssertEqual(failure.errorCode, "workspace_freshness_timeout")
+        XCTAssertTrue(failure.retryable)
+        XCTAssertTrue(failure.errorMessage.contains("No filesystem mutation was started"))
+        XCTAssertTrue(failure.suggestion.contains("replay is safe"))
+    }
+
+    func testUnhydratedInactiveAgentRouteFailsRetryablyBeforeLookupHydration() {
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: 1,
+            workspaceID: UUID(),
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "Inactive Agent",
+            runID: nil,
+            activeAgentSessionID: UUID(),
+            worktreeBindingState: .unhydrated,
+            explicitlyBound: true
+        )
+
+        let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(for: snapshot)
+
+        XCTAssertEqual(failure?.errorCode, "worktree_scope_hydrating")
+        XCTAssertEqual(failure?.retryable, true)
+        XCTAssertTrue(failure?.errorMessage.contains("No filesystem mutation was started") == true)
+    }
+
     func testApplyEditsProviderStopsOnMutationScopeFailureBeforeTranslationOrFreshness() throws {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPApplyEditsToolProvider.swift")
         let body = try XCTUnwrap(source.slice(
@@ -46,7 +84,9 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
 
         try Self.assertOrdered([
-            "let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)",
+            "let (resolvedContext, lookupContext) = try await dependencies.resolveMutationFileToolContext(",
+            "MCPMutationRetryableFailure.unresolvedRouteFailure(",
+            "return Self.retryableFailureSummary(request: request, failure: failure)",
             "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
             "return Self.retryableFailureSummary(request: request, failure: failure)",
             "let effectivePath = lookupContext.translateInputPath(request.path)",
@@ -62,12 +102,74 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
 
         try Self.assertOrdered([
-            "let lookupContext = await resolveFileToolLookupContext(from: metadata)",
+            "var (resolvedContext, lookupContext) = try await resolveMutationFileToolContext(",
+            "MCPMutationRetryableFailure.unresolvedRouteFailure(",
+            "throw failure",
             "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
             "throw failure",
             "let effectivePath = lookupContext.translateInputPath(path)",
             "awaitAppliedIngressForExplicitRequest("
         ], in: body)
+    }
+
+    func testMoveUsesOneSharedFreshnessDeadlineForSourceAndDestination() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "    private func performFileAction(\n",
+            to: "    /// Creates a **new** file"
+        ))
+
+        let preflight = try XCTUnwrap(body.slice(
+            from: "        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)\n",
+            to: "        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility, transition: .completed)"
+        ))
+        XCTAssertTrue(preflight.contains("let mutationPaths = [effectivePath] + (effectiveNewPath.map { [$0] } ?? [])"))
+        XCTAssertTrue(preflight.contains("awaitAppliedIngressForExplicitRequests(\n                userPaths: mutationPaths"))
+        XCTAssertEqual(
+            preflight.components(separatedBy: "mutationPreflightFreshnessWaitTimeout").count - 1,
+            1,
+            "source and destination must share one timeout race so the structured freshness failure wins before the outer watchdog"
+        )
+        XCTAssertFalse(preflight.contains("awaitAppliedIngressForExplicitRequest(\n"))
+        try Self.assertOrdered([
+            "let mutationPaths = [effectivePath] + (effectiveNewPath.map { [$0] } ?? [])",
+            "awaitAppliedIngressForExplicitRequests(",
+            "catch is WorkspaceAppliedIngressWaitError",
+            "throw MCPMutationRetryableFailure.workspaceFreshnessUnavailable()"
+        ], in: preflight)
+    }
+
+    func testCreateSelectionUsesCanonicalPersistencePath() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "    private func performFileAction(\n",
+            to: "    /// Creates a **new** file"
+        ))
+
+        try Self.assertOrdered([
+            "freshness = \"pending\"",
+            "let baseSelection = resolvedContext.snapshot.selection",
+            "let requestedSelection = addResult.selection",
+            "resolvedContext.snapshot.selection = requestedSelection",
+            "persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)",
+            "requireCanonicalSelection(",
+            "warning: acknowledgementWarnings.isEmpty ? nil"
+        ], in: body)
+        XCTAssertFalse(body.contains("private discovery selection"))
+        XCTAssertTrue(body.contains("use operation ID \\(operationID) only to correlate this result"))
+        XCTAssertFalse(body.contains("reconcile using operation ID"))
+    }
+
+    func testFileActionsOperationIDSchemaDescribesCorrelationWithoutJournalSemantics() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "    private func fileActionsTool() -> Tool {",
+            to: "    private func getCodeStructureTool() -> Tool"
+        ))
+
+        XCTAssertTrue(body.contains("caller-stable correlation ID"))
+        XCTAssertTrue(body.contains("not a deduplication or status lookup key"))
+        XCTAssertFalse(body.contains("reconciling a lost mutation reply"))
     }
 
     func testFileActionsToolConvertsRetryableMutationFailureToStructuredReply() throws {
@@ -78,7 +180,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
 
         try Self.assertOrdered([
-            "let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)",
+            "let acknowledgement = try await dependencies.performFileAction(action, path, content, newPath, ifExists, operationID)",
             "catch let failure as MCPMutationRetryableFailure",
             "ToolResultDTOs.FileActionReply.retryableFailure(",
             "failure: failure"

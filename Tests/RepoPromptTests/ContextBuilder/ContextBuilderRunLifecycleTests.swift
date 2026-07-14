@@ -44,6 +44,9 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             returning: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion(
                 runID: record.runID,
                 tabID: tabID,
+                identity: nil,
+                agentKind: nil,
+                modelRaw: nil,
                 terminalDisposition: .completed,
                 agentOutput: "done",
                 usedAgentOutputAsPrompt: false,
@@ -1173,6 +1176,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
 
             let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: composition.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
@@ -1384,6 +1391,13 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 let tabID = try XCTUnwrap(
                     activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
                 )
+                ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                    apiSettingsViewModel: composition.apiSettingsViewModel,
+                    workspaceID: activeWorkspace.id,
+                    agent: .codexExec,
+                    modelRaw: AgentModel.gpt55CodexLow.rawValue
+                )
+
                 let viewModel = composition.contextBuilderAgentViewModel
                 let savedAgent = viewModel.selectedAgent
                 let savedModelRaw = viewModel.selectedModelRaw

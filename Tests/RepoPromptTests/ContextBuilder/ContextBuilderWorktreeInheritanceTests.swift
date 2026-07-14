@@ -12,6 +12,67 @@ import XCTest
 
     @MainActor
     final class ContextBuilderWorktreeInheritanceTests: XCTestCase {
+        func testExplicitInactiveWorkspaceContextBuilderUsesTargetAuthorityWithoutVisibleProjection() async throws {
+            try await runInactiveWorkspaceAuthorityScenario(
+                bindTargetFirst: false,
+                validationStartsIncomplete: true
+            )
+        }
+
+        func testBoundInactiveWorkspaceContextBuilderUsesTargetAuthorityWithoutVisibleProjection() async throws {
+            try await runInactiveWorkspaceAuthorityScenario(bindTargetFirst: true)
+        }
+
+        func testInactiveWorkspaceContextBuilderSurvivesVisibleTabSwitchAndCancelsWithoutLateProjection() async throws {
+            try await runInactiveWorkspaceAuthorityScenario(bindTargetFirst: false, cancelDuringRun: true)
+        }
+
+        func testInactiveWorkspaceContextBuilderFailsClosedWhenTargetProjectionIsUnavailable() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let state = ContextBuilderWorktreeProbeState()
+                let factory = ContextBuilderWorktreeProbeFactory(state: state)
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    contextBuilderProviderFactory: factory.makeProvider
+                )
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let workspaceB = try XCTUnwrap(
+                        fixture.contextB.window.workspaceManager.workspaces.first {
+                            $0.id == fixture.contextB.workspaceID
+                        }
+                    )
+                    fixture.contextB.window.workspaceManager.workspaces.removeAll {
+                        $0.id == fixture.contextB.workspaceID
+                    }
+                    fixture.contextA.window.workspaceManager.workspaces.append(workspaceB)
+                    let endpoint = try fixture.endpointA()
+                    let response = try await endpoint.callTool(
+                        name: MCPWindowToolName.contextBuilder,
+                        arguments: [
+                            "context_id": fixture.contextB.tabID.uuidString,
+                            "instructions": "Do not fall back to workspace A."
+                        ],
+                        timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
+                    )
+                    let errorText = try toolResultText(response)
+                    XCTAssertTrue(errorText.localizedCaseInsensitiveContains("projection"), errorText)
+                    XCTAssertEqual(state.providerCreationCount, 0)
+                    XCTAssertEqual(fixture.contextA.window.workspaceManager.activeWorkspaceID, fixture.contextA.workspaceID)
+                    XCTAssertEqual(
+                        fixture.contextA.window.mcpServer.connectionBindingSnapshot(
+                            forConnection: endpoint.connectionID
+                        ).bindingKind,
+                        .unbound
+                    )
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let state = ContextBuilderWorktreeProbeState()
@@ -231,7 +292,8 @@ import XCTest
                         )
                     }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
+                        _, identity, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
+                        let tabID = identity.tabID
                         XCTAssertEqual(agentModeSessionID, sessionID)
                         XCTAssertEqual(agentModeRunID, parentRunID)
                         XCTAssertEqual(reviewGitContext.compareIntent, .uncommittedHEAD)
@@ -993,7 +1055,8 @@ import XCTest
                             )
                         }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, routedSessionID, routedRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
+                        _, identity, routedSessionID, routedRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
+                        let tabID = identity.tabID
                         XCTAssertEqual(routedSessionID, sessionID)
                         XCTAssertEqual(routedRunID, parentRunID)
                         let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
@@ -1267,7 +1330,8 @@ import XCTest
                             )
                         }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, _, _, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
+                        _, identity, _, _, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
+                        let tabID = identity.tabID
                         let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
@@ -1736,6 +1800,385 @@ import XCTest
             throw failure("Timed out waiting for codemap containing \(expectedText) in \(relativePath)")
         }
 
+        private func runInactiveWorkspaceAuthorityScenario(
+            bindTargetFirst: Bool,
+            cancelDuringRun: Bool = false,
+            validationStartsIncomplete: Bool = false
+        ) async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let state = ContextBuilderWorktreeProbeState()
+                let factory = ContextBuilderWorktreeProbeFactory(state: state)
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    contextBuilderProviderFactory: factory.makeProvider
+                )
+                let settings = GlobalSettingsStore.shared
+                let previousPresetSetting = settings.mcpShowModelPresets()
+                settings.setMCPShowModelPresets(false, commit: false)
+                defer { settings.setMCPShowModelPresets(previousPresetSetting, commit: false) }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let window = fixture.contextA.window
+                    let sourceWorkspaceB = try XCTUnwrap(
+                        fixture.contextB.window.workspaceManager.workspaces.first {
+                            $0.id == fixture.contextB.workspaceID
+                        }
+                    )
+                    fixture.contextB.window.workspaceManager.workspaces.removeAll {
+                        $0.id == fixture.contextB.workspaceID
+                    }
+                    window.workspaceManager.workspaces.append(sourceWorkspaceB)
+                    let loadedBRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                        in: window,
+                        path: fixture.contextB.rootURL.path
+                    )
+                    defer { Task { await window.workspaceFileContextStore.unloadRoot(id: loadedBRoot.id) } }
+
+                    window.apiSettingsViewModel.isClaudeCodeConnected = true
+                    window.apiSettingsViewModel.isCodexConnected = true
+                    if validationStartsIncomplete {
+                        window.apiSettingsViewModel.test_resetContextBuilderProviderValidation()
+                        XCTAssertFalse(window.apiSettingsViewModel.isContextBuilderProviderValidationComplete)
+                        window.contextBuilderAgentViewModel.installRunTestHooks(
+                            ContextBuilderAgentViewModel.RunTestHooks(
+                                beforeProcessingProviderEvent: nil,
+                                providerEventDisposition: nil,
+                                teardownCompleted: nil,
+                                validateContextBuilderProviders: {
+                                    window.apiSettingsViewModel.test_completeContextBuilderProviderValidation(
+                                        verifiedProviders: [.claudeCode, .codexExec]
+                                    )
+                                }
+                            )
+                        )
+                    } else {
+                        window.apiSettingsViewModel.test_completeContextBuilderProviderValidation(
+                            verifiedProviders: [.claudeCode, .codexExec]
+                        )
+                    }
+                    defer { window.contextBuilderAgentViewModel.installRunTestHooks(nil) }
+                    settings.setWorkspaceAgentModelsProfile(
+                        workspaceID: fixture.contextA.workspaceID,
+                        profile: AgentModelsSettingsProfile(
+                            planningModelRaw: AIModel.claude4Sonnet.rawValue,
+                            contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+                            contextBuilderModelsByAgent: [
+                                AgentProviderKind.claudeCode.rawValue: AgentModel.claudeSonnet.rawValue
+                            ]
+                        )
+                    )
+                    settings.setWorkspaceAgentModelsProfile(
+                        workspaceID: fixture.contextB.workspaceID,
+                        profile: AgentModelsSettingsProfile(
+                            planningModelRaw: AIModel.gpt54Pro.rawValue,
+                            contextBuilderAgentRaw: AgentProviderKind.codexExec.rawValue,
+                            contextBuilderModelsByAgent: [
+                                AgentProviderKind.codexExec.rawValue: AgentModel.gpt55CodexLow.rawValue
+                            ]
+                        )
+                    )
+                    var settingsB = settings.chatSettings(for: fixture.contextB.workspaceID)
+                    settingsB.discoveryTokenBudget = 43210
+                    settingsB.discoveryPlanTokenBudget = 54321
+                    settingsB.discoveryAllowClarifyingQuestionsForMCP = true
+                    settingsB.discoveryQuestionTimeoutSeconds = 91
+                    settings.updateChatSettings(settingsB, commit: false)
+                    var settingsA = settings.chatSettings(for: fixture.contextA.workspaceID)
+                    settingsA.discoveryAllowClarifyingQuestionsForMCP = true
+                    settingsA.discoveryQuestionTimeoutSeconds = 7
+                    settings.updateChatSettings(settingsA, commit: false)
+                    _ = await window.selectionCoordinator.persistSelection(
+                        StoredSelection(
+                            selectedPaths: [fixture.contextB.fileURL.path],
+                            codemapAutoEnabled: false
+                        ),
+                        for: WorkspaceSelectionIdentity(
+                            workspaceID: fixture.contextB.workspaceID,
+                            tabID: fixture.contextB.tabID
+                        ),
+                        source: .mcpTabContext,
+                        mirrorToUIIfActive: false
+                    )
+                    window.contextBuilderAgentViewModel.refreshActiveSessionBindings()
+                    await Task.yield()
+
+                    let gate = cancelDuringRun ? ContextBuilderProbeGate() : nil
+                    factory.configure(
+                        networkManager: fixture.networkManager,
+                        logicalFilePath: fixture.contextB.fileURL.path,
+                        searchPattern: fixture.contextB.sentinel,
+                        probeCodeStructure: false,
+                        promptText: "B generated prompt",
+                        gate: gate
+                    )
+                    window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
+                        contextBuilderViewModel, identity, _, _, mode, _, _, _, _, _, _, _ in
+                        XCTAssertEqual(identity.workspaceID, fixture.contextB.workspaceID)
+                        XCTAssertEqual(identity.tabID, fixture.contextB.tabID)
+                        XCTAssertEqual(
+                            contextBuilderViewModel.sessions[identity.tabID]?.mcpPlanningModelRaw,
+                            AIModel.gpt54Pro.rawValue
+                        )
+                        return ChatSendReply(
+                            chatId: UUID(),
+                            shortId: "inactive-b-plan",
+                            mode: mode.mcpModeName,
+                            response: "B-scoped plan",
+                            errors: nil
+                        )
+                    }
+                    defer { window.mcpServer.setContextBuilderFollowUpOverrideForTesting(nil) }
+
+                    let viewModel = window.contextBuilderAgentViewModel
+                    let visibleBefore = (
+                        workspaceID: window.workspaceManager.activeWorkspaceID,
+                        tabID: window.promptManager.activeComposeTabID,
+                        agent: viewModel.selectedAgent,
+                        model: viewModel.selectedModelRaw,
+                        instructions: viewModel.contextBuilderInstructions,
+                        tokenBudget: viewModel.tokenBudget,
+                        log: viewModel.agentLog.map(\.message),
+                        busy: viewModel.isAgentBusy,
+                        controlled: viewModel.isMCPControlledRun
+                    )
+
+                    let endpoint = try fixture.endpointA()
+                    if bindTargetFirst {
+                        _ = try await endpoint.callTool(
+                            name: "bind_context",
+                            arguments: ["op": "bind", "context_id": fixture.contextB.tabID.uuidString]
+                        )
+                    }
+                    var arguments: [String: Any] = [
+                        "instructions": "Inspect workspace B only.",
+                        "response_type": "plan",
+                        "_rawJSON": true
+                    ]
+                    if !bindTargetFirst {
+                        arguments["context_id"] = fixture.contextB.tabID.uuidString
+                    }
+                    var removedTargetSnapshot: ComposeTabState?
+                    if let gate {
+                        let request = Task {
+                            try await endpoint.callTool(
+                                name: MCPWindowToolName.contextBuilder,
+                                arguments: arguments,
+                                timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
+                            )
+                        }
+                        try await gate.waitUntilArrived()
+
+                        let targetWorkspaceIndex = try XCTUnwrap(
+                            window.workspaceManager.workspaces.firstIndex { $0.id == fixture.contextB.workspaceID }
+                        )
+                        let completeTargetWorkspace = window.workspaceManager.workspaces[targetWorkspaceIndex]
+                        var transientReloadWorkspace = completeTargetWorkspace
+                        transientReloadWorkspace.composeTabs = []
+                        transientReloadWorkspace.activeComposeTabID = nil
+                        window.workspaceManager.workspaces[targetWorkspaceIndex] = transientReloadWorkspace
+                        try await Task.sleep(for: .milliseconds(50))
+                        XCTAssertTrue(viewModel.tabsWithActiveContextBuilderRun.contains(fixture.contextB.tabID))
+                        XCTAssertTrue(viewModel.sessions[fixture.contextB.tabID]?.isMCPControlledRun ?? false)
+                        window.workspaceManager.workspaces[targetWorkspaceIndex] = completeTargetWorkspace
+
+                        let replacementTab = ComposeTabState(name: "Visible A replacement")
+                        let workspaceIndex = try XCTUnwrap(
+                            window.workspaceManager.workspaces.firstIndex { $0.id == fixture.contextA.workspaceID }
+                        )
+                        window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(replacementTab)
+                        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = replacementTab.id
+                        window.promptManager.loadComposeTabsFromWorkspace(
+                            window.workspaceManager.workspaces[workspaceIndex],
+                            syncPromptText: true
+                        )
+                        await window.promptManager.switchComposeTab(replacementTab.id)
+
+                        let ambientTab = ComposeTabState(name: "Unrelated visible workspace")
+                        let ambientWorkspace = WorkspaceModel(
+                            name: "Unrelated visible workspace",
+                            repoPaths: [fixture.contextA.rootURL.path],
+                            ephemeralFlag: true,
+                            composeTabs: [ambientTab],
+                            activeComposeTabID: ambientTab.id
+                        )
+                        window.workspaceManager.workspaces.append(ambientWorkspace)
+                        await window.workspaceManager.switchWorkspace(
+                            to: ambientWorkspace,
+                            saveState: false,
+                            reason: "inactive Context Builder lifecycle regression"
+                        )
+                        let visibleAfterSwitch = (
+                            workspaceID: window.workspaceManager.activeWorkspaceID,
+                            tabID: window.promptManager.activeComposeTabID,
+                            agent: viewModel.selectedAgent,
+                            model: viewModel.selectedModelRaw,
+                            instructions: viewModel.contextBuilderInstructions,
+                            tokenBudget: viewModel.tokenBudget,
+                            log: viewModel.agentLog.map(\.message),
+                            busy: viewModel.isAgentBusy,
+                            controlled: viewModel.isMCPControlledRun
+                        )
+                        XCTAssertTrue(viewModel.tabsWithActiveContextBuilderRun.contains(fixture.contextB.tabID))
+                        XCTAssertTrue(viewModel.sessions[fixture.contextB.tabID]?.isMCPControlledRun ?? false)
+                        removedTargetSnapshot = window.workspaceManager.composeTab(for: WorkspaceSelectionIdentity(
+                            workspaceID: fixture.contextB.workspaceID,
+                            tabID: fixture.contextB.tabID
+                        ))
+                        window.workspaceManager.workspaces.removeAll { $0.id == fixture.contextB.workspaceID }
+                        for _ in 0 ..< 100 where viewModel.tabsWithActiveContextBuilderRun.contains(fixture.contextB.tabID) {
+                            try await Task.sleep(for: .milliseconds(10))
+                        }
+                        XCTAssertFalse(viewModel.tabsWithActiveContextBuilderRun.contains(fixture.contextB.tabID))
+                        await gate.release()
+                        let cancellationResponse = try await request.value
+                        let cancellationText = try toolResultText(cancellationResponse)
+                        XCTAssertTrue(
+                            cancellationText.localizedCaseInsensitiveContains("cancelled"),
+                            cancellationText
+                        )
+                        try await Task.sleep(for: .milliseconds(100))
+                        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, visibleAfterSwitch.workspaceID)
+                        XCTAssertEqual(window.promptManager.activeComposeTabID, visibleAfterSwitch.tabID)
+                        XCTAssertEqual(viewModel.selectedAgent, visibleAfterSwitch.agent)
+                        XCTAssertEqual(viewModel.selectedModelRaw, visibleAfterSwitch.model)
+                        XCTAssertEqual(viewModel.contextBuilderInstructions, visibleAfterSwitch.instructions)
+                        XCTAssertEqual(viewModel.tokenBudget, visibleAfterSwitch.tokenBudget)
+                        XCTAssertEqual(viewModel.agentLog.map(\.message), visibleAfterSwitch.log)
+                        XCTAssertEqual(viewModel.isAgentBusy, visibleAfterSwitch.busy)
+                        XCTAssertEqual(viewModel.isMCPControlledRun, visibleAfterSwitch.controlled)
+                        XCTAssertFalse(viewModel.tabsWithActiveContextBuilderRun.contains(fixture.contextB.tabID))
+                        XCTAssertFalse(viewModel.sessions[fixture.contextB.tabID]?.isMCPControlledRun ?? true)
+                    } else {
+                        let response = try await endpoint.callTool(
+                            name: MCPWindowToolName.contextBuilder,
+                            arguments: arguments,
+                            timeoutSeconds: contextBuilderWorktreeProbeRunTimeoutSeconds
+                        )
+                        let text = try toolResultText(response)
+                        XCTAssertTrue(text.contains(AgentProviderKind.codexExec.rawValue), text)
+                        XCTAssertTrue(text.contains(AgentModel.gpt55CodexLow.rawValue), text)
+                        XCTAssertTrue(text.contains(AIModel.gpt54Pro.displayName), text)
+                        XCTAssertTrue(text.contains("54321") || text.contains("54,321"), text)
+                    }
+                    let provider = try XCTUnwrap(state.providerCreations.last)
+                    if validationStartsIncomplete {
+                        XCTAssertTrue(window.apiSettingsViewModel.isContextBuilderProviderValidationComplete)
+                    }
+                    XCTAssertEqual(provider.agent, .codexExec)
+                    XCTAssertEqual(provider.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+                    XCTAssertEqual(provider.workspacePath, fixture.contextB.rootURL.standardizedFileURL.path)
+                    let run = try XCTUnwrap(state.runs.last)
+                    XCTAssertTrue(run.userMessage.contains(fixture.contextB.fileURL.lastPathComponent), run.userMessage)
+                    XCTAssertFalse(run.userMessage.contains(fixture.contextA.sentinel), run.userMessage)
+                    XCTAssertFalse(run.systemPrompt.contains("ask_user"), run.systemPrompt)
+                    if !cancelDuringRun {
+                        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, visibleBefore.workspaceID)
+                        XCTAssertEqual(window.promptManager.activeComposeTabID, visibleBefore.tabID)
+                        XCTAssertEqual(viewModel.selectedAgent, visibleBefore.agent)
+                        if validationStartsIncomplete {
+                            XCTAssertEqual(viewModel.selectedModelRaw, AgentModel.claudeSonnet.rawValue)
+                        } else {
+                            XCTAssertEqual(viewModel.selectedModelRaw, visibleBefore.model)
+                        }
+                        XCTAssertEqual(viewModel.contextBuilderInstructions, visibleBefore.instructions)
+                        XCTAssertEqual(viewModel.tokenBudget, visibleBefore.tokenBudget)
+                        XCTAssertEqual(viewModel.agentLog.map(\.message), visibleBefore.log)
+                        XCTAssertEqual(viewModel.isAgentBusy, visibleBefore.busy)
+                        XCTAssertEqual(viewModel.isMCPControlledRun, visibleBefore.controlled)
+                    }
+                    let storedB = try XCTUnwrap(
+                        removedTargetSnapshot ?? window.workspaceManager.composeTab(for: WorkspaceSelectionIdentity(
+                            workspaceID: fixture.contextB.workspaceID,
+                            tabID: fixture.contextB.tabID
+                        ))
+                    )
+                    XCTAssertFalse(storedB.selection.selectedPaths.isEmpty)
+                    if cancelDuringRun {
+                        XCTAssertEqual(storedB.promptText, "B generated prompt")
+                    } else {
+                        XCTAssertFalse(storedB.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        let visibleOracleSessionIDs = Set(window.oracleViewModel.sessions.map(\.id))
+                        let visibleOracleCurrentSessionID = window.oracleViewModel.currentSessionID
+                        let agentModeSessionID = UUID()
+                        let agentModeRunID = UUID()
+                        let persisted = try await window.oracleViewModel.createSessionFromHeadlessRun(
+                            prompt: "B-scoped prompt",
+                            response: "B-scoped response",
+                            model: .gpt54Pro,
+                            tokenInfo: ChatTokenInfo(),
+                            selection: storedB.selection,
+                            chatName: "Inactive B",
+                            chatPresetID: nil,
+                            tabID: fixture.contextB.tabID,
+                            workspaceID: fixture.contextB.workspaceID,
+                            agentModeSessionID: agentModeSessionID,
+                            agentModeRunID: agentModeRunID
+                        )
+                        XCTAssertEqual(persisted.session.workspaceID, fixture.contextB.workspaceID)
+                        XCTAssertEqual(persisted.session.composeTabID, fixture.contextB.tabID)
+                        XCTAssertEqual(persisted.session.agentModeSessionID, agentModeSessionID)
+                        XCTAssertEqual(persisted.session.agentModeRunID, agentModeRunID)
+                        XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(persisted.session.fileURL).path))
+                        XCTAssertEqual(Set(window.oracleViewModel.sessions.map(\.id)), visibleOracleSessionIDs)
+                        XCTAssertEqual(window.oracleViewModel.currentSessionID, visibleOracleCurrentSessionID)
+
+                        let continuedID = try await window.oracleViewModel.locateOrCreateChat(
+                            persisted.shortID,
+                            tabID: fixture.contextB.tabID,
+                            activateInUI: false,
+                            agentModeSessionID: agentModeSessionID,
+                            agentModeRunID: agentModeRunID
+                        )
+                        XCTAssertEqual(continuedID, persisted.session.id)
+                        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, fixture.contextA.workspaceID)
+                        XCTAssertEqual(window.oracleViewModel.currentSessionID, visibleOracleCurrentSessionID)
+                        XCTAssertTrue(window.oracleViewModel.sessions.contains(where: {
+                            $0.id == persisted.session.id
+                                && $0.agentModeSessionID == agentModeSessionID
+                                && $0.agentModeRunID == agentModeRunID
+                        }))
+                        do {
+                            _ = try await window.oracleViewModel.locateOrCreateChat(
+                                persisted.shortID,
+                                tabID: fixture.contextB.tabID,
+                                activateInUI: false,
+                                agentModeSessionID: agentModeSessionID,
+                                agentModeRunID: UUID()
+                            )
+                            XCTFail("Expected strict continuation ownership mismatch to fail closed")
+                        } catch {
+                            XCTAssertTrue(error.localizedDescription.contains("different Agent Mode owner"))
+                        }
+                        do {
+                            _ = try await window.oracleViewModel.createSessionFromHeadlessRun(
+                                prompt: "missing",
+                                response: "missing",
+                                model: .gpt54Pro,
+                                tokenInfo: ChatTokenInfo(),
+                                selection: StoredSelection(),
+                                chatName: nil,
+                                chatPresetID: nil,
+                                tabID: UUID(),
+                                workspaceID: UUID()
+                            )
+                            XCTFail("Expected unavailable inactive Oracle workspace to fail closed")
+                        } catch {
+                            XCTAssertTrue(error is ChatSessionError, error.localizedDescription)
+                        }
+                        XCTAssertEqual(
+                            Set(window.oracleViewModel.sessions.map(\.id)),
+                            visibleOracleSessionIDs.union([persisted.session.id])
+                        )
+                    }
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
             let workspace = try XCTUnwrap(
                 context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
@@ -1747,6 +2190,11 @@ import XCTest
             )
             let activeWorkspace = try XCTUnwrap(context.window.workspaceManager.activeWorkspace)
             context.window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: context.window.apiSettingsViewModel,
+                workspaceID: context.workspaceID
+            )
         }
 
         private func configureAgentModeEndpoint(
@@ -1875,6 +2323,8 @@ import XCTest
             let searchPattern: String
             let publishImplicitGitArtifacts: Bool
             let probeCodeStructure: Bool
+            let promptText: String?
+            let gate: ContextBuilderProbeGate?
         }
 
         private let state: ContextBuilderWorktreeProbeState
@@ -1889,14 +2339,18 @@ import XCTest
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool = false,
-            probeCodeStructure: Bool = CodemapE2ETestGate.isEnabled
+            probeCodeStructure: Bool = CodemapE2ETestGate.isEnabled,
+            promptText: String? = nil,
+            gate: ContextBuilderProbeGate? = nil
         ) {
             configuration = Configuration(
                 networkManager: networkManager,
                 logicalFilePath: logicalFilePath,
                 searchPattern: searchPattern,
                 publishImplicitGitArtifacts: publishImplicitGitArtifacts,
-                probeCodeStructure: probeCodeStructure
+                probeCodeStructure: probeCodeStructure,
+                promptText: promptText,
+                gate: gate
             )
         }
 
@@ -1905,8 +2359,7 @@ import XCTest
             modelString: String?,
             workspacePath: String?
         ) -> HeadlessAgentProvider {
-            _ = modelString
-            state.recordProviderCreation()
+            state.recordProviderCreation(agent: agent, modelRaw: modelString, workspacePath: workspacePath)
             guard let configuration else {
                 preconditionFailure("Context Builder probe provider used before configuration")
             }
@@ -1920,8 +2373,10 @@ import XCTest
                 searchPattern: configuration.searchPattern,
                 publishImplicitGitArtifacts: configuration.publishImplicitGitArtifacts,
                 probeCodeStructure: configuration.probeCodeStructure,
+                promptText: configuration.promptText,
                 clientName: clientName,
-                workspacePath: workspacePath
+                workspacePath: workspacePath,
+                gate: configuration.gate
             )
         }
     }
@@ -1933,8 +2388,10 @@ import XCTest
         private let searchPattern: String
         private let publishImplicitGitArtifacts: Bool
         private let probeCodeStructure: Bool
+        private let promptText: String?
         private let clientName: String
         private let workspacePath: String?
+        private let gate: ContextBuilderProbeGate?
         private var endpoint: PersistentMCPTestEndpoint?
         private var activeRunID: UUID?
 
@@ -1945,8 +2402,10 @@ import XCTest
             searchPattern: String,
             publishImplicitGitArtifacts: Bool,
             probeCodeStructure: Bool,
+            promptText: String?,
             clientName: String,
-            workspacePath: String?
+            workspacePath: String?,
+            gate: ContextBuilderProbeGate?
         ) {
             self.state = state
             self.networkManager = networkManager
@@ -1954,8 +2413,10 @@ import XCTest
             self.searchPattern = searchPattern
             self.publishImplicitGitArtifacts = publishImplicitGitArtifacts
             self.probeCodeStructure = probeCodeStructure
+            self.promptText = promptText
             self.clientName = clientName
             self.workspacePath = workspacePath
+            self.gate = gate
         }
 
         func streamAgentMessage(
@@ -1979,6 +2440,7 @@ import XCTest
                     MCPWindowToolName.search,
                     MCPWindowToolName.getCodeStructure,
                     MCPWindowToolName.manageSelection,
+                    MCPWindowToolName.prompt,
                     MCPWindowToolName.workspaceContext,
                     MCPWindowToolName.git
                 ]
@@ -2038,6 +2500,13 @@ import XCTest
                 ],
                 timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
             ))
+            if let promptText {
+                _ = try await endpoint.callTool(
+                    name: MCPWindowToolName.prompt,
+                    arguments: ["op": "set", "text": promptText],
+                    timeoutSeconds: contextBuilderWorktreeProbeToolTimeoutSeconds
+                )
+            }
             let git: String? = if publishImplicitGitArtifacts {
                 try await toolResultText(endpoint.callTool(
                     name: MCPWindowToolName.git,
@@ -2062,6 +2531,7 @@ import XCTest
             ))
             await state.recordRun(ContextBuilderWorktreeProbeState.Run(
                 workspacePath: workspacePath,
+                systemPrompt: message.systemPrompt,
                 userMessage: message.userMessage,
                 selectionBeforeRead: selectionBeforeRead,
                 tree: tree,
@@ -2073,6 +2543,7 @@ import XCTest
                 git: git,
                 workspaceContext: workspaceContext
             ))
+            await gate?.arriveAndWait()
 
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: "Context selected."))
@@ -2192,6 +2663,7 @@ import XCTest
 
         struct Run {
             let workspacePath: String?
+            let systemPrompt: String
             let userMessage: String
             let selectionBeforeRead: SelectionObservation
             let tree: String
@@ -2220,12 +2692,14 @@ import XCTest
         }
 
         private(set) var providerCreationCount = 0
+        private(set) var providerCreations: [(agent: AgentProviderKind, modelRaw: String?, workspacePath: String?)] = []
         private(set) var runs: [Run] = []
         private(set) var followUps: [FollowUp] = []
         private(set) var accounting: [Accounting] = []
 
-        func recordProviderCreation() {
+        func recordProviderCreation(agent: AgentProviderKind, modelRaw: String?, workspacePath: String?) {
             providerCreationCount += 1
+            providerCreations.append((agent, modelRaw, workspacePath))
         }
 
         func recordRun(_ run: Run) {
@@ -2260,6 +2734,29 @@ import XCTest
                 selection: selection,
                 lookupContext: lookupContext
             ))
+        }
+    }
+
+    private actor ContextBuilderProbeGate {
+        private var arrived = false
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+        func arriveAndWait() async {
+            arrived = true
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+            }
+        }
+
+        func waitUntilArrived() async throws {
+            while !arrived {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        func release() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
         }
     }
 #endif

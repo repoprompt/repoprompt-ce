@@ -78,6 +78,9 @@ extension Notification.Name {
     /// Posted when a compose tab's persisted display name changes.
     /// userInfo: ["tabID": UUID, "windowID": Int, "name": String]
     static let composeTabNameChanged = Notification.Name("composeTabNameChanged")
+    /// Posted when a compose tab is linked to or unlinked from a persistent Agent session.
+    /// userInfo: ["tabID": UUID, "windowID": Int, "previousSessionID": UUID?, "sessionID": UUID?]
+    static let agentSessionBindingDidChange = Notification.Name("agentSessionBindingDidChange")
 
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.

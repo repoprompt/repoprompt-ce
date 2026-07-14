@@ -4162,6 +4162,13 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @MainActor
+    func setActiveChatSessionID(_ sessionID: UUID?, for identity: WorkspaceSelectionIdentity) {
+        guard var tab = composeTab(for: identity) else { return }
+        tab.activeChatSessionID = sessionID
+        _ = updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID)
+    }
+
+    @MainActor
     func activeChatSessionID(forTabID tabID: UUID) -> UUID? {
         composeTab(with: tabID)?.activeChatSessionID
     }

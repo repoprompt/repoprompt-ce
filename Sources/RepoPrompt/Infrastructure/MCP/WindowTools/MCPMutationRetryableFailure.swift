@@ -27,6 +27,34 @@ struct MCPMutationRetryableFailure: Error, Equatable {
         )
     }
 
+    static func workspaceFreshnessUnavailable() -> MCPMutationRetryableFailure {
+        MCPMutationRetryableFailure(
+            errorCode: "workspace_freshness_timeout",
+            errorMessage: "Workspace file ingress did not become fresh before mutation. No filesystem mutation was started.",
+            retryable: true,
+            retryAfterMilliseconds: retryDelayMilliseconds,
+            suggestion: "Retry after the suggested delay. This failure occurred before mutation, so replay is safe."
+        )
+    }
+
+    static func worktreeScopeHydrating() -> MCPMutationRetryableFailure {
+        MCPMutationRetryableFailure(
+            errorCode: "worktree_scope_hydrating",
+            errorMessage: "The inactive Agent tab's worktree scope is still being restored. No filesystem mutation was started.",
+            retryable: true,
+            retryAfterMilliseconds: retryDelayMilliseconds,
+            suggestion: "Retry after the suggested delay. This failure occurred before mutation, so replay is safe."
+        )
+    }
+
+    static func unresolvedRouteFailure(
+        for snapshot: MCPServerViewModel.TabContextSnapshot
+    ) -> MCPMutationRetryableFailure? {
+        guard snapshot.activeAgentSessionID != nil else { return nil }
+        guard case .unhydrated = snapshot.worktreeBindingState else { return nil }
+        return .worktreeScopeHydrating()
+    }
+
     @MainActor
     static func mutationScopeFailure(
         for lookupContext: WorkspaceLookupContext,

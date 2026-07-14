@@ -34,7 +34,7 @@ enum MCPContextBuilderGitReviewPolicyError: Equatable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .targetDeferred:
-            "Context Builder review target election is deferred until discovery commits its final selection."
+            "Context Builder review target election is deferred until discovery completes and freezes its review target."
         case let .targetUnavailable(reason):
             reason.localizedDescription
         case .publicationOutsideFrozenTarget:

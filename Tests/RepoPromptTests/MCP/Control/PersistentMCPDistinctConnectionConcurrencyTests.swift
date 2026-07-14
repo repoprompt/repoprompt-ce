@@ -1394,6 +1394,45 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
     }
 
+    /// Opt-in steady-state readiness for tests that inject a synthetic Context Builder provider.
+    ///
+    /// Workspace IDs in these fixtures are freshly generated, and the settings store has no API
+    /// to remove a workspace profile. Keeping the seed workspace-scoped therefore bounds retained
+    /// test settings to an unreachable unique ID without mutating the global Agent Models profile.
+    @MainActor
+    enum ContextBuilderTestReadinessSupport {
+        static func seedCanonicalProviderReadiness(
+            apiSettingsViewModel: APISettingsViewModel,
+            workspaceID: UUID,
+            agent: AgentProviderKind = .claudeCode,
+            modelRaw: String = AgentModel.claudeSonnet.rawValue
+        ) {
+            switch agent {
+            case .claudeCode:
+                apiSettingsViewModel.isClaudeCodeConnected = true
+            case .codexExec:
+                apiSettingsViewModel.isCodexConnected = true
+            default:
+                preconditionFailure("Unsupported synthetic Context Builder test provider: \(agent.rawValue)")
+            }
+            apiSettingsViewModel.test_completeContextBuilderProviderValidation(
+                verifiedProviders: [agent]
+            )
+
+            let settings = GlobalSettingsStore.shared
+            var profile = settings.effectiveAgentModelsProfile(workspaceID: workspaceID)
+            profile.contextBuilderAgentRaw = agent.rawValue
+            profile = profile.replacingContextBuilderModel(
+                modelRaw,
+                for: agent.rawValue
+            )
+            settings.setWorkspaceAgentModelsProfile(
+                workspaceID: workspaceID,
+                profile: profile
+            )
+        }
+    }
+
     @MainActor
     final class PersistentMCPTestFixture {
         static let sharedSearchToken = "distinct_mcp_connection_shared_search_token"
