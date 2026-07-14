@@ -462,6 +462,15 @@ public enum AIModel: Equatable, Hashable {
 
     private static let openAITierPrefix = "openai_tier__"
 
+    static func rawValueWithoutOpenAIServiceTier(_ rawValue: String) -> String {
+        let normalizedRawValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedRawValue.hasPrefix(openAITierPrefix) else { return rawValue }
+        let rest = String(normalizedRawValue.dropFirst(openAITierPrefix.count))
+        let parts = rest.components(separatedBy: "__")
+        guard parts.count >= 2 else { return rawValue }
+        return parts.dropFirst().joined(separator: "__")
+    }
+
     /// Returns the service tier override if this is a tier variant, nil otherwise
     var openAIServiceTierOverride: String? {
         if case let .openAIServiceTierVariant(_, tier) = self { return tier }
@@ -1179,6 +1188,9 @@ public enum AIModel: Equatable, Hashable {
                 let tier = parts[0]
                 let baseRaw = parts.dropFirst().joined(separator: "__")
                 if let base = AIModel.fromModelName(baseRaw) {
+                    if !UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants") {
+                        return base
+                    }
                     return .openAIServiceTierVariant(base: base, tier: tier)
                 }
             }

@@ -18,6 +18,9 @@ SOURCE_GH_TOKEN="${SOURCE_GH_TOKEN:-${GH_TOKEN:-}}"
 PUBLIC_UPDATE_GH_TOKEN="${PUBLIC_UPDATE_GH_TOKEN:-}"
 REVIEWED_CHECKSUMS_SHA256="${REVIEWED_CHECKSUMS_SHA256:-}"
 ARCHIVE_BASENAME="${APP_NAME}-${MARKETING_VERSION}-${BUILD_NUMBER}"
+SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"
+SENTRY_DEPLOY_ENVIRONMENT="${REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT:-production}"
+SENTRY_API_BASE_URL="${REPOPROMPT_SENTRY_API_BASE_URL:-https://sentry.io/api/0}"
 DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"
 UPDATE_ZIP_NAME="$ARCHIVE_BASENAME.zip"
 DMG_NAME="$ARCHIVE_BASENAME.dmg"
@@ -34,6 +37,7 @@ SOURCE_RELEASE_ASSET_SNAPSHOT=""
 SOURCE_RELEASE_WAS_DRAFT=""
 UPDATE_RELEASE_STATE=""
 UPDATE_RELEASE_ASSET_SNAPSHOT=""
+SENTRY_CURL_CONFIG=""
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -68,6 +72,113 @@ cleanup() {
     [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+
+prepare_sentry_api_access() {
+    require_env REPOPROMPT_SENTRY_ORG
+    require_env REPOPROMPT_SENTRY_PROJECT
+    local token="${SENTRY_AUTH_TOKEN:-}"
+    if [[ -z "$token" ]]; then
+        local token_file="${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}"
+        [[ -n "$token_file" ]] || fail "Missing Sentry auth token file for stable promotion"
+        [[ -f "$token_file" ]] || fail "Sentry auth token file does not exist: $token_file"
+        token="$(tr -d '\r\n' < "$token_file")"
+    fi
+    [[ -n "$token" ]] || fail "Sentry auth token is empty"
+    [[ -n "$TMP_DIR" ]] || fail "Sentry API access requires verified promotion state"
+
+    SENTRY_CURL_CONFIG="$TMP_DIR/sentry-curl.conf"
+    (
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$token" > "$SENTRY_CURL_CONFIG"
+    )
+    chmod 600 "$SENTRY_CURL_CONFIG"
+    unset SENTRY_AUTH_TOKEN
+}
+
+sentry_deploy_endpoint() {
+    local encoded_org encoded_release
+    encoded_org="$(jq -rn --arg value "$REPOPROMPT_SENTRY_ORG" '$value | @uri')"
+    encoded_release="$(jq -rn --arg value "$SENTRY_RELEASE_NAME" '$value | @uri')"
+    printf '%s/organizations/%s/releases/%s/deploys/' \
+        "${SENTRY_API_BASE_URL%/}" "$encoded_org" "$encoded_release"
+}
+
+sentry_api_request() {
+    local method="$1"
+    local output_file="$2"
+    local body_file="${3:-}"
+    local args=(
+        --silent
+        --show-error
+        --output "$output_file"
+        --write-out '%{http_code}'
+        --request "$method"
+        --config "$SENTRY_CURL_CONFIG"
+        --header 'Accept: application/json'
+    )
+    if [[ -n "$body_file" ]]; then
+        args+=(--header 'Content-Type: application/json' --data-binary "@$body_file")
+    fi
+
+    local status
+    status="$(curl "${args[@]}" "$(sentry_deploy_endpoint)")" ||
+        fail "Unable to call the Sentry deploy API"
+    if [[ "$status" == "403" ]]; then
+        fail "Sentry deploy API rejected the promotion token (HTTP 403); verify the manual project:releases release gate"
+    fi
+    [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+        fail "Sentry deploy API request failed with HTTP $status"
+}
+
+list_matching_sentry_deploys() {
+    local output_file="$1"
+    sentry_api_request GET "$output_file"
+    jq -e '
+        type == "array" and
+        all(.[]; has("environment") and (.environment | type == "string") and
+            has("name") and ((.name == null) or (.name | type == "string")))
+    ' "$output_file" >/dev/null ||
+        fail "Sentry deploy API returned malformed JSON"
+    jq -r \
+        --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
+        --arg name "$RELEASE_TAG" \
+        '[.[] | select(.environment == $environment and .name == $name)] | length' \
+        "$output_file"
+}
+
+preflight_sentry_deploy_access() {
+    prepare_sentry_api_access
+    local matches
+    matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-preflight.json")"
+    [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
+    printf 'OK: Sentry deploy access verified for %s.\n' "$SENTRY_RELEASE_NAME"
+}
+
+record_verified_sentry_deploy_if_needed() {
+    local matches
+    matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-record.json")"
+    [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
+    if (( matches > 0 )); then
+        printf 'OK: Sentry production deploy already recorded for %s.\n' "$RELEASE_TAG"
+        return
+    fi
+
+    local body_file="$TMP_DIR/sentry-deploy-create.json"
+    jq -n \
+        --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
+        --arg name "$RELEASE_TAG" \
+        --arg project "$REPOPROMPT_SENTRY_PROJECT" \
+        '{environment: $environment, name: $name, projects: [$project]}' > "$body_file"
+    chmod 600 "$body_file"
+    sentry_api_request POST "$TMP_DIR/sentry-deploy-created.json" "$body_file"
+    jq -e \
+        --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
+        --arg name "$RELEASE_TAG" \
+        '.environment == $environment and .name == $name' \
+        "$TMP_DIR/sentry-deploy-created.json" >/dev/null ||
+        fail "Sentry deploy API returned a malformed create response"
+    printf 'OK: recorded Sentry production deploy for %s.\n' "$RELEASE_TAG"
+}
 
 source_gh() {
     GH_TOKEN="$SOURCE_GH_TOKEN" gh "$@"
@@ -374,7 +485,9 @@ verify_strictly_newer_build() {
         fail "Unable to query the current stable updater release: HTTP $latest_status"
     latest_json="$(cat "$latest_json_file")"
     latest_tag="$(jq -r .tag_name <<< "$latest_json")"
-    [[ "$latest_tag" != "$RELEASE_TAG" ]] || return
+    if [[ "$latest_tag" == "$RELEASE_TAG" ]]; then
+        return 0
+    fi
 
     latest_appcast="$TMP_DIR/latest-appcast.xml"
     curl_anonymous \
@@ -544,8 +657,10 @@ case "$MODE" in
         ;;
     promote)
         verify_source_release
+        preflight_sentry_deploy_access
         publish_reviewed_release
         verify_anonymous_publish
+        record_verified_sentry_deploy_if_needed
         ;;
     *)
         fail "Usage: $0 verify|promote"

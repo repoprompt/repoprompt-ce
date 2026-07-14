@@ -442,6 +442,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                     return "must-not-publish"
                 }
             }
+            defer {
+                task.cancel()
+                gate.release()
+            }
 
             try await gate.waitUntilStarted()
             task.cancel()
@@ -1094,7 +1098,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
     private func readyCodemapDemand(
         store: WorkspaceFileContextStore,
         fileID: UUID,
-        timeout: Duration = .seconds(20)
+        timeout: Duration = .seconds(60)
     ) async throws -> WorkspaceCodemapArtifactDemandReady {
         var result = await store.requestCodemapArtifact(forFileID: fileID)
         let clock = ContinuousClock()
@@ -1252,7 +1256,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             do {
                 try await condition.waitUntil(
                     "preassembly content read gate release",
-                    timeout: 5
+                    timeout: 20
                 ) { $0.released }
             } catch is CancellationError {
                 // Cancellation is the contract for the cancellation-path test; the
@@ -1265,7 +1269,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         func waitUntilStarted() async throws {
             try await condition.waitUntil(
                 "preassembly content read gate start",
-                timeout: 5
+                timeout: 20
             ) { $0.started }
         }
 

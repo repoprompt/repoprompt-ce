@@ -1113,8 +1113,8 @@ final class MCPServerViewModel: ObservableObject {
                 connectionID: connectionID
             )
             return MCPWindowToolDependencies.ContextBuilderTabResolution(
-                tabID: resolution.tabID,
-                workspaceID: resolution.workspaceID,
+                identity: resolution.identity,
+                nestedTabContext: resolution.nestedTabContext,
                 agentModeSessionID: resolution.agentModeSessionID,
                 agentModeRunID: resolution.agentModeRunID,
                 bindCaller: resolution.bindCaller,
@@ -1180,13 +1180,13 @@ final class MCPServerViewModel: ObservableObject {
                 _ = authorization
             #endif
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
                     return try await override(
                         contextBuilderVM,
-                        tabID,
+                        identity,
                         agentModeSessionID,
                         agentModeRunID,
                         mode,
@@ -1201,7 +1201,7 @@ final class MCPServerViewModel: ObservableObject {
                 }
             #endif
             return try await contextBuilderVM.runMCPPlanOrQuestion(
-                for: tabID,
+                for: identity,
                 oracleViewModel: oracleVM,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
@@ -1320,6 +1320,12 @@ final class MCPServerViewModel: ObservableObject {
         resolveFileToolLookupContext: { [weak self] metadata in
             guard let self else { return .visibleWorkspace }
             return await resolveFileToolLookupContext(from: metadata)
+        },
+        resolveMutationFileToolContext: { [weak self] metadata, toolName in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while resolving mutation worktree scope")
+            }
+            return try await resolveMutationFileToolContext(from: metadata, toolName: toolName)
         },
         stabilizedVirtualSelection: { [weak self] context in
             guard let self else { return context.selection }
@@ -1454,9 +1460,9 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return "Window deallocated while resolving selection inputs." }
             return await makeSelectionHintError(paths: paths, operation: operation, lookupContext: lookupContext)
         },
-        performFileAction: { [weak self] action, path, content, newPath, ifExists in
+        performFileAction: { [weak self] action, path, content, newPath, ifExists, operationID in
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
-            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
+            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists, operationID: operationID)
         },
         buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
@@ -3444,8 +3450,8 @@ final class MCPServerViewModel: ObservableObject {
         targetWindow: WindowState,
         connectionID: UUID?
     ) async throws -> (
-        tabID: UUID,
-        workspaceID: UUID?,
+        identity: WorkspaceSelectionIdentity,
+        nestedTabContext: TabContextSnapshot,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         bindCaller: Bool,
@@ -3523,10 +3529,34 @@ final class MCPServerViewModel: ObservableObject {
                 workspaceContext = nil
             }
 
-            let lookupContext: WorkspaceLookupContext = if let workspaceContext {
-                workspaceContext.lookupContext
+            let lookupContext: WorkspaceLookupContext
+            if let workspaceContext {
+                lookupContext = workspaceContext.lookupContext
+            } else if let workspaceID = context.workspaceID,
+                      workspaceID != targetWindow.workspaceManager.activeWorkspaceID
+            {
+                guard let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID }) else {
+                    throw MCPError.invalidParams("The inactive Context Builder workspace is no longer available.")
+                }
+                let canonicalPaths = Set(workspace.repoPaths.map(StandardizedPath.absolute))
+                let loadedPaths = await Set(
+                    targetWindow.promptManager.workspaceFileContextStore.rootRefs(scope: .allLoaded)
+                        .map(\.standardizedFullPath)
+                )
+                guard !canonicalPaths.isEmpty, canonicalPaths.isSubset(of: loadedPaths) else {
+                    throw MCPError.invalidParams(
+                        "The resolved Context Builder workspace projection is unavailable. Reload the target workspace before retrying."
+                    )
+                }
+                lookupContext = WorkspaceLookupContext(
+                    rootScope: .sessionBoundWorkspace(
+                        canonicalRootPaths: canonicalPaths,
+                        physicalRootPaths: []
+                    ),
+                    bindingProjection: nil
+                )
             } else {
-                try await targetWindow.mcpServer.resolveFileToolLookupContext(
+                lookupContext = try await targetWindow.mcpServer.resolveFileToolLookupContext(
                     tabID: context.tabID,
                     workspaceID: context.workspaceID
                 )
@@ -3544,9 +3574,14 @@ final class MCPServerViewModel: ObservableObject {
             }
             let agentModeSessionID = purpose == .agentModeRun ? context.activeAgentSessionID : nil
             let agentModeRunID = purpose == .agentModeRun ? context.runID : nil
+            guard let workspaceID = context.workspaceID else {
+                throw MCPError.invalidParams("context_builder resolved a tab without workspace authority.")
+            }
+            var nestedTabContext = context
+            nestedTabContext.frozenLookupContext = lookupContext
             return (
-                context.tabID,
-                context.workspaceID,
+                WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID),
+                nestedTabContext,
                 agentModeSessionID,
                 agentModeRunID,
                 shouldBindCaller,
@@ -3573,9 +3608,26 @@ final class MCPServerViewModel: ObservableObject {
             tabID: createdTab.id,
             base: "HEAD"
         )
+        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace is available for a fresh Context Builder tab.")
+        }
+        var nestedTabContext = TabContextSnapshot(
+            tabID: createdTab.id,
+            windowID: targetWindow.windowID,
+            workspaceID: activeWorkspace.id,
+            promptText: createdTab.promptText,
+            selection: createdTab.selection,
+            selectedMetaPromptIDs: createdTab.selectedMetaPromptIDs,
+            selectedContextBuilderPromptIDs: createdTab.contextBuilder.selectedContextBuilderPromptIDs,
+            tabName: createdTab.name,
+            runID: nil,
+            activeAgentSessionID: createdTab.activeAgentSessionID,
+            explicitlyBound: true
+        )
+        nestedTabContext.frozenLookupContext = .visibleWorkspace
         return (
-            createdTab.id,
-            targetWindow.workspaceManager.activeWorkspace?.id,
+            WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: createdTab.id),
+            nestedTabContext,
             nil,
             nil,
             true,
@@ -5808,20 +5860,26 @@ final class MCPServerViewModel: ObservableObject {
         path: String,
         content: String? = nil,
         newPath: String? = nil,
-        ifExists: String? = nil
-    ) async throws -> String? {
+        ifExists: String? = nil,
+        operationID: String
+    ) async throws -> MCPFileActionMutationAcknowledgement {
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks)
         // Enforce workspace presence in multi-window mode
         try await requireWorkspaceForTool(MCPWindowToolName.fileActions)
         try Task.checkCancellation()
         let metadata = await captureRequestMetadata()
-        var resolvedContext = try resolveTabContextSnapshot(
+        var (resolvedContext, lookupContext) = try await resolveMutationFileToolContext(
             from: metadata,
-            toolName: MCPWindowToolName.fileActions,
-            policy: .allowLegacyImplicitRouting
+            toolName: MCPWindowToolName.fileActions
         )
-        let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if !resolvedContext.usesActiveTabCompatibility,
+           let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
+               for: resolvedContext.snapshot
+           )
+        {
+            throw failure
+        }
         if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
             for: lookupContext,
             store: promptVM.workspaceFileContextStore
@@ -5836,15 +5894,15 @@ final class MCPServerViewModel: ObservableObject {
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)
-        _ = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: effectivePath,
-            fallbackScope: lookupContext.rootScope
-        )
-        if let effectiveNewPath {
-            _ = await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectiveNewPath,
-                fallbackScope: lookupContext.rootScope
+        do {
+            let mutationPaths = [effectivePath] + (effectiveNewPath.map { [$0] } ?? [])
+            _ = try await store.awaitAppliedIngressForExplicitRequests(
+                userPaths: mutationPaths,
+                fallbackScope: lookupContext.rootScope,
+                timeout: MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeout
             )
+        } catch is WorkspaceAppliedIngressWaitError {
+            throw MCPMutationRetryableFailure.workspaceFreshnessUnavailable()
         }
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility, transition: .completed)
         try Task.checkCancellation()
@@ -5882,7 +5940,6 @@ final class MCPServerViewModel: ObservableObject {
             default:
                 throw MCPError.invalidParams("invalid action: \(action). Must be 'create', 'delete', or 'move'")
             }
-            try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
         } catch is CancellationError {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
@@ -5900,56 +5957,82 @@ final class MCPServerViewModel: ObservableObject {
             throw MCPError.invalidParams("File action '\(action)' failed: \(error.localizedDescription)")
         }
 
-        // Ensure resulting synthetic publications are canonical before returning.
-        try Task.checkCancellation()
+        // The filesystem mutation is durable. From this point cancellation must not be
+        // misreported as a safe-to-retry pre-mutation failure.
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog)
-        _ = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: effectivePath,
-            fallbackScope: lookupContext.rootScope
-        )
-        if let effectiveNewPath {
-            _ = await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectiveNewPath,
-                fallbackScope: lookupContext.rootScope
+        var freshness = "fresh"
+        do {
+            _ = try await store.awaitAppliedIngressForExplicitRequest(
+                userPath: effectivePath,
+                fallbackScope: lookupContext.rootScope,
+                timeout: .seconds(2)
             )
+            if let effectiveNewPath {
+                _ = try await store.awaitAppliedIngressForExplicitRequest(
+                    userPath: effectiveNewPath,
+                    fallbackScope: lookupContext.rootScope,
+                    timeout: .seconds(2)
+                )
+            }
+        } catch {
+            freshness = "pending"
         }
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)
-        try Task.checkCancellation()
+        var acknowledgementWarnings: [String] = []
+        if freshness == "pending" {
+            acknowledgementWarnings.append(
+                "The filesystem mutation is durable, but workspace freshness is still pending. Inspect the filesystem with read_file or file_search and use operation ID \(operationID) only to correlate this result; do not blindly replay the mutation."
+            )
+        }
+        if Task.isCancelled {
+            acknowledgementWarnings.append(
+                "Reply delivery was cancelled after the durable mutation. Inspect the filesystem and use operation ID \(operationID) only to correlate this result; do not blindly replay."
+            )
+        }
         if action.lowercased() == "create", !resolvedContext.usesActiveTabCompatibility {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection)
+            let baseSelection = resolvedContext.snapshot.selection
             let addResult = await addStoredSelectionPaths(
-                existing: resolvedContext.snapshot.selection,
+                existing: baseSelection,
                 paths: [effectivePath],
                 rawPaths: [path],
                 mode: "full",
                 lookupRootScope: lookupContext.rootScope
             )
-            try Task.checkCancellation()
-            guard addResult.selection != resolvedContext.snapshot.selection else {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                return nil
-            }
-            resolvedContext.snapshot.selection = addResult.selection
-            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
-            try Task.checkCancellation()
-            do {
-                _ = try MCPSelectionToolProvider.requireCanonicalSelection(
-                    verification,
-                    requested: addResult.selection,
-                    tabID: resolvedContext.snapshot.tabID,
-                    operation: "file_actions create selection update",
-                    recovery: "Retry manage_selection for the same context_id."
+            let requestedSelection = addResult.selection
+            if requestedSelection != baseSelection {
+                resolvedContext.snapshot.selection = requestedSelection
+                let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+                do {
+                    _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                        verification,
+                        requested: requestedSelection,
+                        tabID: resolvedContext.snapshot.tabID,
+                        operation: "file_actions create selection update",
+                        recovery: "Retry manage_selection for the same context_id."
+                    )
+                } catch is CancellationError {
+                    acknowledgementWarnings.append(
+                        "The created path selection update was cancelled and was not confirmed."
+                    )
+                } catch {
+                    acknowledgementWarnings.append(
+                        "The file was created, but its selection was not confirmed. \(error)"
+                    )
+                }
+            } else if freshness == "pending" {
+                acknowledgementWarnings.append(
+                    "The created path selection was not confirmed while workspace freshness was pending."
                 )
-            } catch is CancellationError {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                throw CancellationError()
-            } catch {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                return "The file was created, but its selection was not confirmed. \(error)"
             }
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
         }
-        return nil
+        return MCPFileActionMutationAcknowledgement(
+            warning: acknowledgementWarnings.isEmpty ? nil : acknowledgementWarnings.joined(separator: " "),
+            operationID: operationID,
+            mutationState: "applied",
+            freshness: freshness
+        )
     }
 
     /// Creates a **new** file, with optional overwrite behavior.

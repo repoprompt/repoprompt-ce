@@ -758,8 +758,9 @@ final class CLIProcessRunner {
         workingDirectory: String?
     ) -> CLIProcessRunnerError {
         switch error {
-        case let .pipeCreationFailed(pipe):
-            return .spawnFailed("Failed to create \(pipe) pipe for process startup")
+        case let .pipeCreationFailed(label, errnoValue):
+            let message = String(cString: strerror(errnoValue))
+            return .spawnFailed("Failed to create \(label) pipe for process startup: \(message)")
         case let .descriptorConfigurationFailed(label, fd, underlying):
             let message = String(cString: strerror(underlying.errnoValue))
             return .spawnFailed("Failed to configure \(label) pipe descriptor \(fd) for process startup: \(message)")
@@ -849,6 +850,10 @@ final class CLIProcessRunner {
             return (exitCode, timedOut)
         } catch let terminationError as ProcessTerminationError {
             switch terminationError {
+            case let .childOwnershipLost(pid):
+                throw CLIProcessRunnerError.waitFailed(
+                    "waitpid reported ECHILD for sole-reaper child \(pid)"
+                )
             case let .waitFailed(message):
                 throw CLIProcessRunnerError.waitFailed(message)
             }

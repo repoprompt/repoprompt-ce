@@ -4,7 +4,7 @@ import Foundation
 import XCTest
 
 final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestSupport {
-    func testStoreEditRenameAndDeleteAwaitCodemapAuthorityFenceBeforeReturning() async throws {
+    func testStoreEditRenameAndDeleteRevokeAuthorityBeforeReturningAndRecoverAfterRetainedInvalidation() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
@@ -43,8 +43,8 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
             relativePath: mutable.standardizedRelativePath
         )
         let editedFile = try XCTUnwrap(editedFileValue)
-        let editedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: editedFile.id))
-        _ = try await readyResult(settledResult(store: store, ticket: editedTicket))
+        let editedDemand = try await readyArtifactDemand(store: store, forFileID: editedFile.id)
+        let editedTicket = editedDemand.ticket
         try await store.moveFile(
             rootID: loaded.id,
             from: mutable.standardizedRelativePath,
@@ -58,8 +58,8 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
             relativePath: "Sources/Renamed.swift"
         )
         let renamedFile = try XCTUnwrap(renamedFileValue)
-        let renamedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: renamedFile.id))
-        _ = try await readyResult(settledResult(store: store, ticket: renamedTicket))
+        let renamedDemand = try await readyArtifactDemand(store: store, forFileID: renamedFile.id)
+        let renamedTicket = renamedDemand.ticket
         try await store.deleteFile(rootID: loaded.id, relativePath: "Sources/Renamed.swift")
         await assertStale(store.codemapArtifactDemandStatus(renamedTicket))
         XCTAssertEqual(try unrelatedReady.handle.artifactKey(), unrelatedReady.snapshot.artifactKey)
@@ -67,7 +67,7 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
         await store.unloadRoot(id: loaded.id)
     }
 
-    func testCheckoutAndCatalogAdvanceFenceOldAuthorityBeforeSuccessorDemand() async throws {
+    func testCheckoutFencesOldAuthorityAndCreatePreservesUnrelatedSuccessorDemand() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
@@ -130,7 +130,9 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
             relativePath: "Sources/CatalogReplacement.swift",
             content: SwiftFixtureSource.emptyStruct("CatalogReplacement")
         )
-        await assertStale(store.codemapArtifactDemandStatus(successorTicket))
+        guard case .ready = await store.codemapArtifactDemandStatus(successorTicket) else {
+            return XCTFail("A path-local create must preserve unrelated ready codemap authority.")
+        }
         try await assertEngineRootCount(1, fixture: fixture)
         await store.unloadRoot(id: loaded.id)
     }

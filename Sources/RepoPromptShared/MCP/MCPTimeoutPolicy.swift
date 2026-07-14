@@ -9,6 +9,13 @@ public enum MCPTimeoutPolicy {
     public static let workspaceFreshnessWaitTimeoutSeconds = 30
     public static let workspaceFreshnessWaitTimeout: Duration = .seconds(workspaceFreshnessWaitTimeoutSeconds)
 
+    /// Mutation preflight must settle before the ordinary bounded tool watchdog so a blocked
+    /// workspace barrier can return a retryable result instead of racing connection teardown.
+    public static let mutationPreflightFreshnessWaitTimeoutSeconds = 20
+    public static let mutationPreflightFreshnessWaitTimeout: Duration = .seconds(
+        mutationPreflightFreshnessWaitTimeoutSeconds
+    )
+
     public static let workspaceReadinessWaitTimeoutSeconds = 30
     public static let workspaceReadinessWaitTimeout: Duration = .seconds(workspaceReadinessWaitTimeoutSeconds)
 
