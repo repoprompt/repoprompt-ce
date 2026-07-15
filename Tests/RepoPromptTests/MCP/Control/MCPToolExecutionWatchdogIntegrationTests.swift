@@ -64,6 +64,79 @@ import XCTest
             }
         }
 
+        func testResolvedProviderTaskLocalsPropagateToChildAndRestoreBeforeFormatting() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let manager = fixture.networkManager
+                let expectedTabID = fixture.contextA.tabID
+                let probe = MCPToolRequestTaskLocalProbe()
+
+                do {
+                    let endpoint = try fixture.endpointA()
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                        let immediateConnectionID = ServerNetworkManager.currentConnectionID
+                        let immediateTabID = ServerNetworkManager.currentTabContextHint?.tabID
+                        let childConnectionID = await Task {
+                            ServerNetworkManager.currentConnectionID
+                        }.value
+                        let childTabID = await Task {
+                            ServerNetworkManager.currentTabContextHint?.tabID
+                        }.value
+                        return await probe.recordProvider(
+                            immediateConnectionID: immediateConnectionID,
+                            immediateTabID: immediateTabID,
+                            childConnectionID: childConnectionID,
+                            childTabID: childTabID
+                        )
+                    }
+                    await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
+                        guard connectionID == endpoint.connectionID,
+                              toolName == MCPWindowToolName.readFile
+                        else { return }
+                        await probe.recordPostProvider(
+                            connectionID: ServerNetworkManager.currentConnectionID,
+                            tabID: ServerNetworkManager.currentTabContextHint?.tabID
+                        )
+                    }
+
+                    _ = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": expectedTabID.uuidString,
+                            "_rawJSON": true
+                        ]
+                    )
+
+                    let snapshot = await probe.snapshot()
+                    XCTAssertTrue(snapshot.didRecordProvider)
+                    XCTAssertEqual(snapshot.immediateConnectionID, endpoint.connectionID)
+                    XCTAssertEqual(snapshot.immediateTabID, expectedTabID)
+                    XCTAssertEqual(snapshot.childConnectionID, endpoint.connectionID)
+                    XCTAssertEqual(snapshot.childTabID, expectedTabID)
+                    XCTAssertTrue(snapshot.didRecordPostProvider)
+                    XCTAssertNil(snapshot.postProviderConnectionID)
+                    XCTAssertNil(snapshot.postProviderTabID)
+
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.readFile,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.readFile,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testSameWindowExclusiveResourceReleasesBeforeCompletionObserverTail() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -1987,6 +2060,61 @@ import XCTest
 
         func cancelForCleanup() async {
             gate.forceCancel()
+        }
+    }
+
+    private actor MCPToolRequestTaskLocalProbe {
+        struct Snapshot {
+            let didRecordProvider: Bool
+            let immediateConnectionID: UUID?
+            let immediateTabID: UUID?
+            let childConnectionID: UUID?
+            let childTabID: UUID?
+            let didRecordPostProvider: Bool
+            let postProviderConnectionID: UUID?
+            let postProviderTabID: UUID?
+        }
+
+        private var didRecordProvider = false
+        private var immediateConnectionID: UUID?
+        private var immediateTabID: UUID?
+        private var childConnectionID: UUID?
+        private var childTabID: UUID?
+        private var didRecordPostProvider = false
+        private var postProviderConnectionID: UUID?
+        private var postProviderTabID: UUID?
+
+        func recordProvider(
+            immediateConnectionID: UUID?,
+            immediateTabID: UUID?,
+            childConnectionID: UUID?,
+            childTabID: UUID?
+        ) -> Value {
+            didRecordProvider = true
+            self.immediateConnectionID = immediateConnectionID
+            self.immediateTabID = immediateTabID
+            self.childConnectionID = childConnectionID
+            self.childTabID = childTabID
+            return .object(["status": .string("ok")])
+        }
+
+        func recordPostProvider(connectionID: UUID?, tabID: UUID?) {
+            didRecordPostProvider = true
+            postProviderConnectionID = connectionID
+            postProviderTabID = tabID
+        }
+
+        func snapshot() -> Snapshot {
+            Snapshot(
+                didRecordProvider: didRecordProvider,
+                immediateConnectionID: immediateConnectionID,
+                immediateTabID: immediateTabID,
+                childConnectionID: childConnectionID,
+                childTabID: childTabID,
+                didRecordPostProvider: didRecordPostProvider,
+                postProviderConnectionID: postProviderConnectionID,
+                postProviderTabID: postProviderTabID
+            )
         }
     }
 
