@@ -7802,13 +7802,14 @@ actor GitService {
         guard !worktreeRecords.isEmpty else { return [] }
 
         let layoutsByPath: [String: GitRepositoryLayout] = Dictionary(
-            uniqueKeysWithValues: worktreeRecords.compactMap { record -> (String, GitRepositoryLayout)? in
+            worktreeRecords.compactMap { record -> (String, GitRepositoryLayout)? in
                 let pathURL = URL(fileURLWithPath: record.path)
                 guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: pathURL) else {
                     return nil
                 }
                 return (pathURL.standardizedFileURL.path, layout)
-            }
+            },
+            uniquingKeysWith: { first, _ in first }
         )
 
         let commonGitDir = currentLayout?.commonDir
