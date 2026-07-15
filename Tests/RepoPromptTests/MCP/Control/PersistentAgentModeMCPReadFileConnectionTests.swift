@@ -659,6 +659,63 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             XCTAssertEqual(preservedFull.selectedPaths, [targetLogicalPath])
             XCTAssertNil(preservedFull.slices[targetLogicalPath])
+
+            try await clearSelection(fixture: fixture, id: 10)
+            _ = try await readFile(
+                fixture: fixture,
+                id: 11,
+                path: targetLogicalPath,
+                startLine: 200,
+                limit: 10
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let slicedSelection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(slicedSelection.slices[targetLogicalPath], [LineRange(start: 200, end: 209)])
+
+            let worktreeRootID = try fixture.installedWorktreeRootID
+            let worktreeFiles = await fixture.window.workspaceFileContextStore.files(
+                inRoot: worktreeRootID
+            )
+            XCTAssertGreaterThan(worktreeFiles.count, 1)
+            let rootLifetimeID = try await fixture.window.workspaceFileContextStore.rootLifetimeIDForTesting(
+                rootID: worktreeRootID
+            )
+            let handled = fixture.window.workspaceFilesViewModel.hiddenSessionSliceRebaseDebugSnapshotForTesting(
+                fullPath: physicalURL.path,
+                rootID: worktreeRootID,
+                rootLifetimeID: rootLifetimeID
+            ).handledGeneration
+            await fixture.window.workspaceFileContextStore.resetAppliedIndexRecordLookupDiagnosticsForTesting()
+            fixture.resetHiddenSessionBindingsProviderCallCount()
+
+            await fixture.window.workspaceFilesViewModel.applyWorkspaceAppliedIndexEventForTesting(
+                WorkspaceAppliedIndexBatchEvent(
+                    rootID: worktreeRootID,
+                    rootPath: physicalRootPath,
+                    generation: handled &+ 1,
+                    rootLifetimeID: rootLifetimeID,
+                    modifiedFileIDs: worktreeFiles.map(\.id)
+                )
+            )
+
+            XCTAssertEqual(fixture.hiddenSessionBindingsProviderCallCount, 1)
+            let lookupDiagnostics = await fixture.window.workspaceFileContextStore
+                .appliedIndexRecordLookupDiagnosticsForTesting()
+            XCTAssertEqual(lookupDiagnostics.lookupRequests, 1)
+            XCTAssertEqual(lookupDiagnostics.requestedRecords, worktreeFiles.count)
+            XCTAssertEqual(lookupDiagnostics.rootSnapshots, 0)
+
+            await fixture.window.workspaceFilesViewModel.applyWorkspaceAppliedIndexEventForTesting(
+                WorkspaceAppliedIndexBatchEvent(
+                    rootID: worktreeRootID,
+                    rootPath: physicalRootPath,
+                    generation: handled &+ 2,
+                    rootLifetimeID: rootLifetimeID,
+                    isRootUnload: true
+                )
+            )
         }
 
         func assertWorktreeSearchPhysicalCoverage(fixture: Fixture) async throws {
@@ -2783,6 +2840,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var auxiliaryRootID: UUID?
         private var peerRootID: UUID?
         private var peerTargetStateVersionBeforeSelection: Int?
+        private(set) var hiddenSessionBindingsProviderCallCount = 0
         private var peerCatalogService: MCPWindowToolCatalogService?
         private var ownedRoutingService: WindowRoutingService?
         private var cleanedUp = false
@@ -3200,13 +3258,19 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             worktreeBinding = binding
             installWorktreeBindingProvider(binding)
-            window.workspaceFilesViewModel.setSessionWorktreeBindingsProvider { sessionID in
-                sessionID == Self.agentSessionID ? [binding] : []
+            window.workspaceFilesViewModel.setSessionWorktreeBindingsProvider { [weak self] sessionID in
+                guard let self else { return [] }
+                hiddenSessionBindingsProviderCallCount += 1
+                return sessionID == Self.agentSessionID ? [binding] : []
             }
             let projection = try await WorkspaceRootBindingProjectionMaterializer(
                 store: window.workspaceFileContextStore
             ).materialize(sessionID: Self.agentSessionID, bindings: [binding])
             XCTAssertNotNil(projection)
+        }
+
+        func resetHiddenSessionBindingsProviderCallCount() {
+            hiddenSessionBindingsProviderCallCount = 0
         }
 
         private func installWorktreeBindingProvider(_ binding: AgentSessionWorktreeBinding) {
