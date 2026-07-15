@@ -1,45 +1,45 @@
 import Foundation
 
-struct WorkspaceRootRef: Hashable {
-    let id: UUID
-    let name: String
-    let fullPath: String
-    let standardizedFullPath: String
+package struct WorkspaceRootRef: Hashable, Sendable {
+    package let id: UUID
+    package let name: String
+    package let fullPath: String
+    package let standardizedFullPath: String
 
-    init(id: UUID, name: String, fullPath: String) {
+    package init(id: UUID, name: String, fullPath: String) {
         self.id = id
         self.name = name
         self.fullPath = fullPath
         standardizedFullPath = StandardizedPath.absolute(fullPath)
     }
 
-    var compatibilityAlias: String {
+    package var compatibilityAlias: String {
         (standardizedFullPath as NSString).lastPathComponent
     }
 
-    var renderedLabel: String {
+    package var renderedLabel: String {
         "\(name) → \(fullPath)"
     }
 }
 
-enum RootAliasResolution: Equatable {
+package enum RootAliasResolution: Equatable {
     case notAliasPrefixed
     case bareRoot(root: WorkspaceRootRef, alias: String)
     case prefixed(root: WorkspaceRootRef, alias: String, remainder: String)
     case ambiguous(alias: String, matchingRoots: [WorkspaceRootRef])
 }
 
-struct RootAliasOptions {
-    let requireRemainder: Bool
-    let allowCompatibilityAlias: Bool
+package struct RootAliasOptions {
+    package let requireRemainder: Bool
+    package let allowCompatibilityAlias: Bool
     /// When true, suppresses alias interpretation only if a same-name top-level subpath
     /// exists under the matched root. This is a shallow top-level check only; it does not
     /// compare the full remainder chain or score deeper structure.
     /// Tool-create flows use richer literal-vs-alias depth scoring in
     /// `WorkspaceFilesViewModel.resolvedLiteralCreateResult(...)`.
-    let disambiguateRealSubpath: Bool
+    package let disambiguateRealSubpath: Bool
 
-    init(
+    package init(
         requireRemainder: Bool,
         allowCompatibilityAlias: Bool = true,
         disambiguateRealSubpath: Bool = false
@@ -50,8 +50,8 @@ struct RootAliasOptions {
     }
 }
 
-enum WorkspaceAliasResolver {
-    static func resolve(
+package enum WorkspaceAliasResolver {
+    package static func resolve(
         userPath: String,
         roots: [WorkspaceRootRef],
         options: RootAliasOptions,
@@ -152,7 +152,7 @@ enum WorkspaceAliasResolver {
     }
 }
 
-enum PathResolutionIssue: Equatable {
+package enum PathResolutionIssue: Equatable {
     case emptyInput
     case invalidPathCharacters(input: String, reason: String)
     case ambiguousAlias(alias: String, matchingRoots: [WorkspaceRootRef])
@@ -163,8 +163,8 @@ enum PathResolutionIssue: Equatable {
     case unresolved(input: String)
 }
 
-enum PathResolutionIssueRenderer {
-    static func message(for issue: PathResolutionIssue) -> String {
+package enum PathResolutionIssueRenderer {
+    package static func message(for issue: PathResolutionIssue) -> String {
         switch issue {
         case .emptyInput:
             return "Path is required."
@@ -189,8 +189,8 @@ enum PathResolutionIssueRenderer {
     }
 }
 
-enum ClientPathFormatter {
-    static func nonAbsoluteDisplayPath(
+package enum ClientPathFormatter {
+    package static func nonAbsoluteDisplayPath(
         root: WorkspaceRootRef,
         relativePath: String,
         visibleRoots: [WorkspaceRootRef]
@@ -203,7 +203,7 @@ enum ClientPathFormatter {
         return standardizedRelative.isEmpty ? alias : "\(alias)/\(standardizedRelative)"
     }
 
-    static func nonAbsoluteRootAlias(root: WorkspaceRootRef, visibleRoots: [WorkspaceRootRef]) -> String {
+    package static func nonAbsoluteRootAlias(root: WorkspaceRootRef, visibleRoots: [WorkspaceRootRef]) -> String {
         if visibleRoots.count <= 1 {
             return root.name
         }
@@ -231,7 +231,7 @@ enum ClientPathFormatter {
             .map(String.init)
     }
 
-    static func displayPath(
+    package static func displayPath(
         root: WorkspaceRootRef,
         relativePath: String,
         visibleRoots: [WorkspaceRootRef]
@@ -255,7 +255,7 @@ enum ClientPathFormatter {
         )
     }
 
-    static func displayAbsolutePath(
+    package static func displayAbsolutePath(
         fullPath: String,
         visibleRoots: [WorkspaceRootRef]
     ) -> String {

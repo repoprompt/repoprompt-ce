@@ -45,6 +45,7 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptWorkspaceCore",
     "RepoPromptShared",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
     "Sparkle",
@@ -123,6 +124,10 @@ let package = Package(
             path: "Sources/RepoPromptExecutable"
         ),
         .target(
+            name: "RepoPromptWorkspaceCore",
+            path: "Sources/RepoPromptWorkspaceCore"
+        ),
+        .target(
             name: "RepoPromptApp",
             dependencies: repoPromptAppDependencies,
             path: "Sources/RepoPrompt",
@@ -145,6 +150,11 @@ let package = Package(
         // See docs/architecture/source-layout.md and ThirdPartyLicenses/tree-sitter/README.md.
         .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
+        .testTarget(
+            name: "RepoPromptWorkspaceCoreTests",
+            dependencies: ["RepoPromptWorkspaceCore"],
+            path: "Tests/RepoPromptWorkspaceCoreTests"
+        ),
         .testTarget(
             name: "RepoPromptTests",
             dependencies: repoPromptTestDependencies,

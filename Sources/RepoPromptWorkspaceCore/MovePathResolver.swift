@@ -1,23 +1,23 @@
 import Foundation
 
 /// Root-scoped move/rename destination resolution with alias disambiguation.
-enum MovePathResolver {
-    typealias Root = WorkspaceRootRef
+package enum MovePathResolver {
+    package typealias Root = WorkspaceRootRef
 
-    enum AliasPrefixCheck {
+    package enum AliasPrefixCheck {
         case notPrefixed
         case uniqueRoot(root: Root, alias: String)
         case ambiguous(alias: String, matchingRoots: [Root])
     }
 
-    enum Error: Swift.Error, Equatable {
+    package enum Error: Swift.Error, Equatable {
         case emptyDestination
         case destinationOutsideRoot(root: Root)
         case ambiguousAlias(alias: String, matchingRoots: [Root])
         case crossRootAlias(alias: String, resolvedRoot: Root)
     }
 
-    static func resolveRelativePathInRoot(
+    package static func resolveRelativePathInRoot(
         userPath: String,
         sourceRoot: Root,
         visibleRoots: [Root]
@@ -67,7 +67,7 @@ enum MovePathResolver {
         return try validatedRelativeDestination(standardized, within: sourceRoot)
     }
 
-    static func checkAliasPrefix(
+    package static func checkAliasPrefix(
         _ userPath: String,
         visibleRoots: [Root],
         requireRemainder: Bool

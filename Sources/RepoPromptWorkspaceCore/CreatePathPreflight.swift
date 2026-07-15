@@ -1,9 +1,9 @@
 import Foundation
 
 /// Pure helper for create preflight validation and root-alias checks.
-enum CreatePathPreflight {
+package enum CreatePathPreflight {
     /// Controls how strict the preflight validation is for multi-root workspaces.
-    enum Mode {
+    package enum Mode {
         /// Current behavior: always require alias prefix or absolute path when multiple roots are loaded.
         case strictRequireAliasInMultiRoot
         /// Relaxed mode for tool flows: allow relative paths without alias if they can be resolved
@@ -11,27 +11,27 @@ enum CreatePathPreflight {
         case allowImplicitRootIfUnambiguous
     }
 
-    typealias Root = WorkspaceRootRef
+    package typealias Root = WorkspaceRootRef
 
-    enum AliasPrefixCheck: Equatable {
+    package enum AliasPrefixCheck: Equatable {
         case notPrefixed
         case uniqueRoot(root: Root, alias: String)
         case ambiguous(alias: String, matchingRoots: [Root])
     }
 
-    enum Error: Swift.Error, Equatable {
+    package enum Error: Swift.Error, Equatable {
         case emptyPath
         case ambiguousAlias(alias: String, matchingRoots: [Root])
         case missingAliasWithMultipleRoots(loadedRoots: [Root])
     }
 
-    struct Result: Equatable {
-        let normalizedPath: String
-        let aliasCheck: AliasPrefixCheck
-        let isAbsolute: Bool
+    package struct Result: Equatable {
+        package let normalizedPath: String
+        package let aliasCheck: AliasPrefixCheck
+        package let isAbsolute: Bool
     }
 
-    static func validate(
+    package static func validate(
         userPath: String,
         visibleRoots: [Root],
         mode: Mode = .strictRequireAliasInMultiRoot
@@ -68,7 +68,7 @@ enum CreatePathPreflight {
         return Result(normalizedPath: standardized, aliasCheck: aliasCheck, isAbsolute: isAbsolute)
     }
 
-    static func checkAliasPrefix(
+    package static func checkAliasPrefix(
         _ userPath: String,
         visibleRoots: [Root],
         requireRemainder: Bool
