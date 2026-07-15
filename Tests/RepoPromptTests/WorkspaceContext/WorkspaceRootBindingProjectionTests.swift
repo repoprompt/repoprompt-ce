@@ -484,6 +484,67 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         await store.unloadRoot(id: loadedLogicalRoot.id)
     }
 
+    func testTwoBindingsSharingWorktreeEmitOneDeterministicPhysicalRoot() async throws {
+        let firstLogicalURL = try makeTemporaryRoot(name: "ProjectionSharedWorktreeFirst")
+        let secondLogicalURL = try makeTemporaryRoot(name: "ProjectionSharedWorktreeSecond")
+        let physicalRootURL = try makeTemporaryRoot(name: "ProjectionSharedWorktreePhysical")
+        try write("let origin = \"worktree\"\n", to: physicalRootURL.appendingPathComponent("Sources/App.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let firstRecord = try await store.loadRoot(path: firstLogicalURL.path)
+        let secondRecord = try await store.loadRoot(path: secondLogicalURL.path)
+        let firstLogicalRoot = WorkspaceRootRef(
+            id: firstRecord.id,
+            name: "First Logical Name",
+            fullPath: firstRecord.standardizedFullPath
+        )
+        let secondLogicalRoot = WorkspaceRootRef(
+            id: secondRecord.id,
+            name: "Second Logical Name",
+            fullPath: secondRecord.standardizedFullPath
+        )
+        let sharedPhysicalRoot = WorkspaceRootRef(
+            id: UUID(),
+            name: "Ignored Input Name",
+            fullPath: physicalRootURL.path
+        )
+        let sessionID = UUID()
+        let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+        addTeardownBlock {
+            await materializer.release(sessionID: sessionID)
+            await store.unloadRoot(id: firstRecord.id)
+            await store.unloadRoot(id: secondRecord.id)
+        }
+
+        let materializedProjection = await materializer.materialize(
+            sessionID: sessionID,
+            bindings: [
+                Self.binding(
+                    logicalRoot: firstLogicalRoot,
+                    physicalRoot: sharedPhysicalRoot,
+                    worktreeID: "shared-first"
+                ),
+                Self.binding(
+                    logicalRoot: secondLogicalRoot,
+                    physicalRoot: sharedPhysicalRoot,
+                    worktreeID: "shared-second"
+                )
+            ]
+        )
+        let projection = try XCTUnwrap(materializedProjection)
+        let physicalRoot = try XCTUnwrap(projection.physicalRootRefs.first)
+        let availability = await store.rootScopeAvailability(projection.lookupRootScope)
+        let scopedRoots = await store.rootRefs(scope: projection.lookupRootScope)
+
+        XCTAssertTrue(projection.isFullyMaterialized)
+        XCTAssertEqual(projection.logicalRootRefs.count, 2)
+        XCTAssertEqual(projection.physicalRootRefs, [physicalRoot])
+        XCTAssertEqual(Set(projection.boundRootsForMetadata.map(\.physicalRoot)), [physicalRoot])
+        XCTAssertEqual(physicalRoot.name, physicalRootURL.lastPathComponent)
+        XCTAssertEqual(availability, .available)
+        XCTAssertEqual(scopedRoots.map(\.id), [physicalRoot.id])
+    }
+
     func testMaterializedSessionWorktreeScopeReportsAvailable() async throws {
         let logicalRootURL = try makeTemporaryRoot(name: "ProjectionAvailableLogical")
         let physicalRootURL = try makeTemporaryRoot(name: "ProjectionAvailablePhysical")

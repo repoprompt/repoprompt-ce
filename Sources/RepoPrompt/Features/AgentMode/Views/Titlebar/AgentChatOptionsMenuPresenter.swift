@@ -1,14 +1,22 @@
 import AppKit
 
+struct AgentChatOptionsMenuTarget: Equatable {
+    let workspaceID: UUID
+    let tabID: UUID
+    let agentSessionID: UUID
+    let tabName: String
+}
+
 struct AgentChatOptionsMenuSnapshot: Equatable {
+    let target: AgentChatOptionsMenuTarget
     let isPinned: Bool
 }
 
 struct AgentChatOptionsMenuActions {
-    let togglePin: () -> Void
-    let rename: () -> Void
-    let stash: () -> Void
-    let delete: () -> Void
+    let togglePin: (AgentChatOptionsMenuTarget) -> Void
+    let rename: (AgentChatOptionsMenuTarget) -> Void
+    let stash: (AgentChatOptionsMenuTarget) -> Void
+    let delete: (AgentChatOptionsMenuTarget) -> Void
 }
 
 private final class AgentChatOptionsMenuItem: NSMenuItem {
@@ -34,35 +42,43 @@ private final class AgentChatOptionsMenuItem: NSMenuItem {
 
 @MainActor
 enum AgentChatOptionsMenuPresenter {
-    static func popUp(
-        below anchorView: NSView,
+    static func makeMenu(
         snapshot: AgentChatOptionsMenuSnapshot,
         actions: AgentChatOptionsMenuActions
-    ) {
+    ) -> NSMenu {
+        let target = snapshot.target
         let menu = NSMenu(title: "Chat Options")
         menu.autoenablesItems = false
         menu.addItem(AgentChatOptionsMenuItem(
             title: snapshot.isPinned ? "Unpin Chat" : "Pin Chat",
             symbolName: snapshot.isPinned ? "pin.slash" : "pin",
-            handler: actions.togglePin
+            handler: { actions.togglePin(target) }
         ))
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Rename Chat…",
             symbolName: "pencil",
-            handler: actions.rename
+            handler: { actions.rename(target) }
         ))
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Stash Chat",
             symbolName: "tray.and.arrow.down",
-            handler: actions.stash
+            handler: { actions.stash(target) }
         ))
         menu.addItem(.separator())
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Delete Chat…",
             symbolName: "trash",
-            handler: actions.delete
+            handler: { actions.delete(target) }
         ))
+        return menu
+    }
 
+    static func popUp(
+        below anchorView: NSView,
+        snapshot: AgentChatOptionsMenuSnapshot,
+        actions: AgentChatOptionsMenuActions
+    ) {
+        let menu = makeMenu(snapshot: snapshot, actions: actions)
         let menuOriginY = anchorView.isFlipped
             ? anchorView.bounds.maxY + 2
             : anchorView.bounds.minY - 2

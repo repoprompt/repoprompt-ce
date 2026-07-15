@@ -103,8 +103,7 @@ struct WorkspaceRootBindingProjection: Equatable {
     }
 
     var physicalRootRefs: [WorkspaceRootRef] {
-        replacementsByLogicalRootPath.values
-            .map(\.physicalRoot)
+        Array(Set(replacementsByLogicalRootPath.values.map(\.physicalRoot)))
             .sorted { $0.standardizedFullPath < $1.standardizedFullPath }
     }
 
@@ -480,9 +479,16 @@ struct WorkspaceRootBindingProjectionMaterializer {
         }
         guard !preparation.bindings.isEmpty else { return nil }
 
-        let recordsByPath = Dictionary(uniqueKeysWithValues: records.map {
-            ($0.standardizedPhysicalPath, $0)
-        })
+        var recordsByPath: [String: WorkspaceSessionWorktreeOwnedRoot] = [:]
+        for record in records {
+            if let existing = recordsByPath[record.standardizedPhysicalPath], existing != record {
+                await store.releaseSessionWorktreeOwnership(ownerID: preparation.sessionID)
+                throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(record.standardizedPhysicalPath)
+            }
+            recordsByPath[record.standardizedPhysicalPath] = record
+        }
+
+        var physicalRootsByID: [UUID: WorkspaceRootRef] = [:]
         var boundRoots: [WorkspaceRootBindingProjection.BoundRoot] = []
         for binding in preparation.bindings {
             let logicalRoot = logicalRoot(for: binding, visibleRoots: preparation.visibleRoots)
@@ -491,11 +497,21 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 await store.releaseSessionWorktreeOwnership(ownerID: preparation.sessionID)
                 throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(physicalPath)
             }
-            let physicalRoot = WorkspaceRootRef(
-                id: physicalRecord.rootID,
-                name: logicalRoot.name,
-                fullPath: physicalRecord.standardizedPhysicalPath
-            )
+            let physicalRoot: WorkspaceRootRef
+            if let existing = physicalRootsByID[physicalRecord.rootID] {
+                guard existing.standardizedFullPath == physicalRecord.standardizedPhysicalPath else {
+                    await store.releaseSessionWorktreeOwnership(ownerID: preparation.sessionID)
+                    throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(physicalPath)
+                }
+                physicalRoot = existing
+            } else {
+                physicalRoot = WorkspaceRootRef(
+                    id: physicalRecord.rootID,
+                    name: URL(fileURLWithPath: physicalRecord.standardizedPhysicalPath).lastPathComponent,
+                    fullPath: physicalRecord.standardizedPhysicalPath
+                )
+                physicalRootsByID[physicalRecord.rootID] = physicalRoot
+            }
             boundRoots.append(.init(
                 logicalRoot: logicalRoot,
                 physicalRoot: physicalRoot,

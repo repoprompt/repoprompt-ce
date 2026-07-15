@@ -287,7 +287,7 @@ Add these environment secrets:
 | `PUBLIC_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission. |
 | `TIP_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-tip-updates` with repository contents read/write permission. Do not reuse the stable update token. |
 | `SENTRY_DSN` | Sentry DSN injected into official signed builds for release routing. It is not a credential, but keep it in the protected release environment so unofficial artifacts do not route telemetry to the official project. |
-| `SENTRY_AUTH_TOKEN` | Sentry release token used for draft-time debug-symbol/release metadata and verified-promotion deploy recording. Provisioning it with `project:releases` only is a manual release gate; tooling does not inspect or change token scopes. |
+| `SENTRY_AUTH_TOKEN` | Sentry Organization Token used for draft-time debug-symbol/release metadata and verified-promotion deploy recording. Create it with the fixed `org:ci` scope; Organization Token scopes are immutable, and release tooling does not inspect or change them. |
 
 Add these non-secret release environment variables when Sentry symbol upload is enabled:
 
@@ -313,8 +313,11 @@ When Sentry is enabled, release staging generates dSYMs under
 `.build/sentry-symbols/release` and carries them inside the staged release ZIP.
 `release.sh publish-staged` requires `SENTRY_AUTH_TOKEN` (or
 `REPOPROMPT_SENTRY_AUTH_TOKEN_FILE`), `REPOPROMPT_SENTRY_ORG`, and
-`REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases, then uploads
-those debug symbols. After the GitHub draft exists, it finalizes the Sentry
+`REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases. Before code
+signing or notarization, it performs a read-only release API preflight. Release
+lookup, creation, commit association, and finalization use Sentry's release API,
+which accepts Organization Tokens with `org:ci`; only debug-symbol upload uses
+`sentry-cli`. After the GitHub draft exists, the script finalizes the Sentry
 release to mark its commit metadata and symbols ready. Finalization does not
 mean that the release is deployed to production.
 The upload helper runs:

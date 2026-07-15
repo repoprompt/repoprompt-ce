@@ -3,7 +3,7 @@ import SwiftUI
 
 private enum UpdateAvailableToolbarSnapshot: Equatable {
     case hidden
-    case available(displayVersion: String?, canCheckForUpdates: Bool)
+    case available(notice: AvailableUpdateNotice, canCheckForUpdates: Bool)
 }
 
 @MainActor
@@ -14,17 +14,15 @@ private final class UpdateAvailableToolbarStateObserver: ObservableObject {
 
     init(sparkleManager: SparkleUpdaterManager) {
         snapshot = Self.makeSnapshot(
-            updateAvailable: sparkleManager.updateAvailable,
-            updateVersion: sparkleManager.updateVersion,
+            availableUpdate: sparkleManager.availableUpdate,
             canCheckForUpdates: sparkleManager.canCheckForUpdates
         )
 
-        Publishers.CombineLatest3(
-            sparkleManager.$updateAvailable.removeDuplicates(),
-            sparkleManager.$updateVersion.removeDuplicates(),
+        Publishers.CombineLatest(
+            sparkleManager.$availableUpdate.removeDuplicates(),
             sparkleManager.$canCheckForUpdates.removeDuplicates()
         )
-        .map(Self.makeSnapshot(updateAvailable:updateVersion:canCheckForUpdates:))
+        .map(Self.makeSnapshot(availableUpdate:canCheckForUpdates:))
         .removeDuplicates()
         .receive(on: RunLoop.main)
         .sink { [weak self] snapshot in
@@ -35,21 +33,11 @@ private final class UpdateAvailableToolbarStateObserver: ObservableObject {
     }
 
     private nonisolated static func makeSnapshot(
-        updateAvailable: Bool,
-        updateVersion: String?,
+        availableUpdate: AvailableUpdateNotice?,
         canCheckForUpdates: Bool
     ) -> UpdateAvailableToolbarSnapshot {
-        guard updateAvailable else { return .hidden }
-        return .available(
-            displayVersion: normalizedDisplayVersion(updateVersion),
-            canCheckForUpdates: canCheckForUpdates
-        )
-    }
-
-    private nonisolated static func normalizedDisplayVersion(_ version: String?) -> String? {
-        guard let version = version?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !version.isEmpty else { return nil }
-        return version.lowercased().hasPrefix("v") ? version : "v\(version)"
+        guard let availableUpdate else { return .hidden }
+        return .available(notice: availableUpdate, canCheckForUpdates: canCheckForUpdates)
     }
 }
 
@@ -68,14 +56,14 @@ struct UpdateAvailableToolbarPill: View {
         switch observer.snapshot {
         case .hidden:
             EmptyView()
-        case let .available(displayVersion, canCheckForUpdates):
+        case let .available(notice, canCheckForUpdates):
             Button {
                 sparkleManager.installUpdate()
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.down.circle.fill")
                         .imageScale(.small)
-                    Text(labelText(displayVersion: displayVersion))
+                    Text(notice.toolbarLabel)
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
                 }
@@ -91,34 +79,10 @@ struct UpdateAvailableToolbarPill: View {
             .buttonStyle(.plain)
             .padding(.trailing, 8)
             .disabled(!canCheckForUpdates)
-            .hoverTooltip(helpText(displayVersion: displayVersion, canCheckForUpdates: canCheckForUpdates), .bottom)
-            .accessibilityLabel(accessibilityLabel(displayVersion: displayVersion))
+            .hoverTooltip(canCheckForUpdates ? notice.availableTooltip : notice.notReadyTooltip, .bottom)
+            .accessibilityLabel(notice.accessibilityLabel)
             .accessibilityHint(accessibilityHint(canCheckForUpdates: canCheckForUpdates))
         }
-    }
-
-    private func labelText(displayVersion: String?) -> String {
-        guard let displayVersion else { return "Update" }
-        return "Update \(displayVersion)"
-    }
-
-    private func helpText(displayVersion: String?, canCheckForUpdates: Bool) -> String {
-        if !canCheckForUpdates {
-            guard let displayVersion else {
-                return "Update available, but Sparkle is not ready to check for updates yet"
-            }
-            return "Update available: \(displayVersion), but Sparkle is not ready to check for updates yet"
-        }
-
-        guard let displayVersion else {
-            return "Update available — click for release notes"
-        }
-        return "Update available: \(displayVersion) — click for release notes"
-    }
-
-    private func accessibilityLabel(displayVersion: String?) -> String {
-        guard let displayVersion else { return "Update available" }
-        return "Update available, version \(displayVersion)"
     }
 
     private func accessibilityHint(canCheckForUpdates: Bool) -> String {

@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1269,41 +1270,107 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self,
         lookup_mode: str,
         attempts: int = 1,
-    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
-        call_log = temp_dir / "sentry-calls.log"
-        release_state = temp_dir / "release-created"
-        fake_cli = temp_dir / "sentry-cli"
-        fake_cli.write_text(
-            """#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "$SENTRY_CALL_LOG"
-if [[ "$*" == *"releases info"* ]]; then
-    case "$SENTRY_LOOKUP_MODE" in
-        not-found-once)
-            if [[ -f "$SENTRY_RELEASE_STATE" ]]; then
-                exit 0
-            fi
-            printf 'error: release not found (404)\n' >&2
-            exit 1
-            ;;
-        denied)
-            printf 'error: authentication failed\n' >&2
-            exit 2
-            ;;
-        existing)
-            exit 0
-            ;;
-    esac
-fi
-if [[ "$*" == *"releases new"* ]]; then
-    : > "$SENTRY_RELEASE_STATE"
-fi
+        call_log = temp_dir / "sentry-api-calls.jsonl"
+        release_state = temp_dir / "sentry-release.json"
+        api_tmp = temp_dir / "api-tmp"
+        api_tmp.mkdir()
+        fake_curl = temp_dir / "curl"
+        fake_curl.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+args = sys.argv[1:]
+
+def option(name):
+    return args[args.index(name) + 1]
+
+config = Path(option("--config"))
+if stat.S_IMODE(config.stat().st_mode) != 0o600:
+    raise SystemExit(90)
+if config.read_text(encoding="utf-8") != 'header = "Authorization: Bearer fixture-token"\\n':
+    raise SystemExit(91)
+token_file = Path(os.environ["REPOPROMPT_SENTRY_AUTH_TOKEN_FILE"])
+if stat.S_IMODE(token_file.stat().st_mode) != 0o600:
+    raise SystemExit(92)
+if token_file.read_text(encoding="utf-8") != "fixture-token":
+    raise SystemExit(93)
+if "SENTRY_AUTH_TOKEN" in os.environ:
+    raise SystemExit(94)
+
+scenario = os.environ["SENTRY_LOOKUP_MODE"]
+if scenario == "transport":
+    raise SystemExit(7)
+
+method = option("--request")
+output = Path(option("--output"))
+url = args[-1]
+body = None
+if "--data-binary" in args:
+    body_arg = option("--data-binary")
+    if not body_arg.startswith("@"):
+        raise SystemExit(95)
+    body = json.loads(Path(body_arg[1:]).read_text(encoding="utf-8"))
+
+with Path(os.environ["SENTRY_CALL_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"method": method, "url": url, "body": body}) + "\\n")
+
+state_path = Path(os.environ["SENTRY_RELEASE_STATE"])
+parsed = urlparse(url)
+is_preflight = parsed.query != ""
+is_collection = parsed.path.endswith("/releases/")
+version = unquote(parsed.path.rstrip("/").split("/")[-1])
+
+def release_payload():
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return {
+        "version": state["version"],
+        "projects": [{"slug": "fixture-project"}],
+        "dateReleased": state.get("dateReleased"),
+    }
+
+if is_preflight:
+    if scenario == "unauthorized":
+        status, response = 401, {"detail": "SECRET_BODY_MARKER"}
+    elif scenario == "denied":
+        status, response = 403, {"detail": "SECRET_BODY_MARKER"}
+    elif scenario == "malformed":
+        status, response = 200, {}
+    else:
+        status, response = 200, []
+elif method == "GET" and not is_collection:
+    if state_path.exists():
+        status, response = 200, release_payload()
+    else:
+        status, response = 404, {"detail": "SECRET_BODY_MARKER"}
+elif method == "POST" and is_collection:
+    state_path.write_text(
+        json.dumps({"version": body["version"], "dateReleased": None}),
+        encoding="utf-8",
+    )
+    status, response = 201, release_payload()
+elif method == "PUT" and not is_collection and state_path.exists():
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if "dateReleased" in body:
+        state["dateReleased"] = body["dateReleased"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    status, response = 200, release_payload()
+else:
+    status, response = 500, {"detail": "unexpected fixture request", "version": version}
+
+output.write_text(json.dumps(response), encoding="utf-8")
+sys.stdout.write(str(status))
 """,
             encoding="utf-8",
         )
-        fake_cli.chmod(0o755)
+        fake_curl.chmod(0o755)
         env = os.environ.copy()
         env.update(
             {
@@ -1312,11 +1379,13 @@ fi
                 "SENTRY_AUTH_TOKEN": "fixture-token",
                 "REPOPROMPT_SENTRY_ORG": "fixture-org",
                 "REPOPROMPT_SENTRY_PROJECT": "fixture-project",
+                "REPOPROMPT_SENTRY_API_BASE_URL": "https://sentry.example/api/0",
                 "SOURCE_GITHUB_REPOSITORY": "fixture/repository",
                 "RELEASE_COMMIT": "0123456789abcdef",
                 "SENTRY_LOOKUP_MODE": lookup_mode,
                 "SENTRY_CALL_LOG": str(call_log),
                 "SENTRY_RELEASE_STATE": str(release_state),
+                "FIXTURE_TMP_DIR": str(api_tmp),
                 "ATTEMPTS": str(attempts),
             }
         )
@@ -1324,7 +1393,10 @@ fi
             [
                 "bash",
                 "-c",
-                'source "$1"; for ((attempt = 0; attempt < ATTEMPTS; attempt++)); do prepare_sentry_release; done',
+                'source "$1"; TMP_DIR="$FIXTURE_TMP_DIR"; '
+                "preflight_sentry_release_access; "
+                "for ((attempt = 0; attempt < ATTEMPTS; attempt++)); do prepare_sentry_release; done; "
+                "finalize_sentry_release; finalize_sentry_release",
                 "sentry-release-test",
                 str(SCRIPT_DIR / "release.sh"),
             ],
@@ -1332,40 +1404,69 @@ fi
             text=True,
             capture_output=True,
         )
-        calls = call_log.read_text(encoding="utf-8").splitlines() if call_log.exists() else []
+        calls = (
+            [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+            if call_log.exists()
+            else []
+        )
         return result, calls
 
     def test_sentry_release_prepare_creates_only_for_not_found_and_is_retry_safe(self) -> None:
         result, calls = self.run_sentry_prepare_fixture("not-found-once", attempts=2)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sum("releases info" in call for call in calls), 2)
-        self.assertEqual(sum("releases new" in call for call in calls), 1)
-        self.assertEqual(sum("releases set-commits" in call for call in calls), 2)
-        self.assertTrue(
-            any(
-                "--org fixture-org releases new --project fixture-project "
-                "com.pvncher.repoprompt.ce@" in call
-                for call in calls
-            )
+        collection_posts = [call for call in calls if call["method"] == "POST"]
+        refs_updates = [
+            call
+            for call in calls
+            if call["method"] == "PUT" and "refs" in (call["body"] or {})
+        ]
+        finalizations = [
+            call
+            for call in calls
+            if call["method"] == "PUT" and "dateReleased" in (call["body"] or {})
+        ]
+        self.assertEqual(len(collection_posts), 1)
+        self.assertEqual(len(refs_updates), 2)
+        self.assertEqual(len(finalizations), 1)
+        self.assertEqual(
+            collection_posts[0]["body"]["refs"],
+            [{"repository": "fixture/repository", "commit": "0123456789abcdef"}],
         )
-        self.assertTrue(
-            all(
-                "--commit fixture/repository@0123456789abcdef" in call
-                for call in calls
-                if "releases set-commits" in call
-            )
-        )
+        self.assertTrue(all("%40" in call["url"] and "%2B" in call["url"] for call in refs_updates))
+        self.assertIn("already finalized", result.stdout)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr + json.dumps(calls))
+        self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
 
     def test_sentry_release_prepare_does_not_create_after_lookup_failure(self) -> None:
         result, calls = self.run_sentry_prepare_fixture("denied")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(sum("releases info" in call for call in calls), 1)
-        self.assertFalse(any("releases new" in call for call in calls))
-        self.assertFalse(any("releases set-commits" in call for call in calls))
-        self.assertIn("refusing to create it", result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["method"], "GET")
+        self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
+        self.assertIn("org:ci access", result.stderr)
         self.assertNotIn("fixture-token", result.stdout + result.stderr)
+        self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
+
+    def test_sentry_release_preflight_distinguishes_invalid_token_without_mutation(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("unauthorized")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
+        self.assertIn("HTTP 401", result.stderr)
+        self.assertIn("SENTRY_AUTH_TOKEN is current", result.stderr)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr)
+        self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
+
+    def test_sentry_release_preflight_rejects_malformed_json_before_mutation(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("malformed")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
+        self.assertIn("malformed JSON during access preflight", result.stderr)
 
     def test_sentry_symbol_flow_is_explicit_secret_safe_and_release_only_by_default(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
@@ -1392,15 +1493,19 @@ fi
         self.assertIn('SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"', release_script)
         self.assertIn('require_sentry_publish_configuration() {', release_script)
         self.assertIn('require_command sentry-cli', release_script)
+        self.assertIn('preflight_sentry_release_access', release_script)
         self.assertIn('prepare_sentry_release', release_script)
-        self.assertIn('releases new', release_script)
-        self.assertIn('releases set-commits', release_script)
-        self.assertIn('--commit "$source_repository@$RELEASE_COMMIT"', release_script)
+        self.assertIn('sentry_api_request POST', release_script)
+        self.assertIn('sentry_api_request PUT', release_script)
+        self.assertIn("'{refs: [{repository: $repository, commit: $commit}]}'", release_script)
         self.assertIn('finalize_sentry_release', release_script)
-        self.assertIn('releases finalize "$SENTRY_RELEASE_NAME"', release_script)
+        self.assertIn("'{dateReleased: $date_released}'", release_script)
+        self.assertNotIn('sentry-cli --org', release_script)
         self.assertNotIn('record_sentry_production_deploy', release_script)
         self.assertNotIn('releases deploys "$SENTRY_RELEASE_NAME" new', release_script)
-        self.assertIn('SENTRY_AUTH_TOKEN="$(tr -d', release_script)
+        self.assertIn('token="$(tr -d', release_script)
+        self.assertIn('REPOPROMPT_SENTRY_AUTH_TOKEN_FILE="$normalized_token_file"', release_script)
+        self.assertIn('unset SENTRY_AUTH_TOKEN', release_script)
 
         self.assertIn('preflight_sentry_deploy_access', promote_script)
         self.assertIn('record_verified_sentry_deploy_if_needed', promote_script)
@@ -1411,6 +1516,10 @@ fi
         self.assertNotIn("--retry", sentry_request)
 
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}\n\ncase", 1)[0]
+        self.assertLess(
+            publish_staged.index("preflight_sentry_release_access"),
+            publish_staged.index("sign_staged_release.sh"),
+        )
         self.assertLess(publish_staged.index("prepare_sentry_release"), publish_staged.index("upload_required_sentry_symbols"))
         self.assertLess(publish_staged.index("upload_required_sentry_symbols"), publish_staged.index("gh release view"))
         self.assertLess(publish_staged.index("gh release view"), publish_staged.index("gh release create"))
@@ -1649,7 +1758,10 @@ fi
         )[0]
         self.assertNotIn("updaterController.startUpdater()", manager_init)
         self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
-        self.assertIn("guard updaterStarted, sparkleConfigurationValid else { return false }", sparkle_manager)
+        self.assertIn(
+            "guard updaterStarted, sparkleConfigurationValid, activeUserInitiatedChannel == nil else {",
+            sparkle_manager,
+        )
 
     def test_ci_secret_scan_covers_introduced_commit_range_and_checked_out_tree(self) -> None:
         workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -1987,14 +2099,20 @@ sys.stdout.write(str(status))
             ]
         ).stdout.strip()
 
-        def write_appcast(enclosure_signature: str) -> None:
+        def write_appcast(
+            enclosure_signature: str,
+            *,
+            title: str = "Tip build v9.8.7",
+            display_version: str = "Tip build v9.8.7",
+        ) -> None:
             appcast.write_text(
                 f"""<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
     <item>
+      <title>{title}</title>
       <sparkle:version>1.2.3</sparkle:version>
-      <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+      <sparkle:shortVersionString>{display_version}</sparkle:shortVersionString>
       <enclosure url="https://example.invalid/tip/{archive.name}"
                  length="{archive.stat().st_size}"
                  sparkle:edSignature="{enclosure_signature}" />
@@ -2039,10 +2157,73 @@ validate_generated_tip_appcast""",
         accepted = subprocess.run(command, env=env, text=True, capture_output=True)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
+        duplicate_version_tree = ET.parse(appcast)
+        duplicate_version_item = duplicate_version_tree.getroot().find("./channel/item")
+        self.assertIsNotNone(duplicate_version_item)
+        assert duplicate_version_item is not None
+        ET.SubElement(
+            duplicate_version_item,
+            "{http://www.andymatuschak.org/xml-namespaces/sparkle}version",
+        ).text = "999"
+        duplicate_version_tree.write(appcast, encoding="utf-8", xml_declaration=True)
+        rejected_duplicate_version = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_duplicate_version.returncode, 0)
+        self.assertIn(
+            "tip appcast item must contain exactly one sparkle:version",
+            rejected_duplicate_version.stderr,
+        )
+
+        write_appcast(signature, title="Version 9.8.7")
+        rejected_title = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_title.returncode, 0)
+        self.assertIn("Tip appcast title mismatch", rejected_title.stderr)
+
+        write_appcast(signature, display_version="9.8.7")
+        rejected_display_version = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_display_version.returncode, 0)
+        self.assertIn("Tip appcast display version mismatch", rejected_display_version.stderr)
+
         write_appcast("")
-        rejected = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected.stderr)
+        rejected_signature = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_signature.returncode, 0)
+        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected_signature.stderr)
+
+    def test_tip_appcast_label_changes_display_metadata_without_changing_comparison_version(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        appcast = temp_dir / "appcast.xml"
+        appcast.write_text(
+            """<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel><item><title>Version 9.8.7</title>
+    <sparkle:version>29.8.52</sparkle:version>
+    <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+  </item></channel>
+</rss>
+""",
+            encoding="utf-8",
+        )
+        command = [
+            "bash",
+            "-c",
+            """source "$1"
+APPCAST="$2"
+MARKETING_VERSION="9.8.7"
+label_generated_tip_appcast""",
+            "tip-appcast-label",
+            str(SCRIPT_DIR / "main_tip_release.sh"),
+            str(appcast),
+        ]
+
+        labeled = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(labeled.returncode, 0, labeled.stderr)
+        item = ET.parse(appcast).getroot().find("./channel/item")
+        self.assertIsNotNone(item)
+        assert item is not None
+        sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+        self.assertEqual(item.findtext(f"{{{sparkle}}}version"), "29.8.52")
+        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "Tip build v9.8.7")
+        self.assertEqual(item.findtext("title"), "Tip build v9.8.7")
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent

@@ -12,12 +12,26 @@ struct SpawnedProcess: @unchecked Sendable {
 }
 
 enum ProcessLauncherError: Error {
-    case pipeCreationFailed(String)
+    case pipeCreationFailed(label: String, errno: Int32)
     case descriptorConfigurationFailed(label: String, fd: Int32, underlying: POSIXDescriptorConfigurationError)
     case spawnFileActionsFailed(operation: String, errno: Int32)
     case changeDirectoryFailed(path: String, errno: Int32)
     case spawnAttributesFailed(operation: String, errno: Int32)
     case spawnFailed(errno: Int32)
+
+    var processLaunchFailure: (domain: String, code: Int) {
+        let errnoValue: Int32 = switch self {
+        case let .pipeCreationFailed(_, errnoValue),
+             let .spawnFileActionsFailed(_, errnoValue),
+             let .changeDirectoryFailed(_, errnoValue),
+             let .spawnAttributesFailed(_, errnoValue),
+             let .spawnFailed(errnoValue):
+            errnoValue
+        case let .descriptorConfigurationFailed(_, _, underlying):
+            underlying.errnoValue
+        }
+        return (NSPOSIXErrorDomain, Int(errnoValue))
+    }
 }
 
 enum ProcessLauncher {
@@ -102,7 +116,8 @@ enum ProcessLauncher {
         }
 
         guard pipe(&stdinPipe) == 0 else {
-            throw ProcessLauncherError.pipeCreationFailed("stdin")
+            let failure = errno
+            throw ProcessLauncherError.pipeCreationFailed(label: "stdin", errno: failure)
         }
         do {
             try configureCloseOnExec(stdinPipe, label: "stdin")
@@ -112,8 +127,9 @@ enum ProcessLauncher {
         }
 
         guard pipe(&stdoutPipe) == 0 else {
+            let failure = errno
             closePipe(&stdinPipe)
-            throw ProcessLauncherError.pipeCreationFailed("stdout")
+            throw ProcessLauncherError.pipeCreationFailed(label: "stdout", errno: failure)
         }
         do {
             try configureCloseOnExec(stdoutPipe, label: "stdout")
@@ -124,9 +140,10 @@ enum ProcessLauncher {
         }
 
         guard pipe(&stderrPipe) == 0 else {
+            let failure = errno
             closePipe(&stdinPipe)
             closePipe(&stdoutPipe)
-            throw ProcessLauncherError.pipeCreationFailed("stderr")
+            throw ProcessLauncherError.pipeCreationFailed(label: "stderr", errno: failure)
         }
         do {
             try configureCloseOnExec(stderrPipe, label: "stderr")

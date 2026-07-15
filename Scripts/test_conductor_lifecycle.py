@@ -1921,6 +1921,23 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
 
 
 class SmokeOperationTests(unittest.TestCase):
+    def test_execution_location_ui_smoke_resolves_process_by_numeric_pid_without_name_fallback(self) -> None:
+        source = (SCRIPT_DIR / "smoke_agent_execution_location_popover.sh").read_text(encoding="utf-8")
+
+        self.assertIn("repeat with candidateProcess in application processes", source)
+        self.assertIn("set candidatePID to (unix id of candidateProcess) as integer", source)
+        self.assertIn("if candidatePID is targetPID then", source)
+        self.assertIn("if ((unix id of candidateProcess) as integer) is targetPID then return", source)
+        self.assertIn("set frontmost to true", source)
+        self.assertIn("key code 53", source)
+        self.assertIn("entire contents of window windowIndex whose value of attribute", source)
+        self.assertIn("repeat with windowIndex from 1 to 1", source)
+        self.assertNotIn("first application process whose unix id is targetPID", source)
+        self.assertNotIn("process appProcessName", source)
+        self.assertNotIn("contents of candidateProcess", source)
+        self.assertNotIn("my targetPID", source)
+        self.assertNotIn("on firstElementWithIdentifier", source)
+
     def test_manage_worktree_list_stage_runs_after_tree_roots_before_agent_manage(self) -> None:
         calls: list[tuple[str, list[str]]] = []
 
@@ -1955,6 +1972,63 @@ class SmokeOperationTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_execution_location_ui_smoke_runs_after_worktree_readiness_stages(self) -> None:
+        calls: list[tuple[str, list[str], dict[str, object]]] = []
+
+        def record_command(name: str, argv: list[str], *_args: object, **kwargs: object) -> tuple[int, str, str]:
+            calls.append((name, argv, kwargs))
+            return 0, "", ""
+
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "find_debug_app_pids", return_value=["4242"]
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT": "2",
+                "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES": "2",
+            },
+            clear=False,
+        ), mock.patch.object(
+            conductor, "run_operation_command", side_effect=record_command
+        ):
+            code = conductor.operation_smoke(
+                Path("/tmp/repo"),
+                {"windowId": "7", "workspace": "test-workspace", "executionLocationUI": True},
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [name for name, _argv, _kwargs in calls],
+            [
+                "windows",
+                "workspace switch",
+                "tree roots",
+                "manage_worktree list",
+                "agent_manage roles",
+                "execution location UI smoke",
+            ],
+        )
+        self.assertEqual(
+            calls[-1][1],
+            ["/tmp/repo/Scripts/smoke_agent_execution_location_popover.sh", "4242"],
+        )
+        self.assertEqual(calls[-1][2]["timeout"], 184.0)
+
+    def test_execution_location_ui_smoke_requires_one_exact_debug_app(self) -> None:
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "find_debug_app_pids", return_value=[]
+        ), mock.patch.object(conductor, "run_operation_command", return_value=(0, "", "")) as run_command, contextlib.redirect_stdout(
+            io.StringIO()
+        ) as output:
+            code = conductor.operation_smoke(
+                Path("/tmp/repo"),
+                {"windowId": "7", "workspace": "test-workspace", "executionLocationUI": True},
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(run_command.call_count, 5)
+        self.assertIn("requires exactly one running RepoPrompt debug app", output.getvalue())
 
     def test_structured_smoke_calls_route_to_requested_window_with_fake_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

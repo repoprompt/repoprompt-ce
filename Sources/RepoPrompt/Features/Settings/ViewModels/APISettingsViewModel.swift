@@ -1989,6 +1989,13 @@ public class APISettingsViewModel: ObservableObject {
             contextBuilderVerifiedCLIProviders = verifiedProviders
             isContextBuilderProviderValidationComplete = true
         }
+
+        func test_resetContextBuilderProviderValidation() {
+            contextBuilderProviderValidationTask?.cancel()
+            contextBuilderProviderValidationTask = nil
+            contextBuilderVerifiedCLIProviders = []
+            isContextBuilderProviderValidationComplete = false
+        }
     #endif
 
     private func resetPreferredModelIfNeeded(for provider: AIProviderType) {

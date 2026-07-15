@@ -124,7 +124,7 @@ sentry_api_request() {
     status="$(curl "${args[@]}" "$(sentry_deploy_endpoint)")" ||
         fail "Unable to call the Sentry deploy API"
     if [[ "$status" == "403" ]]; then
-        fail "Sentry deploy API rejected the promotion token (HTTP 403); verify the manual project:releases release gate"
+        fail "Sentry deploy API rejected the organization token (HTTP 403); verify org:ci access to $REPOPROMPT_SENTRY_ORG/$REPOPROMPT_SENTRY_PROJECT"
     fi
     [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
         fail "Sentry deploy API request failed with HTTP $status"
