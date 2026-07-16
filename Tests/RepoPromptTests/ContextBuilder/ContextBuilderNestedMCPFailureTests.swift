@@ -173,6 +173,10 @@ import XCTest
                 saveState: false,
                 reason: "ContextBuilderNestedMCPFailureTests"
             )
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: context.window.apiSettingsViewModel,
+                workspaceID: context.workspaceID
+            )
         }
 
         private static func toolResultText(_ response: PersistentMCPTestRPCResponse) throws -> String {

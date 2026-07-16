@@ -383,7 +383,8 @@ path = bundle / "Contents" / "Resources" / "RepoPromptDebugProvenance.json"
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(f"Debug bundle provenance: {path}")
 PY
-    run plutil -lint "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"
+    run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_json.py" \
+        "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"
 fi
 
 phase "Signing app bundle"

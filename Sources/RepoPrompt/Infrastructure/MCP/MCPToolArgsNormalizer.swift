@@ -313,7 +313,7 @@ enum MCPToolArgsNormalizer {
     }
 
     private static func allowedSiblingKeys(for tool: String) -> Set<String> {
-        let common: Set = ["_tabID", "_windowID", "_rawJSON", "context_id", "path", "verbose", "args"]
+        let common: Set = ["_tabID", "_windowID", "_rawJSON", "context_id", "path", "verbose", "args", "operation_id"]
         switch tool {
         case "bind_context":
             return common.union(["op", "window_id", "working_dirs", "create_if_missing", "tab_name"])

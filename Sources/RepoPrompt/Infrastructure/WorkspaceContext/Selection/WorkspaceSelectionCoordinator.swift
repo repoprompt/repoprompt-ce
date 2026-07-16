@@ -260,6 +260,23 @@ final class WorkspaceSelectionCoordinator {
         )
     }
 
+    /// Protects an already-persisted MCP selection from UI snapshots that were queued before
+    /// the canonical write. This is the generic presentation fence used when a caller has
+    /// already written canonical tab state outside `persistSelection`.
+    func protectCanonicalMCPSelectionFromDeferredUISnapshots(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity
+    ) {
+        guard let workspaceManager,
+              workspaceManager.composeTab(for: identity)?.selection == selection
+        else { return }
+        updateMCPSelectionPresentation(
+            selection,
+            for: identity,
+            workspaceManager: workspaceManager
+        )
+    }
+
     func selectionSnapshot(
         for identity: WorkspaceSelectionIdentity,
         flushPendingUIIfActive: Bool = true

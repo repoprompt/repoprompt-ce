@@ -57,8 +57,13 @@ The runtime configuration is deliberately conservative:
 - a small bounded Sentry cache and breadcrumb limit,
 - a `beforeSend` scrubber that removes the Sentry request object, request payload fields, user and
   geo fields, server names, stable device identifiers, installation/vendor/advertising identifiers,
-  and redacts obvious secrets, local home paths, and IP-like values from event fields exposed by
-  Sentry Cocoa.
+  and redacts obvious secrets, arbitrary macOS user-home paths, and IP-like values from event fields
+  exposed by Sentry Cocoa,
+- typed traversal of event, thread, and exception stack traces, exception mechanisms, frame
+  registers/variables/context, and debug images; user-local values in path-bearing frame and debug
+  image fields are removed while symbolication identifiers and addresses are preserved,
+- removal of Sentry `dist` in `beforeSend`, after the pinned SDK has restored the bundle build number
+  during event preparation.
 
 ## What is not sent
 
@@ -75,8 +80,18 @@ RepoPrompt CE does not intentionally send:
 Native crash reports may include SDK-provided crash context such as stack traces, exception messages,
 app/OS versions, device model, locale, and memory values. RepoPrompt disables default PII, disables
 Sentry's automatic failed-request and release-health session capture, and applies its own scrubber
-before events are sent. RepoPrompt explicitly clears Sentry `dist` at SDK startup for new events; older cached crashes from
-previous builds may retain the distribution value originally attached by those builds.
+before events are sent.
+
+For pinned Sentry Cocoa 9.17.1, crash and app-hang conversion populates typed frames, exceptions, and
+debug images before `beforeSend`; RepoPrompt clears the SDK-restored `dist` and scrubs those fields
+before event serialization. Already-serialized envelopes cached by an older build are not rewritten.
+Sentry's user-feedback event type bypasses `beforeSend`, but RepoPrompt does not expose or capture that
+event type. The envelope header can carry SDK-generated trace-routing metadata outside the serialized
+event item; RepoPrompt does not put prompts, file contents, workspace names, or user identifiers there.
+Sentry also runs global event processors after `beforeSend`; RepoPrompt registers none, and adding one
+that restores unsanitized data would violate this boundary. SDK upgrades must revalidate crash/hang
+conversion, callback order, processor order, and envelope serialization before this promise is carried
+forward.
 
 ## Processor
 

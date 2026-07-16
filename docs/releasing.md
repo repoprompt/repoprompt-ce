@@ -287,7 +287,7 @@ Add these environment secrets:
 | `PUBLIC_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission. |
 | `TIP_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-tip-updates` with repository contents read/write permission. Do not reuse the stable update token. |
 | `SENTRY_DSN` | Sentry DSN injected into official signed builds for release routing. It is not a credential, but keep it in the protected release environment so unofficial artifacts do not route telemetry to the official project. |
-| `SENTRY_AUTH_TOKEN` | Sentry auth token used only for uploading release debug symbols during publication. |
+| `SENTRY_AUTH_TOKEN` | Sentry release token used for draft-time debug-symbol/release metadata and verified-promotion deploy recording. Provisioning it with `project:releases` only is a manual release gate; tooling does not inspect or change token scopes. |
 
 Add these non-secret release environment variables when Sentry symbol upload is enabled:
 
@@ -296,6 +296,8 @@ Add these non-secret release environment variables when Sentry symbol upload is 
 | `REPOPROMPT_ENABLE_SENTRY` | `1` for official telemetry-enabled release staging. |
 | `REPOPROMPT_SENTRY_ORG` | Sentry organization slug. |
 | `REPOPROMPT_SENTRY_PROJECT` | Sentry project slug. |
+
+Official stable promotion intentionally requires `SENTRY_AUTH_TOKEN` and the Sentry org/project/environment configuration so it can record the verified production deploy only after public verification.
 
 ## Sentry telemetry and debug symbols
 
@@ -312,7 +314,9 @@ When Sentry is enabled, release staging generates dSYMs under
 `release.sh publish-staged` requires `SENTRY_AUTH_TOKEN` (or
 `REPOPROMPT_SENTRY_AUTH_TOKEN_FILE`), `REPOPROMPT_SENTRY_ORG`, and
 `REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases, then uploads
-those debug symbols.
+those debug symbols. After the GitHub draft exists, it finalizes the Sentry
+release to mark its commit metadata and symbols ready. Finalization does not
+mean that the release is deployed to production.
 The upload helper runs:
 
 ```bash
@@ -513,9 +517,18 @@ it does not execute packaged helper code while source and updater tokens or the
 Sparkle private key are available. After verification, it creates or resumes an
 updater draft with the reviewed ZIP, appcast, and checksums, publishes the
 updater release, publishes the source release, explicitly marks both as latest,
-and immediately verifies every source and updater asset anonymously. The workflow serializes stable-channel
+and immediately verifies every source and updater asset anonymously. Before the
+first publication mutation, promotion also performs a read-only Sentry deploy
+API preflight using a mode-`0600` ephemeral curl configuration. After anonymous
+publication verification succeeds, it repeats the deploy list and creates the
+exact production/tag deploy only when it is absent. The deploy release-name path
+segment is percent-encoded, and the deploy-creating POST is never automatically
+retried. The workflow serializes stable-channel
 promotion so two CI promotions cannot race. Rerunning the same tag safely
-resumes expected partial states only when the existing assets match exactly.
+resumes expected partial states only when the existing assets match exactly;
+list-before-create makes the Sentry marker idempotent across those serialized
+runs. HTTP `403` is reported as an auth/scope gate failure, while malformed API
+JSON fails closed separately.
 
 ```text
 https://github.com/repoprompt/repoprompt-ce-updates/releases/latest
@@ -576,7 +589,11 @@ For an incomplete source draft, inspect its assets and either delete the
 incomplete draft before rerunning the protected build or resume only after
 checksum comparison. If promotion stops after creating or publishing an
 updater release, rerun **Promote Release** with the same tag. It resumes only
-when the existing updater assets match the reviewed source assets exactly. For
+when the existing updater assets match the reviewed source assets exactly. If
+both releases are already public but Sentry deploy creation failed, the same
+rerun re-verifies public assets and records the missing deploy; an existing
+exact environment/tag deploy is left unchanged. Tooling does not delete or
+rewrite premature deploy markers created by older release tooling. For
 a public regression, withdraw the bad release if policy allows it and publish a
 new hotfix tag with a higher `BUILD_NUMBER`; explicitly promote the hotfix as
 latest.

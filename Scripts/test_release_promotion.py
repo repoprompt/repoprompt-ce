@@ -23,7 +23,7 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertIn("OK: reviewed source release assets verified for v1.0.0.", result.stdout)
 
     def test_promote_mirrors_draft_before_publishing_and_runs_anonymous_smoke(self) -> None:
-        result, capture, _tools = self.run_promotion("promote")
+        result, capture, tools = self.run_promotion("promote")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: anonymous release smoke passed for v1.0.0.", result.stdout)
@@ -41,6 +41,10 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         self.assertLess(create, publish_update)
         self.assertLess(publish_update, publish_source)
+        sentry_calls = [line for line in tools.read_text(encoding="utf-8").splitlines() if line.startswith("sentry ")]
+        self.assertEqual(sum(" GET " in call for call in sentry_calls), 2)
+        self.assertEqual(sum(" POST " in call for call in sentry_calls), 1)
+        self.assertTrue(all("com.pvncher.repoprompt.ce%401.0.0%2B1" in call for call in sentry_calls))
 
     def test_promote_resumes_matching_updater_draft_without_reupload(self) -> None:
         result, capture, _tools = self.run_promotion("promote", update_state="draft")
@@ -54,6 +58,55 @@ class ReleasePromotionTests(unittest.TestCase):
         result, _capture, _tools = self.run_promotion("verify", source_is_draft=False)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_promote_partial_publish_rerun_reaches_missing_sentry_deploy(self) -> None:
+        result, _capture, tools = self.run_promotion(
+            "promote",
+            source_is_draft=False,
+            update_state="published",
+            promotion_already_published=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sentry_calls = tools.read_text(encoding="utf-8")
+        self.assertIn("sentry POST", sentry_calls)
+        self.assertIn("OK: recorded Sentry production deploy", result.stdout)
+
+    def test_promote_skips_existing_exact_sentry_deploy(self) -> None:
+        result, _capture, tools = self.run_promotion("promote", sentry_deploy_state="exact")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sentry_calls = tools.read_text(encoding="utf-8")
+        self.assertNotIn("sentry POST", sentry_calls)
+        self.assertIn("already recorded", result.stdout)
+
+    def test_promote_unrelated_sentry_deploy_does_not_suppress_create(self) -> None:
+        result, _capture, tools = self.run_promotion("promote", sentry_deploy_state="unrelated")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sentry POST", tools.read_text(encoding="utf-8"))
+
+    def test_promote_fails_closed_on_sentry_scope_failure_before_github_mutation(self) -> None:
+        result, capture, tools = self.run_promotion("promote", sentry_http_status="403")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTP 403", result.stderr)
+        self.assertNotIn("release edit", capture.read_text(encoding="utf-8"))
+        self.assertNotIn("sentry POST", tools.read_text(encoding="utf-8"))
+
+    def test_promote_fails_closed_on_malformed_sentry_deploy_list(self) -> None:
+        result, capture, tools = self.run_promotion("promote", sentry_deploy_state="malformed")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed JSON", result.stderr)
+        self.assertNotIn("release edit", capture.read_text(encoding="utf-8"))
+        self.assertNotIn("sentry POST", tools.read_text(encoding="utf-8"))
+
+    def test_promote_does_not_record_deploy_when_anonymous_verification_fails(self) -> None:
+        result, _capture, tools = self.run_promotion("promote", anonymous_failure=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("sentry POST", tools.read_text(encoding="utf-8"))
 
     def test_verify_rejects_extra_source_asset(self) -> None:
         result, _capture, _tools = self.run_promotion("verify", extra_source_asset=True)
@@ -132,6 +185,10 @@ class ReleasePromotionTests(unittest.TestCase):
         latest_http_status: str = "404",
         reviewed_checksums_sha256: str = "",
         release_tag: str = "v1.0.0",
+        sentry_deploy_state: str = "absent",
+        sentry_http_status: str = "200",
+        anonymous_failure: bool = False,
+        promotion_already_published: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -237,6 +294,14 @@ class ReleasePromotionTests(unittest.TestCase):
 
         capture = temp_dir / "gh-calls.txt"
         tool_capture = temp_dir / "tool-calls.txt"
+        sentry_token_file = temp_dir / "sentry-token"
+        sentry_token_file.write_text("fixture-sentry-token\n", encoding="utf-8")
+        sentry_token_file.chmod(0o600)
+        sentry_deploy_created = temp_dir / "sentry-deploy-created"
+        anonymous_verified = temp_dir / "anonymous-verified"
+        promotion_published = temp_dir / "promotion-published"
+        if promotion_already_published:
+            promotion_published.touch()
         self.write_stub(
             fake_bin,
             "gh",
@@ -342,17 +407,65 @@ class ReleasePromotionTests(unittest.TestCase):
             output=""
             url=""
             write_status=false
+            method="GET"
+            config=""
+            body=""
             while [[ "$#" -gt 0 ]]; do
                 case "$1" in
                     --output) shift; output="$1" ;;
                     --write-out) shift; write_status=true ;;
+                    --request) shift; method="$1" ;;
+                    --config) shift; config="$1" ;;
+                    --data-binary) shift; body="$1" ;;
                     http*) url="$1" ;;
                 esac
                 shift || true
             done
+            printf 'curl %s %s\n' "$method" "$url" >> "$FAKE_TOOL_CAPTURE"
             case "$url" in
+                https://sentry.io/api/0/organizations/repoprompt/releases/com.pvncher.repoprompt.ce%401.0.0%2B1/deploys/)
+                    printf 'sentry %s %s\n' "$method" "$url" >> "$FAKE_TOOL_CAPTURE"
+                    [[ "$args" != *"fixture-sentry-token"* ]] || { printf 'token leaked in curl args\n' >&2; exit 1; }
+                    [[ -n "$config" && "$(stat -f %Lp "$config")" == "600" ]] || {
+                        printf 'Sentry curl config is missing or not mode 0600\n' >&2
+                        exit 1
+                    }
+                    grep -Fq 'Authorization: Bearer fixture-sentry-token' "$config"
+                    if [[ "$FAKE_SENTRY_HTTP_STATUS" != "200" ]]; then
+                        printf '{"detail":"denied"}\n' > "$output"
+                        $write_status && printf '%s' "$FAKE_SENTRY_HTTP_STATUS"
+                    elif [[ "$method" == "GET" ]]; then
+                        if [[ -f "$FAKE_SENTRY_DEPLOY_CREATED" || "$FAKE_SENTRY_DEPLOY_STATE" == "exact" ]]; then
+                            printf '[{"environment":"production","name":"v1.0.0"}]\n' > "$output"
+                        elif [[ "$FAKE_SENTRY_DEPLOY_STATE" == "unrelated" ]]; then
+                            printf '[{"environment":"staging","name":"v1.0.0"},{"environment":"production","name":"other"}]\n' > "$output"
+                        elif [[ "$FAKE_SENTRY_DEPLOY_STATE" == "malformed" ]]; then
+                            printf '{"unexpected":true}\n' > "$output"
+                        else
+                            printf '[]\n' > "$output"
+                        fi
+                        $write_status && printf '200'
+                    else
+                        [[ "$method" == "POST" ]] || exit 1
+                        [[ -f "$FAKE_ANONYMOUS_VERIFIED" ]] || {
+                            printf 'Sentry deploy POST preceded anonymous verification\n' >&2
+                            exit 1
+                        }
+                        grep -q 'release edit v1.0.0 --repo repoprompt/repoprompt-ce-updates' "$FAKE_GH_CAPTURE"
+                        grep -q 'release edit v1.0.0 --repo repoprompt/repoprompt-ce ' "$FAKE_GH_CAPTURE"
+                        body="${body#@}"
+                        jq -e '.environment == "production" and .name == "v1.0.0" and .projects == ["repoprompt"]' "$body" >/dev/null
+                        touch "$FAKE_SENTRY_DEPLOY_CREATED"
+                        printf '{"environment":"production","name":"v1.0.0"}\n' > "$output"
+                        $write_status && printf '201'
+                    fi
+                    ;;
                 https://api.github.com/repos/repoprompt/repoprompt-ce-updates/releases/latest)
-                    if [[ "$args" != *"Authorization: Bearer update-token"* ]]; then
+                    if [[ "$FAKE_PROMOTION_ALREADY_PUBLISHED" == "true" ]]; then
+                        printf '{"tag_name":"v1.0.0"}\n' > "$output"
+                        printf '200'
+                        exit 0
+                    elif [[ "$args" != *"Authorization: Bearer update-token"* ]]; then
                         $write_status && printf '403'
                     elif [[ -n "$FAKE_LATEST_BUILD" && ! -f "$FAKE_PROMOTION_PUBLISHED" ]]; then
                         printf '{"tag_name":"v0.9.0"}\\n' > "$output"
@@ -372,7 +485,15 @@ class ReleasePromotionTests(unittest.TestCase):
                     $write_status && printf 'https://github.com/repoprompt/repoprompt-ce-updates/releases/tag/v1.0.0'
                     ;;
                 https://github.com/repoprompt/repoprompt-ce/releases/latest)
+                    touch "$FAKE_ANONYMOUS_VERIFIED"
                     $write_status && printf 'https://github.com/repoprompt/repoprompt-ce/releases/tag/v1.0.0'
+                    ;;
+                https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml)
+                    if [[ "$FAKE_ANONYMOUS_FAILURE" == "true" ]]; then
+                        printf 'corrupt anonymous appcast\n' > "$output"
+                        exit 0
+                    fi
+                    cp "$FAKE_ASSET_DIR/appcast.xml" "$output"
                     ;;
                 */v0.9.0/appcast.xml) cp "$FAKE_ASSET_DIR/previous-appcast.xml" "$output" ;;
                 */appcast.xml) cp "$FAKE_ASSET_DIR/appcast.xml" "$output" ;;
@@ -403,6 +524,10 @@ class ReleasePromotionTests(unittest.TestCase):
                 "PUBLIC_UPDATE_GH_TOKEN": "update-token",
                 "REVIEWED_CHECKSUMS_SHA256": reviewed_checksums_sha256 or self.sha256(checksums_path),
                 "SPARKLE_PRIVATE_KEY": "fixture-private-key",
+                "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE": str(sentry_token_file),
+                "REPOPROMPT_SENTRY_ORG": "repoprompt",
+                "REPOPROMPT_SENTRY_PROJECT": "repoprompt",
+                "REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT": "production",
                 "FAKE_GH_CAPTURE": str(capture),
                 "FAKE_TOOL_CAPTURE": str(tool_capture),
                 "FAKE_SOURCE_IS_DRAFT": "true" if source_is_draft else "false",
@@ -414,7 +539,13 @@ class ReleasePromotionTests(unittest.TestCase):
                 "FAKE_DERIVED_PUBLIC_KEY": derived_public_key,
                 "FAKE_LATEST_BUILD": latest_build,
                 "FAKE_LATEST_HTTP_STATUS": latest_http_status,
-                "FAKE_PROMOTION_PUBLISHED": str(temp_dir / "promotion-published"),
+                "FAKE_PROMOTION_PUBLISHED": str(promotion_published),
+                "FAKE_PROMOTION_ALREADY_PUBLISHED": "true" if promotion_already_published else "false",
+                "FAKE_SENTRY_DEPLOY_STATE": sentry_deploy_state,
+                "FAKE_SENTRY_HTTP_STATUS": sentry_http_status,
+                "FAKE_SENTRY_DEPLOY_CREATED": str(sentry_deploy_created),
+                "FAKE_ANONYMOUS_FAILURE": "true" if anonymous_failure else "false",
+                "FAKE_ANONYMOUS_VERIFIED": str(anonymous_verified),
             }
         )
         result = subprocess.run(
@@ -422,10 +553,10 @@ class ReleasePromotionTests(unittest.TestCase):
             env=env,
             text=True,
             capture_output=True,
-            timeout=15,
+            timeout=45,
         )
         if mode == "promote" and result.returncode == 0:
-            (temp_dir / "promotion-published").touch()
+            promotion_published.touch()
         return result, capture, tool_capture
 
     @staticmethod

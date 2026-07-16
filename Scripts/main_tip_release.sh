@@ -42,10 +42,12 @@ FINAL_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-metadata.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
 STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
+SIGN_UPDATE="$TRUSTED_ROOT/Vendor/Sparkle/bin/sign_update"
 TMP_DIR=""
 
 require_command() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
 require_env() { [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"; }
+require_file() { [[ -f "$1" ]] || fail "Missing required file: $1"; }
 cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
@@ -160,11 +162,80 @@ submit_notarization() {
         --timeout "${NOTARYTOOL_TIMEOUT:-30m}"
 }
 
+derive_sparkle_public_key() {
+    xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/derive_sparkle_public_key.swift" "$1"
+}
+
+validate_generated_tip_appcast() {
+    local appcast_values="$TMP_DIR/tip-appcast-values.tsv"
+    python3 - "$APPCAST" > "$appcast_values" <<'PYTHON'
+import sys
+import xml.etree.ElementTree as ET
+
+sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+root = ET.parse(sys.argv[1]).getroot()
+items = root.findall("./channel/item")
+if len(items) != 1:
+    raise SystemExit(f"tip appcast must contain exactly one item, got {len(items)}")
+enclosures = items[0].findall("enclosure")
+if len(enclosures) != 1:
+    raise SystemExit(f"tip appcast item must contain exactly one enclosure, got {len(enclosures)}")
+item = items[0]
+enclosure = enclosures[0]
+values = [
+    enclosure.attrib.get("url", ""),
+    enclosure.attrib.get(f"{{{sparkle}}}edSignature", ""),
+    enclosure.attrib.get("length", ""),
+    item.findtext(f"{{{sparkle}}}version", default=""),
+    item.findtext(f"{{{sparkle}}}shortVersionString", default=""),
+]
+print("\x1f".join(values))
+PYTHON
+
+    local enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing
+    IFS=$'\x1f' read -r enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing < "$appcast_values"
+    [[ "$enclosure_url" == "$TIP_DOWNLOAD_URL_PREFIX$(basename "$UPDATE_ZIP")" ]] ||
+        fail "Tip appcast enclosure URL mismatch: $enclosure_url"
+    [[ -n "$enclosure_signature" ]] || fail "Tip appcast enclosure is missing an EdDSA signature"
+    [[ "$enclosure_length" == "$(stat -f %z "$UPDATE_ZIP")" ]] ||
+        fail "Tip appcast enclosure length does not match $(basename "$UPDATE_ZIP")"
+    [[ "$appcast_build" == "$TIP_BUILD_NUMBER" ]] ||
+        fail "Tip appcast build mismatch: expected $TIP_BUILD_NUMBER, got $appcast_build"
+    [[ "$appcast_marketing" == "$MARKETING_VERSION" ]] ||
+        fail "Tip appcast marketing version mismatch: expected $MARKETING_VERSION, got $appcast_marketing"
+
+    local private_key_file="$TMP_DIR/tip-sparkle-private-key"
+    local public_key_file="$TMP_DIR/tip-sparkle-public-key"
+    umask 077
+    printf '%s' "$SPARKLE_PRIVATE_KEY" > "$private_key_file"
+
+    local derived_public_key committed_public_key reproduced_signature
+    derived_public_key="$(derive_sparkle_public_key "$private_key_file")"
+    committed_public_key="$(plutil -extract SUPublicEDKey raw "$APP_BUNDLE/Contents/Info.plist")"
+    [[ "$derived_public_key" == "$committed_public_key" ]] ||
+        fail "Tip Sparkle private key does not match the app bundle SUPublicEDKey"
+    reproduced_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" |
+        "$SIGN_UPDATE" --ed-key-file - -p "$UPDATE_ZIP" |
+        tr -d '\r\n')"
+    [[ "$reproduced_signature" == "$enclosure_signature" ]] ||
+        fail "Tip Sparkle private key does not reproduce the generated appcast signature"
+
+    printf '%s' "$committed_public_key" > "$public_key_file"
+    xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift" \
+        "$public_key_file" "$enclosure_signature" "$UPDATE_ZIP"
+}
+
 sign_tip() {
     require_command ditto
     require_command hdiutil
+    require_command plutil
+    require_command python3
     require_command shasum
+    require_command stat
     require_command xcrun
+    require_file "$SIGN_UPDATE"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/derive_sparkle_public_key.swift"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
     require_env SIGN_IDENTITY
     require_env REPOPROMPT_PROVISIONING_PROFILE
     require_env SPARKLE_PRIVATE_KEY
@@ -214,6 +285,7 @@ sign_tip() {
             --download-url-prefix "$TIP_DOWNLOAD_URL_PREFIX" \
             -o "$APPCAST" \
             "$appcast_dir"
+    validate_generated_tip_appcast
     (cd "$DIST_DIR" && shasum -a 256 \
         "$(basename "$UPDATE_ZIP")" \
         "$(basename "$DMG")" \
@@ -250,9 +322,11 @@ publish_tip() {
     printf 'OK: published tip update release %s to %s.\n' "$TIP_TAG" "$TIP_UPDATE_REPOSITORY"
 }
 
-case "$MODE" in
-    stage) stage_tip ;;
-    sign) sign_tip ;;
-    publish-tip) publish_tip ;;
-    *) fail "Usage: $0 stage|sign|publish-tip" ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        stage) stage_tip ;;
+        sign) sign_tip ;;
+        publish-tip) publish_tip ;;
+        *) fail "Usage: $0 stage|sign|publish-tip" ;;
+    esac
+fi

@@ -3,6 +3,30 @@ import XCTest
 
 @MainActor
 final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
+    func testOperationIdentityRejectsWorkspaceAndInheritanceChanges() {
+        let workspaceID = UUID()
+        let identity = AgentModelsOperationIdentity(
+            sourceWorkspaceID: workspaceID,
+            inheritanceMode: .useWorkspaceOverrides
+        )
+
+        XCTAssertTrue(identity.matches(sourceWorkspaceID: workspaceID, inheritanceMode: .useWorkspaceOverrides))
+        XCTAssertFalse(identity.matches(sourceWorkspaceID: UUID(), inheritanceMode: .useWorkspaceOverrides))
+        XCTAssertFalse(identity.matches(sourceWorkspaceID: workspaceID, inheritanceMode: .useGlobalSettings))
+    }
+
+    func testRecommendationActionRevisionGuardRejectsSameIdentityAfterDurableChange() {
+        var guardState = RecommendationActionRevisionGuard()
+        guardState.markComputed()
+        XCTAssertTrue(guardState.isCurrent)
+
+        guardState.invalidate()
+        XCTAssertFalse(guardState.isCurrent)
+
+        guardState.markComputed()
+        XCTAssertTrue(guardState.isCurrent)
+    }
+
     func testRecommendationSatisfactionUsesTargetEditingScope() throws {
         let fixture = try makeFixture()
         let workspaceID = UUID()
@@ -25,13 +49,11 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )
 
         let globalRecommendations = fixture.engine.computeRecommendations(
-            for: workspaceID,
-            scope: .global,
+            for: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global),
             enabledProviders: [.openAI]
         )
         let workspaceRecommendations = fixture.engine.computeRecommendations(
-            for: workspaceID,
-            scope: .workspace(workspaceID),
+            for: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID)),
             enabledProviders: [.openAI]
         )
 
@@ -65,14 +87,12 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )
 
         let recommendations = fixture.engine.computeRecommendations(
-            for: workspaceID,
-            scope: .workspace(workspaceID),
+            for: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID)),
             enabledProviders: [.openAI]
         )
         fixture.engine.applyModelRecommendations(
             recommendations,
-            workspaceID: workspaceID,
-            scope: .workspace(workspaceID)
+            identity: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID))
         )
 
         let workspaceProfile = try XCTUnwrap(fixture.store.workspaceAgentModelsProfile(for: workspaceID))
@@ -104,8 +124,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )
         fixture.engine.applyContextBuilderRecommendation(
             recommendation,
-            workspaceID: workspaceID,
-            scope: .workspace(workspaceID)
+            identity: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID))
         )
 
         let workspaceProfile = try XCTUnwrap(fixture.store.workspaceAgentModelsProfile(for: workspaceID))
@@ -155,8 +174,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )
         fixture.engine.applyMCPAgentDefaultsRecommendation(
             recommendation,
-            workspaceID: workspaceID,
-            scope: .workspace(workspaceID)
+            identity: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID))
         )
 
         XCTAssertEqual(
@@ -177,7 +195,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
 
         fixture.engine.applyContextBuilderRecommendation(
             recommendation,
-            workspaceID: workspaceID,
+            identity: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global),
             contextBuilderWriteIntent: .automaticSeed
         )
 
@@ -185,7 +203,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
 
         fixture.engine.applyContextBuilderRecommendation(
             recommendation,
-            workspaceID: workspaceID,
+            identity: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global),
             contextBuilderWriteIntent: .userInitiated
         )
 
@@ -193,7 +211,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
 
         fixture.engine.applyContextBuilderRecommendation(
             recommendation,
-            workspaceID: workspaceID,
+            identity: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global),
             contextBuilderWriteIntent: .automaticSeed
         )
 

@@ -100,4 +100,42 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertTrue(store.codexReasoningSummariesEnabled())
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), futureJSON)
     }
+
+    func testSetReportsAutomaticSchemaNormalizationFailureWithoutTouchingOriginal() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let falseV4JSON = #"{"schemaVersion":4,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{},"scalarPreferences":{}}"#
+        try Data(falseV4JSON.utf8).write(to: fileURL)
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(
+                fileURL: fileURL,
+                normalizationBackupWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) }
+            )
+        )
+        let service = AppSettingsMCPService(store: store)
+
+        let result = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string("agent_mode.codex_reasoning_summaries_enabled"),
+            "value": .bool(true)
+        ])
+
+        XCTAssertEqual(
+            result.objectValue?["persistence_block_reason"]?.stringValue,
+            "automatic_schema_normalization_failed"
+        )
+        let warning = try XCTUnwrap(result.objectValue?["persistence_warning"]?.stringValue)
+        XCTAssertTrue(warning.contains("applied in memory"))
+        XCTAssertTrue(warning.contains("original file is preserved"))
+        XCTAssertTrue(warning.contains("explicit recovery"))
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), falseV4JSON)
+    }
 }

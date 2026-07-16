@@ -2447,6 +2447,37 @@ extension MCPServerViewModel {
         return adjustedLookupContext
     }
 
+    /// Resolves mutation routing and lookup authority together so an inactive,
+    /// persisted Agent tab can hydrate its worktree binding before the mutation
+    /// gate evaluates it. Re-resolving the snapshot after hydration keeps stale or
+    /// superseded routes fail-closed instead of falling back to the visible checkout.
+    @MainActor
+    func resolveMutationFileToolContext(
+        from metadata: RequestMetadata,
+        toolName: String
+    ) async throws -> (
+        resolvedContext: ResolvedTabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
+    ) {
+        var resolvedContext = try resolveTabContextSnapshot(
+            from: metadata,
+            toolName: toolName,
+            policy: .allowLegacyImplicitRouting
+        )
+        let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if !resolvedContext.usesActiveTabCompatibility,
+           resolvedContext.snapshot.activeAgentSessionID != nil,
+           case .unhydrated = resolvedContext.snapshot.worktreeBindingState
+        {
+            resolvedContext = try resolveTabContextSnapshot(
+                from: metadata,
+                toolName: toolName,
+                policy: .allowLegacyImplicitRouting
+            )
+        }
+        return (resolvedContext, lookupContext)
+    }
+
     @MainActor
     private func fileToolVisibleRootFingerprint() async -> String {
         await promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
@@ -4455,6 +4486,10 @@ extension MCPServerViewModel {
         guard let storedTab = manager.composeTab(for: identity),
               storedTab.selection == updatedTab.selection
         else { return nil }
+        selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
+            storedTab.selection,
+            for: identity
+        )
         let committedSelectionRevision = manager.selectionRevisionForMCP(
             workspaceID: identity.workspaceID,
             tabID: identity.tabID
@@ -4485,6 +4520,11 @@ extension MCPServerViewModel {
         manager.beginApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext applying to UI: tab=\(applyTab.id) selectionCount=\(applyTab.selection.selectedPaths.count) promptChars=\(applyTab.promptText.count)")
         await manager.applyComposeTabState(applyTab)
+        // Refresh after the full UI apply because its final recount can enqueue another stale snapshot.
+        selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
+            applyTab.selection,
+            for: identity
+        )
         manager.endApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext UI applied: tab=\(applyTab.id)")
         guard isStillCurrent(), !Task.isCancelled else { return nil }

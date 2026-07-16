@@ -789,6 +789,9 @@ enum ToolResultDTOs {
         let retryable: Bool?
         let retryAfterMilliseconds: Int?
         let suggestion: String?
+        let operationID: String?
+        let mutationState: String?
+        let freshness: String?
 
         init(
             status: String,
@@ -811,7 +814,10 @@ enum ToolResultDTOs {
             errorCode: String? = nil,
             retryable: Bool? = nil,
             retryAfterMilliseconds: Int? = nil,
-            suggestion: String? = nil
+            suggestion: String? = nil,
+            operationID: String? = nil,
+            mutationState: String? = nil,
+            freshness: String? = nil
         ) {
             self.status = status
             self.editsRequested = editsRequested
@@ -834,6 +840,9 @@ enum ToolResultDTOs {
             self.retryable = retryable
             self.retryAfterMilliseconds = retryAfterMilliseconds
             self.suggestion = suggestion
+            self.operationID = operationID
+            self.mutationState = mutationState
+            self.freshness = freshness
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -858,6 +867,9 @@ enum ToolResultDTOs {
             case retryable
             case retryAfterMilliseconds = "retry_after_ms"
             case suggestion
+            case operationID = "operation_id"
+            case mutationState = "mutation_state"
+            case freshness
         }
     }
 
@@ -1107,6 +1119,9 @@ enum ToolResultDTOs {
         let path: String
         let newPath: String? // present for move/rename
         let warning: String?
+        let operationID: String?
+        let mutationState: String?
+        let freshness: String?
         let errorMessage: String?
         let errorCode: String?
         let retryable: Bool?
@@ -1119,6 +1134,9 @@ enum ToolResultDTOs {
             path: String,
             newPath: String?,
             warning: String? = nil,
+            operationID: String? = nil,
+            mutationState: String? = nil,
+            freshness: String? = nil,
             errorMessage: String? = nil,
             errorCode: String? = nil,
             retryable: Bool? = nil,
@@ -1130,6 +1148,9 @@ enum ToolResultDTOs {
             self.path = path
             self.newPath = newPath
             self.warning = warning
+            self.operationID = operationID
+            self.mutationState = mutationState
+            self.freshness = freshness
             self.errorMessage = errorMessage
             self.errorCode = errorCode
             self.retryable = retryable
@@ -1143,6 +1164,9 @@ enum ToolResultDTOs {
             case path
             case newPath = "new_path"
             case warning
+            case operationID = "operation_id"
+            case mutationState = "mutation_state"
+            case freshness
             case errorMessage = "error"
             case errorCode = "error_code"
             case retryable
