@@ -53,8 +53,12 @@ struct AgentMCPStartWorktreeCoordinator {
 
     private struct RepositoryContext {
         let repo: GitRepoDescriptor
-        let allRepos: [GitRepoDescriptor]
         let visibleRoots: [WorkspaceRootRef]
+        let logicalRoot: WorkspaceRootRef
+    }
+
+    private struct RepositoryCandidate {
+        let repo: GitRepoDescriptor
         let logicalRoot: WorkspaceRootRef
     }
 
@@ -183,10 +187,12 @@ struct AgentMCPStartWorktreeCoordinator {
                     throw MCPError.internalError("\(operationName) worktree preparation reached an unexpected empty worktree mode.")
                 case let .existing(selector):
                     do {
+                        // Repository selection is the authority boundary for the resulting logical-root binding.
+                        // Searching sibling workspace repositories could bind a foreign worktree under that root.
                         worktree = try await gitTargetResolver.resolveWorktree(
                             selector: selector,
                             repo: context.repo,
-                            allRepos: context.allRepos
+                            allRepos: [context.repo]
                         )
                         initializationReceipt = nil
                         initializationFallbackReason = nil
@@ -416,19 +422,24 @@ struct AgentMCPStartWorktreeCoordinator {
     ) async throws -> RepositoryContext {
         let store = targetWindow.promptManager.workspaceFileContextStore
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
-        var repos: [GitRepoDescriptor] = []
+        let discoveryRoots = Self.repositoryDiscoveryRoots(
+            primaryRoot: targetWindow.workspaceManager.activeWorkspace?.repoPaths.first,
+            visibleRoots: visibleRoots
+        )
+        var candidates: [RepositoryCandidate] = []
         var seen = Set<String>()
-        for root in visibleRoots {
+        for root in discoveryRoots {
             if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
                 let descriptor = GitRepoDescriptor(rootURL: resolved.rootURL)
                 if seen.insert(descriptor.rootPath.lowercased()).inserted {
-                    repos.append(descriptor)
+                    candidates.append(RepositoryCandidate(repo: descriptor, logicalRoot: root))
                 }
             }
         }
-        guard let defaultRepo = repos.first else {
+        guard let defaultCandidate = candidates.first else {
             throw MCPError.invalidParams("No Git repository found in loaded roots for \(operationName) worktree binding.")
         }
+        let repos = candidates.map(\.repo)
         let repo: GitRepoDescriptor
         var explicitLogicalRoot: WorkspaceRootRef?
         if let rawRepoRoot = request.repoRoot {
@@ -440,13 +451,14 @@ struct AgentMCPStartWorktreeCoordinator {
                     rawRepoRoot,
                     allRepos: repos,
                     visibleRoots: visibleRoots,
-                    defaultRepo: defaultRepo
+                    defaultRepo: defaultCandidate.repo
                 )
             } catch let error as GitRepoTargetResolverError {
                 throw MCPError.invalidParams(error.message)
             }
         } else {
-            repo = defaultRepo
+            repo = defaultCandidate.repo
+            explicitLogicalRoot = defaultCandidate.logicalRoot
         }
         let logicalRoot = try await logicalRoot(
             for: repo,
@@ -455,7 +467,6 @@ struct AgentMCPStartWorktreeCoordinator {
         )
         return RepositoryContext(
             repo: repo,
-            allRepos: repos,
             visibleRoots: visibleRoots,
             logicalRoot: logicalRoot
         )
@@ -707,6 +718,30 @@ struct AgentMCPStartWorktreeCoordinator {
                 || standardizedPath(root.standardizedFullPath) == canonical
                 || standardizedPath(root.fullPath) == canonical
         }
+    }
+
+    /// Provider startup treats the declared workspace root as primary even when file-root load order differs.
+    /// Preserve sibling order so only the implicit default changes.
+    static func repositoryDiscoveryRoots(
+        primaryRoot: String?,
+        visibleRoots: [WorkspaceRootRef]
+    ) -> [WorkspaceRootRef] {
+        guard let primaryRoot else {
+            return visibleRoots
+        }
+        let primaryPath = ((primaryRoot as NSString).expandingTildeInPath as NSString).standardizingPath
+        guard let primaryIndex = visibleRoots.firstIndex(where: {
+            ($0.standardizedFullPath as NSString).standardizingPath == primaryPath
+        }) else {
+            return visibleRoots
+        }
+        guard primaryIndex != visibleRoots.startIndex else {
+            return visibleRoots
+        }
+        var ordered = visibleRoots
+        let primary = ordered.remove(at: primaryIndex)
+        ordered.insert(primary, at: ordered.startIndex)
+        return ordered
     }
 
     private func explicitWorktreePath(from value: Value?) throws -> URL? {

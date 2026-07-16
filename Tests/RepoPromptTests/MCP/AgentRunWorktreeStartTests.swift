@@ -2486,6 +2486,167 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(exploreChild.worktreeBindings, observation.bindings)
     }
 
+    func testAgentStartWorktreeSelectorsDefaultToWorkspacePrimaryRepoWhenRootsLoadedOutOfOrder() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/primary-selector-\(primaryFixture.suffix)"
+        let primaryWorktree = primaryFixture.sandbox.appendingPathComponent(
+            "primary-selector-worktree",
+            isDirectory: true
+        )
+        try runGit(
+            ["worktree", "add", "-b", branch, primaryWorktree.path, "HEAD"],
+            cwd: primaryFixture.repo
+        )
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: primaryFixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: primaryFixture.repo,
+            path: primaryWorktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: primaryFixture.repo) }
+        )
+
+        let primaryRef = WorkspaceRootRef(
+            id: UUID(),
+            name: "primary",
+            fullPath: primaryFixture.repo.path
+        )
+        let secondaryRef = WorkspaceRootRef(
+            id: UUID(),
+            name: "secondary",
+            fullPath: secondaryFixture.repo.path
+        )
+        let discoveryRoots = AgentMCPStartWorktreeCoordinator.repositoryDiscoveryRoots(
+            primaryRoot: primaryFixture.repo.path,
+            visibleRoots: [secondaryRef, primaryRef]
+        )
+        XCTAssertEqual(discoveryRoots, [primaryRef, secondaryRef])
+
+        let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        XCTAssertEqual(workspace.repoPaths.first, primaryFixture.repo.path)
+
+        for testCase in [
+            (label: "implicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: nil),
+            (label: "implicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: nil),
+            (label: "explicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: primaryFixture.repo.path),
+            (label: "explicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: primaryFixture.repo.path)
+        ] {
+            let service = makeAgentRunStartService(window: window, sourceTabID: nil)
+            var args: [String: Value] = [
+                "op": .string("start"),
+                "message": .string(testCase.label),
+                "detach": .bool(true),
+                "timeout": .int(0),
+                testCase.key: .string(testCase.selector)
+            ]
+            if let repoRoot = testCase.repoRoot {
+                args["worktree_repo_root"] = .string(repoRoot)
+            }
+            let value = try await service.execute(args: args)
+            let object = try XCTUnwrap(value.objectValue, testCase.label)
+            let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue, testCase.label)
+            let binding = try XCTUnwrap(bindings.first?.objectValue, testCase.label)
+            XCTAssertEqual(bindings.count, 1, testCase.label)
+            XCTAssertEqual(binding["worktree_id"]?.stringValue, descriptor.worktreeID, testCase.label)
+            XCTAssertEqual(binding["logical_root_path"]?.stringValue, primaryFixture.repo.path, testCase.label)
+            XCTAssertEqual(binding["worktree_root_path"]?.stringValue, descriptor.path, testCase.label)
+        }
+    }
+
+    func testAgentStartWorktreeSelectorsRejectCrossRepositoryMatchesForImplicitAndExplicitPrimaryRoot() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/cross-repo-selector-\(secondaryFixture.suffix)"
+        let secondaryWorktree = secondaryFixture.sandbox.appendingPathComponent(
+            "cross-repo-selector-worktree",
+            isDirectory: true
+        )
+        try runGit(
+            ["worktree", "add", "-b", branch, secondaryWorktree.path, "HEAD"],
+            cwd: secondaryFixture.repo
+        )
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: secondaryFixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: secondaryFixture.repo,
+            path: secondaryWorktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo) }
+        )
+        let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        let viewModel = window.agentModeViewModel
+        let initialTabCount = try XCTUnwrap(window.workspaceManager.activeWorkspace).composeTabs.count
+        let initialSessionCount = viewModel.sessions.count
+
+        for testCase in [
+            (label: "implicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: nil),
+            (label: "implicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: nil),
+            (label: "explicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: primaryFixture.repo.path),
+            (label: "explicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: primaryFixture.repo.path)
+        ] {
+            let service = makeAgentRunStartService(window: window, sourceTabID: nil)
+            var args: [String: Value] = [
+                "op": .string("start"),
+                "message": .string(testCase.label),
+                "detach": .bool(true),
+                "timeout": .int(0),
+                testCase.key: .string(testCase.selector)
+            ]
+            if let repoRoot = testCase.repoRoot {
+                args["worktree_repo_root"] = .string(repoRoot)
+            }
+            do {
+                _ = try await service.execute(args: args)
+                XCTFail("Expected cross-repository selector rejection: \(testCase.label)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("No worktree found"), testCase.label)
+            }
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.count, initialTabCount, testCase.label)
+            XCTAssertEqual(viewModel.sessions.count, initialSessionCount, testCase.label)
+        }
+    }
+
+    func testAgentStartWorktreeSelectorRejectsSecondaryGitRepoWhenPrimaryRootIsNonGit() async throws {
+        let primaryRoot = try makeTemporaryDirectory(named: "non-git-primary-root")
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/secondary-selector-\(secondaryFixture.suffix)"
+        let secondaryWorktree = secondaryFixture.sandbox.appendingPathComponent(
+            "secondary-selector-worktree",
+            isDirectory: true
+        )
+        try runGit(
+            ["worktree", "add", "-b", branch, secondaryWorktree.path, "HEAD"],
+            cwd: secondaryFixture.repo
+        )
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: secondaryFixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: secondaryFixture.repo,
+            path: secondaryWorktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo) }
+        )
+        let window = try await makeWindow(roots: [primaryRoot, secondaryFixture.repo])
+        let initialTabCount = try XCTUnwrap(window.workspaceManager.activeWorkspace).composeTabs.count
+
+        let service = makeAgentRunStartService(window: window, sourceTabID: nil)
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("start"),
+                "message": .string("reject secondary repository"),
+                "detach": .bool(true),
+                "timeout": .int(0),
+                "worktree_id": .string(descriptor.worktreeID)
+            ])
+            XCTFail("Expected a secondary-repository worktree to be rejected when the primary root is non-Git")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("supports the primary workspace root only"))
+        }
+        XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.count, initialTabCount)
+    }
+
     func testSharedStartWorktreeCoordinatorHonorsPreCancelledCreateWithoutMutation() async throws {
         let fixture = try makeGitFixture()
         let window = try await makeWindow(root: fixture.repo)
