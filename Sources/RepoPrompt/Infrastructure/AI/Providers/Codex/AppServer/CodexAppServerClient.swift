@@ -627,8 +627,8 @@ actor CodexAppServerClient {
         return installTransportTermination(
             generation: generation,
             reason: reason,
-            afterClaim: { lastTransportFailure = requestFailure },
-            operation: { client in
+            captureAfterClaim: { lastTransportFailure = requestFailure },
+            operation: { client, _ in
                 await client.completeTransportTermination(
                     generation: generation,
                     flushStdout: flushStdout,
@@ -650,19 +650,16 @@ actor CodexAppServerClient {
         else {
             return nil
         }
-        let expectedAgentPIDToClear = ClaimCapture<RegisteredExpectedAgentPID>()
         return installTransportTermination(
             generation: generation,
             reason: .observedProcessExit(status: status),
-            afterClaim: {
-                expectedAgentPIDToClear.value = takeRegisteredExpectedAgentPIDForDeferredClear()
-            },
-            operation: { client in
+            captureAfterClaim: { takeRegisteredExpectedAgentPIDForDeferredClear() },
+            operation: { client, expectedAgentPIDToClear in
                 await client.completeObservedProcessExitTermination(
                     status: status,
                     observer: observer,
                     generation: generation,
-                    expectedAgentPIDToClear: expectedAgentPIDToClear.value
+                    expectedAgentPIDToClear: expectedAgentPIDToClear
                 )
             }
         )
@@ -672,11 +669,11 @@ actor CodexAppServerClient {
     /// same-generation task reuse, the terminal-cause claim, post-claim state
     /// capture, and termination-task publication happen identically here so a
     /// new termination cause cannot skip or reorder any step of the protocol.
-    private func installTransportTermination(
+    private func installTransportTermination<ClaimContext: Sendable>(
         generation: UInt64,
         reason: TransportTerminationReason,
-        afterClaim: () -> Void,
-        operation: @escaping @Sendable (CodexAppServerClient) async -> Void
+        captureAfterClaim: () -> ClaimContext,
+        operation: @escaping @Sendable (CodexAppServerClient, ClaimContext) async -> Void
     ) -> Task<Void, Never>? {
         if let existing = transportTerminationTask,
            existing.generation == generation
@@ -684,20 +681,13 @@ actor CodexAppServerClient {
             return existing.task
         }
         guard claimTransportTermination(reason: reason) else { return nil }
-        afterClaim()
+        let claimContext = captureAfterClaim()
         let task = Task { [weak self] in
             guard let self else { return }
-            await operation(self)
+            await operation(self, claimContext)
         }
         transportTerminationTask = (generation: generation, task: task)
         return task
-    }
-
-    /// Box for a value produced at claim time (synchronously, before the
-    /// termination task is published) and consumed inside the escaping
-    /// termination operation.
-    private final class ClaimCapture<Value>: @unchecked Sendable {
-        var value: Value?
     }
 
     private func claimTransportTermination(reason: TransportTerminationReason) -> Bool {
