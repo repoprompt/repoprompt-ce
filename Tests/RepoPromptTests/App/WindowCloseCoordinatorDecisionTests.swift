@@ -140,10 +140,12 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertFalse(window.apiSettingsViewModel.test_hasPreparedForWindowClose)
         window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
         guard await waitForSubscriberCount(1, pollingService: pollingService) else { return }
-        // Use Context Builder's product-valid selected-agent path; forcing a Codex
-        // subscription while the selected agent is non-Codex can be stopped by
-        // normal model-polling reconciliation before this assertion runs.
+        // Use Context Builder's product-valid selected-agent path; explicitly
+        // transition away and back because persisted global hydration may already select Codex.
+        window.contextBuilderAgentViewModel.selectedAgent = .claudeCode
         window.contextBuilderAgentViewModel.selectedAgent = .codexExec
+        await waitForPendingMainQueueWork()
+        window.contextBuilderAgentViewModel.test_startCodexModelsSubscriptionIfNeeded()
         XCTAssertTrue(window.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask)
         guard await waitForSubscriberCount(2, pollingService: pollingService) else { return }
         let attachedSubscriberCount = await pollingService.test_subscriberCount()
@@ -183,6 +185,88 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         )
         XCTAssertTrue(requestObservationAfterClose.isQuiescent)
         XCTAssertEqual(requestObservationAfterClose.activeRequestCount, 0)
+    }
+
+    func testPreValidationHydrationStopsExplicitlyStartedDynamicModelPolling() async {
+        let previousCursorConnected = UserDefaults.standard.object(forKey: "CursorCLIConnected")
+        let settingsStore = GlobalSettingsStore.shared
+        let previousProfile = settingsStore.globalAgentModelsProfile()
+        defer {
+            settingsStore.setGlobalAgentModelsProfile(
+                previousProfile,
+                contextBuilderWriteIntent: .preserveExistingOwnership
+            )
+            if let previousCursorConnected {
+                UserDefaults.standard.set(previousCursorConnected, forKey: "CursorCLIConnected")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "CursorCLIConnected")
+            }
+        }
+        UserDefaults.standard.set(true, forKey: "CursorCLIConnected")
+        settingsStore.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                contextBuilderAgentRaw: AgentProviderKind.cursor.rawValue,
+                contextBuilderModelsByAgent: [
+                    AgentProviderKind.cursor.rawValue: AgentModel.cursorAuto.rawValue
+                ]
+            ),
+            contextBuilderWriteIntent: .userInitiated
+        )
+
+        let client = WindowClosePollingClientSpy()
+        let pollingService = CodexModelPollingService(
+            client: client,
+            intervalNanos: 60_000_000_000,
+            stopClientWhenIdle: true
+        )
+        let window = trackWindow(WindowState(
+            codexModelPollingService: pollingService,
+            loadStoredAPISettingsDataOnInit: false
+        ))
+        WindowStatesManager.shared.registerWindowState(window)
+        let viewModel = window.contextBuilderAgentViewModel
+
+        func persistClaudeSelection() {
+            settingsStore.setGlobalAgentModelsProfile(
+                AgentModelsSettingsProfile(
+                    contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+                    contextBuilderModelsByAgent: [
+                        AgentProviderKind.claudeCode.rawValue: AgentModel.claudeSonnet.rawValue
+                    ]
+                ),
+                contextBuilderWriteIntent: .userInitiated
+            )
+        }
+
+        func assertNoDynamicModelPolling() {
+            XCTAssertFalse(viewModel.test_hasCodexModelsSubscriptionTask)
+            XCTAssertFalse(viewModel.test_hasOpenCodeModelsSubscriptionTask)
+            XCTAssertFalse(viewModel.test_hasCursorModelsSubscriptionTask)
+        }
+
+        XCTAssertFalse(window.apiSettingsViewModel.isContextBuilderProviderValidationComplete)
+        assertNoDynamicModelPolling()
+
+        viewModel.selectedAgent = .codexExec
+        XCTAssertTrue(viewModel.test_hasCodexModelsSubscriptionTask)
+        persistClaudeSelection()
+        viewModel.test_applyEffectiveAgentModelForLifecycle()
+        assertNoDynamicModelPolling()
+
+        viewModel.selectedAgent = .openCode
+        XCTAssertTrue(viewModel.test_hasOpenCodeModelsSubscriptionTask)
+        persistClaudeSelection()
+        viewModel.test_handleAgentProviderAvailabilityChangedForLifecycle()
+        assertNoDynamicModelPolling()
+
+        viewModel.selectedAgent = .cursor
+        XCTAssertTrue(viewModel.test_hasCursorModelsSubscriptionTask)
+        persistClaudeSelection()
+        viewModel.test_applyEffectiveAgentModelForLifecycle()
+        assertNoDynamicModelPolling()
+
+        unregisterTrackedWindow(window)
+        await window.tearDown()
     }
 
     func testAPISettingsCloseDuringInitialLoadDoesNotStartProviderValidation() async throws {
