@@ -88,7 +88,15 @@ final class AgentRunCoordinator {
 
         let lease = MCPBootstrapLease(spec: leaseSpec)
         let acquired = await lease.acquire()
-        guard acquired else { throw CancellationError() }
+        guard acquired else {
+            // A gate-deadline timeout is a retryable provisioning failure, not an
+            // intentional cancel; surface it as a distinct error so `catch is
+            // CancellationError` callers do not misclassify it. See #419.
+            if await lease.lastAcquireWasTimeout {
+                throw HeadlessAgentConnectionAcquireTimeoutError()
+            }
+            throw CancellationError()
+        }
         return lease
     }
 

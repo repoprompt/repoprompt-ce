@@ -9,6 +9,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds, 30)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds, 30)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds, 120)
+        XCTAssertEqual(MCPTimeoutPolicy.headlessAgentConnectionAcquireDeadlineSeconds, 120)
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds, 5)
         XCTAssertEqual(MCPTimeoutPolicy.responseSendDeadlineSeconds, 30)
         XCTAssertEqual(MCPTimeoutPolicy.codexServerActiveTimeoutSeconds, 10000)

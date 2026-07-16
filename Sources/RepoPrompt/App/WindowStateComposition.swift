@@ -32,6 +32,7 @@ enum WindowStateCompositionFactory {
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        workspaceSearchService injectedWorkspaceSearchService: WorkspaceSearchService? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared
@@ -45,7 +46,7 @@ enum WindowStateCompositionFactory {
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore()
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
-        let workspaceSearchService = WorkspaceSearchService()
+        let workspaceSearchService = injectedWorkspaceSearchService ?? WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
 
         // 2) AI queries

@@ -53,6 +53,15 @@ public enum MCPTimeoutPolicy {
     public static let cliSemanticWaitResponseMarginSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
     public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 120
+
+    /// Server-side deadline for a headless agent connection gate acquisition
+    /// (`agent_run` / `agent_explore` bootstrap). Bounds the multi-window amplifier
+    /// where one stalled bootstrap would otherwise queue every subsequent start
+    /// indefinitely up to the MCP client idle timeout. See repoprompt-ce #419.
+    public static let headlessAgentConnectionAcquireDeadlineSeconds: TimeInterval = 120
+    public static let headlessAgentConnectionAcquireDeadline: Duration = .seconds(
+        headlessAgentConnectionAcquireDeadlineSeconds
+    )
     public static let askUserDefaultTimeoutSeconds: TimeInterval = 300
     public static let nextUserInstructionDefaultWaitSeconds: TimeInterval = 600
     public static let applyEditsApprovalTimeoutSeconds: TimeInterval = 300
