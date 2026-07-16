@@ -166,6 +166,44 @@ derive_sparkle_public_key() {
     xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/derive_sparkle_public_key.swift" "$1"
 }
 
+label_generated_tip_appcast() {
+    python3 - "$APPCAST" "$MARKETING_VERSION" <<'PYTHON'
+import sys
+import xml.etree.ElementTree as ET
+
+sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+ET.register_namespace("sparkle", sparkle)
+tree = ET.parse(sys.argv[1])
+root = tree.getroot()
+items = root.findall("./channel/item")
+if len(items) != 1:
+    raise SystemExit(f"tip appcast must contain exactly one item, got {len(items)}")
+
+item = items[0]
+display_version = f"Tip build v{sys.argv[2]}"
+
+titles = item.findall("title")
+if len(titles) > 1:
+    raise SystemExit(f"tip appcast item must contain at most one title, got {len(titles)}")
+title = titles[0] if titles else ET.SubElement(item, "title")
+title.text = display_version
+
+short_versions = item.findall(f"{{{sparkle}}}shortVersionString")
+if len(short_versions) > 1:
+    raise SystemExit(
+        f"tip appcast item must contain at most one sparkle:shortVersionString, got {len(short_versions)}"
+    )
+short_version = (
+    short_versions[0]
+    if short_versions
+    else ET.SubElement(item, f"{{{sparkle}}}shortVersionString")
+)
+short_version.text = display_version
+
+tree.write(sys.argv[1], encoding="utf-8", xml_declaration=True)
+PYTHON
+}
+
 validate_generated_tip_appcast() {
     local appcast_values="$TMP_DIR/tip-appcast-values.tsv"
     python3 - "$APPCAST" > "$appcast_values" <<'PYTHON'
@@ -182,18 +220,35 @@ if len(enclosures) != 1:
     raise SystemExit(f"tip appcast item must contain exactly one enclosure, got {len(enclosures)}")
 item = items[0]
 enclosure = enclosures[0]
+titles = item.findall("title")
+versions = item.findall(f"{{{sparkle}}}version")
+short_versions = item.findall(f"{{{sparkle}}}shortVersionString")
+if len(titles) != 1:
+    raise SystemExit(f"tip appcast item must contain exactly one title, got {len(titles)}")
+if len(versions) != 1:
+    raise SystemExit(
+        f"tip appcast item must contain exactly one sparkle:version, got {len(versions)}"
+    )
+if len(short_versions) != 1:
+    raise SystemExit(
+        "tip appcast item must contain exactly one "
+        f"sparkle:shortVersionString, got {len(short_versions)}"
+    )
 values = [
+    titles[0].text or "",
     enclosure.attrib.get("url", ""),
     enclosure.attrib.get(f"{{{sparkle}}}edSignature", ""),
     enclosure.attrib.get("length", ""),
-    item.findtext(f"{{{sparkle}}}version", default=""),
-    item.findtext(f"{{{sparkle}}}shortVersionString", default=""),
+    versions[0].text or "",
+    short_versions[0].text or "",
 ]
 print("\x1f".join(values))
 PYTHON
 
-    local enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing
-    IFS=$'\x1f' read -r enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing < "$appcast_values"
+    local appcast_title enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing
+    IFS=$'\x1f' read -r appcast_title enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing < "$appcast_values"
+    [[ "$appcast_title" == "Tip build v$MARKETING_VERSION" ]] ||
+        fail "Tip appcast title mismatch: expected Tip build v$MARKETING_VERSION, got $appcast_title"
     [[ "$enclosure_url" == "$TIP_DOWNLOAD_URL_PREFIX$(basename "$UPDATE_ZIP")" ]] ||
         fail "Tip appcast enclosure URL mismatch: $enclosure_url"
     [[ -n "$enclosure_signature" ]] || fail "Tip appcast enclosure is missing an EdDSA signature"
@@ -201,8 +256,8 @@ PYTHON
         fail "Tip appcast enclosure length does not match $(basename "$UPDATE_ZIP")"
     [[ "$appcast_build" == "$TIP_BUILD_NUMBER" ]] ||
         fail "Tip appcast build mismatch: expected $TIP_BUILD_NUMBER, got $appcast_build"
-    [[ "$appcast_marketing" == "$MARKETING_VERSION" ]] ||
-        fail "Tip appcast marketing version mismatch: expected $MARKETING_VERSION, got $appcast_marketing"
+    [[ "$appcast_marketing" == "Tip build v$MARKETING_VERSION" ]] ||
+        fail "Tip appcast display version mismatch: expected Tip build v$MARKETING_VERSION, got $appcast_marketing"
 
     local private_key_file="$TMP_DIR/tip-sparkle-private-key"
     local public_key_file="$TMP_DIR/tip-sparkle-public-key"
@@ -285,6 +340,7 @@ sign_tip() {
             --download-url-prefix "$TIP_DOWNLOAD_URL_PREFIX" \
             -o "$APPCAST" \
             "$appcast_dir"
+    label_generated_tip_appcast
     validate_generated_tip_appcast
     (cd "$DIST_DIR" && shasum -a 256 \
         "$(basename "$UPDATE_ZIP")" \

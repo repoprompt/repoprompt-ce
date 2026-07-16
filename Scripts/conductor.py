@@ -144,7 +144,8 @@ Operation commands:
   ./conductor app stop                                 # latest interactive stop intent
   ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
-  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run]
+  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
+    --execution-location-ui uses REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT (default 3s) and _CYCLES (default 3); Accessibility permission is required.
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
@@ -3843,6 +3844,18 @@ def find_debug_app_pids() -> List[str]:
     return [str(pid) for pid in matching_processes(debug_app_executable_path())]
 
 
+def execution_location_ui_smoke_timeout(env: Dict[str, str]) -> float:
+    try:
+        wait_seconds = max(0.0, float(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT", "3")))
+    except ValueError:
+        wait_seconds = 3.0
+    try:
+        cycles = max(1, int(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES", "3")))
+    except ValueError:
+        cycles = 3
+    return cycles * (wait_seconds + 60.0) + 60.0
+
+
 def terminate_debug_app_processes() -> List[str]:
     return [str(pid) for pid in terminate_matching_processes(debug_app_executable_path())]
 
@@ -4315,6 +4328,25 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
                 print(f"FAILED stage '{name}' with status {code}", flush=True)
             return code
 
+    if args.get("executionLocationUI"):
+        debug_pids = find_debug_app_pids()
+        if len(debug_pids) != 1:
+            print(
+                "ERROR: execution-location UI smoke requires exactly one running RepoPrompt debug app "
+                f"matching {debug_app_executable_path()}; found {len(debug_pids)}.",
+                flush=True,
+            )
+            return 1
+        code, _stdout, _stderr = run_operation_command(
+            "execution location UI smoke",
+            [str(repo_root / "Scripts" / "smoke_agent_execution_location_popover.sh"), debug_pids[0]],
+            repo_root,
+            env=env,
+            timeout=execution_location_ui_smoke_timeout(env),
+        )
+        if code != 0:
+            return code
+
     if args.get("agentRun"):
         agent_timeout = float(args.get("agentTimeout") or SMOKE_AGENT_WAIT_SECONDS)
         start_payload = {
@@ -4653,6 +4685,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("--window-id", type=int, default=1)
         parser.add_argument("--agent-run", action="store_true")
         parser.add_argument("--agent-timeout", type=float, default=SMOKE_AGENT_WAIT_SECONDS)
+        parser.add_argument("--execution-location-ui", action="store_true")
         ns = parser.parse_args(rest)
         if ns.agent_timeout < 0:
             raise ConductorError("--agent-timeout must be non-negative")
@@ -4660,6 +4693,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--artifact-manifest requires --packaged-app")
         if ns.packaged_app and ns.agent_run:
             raise ConductorError("--agent-run is not supported with --packaged-app")
+        if ns.packaged_app and ns.execution_location_ui:
+            raise ConductorError("--execution-location-ui is not supported with --packaged-app")
         args.update(
             {
                 "launch": ns.launch,
@@ -4669,6 +4704,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
                 "windowId": ns.window_id,
                 "agentRun": ns.agent_run,
                 "agentTimeout": ns.agent_timeout,
+                "executionLocationUI": ns.execution_location_ui,
             }
         )
     elif operation == "diagnostics":

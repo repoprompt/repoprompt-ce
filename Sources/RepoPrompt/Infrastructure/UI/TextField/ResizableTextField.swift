@@ -247,26 +247,14 @@ struct ResizableTextField: View {
         .onAppear {
             onHeightChange(Self.height(forPresetIndex: currentHeightPresetIndex, preset: fontPreset))
         }
-        .onDisappear {
-            clearUndoHistory()
-        }
     }
 
     private func reset() {
         text = ""
         // Reset to the smallest height preset
         currentHeightPresetIndex = 0
-        clearUndoHistory()
         // Notify parent of height change
         onHeightChange(ResizableTextField.height(forPresetIndex: currentHeightPresetIndex, preset: fontPreset))
-    }
-
-    private func clearUndoHistory() {
-        if let window = NSApp.mainWindow,
-           let textView = window.firstResponder as? NSTextView
-        {
-            textView.undoManager?.removeAllActions()
-        }
     }
 }
 
@@ -351,7 +339,7 @@ struct CustomTextField: NSViewRepresentable {
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
         textView.string = text
-        textView.undoManager?.removeAllActions()
+        context.coordinator.clearUndoHistory()
 
         // Initial height calculation
         Task { @MainActor in
@@ -398,7 +386,9 @@ struct CustomTextField: NSViewRepresentable {
 
             // Preserve selection when applying programmatic changes.
             let prevSel = textView.selectedRange()
-            textView.string = text
+            context.coordinator.performExternalReplacement(in: textView) {
+                textView.string = text
+            }
             let nsLen = (text as NSString).length
             let clampedLoc = min(max(prevSel.location, 0), nsLen)
             let maxLenFromLoc = max(0, nsLen - clampedLoc)
@@ -424,7 +414,7 @@ struct CustomTextField: NSViewRepresentable {
         textView.delegate = nil
         textView.imagePasteHandler = nil
         textView.isAutomaticSpellingCorrectionEnabled = false
-        textView.undoManager?.removeAllActions()
+        coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
         coordinator.dismissSlashSkillOverlay()
         coordinator.isActive = false
@@ -512,6 +502,21 @@ struct CustomTextField: NSViewRepresentable {
 
         func undoManager(for view: NSTextView) -> UndoManager? {
             textViewUndoManager
+        }
+
+        func performExternalReplacement(
+            in textView: NSTextView,
+            mutation: () -> Void
+        ) {
+            TextViewUndoSafeReplacement.perform(
+                in: textView,
+                undoManager: textViewUndoManager,
+                mutation: mutation
+            )
+        }
+
+        func clearUndoHistory() {
+            textViewUndoManager.removeAllActions()
         }
 
         func updateHeightIfNeeded(textView: NSTextView) {

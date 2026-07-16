@@ -69,6 +69,12 @@ struct RepoPromptSwiftUIApp: App {
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
+        // Pre-warm date formatter cache on a background thread to avoid blocking the main
+        // thread with ICU locale processing (ulocimp_addLikelySubtags) on first render.
+        Task.detached(priority: .utility) {
+            MessageTimestampFormatter.warmUp()
+        }
+
         SentryTelemetryBootstrap.start()
 
         ProcessDebugLogging.log(

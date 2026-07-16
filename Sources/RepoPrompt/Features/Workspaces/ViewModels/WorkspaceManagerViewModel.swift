@@ -274,6 +274,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private var stateVersionByWorkspaceID: [UUID: Int] = [:]
     private var lastSavedVersionByWorkspaceID: [UUID: Int] = [:]
+    #if DEBUG
+        private var workspaceSavePreparationDidFinishHandlerForTesting:
+            (@Sendable (UUID, URL, Int) async -> Void)?
+        private var workspaceSaveAttemptCountByWorkspaceIDForTesting: [UUID: Int] = [:]
+        private var workspaceSaveCapturePublicationCountByWorkspaceIDForTesting: [UUID: Int] = [:]
+        private var savePathComposeTabReloadCountForTesting = 0
+    #endif
 
     @MainActor
     private static var nextWorkspaceSelectionRevision: UInt64 = 1
@@ -364,6 +371,37 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         func debugStateVersionForWorkspace(_ workspaceID: UUID) -> Int {
             stateVersionByWorkspaceID[workspaceID, default: 0]
+        }
+
+        func debugLastSavedVersionForWorkspace(_ workspaceID: UUID) -> Int? {
+            lastSavedVersionByWorkspaceID[workspaceID]
+        }
+
+        func setWorkspaceSavePreparationDidFinishHandlerForTesting(
+            _ handler: (@Sendable (UUID, URL, Int) async -> Void)?
+        ) {
+            workspaceSavePreparationDidFinishHandlerForTesting = handler
+        }
+
+        func resetWorkspaceSaveDiagnosticsForTesting() {
+            workspaceSaveAttemptCountByWorkspaceIDForTesting.removeAll()
+            workspaceSaveCapturePublicationCountByWorkspaceIDForTesting.removeAll()
+            savePathComposeTabReloadCountForTesting = 0
+        }
+
+        func workspaceSaveDiagnosticsForTesting(workspaceID: UUID) -> (
+            attemptCount: Int,
+            capturePublicationCount: Int,
+            composeTabReloadCount: Int
+        ) {
+            (
+                attemptCount: workspaceSaveAttemptCountByWorkspaceIDForTesting[workspaceID, default: 0],
+                capturePublicationCount: workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[
+                    workspaceID,
+                    default: 0
+                ],
+                composeTabReloadCount: savePathComposeTabReloadCountForTesting
+            )
         }
 
         @MainActor
@@ -864,6 +902,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private var pollTimer: Timer?
+    private var pollTimerSaveTask: Task<Void, Never>?
     private let pollInterval: TimeInterval = 30.0
 
     enum GitDataRootLoadMode {
@@ -1618,6 +1657,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     deinit {
         pollTimer?.invalidate()
         pollTimer = nil
+        pollTimerSaveTask?.cancel()
         reloadWorkspacesTask?.cancel()
         reloadPresetsTask?.cancel()
         composeTabApplyTask?.cancel()
@@ -1656,32 +1696,43 @@ class WorkspaceManagerViewModel: ObservableObject {
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-
-                // Skip while switching workspaces or performing a refresh
-                if isSwitchingWorkspace || isRefreshing { return }
-
-                // Check if multiple windows have the same workspace open
-                // Only check if we have a valid activeWorkspaceID
-                if let activeWorkspaceID {
-                    // Safely access WindowStatesManager
-                    let windowCount = WindowStatesManager.shared.countWindowsShowing(workspaceId: activeWorkspaceID)
-                    if windowCount > 1 {
-                        // Skip auto-save when multiple windows have the same workspace
-                        return
-                    }
-                }
-
-                // Capture current state (expanded folders, selected files, prompt, etc.)
-                // and persist it in one atomic call.
-                await pollAndSaveStateAsync(source: .pollTimer)
+                self?.schedulePollTimerSave()
             }
+        }
+    }
+
+    private func schedulePollTimerSave() {
+        guard pollTimer?.isValid == true else { return }
+
+        pollTimerSaveTask?.cancel()
+        pollTimerSaveTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            // Skip while switching workspaces or performing a refresh
+            if isSwitchingWorkspace || isRefreshing { return }
+
+            // Check if multiple windows have the same workspace open
+            // Only check if we have a valid activeWorkspaceID
+            if let activeWorkspaceID {
+                // Safely access WindowStatesManager
+                let windowCount = WindowStatesManager.shared.countWindowsShowing(workspaceId: activeWorkspaceID)
+                if windowCount > 1 {
+                    // Skip auto-save when multiple windows have the same workspace
+                    return
+                }
+            }
+
+            // Capture current state (expanded folders, selected files, prompt, etc.)
+            // and persist it in one atomic call.
+            await pollAndSaveStateAsync(source: .pollTimer)
         }
     }
 
     private func stopPollTimer() {
         pollTimer?.invalidate()
         pollTimer = nil
+        pollTimerSaveTask?.cancel()
+        pollTimerSaveTask = nil
     }
 
     // MARK: - INDEX LOAD/SAVE
@@ -4648,40 +4699,37 @@ class WorkspaceManagerViewModel: ObservableObject {
     // MARK: - State helpers
 
     /// ─────────────────────────────────────────────────────────────
-    /// Updates the cached "working" state for a workspace *iff* something actually
-    /// changed, and returns `true` when a mutation occurs.
     private func updateWorkspaceState(
-        at index: Int,
+        _ workspace: inout WorkspaceModel,
         with state: (
             expandedFolders: [String],
             selection: StoredSelection,
             promptText: String,
             promptIDs: [UUID]
         )
-    ) -> Bool {
-        workspaces[index].currentPromptText = state.promptText
-        workspaces[index].selectedMetaPromptIDs = state.promptIDs
-        // NEW: Persist preset selections and customizations
-        workspaces[index].copyPresetId = promptViewModel.selectedCopyPresetID
-        workspaces[index].copyCustomizations = promptViewModel.workingCopyCustomizations
-        workspaces[index].chatPresetId = promptViewModel.selectedChatPresetID
-        workspaces[index].dateModified = Date()
-        return true
+    ) {
+        workspace.currentPromptText = state.promptText
+        workspace.selectedMetaPromptIDs = state.promptIDs
+        workspace.copyPresetId = promptViewModel.selectedCopyPresetID
+        workspace.copyCustomizations = promptViewModel.workingCopyCustomizations
+        workspace.chatPresetId = promptViewModel.selectedChatPresetID
+        workspace.dateModified = Date()
     }
 
     @discardableResult
     private func captureActiveTabSnapshotForWorkspaceIndex(_ index: Int, source: WorkspaceSaveSource = .pollAndSaveState) -> ComposeTabState? {
         guard workspaces.indices.contains(index) else { return nil }
+        var workspace = workspaces[index]
         let (name, _) = activeComposeTabContext()
-        if let activeTabID = workspaces[index].activeComposeTabID,
-           let tabIndex = workspaces[index].composeTabs.firstIndex(where: { $0.id == activeTabID })
+        if let activeTabID = workspace.activeComposeTabID,
+           let tabIndex = workspace.composeTabs.firstIndex(where: { $0.id == activeTabID })
         {
             guard !isSnapshotCommitSuspended(forTabID: activeTabID) else { return nil }
             #if DEBUG
-                debugSelectionOwnerTraceEvent("save.capture.before", workspace: workspaces[index])
+                debugSelectionOwnerTraceEvent("save.capture.before", workspace: workspace)
             #endif
-            let storedSelection = workspaces[index].composeTabs[tabIndex].selection
-            var snapshot = collectComposeTabSnapshot(name: name, base: workspaces[index].composeTabs[tabIndex])
+            let storedSelection = workspace.composeTabs[tabIndex].selection
+            var snapshot = collectComposeTabSnapshot(name: name, base: workspace.composeTabs[tabIndex])
             let liveUISelection = snapshot.selection
             let canonical = selectionCoordinator?.activeSelectionSnapshot(flushPendingUI: false)
             let saveSelection = Self.selectionForSaveSnapshot(
@@ -4692,35 +4740,64 @@ class WorkspaceManagerViewModel: ObservableObject {
                 activeTabID: activeTabID
             )
             snapshot.selection = saveSelection.selection
-            workspaces[index].composeTabs[tabIndex] = snapshot
-            workspaces[index].dateModified = Date()
-            _ = updateWorkspaceState(
-                at: index,
+            workspace.composeTabs[tabIndex] = snapshot
+            updateWorkspaceState(
+                &workspace,
                 with: (snapshot.expandedFolders, snapshot.selection, snapshot.promptText, snapshot.selectedMetaPromptIDs)
             )
-            let metadata = workspaceSaveMetadata(for: workspaces[index], source: source)
+            workspaces[index] = workspace
+            #if DEBUG
+                workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
+            #endif
+            let metadata = workspaceSaveMetadata(for: workspace, source: source)
             WorkspaceSaveTracer.capture(
                 metadata: metadata,
-                url: workspaceFileURL(for: workspaces[index]),
+                url: workspaceFileURL(for: workspace),
                 liveUI: liveUISelection,
                 stored: storedSelection,
                 canonical: canonical?.selection,
                 chosenOwner: saveSelection.owner
             )
             #if DEBUG
-                debugSelectionOwnerTraceEvent("save.capture.after", workspace: workspaces[index])
+                debugSelectionOwnerTraceEvent("save.capture.after", workspace: workspace)
             #endif
             return snapshot
         } else {
             let legacy = collectWorkspaceState()
-            _ = updateWorkspaceState(at: index, with: legacy)
+            updateWorkspaceState(&workspace, with: legacy)
+            workspaces[index] = workspace
+            #if DEBUG
+                workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
+            #endif
             return nil
         }
     }
 
+    private func reloadComposeTabsAfterSaveCaptureIfNeeded(
+        _ workspace: WorkspaceModel,
+        capturedSnapshot: ComposeTabState?
+    ) {
+        let activeTabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id
+        if capturedSnapshot?.id == activeTabID,
+           promptViewModel.activeComposeTabID == activeTabID,
+           promptViewModel.currentComposeTabs.map(\.id) == workspace.composeTabs.map(\.id),
+           promptViewModel.currentComposeTabs.filter({ $0.id != activeTabID })
+           == workspace.composeTabs.filter({ $0.id != activeTabID })
+        {
+            return
+        }
+        guard promptViewModel.currentComposeTabs != workspace.composeTabs
+            || promptViewModel.activeComposeTabID != activeTabID
+        else { return }
+        promptViewModel.loadComposeTabsFromWorkspace(workspace)
+        #if DEBUG
+            savePathComposeTabReloadCountForTesting += 1
+        #endif
+    }
+
     func pollAndSaveState(source: WorkspaceSaveSource = .pollAndSaveState) {
-        guard let active = activeWorkspace,
-              let index = workspaces.firstIndex(where: { $0.id == active.id }) else { return }
+        guard let active = activeWorkspace else { return }
+        let workspaceID = active.id
 
         // Post notification to allow SwiftUI views to flush pending state
         NotificationCenter.default.post(
@@ -4739,17 +4816,19 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
+        guard let index = workspaceIndex(for: workspaceID) else { return }
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
-        promptViewModel.loadComposeTabsFromWorkspace(workspaces[index])
+        guard let capturedWorkspace = workspace(withID: workspaceID) else { return }
+        let fileURL = workspaceFileURL(for: capturedWorkspace)
+        reloadComposeTabsAfterSaveCaptureIfNeeded(capturedWorkspace, capturedSnapshot: snapshot)
         if let snapshot {
             composeTabSnapshotSubject.send(snapshot)
         }
-        scheduleSave(source: source)
+        scheduleSave(workspaceID: workspaceID, fileURL: fileURL, source: source)
     }
 
     func pollAndSaveStateAsync(source: WorkspaceSaveSource = .pollAndSaveStateAsync) async {
-        guard let active = activeWorkspace,
-              let index = workspaces.firstIndex(where: { $0.id == active.id }) else { return }
+        guard let active = activeWorkspace else { return }
 
         let wsID = active.id
         let cur = stateVersionByWorkspaceID[wsID, default: 0]
@@ -4774,17 +4853,25 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
+        guard let index = workspaceIndex(for: wsID) else { return }
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
-        promptViewModel.loadComposeTabsFromWorkspace(workspaces[index])
+        guard let capturedWorkspace = workspace(withID: wsID) else { return }
+        let fileURL = workspaceFileURL(for: capturedWorkspace)
+        reloadComposeTabsAfterSaveCaptureIfNeeded(capturedWorkspace, capturedSnapshot: snapshot)
         if let snapshot {
             composeTabSnapshotSubject.send(snapshot)
         }
-        await saveWorkspaceAsync(source: source) // see change below to avoid big reassign
-        if let savedWorkspace = workspace(withID: wsID) {
-            await WorkspaceDiskWriter.shared.flush(url: workspaceFileURL(for: savedWorkspace))
-        }
-
-        lastSavedVersionByWorkspaceID[wsID] = cur
+        guard let savedStateVersion = await saveWorkspaceAsync(
+            workspaceID: wsID,
+            fileURL: fileURL,
+            source: source
+        ) else { return }
+        await WorkspaceDiskWriter.shared.flush(url: fileURL)
+        guard workspace(withID: wsID) != nil else { return }
+        lastSavedVersionByWorkspaceID[wsID] = max(
+            lastSavedVersionByWorkspaceID[wsID, default: -1],
+            savedStateVersion
+        )
     }
 
     func restoreWorkspaceState(
@@ -7098,29 +7185,29 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - Save/Load Single Workspace
 
-    private func saveWorkspaceAsync(source: WorkspaceSaveSource = .saveWorkspaceAsync) async {
-        guard let active = activeWorkspace,
-              let idx = workspaces.firstIndex(where: { $0.id == active.id })
-        else {
-            print("No active workspace to save.")
-            return
-        }
+    @discardableResult
+    private func saveWorkspaceAsync(
+        workspaceID: UUID,
+        fileURL: URL,
+        source: WorkspaceSaveSource = .saveWorkspaceAsync,
+        remainingRetryCount: Int = 1
+    ) async -> Int? {
+        guard !Task.isCancelled else { return nil }
+        await WorkspaceDiskWriter.shared.flush(url: fileURL)
+        guard !Task.isCancelled,
+              let currentIndex = workspaceIndex(for: workspaceID)
+        else { return nil }
 
-        let current = workspaces[idx]
-        let capturedStateVersion = stateVersionByWorkspaceID[current.id, default: 0]
-        let baseRoot = currentBaseRoot
-        let customStoragePath = current.customStoragePath
-        let workspaceDirName = directoryName(for: current)
-        let lastSyncedRepoPaths = lastSyncedRepoPathsByWorkspaceID[current.id]
-        await WorkspaceDiskWriter.shared.flush(url: workspaceFileURL(for: current))
+        let current = workspaces[currentIndex]
+        let capturedStateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
+        let lastSyncedRepoPaths = lastSyncedRepoPathsByWorkspaceID[workspaceID]
+        #if DEBUG
+            workspaceSaveAttemptCountByWorkspaceIDForTesting[workspaceID, default: 0] += 1
+        #endif
 
         do {
-            let (merged, data, indexFieldsChanged, preservedDiskRepoPaths, url) = try await Task.detached(priority: .utility) {
-                let workspaceDir: URL = if let customStoragePath {
-                    customStoragePath
-                } else {
-                    baseRoot.appendingPathComponent(workspaceDirName)
-                }
+            let (merged, data, indexFieldsChanged, preservedDiskRepoPaths) = try await Task.detached(priority: .utility) {
+                let workspaceDir = fileURL.deletingLastPathComponent()
                 let chatsDir = workspaceDir.appendingPathComponent("Chats", isDirectory: true)
                 let fm = FileManager.default
 
@@ -7140,9 +7227,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     }
                 }
 
-                let url = workspaceDir.appendingPathComponent("workspace.json")
-                let diskWorkspace: WorkspaceModel? = if fm.fileExists(atPath: url.path) {
-                    try? Self.loadWorkspaceFromFile(at: url)
+                let diskWorkspace: WorkspaceModel? = if fm.fileExists(atPath: fileURL.path) {
+                    try? Self.loadWorkspaceFromFile(at: fileURL)
                 } else {
                     nil
                 }
@@ -7160,57 +7246,76 @@ class WorkspaceManagerViewModel: ObservableObject {
                     (merged.isSystemWorkspace != current.isSystemWorkspace) ||
                     (merged.isHiddenInMenus != current.isHiddenInMenus)
 
-                return (merged, data, indexFieldsChanged, mergeResult.preservedDiskRepoPaths, url)
+                return (merged, data, indexFieldsChanged, mergeResult.preservedDiskRepoPaths)
             }.value
 
-            let latestStateVersion = stateVersionByWorkspaceID[current.id, default: 0]
+            #if DEBUG
+                await workspaceSavePreparationDidFinishHandlerForTesting?(
+                    workspaceID,
+                    fileURL,
+                    remainingRetryCount
+                )
+            #endif
+            guard !Task.isCancelled,
+                  let latestIndex = workspaceIndex(for: workspaceID)
+            else { return nil }
+            let latestStateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
             if latestStateVersion != capturedStateVersion {
                 #if DEBUG
                     WorkspaceRestorePerfLog.event(
                         "workspaceSave.stalePayload.retry",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(current.id),
+                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
                             "capturedVersion": "\(capturedStateVersion)",
                             "latestVersion": "\(latestStateVersion)"
                         ]
                     )
                 #endif
-                await saveWorkspaceAsync(source: source)
-                return
+                guard remainingRetryCount > 0 else { return nil }
+                return await saveWorkspaceAsync(
+                    workspaceID: workspaceID,
+                    fileURL: fileURL,
+                    source: source,
+                    remainingRetryCount: remainingRetryCount - 1
+                )
             }
 
-            // IMPORTANT: Do NOT assign `workspaces[idx] = merged` here.
-            // Our in-memory `workspaces[idx]` already contains our working state.
-            // If index-visible fields changed, update them *individually* to avoid a huge copy.
+            var publishedWorkspace = workspaces[latestIndex]
             if indexFieldsChanged {
-                // Mutate only the few small fields that affect the index
-                workspaces[idx].name = merged.name
-                workspaces[idx].customStoragePath = merged.customStoragePath
-                workspaces[idx].isSystemWorkspace = merged.isSystemWorkspace
-                workspaces[idx].isHiddenInMenus = merged.isHiddenInMenus
-                // (These in-place field writes don't rebuild the entire array)
+                publishedWorkspace.name = merged.name
+                publishedWorkspace.customStoragePath = merged.customStoragePath
+                publishedWorkspace.isSystemWorkspace = merged.isSystemWorkspace
+                publishedWorkspace.isHiddenInMenus = merged.isHiddenInMenus
             }
             if preservedDiskRepoPaths {
-                workspaces[idx].repoPaths = merged.repoPaths
+                publishedWorkspace.repoPaths = merged.repoPaths
+            }
+            if publishedWorkspace != workspaces[latestIndex] {
+                workspaces[latestIndex] = publishedWorkspace
             }
             recordRepoPathBaseline(for: merged)
 
             let metadata = workspaceSaveMetadata(for: merged, source: source)
-            WorkspaceFileDecodeCache.shared.invalidate(url: url)
-            await WorkspaceDiskWriter.shared.enqueueWorkspace(data: data, url: url, metadata: metadata)
+            WorkspaceFileDecodeCache.shared.invalidate(url: fileURL)
+            await WorkspaceDiskWriter.shared.enqueueWorkspace(data: data, url: fileURL, metadata: metadata)
 
-            if indexFieldsChanged {
+            if indexFieldsChanged, workspaceIndex(for: workspaceID) != nil {
                 await rebuildAndSaveIndexAsync()
             }
+            return capturedStateVersion
         } catch {
             print("💾 Failed to serialize workspace: \(error)")
+            return nil
         }
     }
 
-    private func scheduleSave(source: WorkspaceSaveSource) {
-        // Use async version
+    private func scheduleSave(workspaceID: UUID, fileURL: URL, source: WorkspaceSaveSource) {
         Task {
-            await saveWorkspaceAsync(source: source)
+            await saveWorkspaceAsync(
+                workspaceID: workspaceID,
+                fileURL: fileURL,
+                source: source
+            )
         }
     }
 
@@ -7513,6 +7618,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Capture snapshot with a fresh index (workspace could be deleted during the await above).
         guard let snapIdx = workspaceIndex(for: wsID) else { return }
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(snapIdx)
+        guard let capturedWorkspace = self.workspace(withID: wsID) else { return }
+        let saveFileURL = workspaceFileURL(for: capturedWorkspace)
 
         // Suspend snapshot commits during refresh to prevent $selectedFiles subscriber
         // from overwriting the captured selection when dropSelections clears it.
@@ -7540,7 +7647,11 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // Final save only if still the same active workspace.
         guard activeWorkspaceID == wsID, !isSwitchingWorkspace else { return }
-        await saveWorkspaceAsync(source: .refreshWorkspace)
+        await saveWorkspaceAsync(
+            workspaceID: wsID,
+            fileURL: saveFileURL,
+            source: .refreshWorkspace
+        )
     }
 
     @MainActor
@@ -8017,13 +8128,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         workspaces[wsIndex].activePresetID = presetID
+        let workspaceID = active.id
+        let fileURL = workspaceFileURL(for: workspaces[wsIndex])
 
         if preset.capturesFileSelection {
             await fileManager.selectFiles(withPaths: preset.selectedFilePaths, allowEmpty: true)
         }
 
         // Save the workspace state
-        await saveWorkspaceAsync(source: .applyPreset)
+        await saveWorkspaceAsync(
+            workspaceID: workspaceID,
+            fileURL: fileURL,
+            source: .applyPreset
+        )
 
         // Reset the dirty flag since we just applied exactly this preset
         activePresetIsDirty = false
@@ -8067,8 +8184,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             return
         }
         workspaces[index].currentPromptText = newText
-        scheduleSave(source: .updatePromptText)
         bumpStateVersion(for: active.id)
+        scheduleSave(
+            workspaceID: active.id,
+            fileURL: workspaceFileURL(for: workspaces[index]),
+            source: .updatePromptText
+        )
     }
 
     func updateSelectedMetaPromptIDs(_ newIDs: [UUID]) {
@@ -8078,8 +8199,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             return
         }
         workspaces[index].selectedMetaPromptIDs = newIDs
-        scheduleSave(source: .updateSelectedMetaPromptIDs)
         bumpStateVersion(for: active.id)
+        scheduleSave(
+            workspaceID: active.id,
+            fileURL: workspaceFileURL(for: workspaces[index]),
+            source: .updateSelectedMetaPromptIDs
+        )
     }
 
     /// Sets a workspace's ephemeral property by ID

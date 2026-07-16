@@ -47,8 +47,7 @@ struct AgentChatTitleClusterView: View {
     }
 }
 
-private final class AgentChatOptionsButton: NSButton {
-    private var actionHandler: ((NSButton) -> Void)?
+final class AgentChatOptionsButton: NSButton {
     private var trackingArea: NSTrackingArea?
     private var isHovering = false {
         didSet { updateAppearance() }
@@ -60,7 +59,7 @@ private final class AgentChatOptionsButton: NSButton {
         image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "Chat Options")
         imagePosition = .imageOnly
         isBordered = false
-        focusRingType = .none
+        focusRingType = .exterior
         translatesAutoresizingMaskIntoConstraints = false
         toolTip = "Chat Options"
         setAccessibilityLabel("Chat Options")
@@ -83,17 +82,21 @@ private final class AgentChatOptionsButton: NSButton {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func setActionHandler(_ handler: @escaping (NSButton) -> Void) {
-        actionHandler = handler
-    }
-
     override func mouseDown(with _: NSEvent) {
-        actionHandler?(self)
+        guard isEnabled, let action else { return }
+        NSApplication.shared.sendAction(action, to: target, from: self)
     }
 
-    override func accessibilityPerformPress() -> Bool {
-        actionHandler?(self)
-        return true
+    override var focusRingMaskBounds: NSRect {
+        bounds
+    }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(
+            roundedRect: focusRingMaskBounds,
+            xRadius: layer?.cornerRadius ?? 6,
+            yRadius: layer?.cornerRadius ?? 6
+        ).fill()
     }
 
     override func updateTrackingAreas() {
@@ -135,9 +138,8 @@ private struct AgentChatOptionsMenuButton: NSViewRepresentable {
 
     func makeNSView(context: Context) -> AgentChatOptionsButton {
         let button = AgentChatOptionsButton()
-        button.setActionHandler { [coordinator = context.coordinator] sender in
-            coordinator.showMenu(sender)
-        }
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.showMenu(_:))
         return button
     }
 
@@ -148,7 +150,7 @@ private struct AgentChatOptionsMenuButton: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator {
+    final class Coordinator: NSObject {
         var menuSnapshot: () -> AgentChatOptionsMenuSnapshot?
         var menuActions: AgentChatOptionsMenuActions
 
@@ -160,7 +162,7 @@ private struct AgentChatOptionsMenuButton: NSViewRepresentable {
             self.menuActions = menuActions
         }
 
-        func showMenu(_ sender: NSButton) {
+        @objc func showMenu(_ sender: NSButton) {
             guard let snapshot = menuSnapshot() else { return }
             AgentChatOptionsMenuPresenter.popUp(
                 below: sender,

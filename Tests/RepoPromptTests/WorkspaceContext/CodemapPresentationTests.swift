@@ -681,7 +681,7 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         )
         let rootScope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
             canonicalRoots: [allowedRootRef],
-            physicalRoots: [allowedRootRef]
+            physicalRoots: []
         )
         let coordinator = WorkspaceCodemapPresentationCoordinator(
             store: store,

@@ -2342,6 +2342,9 @@ actor WorkspaceFileContextStore {
         private var codemapProjectionRecoveryObserverStartCountForTesting = 0
         private var codemapProjectionRecoveryObserverRearmCountForTesting = 0
         private var filesInRootRequestCountForTesting = 0
+        private var appliedIndexRecordLookupRequestCountForTesting = 0
+        private var appliedIndexRecordLookupRequestedRecordCountForTesting = 0
+        private var appliedIndexRootSnapshotRequestCountForTesting = 0
         private var codemapGraphPublicationWillFlushHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch, Int) async -> Void)?
         private var codemapProjectionRecoveryObserverWillWaitHandlerForTesting:
@@ -6172,7 +6175,55 @@ actor WorkspaceFileContextStore {
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
     }
 
+    func appliedIndexRecordLookup(
+        rootID: UUID,
+        fileIDs: [UUID],
+        folderIDs: [UUID]
+    ) -> WorkspaceAppliedIndexRecordLookup? {
+        #if DEBUG
+            appliedIndexRecordLookupRequestCountForTesting += 1
+            appliedIndexRecordLookupRequestedRecordCountForTesting += fileIDs.count + folderIDs.count
+        #endif
+        guard publishedSeededAuthorityIsQueryable(rootID: rootID),
+              let state = rootStatesByID[rootID]
+        else { return nil }
+
+        var matchingFilesByID: [UUID: WorkspaceFileRecord] = [:]
+        matchingFilesByID.reserveCapacity(fileIDs.count)
+        for fileID in fileIDs {
+            guard let record = filesByID[fileID],
+                  record.rootID == rootID,
+                  state.fileIDsByRelativePath[record.standardizedRelativePath] == fileID,
+                  isDiscoverableFileID(fileID),
+                  filesByID[fileID] == record
+            else { continue }
+            matchingFilesByID[fileID] = record
+        }
+
+        var matchingFoldersByID: [UUID: WorkspaceFolderRecord] = [:]
+        matchingFoldersByID.reserveCapacity(folderIDs.count)
+        for folderID in folderIDs {
+            guard let record = foldersByID[folderID],
+                  record.rootID == rootID,
+                  state.folderIDsByRelativePath[record.standardizedRelativePath] == folderID,
+                  isDiscoverableFolderID(folderID),
+                  foldersByID[folderID] == record
+            else { continue }
+            matchingFoldersByID[folderID] = record
+        }
+
+        return WorkspaceAppliedIndexRecordLookup(
+            root: state.root,
+            generation: appliedIndexGenerationsByRootID[rootID] ?? 0,
+            filesByID: matchingFilesByID,
+            foldersByID: matchingFoldersByID
+        )
+    }
+
     func appliedIndexRootSnapshot(rootID: UUID) -> WorkspaceAppliedIndexRootSnapshot? {
+        #if DEBUG
+            appliedIndexRootSnapshotRequestCountForTesting += 1
+        #endif
         guard publishedSeededAuthorityIsQueryable(rootID: rootID),
               let root = rootStatesByID[rootID]?.root
         else { return nil }
@@ -6240,15 +6291,31 @@ actor WorkspaceFileContextStore {
     ) -> WorkspaceSessionRootLifetimeSnapshot? {
         guard !expectedPhysicalRoots.isEmpty else { return nil }
         let expectedPaths = Set(expectedPhysicalRoots.map(\.standardizedFullPath))
-        let requestedMatches: Bool = switch rootScope {
+        let requestedMatches: Bool
+        switch rootScope {
         case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths):
-            Set(requestedPhysicalRootPaths.map {
+            requestedMatches = Set(requestedPhysicalRootPaths.map {
                 StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
             }) == expectedPaths
-        case let .validatedSessionBoundWorkspace(_, requestedPhysicalRoots):
-            requestedPhysicalRoots == Set(expectedPhysicalRoots)
+        case let .validatedSessionBoundWorkspace(canonicalRoots, requestedPhysicalRoots):
+            let requestedValidation = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: requestedPhysicalRoots
+            )
+            let expectedValidation = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: [],
+                physicalRoots: Set(expectedPhysicalRoots)
+            )
+            if case let .valid(requestedSelector) = requestedValidation,
+               case let .valid(expectedSelector) = expectedValidation
+            {
+                requestedMatches = requestedSelector.physicalRootPathsByID
+                    == expectedSelector.physicalRootPathsByID
+            } else {
+                requestedMatches = false
+            }
         case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
-            false
+            requestedMatches = false
         }
         guard requestedMatches,
               expectedPhysicalRoots.allSatisfy({ expectedRoot in
@@ -6287,16 +6354,22 @@ actor WorkspaceFileContextStore {
             guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
                 return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
             }
+            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: physicalRoots
+            ) else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
             missing = (
-                canonicalRoots.map { ($0, WorkspaceRootKind.primaryWorkspace) }
-                    + physicalRoots.map { ($0, WorkspaceRootKind.sessionWorktree) }
+                selector.canonicalRootPathsByID.map { ($0.key, $0.value, WorkspaceRootKind.primaryWorkspace) }
+                    + selector.physicalRootPathsByID.map { ($0.key, $0.value, WorkspaceRootKind.sessionWorktree) }
             )
-            .compactMap { expectedRoot, expectedKind in
-                guard let currentRoot = rootStatesByID[expectedRoot.id]?.root,
+            .compactMap { rootID, expectedPath, expectedKind in
+                guard let currentRoot = rootStatesByID[rootID]?.root,
                       currentRoot.kind == expectedKind,
-                      currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath,
-                      publishedSeededAuthorityIsQueryable(rootID: expectedRoot.id)
-                else { return expectedRoot.standardizedFullPath }
+                      currentRoot.standardizedFullPath == expectedPath,
+                      publishedSeededAuthorityIsQueryable(rootID: rootID)
+                else { return expectedPath }
                 var isDirectory: ObjCBool = false
                 return FileManager.default.fileExists(
                     atPath: currentRoot.standardizedFullPath,
@@ -15774,6 +15847,24 @@ actor WorkspaceFileContextStore {
             filesInRootRequestCountForTesting
         }
 
+        func resetAppliedIndexRecordLookupDiagnosticsForTesting() {
+            appliedIndexRecordLookupRequestCountForTesting = 0
+            appliedIndexRecordLookupRequestedRecordCountForTesting = 0
+            appliedIndexRootSnapshotRequestCountForTesting = 0
+        }
+
+        func appliedIndexRecordLookupDiagnosticsForTesting() -> (
+            lookupRequests: Int,
+            requestedRecords: Int,
+            rootSnapshots: Int
+        ) {
+            (
+                lookupRequests: appliedIndexRecordLookupRequestCountForTesting,
+                requestedRecords: appliedIndexRecordLookupRequestedRecordCountForTesting,
+                rootSnapshots: appliedIndexRootSnapshotRequestCountForTesting
+            )
+        }
+
         func codemapArtifactDemandRetainCountForTesting(
             _ ticket: WorkspaceCodemapArtifactDemandTicket
         ) -> Int {
@@ -21372,14 +21463,16 @@ actor WorkspaceFileContextStore {
                 }
             }
         case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
-            let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.id, $0) })
-            let physicalByID = Dictionary(uniqueKeysWithValues: physicalRoots.map { ($0.id, $0) })
+            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: physicalRoots
+            ) else { return [] }
             return allRoots.filter { root in
                 switch root.kind {
                 case .primaryWorkspace:
-                    canonicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                    selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
                 case .sessionWorktree:
-                    physicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                    selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
                 case .workspaceGitData, .supplementalSystem:
                     false
                 }

@@ -175,4 +175,108 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertEqual(SparkleBuildVersion("28"), SparkleBuildVersion("28.0.0"))
         XCTAssertNil(SparkleBuildVersion("28.7.95.1"))
     }
+
+    func testAvailableUpdateNoticeKeepsDetectedChannelAndCentralizesTipCopy() {
+        let notice = AvailableUpdateNotice(
+            channel: .tip,
+            version: "1.0.28",
+            buildNumber: "29.8.52",
+            date: nil,
+            releaseNotes: nil
+        )
+
+        XCTAssertEqual(notice.toolbarLabel, "Tip build v1.0.28")
+        XCTAssertEqual(notice.availabilityStatus, "Tip build v1.0.28 (29.8.52) is available")
+        XCTAssertEqual(notice.menuInstallTitle, "Install Tip build v1.0.28…")
+        XCTAssertEqual(notice.installButtonTitle, "Install Tip Build")
+        XCTAssertEqual(notice.accessibilityLabel, "Tip build v1.0.28 (29.8.52) update available")
+        XCTAssertEqual(notice.channel, .tip)
+    }
+
+    func testStableUpdateNoticePreservesExistingStableCopy() {
+        let notice = AvailableUpdateNotice(
+            channel: .stable,
+            version: "v1.0.29",
+            buildNumber: "30",
+            date: nil,
+            releaseNotes: nil
+        )
+
+        XCTAssertEqual(notice.toolbarLabel, "Update v1.0.29")
+        XCTAssertEqual(notice.availabilityStatus, "Version 1.0.29 is available")
+        XCTAssertEqual(notice.menuInstallTitle, "Install Update 1.0.29…")
+        XCTAssertEqual(notice.installButtonTitle, "Install Update")
+        XCTAssertFalse(notice.availabilityStatus.contains("Tip"))
+    }
+
+    func testSparkleDisplayVersionNormalizationRemovesTipDecoration() {
+        XCTAssertEqual(
+            SparkleUpdaterManager.sanitizeVersionString("  Tip build v1.0.28  "),
+            "1.0.28"
+        )
+        XCTAssertEqual(SparkleUpdaterManager.sanitizeVersionString("v1.0.29"), "1.0.29")
+    }
+
+    func testAppcastRequestIdentityRejectsDelayedAndOverlappingResults() throws {
+        let delayedTipRequest = try AppcastCheckRequestIdentity(
+            id: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            channel: .tip
+        )
+        let latestStableRequest = try AppcastCheckRequestIdentity(
+            id: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            channel: .stable
+        )
+
+        XCTAssertFalse(SparkleUpdaterManager.appcastResultIsCurrent(
+            request: delayedTipRequest,
+            activeRequest: latestStableRequest,
+            selectedChannel: .stable
+        ))
+        XCTAssertTrue(SparkleUpdaterManager.appcastResultIsCurrent(
+            request: latestStableRequest,
+            activeRequest: latestStableRequest,
+            selectedChannel: .stable
+        ))
+
+        let supersededStableRequest = AppcastCheckRequestIdentity(channel: .stable)
+        XCTAssertFalse(SparkleUpdaterManager.appcastResultIsCurrent(
+            request: supersededStableRequest,
+            activeRequest: latestStableRequest,
+            selectedChannel: .stable
+        ))
+        XCTAssertFalse(SparkleUpdaterManager.appcastResultIsCurrent(
+            request: latestStableRequest,
+            activeRequest: nil,
+            selectedChannel: .stable
+        ))
+    }
+
+    func testSparkleAppcastItemURLIdentifiesOnlyExactTrustedUpdateChannels() throws {
+        let tipURL = try XCTUnwrap(URL(
+            string: "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/download/tip-abc/RepoPrompt.zip"
+        ))
+        let stableURL = try XCTUnwrap(URL(
+            string: "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1.0.29/RepoPrompt.zip"
+        ))
+        let lookalikeRepositoryURL = try XCTUnwrap(URL(
+            string: "https://github.com/repoprompt/repoprompt-ce-updates-evil/releases/download/v1/RepoPrompt.zip"
+        ))
+        let queryURL = try XCTUnwrap(URL(
+            string: "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1/RepoPrompt.zip?mirror=1"
+        ))
+        let insecureURL = try XCTUnwrap(URL(
+            string: "http://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1/RepoPrompt.zip"
+        ))
+        let malformedDownloadURL = try XCTUnwrap(URL(
+            string: "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1"
+        ))
+
+        XCTAssertEqual(SparkleUpdaterManager.updateChannel(forAppcastItemURL: tipURL), .tip)
+        XCTAssertEqual(SparkleUpdaterManager.updateChannel(forAppcastItemURL: stableURL), .stable)
+        XCTAssertNil(SparkleUpdaterManager.updateChannel(forAppcastItemURL: lookalikeRepositoryURL))
+        XCTAssertNil(SparkleUpdaterManager.updateChannel(forAppcastItemURL: queryURL))
+        XCTAssertNil(SparkleUpdaterManager.updateChannel(forAppcastItemURL: insecureURL))
+        XCTAssertNil(SparkleUpdaterManager.updateChannel(forAppcastItemURL: malformedDownloadURL))
+        XCTAssertNil(SparkleUpdaterManager.updateChannel(forAppcastItemURL: nil))
+    }
 }

@@ -2803,8 +2803,14 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    func closeComposeTab(_ id: UUID) async {
-        await closeComposeTabs(withIDs: [id])
+    func closeComposeTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        await closeComposeTabs(
+            withIDs: [id],
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @MainActor
@@ -2843,7 +2849,8 @@ class PromptViewModel: ObservableObject {
         preferredActiveID: UUID? = nil,
         reason: ComposeTabRemovalReason = .close,
         expandCascade: Bool = true,
-        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        isMutationOwnerCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         guard !ids.isEmpty else { return }
         guard
@@ -2860,6 +2867,16 @@ class PromptViewModel: ObservableObject {
                 return false
             }
             return isMutationContextCurrent?() ?? true
+        }
+
+        func mutationOwnerIsCurrent() -> Bool {
+            guard manager.activeWorkspace?.id == workspace.id,
+                  manager.workspaces.indices.contains(index),
+                  manager.workspaces[index].id == workspace.id
+            else {
+                return false
+            }
+            return isMutationOwnerCurrent?() ?? true
         }
 
         guard mutationContextIsCurrent() else { return }
@@ -2892,12 +2909,14 @@ class PromptViewModel: ObservableObject {
             return adjacentTabID(afterClosing: previousActiveID, tabs: tabsBeforeClose, closingIDs: tabsBeingClosed)
         }()
 
-        // Notify listeners BEFORE mutation so they can cancel running tasks
+        // Notify listeners BEFORE mutation so they can cancel running tasks.
+        // The caller's target context may be invalidated by this intentional cleanup,
+        // so post-notify checks use the stable mutation owner instead.
         guard mutationContextIsCurrent() else { return }
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
-        guard mutationContextIsCurrent() else { return }
+        guard mutationOwnerIsCurrent() else { return }
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
-        guard mutationContextIsCurrent() else { return }
+        guard mutationOwnerIsCurrent() else { return }
         #if DEBUG
             for tabID in tabsBeingClosed {
                 AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
@@ -3131,11 +3150,15 @@ class PromptViewModel: ObservableObject {
     @Published private(set) var currentStashedTabs: [StashedTab] = []
 
     @MainActor
-    func stashTab(_ id: UUID) async {
+    func stashTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
+            isMutationContextCurrent?() ?? true
         else { return }
 
         // Don't allow stashing if it's the last tab
@@ -3146,7 +3169,11 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
-        await closeComposeTabs(withIDs: [id], reason: .stash)
+        await closeComposeTabs(
+            withIDs: [id],
+            reason: .stash,
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @discardableResult
@@ -3245,6 +3272,10 @@ class PromptViewModel: ObservableObject {
             reason: .stash,
             expandCascade: false,
             isMutationContextCurrent: {
+                isArchiveContextCurrent()
+                    && manager.activeWorkspace?.id == expectedWorkspaceID
+            },
+            isMutationOwnerCurrent: {
                 isArchiveContextCurrent()
                     && manager.activeWorkspace?.id == expectedWorkspaceID
             }
