@@ -35,7 +35,7 @@ package enum ProcessLauncherError: Error {
     case spawnAttributesFailed(operation: String, errno: Int32)
     case spawnFailed(errno: Int32)
 
-    var processLaunchFailure: (domain: String, code: Int) {
+    package var processLaunchFailure: (domain: String, code: Int) {
         let errnoValue: Int32 = switch self {
         case let .pipeCreationFailed(_, errnoValue),
              let .spawnFileActionsFailed(_, errnoValue),

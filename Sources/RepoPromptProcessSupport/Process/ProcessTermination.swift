@@ -166,7 +166,7 @@ package enum ProcessTermination {
     }
 
     @discardableResult
-    static func signalProcessGroupOnly(
+    package static func signalProcessGroupOnly(
         processGroupID: pid_t,
         signal: Int32,
         logger: (String) -> Void = { _ in }
