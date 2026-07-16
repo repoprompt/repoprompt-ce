@@ -33,6 +33,15 @@ trap 'exit 143' TERM
 
 log() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+run_phase() {
+  local phase="$1"
+  shift
+  local started=$SECONDS
+  local status=0
+  "$@" || status=$?
+  printf 'phase timing: %s=%ss\n' "$phase" "$((SECONDS - started))"
+  return "$status"
+}
 
 require_tool() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required tool '$1'. Install it before committing or pushing."
@@ -100,7 +109,7 @@ run_pr_ready_path_validations() {
 
   local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/guardrails\.sh|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
   local ci_app_test_runner_paths_pattern='^(Scripts/ci_app_test_runner\.py|Scripts/test_ci_app_test_runner\.py|\.github/workflows/ci\.yml)$'
-  local swift_paths_pattern='\.swift$'
+  local swift_paths_pattern='(\.swift$|^(\.swiftformat|\.swiftlint\.yml|Scripts/swift_style\.sh|Scripts/install_format_tools\.sh|Makefile|\.github/workflows/ci\.yml)$)'
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
   local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
@@ -133,31 +142,31 @@ run_pr_ready_path_validations() {
 
   if (( has_control_plane_changes )); then
     log "Run conductor self-tests"
-    make conductor-selftest
+    run_phase tooling make conductor-selftest
   fi
   if (( has_ci_app_test_runner_changes )); then
     log "Run CI app-test runner self-tests"
-    make ci-app-test-runner-selftest
+    run_phase tooling make ci-app-test-runner-selftest
   fi
   if (( has_swift_changes )); then
     log "Run coordinated Swift lint"
-    make dev-lint
+    run_phase style make lint-impacted RANGE="$base_ref...HEAD"
   fi
   if (( has_root_test_changes )); then
-    log "Run coordinated root tests"
-    make dev-test
+    log "Run impacted coordinated root tests (with conservative full fallback)"
+    run_phase test make dev-test-impacted RANGE="$base_ref...HEAD" FULL_FALLBACK=1
   fi
   if (( has_provider_package_changes )); then
     log "Run coordinated provider tests"
-    make dev-provider-test
+    run_phase test make dev-provider-test
   fi
   if (( has_repoprompt_product_changes )); then
     log "Build RepoPrompt product"
-    make dev-swift-build PRODUCT=RepoPrompt
+    run_phase build make dev-swift-build PRODUCT=RepoPrompt
   fi
   if (( has_mcp_product_changes )); then
     log "Build repoprompt-mcp product"
-    make dev-swift-build PRODUCT=repoprompt-mcp
+    run_phase build make dev-swift-build PRODUCT=repoprompt-mcp
   fi
   if (( has_xcode_generator_test_changes )); then
     log "Run Xcode workspace generator tests"

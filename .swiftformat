@@ -15,5 +15,8 @@
 --wraparguments before-first
 --wrapcollections before-first
 --maxwidth none
+# Keep the established 0.61.1 baseline stable when later SwiftFormat releases
+# add default-enabled semantic layout rules.
+--disable enumNamespaces
 
 --exclude .build,.swiftpm,DerivedData,build,Vendor,Packages/RepoPromptAgentProviders/.build,Sources/CSwiftPCRE2,Sources/RepoPromptC,Sources/RepoPrompt/ThirdParty/SwiftPCRE2,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift

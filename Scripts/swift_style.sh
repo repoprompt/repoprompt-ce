@@ -6,7 +6,7 @@ ACTION="${1:-}"
 
 if [[ -z "$ACTION" || "$ACTION" == "--help" || "$ACTION" == "-h" ]]; then
     cat <<'EOF'
-Usage: ./Scripts/swift_style.sh <format|format-check|lint>
+Usage: ./Scripts/swift_style.sh <format|format-check|lint> [--changed [RANGE]]
 
 Subcommands:
   format        Format first-party Swift files with SwiftFormat.
@@ -19,6 +19,12 @@ EOF
     [[ -z "$ACTION" ]] && exit 2 || exit 0
 fi
 shift || true
+CHANGED_RANGE=""
+if [[ "${1:-}" == "--changed" ]]; then
+    CHANGED_RANGE="${2:-default}"
+    shift
+    (( $# > 0 )) && shift
+fi
 if (( $# > 0 )); then
     echo "ERROR: Unexpected arguments: $*" >&2
     exit 2
@@ -81,9 +87,72 @@ should_include_swift_file(){
 
 SWIFT_FILES=()
 SWIFT_FILES_COLLECTED=0
+STYLE_FALLBACK_PATHS=(
+    ".swiftformat" ".swiftlint.yml" "Package.swift"
+    "Packages/RepoPromptAgentProviders/Package.swift"
+    "Scripts/swift_style.sh" "Scripts/install_format_tools.sh"
+    ".github/workflows/ci.yml" "Makefile"
+)
+
+collect_changed_paths(){
+    local range="$1"
+    if [[ "$range" == "default" ]]; then
+        git diff --name-only --diff-filter=ACMRT -z origin/main...HEAD --
+        git diff --name-only --diff-filter=ACMRT -z HEAD --
+        git ls-files --others --exclude-standard -z
+    else
+        git diff --name-only --diff-filter=ACMRT -z "$range" --
+    fi
+}
+
+path_is_style_fallback(){
+    local path="$1" fallback
+    for fallback in "${STYLE_FALLBACK_PATHS[@]}"; do
+        [[ "$path" == "$fallback" ]] && return 0
+    done
+    return 1
+}
+
+path_is_in_style_scope(){
+    local file="$1" scope
+    for scope in "${STYLE_PATHS[@]}"; do
+        if [[ "$file" == "$scope" || "$file" == "$scope/"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 collect_swift_files(){
-    local path full file
+    local path full file fallback=0 changed_file
     SWIFT_FILES=()
+
+    if [[ -n "$CHANGED_RANGE" ]]; then
+        changed_file="$(mktemp "${TMPDIR:-/tmp}/rpce-style-files.XXXXXX")"
+        if ! collect_changed_paths "$CHANGED_RANGE" > "$changed_file"; then
+            rm -f -- "$changed_file"
+            fail "Unable to determine changed files for style range '$CHANGED_RANGE'; run the full style command."
+        fi
+        while IFS= read -r -d '' file; do
+            path_is_style_fallback "$file" && fallback=1
+            if [[ "$file" == *.swift && -f "$ROOT_DIR/$file" && ! -L "$ROOT_DIR/$file" ]] \
+                && path_is_in_style_scope "$file" && should_include_swift_file "$file"; then
+                SWIFT_FILES+=("$file")
+            fi
+        done < "$changed_file"
+        rm -f -- "$changed_file"
+        if (( fallback == 0 )); then
+            local sorted
+            sorted="$(printf '%s\n' "${SWIFT_FILES[@]}" | sed '/^$/d' | LC_ALL=C sort -u)"
+            SWIFT_FILES=()
+            while IFS= read -r file; do
+                [[ -n "$file" ]] && SWIFT_FILES+=("$file")
+            done <<< "$sorted"
+            SWIFT_FILES_COLLECTED=1
+            return
+        fi
+        printf 'Changed style/tooling boundary requires full Swift style scope.\n'
+    fi
 
     for path in "${STYLE_PATHS[@]}"; do
         full="$ROOT_DIR/$path"
@@ -117,7 +186,8 @@ run_swiftformat(){
     ensure_swift_files_collected
 
     if (( ${#SWIFT_FILES[@]} == 0 )); then
-        fail "No Swift files found in configured style scope."
+        echo "No changed Swift files in configured style scope."
+        return
     fi
 
     local args=(--config "$ROOT_DIR/.swiftformat")
@@ -134,16 +204,21 @@ run_swiftformat(){
 
 run_swiftlint(){
     ensure_tool swiftlint
+    ensure_swift_files_collected
 
-    # Full-repo lint lets SwiftLint discover files from .swiftlint.yml instead of
-    # paying the large environment/script-input overhead for every Swift file.
+    if (( ${#SWIFT_FILES[@]} == 0 )); then
+        echo "No changed Swift files in configured style scope."
+        return
+    fi
+
+    # Pass the selected files together so startup and SourceKit setup are paid once.
     local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)
     if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
         args+=(--reporter github-actions-logging)
     fi
 
     cd "$ROOT_DIR"
-    run swiftlint "${args[@]}"
+    run swiftlint "${args[@]}" "${SWIFT_FILES[@]}"
 }
 
 case "$ACTION" in

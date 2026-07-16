@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTION="status"
+REQUIRED_SWIFTFORMAT_VERSION="0.61.1"
 
 if (( $# > 0 )) && [[ "${1:-}" != -* ]]; then
     ACTION="$1"
@@ -91,6 +92,11 @@ check_tools(){
         print_remediation
         fail "Missing required Swift style tools."
     fi
+    local installed_swiftformat_version
+    installed_swiftformat_version="$(swiftformat_version)"
+    if [[ "$installed_swiftformat_version" != "$REQUIRED_SWIFTFORMAT_VERSION" ]]; then
+        fail "SwiftFormat $REQUIRED_SWIFTFORMAT_VERSION is required; found ${installed_swiftformat_version:-unknown}. Update the repository baseline deliberately before using a different formatter version."
+    fi
     print_status
 }
 
@@ -99,19 +105,11 @@ install_missing_tools(){
         fail "Homebrew is required to install SwiftFormat and SwiftLint. Install Homebrew first, then rerun 'make install-format-tools'."
     fi
 
-    if has_tool swiftformat; then
-        echo "SwiftFormat already installed."
-    else
-        echo "Installing SwiftFormat with Homebrew..."
-        brew install swiftformat
-    fi
+    echo "Installing SwiftFormat $REQUIRED_SWIFTFORMAT_VERSION baseline with Homebrew..."
+    brew install swiftformat
 
-    if has_tool swiftlint; then
-        echo "SwiftLint already installed."
-    else
-        echo "Installing SwiftLint with Homebrew..."
-        brew install swiftlint
-    fi
+    echo "Installing SwiftLint with Homebrew..."
+    brew install swiftlint
 
     check_tools
 }

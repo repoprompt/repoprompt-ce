@@ -17,8 +17,8 @@ Default `push` is a safety gate. It does not run heavyweight lint, test, provide
 | --- | --- |
 | `Scripts/conductor.py`, conductor/preflight control-plane tests, the contribution preflight script, or `Makefile` conductor wiring | `make conductor-selftest`; included in `pr-ready` for these paths. |
 | Hosted app-test CI runner boundary (`.github/workflows/ci.yml`, `Scripts/ci_app_test_runner.py`, `Scripts/test_ci_app_test_runner.py`) | `make ci-app-test-runner-selftest`; included in `pr-ready` for these paths. Hosted CI follow-up is still required for real macOS runner/process behavior. |
-| Swift files | `make dev-lint`; included in `pr-ready` for Swift paths. Run `make dev-format` first when formatting mutation is intended. |
-| Root app source or root tests | Use the smallest focused `make dev-test FILTER=<Suite>` during iteration. Full `make dev-test` is the PR-ready/full local lane when required and is included in `pr-ready` for `Sources/RepoPrompt/` or `Tests/RepoPromptTests/`. |
+| Swift files | Use `make lint-impacted` for ordinary local work; it includes branch, staged, unstaged, and untracked Swift files in one invocation per tool and falls back to full scope for style/tooling uncertainty. `pr-ready` uses the outgoing-range form. Full coordinated `make dev-lint` remains authoritative. |
+| Root app source or root tests | Use the smallest focused `make dev-test FILTER=<Suite>` or `make dev-test-impacted` during iteration. `pr-ready` uses impacted ledger selection with a smoke floor and automatically falls back to full root for broad/uncertain boundaries. Full `make dev-test` remains the explicit authoritative local lane. |
 | Provider package source or tests | `make dev-provider-test`; included in `pr-ready` for provider-package paths. |
 | `Sources/RepoPrompt/**` | `make dev-swift-build PRODUCT=RepoPrompt`; included in `pr-ready` for these paths. |
 | `Sources/RepoPromptMCP/**` or `Sources/RepoPromptShared/**` | `make dev-swift-build PRODUCT=repoprompt-mcp`; included in `pr-ready` for these paths. |

@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-test dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-impacted format-check format-check-impacted lint lint-impacted install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-test dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 
@@ -19,7 +19,7 @@ help:
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
 	@printf '  %-30s %s\n' 'dev-launch-existing' 'Launch existing coordinated debug app without building'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
-	@printf '  %-30s %s\n' 'dev-test-impacted' 'Run impacted root tests; default includes branch, staged, and unstaged changes; override with RANGE=...'
+	@printf '  %-30s %s\n' 'dev-test-impacted' 'Run impacted root tests; default includes branch, staged, unstaged, and untracked changes; override with RANGE=...'
 	@printf '  %-30s %s\n' 'dev-test-shard-plan' 'Print weighted full-root shard filters; override with SHARDS=N'
 	@printf '  %-30s %s\n' 'dev-test-list' 'List XCTest methods through conductor'
 	@printf '  %-30s %s\n' 'dev-provider-test' 'Run provider package tests; override with FILTER=name'
@@ -82,11 +82,20 @@ format-tools-status:
 format:
 	./Scripts/swift_style.sh format
 
+format-impacted:
+	./Scripts/swift_style.sh format --changed "$(if $(RANGE),$(RANGE),default)"
+
 format-check:
 	./Scripts/swift_style.sh format-check
 
+format-check-impacted:
+	./Scripts/swift_style.sh format-check --changed "$(if $(RANGE),$(RANGE),default)"
+
 lint:
 	./Scripts/swift_style.sh lint
+
+lint-impacted:
+	./Scripts/swift_style.sh lint --changed "$(if $(RANGE),$(RANGE),default)"
 
 install-debug-cli:
 	./Scripts/install_debug_cli.sh install --build
@@ -115,6 +124,7 @@ guardrails:
 conductor-selftest:
 	python3 Scripts/test_debug_app_process.py
 	python3 Scripts/test_contribution_preflight.py
+	python3 Scripts/test_swift_style.py
 	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_conductor_output.py
 	python3 Scripts/test_agent_mode_file_tools_benchmark.py
@@ -181,7 +191,7 @@ dev-test:
 	./conductor test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
 
 dev-test-impacted:
-	@python3 Scripts/test_suite_optimizer.py impacted --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --range "$(if $(RANGE),$(RANGE),default)" --run$(if $(INCLUDE_HEAVY), --include-heavy)
+	@python3 Scripts/test_suite_optimizer.py impacted --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --range "$(if $(RANGE),$(RANGE),default)" --run$(if $(INCLUDE_HEAVY), --include-heavy)$(if $(FULL_FALLBACK), --fallback-full)
 
 dev-test-shard-plan:
 	@python3 Scripts/test_suite_optimizer.py shard-plan --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --shards $(if $(SHARDS),$(SHARDS),4)$(if $(INCLUDE_HEAVY), --include-heavy)

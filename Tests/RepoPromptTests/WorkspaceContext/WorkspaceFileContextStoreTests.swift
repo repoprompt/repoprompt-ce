@@ -3030,8 +3030,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let addedURL = root.appendingPathComponent("Added.swift")
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
-            try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
+            let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootID)
+            XCTAssertTrue(attached)
             await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
@@ -3412,8 +3413,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let clock = LockedWorkspaceDiagnosticsClock(nowNanoseconds: 4_000_000_000)
             let store = WorkspaceFileContextStore(debugNowNanoseconds: { clock.now() })
             let record = try await store.loadRoot(path: root.path)
-            try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
+            let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootID)
+            XCTAssertTrue(attached)
             await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let baselineWatcherWatermark = try await store.acceptedWatcherWatermarkForTesting(rootID: rootID)
             let flushGate = AsyncGate()
