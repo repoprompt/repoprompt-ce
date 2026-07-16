@@ -48,11 +48,12 @@ enum AsyncTestWait {
             guard now < deadline else {
                 throw AsyncTestConditionTimeout(description: description, timeout: timeout)
             }
-            let sleepDeadline = min(
-                deadline,
-                now.advanced(by: .nanoseconds(Int64(delay)))
-            )
-            try await clock.sleep(until: sleepDeadline, tolerance: .zero)
+            // ContinuousClock.sleep(until:tolerance:) has produced an invalid
+            // clock-state transition when the enclosing XCTest task is torn down
+            // immediately after the condition succeeds. A bounded relative task
+            // sleep provides the same polling backoff without retaining that clock
+            // sleeper across XCTest teardown.
+            try await Task.sleep(nanoseconds: delay)
             delay = min(delay > maximumDelay / 2 ? maximumDelay : delay * 2, maximumDelay)
         }
     }

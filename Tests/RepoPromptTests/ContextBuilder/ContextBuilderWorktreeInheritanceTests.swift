@@ -2292,15 +2292,6 @@ import XCTest
             )
         }
 
-        private func makeTemporaryRoot(name: String) throws -> URL {
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("ContextBuilderWorktreeInheritanceTests", isDirectory: true)
-                .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-            addTeardownBlock { try? FileManager.default.removeItem(at: url) }
-            return url.standardizedFileURL
-        }
-
         @discardableResult
         private func initializeGitRepository(
             at root: URL,

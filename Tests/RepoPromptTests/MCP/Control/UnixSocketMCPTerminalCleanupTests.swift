@@ -755,12 +755,16 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
         while Date() < deadline {
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
             let pollResult = Darwin.poll(&descriptor, 1, 50)
-            if pollResult < 0, errno == EINTR { continue }
+            if pollResult < 0, errno == EINTR {
+                continue
+            }
             guard pollResult > 0 else { continue }
 
             var byte: UInt8 = 0
             let count = Darwin.read(fd, &byte, 1)
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR {
+                continue
+            }
             guard count > 0 else { throw POSIXError(.EIO) }
             if byte == UInt8(ascii: "\n") {
                 return data
@@ -777,7 +781,9 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                 Darwin.write(fd, buffer.baseAddress, buffer.count)
             }
             if written < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             guard written > 0 else { throw POSIXError(.EIO) }
@@ -808,11 +814,17 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
         pollIntervalNanoseconds: UInt64 = 5_000_000,
         _ condition: @escaping () async -> Bool
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+        do {
+            try await AsyncTestWait.waitUntil(
+                "Unix socket terminal cleanup condition",
+                timeout: timeout,
+                initialDelayNanoseconds: pollIntervalNanoseconds,
+                maximumDelayNanoseconds: pollIntervalNanoseconds,
+                condition: condition
+            )
+            return true
+        } catch {
+            return false
         }
-        return await condition()
     }
 }

@@ -725,7 +725,6 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertTrue(returnFromBResult.didSwitch)
         assertSelectionFixture(fixture, composition: composition)
 
-        try await Task.sleep(nanoseconds: 250_000_000)
         await manager.pollAndSaveStateAsync()
         let workspaceURL = manager.workspaceFileURL(for: fixture.workspace)
         let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL)
@@ -752,7 +751,6 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
             XCTAssertEqual(manager.activeWorkspaceID, fixture.workspace.id)
             assertSelectionFixture(fixture, composition: composition)
 
-            try await Task.sleep(nanoseconds: 250_000_000)
             await manager.pollAndSaveStateAsync()
             let workspaceURL = manager.workspaceFileURL(for: fixture.workspace)
             let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL)
@@ -1388,12 +1386,14 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         line: UInt = #line,
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("workspace switch recovery condition", timeout: timeout) {
+                await MainActor.run { condition() }
+            }
+        } catch {
+            XCTFail("Timed out waiting for workspace switch recovery condition: \(error)", file: file, line: line)
+            throw error
         }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
     }
 }
 
@@ -1498,7 +1498,9 @@ private actor WorkspaceSwitchManualSleeper {
     private var cancelledWaiterIDs: Set<UUID> = []
 
     func sleep(nanoseconds: UInt64) async {
-        if releasedNanoseconds.contains(nanoseconds) { return }
+        if releasedNanoseconds.contains(nanoseconds) {
+            return
+        }
         let waiterID = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -1564,14 +1566,18 @@ private actor WorkspaceSwitchRecoveryGate {
     }
 
     func waitUntilArrived() async {
-        if arrived { return }
+        if arrived {
+            return
+        }
         await withCheckedContinuation { continuation in
             arrivalContinuations.append(continuation)
         }
     }
 
     func waitUntilCompleted() async {
-        if completed { return }
+        if completed {
+            return
+        }
         await withCheckedContinuation { continuation in
             completionContinuations.append(continuation)
         }

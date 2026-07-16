@@ -1228,16 +1228,12 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
     private func waitUntil(
         timeout: TimeInterval = 2.0,
-        file: StaticString = #filePath,
-        line: UInt = #line,
-        _ condition: @escaping () -> Bool
+        _ condition: @escaping @MainActor () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
+        try await AsyncTestWait.waitUntil(
+            "Codex Agent Mode coordinator condition",
+            timeout: timeout
+        ) { await MainActor.run { condition() } }
     }
 }
 

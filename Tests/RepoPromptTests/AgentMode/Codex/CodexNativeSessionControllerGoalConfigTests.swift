@@ -453,13 +453,13 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         minimumCount: Int,
         timeout: TimeInterval = 2
     ) async throws -> Int {
-        let deadline = Date().addingTimeInterval(timeout)
-        var latestCount = try recordedRequests(for: method, at: recordURL).count
-        while latestCount < minimumCount, Date() < deadline {
-            try await Task.sleep(nanoseconds: 50_000_000)
-            latestCount = try recordedRequests(for: method, at: recordURL).count
+        try await AsyncTestWait.waitUntilThrowing(
+            "\(minimumCount) recorded \(method) requests",
+            timeout: timeout
+        ) {
+            try self.recordedRequests(for: method, at: recordURL).count >= minimumCount
         }
-        return latestCount
+        return try recordedRequests(for: method, at: recordURL).count
     }
 
     private func recordedRequests(for method: String, at recordURL: URL) throws -> [[String: Any]] {

@@ -222,17 +222,6 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         #endif
     }
 
-    private static func assertSourceContains(
-        _ snippets: [String],
-        in source: String,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        for snippet in snippets {
-            XCTAssertTrue(source.contains(snippet), "Missing ProcessLauncher result check: \(snippet)", file: file, line: line)
-        }
-    }
-
     private static func firstReceivedMessage(
         from stream: AsyncThrowingStream<Data, Swift.Error>
     ) async throws -> Data? {
@@ -275,7 +264,9 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         while data.count < count, Date() < deadline {
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
             let result = Darwin.poll(&descriptor, 1, 50)
-            if result < 0, errno == EINTR { continue }
+            if result < 0, errno == EINTR {
+                continue
+            }
             guard result > 0 else { continue }
 
             var buffer = [UInt8](repeating: 0, count: count - data.count)
@@ -302,7 +293,9 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         while Date() < deadline {
             var status: Int32 = 0
             let result = Darwin.waitpid(pid, &status, WNOHANG)
-            if result == pid { return status }
+            if result == pid {
+                return status
+            }
             if result < 0 {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ECHILD)
             }
@@ -336,8 +329,12 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
 
             var byte: UInt8 = 0
             let count = Darwin.recv(fd, &byte, 1, Int32(MSG_PEEK | MSG_DONTWAIT))
-            if count == 0 { return true }
-            if count < 0, errno != EAGAIN, errno != EWOULDBLOCK { return false }
+            if count == 0 {
+                return true
+            }
+            if count < 0, errno != EAGAIN, errno != EWOULDBLOCK {
+                return false
+            }
         }
         return false
     }
@@ -345,7 +342,9 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
     private static func waitUntilClosed(_ fd: Int32, timeout: TimeInterval = 2) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if isClosed(fd) { return true }
+            if isClosed(fd) {
+                return true
+            }
             usleep(20000)
         }
         return isClosed(fd)

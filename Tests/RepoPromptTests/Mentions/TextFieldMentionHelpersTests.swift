@@ -79,7 +79,8 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         try await waitUntil { provider.callCount == 2 }
         helper.clickSuggestionForTesting(at: 1)
         provider.completeRefresh()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitUntil { provider.completedRefreshCount == 1 }
+        XCTAssertEqual(helper.suggestionsForTesting, [first, clicked])
 
         let handled = helper.handleCommandIfNeeded(
             textView: textView,
@@ -94,11 +95,9 @@ final class TextFieldMentionHelpersTests: XCTestCase {
     private func waitUntil(
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
-        for _ in 0 ..< 100 {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition")
+        try await AsyncTestWait.waitUntil(
+            "text-field mention condition"
+        ) { await MainActor.run { condition() } }
     }
 }
 
@@ -108,6 +107,7 @@ private final class DelayedSuggestionProvider {
     let refreshed: [MentionSuggestion]
     private var continuation: CheckedContinuation<[MentionSuggestion], Never>?
     private(set) var callCount = 0
+    private(set) var completedRefreshCount = 0
 
     init(initial: [MentionSuggestion], refreshed: [MentionSuggestion]) {
         self.initial = initial
@@ -119,9 +119,11 @@ private final class DelayedSuggestionProvider {
         if callCount == 1 {
             return initial
         }
-        return await withCheckedContinuation { continuation in
+        let suggestions = await withCheckedContinuation { continuation in
             self.continuation = continuation
         }
+        completedRefreshCount += 1
+        return suggestions
     }
 
     func completeRefresh() {

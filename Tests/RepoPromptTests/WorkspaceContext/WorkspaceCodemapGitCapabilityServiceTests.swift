@@ -737,12 +737,12 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
 
         let first = Task { await service.resolve(root: rootRequest) }
         let second = Task { await service.resolve(root: rootRequest) }
-        await waitForEntryCount(2, gate: gate)
-        await waitForWaiterCount(2, service: service)
+        try await waitForEntryCount(2, gate: gate)
+        try await waitForWaiterCount(2, service: service)
 
         first.cancel()
         await assertEqual(first.value, .eligible(initial))
-        await waitForWaiterCount(1, service: service)
+        try await waitForWaiterCount(1, service: service)
         await assertEqual(service.state(for: rootRequest.rootEpoch), .resolving(generation: 2))
 
         await gate.resumeAll()
@@ -767,10 +767,10 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         let rootRequest = request(for: root, seed: 61)
 
         let task = Task { await service.resolve(root: rootRequest) }
-        await waitForEntryCount(1, gate: gate)
+        try await waitForEntryCount(1, gate: gate)
         task.cancel()
         await assertEqual(task.value, .unresolved)
-        await waitForWaiterCount(0, service: service)
+        try await waitForWaiterCount(0, service: service)
         await assertEqual(service.state(for: rootRequest.rootEpoch), .unresolved)
 
         await gate.resumeAll()
@@ -798,7 +798,7 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         let staleRequest = request(for: staleRoot, seed: 71)
         await gate.setPaused(true)
         let staleTask = Task { await service.resolve(root: staleRequest) }
-        await waitForEntryCount(2, gate: gate)
+        try await waitForEntryCount(2, gate: gate)
         await service.release(rootEpoch: staleRequest.rootEpoch)
         await assertEqual(staleTask.value, .unresolved)
         await gate.resumeAll()
@@ -960,23 +960,19 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         )
     }
 
-    private func waitForEntryCount(_ expected: Int, gate: CapabilityResolutionGate) async {
-        for _ in 0 ..< 500 {
-            if await gate.entryCount() >= expected { return }
-            try? await Task.sleep(for: .milliseconds(2))
+    private func waitForEntryCount(_ expected: Int, gate: CapabilityResolutionGate) async throws {
+        try await AsyncTestWait.waitUntil("\(expected) capability resolution entries") {
+            await gate.entryCount() >= expected
         }
-        XCTFail("Timed out waiting for \(expected) capability resolution entries")
     }
 
     private func waitForWaiterCount(
         _ expected: Int,
         service: WorkspaceCodemapGitCapabilityService
-    ) async {
-        for _ in 0 ..< 500 {
-            if await service.snapshotForTesting().waiterCount == expected { return }
-            try? await Task.sleep(for: .milliseconds(2))
+    ) async throws {
+        try await AsyncTestWait.waitUntil("\(expected) capability resolution waiters") {
+            await service.snapshotForTesting().waiterCount == expected
         }
-        XCTFail("Timed out waiting for \(expected) capability waiters")
     }
 
     private func fakeGitScript(topLevel: String) -> String {

@@ -2781,49 +2781,6 @@ import XCTest
             context.window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         }
 
-        private func writeGitArtifactManifest(
-            to url: URL,
-            snapshotID: String,
-            repoKey: String,
-            repoRoot: URL,
-            layout: GitRepositoryLayout,
-            tabID: UUID
-        ) throws {
-            let manifest = GitDiffSnapshotManifest(
-                snapshotID: snapshotID,
-                generatedAt: Date(timeIntervalSince1970: 1),
-                mode: .standard,
-                compare: "HEAD",
-                compareInput: nil,
-                scope: .selected,
-                requestedPaths: ["Sources/Feature.swift"],
-                fingerprint: GitDiffFingerprint(
-                    headSHA: "abc",
-                    baseRef: "HEAD",
-                    statusHash: "status",
-                    generatedAt: Date(timeIntervalSince1970: 1)
-                ),
-                contextLines: 3,
-                detectRenames: false,
-                summary: GitDiffSnapshotManifest.Summary(files: 1, insertions: 1, deletions: 0),
-                files: [],
-                repoKey: repoKey,
-                repoRoot: repoRoot.path,
-                isWorktree: true,
-                worktreeName: repoRoot.lastPathComponent,
-                worktreeRoot: repoRoot.path,
-                mainWorktreeRoot: layout.knownMainWorktreeRoot?.path,
-                commonGitDir: layout.commonDir.path,
-                tabID: tabID
-            )
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            try write(
-                XCTUnwrap(try String(data: encoder.encode(manifest), encoding: .utf8)),
-                to: url
-            )
-        }
-
         private func requireSelectedPath(
             suffix: String,
             in selection: StoredSelection,

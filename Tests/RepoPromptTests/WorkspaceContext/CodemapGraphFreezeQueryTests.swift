@@ -172,18 +172,14 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let cancellationFiles = await store.files(inRoot: cancellationLoaded.id)
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
         XCTAssertEqual(cancellationFiles.count, 2)
-        let firstCancellationTicket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: cancellationFiles[0].id)
-        )
-        _ = try await readyResult(
-            settledResult(store: store, ticket: firstCancellationTicket)
-        )
-        let secondCancellationTicket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: cancellationFiles[1].id)
-        )
-        _ = try await readyResult(
-            settledResult(store: store, ticket: secondCancellationTicket)
-        )
+        let firstCancellationTicket = try await readyArtifactDemand(
+            store: store,
+            forFileID: cancellationFiles[0].id
+        ).ticket
+        let secondCancellationTicket = try await readyArtifactDemand(
+            store: store,
+            forFileID: cancellationFiles[1].id
+        ).ticket
         let cancellationBundle = try await frozenPresentationBundle(
             store.freezeCodemapPresentation([
                 WorkspaceCodemapPresentationRequest(
@@ -219,10 +215,10 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let catalogLoaded = try await store.loadRoot(path: catalogRoot.path)
         let catalogFiles = await store.files(inRoot: catalogLoaded.id)
         let catalogFile = try XCTUnwrap(catalogFiles.first)
-        let catalogTicket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: catalogFile.id)
-        )
-        _ = try await readyResult(settledResult(store: store, ticket: catalogTicket))
+        let catalogTicket = try await readyArtifactDemand(
+            store: store,
+            forFileID: catalogFile.id
+        ).ticket
         let catalogPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
             rootDisplayName: "Catalog Logical Root",
             standardizedRelativePath: catalogFile.standardizedRelativePath
@@ -261,10 +257,10 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let unloadLoaded = try await store.loadRoot(path: unloadRoot.path)
         let unloadFiles = await store.files(inRoot: unloadLoaded.id)
         let unloadFile = try XCTUnwrap(unloadFiles.first)
-        let unloadTicket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: unloadFile.id)
-        )
-        _ = try await readyResult(settledResult(store: store, ticket: unloadTicket))
+        let unloadTicket = try await readyArtifactDemand(
+            store: store,
+            forFileID: unloadFile.id
+        ).ticket
         let unloadBundle = try await frozenPresentationBundle(
             store.freezeCodemapPresentation([
                 WorkspaceCodemapPresentationRequest(

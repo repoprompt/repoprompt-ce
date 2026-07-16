@@ -601,7 +601,6 @@ final class CodexFallbackFIFOTests: XCTestCase {
             cleanupSessionStore: true
         )
         let attemptsAfterDeactivation = publicationAttempts
-        try await Task.sleep(nanoseconds: 100_000_000)
 
         XCTAssertEqual(publicationAttempts, attemptsAfterDeactivation)
         XCTAssertNil(session.codexFallbackSuccessorRetryTask)
@@ -647,7 +646,6 @@ final class CodexFallbackFIFOTests: XCTestCase {
             originatingConnectionID: nil
         )
         let attemptsAfterReplacement = publicationAttempts
-        try await Task.sleep(nanoseconds: 100_000_000)
 
         XCTAssertNotEqual(session.mcpControlContext?.activationID, originalActivationID)
         XCTAssertEqual(publicationAttempts, attemptsAfterReplacement)
@@ -1015,29 +1013,15 @@ final class CodexFallbackFIFOTests: XCTestCase {
         }
     }
 
-    private func assertSteeringRequested(
-        _ disposition: AgentRunSessionStore.WaitDisposition,
-        sessionID: UUID,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        guard case let .noteworthySnapshot(snapshot, reason) = disposition else {
-            return XCTFail("Expected steering wake, got \(disposition)", file: file, line: line)
-        }
-        XCTAssertEqual(reason, .steeringRequested, file: file, line: line)
-        XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
-    }
-
     private func waitUntil(
         timeout: TimeInterval = 2,
         _ predicate: @escaping () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if predicate() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for Codex fallback FIFO state")
+        try await AsyncTestWait.waitUntil(
+            "Codex fallback FIFO state",
+            timeout: timeout,
+            condition: predicate
+        )
     }
 }
 
@@ -1248,12 +1232,12 @@ private actor FallbackStartGate {
     }
 
     func waitUntilWaiting(timeout: TimeInterval = 5) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if waiting { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("fallback start gate waiter", timeout: timeout) { await self.waiting }
+            return true
+        } catch {
+            return false
         }
-        return waiting
     }
 
     func release() {

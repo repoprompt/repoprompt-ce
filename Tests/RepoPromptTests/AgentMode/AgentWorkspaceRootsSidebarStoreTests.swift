@@ -487,12 +487,13 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         timeout: TimeInterval = 2,
         _ condition: @escaping @MainActor () -> Bool
     ) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("workspace roots sidebar condition", timeout: timeout) {
+                await MainActor.run { condition() }
+            }
+        } catch {
+            XCTFail("Timed out waiting for workspace roots sidebar condition: \(error)")
         }
-        XCTFail("Timed out waiting for condition")
     }
 
     private func makeProjection(

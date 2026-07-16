@@ -2026,11 +2026,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         _ message: String,
         condition: @escaping @MainActor () -> Bool
     ) async throws {
-        for _ in 0 ..< 500 {
-            if condition() { return }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        try await AsyncTestWait.waitUntil(message, timeout: 0.5) {
+            await MainActor.run { condition() }
         }
-        throw LifecycleTimeoutError(operation: message, timeoutSeconds: 0.5)
     }
 
     func assertOrderedEvents(

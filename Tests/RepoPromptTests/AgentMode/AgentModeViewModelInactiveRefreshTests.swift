@@ -993,7 +993,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
 
         await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
-        await harness.waitForRequestCount(1)
+        let firstRequestStarted = await harness.waitForRequestCount(1)
+        XCTAssertTrue(firstRequestStarted)
         let generationWhileBindingIsInstalled = try XCTUnwrap(viewModel.test_activeSessionIndexRefreshGeneration)
         let restoredSession = try XCTUnwrap(viewModel.session(for: rootTabID, createIfNeeded: true))
         XCTAssertEqual(restoredSession.activeAgentSessionID, rootSessionID)
@@ -1039,7 +1040,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
 
         await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
-        await harness.waitForRequestCount(1)
+        let firstRequestStarted = await harness.waitForRequestCount(1)
+        XCTAssertTrue(firstRequestStarted)
         let originalGeneration = try XCTUnwrap(viewModel.test_activeSessionIndexRefreshGeneration)
         try await waitUntil {
             viewModel.test_ownerValidatedSessionIndex[originalSessionID] != nil
@@ -1050,7 +1052,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         _ = viewModel.test_installPersistentSessionBinding(sessionID: replacementSessionID, on: session)
         let successorGeneration = try XCTUnwrap(viewModel.test_activeSessionIndexRefreshGeneration)
         XCTAssertGreaterThan(successorGeneration, originalGeneration)
-        await harness.waitForRequestCount(2)
+        let successorRequestStarted = await harness.waitForRequestCount(2)
+        XCTAssertTrue(successorRequestStarted)
         XCTAssertTrue(viewModel.test_ownerValidatedSessionIndex.isEmpty)
 
         await firstGate.release()
@@ -1111,7 +1114,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), [rootSessionID, childSessionID])
 
         viewModel.test_refreshSessionListCache(for: workspace)
-        await harness.waitForRequestCount(2)
+        let secondRequestStarted = await harness.waitForRequestCount(2)
+        XCTAssertTrue(secondRequestStarted)
         try await waitUntil {
             viewModel.test_ownerValidatedSessionIndex[rootSessionID]?.savedAt == updatedRootEntry.savedAt
         }
@@ -1557,12 +1561,10 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         timeout: TimeInterval = 3,
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
-        XCTFail("Timed out waiting for condition")
+        try await AsyncTestWait.waitUntil(
+            "inactive Agent Mode refresh condition",
+            timeout: timeout
+        ) { await MainActor.run { condition() } }
     }
 
     private func makeViewModel() -> AgentModeViewModel {
@@ -1708,9 +1710,14 @@ private actor SidebarIndexStreamHarness {
         return boundSessionIDByTabIDByRequest[requestIndex][tabID]
     }
 
-    func waitForRequestCount(_ expectedCount: Int) async {
-        while requestCount < expectedCount {
-            try? await Task.sleep(nanoseconds: 1_000_000)
+    func waitForRequestCount(_ expectedCount: Int) async -> Bool {
+        do {
+            try await AsyncTestWait.waitUntil("inactive refresh request count \(expectedCount)") {
+                await self.requestCount >= expectedCount
+            }
+            return true
+        } catch {
+            return false
         }
     }
 }
