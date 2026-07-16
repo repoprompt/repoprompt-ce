@@ -77,15 +77,18 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
     private final class Entry {
         let token: UUID
         let source: any DispatchSourceProcess
+        let beforeReap: @Sendable () -> Void
         let completion: @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
 
         init(
             token: UUID,
             source: any DispatchSourceProcess,
+            beforeReap: @escaping @Sendable () -> Void,
             completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
         ) {
             self.token = token
             self.source = source
+            self.beforeReap = beforeReap
             self.completion = completion
         }
     }
@@ -98,6 +101,7 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
 
     func observe(
         pid: pid_t,
+        beforeReap: @escaping @Sendable () -> Void,
         completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
     ) {
         queue.async { [weak self] in
@@ -113,7 +117,12 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
                 eventMask: .exit,
                 queue: queue
             )
-            let entry = Entry(token: token, source: source, completion: completion)
+            let entry = Entry(
+                token: token,
+                source: source,
+                beforeReap: beforeReap,
+                completion: completion
+            )
             entries[pid] = entry
 
             source.setRegistrationHandler { [weak self] in
@@ -140,8 +149,31 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
     }
 
     private func reap(pid: pid_t, token: UUID, mode: ReapMode) {
-        guard entries[pid]?.token == token else { return }
+        guard let entry = entries[pid], entry.token == token else { return }
 
+        while true {
+            var info = siginfo_t()
+            let probeResult = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+            if probeResult == 0 {
+                guard info.si_pid == pid else { return }
+                break
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == ECHILD {
+                complete(pid: pid, token: token, result: .failure(.childOwnershipLost(pid: pid)))
+                return
+            }
+            complete(
+                pid: pid,
+                token: token,
+                result: .failure(.waitFailed(String(cString: strerror(errno))))
+            )
+            return
+        }
+
+        entry.beforeReap()
         var status: Int32 = 0
         while true {
             let result = waitpid(pid, &status, mode.waitOptions)
@@ -466,14 +498,19 @@ enum ProcessTermination {
     }
 
     /// Registers one cancellation-independent direct-child observation. The
-    /// completion runs synchronously on the serial process-wide registry queue
-    /// after the destructive reap. It must close PID-signaling state before it
-    /// returns and return promptly so unrelated child exits can be processed.
+    /// `beforeReap` runs synchronously after a non-destructive terminal probe
+    /// and before the sole destructive wait. The completion must return promptly
+    /// so unrelated child exits can be processed.
     static func observeChildStatus(
         pid: pid_t,
+        beforeReap: @escaping @Sendable () -> Void = {},
         completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
     ) {
-        ChildStatusReaperRegistry.shared.observe(pid: pid, completion: completion)
+        ChildStatusReaperRegistry.shared.observe(
+            pid: pid,
+            beforeReap: beforeReap,
+            completion: completion
+        )
     }
 
     /// Checks child terminal state without consuming the status owned by the
@@ -496,13 +533,10 @@ enum ProcessTermination {
     /// Async convenience wrapper over the callback-based sole-reaper primitive.
     static func reapChildStatus(
         pid: pid_t,
-        onReaped: @escaping @Sendable () -> Void = {}
+        beforeReap: @escaping @Sendable () -> Void = {}
     ) async throws -> ProcessExitStatus {
         try await withCheckedThrowingContinuation { continuation in
-            observeChildStatus(pid: pid) { result in
-                if case .success = result {
-                    onReaped()
-                }
+            observeChildStatus(pid: pid, beforeReap: beforeReap) { result in
                 continuation.resume(with: result)
             }
         }
@@ -582,8 +616,16 @@ enum ProcessTermination {
                 logger: logger
             )
             if await observer.wait(timeout: killGrace) == nil {
-                logger("Process \(observer.pid) has not settled after SIGKILL; awaiting the sole reaper")
-                _ = await observer.wait()
+                logger("Process \(observer.pid) has not settled after bounded SIGKILL cleanup; sole-reaper observation remains active")
+                if observer.isRootSignalingClosed {
+                    await terminateProcessGroupAfterRootReap(
+                        processGroupID: processGroupID,
+                        sigtermGrace: termGrace,
+                        sigkillGrace: killGrace,
+                        logger: logger
+                    )
+                }
+                return
             }
         }
 

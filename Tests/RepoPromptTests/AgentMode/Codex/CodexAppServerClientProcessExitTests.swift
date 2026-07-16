@@ -163,6 +163,36 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         XCTAssertEqual(clearCount, 1)
     }
 
+    func testNilLaunchDirectoryUsesCLIProcessConfigurationDefaultInExitEvidence() async throws {
+        let directory = try makeTemporaryDirectory()
+        let executable = try makeWorkingDirectoryExitServer(in: directory)
+        let client = try await makeClient(
+            executable: executable,
+            launchDirectory: nil,
+            timeout: 5
+        )
+        addTeardownBlock {
+            await client.stop()
+        }
+
+        do {
+            try await client.startIfNeeded()
+            XCTFail("The cwd-reporting fixture must fail startup")
+        } catch let CodexAppServerClient.ClientError.processExited(evidence) {
+            let expectedDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(nil)
+            let actualDirectory = String(decoding: evidence.stderrTail, as: UTF8.self)
+            XCTAssertEqual(evidence.launchDirectory, expectedDirectory)
+            XCTAssertEqual(
+                GitRepoRootAuthorization.canonicalPath(actualDirectory),
+                GitRepoRootAuthorization.canonicalPath(expectedDirectory)
+            )
+            XCTAssertEqual(evidence.status, .exited(code: 41))
+            XCTAssertTrue(evidence.stderrWasSettled)
+        } catch {
+            XCTFail("Expected typed processExited evidence, got \(error)")
+        }
+    }
+
     func testStartupStdoutEOFWhileRootLivesKeepsGenericFailure() async throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeLiveAfterStdoutEOFServer(in: directory)
@@ -463,7 +493,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
 
     private func makeClient(
         executable: URL,
-        launchDirectory: URL,
+        launchDirectory: URL?,
         timeout: TimeInterval,
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
@@ -480,7 +510,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             commandName: executable.path,
             additionalPathHints: [],
             requestTimeout: timeout,
-            processLaunchDirectory: launchDirectory.path
+            processLaunchDirectory: launchDirectory?.path
         ))
         return client
     }
@@ -578,6 +608,21 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         os.close(1)
         while True:
             time.sleep(1)
+        """
+        return try writeExecutable(script, to: executable)
+    }
+
+    private func makeWorkingDirectoryExitServer(in directory: URL) throws -> URL {
+        let executable = directory.appendingPathComponent("working-directory-exit-codex")
+        let script = """
+        #!/usr/bin/env python3
+        import os
+        import sys
+
+        sys.stdin.readline()
+        os.write(2, os.getcwd().encode("utf-8"))
+        os.close(1)
+        os._exit(41)
         """
         return try writeExecutable(script, to: executable)
     }

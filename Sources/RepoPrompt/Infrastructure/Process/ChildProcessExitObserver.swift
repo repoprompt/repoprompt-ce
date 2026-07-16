@@ -6,6 +6,12 @@ import Foundation
 /// Callers may wait repeatedly, but only the callback-based observation invokes
 /// `waitpid` through `ProcessTermination.observeChildStatus`.
 final class ChildProcessExitObserver: @unchecked Sendable {
+    typealias StatusObserver = @Sendable (
+        _ pid: pid_t,
+        _ beforeReap: @escaping @Sendable () -> Void,
+        _ completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
+    ) -> Void
+
     enum Outcome: Equatable {
         case exited(ProcessExitStatus)
         case failed(ProcessTerminationError)
@@ -17,10 +23,18 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         private var outcome: Outcome?
         private var waiters: [UUID: CheckedContinuation<Outcome?, Never>] = [:]
 
-        func markRootReaped() {
+        func closeRootSignalingBeforeReap() {
             lock.lock()
             rootReaped = true
             lock.unlock()
+        }
+
+        func reopenRootSignalingAfterWaitFailure() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard outcome == nil else { return false }
+            rootReaped = false
+            return true
         }
 
         func finish(with outcome: Outcome) {
@@ -72,6 +86,12 @@ final class ChildProcessExitObserver: @unchecked Sendable {
             return operation()
         }
 
+        var isRootSignalingClosed: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return rootReaped
+        }
+
         private func expireWaiter(_ waiterID: UUID) {
             lock.lock()
             let continuation = waiters.removeValue(forKey: waiterID)
@@ -90,34 +110,39 @@ final class ChildProcessExitObserver: @unchecked Sendable {
 
     init(
         pid: pid_t,
-        beforePublishingOutcome: @escaping @Sendable (Outcome) -> Void = { _ in }
+        beforePublishingOutcome: @escaping @Sendable (Outcome) -> Void = { _ in },
+        afterClosingRootSignalingBeforeReap: @escaping @Sendable () -> Void = {},
+        statusObserver: @escaping StatusObserver = { pid, beforeReap, completion in
+            ProcessTermination.observeChildStatus(
+                pid: pid,
+                beforeReap: beforeReap,
+                completion: completion
+            )
+        }
     ) {
         self.pid = pid
         let state = State()
         self.state = state
 
-        ProcessTermination.observeChildStatus(pid: pid) { result in
-            state.markRootReaped()
-            let outcome: Outcome = switch result {
-            case let .success(status): .exited(status)
-            case let .failure(error): .failed(error)
-            }
-            // Publication hooks may deliberately block for diagnostics. Keep
-            // them off the serial reaper registry so unrelated children can
-            // continue closing their ownership windows and publishing exits.
-            Self.outcomePublicationQueue.async {
-                beforePublishingOutcome(outcome)
-                state.finish(with: outcome)
-            }
-        }
+        Self.beginObservation(
+            pid: pid,
+            state: state,
+            beforePublishingOutcome: beforePublishingOutcome,
+            afterClosingRootSignalingBeforeReap: afterClosingRootSignalingBeforeReap,
+            statusObserver: statusObserver
+        )
     }
 
     func wait(timeout: TimeInterval? = nil) async -> Outcome? {
         await state.wait(timeout: timeout)
     }
 
+    var isRootSignalingClosed: Bool {
+        state.isRootSignalingClosed
+    }
+
     /// Signals only while this observer still owns an unreaped root PID. The
-    /// callback closes this lock-protected window immediately after waitpid,
+    /// registry closes this lock-protected window before its destructive wait,
     /// before diagnostic outcome publication can block or change executors.
     func signalRootProcessFamilyIfUnreaped(
         processGroupID: pid_t?,
@@ -132,5 +157,49 @@ final class ChildProcessExitObserver: @unchecked Sendable {
                 logger: logger
             )
         }
+    }
+
+    private static func beginObservation(
+        pid: pid_t,
+        state: State,
+        beforePublishingOutcome: @escaping @Sendable (Outcome) -> Void,
+        afterClosingRootSignalingBeforeReap: @escaping @Sendable () -> Void,
+        statusObserver: @escaping StatusObserver
+    ) {
+        statusObserver(
+            pid,
+            {
+                state.closeRootSignalingBeforeReap()
+                afterClosingRootSignalingBeforeReap()
+            },
+            { result in
+                if case .failure(.waitFailed) = result,
+                   state.reopenRootSignalingAfterWaitFailure()
+                {
+                    outcomePublicationQueue.asyncAfter(deadline: .now() + .milliseconds(10)) {
+                        beginObservation(
+                            pid: pid,
+                            state: state,
+                            beforePublishingOutcome: beforePublishingOutcome,
+                            afterClosingRootSignalingBeforeReap: afterClosingRootSignalingBeforeReap,
+                            statusObserver: statusObserver
+                        )
+                    }
+                    return
+                }
+
+                let outcome: Outcome = switch result {
+                case let .success(status): .exited(status)
+                case let .failure(error): .failed(error)
+                }
+                // Publication hooks may deliberately block for diagnostics. Keep
+                // them off the serial reaper registry so unrelated child exits can
+                // continue closing their ownership windows and publishing exits.
+                outcomePublicationQueue.async {
+                    beforePublishingOutcome(outcome)
+                    state.finish(with: outcome)
+                }
+            }
+        )
     }
 }

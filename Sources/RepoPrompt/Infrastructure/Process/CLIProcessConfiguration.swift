@@ -1,6 +1,10 @@
 import Foundation
 
 struct CLIProcessConfiguration {
+    static func resolvedWorkingDirectory(_ workingDirectory: String?) -> String {
+        workingDirectory ?? FileManager.default.temporaryDirectory.path
+    }
+
     var command: String
     /// Working directory for the CLI process. Defaults to temp directory to avoid macOS security popups.
     var workingDirectory: String
@@ -35,7 +39,7 @@ struct CLIProcessConfiguration {
         logStdinSampleBytes: Int = 0
     ) {
         self.command = command
-        self.workingDirectory = workingDirectory ?? FileManager.default.temporaryDirectory.path
+        self.workingDirectory = Self.resolvedWorkingDirectory(workingDirectory)
         self.environment = environment
         self.additionalPaths = additionalPaths
         self.commandSuffix = commandSuffix

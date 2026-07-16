@@ -1269,7 +1269,9 @@ actor CodexAppServerClient {
             featurePolicy: config.processFeaturePolicy
         )
         let args = processOverrides + ["app-server"]
-        let launchDirectory = config.processLaunchDirectory ?? FileManager.default.currentDirectoryPath
+        let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
+            config.processLaunchDirectory
+        )
         try await processSpawnPreparation()
         try Task.checkCancellation()
         let spawned = try ProcessLauncher.spawn(

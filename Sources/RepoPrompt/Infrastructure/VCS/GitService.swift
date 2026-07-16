@@ -7216,7 +7216,7 @@ actor GitService {
                         reapOutcome = try await .success(
                             ProcessTermination.reapChildStatus(
                                 pid: spawned.pid,
-                                onReaped: { target.markTerminated() }
+                                beforeReap: { target.markTerminated() }
                             )
                         )
                         reapRequiresGroupCleanup = false
@@ -7611,7 +7611,7 @@ actor GitService {
                         reapOutcome = try await .success(
                             ProcessTermination.reapChildStatus(
                                 pid: spawned.pid,
-                                onReaped: { target.markTerminated() }
+                                beforeReap: { target.markTerminated() }
                             )
                         )
                         reapRequiresGroupCleanup = false

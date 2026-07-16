@@ -2,7 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 private final class AgentRunWorktreeStartGitSeedRepository: @unchecked Sendable {
@@ -586,6 +586,36 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let installedRunID = try XCTUnwrap(session.runID)
         XCTAssertNotNil(session.codexController)
         XCTAssertNotNil(session.codexEventTask)
+        session.pendingApproval = AgentApprovalRequest(
+            requestID: .codex(.int(1)),
+            method: "item/commandExecution/requestApproval",
+            kind: .commandExecution,
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "item"
+        )
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        session.codexPendingTurnKind = .user
+        session.codexFallbackPumpTask = Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+        session.mcpFollowUpRunPending = true
+        let livenessKey = AgentModeViewModel.CodexNativeToolLivenessState.Key(
+            invocationID: UUID(),
+            fallbackSignature: "test"
+        )
+        session.codexNativeToolLiveness.inFlight[livenessKey] = .init(
+            toolName: "bash",
+            startedAt: Date(),
+            lastSignalAt: Date(),
+            processID: "123"
+        )
+        viewModel.test_codexCoordinator.test_installCodexToolTrackingPlaceholder(
+            for: session.tabID
+        )
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
 
         session.worktreeBindings = [makeBinding(logicalRoot: "   ", worktreeRoot: worktree.path)]
         await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
@@ -600,6 +630,15 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertNil(session.codexControllerTaskLabelKind)
         XCTAssertNil(session.codexControllerWorkspacePaths)
         XCTAssertNil(session.codexControllerFeatureState)
+        XCTAssertNil(session.pendingApproval)
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertNil(session.codexPendingTurnKind)
+        XCTAssertNil(session.codexFallbackPumpTask)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
         XCTAssertEqual(controller.shutdownCallCount, 1)
     }
 
@@ -2522,6 +2561,16 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             visibleRoots: [secondaryRef, primaryRef]
         )
         XCTAssertEqual(discoveryRoots, [primaryRef, secondaryRef])
+        let primaryAlias = primaryFixture.sandbox.appendingPathComponent("primary-repo-alias")
+        try FileManager.default.createSymbolicLink(
+            at: primaryAlias,
+            withDestinationURL: primaryFixture.repo
+        )
+        let aliasDiscoveryRoots = AgentMCPStartWorktreeCoordinator.repositoryDiscoveryRoots(
+            primaryRoot: primaryAlias.path,
+            visibleRoots: [secondaryRef, primaryRef]
+        )
+        XCTAssertEqual(aliasDiscoveryRoots, [primaryRef, secondaryRef])
 
         let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)

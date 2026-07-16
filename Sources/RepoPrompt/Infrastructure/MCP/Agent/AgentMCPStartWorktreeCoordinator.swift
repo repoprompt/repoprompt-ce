@@ -729,9 +729,9 @@ struct AgentMCPStartWorktreeCoordinator {
         guard let primaryRoot else {
             return visibleRoots
         }
-        let primaryPath = ((primaryRoot as NSString).expandingTildeInPath as NSString).standardizingPath
+        let primaryPath = GitRepoRootAuthorization.canonicalPath(primaryRoot)
         guard let primaryIndex = visibleRoots.firstIndex(where: {
-            ($0.standardizedFullPath as NSString).standardizingPath == primaryPath
+            GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath) == primaryPath
         }) else {
             return visibleRoots
         }

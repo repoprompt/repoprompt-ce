@@ -3689,6 +3689,36 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.scheduleSave(for: session.tabID)
     }
 
+    private func retireCodexControllerAfterWorkspaceResolutionFailure(
+        session: AgentModeViewModel.TabSession,
+        controller: any CodexSessionControlling
+    ) async {
+        cancelCodexThreadNameSync(for: session.tabID)
+        cancelCodexIdleShutdown(for: session.tabID)
+        cancelCodexTransportClosedFallback(for: session.tabID)
+        stopBashLivenessTask(for: session.tabID)
+        stopCodexStallWatchdog(for: session.tabID)
+        session.codexEventTask?.cancel()
+        session.codexEventTask = nil
+        session.codexEventTaskRunID = nil
+        session.codexLastEventAt = nil
+        session.pendingCommandRunningFlushTask?.cancel()
+        session.pendingCommandRunningFlushTask = nil
+        session.pendingCommandRunningByKey.removeAll()
+        abandonCodexFallbackQueue(
+            session: session,
+            reason: "Codex queued follow-up was cancelled because the workspace root became unavailable."
+        )
+        resetTrackedCodexTurns(session)
+        session.pendingCodexComputerUseActivation = nil
+        clearCodexPendingInteractions(in: session)
+        resetCodexWatchdogState(session)
+        clearCodexNativeToolLiveness(session)
+        clearCodexControllerInstanceState(for: session)
+        await controller.shutdown()
+        await stopCodexToolTrackingAndWait(for: session)
+    }
+
     func ensureCodexNativeSession(
         session: AgentModeViewModel.TabSession,
         policyAlreadyInstalled: Bool = false,
@@ -3739,11 +3769,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let controllerToShutdown = session.codexController
             await failCodexStartupForWorkspaceResolution(session: session, error: error)
             if let controllerToShutdown {
-                session.codexEventTask?.cancel()
-                session.codexEventTask = nil
-                session.codexEventTaskRunID = nil
-                clearCodexControllerInstanceState(for: session)
-                await controllerToShutdown.shutdown()
+                await retireCodexControllerAfterWorkspaceResolutionFailure(
+                    session: session,
+                    controller: controllerToShutdown
+                )
             }
             return
         }
@@ -7091,6 +7120,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 userInfo: [NSLocalizedDescriptionKey: errorDescription]
             )
             return shouldRetryCodexStartWithoutResume(existingRef: existingRef, error: error)
+        }
+
+        @_spi(TestSupport)
+        public func test_hasCodexToolTracking(for tabID: UUID) -> Bool {
+            toolTrackingByTabID[tabID] != nil
+        }
+
+        @_spi(TestSupport)
+        public func test_installCodexToolTrackingPlaceholder(for tabID: UUID) {
+            toolTrackingByTabID[tabID] = AgentToolTrackingController()
         }
     #endif
 
