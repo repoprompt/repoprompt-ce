@@ -176,20 +176,31 @@ public enum RegexToolkit {
                 }
                 continue
             }
-            if ch == "[", !inClass { bracket += 1
+            if ch == "[", !inClass {
+                bracket += 1
                 inClass = true
                 continue
             }
-            if ch == "]", inClass { bracket -= 1
-                if bracket == 0 { inClass = false }
+            if ch == "]", inClass {
+                bracket -= 1
+                if bracket == 0 {
+                    inClass = false
+                }
                 continue
             }
-            if ch == "]", !inClass { throw SearchPatternError.unmatchedBrackets(pattern) }
+            if ch == "]", !inClass {
+                throw SearchPatternError.unmatchedBrackets(pattern)
+            }
 
             if !inClass { // outside [...]
-                if ch == "(" { paren += 1 }
-                if ch == ")" { paren -= 1
-                    if paren < 0 { throw SearchPatternError.unmatchedParentheses(pattern) }
+                if ch == "(" {
+                    paren += 1
+                }
+                if ch == ")" {
+                    paren -= 1
+                    if paren < 0 {
+                        throw SearchPatternError.unmatchedParentheses(pattern)
+                    }
                 }
 
                 // ------------------------------------------------------------------
@@ -198,7 +209,9 @@ public enum RegexToolkit {
                 if ch == "{" {
                     // ➊  Fast-path: detect "{" followed by ']', '[' or end-of-string
                     //     → clearly *not* a legal quantifier
-                    if i == pattern.count - 1 { throw SearchPatternError.invalidQuantifier(pattern) }
+                    if i == pattern.count - 1 {
+                        throw SearchPatternError.invalidQuantifier(pattern)
+                    }
                     let next = pattern[pattern.index(pattern.startIndex, offsetBy: i + 1)]
 
                     if next == "," || next == "}" {
@@ -257,8 +270,12 @@ public enum RegexToolkit {
                 }
             }
         }
-        if paren != 0 { throw SearchPatternError.unmatchedParentheses(pattern) }
-        if bracket != 0 { throw SearchPatternError.unmatchedBrackets(pattern) }
+        if paren != 0 {
+            throw SearchPatternError.unmatchedParentheses(pattern)
+        }
+        if bracket != 0 {
+            throw SearchPatternError.unmatchedBrackets(pattern)
+        }
 
         // Use NSRegularExpression's own diagnostics for everything else
         // This catches complex quantifier issues, nested patterns, etc.

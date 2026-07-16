@@ -685,7 +685,9 @@ actor FileSearchActor {
 
     /// Looks like a literal with unnecessary escapes (e.g., "\\(") and no "\\\\"
     private static func looksOverEscapedLiteral(_ s: String) -> Bool {
-        if s.contains("\\\\") { return false } // double-backslash present → likely intended literal backslash
+        if s.contains("\\\\") {
+            return false
+        } // double-backslash present → likely intended literal backslash
         let chars = Array(s)
         var i = 0
         var saw = false
@@ -1522,7 +1524,9 @@ actor FileSearchActor {
         var fileResults: [SearchFileScanBatch] = []
         fileResults.reserveCapacity(batchSize)
         for index in batch.range {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
             let result = try await scanFileWithErrorHandling(entries[index], plan: plan)
             scannedFileCount += 1
             matchCount += result.summary.lineMatchCount
@@ -1827,7 +1831,9 @@ actor FileSearchActor {
         }
 
         while index < scalars.endIndex {
-            if (lineNumber & 0xFF) == 0, Task.isCancelled { break }
+            if (lineNumber & 0xFF) == 0, Task.isCancelled {
+                break
+            }
             let scalar = scalars[index]
             if scalar.value == 13 || scalar.value == 10 { // CR or LF; mirrors SearchLineIndex line boundaries.
                 scanLine(endingAtUTF16: offsetUTF16)
@@ -2088,7 +2094,9 @@ actor FileSearchActor {
                 hitCount += 1
                 if !countOnly, maxCollectedMatches.map({ hits.count < $0 }) ?? true {
                     hits.append(SearchHit(lineNumber: lineNumber))
-                    if reachedCollectionLimit() { break }
+                    if reachedCollectionLimit() {
+                        break
+                    }
                 }
             }
         }
@@ -2151,18 +2159,26 @@ actor FileSearchActor {
 
         try regex.enumerateMatches(in: document.text, matchLimits: RepoPromptPCRE2MatchPolicy.fileSearchFullBuffer) { match in
             defer { matchIndex += 1 }
-            if match.byteRange.isEmpty { return true }
-            if (matchIndex & 0x0F) == 0, Task.isCancelled { return false }
+            if match.byteRange.isEmpty {
+                return true
+            }
+            if (matchIndex & 0x0F) == 0, Task.isCancelled {
+                return false
+            }
 
             let lineNumber = document.lineNumber(forUTF8Offset: match.byteRange.lowerBound)
             guard lineNumber >= 0 else { return true }
-            if lastLineNumber == lineNumber { return true }
+            if lastLineNumber == lineNumber {
+                return true
+            }
 
             lastLineNumber = lineNumber
             hitCount += 1
             if !countOnly, maxCollectedMatches.map({ hits.count < $0 }) ?? true {
                 hits.append(SearchHit(lineNumber: lineNumber))
-                if reachedCollectionLimit() { return false }
+                if reachedCollectionLimit() {
+                    return false
+                }
             }
             return true
         }
@@ -2574,7 +2590,9 @@ actor FileSearchActor {
                             }
                         }
                     }
-                    if matched { return true }
+                    if matched {
+                        return true
+                    }
                 }
                 return false
             } else {
@@ -2729,7 +2747,9 @@ actor FileSearchActor {
 
         // Decide effective strategy when `.auto`
         let effectiveMode: SearchMode = {
-            if options.mode != .auto { return options.mode }
+            if options.mode != .auto {
+                return options.mode
+            }
             return Self.inferMode(pattern)
         }()
         let perfState = EditFlowPerf.begin(
@@ -2981,18 +3001,28 @@ actor FileSearchActor {
         }
 
         // Content indicators
-        if raw.contains("\n") { return .content }
-        if raw.contains(" "), raw.count > 10 { return .content }
+        if raw.contains("\n") {
+            return .content
+        }
+        if raw.contains(" "), raw.count > 10 {
+            return .content
+        }
 
         // Short patterns should search both to be thorough
-        if raw.count <= 3 { return .both }
+        if raw.count <= 3 {
+            return .both
+        }
 
         // Identifier-like tokens (e.g., "Player", "Bomb", "MyClass.swift") should search both
         // paths and content - this is the most intuitive UX for code search
-        if isIdentifierLike(raw) { return .both }
+        if isIdentifierLike(raw) {
+            return .both
+        }
 
         // Medium patterns with spaces are likely content searches
-        if raw.contains(" ") { return .content }
+        if raw.contains(" ") {
+            return .content
+        }
 
         // Everything else defaults to content (most common use case)
         return .content
@@ -3037,15 +3067,21 @@ actor FileSearchActor {
         guard !s.isEmpty else { return false }
 
         // Must be a single token (no spaces or path separators)
-        if s.contains(" ") || s.contains("/") || s.contains("\\") { return false }
+        if s.contains(" ") || s.contains("/") || s.contains("\\") {
+            return false
+        }
 
         // No obvious regex metacharacters
         let forbidden: Set<Character> = ["*", "+", "?", "[", "]", "{", "}", "(", ")", "|", "^", "$"]
-        if s.contains(where: forbidden.contains) { return false }
+        if s.contains(where: forbidden.contains) {
+            return false
+        }
 
         // Restrict to common identifier/filename characters: letters, digits, dot, underscore, hyphen
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
-        if s.unicodeScalars.contains(where: { !allowed.contains($0) }) { return false }
+        if s.unicodeScalars.contains(where: { !allowed.contains($0) }) {
+            return false
+        }
 
         return true
     }

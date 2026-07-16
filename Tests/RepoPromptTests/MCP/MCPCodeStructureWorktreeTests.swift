@@ -637,9 +637,12 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(files.count, 3)
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         let tabID = try XCTUnwrap(workspace.activeComposeTabID)
-        var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
-        composeTab.selection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
-        window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+        let selection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
+        let persistedSelection = await window.selectionCoordinator.persistActiveSelection(selection)
+        XCTAssertEqual(persistedSelection, selection)
+        try await AsyncTestWait.waitUntil("selected code structure selection is persisted", timeout: 5) {
+            window.workspaceManager.composeTab(with: tabID)?.selection == selection
+        }
         try await AsyncTestWait.waitUntil("selected code structure candidates are cataloged", timeout: 5) {
             let resolution = await store.resolveSelectedCodeStructureFiles(
                 atPaths: files.map(\.standardizedFullPath),

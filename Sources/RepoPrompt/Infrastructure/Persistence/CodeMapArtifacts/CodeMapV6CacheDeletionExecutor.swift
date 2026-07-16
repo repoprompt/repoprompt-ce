@@ -243,7 +243,9 @@ struct CodeMapV6CacheDeletionExecutor {
 
     private func acquireNonblockingExclusiveLock(_ descriptor: Int32) throws {
         while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
-            if errno == EINTR { continue }
+            if errno == EINTR {
+                continue
+            }
             if errno == EWOULDBLOCK || errno == EAGAIN {
                 throw ExecutorError.lockContention
             }
@@ -397,7 +399,9 @@ struct CodeMapV6CacheDeletionExecutor {
             CodeMapV6CacheDeletionPolicy.completionFileName,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
-        if descriptor < 0, errno == ENOENT { return .missing }
+        if descriptor < 0, errno == ENOENT {
+            return .missing
+        }
         guard descriptor >= 0 else { return .invalid }
         defer { Darwin.close(descriptor) }
         do {
@@ -476,7 +480,9 @@ struct CodeMapV6CacheDeletionExecutor {
         operation: CodeMapV6CacheDeletionSynchronizationOperation
     ) throws {
         while hooks.synchronize(descriptor, operation) != 0 {
-            if errno == EINTR { continue }
+            if errno == EINTR {
+                continue
+            }
             throw ExecutorError.retryable
         }
     }
@@ -494,7 +500,9 @@ struct CodeMapV6CacheDeletionExecutor {
                     off_t(offset)
                 )
             }
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR {
+                continue
+            }
             guard count > 0 else { throw ExecutorError.retryable }
             offset += count
         }
@@ -512,7 +520,9 @@ struct CodeMapV6CacheDeletionExecutor {
                     buffer.count - offset
                 )
             }
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR {
+                continue
+            }
             guard count > 0 else { throw ExecutorError.retryable }
             offset += count
         }

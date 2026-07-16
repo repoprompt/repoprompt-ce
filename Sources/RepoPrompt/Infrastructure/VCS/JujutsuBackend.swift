@@ -733,10 +733,14 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             // Name is before ":" if present, otherwise first whitespace token.
             if let colon = line.firstIndex(of: ":") {
                 let name = line[..<colon].trimmingCharacters(in: .whitespacesAndNewlines)
-                if !name.isEmpty { results.append(String(name)) }
+                if !name.isEmpty {
+                    results.append(String(name))
+                }
             } else {
                 let parts = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-                if let first = parts.first, !first.isEmpty { results.append(first) }
+                if let first = parts.first, !first.isEmpty {
+                    results.append(first)
+                }
             }
         }
         return Array(Set(results)).sorted()
@@ -784,7 +788,9 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         matches.reserveCapacity(4)
 
         for name in bookmarks.prefix(cap) {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
             let id = try? await getRefID(ref: name, at: repoURL)
             if id == atID {
                 matches.append(name)
@@ -1100,7 +1106,9 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         var capture = false
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
+            if trimmed.isEmpty {
+                continue
+            }
             if loweredMarkers.contains(trimmed.lowercased()) {
                 capture = true
                 continue
@@ -1117,7 +1125,9 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             (lower: f.path.lowercased(), original: f.path, file: f)
         }
         return keyed.sorted { a, b in
-            if a.lower != b.lower { return a.lower < b.lower }
+            if a.lower != b.lower {
+                return a.lower < b.lower
+            }
             return a.original < b.original
         }.map(\.file)
     }

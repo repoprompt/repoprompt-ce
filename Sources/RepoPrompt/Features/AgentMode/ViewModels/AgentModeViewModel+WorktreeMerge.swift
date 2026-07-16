@@ -101,14 +101,20 @@ enum WorktreeMergeSourceBindingResolver {
         let available = bindings.filter { !$0.worktreeRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !available.isEmpty else { throw ResolverError.noBindings }
         guard let repoRoot, !repoRoot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            if available.count == 1 { return available[0] }
+            if available.count == 1 {
+                return available[0]
+            }
             throw ResolverError.ambiguous(available.map(displayLabel(for:)))
         }
 
         let selector = repoRoot.trimmingCharacters(in: .whitespacesAndNewlines)
         let matchedBindings = available.filter { matchesBinding($0, selector: selector) }
-        if matchedBindings.count == 1 { return matchedBindings[0] }
-        if matchedBindings.count > 1 { throw ResolverError.ambiguous(matchedBindings.map(displayLabel(for:))) }
+        if matchedBindings.count == 1 {
+            return matchedBindings[0]
+        }
+        if matchedBindings.count > 1 {
+            throw ResolverError.ambiguous(matchedBindings.map(displayLabel(for:)))
+        }
         throw ResolverError.notFound(selector)
     }
 
@@ -493,7 +499,9 @@ extension AgentModeViewModel {
             return try worktreeMergeOperation(operationID: operationID, in: session)
         }
         let active = session.worktreeMergeOperations.filter { !$0.status.isTerminal }
-        if active.count == 1 { return active[0] }
+        if active.count == 1 {
+            return active[0]
+        }
         if active.isEmpty {
             throw MCPError.invalidParams("operation_id is required because this session has no active worktree merge operation.")
         }

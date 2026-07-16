@@ -345,7 +345,9 @@ private actor GitTargetEvidenceAsyncSignal {
     }
 
     func wait() async {
-        if signaled { return }
+        if signaled {
+            return
+        }
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
         }

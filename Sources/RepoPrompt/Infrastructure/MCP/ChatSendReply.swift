@@ -13,8 +13,12 @@ struct ChatSendReply: Codable {
             "chat_id": .string(shortId), // Only expose short ID
             "mode": .string(mode)
         ]
-        if let r = response { obj["response"] = .string(r) }
-        if let e = errors { obj["errors"] = .array(e.map { .string($0) }) }
+        if let r = response {
+            obj["response"] = .string(r)
+        }
+        if let e = errors {
+            obj["errors"] = .array(e.map { .string($0) })
+        }
 
         return .object(obj)
     }

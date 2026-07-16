@@ -287,7 +287,9 @@ import XCTest
             let interval: UInt64 = 5_000_000
             var waited: UInt64 = 0
             while waited < timeoutNanoseconds {
-                if await predicate(lane.snapshotForTesting()) { return true }
+                if await predicate(lane.snapshotForTesting()) {
+                    return true
+                }
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }
@@ -302,7 +304,9 @@ import XCTest
 
         func markStartedAndWaitForRelease() async {
             startedCount += 1
-            if released { return }
+            if released {
+                return
+            }
             await withCheckedContinuation { continuation in
                 releaseWaiters.append(continuation)
             }

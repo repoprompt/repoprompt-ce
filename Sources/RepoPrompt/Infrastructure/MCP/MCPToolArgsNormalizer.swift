@@ -159,7 +159,9 @@ enum MCPToolArgsNormalizer {
 
                 // Extract _rawJSON if present in nested payload
                 if let rawValue = nestedArgs["_rawJSON"] {
-                    if let b = parseBool(rawValue) { extractedRawJSON = b }
+                    if let b = parseBool(rawValue) {
+                        extractedRawJSON = b
+                    }
                     nestedArgs.removeValue(forKey: "_rawJSON")
                 }
 
@@ -201,7 +203,9 @@ enum MCPToolArgsNormalizer {
             }
 
             if let rawValue = raw["_rawJSON"] {
-                if let b = parseBool(rawValue) { extractedRawJSON = b }
+                if let b = parseBool(rawValue) {
+                    extractedRawJSON = b
+                }
                 raw.removeValue(forKey: "_rawJSON")
             }
 
@@ -364,7 +368,9 @@ enum MCPToolArgsNormalizer {
                 changed = true
                 break
             }
-            if !didOne { break outer }
+            if !didOne {
+                break outer
+            }
         }
 
         return (result, changed)

@@ -1027,7 +1027,13 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                 currentAuthority: fixture.authority
             )
         }
-        XCTAssertEqual(results.count(where: { if case .hit = $0 { true } else { false } }), 2)
+        XCTAssertEqual(results.count(where: {
+            if case .hit = $0 {
+                true
+            } else {
+                false
+            }
+        }), 2)
         XCTAssertEqual(results.count(where: { $0 == .miss }), 1)
 
         await XCTAssertThrowsManifestQuota {
@@ -2889,7 +2895,9 @@ private actor ManifestLockReplacementGate {
             replacementWaiters.removeAll()
             waiters.forEach { $0.resume() }
         }
-        if released { return }
+        if released {
+            return
+        }
         await withCheckedContinuation { continuation in
             if released {
                 continuation.resume()
@@ -2900,7 +2908,9 @@ private actor ManifestLockReplacementGate {
     }
 
     func waitUntilReplaced() async {
-        if replaced { return }
+        if replaced {
+            return
+        }
         await withCheckedContinuation { replacementWaiters.append($0) }
     }
 

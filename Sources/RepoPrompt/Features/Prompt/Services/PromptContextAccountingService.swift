@@ -259,7 +259,9 @@ actor PromptContextAccountingService {
         let orderedSlicePaths = selection.slices.keys.sorted {
             let lhs = StoredSelectionPathNormalization.standardizedPath($0) ?? $0
             let rhs = StoredSelectionPathNormalization.standardizedPath($1) ?? $1
-            if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
+            if lhs != rhs {
+                return lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
+            }
             return $0.utf8.lexicographicallyPrecedes($1.utf8)
         }
 
@@ -913,7 +915,9 @@ actor PromptContextAccountingService {
             location.absolutePath
         ]
         for key in candidateKeys {
-            if let ranges = slices[key] { return ranges }
+            if let ranges = slices[key] {
+                return ranges
+            }
         }
         return nil
     }

@@ -127,13 +127,27 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
             "contract=\(contractKind.rawValue)",
             "elapsed_ms=\(String(format: "%.3f", elapsedMilliseconds))"
         ]
-        if let runID { fields.append("run_id=\(runID.uuidString)") }
-        if let executionDeadlineSeconds { fields.append("deadline_s=\(executionDeadlineSeconds)") }
-        if let cleanupGraceSeconds { fields.append("grace_s=\(cleanupGraceSeconds)") }
-        if let cancellationRequested { fields.append("cancellation_requested=\(cancellationRequested)") }
-        if let cancellationOutcome { fields.append("cancellation_outcome=\(cancellationOutcome)") }
-        if let graceOutcome { fields.append("grace_outcome=\(graceOutcome)") }
-        if let escalationReason { fields.append("escalation_reason=\(escalationReason)") }
+        if let runID {
+            fields.append("run_id=\(runID.uuidString)")
+        }
+        if let executionDeadlineSeconds {
+            fields.append("deadline_s=\(executionDeadlineSeconds)")
+        }
+        if let cleanupGraceSeconds {
+            fields.append("grace_s=\(cleanupGraceSeconds)")
+        }
+        if let cancellationRequested {
+            fields.append("cancellation_requested=\(cancellationRequested)")
+        }
+        if let cancellationOutcome {
+            fields.append("cancellation_outcome=\(cancellationOutcome)")
+        }
+        if let graceOutcome {
+            fields.append("grace_outcome=\(graceOutcome)")
+        }
+        if let escalationReason {
+            fields.append("escalation_reason=\(escalationReason)")
+        }
         if let handlerPhase {
             fields.append("handler_phase=\(handlerPhase.phase.rawValue)")
             fields.append("handler_phase_transition=\(handlerPhase.transition.rawValue)")

@@ -80,10 +80,16 @@ extension FileSystemService {
         var isDirectory = ObjCBool(false)
         guard fm.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), !isDirectory.boolValue else { return false }
         if let values = try? URL(fileURLWithPath: standardizedAbsolutePath).resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-            if values.isSymbolicLink == true { return false }
-            if values.isRegularFile == false { return false }
+            if values.isSymbolicLink == true {
+                return false
+            }
+            if values.isRegularFile == false {
+                return false
+            }
         }
-        if skipSymlinks, pathContainsSymlinkComponent(relativePath: relativePath) { return false }
+        if skipSymlinks, pathContainsSymlinkComponent(relativePath: relativePath) {
+            return false
+        }
         outcome = "current"
         return true
     }
@@ -102,7 +108,9 @@ extension FileSystemService {
 
         var isDirectory = ObjCBool(false)
         guard fm.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), isDirectory.boolValue else { return false }
-        if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) { return false }
+        if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) {
+            return false
+        }
         let canonicalPath = URL(fileURLWithPath: standardizedAbsolutePath).resolvingSymlinksInPath().path
         let canonicalPrefix = canonicalRootPath.hasSuffix("/") ? canonicalRootPath : canonicalRootPath + "/"
         guard canonicalPath == canonicalRootPath || canonicalPath.hasPrefix(canonicalPrefix) else { return false }
@@ -129,8 +137,12 @@ extension FileSystemService {
         }
         let url = URL(fileURLWithPath: standardizedAbsolutePath)
         if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-            if values.isSymbolicLink == true { return .ineligible(.symbolicLink) }
-            if values.isRegularFile == false { return .ineligible(.nonRegularFile) }
+            if values.isSymbolicLink == true {
+                return .ineligible(.symbolicLink)
+            }
+            if values.isRegularFile == false {
+                return .ineligible(.nonRegularFile)
+            }
         }
         if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) {
             return .ineligible(.symlinkComponent)
@@ -439,7 +451,9 @@ extension FileSystemService {
 
     nonisolated static func deepCopyEventPath(_ source: CFString) -> String? {
         let length = CFStringGetLength(source)
-        if length == 0 { return "" }
+        if length == 0 {
+            return ""
+        }
 
         let utf8Encoding = CFStringBuiltInEncodings.UTF8.rawValue
         if let directUTF8 = CFStringGetCStringPtr(source, utf8Encoding) {
@@ -522,9 +536,15 @@ extension FileSystemService {
         guard count > 0 else { return }
 
         // Although these are non-optional in the API, guard against unexpected null pointers defensively
-        if Int(bitPattern: eventPaths) == 0 { return }
-        if Int(bitPattern: eventFlags) == 0 { return }
-        if Int(bitPattern: eventIds) == 0 { return }
+        if Int(bitPattern: eventPaths) == 0 {
+            return
+        }
+        if Int(bitPattern: eventFlags) == 0 {
+            return
+        }
+        if Int(bitPattern: eventIds) == 0 {
+            return
+        }
 
         guard let payload = buildOwnedFSEventPayload(
             numEvents: count,
@@ -862,7 +882,9 @@ extension FileSystemService {
             var parts: [String] = []
 
             func check(_ flag: Int, _ name: String) {
-                if (raw & UInt32(flag)) != 0 { parts.append(name) }
+                if (raw & UInt32(flag)) != 0 {
+                    parts.append(name)
+                }
             }
 
             check(kFSEventStreamEventFlagItemCreated, "Created")
@@ -969,7 +991,9 @@ extension FileSystemService {
         }
 
         // Vim-style hidden swap: .filename.swp
-        if name.hasPrefix("."), name.contains(".sw") { return true }
+        if name.hasPrefix("."), name.contains(".sw") {
+            return true
+        }
 
         return false
     }
@@ -1246,7 +1270,9 @@ extension FileSystemService {
                 // Renamed events sometimes arrive WITHOUT Created/Removed (Finder trash moves, cross-dir moves, etc.)
                 if !created, !removed {
                     // Ignore temp-save churn
-                    if isTempFile { continue }
+                    if isTempFile {
+                        continue
+                    }
 
                     let fullPath = fullPath(forRelativePath: relPath)
                     var isDirFlag: ObjCBool = false
@@ -1268,7 +1294,9 @@ extension FileSystemService {
                             immediateModifications.append(diskIsDir ? .folderAdded(relPath) : .fileAdded(relPath))
                             visitedPaths.insert(relPath)
                             visitedItems[relPath] = diskIsDir
-                            if diskIsDir { trackFolder(relPath, eventId: eventId) }
+                            if diskIsDir {
+                                trackFolder(relPath, eventId: eventId)
+                            }
                         }
                     } else if isKnown {
                         // Path no longer exists here => removal from watched root

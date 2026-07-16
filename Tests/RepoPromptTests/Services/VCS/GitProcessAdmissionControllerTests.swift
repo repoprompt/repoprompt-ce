@@ -248,7 +248,9 @@ final class GitProcessAdmissionControllerTests: XCTestCase {
         _ predicate: @escaping () async -> Bool
     ) async throws {
         for _ in 0 ..< 10000 {
-            if await predicate() { return }
+            if await predicate() {
+                return
+            }
             await Task.yield()
         }
         XCTFail("Timed out waiting for Git admission state")

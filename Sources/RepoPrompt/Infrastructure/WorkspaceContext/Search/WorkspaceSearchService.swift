@@ -469,7 +469,9 @@ actor WorkspaceSearchService {
         var candidateBatches: [[WorkspaceSearchRootPathIndex.Candidate]] = []
         candidateBatches.reserveCapacity(rootPathIndexes.count)
         for index in rootPathIndexes {
-            if Task.isCancelled { return [] }
+            if Task.isCancelled {
+                return []
+            }
             await candidateBatches.append(index.searchVerifyingShadow(query, limit: limit))
         }
         var heap: [RankedCandidateCursor] = []
@@ -495,7 +497,9 @@ actor WorkspaceSearchService {
 
         func pop() -> RankedCandidateCursor? {
             guard !heap.isEmpty else { return nil }
-            if heap.count == 1 { return heap.removeLast() }
+            if heap.count == 1 {
+                return heap.removeLast()
+            }
             let first = heap[0]
             heap[0] = heap.removeLast()
             var index = 0
@@ -519,7 +523,9 @@ actor WorkspaceSearchService {
         var results: [WorkspaceSearchCatalogEntry] = []
         results.reserveCapacity(limit)
         while results.count < limit, let cursor = pop() {
-            if Task.isCancelled { return [] }
+            if Task.isCancelled {
+                return []
+            }
             let candidate = candidateBatches[cursor.rootIndex][cursor.candidateIndex]
             if seenIDs.insert(candidate.entry.id).inserted {
                 results.append(candidate.entry)
@@ -559,7 +565,9 @@ actor WorkspaceSearchService {
 
         func pop() -> EntryCursor? {
             guard !heap.isEmpty else { return nil }
-            if heap.count == 1 { return heap.removeLast() }
+            if heap.count == 1 {
+                return heap.removeLast()
+            }
             let first = heap[0]
             heap[0] = heap.removeLast()
             var index = 0
@@ -595,7 +603,9 @@ actor WorkspaceSearchService {
         _ lhs: WorkspaceSearchRootPathIndex.Candidate,
         _ rhs: WorkspaceSearchRootPathIndex.Candidate
     ) -> Bool {
-        if lhs.score != rhs.score { return lhs.score > rhs.score }
+        if lhs.score != rhs.score {
+            return lhs.score > rhs.score
+        }
         switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
         case .orderedAscending:
             return true

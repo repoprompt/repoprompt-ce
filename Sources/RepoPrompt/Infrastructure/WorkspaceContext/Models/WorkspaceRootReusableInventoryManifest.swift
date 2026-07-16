@@ -1062,9 +1062,11 @@ private enum WorkspaceRootReusableInventoryManifestCodec {
                 guard let base = buffer.baseAddress else { return -1 }
                 return Darwin.read(descriptor, base.advanced(by: offset), count - offset)
             }
-            if amount > 0 { offset += amount }
-            else if amount == 0 { throw WorkspaceRootReusableInventoryManifestError.corrupt("truncated file") }
-            else if errno != EINTR {
+            if amount > 0 {
+                offset += amount
+            } else if amount == 0 {
+                throw WorkspaceRootReusableInventoryManifestError.corrupt("truncated file")
+            } else if errno != EINTR {
                 throw WorkspaceRootReusableInventoryManifestError.io(operation: "read", code: errno)
             }
         }
@@ -1075,8 +1077,12 @@ private enum WorkspaceRootReusableInventoryManifestCodec {
         var byte: UInt8 = 0
         while true {
             let count = Darwin.read(descriptor, &byte, 1)
-            if count == 0 { return }
-            if count > 0 { throw WorkspaceRootReusableInventoryManifestError.corrupt("trailing bytes") }
+            if count == 0 {
+                return
+            }
+            if count > 0 {
+                throw WorkspaceRootReusableInventoryManifestError.corrupt("trailing bytes")
+            }
             guard errno == EINTR else {
                 throw WorkspaceRootReusableInventoryManifestError.io(operation: "trailing-read", code: errno)
             }
@@ -1104,7 +1110,9 @@ private enum WorkspaceRootReusableInventoryManifestCodec {
     }
 
     static func compare(_ lhs: Data, _ rhs: Data) -> SpillBackedSortedArtifactOrdering {
-        if lhs == rhs { return .same }
+        if lhs == rhs {
+            return .same
+        }
         return lhs.lexicographicallyPrecedes(rhs) ? .ascending : .descending
     }
 

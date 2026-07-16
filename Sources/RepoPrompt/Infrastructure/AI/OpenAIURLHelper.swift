@@ -39,7 +39,9 @@ enum OpenAIURLHelper {
             }
         }
 
-        if path.hasSuffix("/"), path != "/" { path.removeLast() }
+        if path.hasSuffix("/"), path != "/" {
+            path.removeLast()
+        }
         comps.path = path
         // Rebuild a string without the trailing /vN if any
         let baseStr = comps.string ?? s

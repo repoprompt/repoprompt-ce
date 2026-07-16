@@ -284,7 +284,9 @@ final class AgentSkillCatalog {
             }
 
             for root in orderedRoots {
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    break
+                }
                 guard let rootDirectoryKey = Self.canonicalExistingDirectoryKey(for: root.url, fileManager: fileManager) else {
                     continue
                 }
@@ -300,7 +302,9 @@ final class AgentSkillCatalog {
                     rootDirectoryKey: rootDirectoryKey,
                     fileManager: fileManager
                 ) {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled {
+                        break
+                    }
                     guard seenDefinitionFileKeys.insert(scanned.definitionFileKey).inserted else {
                         continue
                     }
@@ -488,7 +492,9 @@ final class AgentSkillCatalog {
         var definitions: [ScannedSkillDefinition] = []
 
         func walk(_ directoryURL: URL) {
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
             let contents = (try? fileManager.contentsOfDirectory(
                 at: directoryURL,
                 includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey],
@@ -506,7 +512,9 @@ final class AgentSkillCatalog {
                 $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
             }
             for rawEntryURL in sortedContents {
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    return
+                }
                 // Preserve the user-visible traversal path even when `directoryURL` is a symlink
                 // and Foundation reports children using the resolved target path.
                 let entryURL = directoryURL.appendingPathComponent(rawEntryURL.lastPathComponent)
@@ -561,7 +569,9 @@ final class AgentSkillCatalog {
             $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
         }
         for rawFileURL in sortedContents {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
             let fileURL = directory.appendingPathComponent(rawFileURL.lastPathComponent)
             // Only accept .md files
             guard fileURL.pathExtension.caseInsensitiveCompare("md") == .orderedSame else { continue }

@@ -1216,7 +1216,9 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
             XCTAssertEqual(after.counters.buildsStarted, before.counters.buildsStarted + 1, label)
             let snapshots = await recorder.snapshots
             let projectedEntryCount = snapshots.reduce(into: 0) { count, snapshot in
-                if case let .segment(segment) = snapshot { count += segment.entries.count }
+                if case let .segment(segment) = snapshot {
+                    count += segment.entries.count
+                }
             }
             XCTAssertEqual(projectedEntryCount, 2, label)
             await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
@@ -1398,7 +1400,9 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
 
         let snapshots = await recorder.snapshots
         let entries = snapshots.flatMap { snapshot -> [WorkspaceCodemapProjectionEntry] in
-            if case let .segment(segment) = snapshot { return segment.entries }
+            if case let .segment(segment) = snapshot {
+                return segment.entries
+            }
             return []
         }
         let outcomes = Dictionary(uniqueKeysWithValues: entries.map {

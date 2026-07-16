@@ -220,7 +220,9 @@ enum HistoryMCPToolService {
         let budgetOrder = window.sorted { lhs, rhs in
             let lhsDist = abs(lhs.offset - targetTurnIndex)
             let rhsDist = abs(rhs.offset - targetTurnIndex)
-            if lhsDist != rhsDist { return lhsDist < rhsDist }
+            if lhsDist != rhsDist {
+                return lhsDist < rhsDist
+            }
             return lhs.offset < rhs.offset
         }
 
@@ -235,12 +237,16 @@ enum HistoryMCPToolService {
                 roles: roles,
                 remainingChars: &remainingChars
             )
-            if rendered.truncated { replyTruncated = true }
+            if rendered.truncated {
+                replyTruncated = true
+            }
             renderedTurnsByIndex[turnIndex] = rendered.dto
         }
 
         let turnDTOs = window.compactMap { renderedTurnsByIndex[$0.offset] }
-        if turnDTOs.count < window.count { replyTruncated = true }
+        if turnDTOs.count < window.count {
+            replyTruncated = true
+        }
         let returnedTurnStart = turnDTOs.map(\.turnIndex).min() ?? requestedRange.lowerBound
         let returnedTurnEnd = turnDTOs.map(\.turnIndex).max() ?? requestedRange.lowerBound
 
@@ -699,8 +705,12 @@ enum HistoryMCPToolService {
 
             for turn in transcript.turns {
                 let start = turn.startedAt
-                if let dateFrom, start < dateFrom { continue }
-                if let dateTo, start > dateTo { continue }
+                if let dateFrom, start < dateFrom {
+                    continue
+                }
+                if let dateTo, start > dateTo {
+                    continue
+                }
                 let end = turn.completedAt ?? turn.lastActivityAt ?? start
                 guard end >= start else { continue }
 
@@ -759,7 +769,9 @@ enum HistoryMCPToolService {
                         turnCount: dt[sid] ?? 0
                     )
                 }
-            } else { details = nil }
+            } else {
+                details = nil
+            }
             return HistoryTimeReply.GroupDTO(
                 key: key,
                 sessions: groupSessionIDs[key]?.count ?? 0,
@@ -867,10 +879,14 @@ enum HistoryMCPToolService {
         var grouped: [String: [HistoryFilteredSessionRecord]] = [:]
         for session in sessions {
             let key = keyProvider(session)
-            if grouped[key] == nil { orderedKeys.append(key) }
+            if grouped[key] == nil {
+                orderedKeys.append(key)
+            }
             grouped[key, default: []].append(session)
         }
-        if let sortKeys { sortKeys(&orderedKeys) }
+        if let sortKeys {
+            sortKeys(&orderedKeys)
+        }
 
         return orderedKeys.map { key in
             let sessionsInGroup = grouped[key]!
@@ -1092,7 +1108,9 @@ enum HistoryMCPToolService {
         for activity in activities {
             guard let tool = activity.toolExecution else { continue }
             let key = "\(tool.toolName ?? "unknown") \(tool.status.rawValue)"
-            if counts[key] == nil { order.append(key) }
+            if counts[key] == nil {
+                order.append(key)
+            }
             counts[key, default: 0] += 1
         }
         guard !order.isEmpty else { return nil }
@@ -1121,7 +1139,9 @@ enum HistoryMCPToolService {
     private static func clipHistoryText(_ text: String, maxChars: Int) -> (text: String, truncated: Bool) {
         guard maxChars > 0 else { return ("", true) }
         guard text.count > maxChars else { return (text, false) }
-        if maxChars == 1 { return ("…", true) }
+        if maxChars == 1 {
+            return ("…", true)
+        }
         return (String(text.prefix(maxChars - 1)) + "…", true)
     }
 
@@ -1226,7 +1246,9 @@ enum HistoryMCPToolService {
                 nil
             }
             guard let reason else { continue }
-            if counts[reason] == nil { order.append(reason) }
+            if counts[reason] == nil {
+                order.append(reason)
+            }
             counts[reason, default: 0] += 1
         }
         return order.prefix(10).map { reason in

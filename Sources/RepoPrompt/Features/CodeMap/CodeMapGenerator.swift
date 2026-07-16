@@ -91,34 +91,54 @@ struct CodeMapGenerator {
         switch category {
         case .swiftStrategy:
             perfStats.captureLoopSwiftStrategyDuration += duration
-            if collectCounters { perfStats.captureLoopSwiftStrategyCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopSwiftStrategyCount += 1
+            }
         case .tsStrategy:
             perfStats.captureLoopTSStrategyDuration += duration
-            if collectCounters { perfStats.captureLoopTSStrategyCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopTSStrategyCount += 1
+            }
         case .interfaceHeuristic:
             perfStats.captureLoopInterfaceHeuristicDuration += duration
-            if collectCounters { perfStats.captureLoopInterfaceHeuristicCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopInterfaceHeuristicCount += 1
+            }
         case .importExport:
             perfStats.captureLoopImportExportDuration += duration
-            if collectCounters { perfStats.captureLoopImportExportCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopImportExportCount += 1
+            }
         case .typeAlias:
             perfStats.captureLoopTypeAliasDuration += duration
-            if collectCounters { perfStats.captureLoopTypeAliasCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopTypeAliasCount += 1
+            }
         case .enumMacro:
             perfStats.captureLoopEnumMacroDuration += duration
-            if collectCounters { perfStats.captureLoopEnumMacroCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopEnumMacroCount += 1
+            }
         case .function:
             perfStats.captureLoopFunctionDuration += duration
-            if collectCounters { perfStats.captureLoopFunctionCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopFunctionCount += 1
+            }
         case .variable:
             perfStats.captureLoopVariableDuration += duration
-            if collectCounters { perfStats.captureLoopVariableCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopVariableCount += 1
+            }
         case .skipped:
             perfStats.captureLoopSkippedDuration += duration
-            if collectCounters { perfStats.captureLoopSkippedCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopSkippedCount += 1
+            }
         case .unclassified:
             perfStats.captureLoopUnclassifiedDuration += duration
-            if collectCounters { perfStats.captureLoopUnclassifiedCount += 1 }
+            if collectCounters {
+                perfStats.captureLoopUnclassifiedCount += 1
+            }
         }
     }
 
@@ -144,31 +164,49 @@ struct CodeMapGenerator {
         switch category {
         case .declaration:
             perfStats.fallbackFunctionDeclarationDuration += duration
-            if collectCounters { perfStats.fallbackFunctionDeclarationCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionDeclarationCount += 1
+            }
         case .jstsSignature:
             perfStats.fallbackFunctionJSTSSignatureDuration += duration
-            if collectCounters { perfStats.fallbackFunctionJSTSSignatureCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionJSTSSignatureCount += 1
+            }
         case .nameExtraction:
             perfStats.fallbackFunctionNameExtractionDuration += duration
-            if collectCounters { perfStats.fallbackFunctionNameExtractionCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionNameExtractionCount += 1
+            }
         case .lteParse:
             perfStats.fallbackFunctionLTEParseDuration += duration
-            if collectCounters { perfStats.fallbackFunctionLTEParseCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionLTEParseCount += 1
+            }
         case .tsFastPath:
             perfStats.fallbackFunctionTSFastPathDuration += duration
-            if collectCounters { perfStats.fallbackFunctionTSFastPathCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionTSFastPathCount += 1
+            }
         case .referencedTypes:
             perfStats.fallbackFunctionReferencedTypesDuration += duration
-            if collectCounters { perfStats.fallbackFunctionReferencedTypesCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionReferencedTypesCount += 1
+            }
         case .routing:
             perfStats.fallbackFunctionRoutingDuration += duration
-            if collectCounters { perfStats.fallbackFunctionRoutingCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionRoutingCount += 1
+            }
         case .modelInsertion:
             perfStats.fallbackFunctionModelInsertionDuration += duration
-            if collectCounters { perfStats.fallbackFunctionModelInsertionCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionModelInsertionCount += 1
+            }
         case .skipped:
             perfStats.fallbackFunctionSkippedDuration += duration
-            if collectCounters { perfStats.fallbackFunctionSkippedCount += 1 }
+            if collectCounters {
+                perfStats.fallbackFunctionSkippedCount += 1
+            }
         }
     }
 
@@ -207,7 +245,9 @@ struct CodeMapGenerator {
 
         mutating func range(for location: Int) -> NSRange {
             let idx = lineIndex(for: location)
-            if let cached = rangeCache[idx] { return cached }
+            if let cached = rangeCache[idx] {
+                return cached
+            }
             let start = boundaries[idx]
             let end = (idx + 1 < boundaries.count) ? boundaries[idx + 1] : contentLength
             let range = NSRange(location: start, length: end - start)
@@ -217,7 +257,9 @@ struct CodeMapGenerator {
 
         mutating func range(covering range: NSRange) -> NSRange {
             let key = RangeCacheKey(range)
-            if let cached = coveringRangeCache[key] { return cached }
+            if let cached = coveringRangeCache[key] {
+                return cached
+            }
             let startIdx = lineIndex(for: range.location)
             let endLocation = max(range.location, NSMaxRange(range) - 1)
             let endIdx = lineIndex(for: endLocation)
@@ -230,7 +272,9 @@ struct CodeMapGenerator {
 
         mutating func line(for location: Int) -> String {
             let idx = lineIndex(for: location)
-            if let cached = lineCache[idx] { return cached }
+            if let cached = lineCache[idx] {
+                return cached
+            }
             let line = nsContent.substring(with: range(for: location))
             lineCache[idx] = line
             return line
@@ -238,7 +282,9 @@ struct CodeMapGenerator {
 
         mutating func line(covering range: NSRange) -> String {
             let key = RangeCacheKey(range)
-            if let cached = coveringLineCache[key] { return cached }
+            if let cached = coveringLineCache[key] {
+                return cached
+            }
             let line = nsContent.substring(with: self.range(covering: range))
             coveringLineCache[key] = line
             return line
@@ -246,7 +292,9 @@ struct CodeMapGenerator {
 
         mutating func trimmedLine(for location: Int) -> String {
             let idx = lineIndex(for: location)
-            if let cached = trimmedCache[idx] { return cached }
+            if let cached = trimmedCache[idx] {
+                return cached
+            }
             let trimmed = line(for: location).trimmingCharacters(in: .whitespacesAndNewlines)
             trimmedCache[idx] = trimmed
             return trimmed
@@ -254,7 +302,9 @@ struct CodeMapGenerator {
 
         mutating func trimmedLine(covering range: NSRange) -> String {
             let key = RangeCacheKey(range)
-            if let cached = coveringTrimmedCache[key] { return cached }
+            if let cached = coveringTrimmedCache[key] {
+                return cached
+            }
             let trimmed = line(covering: range).trimmingCharacters(in: .whitespacesAndNewlines)
             coveringTrimmedCache[key] = trimmed
             return trimmed
@@ -473,7 +523,9 @@ struct CodeMapGenerator {
             }
         }
         let pythonEnumDeclsByRange = pythonEnumDecls.sorted { lhs, rhs in
-            if lhs.range.location != rhs.range.location { return lhs.range.location < rhs.range.location }
+            if lhs.range.location != rhs.range.location {
+                return lhs.range.location < rhs.range.location
+            }
             return lhs.range.length < rhs.range.length
         }
         func pythonEnumName(containing range: NSRange) -> String? {
@@ -550,7 +602,9 @@ struct CodeMapGenerator {
             for decl in captureIndex.captures(named: "rust.impl.decl") {
                 guard let nameCap = captureIndex.firstCapture(named: "rust.impl.type", containedIn: decl.range) else { continue }
                 let targetName = substring(content: content, range: nameCap.range)
-                if targetName.isEmpty { continue }
+                if targetName.isEmpty {
+                    continue
+                }
                 let ln = lineNumber(for: decl.range.location, using: boundaries)
                 rustImplBoundaries.append(.init(range: decl.range, targetTypeName: targetName, startLine: ln))
             }
@@ -562,17 +616,23 @@ struct CodeMapGenerator {
         let classBoundariesByRange = classBoundaries.filter { $0.range != nil }.sorted { lhs, rhs in
             let lhsRange = lhs.range!
             let rhsRange = rhs.range!
-            if lhsRange.location != rhsRange.location { return lhsRange.location < rhsRange.location }
+            if lhsRange.location != rhsRange.location {
+                return lhsRange.location < rhsRange.location
+            }
             return lhsRange.length < rhsRange.length
         }
         let interfaceBoundaryListByRange = interfaceBoundaryList.filter { $0.range != nil }.sorted { lhs, rhs in
             let lhsRange = lhs.range!
             let rhsRange = rhs.range!
-            if lhsRange.location != rhsRange.location { return lhsRange.location < rhsRange.location }
+            if lhsRange.location != rhsRange.location {
+                return lhsRange.location < rhsRange.location
+            }
             return lhsRange.length < rhsRange.length
         }
         let rustImplBoundariesByRange = rustImplBoundaries.sorted { lhs, rhs in
-            if lhs.range.location != rhs.range.location { return lhs.range.location < rhs.range.location }
+            if lhs.range.location != rhs.range.location {
+                return lhs.range.location < rhs.range.location
+            }
             return lhs.range.length < rhs.range.length
         }
 
@@ -664,7 +724,9 @@ struct CodeMapGenerator {
 
         func simpleIdentifier(from text: String) -> String? {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { return nil }
+            if trimmed.isEmpty {
+                return nil
+            }
             return Self.firstRegexGroup(RegexCache.simpleIdentifier, in: trimmed)
         }
 
@@ -1207,7 +1269,9 @@ struct CodeMapGenerator {
                         lightweightMatch = nil
                     }
                     if let match = lightweightMatch {
-                        if let n = match["name"], !n.isEmpty { fnName = n }
+                        if let n = match["name"], !n.isEmpty {
+                            fnName = n
+                        }
                         if let rt = match["returnType"], !rt.isEmpty {
                             returnType = rt
                             let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -1362,7 +1426,9 @@ struct CodeMapGenerator {
                 let heavyweightMatch = extractionMemo.matchFunctionLine(decl, language: supportedLanguage, stats: activePerfStats)
                 recordFallbackFunctionAttribution(.lteParse, since: lteParseStart)
                 if let match = heavyweightMatch {
-                    if let n = match["name"], !n.isEmpty { fnName = n }
+                    if let n = match["name"], !n.isEmpty {
+                        fnName = n
+                    }
                     if let rt = match["returnType"], !rt.isEmpty {
                         returnType = rt
                         let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -1590,7 +1656,9 @@ struct CodeMapGenerator {
                 // Use rawLine for indent detection
                 let indent = rawLine.prefix { $0.isWhitespace }.count
                 if supportedLanguage == .ts, indent > 0 { // interface / type-literal
-                    if debugLogging { print("   ⏭️  Skipped interface member") }
+                    if debugLogging {
+                        print("   ⏭️  Skipped interface member")
+                    }
                     recordCaptureAttribution(.variable, since: attributionStart)
                     continue
                 }
@@ -1630,7 +1698,9 @@ struct CodeMapGenerator {
                 if supportedLanguage == .ts, trimmedLine.contains("="),
                    trimmedLine.hasSuffix(";"), !trimmedLine.contains(":")
                 {
-                    if debugLogging { print("   ⏭️  Skipped type-alias masquerading as variable") }
+                    if debugLogging {
+                        print("   ⏭️  Skipped type-alias masquerading as variable")
+                    }
                     recordCaptureAttribution(.variable, since: attributionStart)
                     continue
                 }
@@ -2173,7 +2243,9 @@ struct CodeMapGenerator {
             let nextLineRange = nsContent.lineRange(for: NSRange(location: nextLocation, length: 0))
             let nextLine = nsContent.substring(with: nextLineRange)
             let trimmedNext = nextLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmedNext.isEmpty || (trimmedNext.first == terminator) { break }
+            if trimmedNext.isEmpty || (trimmedNext.first == terminator) {
+                break
+            }
             if trimmedNext.first == ":", declaration.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(")") {
                 break
             }
@@ -2229,7 +2301,9 @@ struct CodeMapGenerator {
             let trimmedDecl = declaration.trimmingCharacters(in: .whitespacesAndNewlines)
             switch context {
             case .functionLike:
-                if isJSTSFunctionSignatureComplete(trimmedDecl) { return trimmedDecl }
+                if isJSTSFunctionSignatureComplete(trimmedDecl) {
+                    return trimmedDecl
+                }
             case .statementLike:
                 break
             }
@@ -2237,12 +2311,16 @@ struct CodeMapGenerator {
             let nextLineRange = nsContent.lineRange(for: NSRange(location: nextLocation, length: 0))
             let nextLine = nsContent.substring(with: nextLineRange)
             let trimmedNext = nextLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmedNext.isEmpty { break }
+            if trimmedNext.isEmpty {
+                break
+            }
             let nextIndent = nextLine.prefix(while: { $0.isWhitespace }).count
 
             if context == .statementLike {
                 let needsBraceContinuation = jstsNeedsBraceContinuation(trimmedDecl)
-                if nextIndent <= baseIndent, !needsBraceContinuation { break }
+                if nextIndent <= baseIndent, !needsBraceContinuation {
+                    break
+                }
             }
 
             declaration += "\n" + trimmedNext
@@ -2296,7 +2374,9 @@ struct CodeMapGenerator {
 
     private static func jstsNeedsBraceContinuation(_ declaration: String) -> Bool {
         let trimmed = declaration.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return false }
+        if trimmed.isEmpty {
+            return false
+        }
         return jstsTopLevelBraceDepth(in: Substring(trimmed)) > 0
     }
 
@@ -2352,7 +2432,9 @@ struct CodeMapGenerator {
             case "[": bracketDepth += 1
             case "]": bracketDepth = max(0, bracketDepth - 1)
             case "{":
-                if angleDepth == 0, parenDepth == 0, bracketDepth == 0 { braceDepth += 1 }
+                if angleDepth == 0, parenDepth == 0, bracketDepth == 0 {
+                    braceDepth += 1
+                }
             case "}":
                 if angleDepth == 0, parenDepth == 0, bracketDepth == 0, braceDepth > 0 {
                     braceDepth -= 1
@@ -2373,7 +2455,9 @@ struct CodeMapGenerator {
                 count += 1
             } else if ch == ")" {
                 count -= 1
-                if count == 0 { return index }
+                if count == 0 {
+                    return index
+                }
             }
             index = string.index(after: index)
         }

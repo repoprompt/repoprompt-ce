@@ -100,7 +100,9 @@ extension FileSystemService {
             for url in children {
                 let name = url.lastPathComponent
                 guard name != ".", name != ".." else { continue }
-                if Self.isRepoPromptTempFilename(name) { continue }
+                if Self.isRepoPromptTempFilename(name) {
+                    continue
+                }
                 switch name {
                 case ".gitignore": hasGitignore = true
                 case ".repo_ignore": hasRepoIgnore = true

@@ -489,6 +489,46 @@ final class ClaudeAgentModeCoordinator {
         controllerRetirementGenerationByTabID.removeValue(forKey: session.tabID)
     }
 
+    @discardableResult
+    func shutdownIdleClaudeControllerIfCurrent(
+        _ session: AgentModeViewModel.TabSession,
+        completedRunID: UUID?,
+        retainedController: any NativeAgentRuntimeControlling
+    ) async -> Bool {
+        guard session.selectedAgent.usesClaudeNativeRuntime,
+              session.runID == completedRunID,
+              session.runState == .completed,
+              sessionOwnsClaudeController(retainedController, for: session),
+              !hasPendingResumeTransfer(for: session)
+        else {
+            return false
+        }
+        guard let detached = detachClaudeController(
+            retainedController,
+            from: session,
+            removeToolTracking: true
+        ) else {
+            return false
+        }
+        let retirementTask = Task { @MainActor in
+            await retireClaudeController(
+                detached,
+                for: session,
+                captureProviderSessionID: true
+            )
+        }
+        guard await retirementTask.value else {
+            return false
+        }
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+        session.pendingSupersedingTurnCompletions = 0
+        session.claudeSupersedingProtectedTurnIDs.removeAll()
+        session.claudeExpectedTurnIDs.removeAll()
+        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+        session.setRunningStatus(nil, source: nil)
+        return true
+    }
+
     #if DEBUG
         func test_discardRuntimeState(for session: AgentModeViewModel.TabSession) {
             session.claudeController = nil

@@ -139,7 +139,9 @@ enum ToolSchemaIntrospector {
 
         // Sort with required parameters first, then alphabetically
         parameters.sort { a, b in
-            if a.required != b.required { return a.required }
+            if a.required != b.required {
+                return a.required
+            }
             return a.name < b.name
         }
 

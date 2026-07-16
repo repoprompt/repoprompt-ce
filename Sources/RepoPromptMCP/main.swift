@@ -128,11 +128,21 @@ struct CLIHostDisconnectProvenance: Equatable, CustomStringConvertible {
 
     var description: String {
         var fields = ["reason=\(reason.rawValue)"]
-        if let errno { fields.append("errno=\(errno)") }
-        if let bytesWritten { fields.append("bytes_written=\(bytesWritten)") }
-        if let totalBytes { fields.append("total_bytes=\(totalBytes)") }
-        if let initialParentPID { fields.append("initial_parent_pid=\(initialParentPID)") }
-        if let currentParentPID { fields.append("current_parent_pid=\(currentParentPID)") }
+        if let errno {
+            fields.append("errno=\(errno)")
+        }
+        if let bytesWritten {
+            fields.append("bytes_written=\(bytesWritten)")
+        }
+        if let totalBytes {
+            fields.append("total_bytes=\(totalBytes)")
+        }
+        if let initialParentPID {
+            fields.append("initial_parent_pid=\(initialParentPID)")
+        }
+        if let currentParentPID {
+            fields.append("current_parent_pid=\(currentParentPID)")
+        }
         return fields.joined(separator: " ")
     }
 }
@@ -1020,7 +1030,9 @@ actor BootstrapSocketProxy {
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.pollFailed(errno: errno)
             }
 
@@ -1175,10 +1187,14 @@ extension BootstrapSocketProxy {
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.pollFailed(errno: errno)
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
                 throw SocketProxyError.connectionReset
@@ -1189,7 +1205,9 @@ extension BootstrapSocketProxy {
                 Darwin.read(socketFD, ptr, 1)
             }
             if bytesRead < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
+                if errno == EAGAIN || errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.readFailed(errno: errno)
             }
             if bytesRead == 0 {
@@ -1418,7 +1436,9 @@ extension BootstrapSocketProxy {
                 try validateCLIHostInputPollResult(pollResult, errno: errno)
                 continue
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             let revents = Int32(pfd.revents)
             if revents & (POLLERR | POLLNVAL) != 0 {
@@ -1695,7 +1715,9 @@ extension BootstrapSocketProxy {
                 let pollResult = poll(&pfd, 1, 1000)
 
                 if pollResult < 0 {
-                    if errno == EINTR { continue }
+                    if errno == EINTR {
+                        continue
+                    }
                     throw SocketProxyError.pollFailed(errno: errno)
                 }
                 readiness = pollResult == 0 ? .timedOut : .events(pfd.revents)
@@ -1742,7 +1764,9 @@ extension BootstrapSocketProxy {
             }
 
             if bytesRead < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
+                if errno == EAGAIN || errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.readFailed(errno: errno)
             }
             if bytesRead == 0 {
@@ -1920,7 +1944,9 @@ extension BootstrapSocketProxy {
 
             if written < 0 {
                 let err = errno
-                if err == EINTR { continue }
+                if err == EINTR {
+                    continue
+                }
                 if err == EAGAIN || err == EWOULDBLOCK {
                     let remainingMs = Int32(deadline.timeIntervalSinceNow * 1000)
                     if remainingMs <= 0 {
@@ -1930,7 +1956,9 @@ extension BootstrapSocketProxy {
                     var pfd = pollfd(fd: socketFD, events: Int16(POLLOUT), revents: 0)
                     let result = poll(&pfd, 1, min(remainingMs, 250))
                     if result < 0 {
-                        if errno == EINTR { continue }
+                        if errno == EINTR {
+                            continue
+                        }
                         throw SocketProxyError.pollFailed(errno: errno)
                     }
                     if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
@@ -2070,7 +2098,9 @@ actor MCPService: Service {
         }
 
         // Check if already cancelled before waiting
-        if Task.isCancelled { return nil }
+        if Task.isCancelled {
+            return nil
+        }
 
         return await withTaskCancellationHandler {
             await withCheckedContinuation { cont in

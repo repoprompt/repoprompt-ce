@@ -235,9 +235,15 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                 let code = error["code"] as? String
 
                 var parts: [String] = []
-                if let msg = message { parts.append(msg) }
-                if let t = type { parts.append("Type: \(t)") }
-                if let c = code { parts.append("Code: \(c)") }
+                if let msg = message {
+                    parts.append(msg)
+                }
+                if let t = type {
+                    parts.append("Type: \(t)")
+                }
+                if let c = code {
+                    parts.append("Code: \(c)")
+                }
 
                 if !parts.isEmpty {
                     return parts.joined(separator: ". ")
@@ -547,7 +553,9 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                                 for try await byte in bytes {
                                     errorData.append(byte)
                                     // Limit error body size to prevent memory issues
-                                    if errorData.count > 10000 { break }
+                                    if errorData.count > 10000 {
+                                        break
+                                    }
                                 }
                             } catch {
                                 // Ignore read errors when collecting error body

@@ -30,8 +30,12 @@ struct AgentExportCard: View {
 
     private var tokenColor: Color {
         guard let tokens = displayTokens else { return .secondary }
-        if tokens > 100_000 { return .red }
-        if tokens >= 60000 { return .orange }
+        if tokens > 100_000 {
+            return .red
+        }
+        if tokens >= 60000 {
+            return .orange
+        }
         return .green
     }
 
@@ -954,7 +958,9 @@ final class AgentSelectedFilePreviewLoadCoordinator: ObservableObject {
 
     func displayText(for row: AgentContextExportRow) -> String {
         guard activePreviewRowID == row.id else { return "No preview content available" }
-        if isLoadingPreview { return "Loading preview…" }
+        if isLoadingPreview {
+            return "Loading preview…"
+        }
         return previewText ?? "No preview content available"
     }
 
@@ -1197,7 +1203,9 @@ private struct AgentFileRowActionButton: View {
 
     private var foregroundColor: Color {
         guard !isDisabled else { return .secondary.opacity(0.35) }
-        if isButtonHovered { return hoverColor }
+        if isButtonHovered {
+            return hoverColor
+        }
         return .secondary.opacity(rowIsHovered ? 1 : 0.55)
     }
 

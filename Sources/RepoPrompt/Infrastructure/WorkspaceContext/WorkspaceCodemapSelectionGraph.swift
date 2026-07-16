@@ -820,7 +820,9 @@ actor WorkspaceCodemapSelectionGraph {
     func queryStructure(
         _ query: WorkspaceCodemapSelectionGraphRuntimeStructureQuery
     ) -> WorkspaceCodemapSelectionGraphRuntimeStructureDisposition {
-        if Task.isCancelled { return .unavailable(.cancelled) }
+        if Task.isCancelled {
+            return .unavailable(.cancelled)
+        }
         if let revokedReason {
             return .unavailable(.explicitRootUnavailable(revokedReason))
         }
@@ -1053,11 +1055,15 @@ actor WorkspaceCodemapSelectionGraph {
         }
 
         resolutions.sort {
-            if $0.sourceIndex != $1.sourceIndex { return $0.sourceIndex < $1.sourceIndex }
+            if $0.sourceIndex != $1.sourceIndex {
+                return $0.sourceIndex < $1.sourceIndex
+            }
             return $0.targetIndex < $1.targetIndex
         }
         failures.sort {
-            if $0.sourceIndex != $1.sourceIndex { return $0.sourceIndex < $1.sourceIndex }
+            if $0.sourceIndex != $1.sourceIndex {
+                return $0.sourceIndex < $1.sourceIndex
+            }
             return utf8Precedes($0.record.referencedName, $1.record.referencedName)
         }
         let targets = targetIndices.sorted().map(shard.endpoint(at:))
@@ -1120,13 +1126,17 @@ actor WorkspaceCodemapSelectionGraph {
                     reachedBy: visit.reachedBy
                 )
             }.sorted {
-                if $0.depth != $1.depth { return $0.depth < $1.depth }
+                if $0.depth != $1.depth {
+                    return $0.depth < $1.depth
+                }
                 let lhsIndex = shard.nodeIndexByFileID[$0.endpoint.fileID] ?? .max
                 let rhsIndex = shard.nodeIndexByFileID[$1.endpoint.fileID] ?? .max
                 return lhsIndex < rhsIndex
             }
             let orderedFailures = failures.sorted {
-                if $0.sourceIndex != $1.sourceIndex { return $0.sourceIndex < $1.sourceIndex }
+                if $0.sourceIndex != $1.sourceIndex {
+                    return $0.sourceIndex < $1.sourceIndex
+                }
                 return utf8Precedes($0.record.referencedName, $1.record.referencedName)
             }
             return WorkspaceCodemapSelectionGraphRuntimeStructureResult(
@@ -1160,7 +1170,9 @@ actor WorkspaceCodemapSelectionGraph {
 
         var cursor = 0
         while cursor < queue.count {
-            if Task.isCancelled { return .unavailable(.cancelled) }
+            if Task.isCancelled {
+                return .unavailable(.cancelled)
+            }
             let currentIndex = queue[cursor]
             cursor += 1
             guard let currentVisit = visitsByIndex[currentIndex],
@@ -1202,7 +1214,9 @@ actor WorkspaceCodemapSelectionGraph {
                 })
             }
             neighbors.sort {
-                if $0.index != $1.index { return $0.index < $1.index }
+                if $0.index != $1.index {
+                    return $0.index < $1.index
+                }
                 return $0.direction.rawValue < $1.direction.rawValue
             }
 
@@ -2284,7 +2298,9 @@ private func querySourcePrecedes(
     _ lhs: WorkspaceCodemapSelectionGraphRuntimeQuerySource,
     _ rhs: WorkspaceCodemapSelectionGraphRuntimeQuerySource
 ) -> Bool {
-    if lhs.fileID != rhs.fileID { return uuidPrecedes(lhs.fileID, rhs.fileID) }
+    if lhs.fileID != rhs.fileID {
+        return uuidPrecedes(lhs.fileID, rhs.fileID)
+    }
     return lhs.requestGeneration < rhs.requestGeneration
 }
 

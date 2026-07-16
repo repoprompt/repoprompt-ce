@@ -269,7 +269,9 @@ actor IgnoreRulesManager {
         let gitignorePath = (path as NSString).appendingPathComponent(".gitignore")
         let gitignoreContent: String? = if fm.fileExists(atPath: gitignorePath, isDirectory: nil) {
             try await loadFileContent(at: gitignorePath)
-        } else { nil }
+        } else {
+            nil
+        }
 
         // Always add global ignore defaults from user settings (lower priority)
         let globalIgnoreContent = fetchGlobalDefaults()
@@ -280,8 +282,12 @@ actor IgnoreRulesManager {
             let repoIgnorePath = (path as NSString).appendingPathComponent(".repo_ignore")
             if fm.fileExists(atPath: repoIgnorePath, isDirectory: nil) {
                 repoIgnoreContent = try await loadFileContent(at: repoIgnorePath)
-            } else { repoIgnoreContent = nil }
-        } else { repoIgnoreContent = nil }
+            } else {
+                repoIgnoreContent = nil
+            }
+        } else {
+            repoIgnoreContent = nil
+        }
 
         // If enabled and a local .cursorignore exists, add it with highest local priority.
         let cursorignoreContent: String?
@@ -289,8 +295,12 @@ actor IgnoreRulesManager {
             let cursorignorePath = (path as NSString).appendingPathComponent(".cursorignore")
             if fm.fileExists(atPath: cursorignorePath, isDirectory: nil) {
                 cursorignoreContent = try await loadFileContent(at: cursorignorePath)
-            } else { cursorignoreContent = nil }
-        } else { cursorignoreContent = nil }
+            } else {
+                cursorignoreContent = nil
+            }
+        } else {
+            cursorignoreContent = nil
+        }
 
         let authority = Self.compileRootAuthority(
             gitignoreContent: gitignoreContent,
@@ -406,9 +416,13 @@ actor IgnoreRulesManager {
         while true {
             try Task.checkCancellation()
             let amount = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
-            if amount == 0 { break }
+            if amount == 0 {
+                break
+            }
             if amount < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw MandatoryGitIgnoreControlError.unavailable
             }
             let (nextCount, overflow) = data.count.addingReportingOverflow(amount)
@@ -450,7 +464,9 @@ actor IgnoreRulesManager {
 
     private nonisolated static func mandatoryGitIgnoreControlExists(at url: URL) throws -> Bool {
         var value = stat()
-        if lstat(url.path, &value) == 0 { return true }
+        if lstat(url.path, &value) == 0 {
+            return true
+        }
         guard errno == ENOENT else { throw MandatoryGitIgnoreControlError.unavailable }
         return false
     }

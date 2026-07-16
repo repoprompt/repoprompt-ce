@@ -1201,7 +1201,9 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         var sourceTicket: WorkspaceCodemapArtifactDemandTicket?
         for file in files {
             let demand = try await readyArtifactDemand(store: store, forFileID: file.id)
-            if file.id == source.id { sourceTicket = demand.ticket }
+            if file.id == source.id {
+                sourceTicket = demand.ticket
+            }
         }
         let identities = await store.codemapAutomaticSelectionSourceIdentities(
             forFileIDs: [source.id],
@@ -1300,11 +1302,15 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         let result = try await task.value
 
         XCTAssertFalse(result.roots.flatMap(\.sourceIssues).contains {
-            if case .pending = $0 { return true }
+            if case .pending = $0 {
+                return true
+            }
             return false
         })
         XCTAssertFalse(result.roots.contains {
-            if case .stale(.sourceStateChanged(_)) = $0.coverage { return true }
+            if case .stale(.sourceStateChanged(_)) = $0.coverage {
+                return true
+            }
             return false
         })
         await store.unloadRoot(id: loaded.id)

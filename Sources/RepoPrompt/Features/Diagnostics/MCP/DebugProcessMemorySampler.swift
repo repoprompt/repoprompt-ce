@@ -298,7 +298,9 @@
             let intervalNanoseconds = UInt64(intervalMS) * 1_000_000
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: intervalNanoseconds)
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    break
+                }
                 recordPeriodicSample(sessionID: sessionID)
             }
         }

@@ -126,7 +126,9 @@ final class DurableArtifactGarbageCollector {
             try marks.append(id)
             try frontier.append(id)
             let (next, overflow) = report.markedCount.addingReportingOverflow(1)
-            if overflow { throw DurableArtifactStoreError.framingOverflow }
+            if overflow {
+                throw DurableArtifactStoreError.framingOverflow
+            }
             report.markedCount = next
         }
         for object in objects {
@@ -166,7 +168,9 @@ final class DurableArtifactGarbageCollector {
         var totalObjectBytes: UInt64 = 0
         try forEachObject { _, identity, _, _ in
             let (next, overflow) = totalObjectBytes.addingReportingOverflow(UInt64(identity.size))
-            if overflow { throw DurableArtifactStoreError.framingOverflow }
+            if overflow {
+                throw DurableArtifactStoreError.framingOverflow
+            }
             totalObjectBytes = next
         }
         var quotaPressure = totalObjectBytes > quota
@@ -453,7 +457,9 @@ final class DurableArtifactGarbageCollector {
     }
 
     private func classifyObsoleteCandidate(_ name: String) -> ObsoleteCandidate? {
-        if isObsoleteVersionName(name), name != "v1" { return .raw }
+        if isObsoleteVersionName(name), name != "v1" {
+            return .raw
+        }
         let prefix = ".obsolete."
         guard name.hasPrefix(prefix) else { return nil }
         let remainder = name.dropFirst(prefix.count)
@@ -522,7 +528,9 @@ private final class DurableArtifactNameSpool {
         guard identity.size >= 0, offset >= 0, offset <= identity.size else {
             throw DurableArtifactStoreError.invalidFraming
         }
-        if offset == identity.size { return nil }
+        if offset == identity.size {
+            return nil
+        }
         let lengthData = try DurableArtifactSecureIO.preadExactly(descriptor.rawValue, offset: offset, count: 2)
         let length = lengthData.withUnsafeBytes { raw in
             UInt16(bigEndian: raw.loadUnaligned(as: UInt16.self))
@@ -600,7 +608,9 @@ private final class DurableArtifactGCMarkFile {
     func contains(_ expected: DurableArtifactObjectID) throws -> Bool {
         var offset: off_t = 0
         while let candidate = try next(offset: &offset) {
-            if candidate == expected { return true }
+            if candidate == expected {
+                return true
+            }
         }
         return false
     }
@@ -610,7 +620,9 @@ private final class DurableArtifactGCMarkFile {
         guard identity.size >= 0, offset >= 0, offset <= identity.size else {
             throw DurableArtifactStoreError.invalidFraming
         }
-        if offset == identity.size { return nil }
+        if offset == identity.size {
+            return nil
+        }
         let lengthData = try DurableArtifactSecureIO.preadExactly(descriptor.rawValue, offset: offset, count: 1)
         let familyLength = Int(lengthData[0])
         guard familyLength > 0, familyLength <= 64 else { throw DurableArtifactStoreError.invalidFraming }

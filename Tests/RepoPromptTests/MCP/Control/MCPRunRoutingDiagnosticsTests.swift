@@ -206,7 +206,9 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             var continuationCount = 0
             for _ in 0 ..< 100 {
                 continuationCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
-                if continuationCount == 2 { break }
+                if continuationCount == 2 {
+                    break
+                }
                 await Task.yield()
             }
             XCTAssertEqual(continuationCount, 2)
@@ -239,7 +241,9 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             var continuationCount = 0
             for _ in 0 ..< 100 {
                 continuationCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
-                if continuationCount == 2 { break }
+                if continuationCount == 2 {
+                    break
+                }
                 await Task.yield()
             }
             XCTAssertEqual(continuationCount, 2)
@@ -301,7 +305,9 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
     #if DEBUG
         private func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in
-                if case let .text(text, _, _) = content { return text }
+                if case let .text(text, _, _) = content {
+                    return text
+                }
                 return nil
             }.joined()
             let data = try XCTUnwrap(text.data(using: .utf8))

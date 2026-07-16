@@ -261,9 +261,15 @@ struct SupportedModes: Codable, Equatable {
     /// Returns a user-friendly string describing the enabled modes
     var displayString: String {
         var modes: [String] = []
-        if chat { modes.append("Chat") }
-        if plan { modes.append("Plan") }
-        if review { modes.append("Review") }
+        if chat {
+            modes.append("Chat")
+        }
+        if plan {
+            modes.append("Plan")
+        }
+        if review {
+            modes.append("Review")
+        }
 
         if modes.isEmpty {
             return "No modes enabled"

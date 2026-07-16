@@ -176,7 +176,9 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
     ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if condition() { return }
+            if condition() {
+                return
+            }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for condition", file: file, line: line)

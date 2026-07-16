@@ -456,7 +456,9 @@ extension FileSystemService {
 
     func seedReplayRequiresFailClosedRecovery() -> Bool {
         guard let state = seedInitializationState else { return false }
-        if case .replaying = state.phase { return true }
+        if case .replaying = state.phase {
+            return true
+        }
         return false
     }
 
@@ -547,7 +549,9 @@ extension FileSystemService {
             throw FileSystemSeedReplayError.watcherNotActive
         }
         if let cut, state.phase != .replaying(cut) {
-            if case let .failed(error) = state.phase { throw error }
+            if case let .failed(error) = state.phase {
+                throw error
+            }
             throw FileSystemSeedReplayError.initializationNotCurrent
         }
     }
@@ -556,7 +560,9 @@ extension FileSystemService {
         guard let state = seedInitializationState else {
             throw FileSystemSeedReplayError.initializationNotCurrent
         }
-        if case let .failed(error) = state.phase { throw error }
+        if case let .failed(error) = state.phase {
+            throw error
+        }
     }
 
     private func failSeedReplay(

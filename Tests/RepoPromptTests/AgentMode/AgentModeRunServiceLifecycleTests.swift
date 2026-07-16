@@ -695,6 +695,554 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testACPIdleShutdownTearsDownCompletedRetainedControllerAndPreservesProviderSessionID() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent("idle-acp-process-id.txt")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .openCode)
+                return provider
+            },
+            autoSignalACPRouting: true,
+            acpIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Complete and idle cleanup",
+            initialMessageForRun: "Complete and idle cleanup",
+            attachments: []
+        )
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("OpenCode idle-cleanup run") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        let retainedController = try XCTUnwrap(session.acpController)
+        XCTAssertEqual(session.providerSessionID, "opencode-mode-flow")
+
+        try await waitUntil("OpenCode process ID should be recorded") {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+
+        try await waitUntilProcessExits(processID, "ACP idle TTL should terminate retained OpenCode process")
+        XCTAssertNil(session.acpController)
+        XCTAssertEqual(session.providerSessionID, "opencode-mode-flow")
+        let remainsReusable = await retainedController.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+        acpControllers.removeValue(forKey: ObjectIdentifier(retainedController))
+    }
+
+    func testACPIdleShutdownRechecksSafetyBeforeTeardown() async throws {
+        enum SuppressionCase: String, CaseIterable {
+            case active
+            case pendingApproval
+            case pendingQuestion
+            case pendingSteering
+        }
+
+        for suppression in SuppressionCase.allCases {
+            let fixture = try await makeRetainedACPFixture(
+                processIDFileName: "idle-suppress-\(suppression.rawValue)-acp-process-id.txt",
+                acpIdleShutdownDelayNanos: 1_000_000
+            )
+            fixture.session.providerSessionID = "resume-\(suppression.rawValue)"
+            fixture.service.scheduleACPIdleShutdownIfNeeded(
+                for: fixture.session,
+                completedRunID: fixture.session.runID,
+                retainedController: fixture.controller,
+                agent: .openCode,
+                reason: "test"
+            )
+
+            switch suppression {
+            case .active:
+                fixture.session.runState = .running
+            case .pendingApproval:
+                fixture.session.pendingApproval = AgentApprovalRequest(
+                    requestID: .acp("approval"),
+                    method: "session/request_permission",
+                    kind: .commandExecution,
+                    threadID: "thread",
+                    turnID: "turn",
+                    itemID: "item"
+                )
+            case .pendingQuestion:
+                fixture.session.waitingPrompt = "Need input"
+            case .pendingSteering:
+                fixture.session.pendingACPSteeringInstructions = [
+                    makeACPSteeringInstruction(session: fixture.session, text: "steer")
+                ]
+            }
+
+            try await Task.sleep(nanoseconds: 50_000_000)
+            XCTAssertTrue(Self.processIsRunning(fixture.processID), suppression.rawValue)
+            XCTAssertTrue(fixture.session.acpController === fixture.controller, suppression.rawValue)
+            XCTAssertEqual(fixture.session.providerSessionID, "resume-\(suppression.rawValue)", suppression.rawValue)
+            await fixture.session.teardownACPControllerIfPresent()
+            acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+        }
+    }
+
+    func testACPIdleShutdownTearsDownWhenNewRunCannotReuseController() async throws {
+        let fixture = try await makeRetainedACPFixture(
+            processIDFileName: "idle-new-run-acp-process-id.txt",
+            acpIdleShutdownDelayNanos: 1_000_000
+        )
+        fixture.service.scheduleACPIdleShutdownIfNeeded(
+            for: fixture.session,
+            completedRunID: fixture.session.runID,
+            retainedController: fixture.controller,
+            agent: .openCode,
+            reason: "test"
+        )
+
+        fixture.session.selectedAgent = .codexExec
+        let outcome = await fixture.service.startRun(
+            tabID: fixture.session.tabID,
+            session: fixture.session,
+            initialUserMessage: "new run tears down stale ACP cleanup",
+            initialMessageForRun: "new run tears down stale ACP cleanup",
+            attachments: []
+        )
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertNil(fixture.session.acpController)
+        try await waitUntilProcessExits(fixture.processID, "Non-ACP run should terminate stale retained ACP process")
+        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+    }
+
+    func testACPStartupFailureRetiresRetainedControllerAndPreservesProviderSessionID() async throws {
+        let fixture = try await makeRetainedACPFixture(
+            processIDFileName: "startup-failure-retained-acp-process-id.txt",
+            workspacePathProvider: { _ in throw LifecycleTestError.workspaceMissing },
+            acpIdleShutdownDelayNanos: 1_000_000
+        )
+        fixture.session.providerSessionID = "existing-acp-session"
+        fixture.service.scheduleACPIdleShutdownIfNeeded(
+            for: fixture.session,
+            completedRunID: fixture.session.runID,
+            retainedController: fixture.controller,
+            agent: .openCode,
+            reason: "test"
+        )
+
+        let outcome = await fixture.service.startRun(
+            tabID: fixture.session.tabID,
+            session: fixture.session,
+            initialUserMessage: "startup fails",
+            initialMessageForRun: "startup fails",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        XCTAssertEqual(fixture.session.runState, .failed)
+        XCTAssertNil(fixture.session.acpController)
+        XCTAssertEqual(fixture.session.providerSessionID, "existing-acp-session")
+        try await waitUntilProcessExits(fixture.processID, "ACP startup failure should terminate retained process")
+        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+    }
+
+    func testSelectedAgentSwitchTearsDownRetainedACPController() async throws {
+        let fixture = try await makeRetainedACPFixture(
+            processIDFileName: "selected-agent-switch-retained-acp-process-id.txt",
+            acpIdleShutdownDelayNanos: 1_000_000
+        )
+        fixture.host.ensureSession(for: fixture.session.tabID)
+        let session = try XCTUnwrap(fixture.host.sessions[fixture.session.tabID])
+        session.selectedAgent = .openCode
+        session.runID = fixture.session.runID
+        session.runState = .completed
+        session.acpController = fixture.controller
+        fixture.host.test_setCurrentTabIDOverride(session.tabID)
+        defer { fixture.host.test_setCurrentTabIDOverride(nil) }
+        fixture.service.scheduleACPIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: fixture.controller,
+            agent: .openCode,
+            reason: "test"
+        )
+
+        fixture.host.selectedAgent = .codexExec
+
+        XCTAssertNil(session.acpController)
+        try await waitUntilProcessExits(fixture.processID, "Selected-agent switch should terminate stale retained ACP process")
+        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+    }
+
+    func testACPIdleShutdownIsNotScheduledForRejectedTerminalPublication() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent("idle-rejected-publication-acp-process-id.txt")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { _, _ in provider },
+            publishTerminalCommitResult: { _, _, _ in .rejected(reason: "test") },
+            autoSignalACPRouting: true,
+            acpIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Complete with rejected publication",
+            initialMessageForRun: "Complete with rejected publication",
+            attachments: []
+        )
+        try await withLifecycleTimeout("OpenCode rejected-publication run") {
+            await session.agentTask?.value
+        }
+        let controller = try XCTUnwrap(session.acpController)
+        try await waitUntil("OpenCode process ID should be recorded") {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(session.lastTerminalPublicationResult, .rejected(reason: "test"))
+        XCTAssertTrue(Self.processIsRunning(processID))
+        XCTAssertTrue(session.acpController === controller)
+        await session.teardownACPControllerIfPresent()
+        acpControllers.removeValue(forKey: ObjectIdentifier(controller))
+    }
+
+    func testClaudeIdleShutdownTearsDownCompletedRetainedControllerAndPreservesProviderSessionID() async throws {
+        let recorder = LifecycleRecorder()
+        let turnID = UUID()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            sendTurnID: turnID,
+            events: [.turnCompleted(turnID: turnID, status: .completed)]
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            autoSignalACPRouting: true,
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Complete and idle cleanup",
+            initialMessageForRun: "Complete and idle cleanup",
+            attachments: []
+        )
+        try await withLifecycleTimeout("Claude idle-cleanup run") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(
+            session.claudeController.map { ObjectIdentifier($0 as AnyObject) },
+            ObjectIdentifier(controller as AnyObject)
+        )
+
+        try await waitUntil("Claude idle TTL should detach retained controller") {
+            session.claudeController == nil
+        }
+        try await waitUntil("Claude idle TTL should shut down retained controller") {
+            recorder.contains("claude:shutdown")
+        }
+        XCTAssertNil(session.claudeController)
+        XCTAssertEqual(session.providerSessionID, "lifecycle-claude-session")
+        assertOrderedEvents([
+            "claude:current-ref",
+            "claude:shutdown"
+        ], in: recorder)
+    }
+
+    func testClaudeIdleShutdownRechecksSafetyBeforeTeardown() async throws {
+        enum SuppressionCase: String, CaseIterable {
+            case active
+            case pendingApproval
+            case pendingQuestion
+            case pendingSteering
+        }
+
+        for suppression in SuppressionCase.allCases {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleFakeNativeController(recorder: recorder)
+            let harness = makeHarness(
+                recorder: recorder,
+                claudeController: controller,
+                claudeIdleShutdownDelayNanos: 1_000_000
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .claudeCode
+            session.runID = UUID()
+            session.runState = .completed
+            session.claudeController = controller
+            session.providerSessionID = "resume-\(suppression.rawValue)"
+            harness.service.scheduleClaudeIdleShutdownIfNeeded(
+                for: session,
+                completedRunID: session.runID,
+                retainedController: controller,
+                agent: .claudeCode,
+                reason: "test"
+            )
+
+            switch suppression {
+            case .active:
+                session.runState = .running
+            case .pendingApproval:
+                session.pendingApproval = AgentApprovalRequest(
+                    requestID: .claudeControl("approval"),
+                    method: "permission/request",
+                    kind: .commandExecution,
+                    threadID: "thread",
+                    turnID: "turn",
+                    itemID: "item"
+                )
+            case .pendingQuestion:
+                session.waitingPrompt = "Need input"
+            case .pendingSteering:
+                session.pendingClaudeSteeringInstructions = [
+                    makeClaudeSteeringInstruction(session: session, text: "steer")
+                ]
+            }
+
+            try await Task.sleep(nanoseconds: 50_000_000)
+            XCTAssertEqual(
+                session.claudeController.map { ObjectIdentifier($0 as AnyObject) },
+                ObjectIdentifier(controller as AnyObject),
+                suppression.rawValue
+            )
+            XCTAssertEqual(session.providerSessionID, "resume-\(suppression.rawValue)", suppression.rawValue)
+            XCTAssertFalse(recorder.contains("claude:shutdown"), suppression.rawValue)
+            await harness.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testClaudeIdleShutdownWaitsForActiveChildAgentRunWait() async throws {
+        // Production schedules idle cleanup once from postCommit. While a child
+        // agent_run.wait is active, teardown is unsafe; the scheduler must re-arm
+        // autonomously after the wait drains — no second schedule call.
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        var hasActiveChildWait = true
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            activeAgentRunWaitQuery: { _ in hasActiveChildWait },
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.claudeController = controller
+        session.providerSessionID = "resume-child-wait"
+
+        harness.service.scheduleClaudeIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: controller,
+            agent: .claudeCode,
+            reason: "test"
+        )
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNotNil(session.claudeController)
+        XCTAssertFalse(recorder.contains("claude:shutdown"))
+        XCTAssertEqual(session.providerSessionID, "resume-child-wait")
+
+        hasActiveChildWait = false
+        try await waitUntil("Claude idle cleanup should re-arm and teardown after the child wait drains") {
+            session.claudeController == nil
+        }
+        XCTAssertEqual(session.providerSessionID, "lifecycle-claude-session")
+    }
+
+    func testCancellingIdleOwnershipDoesNotCancelShutdownAfterTeardownBegins() async throws {
+        let recorder = LifecycleRecorder()
+        let shutdownGate = LifecycleAsyncGate()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            shutdownGate: shutdownGate
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.claudeController = controller
+        session.providerSessionID = "resume-cancel-safe"
+
+        harness.service.scheduleClaudeIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: controller,
+            agent: .claudeCode,
+            reason: "test"
+        )
+        await shutdownGate.waitUntilArrived()
+
+        harness.service.cancelClaudeIdleShutdown(for: session.tabID)
+        await shutdownGate.release()
+        try await withLifecycleTimeout("Claude shutdown should finish after idle ownership is cancelled") {
+            while await !controller.didFinishShutdown() {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+
+        let shutdownWasCancelled = await controller.didShutdownObserveCancellation()
+        XCTAssertEqual(shutdownWasCancelled, false)
+        XCTAssertNil(session.claudeController)
+        XCTAssertEqual(session.providerSessionID, "lifecycle-claude-session")
+    }
+
+    func testClaudeIdleShutdownCancelsOnNewRun() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.claudeController = controller
+        harness.service.scheduleClaudeIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: controller,
+            agent: .claudeCode,
+            reason: "test"
+        )
+
+        session.selectedAgent = .codexExec
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "new run cancels idle cleanup",
+            initialMessageForRun: "new run cancels idle cleanup",
+            attachments: []
+        )
+        XCTAssertEqual(outcome, .sent)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(
+            session.claudeController.map { ObjectIdentifier($0 as AnyObject) },
+            ObjectIdentifier(controller as AnyObject)
+        )
+        XCTAssertFalse(recorder.contains("claude:shutdown"))
+        await controller.shutdown()
+    }
+
+    func testClaudeStartupFailureRetiresRetainedControllerAndPreservesProviderSessionID() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in throw LifecycleTestError.workspaceMissing },
+            claudeController: controller,
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.claudeController = controller
+        session.providerSessionID = "existing-claude-session"
+        harness.service.scheduleClaudeIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: controller,
+            agent: .claudeCode,
+            reason: "test"
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "startup fails",
+            initialMessageForRun: "startup fails",
+            attachments: []
+        )
+
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertNil(session.claudeController)
+        XCTAssertEqual(session.providerSessionID, "lifecycle-claude-session")
+        assertOrderedEvents([
+            "claude:current-ref",
+            "claude:shutdown"
+        ], in: recorder)
+    }
+
+    func testClaudeIdleShutdownIsNotScheduledForRejectedTerminalPublication() async throws {
+        let recorder = LifecycleRecorder()
+        let turnID = UUID()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            sendTurnID: turnID,
+            events: [.turnCompleted(turnID: turnID, status: .completed)]
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            publishTerminalCommitResult: { _, _, _ in .rejected(reason: "test") },
+            autoSignalACPRouting: true,
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Complete with rejected publication",
+            initialMessageForRun: "Complete with rejected publication",
+            attachments: []
+        )
+        try await withLifecycleTimeout("Claude rejected-publication run") {
+            await session.agentTask?.value
+        }
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(session.lastTerminalPublicationResult, .rejected(reason: "test"))
+        XCTAssertEqual(
+            session.claudeController.map { ObjectIdentifier($0 as AnyObject) },
+            ObjectIdentifier(controller as AnyObject)
+        )
+        XCTAssertFalse(recorder.contains("claude:shutdown"))
+        await harness.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
     func testTerminalBarrierRejectsStaleOwnership() async {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
@@ -720,6 +1268,110 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.runState, .running)
         XCTAssertEqual(session.activeRunOwnership, currentOwnership)
         XCTAssertFalse(recorder.contains(prefix: "commit:"))
+    }
+
+    func testSharedIdleShutdownPolicyMatchesCodexDefaultTTL() {
+        XCTAssertEqual(AgentModeIdleShutdownPolicy.defaultDelay, 300)
+        XCTAssertEqual(AgentModeIdleShutdownPolicy.defaultDelayNanos, 300_000_000_000)
+        XCTAssertEqual(
+            AgentModeIdleShutdownPolicy.normalizedDelayNanos(AgentModeIdleShutdownPolicy.defaultDelayNanos),
+            300_000_000_000
+        )
+        XCTAssertEqual(AgentModeIdleShutdownPolicy.normalizedDelayNanos(1), 1_000_000)
+    }
+
+    func testTerminalBarrierRejectsBeforeTerminalSideEffectsWhenDrainChangesBeforeCommit() async {
+        // Contract-level proof: if provider drain state changes between the barrier's
+        // preflight check and final commit check, terminal finalization work must not
+        // run before the commit is rejected.
+        let recorder = LifecycleRecorder()
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.drainRace")
+        var bufferDrainChecks = 0
+        var postCommitCalled = false
+
+        let revision = await barrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.drainRace",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            providerBuffersAreDrained: {
+                bufferDrainChecks += 1
+                return bufferDrainChecks == 1
+            },
+            postCommit: {
+                postCommitCalled = true
+                recorder.record("post-commit")
+            }
+        ))
+
+        XCTAssertNil(revision)
+        XCTAssertEqual(bufferDrainChecks, 2)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertFalse(session.terminalCommitInProgress)
+        XCTAssertTrue(recorder.contains("assistant-flush"))
+        XCTAssertFalse(recorder.contains("attachments:deleteFiles"))
+        XCTAssertFalse(recorder.contains("run-active:false"))
+        XCTAssertFalse(recorder.contains("prepare-publication"))
+        XCTAssertFalse(recorder.contains("bindings"))
+        XCTAssertFalse(recorder.contains("save"))
+        XCTAssertFalse(recorder.contains(prefix: "commit:"))
+        XCTAssertFalse(postCommitCalled)
+        XCTAssertFalse(recorder.contains("post-commit"))
+    }
+
+    func testTerminalBarrierRunsPostCommitOnlyForAcceptedPublication() async {
+        let rows: [(String, AgentRunTerminalPublicationResult, Bool)] = [
+            ("accepted", .accepted(successorEpoch: nil), true),
+            ("stale", .stale, false),
+            ("rejected", .rejected(reason: "test"), false)
+        ]
+
+        for (name, publicationResult, expectPostCommit) in rows {
+            let recorder = LifecycleRecorder()
+            let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(
+                recorder: recorder,
+                publishTerminalCommitResult: { _, revision, _ in
+                    recorder.record("commit:\(revision.commitID.uuidString)")
+                    return publicationResult
+                }
+            ))
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.runID = UUID()
+            session.runState = .running
+            let ownership = session.beginRunAttempt(source: "test.publication.\(name)")
+            var postCommitCalled = false
+
+            let revision = await barrier.commit(.init(
+                session: session,
+                ownership: ownership,
+                expectedRunID: session.runID,
+                terminalState: .completed,
+                source: "test.publication.\(name)",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: false,
+                notifyTurnComplete: false,
+                postCommit: {
+                    postCommitCalled = true
+                    recorder.record("post-commit")
+                }
+            ))
+
+            XCTAssertNotNil(revision, name)
+            XCTAssertEqual(postCommitCalled, expectPostCommit, name)
+            XCTAssertEqual(recorder.contains("post-commit"), expectPostCommit, name)
+            XCTAssertEqual(session.lastTerminalPublicationResult, publicationResult, name)
+        }
     }
 
     func testNewAttemptResetsProviderDrainGenerationAcrossProviderFamilies() async {
@@ -1511,7 +2163,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
         publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
-        autoSignalACPRouting: Bool = false
+        publishTerminalCommitResult: ((
+            AgentModeViewModel.TabSession,
+            AgentRunTerminalCommitRevision,
+            AgentRunEpochTransitionKind?
+        ) async -> AgentRunTerminalPublicationResult)? = nil,
+        autoSignalACPRouting: Bool = false,
+        activeAgentRunWaitQuery: @escaping (UUID) -> Bool = { _ in false },
+        acpIdleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos,
+        claudeIdleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
@@ -1572,8 +2232,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: cancelMCPTools,
             awaitNoActiveMCPTools: idleWaiter,
-            activeAgentRunWaitQuery: { _ in false },
-            childAgentRunWaitDrainTimeoutSeconds: 0.01
+            activeAgentRunWaitQuery: activeAgentRunWaitQuery,
+            childAgentRunWaitDrainTimeoutSeconds: 0.01,
+            acpIdleShutdownDelayNanos: acpIdleShutdownDelayNanos,
+            claudeIdleShutdownDelayNanos: claudeIdleShutdownDelayNanos
         )
         return LifecycleHarness(
             service: AgentModeRunService(
@@ -1581,7 +2243,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 hooks: makeHooks(
                     recorder: recorder,
                     flushPendingAssistantDelta: flushPendingAssistantDelta,
-                    publishTerminalCommit: publishTerminalCommit
+                    publishTerminalCommit: publishTerminalCommit,
+                    publishTerminalCommitResult: publishTerminalCommitResult
                 ),
                 toolTrackingHooks: .noOp
             ),
@@ -1659,12 +2322,17 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     private struct RetainedACPFixture {
         let host: AgentModeViewModel
+        let service: AgentModeRunService
         let session: AgentModeViewModel.TabSession
         let controller: ACPAgentSessionController
         let processID: pid_t
     }
 
-    private func makeRetainedACPFixture(processIDFileName: String) async throws -> RetainedACPFixture {
+    private func makeRetainedACPFixture(
+        processIDFileName: String,
+        workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in nil },
+        acpIdleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos
+    ) async throws -> RetainedACPFixture {
         let recorder = LifecycleRecorder()
         let workspace = try makeTemporaryDirectory()
         let processIDURL = workspace.appendingPathComponent(processIDFileName)
@@ -1686,7 +2354,16 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let processID = try XCTUnwrap(pid_t(processIDText))
-        let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in workspace.path })
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { session in
+                if let overridePath = try workspacePathProvider(session) {
+                    return overridePath
+                }
+                return workspace.path
+            },
+            acpIdleShutdownDelayNanos: acpIdleShutdownDelayNanos
+        )
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .openCode
         session.runID = UUID()
@@ -1694,6 +2371,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.acpController = controller
         return RetainedACPFixture(
             host: harness.host,
+            service: harness.service,
             session: session,
             controller: controller,
             processID: processID
@@ -2027,7 +2705,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         condition: @escaping @MainActor () -> Bool
     ) async throws {
         for _ in 0 ..< 500 {
-            if condition() { return }
+            if condition() {
+                return
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         throw LifecycleTimeoutError(operation: message, timeoutSeconds: 0.5)

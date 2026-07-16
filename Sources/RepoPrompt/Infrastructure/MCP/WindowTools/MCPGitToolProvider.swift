@@ -27,7 +27,9 @@ private final class MCPGitRequestContext {
     }
 
     func allRepos() async -> [GitRepoDescriptor] {
-        if let discoveredRepos { return discoveredRepos }
+        if let discoveredRepos {
+            return discoveredRepos
+        }
 
         var seenRoots = Set<String>()
         var seenRepos = Set<String>()
@@ -47,7 +49,9 @@ private final class MCPGitRequestContext {
 
     func backend(for repoURL: URL) async -> any VCSBackend {
         let key = pathKey(repoURL)
-        if let backend = backendsByPath[key] { return backend }
+        if let backend = backendsByPath[key] {
+            return backend
+        }
         let backend = await vcsService.backend(forRepoRoot: repoURL)
         backendsByPath[key] = backend
         return backend
@@ -55,7 +59,9 @@ private final class MCPGitRequestContext {
 
     func currentBranch(for repoURL: URL) async -> String? {
         let key = pathKey(repoURL)
-        if resolvedBranchPaths.contains(key) { return branchesByPath[key] }
+        if resolvedBranchPaths.contains(key) {
+            return branchesByPath[key]
+        }
         let backend = await backend(for: repoURL)
         let branch = try? await backend.getCurrentBranch(at: repoURL)
         resolvedBranchPaths.insert(key)
@@ -78,7 +84,9 @@ private final class MCPGitRequestContext {
 
     func headID(for repoURL: URL) async -> String? {
         let key = pathKey(repoURL)
-        if resolvedHeadPaths.contains(key) { return headsByPath[key] }
+        if resolvedHeadPaths.contains(key) {
+            return headsByPath[key]
+        }
         let backend = await backend(for: repoURL)
         let head = try? await backend.getHeadID(at: repoURL)
         resolvedHeadPaths.insert(key)
@@ -96,7 +104,9 @@ private final class MCPGitRequestContext {
 
     func mainBranchRef(for repoURL: URL) async -> String? {
         let key = pathKey(repoURL)
-        if resolvedMainBranchPaths.contains(key) { return mainBranchesByPath[key] }
+        if resolvedMainBranchPaths.contains(key) {
+            return mainBranchesByPath[key]
+        }
 
         let backend = await backend(for: repoURL)
         let remoteBranches = await (try? backend.getRemoteBranches(at: repoURL, limit: 200).map(\.name)) ?? []
@@ -120,7 +130,9 @@ private final class MCPGitRequestContext {
 
     func worktreeDTO(for repoURL: URL) async -> WorktreeDTO? {
         let key = pathKey(repoURL)
-        if resolvedWorktreePaths.contains(key) { return worktreesByPath[key] }
+        if resolvedWorktreePaths.contains(key) {
+            return worktreesByPath[key]
+        }
         resolvedWorktreePaths.insert(key)
 
         let backend = await backend(for: repoURL)
@@ -299,7 +311,9 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         _ status: VCSRepositoryStatus
     ) -> ToolResultDTOs.GitToolReplyDTO.StatusDTO {
         var parts: [String] = []
-        if let branch = status.branch { parts.append(branch) }
+        if let branch = status.branch {
+            parts.append(branch)
+        }
         if let ahead = status.ahead, let behind = status.behind {
             parts.append("+\(ahead) -\(behind)")
         }
@@ -813,9 +827,13 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             guard datePart.count == 10 else { return false }
             let dateChars = Array(datePart)
             guard dateChars.indices.contains(4), dateChars.indices.contains(7) else { return false }
-            if dateChars[4] != "-" || dateChars[7] != "-" { return false }
+            if dateChars[4] != "-" || dateChars[7] != "-" {
+                return false
+            }
             let dateDigits = dateChars.enumerated().allSatisfy { idx, ch in
-                if idx == 4 || idx == 7 { return true }
+                if idx == 4 || idx == 7 {
+                    return true
+                }
                 return ch.isNumber
             }
             guard dateDigits else { return false }
@@ -1108,7 +1126,9 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 let snapshotIDOverride: String? = {
                     guard let raw = args["snapshot_id"]?.stringValue else { return nil }
                     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.isEmpty || trimmed.lowercased() == "auto" { return nil }
+                    if trimmed.isEmpty || trimmed.lowercased() == "auto" {
+                        return nil
+                    }
                     return GitDiffSnapshotStore.normalizeSnapshotID(trimmed)
                 }()
 

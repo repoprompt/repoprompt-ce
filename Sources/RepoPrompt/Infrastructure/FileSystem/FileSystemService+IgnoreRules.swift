@@ -424,7 +424,9 @@ extension FileSystemService {
                 )
                 effectiveRules.addCompiledLayer(compiled, authority: .mandatoryGit)
             } catch {
-                if ignoreRulePolicy.enforcesGitIgnoreFloor { throw error }
+                if ignoreRulePolicy.enforcesGitIgnoreFloor {
+                    throw error
+                }
                 print("Failed to compile .gitignore at \(gitignoreURL.path): \(error)")
             }
         }

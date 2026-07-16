@@ -2268,7 +2268,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         let sortedFolders = event.upsertedFolders.sorted { lhs, rhs in
             let lhsDepth = lhs.standardizedRelativePath.split(separator: "/").count
             let rhsDepth = rhs.standardizedRelativePath.split(separator: "/").count
-            if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+            if lhsDepth != rhsDepth {
+                return lhsDepth < rhsDepth
+            }
             return lhs.standardizedRelativePath < rhs.standardizedRelativePath
         }
         for folder in sortedFolders where folder.rootID == event.rootID && !folder.standardizedRelativePath.isEmpty {
@@ -2313,7 +2315,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             removeFileFromParentChildrenArray(fileVM)
             fileHierarchyIndex.removeFile(forKey: fullPath, expectedRootKey: rootKey)
             topologyChanged = true
-            if let formerParent { dirtyFolders[formerParent.id] = formerParent }
+            if let formerParent {
+                dirtyFolders[formerParent.id] = formerParent
+            }
         }
 
         var removedFolderRelativePaths = Set(event.removedFolderPaths.map(StandardizedPath.relative))
@@ -2429,7 +2433,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         #endif
         let file = fileHierarchyIndex.filesByID[id]
         #if DEBUG
-            if file == nil { appliedIndexProjectionDirectIDLookupMissCount += 1 }
+            if file == nil {
+                appliedIndexProjectionDirectIDLookupMissCount += 1
+            }
         #endif
         return file
     }
@@ -2441,7 +2447,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         #endif
         let folder = fileHierarchyIndex.foldersByID[id]
         #if DEBUG
-            if folder == nil { appliedIndexProjectionDirectIDLookupMissCount += 1 }
+            if folder == nil {
+                appliedIndexProjectionDirectIDLookupMissCount += 1
+            }
         #endif
         return folder
     }
@@ -2505,7 +2513,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         for path in expandedFolderPaths {
             if let root = rootFolders.first(where: { path.hasPrefix($0.standardizedFullPath) }) {
                 var rel = String(path.dropFirst(root.standardizedFullPath.count))
-                if rel.hasPrefix("/") { rel.removeFirst() }
+                if rel.hasPrefix("/") {
+                    rel.removeFirst()
+                }
                 results.append(rel)
             }
         }
@@ -3163,7 +3173,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         do {
             try await workspaceFileContextStore.startWatchingRoot(id: rootRecord.id)
         } catch {
-            if error is CancellationError { throw error }
+            if error is CancellationError {
+                throw error
+            }
             deferredWatcherStartError = error
         }
         guard workspaceFileContextRootsByRootKey[rootKey]?.id == rootRecord.id else { return }
@@ -4531,7 +4543,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         if let parent = fileHierarchyIndex.foldersByFullPath[parentFull] {
             let isRoot = rootFolders.contains { $0.id == parent.id }
             let isLinked = (parent.parent != nil) || isRoot
-            if !isLinked { createMissingParentFolder(parentPath: parentRel, under: root) }
+            if !isLinked {
+                createMissingParentFolder(parentPath: parentRel, under: root)
+            }
 
             guard canAttachFolder(folderVM, to: parent) else {
                 logInvalidFolderAttach(child: folderVM, parent: parent, root: root, reason: "invalid-parent-attachment")
@@ -4560,10 +4574,14 @@ class WorkspaceFilesViewModel: ObservableObject {
     /// ─────────────────────────────────────────────────────────────
     @MainActor
     private func canAttachFolder(_ child: FolderViewModel, to parent: FolderViewModel) -> Bool {
-        if child.id == parent.id { return false }
+        if child.id == parent.id {
+            return false
+        }
         let parentPath = parent.standardizedFullPath
         let childPath = child.standardizedFullPath
-        if childPath == parentPath { return false }
+        if childPath == parentPath {
+            return false
+        }
         let prefix = parentPath.hasSuffix("/") ? parentPath : parentPath + "/"
         return childPath.hasPrefix(prefix)
     }
@@ -7114,7 +7132,9 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func folderForFullPathCaseInsensitive(_ path: String) -> FolderViewModel? {
         let std = (path as NSString).standardizingPath
         // 1) fast exact hit
-        if let exact = fileHierarchyIndex.foldersByFullPath[std] { return exact }
+        if let exact = fileHierarchyIndex.foldersByFullPath[std] {
+            return exact
+        }
         // 2) fallback O(n) ‑ single pass, case‑folded compare
         let lower = std.lowercased()
         return fileHierarchyIndex
@@ -7322,7 +7342,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         var stack: [FolderViewModel] = [folder]
         while let current = stack.popLast() {
             guard visitedFolderIDs.insert(current.id).inserted else { continue }
-            if current.relativePath == relativePath { return current }
+            if current.relativePath == relativePath {
+                return current
+            }
             for child in current.children {
                 if case let .folder(sub) = child {
                     stack.append(sub)
@@ -7971,10 +7993,14 @@ class WorkspaceFilesViewModel: ObservableObject {
             let bKey = canonical(b.fullPath)
             let aFound = indexByCanonical[aKey] != nil
             let bFound = indexByCanonical[bKey] != nil
-            if aFound != bFound { return aFound }
+            if aFound != bFound {
+                return aFound
+            }
             let ai = indexByCanonical[aKey] ?? Int.max
             let bi = indexByCanonical[bKey] ?? Int.max
-            if ai != bi { return ai < bi }
+            if ai != bi {
+                return ai < bi
+            }
             let ao = originalIndex[aKey] ?? Int.max
             let bo = originalIndex[bKey] ?? Int.max
             return ao < bo
@@ -8145,7 +8171,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             return rootFolders.filter { !gitDataRootIDs.contains($0.id) }
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             return rootFolders.filter { root in
-                if physicalRootPaths.contains(root.standardizedFullPath) { return true }
+                if physicalRootPaths.contains(root.standardizedFullPath) {
+                    return true
+                }
                 return visibleRootFolders.contains(where: { $0.id == root.id })
                     && canonicalRootPaths.contains(root.standardizedFullPath)
             }
@@ -8511,11 +8539,17 @@ class WorkspaceFilesViewModel: ObservableObject {
             ))
             switch kind {
             case .file:
-                if findFileByFullPath(abs) != nil { return nil }
+                if findFileByFullPath(abs) != nil {
+                    return nil
+                }
             case .folder:
-                if findFolderByFullPath(abs) != nil { return nil }
+                if findFolderByFullPath(abs) != nil {
+                    return nil
+                }
             case .either:
-                if findFileByFullPath(abs) != nil || findFolderByFullPath(abs) != nil { return nil }
+                if findFileByFullPath(abs) != nil || findFolderByFullPath(abs) != nil {
+                    return nil
+                }
             }
         case .notAliasPrefixed:
             break
@@ -8639,7 +8673,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             guard let folderSoFar = currentFolder else { break }
             if let childFolder = folderSoFar.children
                 .compactMap({ item -> FolderViewModel? in
-                    if case let .folder(f) = item { return f }
+                    if case let .folder(f) = item {
+                        return f
+                    }
                     return nil
                 })
                 .first(where: { $0.name == component })
@@ -10792,7 +10828,9 @@ extension WorkspaceFilesViewModel {
         // Fast-exit if nothing changes (preserves @Published churn)
         let idsUnchanged = (newIDs == selectedFileIDs)
         let filesUnchanged: Bool = {
-            if newFiles.count != selectedFiles.count { return false }
+            if newFiles.count != selectedFiles.count {
+                return false
+            }
             // Compare by stable identity (UUID)
             let lhs = newFiles.map(\.id)
             let rhs = selectedFiles.map(\.id)
@@ -10920,7 +10958,9 @@ extension WorkspaceFilesViewModel {
     @MainActor
     private func flushPendingSelectionChanges() {
         // Fast-exit ─ nothing queued
-        if pendingSelectionAdds.isEmpty, pendingSelectionRemoves.isEmpty { return }
+        if pendingSelectionAdds.isEmpty, pendingSelectionRemoves.isEmpty {
+            return
+        }
 
         // Start from the current snapshot
         var newArray = selectedFiles
@@ -11290,7 +11330,9 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     private func applySelectionSnapshot(paths: [String], allowEmpty: Bool) async {
-        if paths.isEmpty && !allowEmpty { return }
+        if paths.isEmpty && !allowEmpty {
+            return
+        }
         let foundFiles = await findFiles(atPaths: paths)
         let targetFiles = Array(foundFiles.values)
         let targetIDs = Set(targetFiles.map(\.id))
@@ -12137,7 +12179,9 @@ extension WorkspaceFilesViewModel {
                     .components(separatedBy: .newlines)
                     .contains { $0.trimmingCharacters(in: .whitespaces) == finalLine }
 
-                if alreadyPresent { return } // nothing to do
+                if alreadyPresent {
+                    return
+                } // nothing to do
 
                 let needsNL = existing.isEmpty ? "" :
                     (existing.hasSuffix("\n") ? "" : "\n")
@@ -12379,7 +12423,9 @@ extension WorkspaceFilesViewModel {
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while ContinuousClock.now < deadline {
-            if required.allSatisfy({ isCaughtUp($0.state) }) { return [] }
+            if required.allSatisfy({ isCaughtUp($0.state) }) {
+                return []
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         return Set(required.compactMap { isCaughtUp($0.state) ? nil : $0.fullPath })
@@ -12673,7 +12719,9 @@ extension WorkspaceFilesViewModel {
             let normalizedRanges = SliceRangeMath.normalize(result.rebased)
             let nextAnchors: [SliceAnchor]? = {
                 guard !normalizedRanges.isEmpty else { return nil }
-                if Task.isCancelled { return stored.anchors }
+                if Task.isCancelled {
+                    return stored.anchors
+                }
                 return SliceRebaseEngine.buildAnchors(content: newText, ranges: normalizedRanges)
             }()
             return (normalizedRanges, nextAnchors, false)

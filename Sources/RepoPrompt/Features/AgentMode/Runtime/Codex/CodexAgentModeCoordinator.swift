@@ -336,7 +336,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
         activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in true },
         leaseRoutingTimeoutMs: Int = 2000,
-        idleShutdownDelayNanos: UInt64 = 300_000_000_000,
+        idleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos,
         stallWatchdogPollIntervalNanos: UInt64 = 5_000_000_000,
         stallWatchdogProbeThreshold: TimeInterval = 0,
         stallWatchdogRecoveryThreshold: TimeInterval = 0,
@@ -356,7 +356,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.activeAgentRunWaitQuery = activeAgentRunWaitQuery
         self.activeAgentRunWaitDrain = activeAgentRunWaitDrain
         codexLeaseRoutingTimeoutMs = max(500, leaseRoutingTimeoutMs)
-        codexIdleShutdownDelayNanos = max(1_000_000, idleShutdownDelayNanos)
+        codexIdleShutdownDelayNanos = AgentModeIdleShutdownPolicy.normalizedDelayNanos(idleShutdownDelayNanos)
         codexStallWatchdogPollIntervalNanos = max(10_000_000, stallWatchdogPollIntervalNanos)
         let normalizedProbeThreshold = max(0, stallWatchdogProbeThreshold)
         let normalizedRecoveryThreshold = max(0, stallWatchdogRecoveryThreshold)
@@ -1117,8 +1117,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return lhs.isPlaceholderDefault && !rhs.isPlaceholderDefault
             }
 
-            if AIModel.codexBaseModelPrecedes(lhs.rawValue, rhs.rawValue) { return true }
-            if AIModel.codexBaseModelPrecedes(rhs.rawValue, lhs.rawValue) { return false }
+            if AIModel.codexBaseModelPrecedes(lhs.rawValue, rhs.rawValue) {
+                return true
+            }
+            if AIModel.codexBaseModelPrecedes(rhs.rawValue, lhs.rawValue) {
+                return false
+            }
 
             let leftInsertionOrder = insertionOrderByRaw[lhs.rawValue.lowercased()] ?? Int.max
             let rightInsertionOrder = insertionOrderByRaw[rhs.rawValue.lowercased()] ?? Int.max
@@ -1547,11 +1551,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         let chosenEffort: CodexReasoningEffort? = {
             guard !options.isEmpty else { return nil }
-            if let explicitEffort, options.contains(explicitEffort) { return explicitEffort }
-            if let parsedEffort = parsed.reasoningEffort, options.contains(parsedEffort) { return parsedEffort }
-            if let lastUsed, options.contains(lastUsed) { return lastUsed }
-            if let defaultEffort, options.contains(defaultEffort) { return defaultEffort }
-            if options.contains(.medium) { return .medium }
+            if let explicitEffort, options.contains(explicitEffort) {
+                return explicitEffort
+            }
+            if let parsedEffort = parsed.reasoningEffort, options.contains(parsedEffort) {
+                return parsedEffort
+            }
+            if let lastUsed, options.contains(lastUsed) {
+                return lastUsed
+            }
+            if let defaultEffort, options.contains(defaultEffort) {
+                return defaultEffort
+            }
+            if options.contains(.medium) {
+                return .medium
+            }
             return options.first
         }()
         let model = normalizedSpecifier.appServerModelParam
@@ -2745,7 +2759,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         error: Error
     ) -> Bool {
         guard existingRef != nil else { return false }
-        if error is CancellationError { return false }
+        if error is CancellationError {
+            return false
+        }
 
         let nsError = error as NSError
         let candidates = [
@@ -5944,8 +5960,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] compact turnCompleted turnID=\(turnID ?? "nil") status=\(status) runState=\(session.runState)")
                 return
             }
-            if session.runState == .cancelled, status != .interrupted { return }
-            if session.runState == .failed, status != .failed { return }
+            if session.runState == .cancelled, status != .interrupted {
+                return
+            }
+            if session.runState == .failed, status != .failed {
+                return
+            }
             await finalizeCodexRun(
                 session,
                 turnStatus: status,
@@ -6238,11 +6258,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         for key in ["processId", "process_id"] {
             if let value = object[key] as? String {
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
             }
             if let value = object[key] as? NSNumber {
                 let text = value.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty { return text }
+                if !text.isEmpty {
+                    return text
+                }
             }
         }
         return nil
@@ -6370,7 +6394,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         let item = session.items[index]
         let metadata = BashToolResultParser.parseLivenessMetadata(raw: item.toolResultJSON)
-        if metadata.isRunning { return true }
+        if metadata.isRunning {
+            return true
+        }
         return Self.isTerminalBashTranscriptItem(item, metadata: metadata)
     }
 
@@ -6384,8 +6410,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) -> Bool {
         guard item.kind == .toolResult else { return false }
         guard !metadata.isRunning else { return false }
-        if item.toolIsError != nil { return true }
-        if metadata.exitCode != nil { return true }
+        if item.toolIsError != nil {
+            return true
+        }
+        if metadata.exitCode != nil {
+            return true
+        }
         return AgentTranscriptToolStatusSemantics.isTerminalStatusWord(metadata.statusWord)
     }
 
@@ -6393,8 +6423,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ item: AgentChatItem,
         metadata: BashToolResultParser.Metadata
     ) -> Bool {
-        if item.toolIsError == true { return true }
-        if let exitCode = metadata.exitCode, exitCode != 0 { return true }
+        if item.toolIsError == true {
+            return true
+        }
+        if let exitCode = metadata.exitCode, exitCode != 0 {
+            return true
+        }
         let normalizedStatus = AgentTranscriptToolStatusSemantics.normalizedStatusWord(metadata.statusWord)
         return normalizedStatus == "failed" || normalizedStatus == "cancelled"
     }

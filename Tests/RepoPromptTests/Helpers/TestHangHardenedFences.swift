@@ -127,7 +127,9 @@ final class TestReleaseFence: @unchecked Sendable {
         timeout: TimeInterval,
         failOnTimeout: Bool = true
     ) async -> Bool {
-        if hasEntered { return true }
+        if hasEntered {
+            return true
+        }
         do {
             try await AsyncTestWait.waitUntil(
                 "\(name) entered",
@@ -374,7 +376,9 @@ final class TestCancellationGate: @unchecked Sendable {
         timeout: TimeInterval = TestFenceDefaults.enterWait,
         failOnTimeout: Bool = true
     ) async -> Bool {
-        if hasEnteredForTesting { return true }
+        if hasEnteredForTesting {
+            return true
+        }
         do {
             try await AsyncTestWait.waitUntil(
                 "\(name) entered",

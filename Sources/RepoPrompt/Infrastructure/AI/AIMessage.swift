@@ -180,9 +180,13 @@ struct AIMessage {
         for section in promptSectionsOrder where !disabledPromptSections.contains(section) {
             switch section {
             case .fileMap:
-                if !fileTree.isEmpty { parts.append(fileTreeXML) }
+                if !fileTree.isEmpty {
+                    parts.append(fileTreeXML)
+                }
             case .fileContents:
-                if !fileBlocks.isEmpty { parts.append(fileBlocksXML) }
+                if !fileBlocks.isEmpty {
+                    parts.append(fileBlocksXML)
+                }
             case .metaPrompts:
                 if !metaPrompts.isEmpty {
                     parts.append(metaPrompts.joined(separator: "\n"))
@@ -199,7 +203,9 @@ struct AIMessage {
 
         // ───── 3)  Inline system prompt (optional)  ─────
         if embedSystemPrompt, !systemPrompt.isEmpty {
-            if !parts.isEmpty { parts.append("") } // blank line separator
+            if !parts.isEmpty {
+                parts.append("")
+            } // blank line separator
             parts.append(systemPrompt)
         }
 

@@ -84,7 +84,9 @@ enum DecoyPlanner {
             candidatePaths.removeAll { p in
                 fs.content(for: p) != nil || baseline.content(for: p) != nil
             }
-            if candidatePaths.isEmpty { continue }
+            if candidatePaths.isEmpty {
+                continue
+            }
 
             // For each decoy path, insert halo variants (slight differences near the core boundaries).
             var variantIndex = 0
@@ -96,7 +98,9 @@ enum DecoyPlanner {
                 produced.append(DecoySpec(path: decoyPath, sourcePath: sourcePath, kind: .identicalCoreVariantHalo, coreLineSpan: newSpan))
                 variantIndex += 1
                 decoyBudget -= 1
-                if decoyBudget == 0 { break outer }
+                if decoyBudget == 0 {
+                    break outer
+                }
             }
         }
 
@@ -161,14 +165,18 @@ private extension DecoyPlanner {
         func uniqueAppend(_ path: String) {
             let norm = BenchmarkMockFileSystem.normalize(path)
             guard !norm.isEmpty else { return }
-            if !paths.contains(norm) { paths.append(norm) }
+            if !paths.contains(norm) {
+                paths.append(norm)
+            }
         }
 
         switch task.type {
         case .insertGuardTs, .insertGuardGo, .insertGuardSwift:
             if let arr = task.params["guards"]?.arrayValue {
                 for item in arr {
-                    if let p = item.objectValue?["path"]?.stringValue { uniqueAppend(p) }
+                    if let p = item.objectValue?["path"]?.stringValue {
+                        uniqueAppend(p)
+                    }
                 }
             } else if let p = task.params["file"]?.stringValue {
                 uniqueAppend(p)
@@ -178,7 +186,9 @@ private extension DecoyPlanner {
         case .patchBlockTs, .patchBlockGo, .patchBlockSwift:
             if let arr = task.params["blocks"]?.arrayValue {
                 for item in arr {
-                    if let p = item.objectValue?["path"]?.stringValue { uniqueAppend(p) }
+                    if let p = item.objectValue?["path"]?.stringValue {
+                        uniqueAppend(p)
+                    }
                 }
             } else if let p = task.selectFiles.first {
                 uniqueAppend(p)
@@ -186,7 +196,9 @@ private extension DecoyPlanner {
         case .swapArgsInRegionTs, .swapArgsInRegionGo, .swapArgsInRegionSwift:
             if let arr = task.params["regions"]?.arrayValue {
                 for item in arr {
-                    if let p = item.objectValue?["path"]?.stringValue { uniqueAppend(p) }
+                    if let p = item.objectValue?["path"]?.stringValue {
+                        uniqueAppend(p)
+                    }
                 }
             } else if let p = task.selectFiles.first {
                 uniqueAppend(p)
@@ -200,7 +212,9 @@ private extension DecoyPlanner {
             }
         default:
             // For other tasks, best-effort: prefer first selection
-            if let p = task.selectFiles.first { uniqueAppend(p) }
+            if let p = task.selectFiles.first {
+                uniqueAppend(p)
+            }
         }
 
         return paths
@@ -354,7 +368,9 @@ extension DecoyPlanner {
             if !norm.isEmpty, seen.insert(norm).inserted {
                 results.append(norm)
             }
-            if results.count >= max(0, count) { break }
+            if results.count >= max(0, count) {
+                break
+            }
         }
         return results
     }
@@ -524,8 +540,12 @@ private extension DecoyPlanner {
             // Grab until next non-UID char
             var collected = ""
             for ch in after {
-                if ch == " " || ch == "*" || ch == "/" || ch == "-" { break }
-                if ch == ":" { continue }
+                if ch == " " || ch == "*" || ch == "/" || ch == "-" {
+                    break
+                }
+                if ch == ":" {
+                    continue
+                }
                 collected.append(ch)
             }
             // Trim trailing ornaments

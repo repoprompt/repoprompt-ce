@@ -99,6 +99,12 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`agent_perf_metrics` is only available in DEBUG builds.")
                 #endif
+            case "agent_memory_snapshot":
+                #if DEBUG
+                    return await debugAgentMemorySnapshotPayload(op: op, arguments: arguments)
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`agent_memory_snapshot` is only available in DEBUG builds.")
+                #endif
             case "seed_agent_text_derivation_fixture":
                 #if DEBUG
                     return await debugSeedAgentTextDerivationFixturePayload(op: op, arguments: arguments)
@@ -351,7 +357,9 @@ import MCP
         }
 
         static func debugOptionalValue(_ value: (some Any)?) -> Any {
-            if let value { return value }
+            if let value {
+                return value
+            }
             return NSNull()
         }
 
@@ -376,13 +384,102 @@ import MCP
         }
 
         private nonisolated static func debugJSONString(_ object: [String: Any]) -> String {
+            let sanitized = debugJSONCompatibleObject(object)
+            guard JSONSerialization.isValidJSONObject(sanitized) else {
+                return "{\"ok\":false,\"error\":\"Unable to encode debug response: sanitized payload is not a valid JSON object.\"}"
+            }
             do {
-                let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+                let data = try JSONSerialization.data(withJSONObject: sanitized, options: [.sortedKeys])
                 return String(data: data, encoding: .utf8) ?? "{\"ok\":false,\"error\":\"Unable to encode debug response.\"}"
             } catch {
                 let escaped = String(describing: error).replacingOccurrences(of: "\"", with: "\\\"")
                 return "{\"ok\":false,\"error\":\"Unable to encode debug response: \(escaped)\"}"
             }
+        }
+
+        private nonisolated static func debugJSONCompatibleObject(_ object: [String: Any]) -> [String: Any] {
+            var sanitized: [String: Any] = [:]
+            sanitized.reserveCapacity(object.count)
+            for (key, value) in object {
+                sanitized[key] = debugJSONCompatibleValue(value)
+            }
+            return sanitized
+        }
+
+        private nonisolated static func debugJSONCompatibleValue(_ value: Any) -> Any {
+            if value is NSNull {
+                return NSNull()
+            }
+            if let value = value as? String {
+                return value
+            }
+            if let value = value as? Bool {
+                return value
+            }
+            if let value = value as? Int {
+                return value
+            }
+            if let value = value as? Int8 {
+                return Int(value)
+            }
+            if let value = value as? Int16 {
+                return Int(value)
+            }
+            if let value = value as? Int32 {
+                return Int(value)
+            }
+            if let value = value as? Int64 {
+                return value
+            }
+            if let value = value as? UInt {
+                return NSNumber(value: value)
+            }
+            if let value = value as? UInt8 {
+                return Int(value)
+            }
+            if let value = value as? UInt16 {
+                return Int(value)
+            }
+            if let value = value as? UInt32 {
+                return NSNumber(value: value)
+            }
+            if let value = value as? UInt64 {
+                return NSNumber(value: value)
+            }
+            if let value = value as? Float {
+                return value.isFinite ? Double(value) : NSNull()
+            }
+            if let value = value as? Double {
+                return value.isFinite ? value : NSNull()
+            }
+            if let value = value as? NSNumber {
+                let double = value.doubleValue
+                return double.isFinite ? value : NSNull()
+            }
+            if let value = value as? Date {
+                return AgentMCPToolHelpers.timestamp(value)
+            }
+            if let value = value as? UUID {
+                return value.uuidString
+            }
+            if let value = value as? [String: Any] {
+                return debugJSONCompatibleObject(value)
+            }
+            if let value = value as? [Any] {
+                return value.map(debugJSONCompatibleValue)
+            }
+            if let value = value as? NSDictionary {
+                var dictionary: [String: Any] = [:]
+                dictionary.reserveCapacity(value.count)
+                for (rawKey, rawValue) in value {
+                    dictionary[String(describing: rawKey)] = debugJSONCompatibleValue(rawValue)
+                }
+                return dictionary
+            }
+            if let value = value as? NSArray {
+                return value.map(debugJSONCompatibleValue)
+            }
+            return String(describing: value)
         }
 
         func debugLargeWorkspaceMemoryPayload(op: String, arguments: [String: Value]) async -> CallTool.Result {

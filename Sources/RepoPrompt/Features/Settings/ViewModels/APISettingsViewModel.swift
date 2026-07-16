@@ -110,7 +110,9 @@ enum ClaudeCodeCLIStatus: Equatable {
     }
 
     var isKnownMissing: Bool {
-        if case .binaryMissing = self { return true }
+        if case .binaryMissing = self {
+            return true
+        }
         return false
     }
 }
@@ -124,7 +126,9 @@ enum ClaudeCompatibleBackendTestResult: Equatable {
     case failed(message: String)
 
     var isSuccess: Bool {
-        if case .success = self { return true }
+        if case .success = self {
+            return true
+        }
         return false
     }
 
@@ -449,7 +453,9 @@ public class APISettingsViewModel: ObservableObject {
         provider: AgentProviderKind
     ) -> ProviderStatusSnapshot.Availability {
         guard isConnected else { return .notConfigured }
-        if isVerifiedContextBuilderProvider(provider) { return .ready }
+        if isVerifiedContextBuilderProvider(provider) {
+            return .ready
+        }
         return isContextBuilderProviderValidationComplete ? .notConfigured : .configured
     }
 
@@ -665,14 +671,24 @@ public class APISettingsViewModel: ObservableObject {
     func compatibleBackendStatusLabel(for id: ClaudeCodeCompatibleBackendID) -> String {
         let config = compatibleBackendConfig(for: id)
         let hasSecret = compatibleBackendHasSecret(id)
-        if id == .custom, !config.isEnabled { return "Off" }
-        if claudeCodeCLIStatus.isKnownMissing { return "Needs Claude CLI" }
-        if !hasSecret { return "Needs API key" }
-        if !config.isValid { return "Incomplete" }
+        if id == .custom, !config.isEnabled {
+            return "Off"
+        }
+        if claudeCodeCLIStatus.isKnownMissing {
+            return "Needs Claude CLI"
+        }
+        if !hasSecret {
+            return "Needs API key"
+        }
+        if !config.isValid {
+            return "Incomplete"
+        }
         if let result = compatibleBackendLastTestResult[id] {
             return result.isSuccess ? "Active · Tested" : "Test failed"
         }
-        if compatibleBackendIsActive(id) { return "Ready" }
+        if compatibleBackendIsActive(id) {
+            return "Ready"
+        }
         return "Not Configured"
     }
 
@@ -1128,7 +1144,9 @@ public class APISettingsViewModel: ObservableObject {
     @MainActor
     func validateCachedContextBuilderProvidersIfNeeded() async {
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
-        if isContextBuilderProviderValidationComplete { return }
+        if isContextBuilderProviderValidationComplete {
+            return
+        }
         if let contextBuilderProviderValidationTask {
             await contextBuilderProviderValidationTask.value
             return
@@ -1138,7 +1156,9 @@ public class APISettingsViewModel: ObservableObject {
         // A live refresh may legitimately omit dynamic metadata, especially for Cursor.
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
-        if isContextBuilderProviderValidationComplete { return }
+        if isContextBuilderProviderValidationComplete {
+            return
+        }
         if let contextBuilderProviderValidationTask {
             await contextBuilderProviderValidationTask.value
             return
@@ -1472,20 +1492,42 @@ public class APISettingsViewModel: ObservableObject {
         // 4. Fire-and-forget model-catalogue fetches (always refresh)
         // ----------------------------------------------------------------
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
-        if isOpenAIKeyValid { openAIModelsTask = Task { await self.updateOpenAIModels() } }
-        if isDeepSeekKeyValid { deepSeekModelsTask = Task { await self.updateDeepSeekModels() } }
-        if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
-        if isGrokKeyValid { grokModelsTask = Task { await self.updateGrokModels() } }
-        if isGroqKeyValid { groqModelsTask = Task { await self.updateGroqModels() } }
+        if isOpenAIKeyValid {
+            openAIModelsTask = Task { await self.updateOpenAIModels() }
+        }
+        if isDeepSeekKeyValid {
+            deepSeekModelsTask = Task { await self.updateDeepSeekModels() }
+        }
+        if isFireworksKeyValid {
+            fireworksModelsTask = Task { await self.updateFireworksModels() }
+        }
+        if isGrokKeyValid {
+            grokModelsTask = Task { await self.updateGrokModels() }
+        }
+        if isGroqKeyValid {
+            groqModelsTask = Task { await self.updateGroqModels() }
+        }
         if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
             startCodexModelsSubscriptionIfNeeded()
         } else {
             stopCodexModelsSubscription()
         }
-        if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
-        if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
-        if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
-        if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
+        if isOpenCodeConnected {
+            startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil)
+        } else {
+            stopOpenCodeModelsSubscription(clearModels: true)
+        }
+        if isCursorConnected {
+            startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
+        } else {
+            stopCursorModelsSubscription(clearModels: true)
+        }
+        if isOpenRouterKeyValid {
+            openRouterModelsTask = Task { await self.fetchOpenRouterModels() }
+        }
+        if isCustomProviderValid {
+            customModelsTask = Task { await self.fetchCustomModels() }
+        }
 
         // ----------------------------------------------------------------
         // 5. Build initial UI list from whatever caches we already have
@@ -2091,7 +2133,9 @@ public class APISettingsViewModel: ObservableObject {
             openAIApiKey = trimmed
             isOpenAIKeyValid = true
             await updateOpenAIModels()
-        } else { isOpenAIKeyValid = false }
+        } else {
+            isOpenAIKeyValid = false
+        }
         return ok
     }
 
@@ -2307,7 +2351,9 @@ public class APISettingsViewModel: ObservableObject {
             try await keyManager.saveAPIKey(trimmed, for: .gemini)
             geminiApiKey = trimmed
             isGeminiKeyValid = true
-        } else { isGeminiKeyValid = false }
+        } else {
+            isGeminiKeyValid = false
+        }
         return ok
     }
 
@@ -2320,7 +2366,9 @@ public class APISettingsViewModel: ObservableObject {
             deepSeekApiKey = trimmed
             isDeepSeekKeyValid = true
             await updateDeepSeekModels()
-        } else { isDeepSeekKeyValid = false }
+        } else {
+            isDeepSeekKeyValid = false
+        }
         return ok
     }
 
@@ -2333,7 +2381,9 @@ public class APISettingsViewModel: ObservableObject {
             fireworksApiKey = trimmed
             isFireworksKeyValid = true
             await updateFireworksModels()
-        } else { isFireworksKeyValid = false }
+        } else {
+            isFireworksKeyValid = false
+        }
         return ok
     }
 
@@ -2345,7 +2395,9 @@ public class APISettingsViewModel: ObservableObject {
             grokApiKey = trimmed
             isGrokKeyValid = true
             await updateGrokModels()
-        } else { isGrokKeyValid = false }
+        } else {
+            isGrokKeyValid = false
+        }
         return ok
     }
 
@@ -2357,7 +2409,9 @@ public class APISettingsViewModel: ObservableObject {
             groqApiKey = trimmed
             isGroqKeyValid = true
             await updateGroqModels()
-        } else { isGroqKeyValid = false }
+        } else {
+            isGroqKeyValid = false
+        }
         return ok
     }
 

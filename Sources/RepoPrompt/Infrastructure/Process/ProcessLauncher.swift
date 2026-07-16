@@ -94,8 +94,12 @@ enum ProcessLauncher {
         var stderrPipe: [Int32] = [-1, -1]
 
         func closePipe(_ pipe: inout [Int32]) {
-            if pipe[0] != -1 { close(pipe[0]) }
-            if pipe[1] != -1 { close(pipe[1]) }
+            if pipe[0] != -1 {
+                close(pipe[0])
+            }
+            if pipe[1] != -1 {
+                close(pipe[1])
+            }
             pipe = [-1, -1]
         }
 

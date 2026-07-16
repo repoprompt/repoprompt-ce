@@ -36,8 +36,12 @@ enum MCPClientIdentity {
 
     static func canonicalFamilyID(_ raw: String?) -> String? {
         guard let normalized = normalized(raw) else { return nil }
-        if matchesFamily(normalized, tokens: ["claude", "code"]) { return "claude-code" }
-        if matchesFamily(normalized, tokens: ["codex", "mcp", "client"]) { return "codex-mcp-client" }
+        if matchesFamily(normalized, tokens: ["claude", "code"]) {
+            return "claude-code"
+        }
+        if matchesFamily(normalized, tokens: ["codex", "mcp", "client"]) {
+            return "codex-mcp-client"
+        }
         if matchesFamily(normalized, tokens: ["gemini", "cli", "mcp", "client"])
             || matchesFamily(normalized, tokens: ["gemini", "cli"])
         {
@@ -49,8 +53,12 @@ enum MCPClientIdentity {
         {
             return "cursor"
         }
-        if matchesFamily(normalized, tokens: ["claude", "ai"]) { return "claude-ai" }
-        if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) { return "repoprompt-cli" }
+        if matchesFamily(normalized, tokens: ["claude", "ai"]) {
+            return "claude-ai"
+        }
+        if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) {
+            return "repoprompt-cli"
+        }
         return nil
     }
 

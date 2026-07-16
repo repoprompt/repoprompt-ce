@@ -3837,7 +3837,9 @@ import XCTest
             let deadline = clock.now.advanced(by: timeout)
             while clock.now < deadline {
                 let snapshot = await limiter.debugSnapshot()
-                if predicate(snapshot) { return snapshot }
+                if predicate(snapshot) {
+                    return snapshot
+                }
                 try? await Task.sleep(for: .milliseconds(5))
             }
             let snapshot = await limiter.debugSnapshot()
@@ -3873,7 +3875,9 @@ import XCTest
 
         private func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in
-                if case let .text(text, _, _) = content { return text }
+                if case let .text(text, _, _) = content {
+                    return text
+                }
                 return nil
             }.joined()
             let data = try XCTUnwrap(text.data(using: .utf8))
@@ -4104,7 +4108,9 @@ import XCTest
         }
 
         func waitUntil(_ target: Int, timeout: Duration) async -> Int? {
-            if value >= target { return value }
+            if value >= target {
+                return value
+            }
             let waiterID = UUID()
             return await withCheckedContinuation { continuation in
                 waiters[waiterID] = Waiter(target: target, continuation: continuation)

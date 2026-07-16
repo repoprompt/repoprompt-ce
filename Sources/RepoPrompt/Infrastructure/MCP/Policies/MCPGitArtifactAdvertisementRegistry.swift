@@ -180,7 +180,9 @@ final class MCPGitArtifactAdvertisementRegistry {
         }
 
         nextGeneration &+= 1
-        if nextGeneration == 0 { nextGeneration = 1 }
+        if nextGeneration == 0 {
+            nextGeneration = 1
+        }
         let provenance = MCPGitArtifactAdvertisementProvenance(
             identity: identity,
             capability: capability

@@ -812,7 +812,9 @@ final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
                 }
                 var values: [Data] = []
                 for try await value in group {
-                    if let value { values.append(value) }
+                    if let value {
+                        values.append(value)
+                    }
                 }
                 return values
             }
@@ -1008,7 +1010,9 @@ final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
     ) async throws {
         let deadline = Date().addingTimeInterval(2)
         repeat {
-            if await predicate() { return }
+            if await predicate() {
+                return
+            }
             try await Task.sleep(nanoseconds: 1_000_000)
         } while Date() < deadline
         XCTFail("Timed out waiting for deterministic cache state", file: file, line: line)
@@ -1131,7 +1135,9 @@ final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
             return false
         }
         while let url = enumerator.nextObject() as? URL {
-            if url.lastPathComponent.hasPrefix("run.") { return true }
+            if url.lastPathComponent.hasPrefix("run.") {
+                return true
+            }
         }
         return false
     }
@@ -1988,7 +1994,9 @@ private actor PrefixControlCollectorGate {
     }
 
     func waitUntilCollectionStarts() async {
-        if count > 0 { return }
+        if count > 0 {
+            return
+        }
         await withCheckedContinuation { collectionStartWaiters.append($0) }
     }
 }

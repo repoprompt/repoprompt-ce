@@ -242,7 +242,11 @@ struct AgentWorkspaceRootsSectionView: View {
         .padding(.bottom, panelBottomPadding)
         .alert("Error Adding Folder", isPresented: Binding(
             get: { addFolderError != nil },
-            set: { if !$0 { addFolderError = nil } }
+            set: {
+                if !$0 {
+                    addFolderError = nil
+                }
+            }
         )) {
             Button("OK") { addFolderError = nil }
         } message: {

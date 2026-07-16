@@ -188,7 +188,9 @@ struct AIModelDropdown: View {
         for backendID in grouped.keys.sorted(by: {
             let lhsRank = backendSortOrder[$0] ?? Int.max
             let rhsRank = backendSortOrder[$1] ?? Int.max
-            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            if lhsRank != rhsRank {
+                return lhsRank < rhsRank
+            }
             return compatibleClaudeBackendTopLevelDisplayName(for: $0).localizedCaseInsensitiveCompare(
                 compatibleClaudeBackendTopLevelDisplayName(for: $1)
             ) == .orderedAscending
@@ -198,7 +200,9 @@ struct AIModelDropdown: View {
                 .sorted { lhs, rhs in
                     let lhsRank = compatibleClaudeBackendOptionRank(lhs.1.requestedModelRaw)
                     let rhsRank = compatibleClaudeBackendOptionRank(rhs.1.requestedModelRaw)
-                    if lhsRank != rhsRank { return lhsRank < rhsRank }
+                    if lhsRank != rhsRank {
+                        return lhsRank < rhsRank
+                    }
                     return lhs.1.optionDisplayName.localizedCaseInsensitiveCompare(rhs.1.optionDisplayName) == .orderedAscending
                 }
                 .map(\.0)

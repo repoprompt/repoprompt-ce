@@ -355,7 +355,9 @@ enum CodexIntegrationConfiguration {
 
             if isTOMLHeaderLine(line) {
                 finalizeSection(before: idx)
-                if completed { break }
+                if completed {
+                    break
+                }
                 resetSectionState(at: idx, isRepoPrompt: isRepoPromptMCPServerHeader(line))
                 idx += 1
                 continue
@@ -553,7 +555,9 @@ enum CodexIntegrationConfiguration {
             components.append(component)
             expectingComponent = false
             skipWhitespace(in: text, from: &index)
-            if index == text.endIndex { return components }
+            if index == text.endIndex {
+                return components
+            }
             guard text[index] == "." else { return nil }
             index = text.index(after: index)
             expectingComponent = true
@@ -690,7 +694,9 @@ enum CodexIntegrationConfiguration {
             radix = 10
             digitText = unsignedText
             let digitsOnly = digitText.replacingOccurrences(of: "_", with: "")
-            if digitsOnly.count > 1, digitsOnly.first == "0" { return nil }
+            if digitsOnly.count > 1, digitsOnly.first == "0" {
+                return nil
+            }
         }
 
         guard isValidTOMLIntegerDigits(digitText, radix: radix) else { return nil }
@@ -1057,7 +1063,9 @@ enum CodexIntegrationConfiguration {
         within blockRange: BlockRange
     ) -> [Int] {
         var indices: [Int] = []
-        if blockRange.start + 1 >= blockRange.end { return indices }
+        if blockRange.start + 1 >= blockRange.end {
+            return indices
+        }
         for idx in (blockRange.start + 1) ..< blockRange.end {
             if isKeyLine(lines[idx], singleKey: key) {
                 indices.append(idx)

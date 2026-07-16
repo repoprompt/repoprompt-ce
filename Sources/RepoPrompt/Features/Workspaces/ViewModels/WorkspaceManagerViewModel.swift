@@ -860,7 +860,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Async helper to await initialization completion.
     func awaitInitialized() async {
-        if isInitialized, !isSwitchingWorkspace { return }
+        if isInitialized, !isSwitchingWorkspace {
+            return
+        }
         await withCheckedContinuation { continuation in
             onceInitialized { [weak self] in
                 guard let self else {
@@ -1554,9 +1556,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                     let ws = loadResult.workspace
                     #if DEBUG
                         decodedWorkspaceCount += 1
-                        if loadResult.cacheHit { workspaceDecodeCacheHitCount += 1 }
-                        if loadResult.composeTabsNormalized { composeTabNormalizationCount += 1 }
-                        if loadResult.normalizationRequiresSave { normalizationSaveBackCount += 1 }
+                        if loadResult.cacheHit {
+                            workspaceDecodeCacheHitCount += 1
+                        }
+                        if loadResult.composeTabsNormalized {
+                            composeTabNormalizationCount += 1
+                        }
+                        if loadResult.normalizationRequiresSave {
+                            normalizationSaveBackCount += 1
+                        }
                     #endif
                     loaded.append(ws)
                 } else {
@@ -1781,7 +1789,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             var loadedMutable: [WorkspaceModel] = []
 
             for entry in indexEntries {
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    return
+                }
 
                 let wURL: URL
                 if let customURL = entry.customStoragePath {
@@ -1804,7 +1814,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
             // Freeze mutable collection before crossing actor boundary
             let loaded = loadedMutable
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
 
             await MainActor.run { [weak self, loaded, token, currentActiveID] in
                 guard let self else { return }
@@ -1917,7 +1929,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             var updatesMutable: [(id: UUID, presets: [WorkspacePreset], activePresetID: UUID?)] = []
 
             for entry in indexEntries {
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    return
+                }
 
                 let wURL: URL
                 if let customURL = entry.customStoragePath {
@@ -1941,7 +1955,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
             // Freeze mutable collection before crossing actor boundary
             let updates = updatesMutable
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
 
             await MainActor.run { [weak self, updates, token] in
                 guard let self else { return }
@@ -2418,7 +2434,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             } catch {
                 return false
             }
-            if Task.isCancelled { return false }
+            if Task.isCancelled {
+                return false
+            }
             remaining -= interval
         }
         return !isChatBusy
@@ -2564,7 +2582,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     ) async -> Bool {
         guard pendingSwitchConfirmationRequest == nil else { return false }
         return await withTaskCancellationHandler {
-            if Task.isCancelled { return false }
+            if Task.isCancelled {
+                return false
+            }
             return await withCheckedContinuation { continuation in
                 guard ownsWorkspaceSwitchOperation(operationID), !Task.isCancelled else {
                     continuation.resume(returning: false)
@@ -3695,7 +3715,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let oldSelection = workspaces[workspaceIndex].composeTabs[tabIndex].selection
         var updatedTab = tab
-        if touchModified { updatedTab.lastModified = Date() }
+        if touchModified {
+            updatedTab.lastModified = Date()
+        }
         workspaces[workspaceIndex].composeTabs[tabIndex] = updatedTab
         recordSelectionRevisionIfChanged(
             workspaceIndex: workspaceIndex,
@@ -4186,7 +4208,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private nonisolated static func bindingPath(_ child: String, isWithinOrEqualTo parent: String) -> Bool {
-        if child == parent { return true }
+        if child == parent {
+            return true
+        }
         let normalizedParent = parent.hasSuffix("/") ? parent : parent + "/"
         return child.hasPrefix(normalizedParent)
     }
@@ -5658,11 +5682,15 @@ class WorkspaceManagerViewModel: ObservableObject {
         return workspaces.sorted { lhs, rhs in
             let lhsActiveWork = activeWork(lhs)
             let rhsActiveWork = activeWork(rhs)
-            if lhsActiveWork != rhsActiveWork { return lhsActiveWork }
+            if lhsActiveWork != rhsActiveWork {
+                return lhsActiveWork
+            }
 
             let lhsFocused = focused(lhs)
             let rhsFocused = focused(rhs)
-            if lhsFocused != rhsFocused { return lhsFocused }
+            if lhsFocused != rhsFocused {
+                return lhsFocused
+            }
 
             switch (lowestWindowID(lhs), lowestWindowID(rhs)) {
             case let (.some(lhsWindowID), .some(rhsWindowID)) where lhsWindowID != rhsWindowID:
@@ -5677,9 +5705,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
             let lhsVisible = !lhs.isHiddenInMenus
             let rhsVisible = !rhs.isHiddenInMenus
-            if lhsVisible != rhsVisible { return lhsVisible }
-            if lhs.lastUsed != rhs.lastUsed { return lhs.lastUsed > rhs.lastUsed }
-            if lhs.dateModified != rhs.dateModified { return lhs.dateModified > rhs.dateModified }
+            if lhsVisible != rhsVisible {
+                return lhsVisible
+            }
+            if lhs.lastUsed != rhs.lastUsed {
+                return lhs.lastUsed > rhs.lastUsed
+            }
+            if lhs.dateModified != rhs.dateModified {
+                return lhs.dateModified > rhs.dateModified
+            }
             return cleanupWorkspaceSort(lhs, rhs)
         }.first
     }
@@ -6413,8 +6447,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             let initialIndexedResult = await indexedResult
             let initialWarmedResult = await warmedResult
             var indexGeneration = initialIndexedResult.generation
-            if let duration = initialIndexedResult.durationMS { totalSearchIndexRebuildDurationMS += duration }
-            if let duration = initialWarmedResult.durationMS { totalPathLookupWarmDurationMS += duration }
+            if let duration = initialIndexedResult.durationMS {
+                totalSearchIndexRebuildDurationMS += duration
+            }
+            if let duration = initialWarmedResult.durationMS {
+                totalPathLookupWarmDurationMS += duration
+            }
         #else
             async let indexedGeneration = workspaceSearchService.rebuildIndex(from: initialSearchSnapshot)
             async let warmedGeneration = fileManager.workspaceFileContextStore.warmPathLookupIndexes(rootScope: .visibleWorkspace)
@@ -6468,7 +6506,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                     hydrationGeneration: hydrationGeneration
                 )
                 indexGeneration = rebuildResult.generation
-                if let duration = rebuildResult.durationMS { totalSearchIndexRebuildDurationMS += duration }
+                if let duration = rebuildResult.durationMS {
+                    totalSearchIndexRebuildDurationMS += duration
+                }
             #else
                 indexGeneration = await workspaceSearchService.rebuildIndex(from: snapshot)
             #endif
@@ -6914,7 +6954,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         func flush(url: URL) async {
-            if pendingByURL[url] == nil { return }
+            if pendingByURL[url] == nil {
+                return
+            }
             let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
             let flushState = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.flushWait)
             EditFlowPerf.lifecycleEvent(
@@ -7715,7 +7757,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private func handleAllFoldersUnloaded() {
         guard let active = activeWorkspace else { return }
-        if isRefreshing { return }
+        if isRefreshing {
+            return
+        }
 
         if active.repoPaths.isEmpty {
             if let fallback = findOrCreateDefaultWorkspace(),
@@ -7731,7 +7775,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func removeActiveWorkspaceRoot(path: String) async {
-        if isRefreshing { return }
+        if isRefreshing {
+            return
+        }
         await removeFolder(path)
     }
 

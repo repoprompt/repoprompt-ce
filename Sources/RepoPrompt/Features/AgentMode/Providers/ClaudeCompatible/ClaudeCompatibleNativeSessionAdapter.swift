@@ -79,6 +79,12 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         await controller.respondToPermissionRequest(id: id, decision: decision)
     }
 
+    #if DEBUG
+        func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot? {
+            await controller.debugProcessSnapshot()
+        }
+    #endif
+
     static func streamResult(from providerResult: ClaudeCompatiblePluginStreamResult) -> AIStreamResult {
         ClaudeCompatiblePluginBridge.streamResult(from: providerResult)
     }

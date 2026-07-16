@@ -46,8 +46,12 @@ enum DurableArtifactTestSupport {
                 randomBytes: randomBytes,
                 token: token,
                 crash: { point in
-                    if point == crashExitPoint { _exit(86) }
-                    if point == crashPoint { throw DurableArtifactStoreError.simulatedCrash(point) }
+                    if point == crashExitPoint {
+                        _exit(86)
+                    }
+                    if point == crashPoint {
+                        throw DurableArtifactStoreError.simulatedCrash(point)
+                    }
                     try crashAction?(point)
                 },
                 transformDigest: { digest in
@@ -77,8 +81,12 @@ enum DurableArtifactTestSupport {
                 randomBytes: randomBytes,
                 token: token,
                 crash: { point in
-                    if point == crashExitPoint { _exit(86) }
-                    if point == crashPoint { throw DurableArtifactStoreError.simulatedCrash(point) }
+                    if point == crashExitPoint {
+                        _exit(86)
+                    }
+                    if point == crashPoint {
+                        throw DurableArtifactStoreError.simulatedCrash(point)
+                    }
                     try crashAction?(point)
                 },
                 transformDigest: { digest in

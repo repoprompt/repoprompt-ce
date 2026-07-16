@@ -226,7 +226,9 @@ final class AgentNavigationHUDViewModel: ObservableObject {
             return (index, score, item)
         }
         .sorted { lhs, rhs in
-            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+            if lhs.1 != rhs.1 {
+                return lhs.1 > rhs.1
+            }
             return lhs.0 < rhs.0
         }
         .map(\.2)

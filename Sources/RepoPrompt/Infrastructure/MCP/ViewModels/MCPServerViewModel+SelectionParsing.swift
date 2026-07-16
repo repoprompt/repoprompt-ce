@@ -146,7 +146,9 @@ extension MCPServerViewModel {
 
         for rawToken in rawTokens {
             var token = String(rawToken)
-            if token.isEmpty { continue }
+            if token.isEmpty {
+                continue
+            }
             if token.lowercased().hasPrefix("l") {
                 token.removeFirst()
             }

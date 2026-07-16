@@ -903,7 +903,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             try Task.checkCancellation()
             let lineStr = "\(match.filePath):\(match.lineNumber + 1): \(match.lineText)"
             let cost = lineStr.count + 3
-            if usedChars + cost > budget { break }
+            if usedChars + cost > budget {
+                break
+            }
             includedContentMatches.append(match)
             usedChars += cost
         }
@@ -911,7 +913,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         for path in pathMatchesFull {
             try Task.checkCancellation()
             let cost = path.count + 3
-            if usedChars + cost > budget { break }
+            if usedChars + cost > budget {
+                break
+            }
             includedPathLines.append(path)
             usedChars += cost
         }

@@ -90,12 +90,16 @@ enum WorkspaceFileCatalogMaterializationResult: Equatable {
     case ineligible(CatalogRegularFileIneligibilityReason)
 
     var file: WorkspaceFileRecord? {
-        if case let .materialized(file) = self { return file }
+        if case let .materialized(file) = self {
+            return file
+        }
         return nil
     }
 
     var ineligibilityReason: CatalogRegularFileIneligibilityReason? {
-        if case let .ineligible(reason) = self { return reason }
+        if case let .ineligible(reason) = self {
+            return reason
+        }
         return nil
     }
 }
@@ -246,7 +250,9 @@ actor WorkspaceFileContextStore {
             guard attempt > 1 else { return min(initialBackoffNanoseconds, maximumBackoffNanoseconds) }
             var delay = min(initialBackoffNanoseconds, maximumBackoffNanoseconds)
             for _ in 1 ..< attempt {
-                if delay >= maximumBackoffNanoseconds { return maximumBackoffNanoseconds }
+                if delay >= maximumBackoffNanoseconds {
+                    return maximumBackoffNanoseconds
+                }
                 let (doubled, overflow) = delay.multipliedReportingOverflow(by: 2)
                 delay = overflow ? maximumBackoffNanoseconds : min(doubled, maximumBackoffNanoseconds)
             }
@@ -3927,7 +3933,9 @@ actor WorkspaceFileContextStore {
         guard repositoryRelativePath == prefixValue || repositoryRelativePath.hasPrefix(prefixValue + "/") else {
             return nil
         }
-        if repositoryRelativePath == prefixValue { return "" }
+        if repositoryRelativePath == prefixValue {
+            return ""
+        }
         return String(repositoryRelativePath.dropFirst(prefixValue.count + 1))
     }
 
@@ -3990,7 +3998,9 @@ actor WorkspaceFileContextStore {
 
     private func requirePublishedSeededAuthorityFresh(rootID: UUID) async throws {
         while publishedSeededAuthorityFencesByRootID[rootID] != nil {
-            if publishedSeededAuthorityIsQueryable(rootID: rootID) { return }
+            if publishedSeededAuthorityIsQueryable(rootID: rootID) {
+                return
+            }
             guard let state = publishedSeededAuthorityStatesByRootID[rootID],
                   !state.reconciliationFailed,
                   state.isBlocked
@@ -4040,7 +4050,9 @@ actor WorkspaceFileContextStore {
         startupContext: WorktreeStartupContext
     ) async {
         guard var pending = pendingSeededRootsByID[pendingID] else { return }
-        if case .fallingBack = pending.phase { return }
+        if case .fallingBack = pending.phase {
+            return
+        }
         pending.phase = .fallingBack(reason)
         pending.terminalFallbackReason = pending.terminalFallbackReason ?? reason
         pendingSeededRootsByID[pendingID] = pending
@@ -4423,7 +4435,9 @@ actor WorkspaceFileContextStore {
                                 case .policyIgnoredTrackedFile:
                                     if let fileID = state.fileIDsByRelativePath[relativePath],
                                        isDiscoverableFileID(fileID)
-                                    { matches = false }
+                                    {
+                                        matches = false
+                                    }
                                 case .baseTombstone:
                                     break
                                 }
@@ -6259,10 +6273,14 @@ actor WorkspaceFileContextStore {
         let roots = rootsForPathLookup(scope: rootScope)
         let allowedRootIDs = Set(roots.map(\.id))
         let folderCount = foldersByID.values.reduce(into: 0) { count, folder in
-            if allowedRootIDs.contains(folder.rootID), isDiscoverableFolderID(folder.id) { count += 1 }
+            if allowedRootIDs.contains(folder.rootID), isDiscoverableFolderID(folder.id) {
+                count += 1
+            }
         }
         let fileCount = filesByID.values.reduce(into: 0) { count, file in
-            if allowedRootIDs.contains(file.rootID), isDiscoverableFileID(file.id) { count += 1 }
+            if allowedRootIDs.contains(file.rootID), isDiscoverableFileID(file.id) {
+                count += 1
+            }
         }
         return WorkspaceCatalogDiagnostics(
             generation: scopedSnapshotGeneration(scope: rootScope),
@@ -7868,9 +7886,15 @@ actor WorkspaceFileContextStore {
         func cursorPrecedes(_ lhs: RootCatalogMergeCursor, _ rhs: RootCatalogMergeCursor) -> Bool {
             let lhsFile = shards[lhs.shardIndex].files[lhs.elementIndex]
             let rhsFile = shards[rhs.shardIndex].files[rhs.elementIndex]
-            if Self.searchCatalogFilePrecedes(lhsFile, rhsFile) { return true }
-            if Self.searchCatalogFilePrecedes(rhsFile, lhsFile) { return false }
-            if lhs.shardIndex == rhs.shardIndex { return lhs.elementIndex < rhs.elementIndex }
+            if Self.searchCatalogFilePrecedes(lhsFile, rhsFile) {
+                return true
+            }
+            if Self.searchCatalogFilePrecedes(rhsFile, lhsFile) {
+                return false
+            }
+            if lhs.shardIndex == rhs.shardIndex {
+                return lhs.elementIndex < rhs.elementIndex
+            }
             return lhs.shardIndex < rhs.shardIndex
         }
 
@@ -7887,7 +7911,9 @@ actor WorkspaceFileContextStore {
 
         func pop() -> RootCatalogMergeCursor? {
             guard !heap.isEmpty else { return nil }
-            if heap.count == 1 { return heap.removeLast() }
+            if heap.count == 1 {
+                return heap.removeLast()
+            }
             let first = heap[0]
             heap[0] = heap.removeLast()
             var index = 0
@@ -7924,8 +7950,12 @@ actor WorkspaceFileContextStore {
         while true {
             switch (lhsIterator.next(), rhsIterator.next()) {
             case let (lhsByte?, rhsByte?):
-                if lhsByte < rhsByte { return .orderedAscending }
-                if lhsByte > rhsByte { return .orderedDescending }
+                if lhsByte < rhsByte {
+                    return .orderedAscending
+                }
+                if lhsByte > rhsByte {
+                    return .orderedDescending
+                }
             case (nil, nil):
                 return .orderedSame
             case (nil, _?):
@@ -8353,7 +8383,9 @@ actor WorkspaceFileContextStore {
                     }
                 }
                 for await (index, sample) in group {
-                    if let sample { samplesByIndex[index] = sample }
+                    if let sample {
+                        samplesByIndex[index] = sample
+                    }
                 }
             }
         }
@@ -9234,8 +9266,12 @@ actor WorkspaceFileContextStore {
     }
 
     private func isDiscoverableLookupResult(_ result: WorkspacePathLookupResult) -> Bool {
-        if let file = result.file, !isDiscoverableFileID(file.id) { return false }
-        if let folder = result.folder, !isDiscoverableFolderID(folder.id) { return false }
+        if let file = result.file, !isDiscoverableFileID(file.id) {
+            return false
+        }
+        if let folder = result.folder, !isDiscoverableFolderID(folder.id) {
+            return false
+        }
         return true
     }
 
@@ -10398,7 +10434,9 @@ actor WorkspaceFileContextStore {
                )
             {
                 guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
-                    if attempt == 0 { continue }
+                    if attempt == 0 {
+                        continue
+                    }
                     return staleSearchContentSnapshot(for: current)
                 }
                 retainSliceRebaseSource(
@@ -10430,7 +10468,9 @@ actor WorkspaceFileContextStore {
             }
 
             guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
-                if attempt == 0 { continue }
+                if attempt == 0 {
+                    continue
+                }
                 return staleSearchContentSnapshot(for: current)
             }
 
@@ -10449,11 +10489,15 @@ actor WorkspaceFileContextStore {
                     )
                 }
                 guard let cached else {
-                    if attempt == 0 { continue }
+                    if attempt == 0 {
+                        continue
+                    }
                     return staleSearchContentSnapshot(for: current)
                 }
                 guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
-                    if attempt == 0 { continue }
+                    if attempt == 0 {
+                        continue
+                    }
                     return staleSearchContentSnapshot(for: current)
                 }
                 retainSliceRebaseSource(
@@ -10474,7 +10518,9 @@ actor WorkspaceFileContextStore {
             } catch let error as ContentReadSchedulerError {
                 throw error
             } catch FileContentValidationError.fingerprintChanged {
-                if attempt == 0 { continue }
+                if attempt == 0 {
+                    continue
+                }
                 return staleSearchContentSnapshot(for: current)
             } catch FileSystemError.fileNotFound {
                 await pruneCatalogFileIfStillCurrent(current)
@@ -10533,7 +10579,9 @@ actor WorkspaceFileContextStore {
             }
 
             guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
-                if attempt == 0 { continue }
+                if attempt == 0 {
+                    continue
+                }
                 return nil
             }
 
@@ -10554,11 +10602,15 @@ actor WorkspaceFileContextStore {
                     return await WorkspaceInteractiveReadProcessor.prepareOffActor(content)
                 }
                 guard let preparedContent = cached.preparedContent else {
-                    if attempt == 0 { continue }
+                    if attempt == 0 {
+                        continue
+                    }
                     return nil
                 }
                 guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
-                    if attempt == 0 { continue }
+                    if attempt == 0 {
+                        continue
+                    }
                     return nil
                 }
                 retainSliceRebaseSource(
@@ -10577,7 +10629,9 @@ actor WorkspaceFileContextStore {
             } catch let error as ContentReadSchedulerError {
                 throw error
             } catch FileContentValidationError.fingerprintChanged {
-                if attempt == 0 { continue }
+                if attempt == 0 {
+                    continue
+                }
                 return nil
             } catch FileSystemError.fileNotFound {
                 await pruneCatalogFileIfStillCurrent(current)
@@ -11490,7 +11544,9 @@ actor WorkspaceFileContextStore {
         _ lhs: WorkspaceCodemapAutomaticSelectionTarget,
         _ rhs: WorkspaceCodemapAutomaticSelectionTarget
     ) -> Bool {
-        if lhs.rootEpoch != rhs.rootEpoch { return codemapRootEpochPrecedes(lhs.rootEpoch, rhs.rootEpoch) }
+        if lhs.rootEpoch != rhs.rootEpoch {
+            return codemapRootEpochPrecedes(lhs.rootEpoch, rhs.rootEpoch)
+        }
         if lhs.logicalPath.standardizedRelativePath != rhs.logicalPath.standardizedRelativePath {
             return lhs.logicalPath.standardizedRelativePath.utf8.lexicographicallyPrecedes(
                 rhs.logicalPath.standardizedRelativePath.utf8
@@ -12275,7 +12331,9 @@ actor WorkspaceFileContextStore {
 
         guard !graphSources.isEmpty else {
             if let staleIssue = sourceIssues.first(where: {
-                if case .staleCatalogGeneration = $0 { return true }
+                if case .staleCatalogGeneration = $0 {
+                    return true
+                }
                 return false
             }), case let .staleCatalogGeneration(source, currentGeneration) = staleIssue {
                 return WorkspaceCodemapAutomaticSelectionRootResult(
@@ -13452,7 +13510,9 @@ actor WorkspaceFileContextStore {
         codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
         if let existing = codemapSessionsByRootEpoch[authority.rootEpoch] {
             guard existing.authority == authority else { return nil }
-            if let setupTask = existing.setupTask { return setupTask }
+            if let setupTask = existing.setupTask {
+                return setupTask
+            }
             if let disposition = existing.setupDisposition {
                 return Task { disposition }
             }
@@ -14711,7 +14771,9 @@ actor WorkspaceFileContextStore {
         }
 
         nodes.sort {
-            if $0.depth != $1.depth { return $0.depth < $1.depth }
+            if $0.depth != $1.depth {
+                return $0.depth < $1.depth
+            }
             if $0.rootEpoch != $1.rootEpoch {
                 return codemapRootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
             }
@@ -15738,7 +15800,9 @@ actor WorkspaceFileContextStore {
         }
         if codemapSessionsByRootEpoch[ticket.rootEpoch]?
             .demandsByFileID.values.contains(where: {
-                if case .ready = $0.result { return true }
+                if case .ready = $0.result {
+                    return true
+                }
                 return false
             }) == true
         {
@@ -17670,7 +17734,9 @@ actor WorkspaceFileContextStore {
                 )
             }
             guard proof.catalogCompletion.finalCursor == expectedFinalCursor else { return .stale }
-            if proof.lastSegmentSequence == UInt64.max { return .stale }
+            if proof.lastSegmentSequence == UInt64.max {
+                return .stale
+            }
         }
 
         let key = WorkspaceCodemapSelectionGraphRuntimeKey(generation: generation)
@@ -18589,7 +18655,11 @@ actor WorkspaceFileContextStore {
                     await projectionDemand.engine.releaseProjectionDemand(projectionDemand.ticket)
                 }
                 if detached.invalidationCommands.contains(where: {
-                    if case .unload = $0 { true } else { false }
+                    if case .unload = $0 {
+                        true
+                    } else {
+                        false
+                    }
                 }) {
                     await engine.unloadRoot(rootEpoch: detached.authority.rootEpoch)
                 }
@@ -19728,8 +19798,12 @@ actor WorkspaceFileContextStore {
         var isDirectory = ObjCBool(false)
         guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), !isDirectory.boolValue else { return false }
         if let values = try? URL(fileURLWithPath: fullPath).resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-            if values.isSymbolicLink == true { return false }
-            if values.isRegularFile == false { return false }
+            if values.isSymbolicLink == true {
+                return false
+            }
+            if values.isRegularFile == false {
+                return false
+            }
         }
         return true
     }
@@ -19739,8 +19813,12 @@ actor WorkspaceFileContextStore {
         var isDirectory = ObjCBool(false)
         guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), isDirectory.boolValue else { return false }
         if let values = try? URL(fileURLWithPath: fullPath).resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
-            if values.isSymbolicLink == true { return false }
-            if values.isDirectory == false { return false }
+            if values.isSymbolicLink == true {
+                return false
+            }
+            if values.isDirectory == false {
+                return false
+            }
         }
         return true
     }
@@ -20165,7 +20243,9 @@ actor WorkspaceFileContextStore {
             case .fileModified:
                 if let file = file(rootID: rootID, relativePath: relativePath) {
                     invalidateSearchContent(file)
-                    if isDiscoverableFileID(file.id) { modifiedFileIDs.append(file.id) }
+                    if isDiscoverableFileID(file.id) {
+                        modifiedFileIDs.append(file.id)
+                    }
                 }
             case .folderModified:
                 if let folder = folder(rootID: rootID, relativePath: relativePath), isDiscoverableFolderID(folder.id) {
@@ -20671,7 +20751,9 @@ actor WorkspaceFileContextStore {
         case let .bareRoot(root, _):
             switch kind {
             case .folder, .either:
-                if rootStatesByID[root.id] != nil { return nil }
+                if rootStatesByID[root.id] != nil {
+                    return nil
+                }
             case .file:
                 break
             }
@@ -20680,7 +20762,9 @@ actor WorkspaceFileContextStore {
                 standardizedRoot: root.standardizedFullPath,
                 standardizedRelativePath: StandardizedPath.relative(remainder)
             )
-            if exactRecordExists(standardizedFullPath: absolute, kind: kind) { return nil }
+            if exactRecordExists(standardizedFullPath: absolute, kind: kind) {
+                return nil
+            }
         case .notAliasPrefixed:
             break
         }
@@ -20991,11 +21075,15 @@ actor WorkspaceFileContextStore {
                       seenStandardizedFullPaths.insert(file.standardizedFullPath).inserted
                 else { continue }
                 files.append(file)
-                if files.count > maximumUniqueFileCount { return true }
+                if files.count > maximumUniqueFileCount {
+                    return true
+                }
             }
             for childFolderID in state.childFolderIDsByFolderID[currentFolderID] ?? [] {
                 guard isDiscoverableFolderID(childFolderID) else { continue }
-                if visit(childFolderID) { return true }
+                if visit(childFolderID) {
+                    return true
+                }
             }
             return false
         }
@@ -21641,8 +21729,12 @@ actor WorkspaceFileContextStore {
     ) {
         let keys = sliceRebaseSourceEntries.keys.filter { key in
             guard key.rootID == rootID else { return false }
-            if let rootLifetimeID, key.rootLifetimeID != rootLifetimeID { return false }
-            if let fileID, key.fileID != fileID { return false }
+            if let rootLifetimeID, key.rootLifetimeID != rootLifetimeID {
+                return false
+            }
+            if let fileID, key.fileID != fileID {
+                return false
+            }
             return true
         }
         for key in keys {
@@ -22178,8 +22270,12 @@ actor WorkspaceFileContextStore {
 
     private func ensureParentFolderID(for relativePath: String, root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) -> UUID {
         let key = StandardizedPath.relative(relativePath)
-        if key.isEmpty || key == "." { return root.id }
-        if let existing = state.folderIDsByRelativePath[key] { return existing }
+        if key.isEmpty || key == "." {
+            return root.id
+        }
+        if let existing = state.folderIDsByRelativePath[key] {
+            return existing
+        }
 
         let parentPath = (key as NSString).deletingLastPathComponent
         let parentID = ensureParentFolderID(for: parentPath, root: root, state: &state, indexes: &indexes)

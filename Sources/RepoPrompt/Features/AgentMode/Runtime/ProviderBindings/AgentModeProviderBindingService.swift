@@ -197,7 +197,9 @@ final class AgentModeProviderBindingService {
                       let controller = session.acpController else { continue }
                 Task { @MainActor in
                     let providerName = session.selectedAgent.displayName
-                    if AgentRuntimeProviderService.enableDebugLogging { print("[ACP-Runner] tab=\(session.tabID) applying \(providerName) session mode=\(sessionModeID)") }
+                    if AgentRuntimeProviderService.enableDebugLogging {
+                        print("[ACP-Runner] tab=\(session.tabID) applying \(providerName) session mode=\(sessionModeID)")
+                    }
                     do {
                         await controller.setAutoApproveAllToolPermissions(runtime.autoApproveAllACPToolPermissions)
                         try await controller.setSessionMode(sessionModeID)
@@ -205,7 +207,9 @@ final class AgentModeProviderBindingService {
                             await controller.respondToPermissionRequest(id: pendingApproval.requestID.displayValue, decision: .acceptForSession)
                         }
                     } catch {
-                        if AgentRuntimeProviderService.enableDebugLogging { print("[ACP-Runner] tab=\(session.tabID) failed to apply \(providerName) session mode=\(sessionModeID) error=\(error.localizedDescription)") }
+                        if AgentRuntimeProviderService.enableDebugLogging {
+                            print("[ACP-Runner] tab=\(session.tabID) failed to apply \(providerName) session mode=\(sessionModeID) error=\(error.localizedDescription)")
+                        }
                     }
                     if session.tabID == currentTabID {
                         updateActiveBindings(session)

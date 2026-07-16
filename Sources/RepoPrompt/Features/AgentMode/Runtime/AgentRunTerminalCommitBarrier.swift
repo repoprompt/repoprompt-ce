@@ -184,6 +184,14 @@ final class AgentRunTerminalCommitBarrier {
             recordRejection("ownership_changed_during_drain", request: request)
             return nil
         }
+        guard session.providerTerminalDrainGeneration == request.providerDrainGeneration,
+              request.providerBuffersAreDrained()
+        else {
+            session.terminalCommitInProgress = false
+            recordTerminalBarrierState(false, request: request)
+            recordRejection("ownership_or_drain_changed_before_commit", request: request)
+            return nil
+        }
 
         hooks.finalizeStreamingItems(session)
         hooks.finalizePendingToolCalls(session, request.terminalState)
@@ -229,16 +237,6 @@ final class AgentRunTerminalCommitBarrier {
            !errorText.isEmpty
         {
             session.appendItem(AgentChatItem.error(errorText, sequenceIndex: session.nextSequenceIndex))
-        }
-
-        guard validatesOwnership(request),
-              session.providerTerminalDrainGeneration == request.providerDrainGeneration,
-              request.providerBuffersAreDrained()
-        else {
-            session.terminalCommitInProgress = false
-            recordTerminalBarrierState(false, request: request)
-            recordRejection("ownership_or_drain_changed_before_commit", request: request)
-            return nil
         }
 
         let attemptTeardown = session.claimRunAttemptTerminalTeardown(
@@ -300,19 +298,18 @@ final class AgentRunTerminalCommitBarrier {
             hooks.notifyAgentTurnComplete(session)
         }
         hooks.scheduleSave(session.tabID)
-        session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
+        let publicationResult = await hooks.publishTerminalCommit(
             session,
             revision,
             successorKind
         )
+        session.lastTerminalPublicationResult = publicationResult
         let followUpInstruction = takeQueuedFollowUpIfReady(
             session: session,
             revision: revision,
-            publicationResult: session.lastTerminalPublicationResult
+            publicationResult: publicationResult
         )
-        if let providerSuccessor,
-           let publicationResult = session.lastTerminalPublicationResult
-        {
+        if let providerSuccessor {
             notifyProviderSuccessor(
                 providerSuccessor,
                 revision: revision,
@@ -326,7 +323,9 @@ final class AgentRunTerminalCommitBarrier {
         )
         session.terminalCommitInProgress = false
         recordTerminalBarrierState(false, request: request)
-        request.postCommit()
+        if case .accepted = publicationResult {
+            request.postCommit()
+        }
 
         if let followUpInstruction {
             hooks.startFollowUpRun(session.tabID, followUpInstruction)

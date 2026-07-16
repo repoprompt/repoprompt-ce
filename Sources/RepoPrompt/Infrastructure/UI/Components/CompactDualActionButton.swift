@@ -140,17 +140,16 @@ struct CompactDualActionButton: View {
         }
     }
 
+    @ViewBuilder
     private var backgroundForState: some View {
-        Group {
-            if !isEnabled {
-                disabledBackground
-            } else if isPressedMain || isPressedSecondary {
-                pressedBackground
-            } else if isHovering {
-                hoverBackground
-            } else {
-                normalBackground
-            }
+        if !isEnabled {
+            disabledBackground
+        } else if isPressedMain || isPressedSecondary {
+            pressedBackground
+        } else if isHovering {
+            hoverBackground
+        } else {
+            normalBackground
         }
     }
 

@@ -15,7 +15,11 @@ enum CodeMapArtifactCatalogOutcomeClass: UInt8, Equatable {
     case negative = 2
 
     init(outcome: CodeMapSyntaxArtifactOutcome) {
-        self = if case .ready = outcome { .positive } else { .negative }
+        self = if case .ready = outcome {
+            .positive
+        } else {
+            .negative
+        }
     }
 }
 
@@ -337,7 +341,9 @@ struct CodeMapArtifactCatalog {
         maximumReadByteCount: UInt64,
         epochSeconds: UInt64
     ) throws -> CodeMapArtifactCatalogScanStep {
-        if session.completed { return .complete }
+        if session.completed {
+            return .complete
+        }
         if let pending = session.pending {
             return try processPendingScanEntry(
                 pending,
@@ -923,7 +929,9 @@ struct CodeMapArtifactCatalog {
                 artifactDestination,
                 UInt32(RENAME_EXCL)
             ) == 0 else {
-                if errno == ENOENT { return .missingOrChanged }
+                if errno == ENOENT {
+                    return .missingOrChanged
+                }
                 throw Self.ioError("gc-artifact-quarantine")
             }
             guard try Self.fileIdentity(sourceArtifact.rawValue) == sourceArtifact.identity,
@@ -1504,7 +1512,9 @@ struct CodeMapArtifactCatalog {
             let descriptor = try openLeaseDescriptor(shard: shard, digest: digest)
             defer { Darwin.close(descriptor) }
             guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-                if errno == EWOULDBLOCK { throw CodeMapArtifactCatalogError.ioFailure(operation: "lease-busy", code: EWOULDBLOCK) }
+                if errno == EWOULDBLOCK {
+                    throw CodeMapArtifactCatalogError.ioFailure(operation: "lease-busy", code: EWOULDBLOCK)
+                }
                 throw Self.ioError("lease-exclusive-lock")
             }
             defer { _ = flock(descriptor, LOCK_UN) }
@@ -1724,10 +1734,14 @@ struct CodeMapArtifactCatalog {
             }
         }
         let descriptor = openat(parent.rawValue, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        if descriptor < 0, !create, errno == ENOENT { return nil }
+        if descriptor < 0, !create, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else { throw ioError("directory-open") }
         do {
-            if created, fchmod(descriptor, directoryMode) != 0 { throw ioError("directory-mode") }
+            if created, fchmod(descriptor, directoryMode) != 0 {
+                throw ioError("directory-mode")
+            }
             let identity = try directoryIdentity(descriptor)
             var pathStatus = stat()
             guard fstatat(parent.rawValue, name, &pathStatus, AT_SYMLINK_NOFOLLOW) == 0 else {
@@ -1739,7 +1753,9 @@ struct CodeMapArtifactCatalog {
                   identity.permissions == directoryMode,
                   identity.device == parent.identity.device
             else { throw CodeMapArtifactCatalogError.insecureEntry }
-            if created { try synchronize(parent.rawValue, operation: "directory-parent-fsync") }
+            if created {
+                try synchronize(parent.rawValue, operation: "directory-parent-fsync")
+            }
             return CatalogDirectory(rawValue: descriptor, identity: identity)
         } catch {
             Darwin.close(descriptor)
@@ -1777,7 +1793,9 @@ struct CodeMapArtifactCatalog {
         name: String
     ) throws -> CatalogFile? {
         let descriptor = openat(parent.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        if descriptor < 0, errno == ENOENT { return nil }
+        if descriptor < 0, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else { throw Self.ioError("scan-leaf-open") }
         do {
             let identity = try Self.fileIdentity(descriptor)
@@ -1895,9 +1913,13 @@ struct CodeMapArtifactCatalog {
         try data.withUnsafeMutableBytes { buffer in
             while completed < byteCount {
                 let result = Darwin.read(descriptor, buffer.baseAddress!.advanced(by: completed), byteCount - completed)
-                if result > 0 { completed += result }
-                else if result == 0 { throw CodeMapArtifactCatalogError.invalidMetadata }
-                else if errno != EINTR { throw ioError("file-read") }
+                if result > 0 {
+                    completed += result
+                } else if result == 0 {
+                    throw CodeMapArtifactCatalogError.invalidMetadata
+                } else if errno != EINTR {
+                    throw ioError("file-read")
+                }
             }
         }
         return data
@@ -1908,9 +1930,13 @@ struct CodeMapArtifactCatalog {
             var completed = 0
             while completed < buffer.count {
                 let result = Darwin.write(descriptor, buffer.baseAddress!.advanced(by: completed), buffer.count - completed)
-                if result > 0 { completed += result }
-                else if result == 0 { throw ioError("file-write-zero") }
-                else if errno != EINTR { throw ioError("file-write") }
+                if result > 0 {
+                    completed += result
+                } else if result == 0 {
+                    throw ioError("file-write-zero")
+                } else if errno != EINTR {
+                    throw ioError("file-write")
+                }
             }
         }
     }
@@ -1991,8 +2017,12 @@ struct CodeMapArtifactCatalog {
     }
 
     private static func processIsActive(_ pid: pid_t) -> Bool {
-        if pid == getpid() { return true }
-        if kill(pid, 0) == 0 { return true }
+        if pid == getpid() {
+            return true
+        }
+        if kill(pid, 0) == 0 {
+            return true
+        }
         return errno != ESRCH
     }
 

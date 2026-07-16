@@ -234,6 +234,16 @@ final actor ClaudeNativeProcessSessionController {
         process != nil
     }
 
+    #if DEBUG
+        func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot? {
+            guard let process else { return nil }
+            return AgentRuntimeProcessSnapshot(
+                pid: process.pid,
+                appearsAlive: AgentRuntimeProcessSnapshot.appearsAlive(pid: process.pid)
+            )
+        }
+    #endif
+
     deinit {
         performSynchronousDeinitCleanup()
     }
@@ -2426,7 +2436,9 @@ final actor ClaudeNativeProcessSessionController {
                 "byteCount": data.count,
                 "text": text
             ]
-            if truncated { result["truncated"] = true }
+            if truncated {
+                result["truncated"] = true
+            }
             return result
         }
         return [

@@ -1330,8 +1330,12 @@ class WindowState: ObservableObject {
                 return nil
             }
             let lower = val.lowercased()
-            if lower == "true" || lower == "1" { return true }
-            if lower == "false" || lower == "0" { return false }
+            if lower == "true" || lower == "1" {
+                return true
+            }
+            if lower == "false" || lower == "0" {
+                return false
+            }
             return nil
         }
         let focusFlag = boolFromQuery("focus")

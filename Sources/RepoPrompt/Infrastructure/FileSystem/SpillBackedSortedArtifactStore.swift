@@ -960,7 +960,9 @@ actor SpillBackedSortedArtifactWriter<Format: SpillBackedSortedArtifactFormat> {
                 throw format.error(.io(operation: "file-close", code: errno))
             }
         } catch {
-            if descriptorIsOpen { Darwin.close(descriptor) }
+            if descriptorIsOpen {
+                Darwin.close(descriptor)
+            }
             try? FileManager.default.removeItem(at: run.url)
             throw error
         }
@@ -1057,7 +1059,9 @@ actor SpillBackedSortedArtifactWriter<Format: SpillBackedSortedArtifactFormat> {
             }
             return output
         } catch {
-            if descriptorIsOpen { Darwin.close(descriptor) }
+            if descriptorIsOpen {
+                Darwin.close(descriptor)
+            }
             try? FileManager.default.removeItem(at: output.url)
             throw error
         }
@@ -1169,7 +1173,9 @@ actor SpillBackedSortedArtifactWriter<Format: SpillBackedSortedArtifactFormat> {
             }
             return (url, footer, recordCount, byteCount)
         } catch {
-            if descriptorIsOpen { Darwin.close(descriptor) }
+            if descriptorIsOpen {
+                Darwin.close(descriptor)
+            }
             try? FileManager.default.removeItem(at: url)
             throw error
         }
@@ -1253,7 +1259,9 @@ actor SpillBackedSortedArtifactWriter<Format: SpillBackedSortedArtifactFormat> {
     }
 
     private func initialCatalogWriter() throws -> SpillRunCatalogWriter<Format> {
-        if let initialRunCatalogWriter { return initialRunCatalogWriter }
+        if let initialRunCatalogWriter {
+            return initialRunCatalogWriter
+        }
         let writer = try makeCatalogWriter()
         initialRunCatalogWriter = writer
         return writer
@@ -1557,7 +1565,9 @@ private final class SpillRunCatalogCursor<Format: SpillBackedSortedArtifactForma
     deinit { Darwin.close(descriptor) }
 
     func next() throws -> UInt64? {
-        if reachedFooter { return nil }
+        if reachedFooter {
+            return nil
+        }
         let frame = try SpillBackedSortedArtifactIO.readExact(descriptor, count: 8, format: format)
         let value = try SpillBackedSortedArtifactIO.decodeUInt64(frame, format: format)
         if value == UInt64.max {
@@ -1632,9 +1642,13 @@ private final class SpillRunCursor<Format: SpillBackedSortedArtifactFormat> {
         }
         var first: UInt8 = 0
         let readCount = Darwin.read(descriptor, &first, 1)
-        if readCount == 0 { throw format.error(.corrupt("run missing footer")) }
+        if readCount == 0 {
+            throw format.error(.corrupt("run missing footer"))
+        }
         if readCount < 0 {
-            if errno == EINTR { return try advance() }
+            if errno == EINTR {
+                return try advance()
+            }
             throw format.error(.io(operation: "run-read", code: errno))
         }
         var lengthBytes = Data([first])
@@ -1748,8 +1762,12 @@ private enum SpillBackedSortedArtifactIO {
         var byte: UInt8 = 0
         while true {
             let count = Darwin.read(descriptor, &byte, 1)
-            if count == 0 { return }
-            if count > 0 { throw format.error(.corrupt(trailingMessage)) }
+            if count == 0 {
+                return
+            }
+            if count > 0 {
+                throw format.error(.corrupt(trailingMessage))
+            }
             guard errno == EINTR else {
                 throw format.error(.io(operation: operation, code: errno))
             }

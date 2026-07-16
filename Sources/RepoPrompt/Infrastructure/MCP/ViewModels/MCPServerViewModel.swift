@@ -54,7 +54,9 @@ private actor MCPRunToolStartGate {
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func wait() async {
-        if isOpen { return }
+        if isOpen {
+            return
+        }
         await withCheckedContinuation { continuation in
             if isOpen {
                 continuation.resume()
@@ -3725,7 +3727,9 @@ final class MCPServerViewModel: ObservableObject {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             if let file = await store.lookupFiles(atPaths: [trimmed], profile: .mcpSelection, rootScope: .visibleWorkspace)[trimmed] {
-                if seen.insert(file.standardizedFullPath).inserted { resolved.append(file.standardizedFullPath) }
+                if seen.insert(file.standardizedFullPath).inserted {
+                    resolved.append(file.standardizedFullPath)
+                }
                 continue
             }
             let folderResolution = await store.expandFolderInputToFiles(trimmed, rootScope: .visibleWorkspace, profile: .mcpSelection)
@@ -4047,14 +4051,18 @@ final class MCPServerViewModel: ObservableObject {
         ) -> [DebugReadFileAutoSelectionTarget] {
             tabContextByConnectionID.compactMap { connectionID, context in
                 guard context.windowID == windowID else { return nil }
-                if let targetConnectionID, connectionID != targetConnectionID { return nil }
+                if let targetConnectionID, connectionID != targetConnectionID {
+                    return nil
+                }
                 if targetConnectionID == nil {
                     guard let agentSessionID, let tabID,
                           context.activeAgentSessionID == agentSessionID,
                           context.tabID == tabID
                     else { return nil }
                 }
-                if let expectedRunID, context.runID != expectedRunID { return nil }
+                if let expectedRunID, context.runID != expectedRunID {
+                    return nil
+                }
                 if let runID = context.runID,
                    connectionIDByRunID[runID] != connectionID || connectionIDToRunID[connectionID] != runID
                 {
@@ -4529,7 +4537,9 @@ final class MCPServerViewModel: ObservableObject {
 
         let metadata = RequestMetadata(
             connectionID: {
-                if case let .bound(connectionID, _) = key.route { return connectionID }
+                if case let .bound(connectionID, _) = key.route {
+                    return connectionID
+                }
                 return nil
             }(),
             clientName: nil,
@@ -4558,7 +4568,9 @@ final class MCPServerViewModel: ObservableObject {
         // attempt revalidates path quiescence, the canonical base, and the full persisted result so
         // no still-running task can certify or overwrite a stale canonical selection.
         for attempt in 0 ..< 3 {
-            if attempt > 0 { await Task.yield() }
+            if attempt > 0 {
+                await Task.yield()
+            }
             guard let fileManager = workspaceManager?.fileManager else { break }
             let sliceRebaseFence = await fileManager.waitForPendingSliceRebasesAndCaptureFence(
                 affectingCandidatePaths: sliceRebaseCandidates
@@ -4901,7 +4913,9 @@ final class MCPServerViewModel: ObservableObject {
         allRoots: [WorkspaceRootRef]
     ) -> String {
         let visible = ClientPathFormatter.displayAbsolutePath(fullPath: path, visibleRoots: visibleRoots)
-        if visible != StandardizedPath.absolute(path) { return visible }
+        if visible != StandardizedPath.absolute(path) {
+            return visible
+        }
         return ClientPathFormatter.displayAbsolutePath(fullPath: path, visibleRoots: allRoots)
     }
 
@@ -4944,7 +4958,9 @@ final class MCPServerViewModel: ObservableObject {
                 standardized == $0.standardizedFullPath
                     || StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath)
             }
-            if !under { outside.append(path) }
+            if !under {
+                outside.append(path)
+            }
         }
 
         var lines: [String] = []
@@ -5015,7 +5031,9 @@ final class MCPServerViewModel: ObservableObject {
             #if DEBUG
                 codeStructureUniqueSeedCandidatesVisitedForTesting += 1
             #endif
-            if resolved.count > maximumSeedCount { return resolved }
+            if resolved.count > maximumSeedCount {
+                return resolved
+            }
         }
 
         let dirCandidates = paths.filter { !matchedFileInputs.contains($0) }
@@ -5038,7 +5056,9 @@ final class MCPServerViewModel: ObservableObject {
             {
                 resolved.append(file)
             }
-            if folderResolution.didExceedLimit { return resolved }
+            if folderResolution.didExceedLimit {
+                return resolved
+            }
         }
 
         return resolved
@@ -6178,11 +6198,15 @@ final class MCPServerViewModel: ObservableObject {
             let isASCIIAlphanumeric = (48 ... 57).contains(Int(scalar.value))
                 || (97 ... 122).contains(Int(scalar.value))
             if isASCIIAlphanumeric {
-                if scalars.count >= maxLength { break }
+                if scalars.count >= maxLength {
+                    break
+                }
                 scalars.append(scalar)
                 lastWasSeparator = false
             } else if !lastWasSeparator, !scalars.isEmpty {
-                if scalars.count >= maxLength { break }
+                if scalars.count >= maxLength {
+                    break
+                }
                 scalars.append("-")
                 lastWasSeparator = true
             }
@@ -6433,7 +6457,9 @@ final class MCPServerViewModel: ObservableObject {
     private nonisolated static func parseContextAlias(_ args: [String: Value]) -> Int? {
         // Direct key "-C"
         if let alias = args["-C"] {
-            if let value = alias.intValue { return value }
+            if let value = alias.intValue {
+                return value
+            }
             if let string = alias.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                let parsed = Int(string)
             {
@@ -6447,7 +6473,9 @@ final class MCPServerViewModel: ObservableObject {
             guard lower.hasPrefix("-c") else { continue }
 
             if lower == "-c" {
-                if let intValue = value.intValue { return intValue }
+                if let intValue = value.intValue {
+                    return intValue
+                }
                 if let string = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                    let parsed = Int(string)
                 {
@@ -6558,7 +6586,9 @@ final class MCPServerViewModel: ObservableObject {
         )
         var sliceSnapshot: [UUID: [LineRange]] = [:]
         for (path, ranges) in StoredSelectionPathNormalization.standardizedSlices(selection.slices) {
-            if let file = resolved[path] { sliceSnapshot[file.id] = ranges }
+            if let file = resolved[path] {
+                sliceSnapshot[file.id] = ranges
+            }
         }
         return (
             selected: selectedPaths.compactMap { resolved[$0] },
