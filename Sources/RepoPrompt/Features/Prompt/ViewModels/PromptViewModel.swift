@@ -488,18 +488,24 @@ class PromptViewModel: ObservableObject {
     }
 
     private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {
-        guard let apiSettingsViewModel,
-              apiSettingsViewModel.isContextBuilderProviderValidationComplete
-        else {
+        guard let apiSettingsViewModel else {
             return nil
         }
         let profile = currentAgentModelsProfile()
         let agentRaw = profile.contextBuilderAgentRaw
         let modelRaw = agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
+        let availability = apiSettingsViewModel.contextBuilderRestorationAvailabilityContext
+        guard apiSettingsViewModel.isContextBuilderProviderValidationComplete else {
+            return AgentModelCatalog.normalizePersistedSelection(
+                agentRaw: agentRaw,
+                modelRaw: modelRaw,
+                availability: availability
+            )
+        }
         return AutoRecommendationEngine.resolveContextBuilderSelection(
             persistedAgentRaw: agentRaw,
             persistedModelRaw: modelRaw,
-            availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
+            availability: availability,
             enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
     }
