@@ -2681,6 +2681,24 @@ actor ServerNetworkManager {
         #endif
     }
 
+    /// Preserves request lifecycle telemetry without extending routing task-local lifetimes.
+    private nonisolated static func withLifecycleCorrelation<T>(
+        _ lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        #if DEBUG || EDIT_FLOW_PERF
+            guard let lifecycleCorrelation else {
+                return try await operation()
+            }
+            return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(
+                lifecycleCorrelation,
+                operation: operation
+            )
+        #else
+            return try await operation()
+        #endif
+    }
+
     func clientIdentifier(forConnection id: UUID) -> String? {
         if let admitted = clientIDByConnection[id] {
             return admitted
@@ -10816,9 +10834,10 @@ actor ServerNetworkManager {
                         EditFlowPerf.Stage.MCPToolCall.permitBodyEnvelope,
                         EditFlowPerf.Dimensions(toolName: toolName)
                     ) {
-                        // Wrap entire call so inner services can query current routing hints.
-                        await Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation) {
-                            await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
+                        // Keep lifecycle telemetry correlated while routing task locals remain provider-scoped.
+                        await Self.withLifecycleCorrelation(lifecycleCorrelation) {
+                            // Preserve the established control-flow nesting without extending routing task-local lifetimes.
+                            do {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,
                                     EditFlowPerf.Dimensions(toolName: toolName)
@@ -11347,12 +11366,22 @@ actor ServerNetworkManager {
                                                     throw ToolDispatchAdmissionError.windowTerminal
                                                 }
                                             }
-                                            let value = try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
-                                                try await EditFlowPerf.measure(
-                                                    EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
-                                                    EditFlowPerf.Dimensions(toolName: toolName),
-                                                    operation: operation
-                                                )
+                                            // Keep request routing task locals adjacent to provider execution. This
+                                            // reduces exposure to macOS 14 task-local unwind behavior while preserving
+                                            // provider and child-task inheritance.
+                                            let value = try await Self.withConnectionID(
+                                                connectionID,
+                                                lifecycleCorrelation: lifecycleCorrelation
+                                            ) {
+                                                try await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
+                                                    try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
+                                                        try await EditFlowPerf.measure(
+                                                            EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                                            EditFlowPerf.Dimensions(toolName: toolName),
+                                                            operation: operation
+                                                        )
+                                                    }
+                                                }
                                             }
                                             await emitExecutionTrace(.handlerCompleted, cancellationOutcome: "success")
                                             EditFlowPerf.lifecycleEvent(
@@ -12005,8 +12034,8 @@ actor ServerNetworkManager {
                                     Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)"),
                                     outcome: "toolNotFound"
                                 )
-                            } // TabContextHint TaskLocal wrapper
-                        } // ConnectionID + LifecycleCorrelation TaskLocal wrapper
+                            }
+                        } // LifecycleCorrelation TaskLocal wrapper
                     } // PermitBodyEnvelope wrapper
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
