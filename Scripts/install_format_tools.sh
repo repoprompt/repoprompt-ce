@@ -11,6 +11,9 @@ FORMAT_TOOLS_DIR="${REPOPROMPT_FORMAT_TOOLS_DIR:-$ROOT_DIR/.build/format-tools}"
 MANAGED_SWIFTFORMAT_DIR="$FORMAT_TOOLS_DIR/swiftformat/$SWIFTFORMAT_REQUIRED_VERSION"
 MANAGED_SWIFTFORMAT_PATH="$MANAGED_SWIFTFORMAT_DIR/swiftformat"
 TEMP_DIR=""
+FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS:-10}"
+FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS="${REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS:-120}"
+FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS="${REPOPROMPT_FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS:-300}"
 
 cleanup(){
     if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
@@ -52,6 +55,20 @@ EOF
 done
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+validate_bounded_positive_integer(){
+    local name="$1" value="$2" maximum="$3"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer"
+    (( value <= maximum )) || fail "$name must not exceed $maximum seconds"
+}
+validate_download_bounds(){
+    validate_bounded_positive_integer REPOPROMPT_FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS "$FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" 60
+    validate_bounded_positive_integer REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS "$FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" 300
+    validate_bounded_positive_integer REPOPROMPT_FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS "$FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS" 600
+    (( FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS <= FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
+    (( FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS <= FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS must not exceed REPOPROMPT_FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS"
+}
 has_tool(){ command -v "$1" >/dev/null 2>&1; }
 
 swiftformat_version_at(){
@@ -156,6 +173,8 @@ require_install_tool(){
 install_authoritative_swiftformat(){
     local archive extracted_path actual_sha installed_version destination_tmp tool
 
+    validate_download_bounds
+
     for tool in curl shasum unzip awk mktemp mkdir cp chmod mv rm; do
         require_install_tool "$tool"
     done
@@ -164,7 +183,11 @@ install_authoritative_swiftformat(){
     archive="$TEMP_DIR/swiftformat.zip"
 
     echo "Installing SwiftFormat $SWIFTFORMAT_REQUIRED_VERSION from the verified official release..."
-    curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --silent --show-error \
+    curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+        --connect-timeout "$FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" \
+        --retry-max-time "$FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS" \
+        --silent --show-error \
         "$SWIFTFORMAT_ARCHIVE_URL" \
         --output "$archive"
 

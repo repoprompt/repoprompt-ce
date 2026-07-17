@@ -21,6 +21,12 @@ ARCHIVE_BASENAME="${APP_NAME}-${MARKETING_VERSION}-${BUILD_NUMBER}"
 SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"
 SENTRY_DEPLOY_ENVIRONMENT="${REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT:-production}"
 SENTRY_API_BASE_URL="${REPOPROMPT_SENTRY_API_BASE_URL:-https://sentry.io/api/0}"
+SENTRY_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS:-10}"
+SENTRY_REQUEST_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS:-60}"
+RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS:-10}"
+RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS:-120}"
+RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS:-600}"
+SENTRY_OPERATION_ATTEMPTS=3
 DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"
 UPDATE_ZIP_NAME="$ARCHIVE_BASENAME.zip"
 DMG_NAME="$ARCHIVE_BASENAME.dmg"
@@ -60,6 +66,29 @@ require_env() {
     [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"
 }
 
+validate_bounded_positive_integer() {
+    local name="$1" value="$2" maximum="$3"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer"
+    (( value <= maximum )) || fail "$name must not exceed $maximum seconds"
+}
+
+validate_sentry_network_bounds() {
+    validate_bounded_positive_integer REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS "$SENTRY_CONNECT_TIMEOUT_SECONDS" 60
+    validate_bounded_positive_integer REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS "$SENTRY_REQUEST_TIMEOUT_SECONDS" 300
+    (( SENTRY_CONNECT_TIMEOUT_SECONDS <= SENTRY_REQUEST_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS"
+}
+
+validate_release_download_bounds() {
+    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" 60
+    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" 300
+    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS" 1200
+    (( RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS <= RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
+    (( RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS <= RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS must not exceed REPOPROMPT_RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS"
+}
+
 require_release_tag_matches_metadata() {
     [[ "$RELEASE_TAG" == "v$MARKETING_VERSION" ]] ||
         fail "Release tag must match release metadata: expected v$MARKETING_VERSION, got ${RELEASE_TAG:-<missing>}"
@@ -74,6 +103,7 @@ cleanup() {
 trap cleanup EXIT
 
 prepare_sentry_api_access() {
+    validate_sentry_network_bounds
     require_env REPOPROMPT_SENTRY_ORG
     require_env REPOPROMPT_SENTRY_PROJECT
     local token="${SENTRY_AUTH_TOKEN:-}"
@@ -110,6 +140,8 @@ sentry_api_request() {
     local args=(
         --silent
         --show-error
+        --connect-timeout "$SENTRY_CONNECT_TIMEOUT_SECONDS"
+        --max-time "$SENTRY_REQUEST_TIMEOUT_SECONDS"
         --output "$output_file"
         --write-out '%{http_code}'
         --request "$method"
@@ -120,19 +152,32 @@ sentry_api_request() {
         args+=(--header 'Content-Type: application/json' --data-binary "@$body_file")
     fi
 
-    local status
-    status="$(curl "${args[@]}" "$(sentry_deploy_endpoint)")" ||
-        fail "Unable to call the Sentry deploy API"
-    if [[ "$status" == "403" ]]; then
-        fail "Sentry deploy API rejected the organization token (HTTP 403); verify org:ci access to $REPOPROMPT_SENTRY_ORG/$REPOPROMPT_SENTRY_PROJECT"
+    local status curl_status
+    if status="$(curl "${args[@]}" "$(sentry_deploy_endpoint)")"; then
+        curl_status=0
+    else
+        curl_status=$?
     fi
-    [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
-        fail "Sentry deploy API request failed with HTTP $status"
+    if (( curl_status != 0 )); then
+        printf 'transport:%s' "$curl_status"
+        return 0
+    fi
+    [[ "$status" =~ ^[0-9]{3}$ ]] || fail "Sentry deploy API returned an invalid HTTP status"
+    printf '%s' "$status"
 }
 
 list_matching_sentry_deploys() {
     local output_file="$1"
-    sentry_api_request GET "$output_file"
+    local status
+    status="$(sentry_api_request GET "$output_file")"
+    if [[ "$status" == transport:* ]]; then
+        printf 'transport'
+        return 0
+    fi
+    if [[ "$status" == "403" ]]; then
+        fail "Sentry deploy API rejected the organization token (HTTP 403); verify org:ci access to $REPOPROMPT_SENTRY_ORG/$REPOPROMPT_SENTRY_PROJECT"
+    fi
+    [[ "$status" =~ ^2[0-9][0-9]$ ]] || fail "Sentry deploy API request failed with HTTP $status"
     jq -e '
         type == "array" and
         all(.[]; has("environment") and (.environment | type == "string") and
@@ -150,19 +195,12 @@ preflight_sentry_deploy_access() {
     prepare_sentry_api_access
     local matches
     matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-preflight.json")"
+    [[ "$matches" != "transport" ]] || fail "Unable to call the Sentry deploy API within the configured deadline"
     [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
     printf 'OK: Sentry deploy access verified for %s.\n' "$SENTRY_RELEASE_NAME"
 }
 
 record_verified_sentry_deploy_if_needed() {
-    local matches
-    matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-record.json")"
-    [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
-    if (( matches > 0 )); then
-        printf 'OK: Sentry production deploy already recorded for %s.\n' "$RELEASE_TAG"
-        return
-    fi
-
     local body_file="$TMP_DIR/sentry-deploy-create.json"
     jq -n \
         --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
@@ -170,14 +208,32 @@ record_verified_sentry_deploy_if_needed() {
         --arg project "$REPOPROMPT_SENTRY_PROJECT" \
         '{environment: $environment, name: $name, projects: [$project]}' > "$body_file"
     chmod 600 "$body_file"
-    sentry_api_request POST "$TMP_DIR/sentry-deploy-created.json" "$body_file"
-    jq -e \
-        --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
-        --arg name "$RELEASE_TAG" \
-        '.environment == $environment and .name == $name' \
-        "$TMP_DIR/sentry-deploy-created.json" >/dev/null ||
-        fail "Sentry deploy API returned a malformed create response"
-    printf 'OK: recorded Sentry production deploy for %s.\n' "$RELEASE_TAG"
+    local matches status attempt
+    for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
+        matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-record.json")"
+        if [[ "$matches" == "transport" ]]; then
+            continue
+        fi
+        [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
+        if (( matches > 0 )); then
+            printf 'OK: Sentry production deploy already recorded for %s.\n' "$RELEASE_TAG"
+            return 0
+        fi
+        status="$(sentry_api_request POST "$TMP_DIR/sentry-deploy-created.json" "$body_file")"
+        if [[ "$status" == transport:* ]]; then
+            continue
+        fi
+        [[ "$status" =~ ^2[0-9][0-9]$ ]] || fail "Sentry deploy API request failed with HTTP $status"
+        jq -e \
+            --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
+            --arg name "$RELEASE_TAG" \
+            '.environment == $environment and .name == $name' \
+            "$TMP_DIR/sentry-deploy-created.json" >/dev/null ||
+            fail "Sentry deploy API returned a malformed create response"
+        printf 'OK: recorded Sentry production deploy for %s.\n' "$RELEASE_TAG"
+        return 0
+    done
+    fail "Unable to reconcile Sentry deploy state after bounded transport failures; no further mutation was attempted"
 }
 
 source_gh() {
@@ -189,12 +245,16 @@ update_gh() {
 }
 
 curl_anonymous() {
+    validate_release_download_bounds
     env -u GH_TOKEN -u GITHUB_TOKEN curl \
         --fail \
         --location \
         --retry 8 \
         --retry-delay 3 \
         --retry-all-errors \
+        --connect-timeout "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" \
+        --retry-max-time "$RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS" \
         "$@"
 }
 
@@ -467,10 +527,13 @@ recheck_source_assets() {
 verify_strictly_newer_build() {
     local latest_json_file="$TMP_DIR/latest-release.json"
     local latest_status latest_json latest_tag latest_appcast latest_build
+    validate_release_download_bounds
     if ! latest_status="$(env -u GH_TOKEN -u GITHUB_TOKEN curl \
         --location \
         --silent \
         --show-error \
+        --connect-timeout "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" \
         --header "Authorization: Bearer $PUBLIC_UPDATE_GH_TOKEN" \
         --header "Accept: application/vnd.github+json" \
         --output "$latest_json_file" \
@@ -651,18 +714,20 @@ verify_anonymous_publish() {
     printf 'OK: anonymous release smoke passed for %s.\n' "$RELEASE_TAG"
 }
 
-case "$MODE" in
-    verify)
-        verify_source_release
-        ;;
-    promote)
-        verify_source_release
-        preflight_sentry_deploy_access
-        publish_reviewed_release
-        verify_anonymous_publish
-        record_verified_sentry_deploy_if_needed
-        ;;
-    *)
-        fail "Usage: $0 verify|promote"
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        verify)
+            verify_source_release
+            ;;
+        promote)
+            verify_source_release
+            preflight_sentry_deploy_access
+            publish_reviewed_release
+            verify_anonymous_publish
+            record_verified_sentry_deploy_if_needed
+            ;;
+        *)
+            fail "Usage: $0 verify|promote"
+            ;;
+    esac
+fi
