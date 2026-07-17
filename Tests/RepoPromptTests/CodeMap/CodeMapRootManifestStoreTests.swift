@@ -412,6 +412,10 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         let accounting = try await store.accounting()
         XCTAssertEqual(accounting.manifestCount, 0)
         XCTAssertEqual(accounting.quarantineCount, 4)
+        let decodeFailures = await store.decodeFailureAccounting()
+        XCTAssertEqual(decodeFailures.totalCount, 3)
+        XCTAssertEqual(decodeFailures.counts[.checksumMismatch], 2)
+        XCTAssertEqual(decodeFailures.counts[.invalidEnvelope], 1)
     }
 
     func testSymlinkHardlinkWrongModeAndRootReplacementFailClosed() async throws {
@@ -2027,13 +2031,187 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         hostile.append(("artifact key pipeline mismatch", checksummedManifest(keyMismatch)))
 
         for (label, data) in hostile {
+            let expectedFailure: CodeMapRootManifestDecodeFailure? = switch label {
+            case "invalid contribution tag", "terminal outcome with contribution":
+                .contributionValidation
+            case "duplicate path", "out-of-order path":
+                .orderingValidation
+            case "record authority mismatch":
+                .authorityValidation
+            default:
+                nil
+            }
             XCTAssertThrowsError(
                 try CodeMapRootManifestCodec.decodeStored(
                     data,
                     filenameDigest: fixture.namespace.storageDigestHex
                 ),
                 label
+            ) { error in
+                if let expectedFailure {
+                    XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, expectedFailure, label)
+                }
+            }
+        }
+    }
+
+    func testRepeatedSemanticQuarantineDelaysAndEventuallyRepairsTheFailingAuthority() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xA9,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("RepeatedSemanticFailure", trailingNewline: false)
+        )
+        let clock = ManifestAccessClock(100)
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                waitForRegenerationBackpressure: { seconds in clock.advance(by: seconds) }
+            ),
+            accessEpochSeconds: { clock.value }
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 1
+        )
+
+        func replaceWithInvalidContributionTag() throws {
+            var data = try Data(contentsOf: store.manifestURL(for: fixture.namespace))
+            let offsets = try manifestCodecOffsets(in: data)
+            data[offsets.records[0].contributionTagOffset] = 0xFF
+            try replaceFile(
+                at: store.manifestURL(for: fixture.namespace),
+                data: checksummedManifest(data)
             )
+        }
+
+        try replaceWithInvalidContributionTag()
+        let firstFailure = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        )
+        XCTAssertEqual(firstFailure, .miss)
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 2
+        )
+
+        try replaceWithInvalidContributionTag()
+        let secondFailure = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        )
+        XCTAssertEqual(secondFailure, .miss)
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 3
+        )
+
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("the blocked durability write should repair after its delay")
+        }
+        let accounting = await store.decodeFailureAccounting()
+        XCTAssertEqual(accounting.counts[.contributionValidation], 2)
+        XCTAssertEqual(accounting.regenerationBackpressureCount, 1)
+        XCTAssertEqual(clock.value, 130)
+    }
+
+    func testStoredManifestDecodeFailureAttributesValidatedFrameStage() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xA7,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("DecodeAttribution", trailingNewline: false)
+        )
+        let encoded = try CodeMapRootManifestCodec.encode(
+            snapshot: CodeMapRootManifestSnapshot(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                manifestGeneration: 1,
+                lastAccessEpochSeconds: 1,
+                records: [fixture.record]
+            )
+        )
+        let offsets = try manifestCodecOffsets(in: encoded)
+
+        var checksumMismatch = encoded
+        checksumMismatch[checksumMismatch.index(before: checksumMismatch.endIndex)] ^= 0xFF
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksumMismatch,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .checksumMismatch)
+        }
+
+        var unsupportedCodec = encoded
+        writeUInt32(99, at: CodeMapRootManifestCodec.magic.count, in: &unsupportedCodec)
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksummedManifest(unsupportedCodec),
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .unsupportedCodecVersion)
+        }
+
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            encoded,
+            filenameDigest: String(repeating: "0", count: 64)
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .namespaceDigestMismatch)
+        }
+
+        var invalidRecord = encoded
+        invalidRecord.replaceSubrange(
+            offsets.records[0].pathDataRange,
+            with: Data("Sources/../x.swif".utf8)
+        )
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksummedManifest(invalidRecord),
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .recordValidation)
+        }
+
+        var trailingPayload = Data(encoded.dropLast(32))
+        trailingPayload.append(0)
+        trailingPayload.append(Data(SHA256.hash(data: trailingPayload)))
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            trailingPayload,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .trailingPayload)
+        }
+
+        let differentNamespace = try namespaceLike(
+            fixture.namespace,
+            worktreeIdentity: worktreeIdentity(0xA8)
+        )
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decode(
+            encoded,
+            expectedNamespace: differentNamespace,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .expectedNamespaceMismatch)
         }
     }
 
@@ -2699,10 +2877,22 @@ private final class ManifestEntryInsertionHook: @unchecked Sendable {
 }
 
 private final class ManifestAccessClock: @unchecked Sendable {
-    let value: UInt64
+    private let lock = NSLock()
+    private var storedValue: UInt64
 
     init(_ value: UInt64) {
-        self.value = value
+        storedValue = value
+    }
+
+    var value: UInt64 {
+        lock.withLock { storedValue }
+    }
+
+    func advance(by amount: UInt64) {
+        lock.withLock {
+            let (sum, overflow) = storedValue.addingReportingOverflow(amount)
+            storedValue = overflow ? .max : sum
+        }
     }
 }
 

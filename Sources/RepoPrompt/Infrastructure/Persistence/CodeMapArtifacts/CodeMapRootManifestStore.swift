@@ -52,6 +52,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
     let maximumQuarantineCount: Int
     let maintenanceEntryLimit: Int
     let minimumAccessRefreshIntervalSeconds: UInt64
+    let regenerationBaseBackoffSeconds: UInt64
 
     static let `default` = CodeMapRootManifestStorePolicy(
         maximumRecordCountPerManifest: 100_000,
@@ -60,7 +61,8 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         maximumStoreByteCount: 256 * 1024 * 1024,
         maximumQuarantineCount: 64,
         maintenanceEntryLimit: 4096,
-        minimumAccessRefreshIntervalSeconds: 60
+        minimumAccessRefreshIntervalSeconds: 60,
+        regenerationBaseBackoffSeconds: 30
     )
 
     init(
@@ -70,7 +72,8 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         maximumStoreByteCount: UInt64,
         maximumQuarantineCount: Int,
         maintenanceEntryLimit: Int,
-        minimumAccessRefreshIntervalSeconds: UInt64 = 60
+        minimumAccessRefreshIntervalSeconds: UInt64 = 60,
+        regenerationBaseBackoffSeconds: UInt64 = 30
     ) {
         precondition(maximumRecordCountPerManifest > 0)
         precondition(maximumManifestByteCount > 0)
@@ -78,6 +81,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         precondition(maximumStoreByteCount >= maximumManifestByteCount)
         precondition(maximumQuarantineCount > 0)
         precondition(maintenanceEntryLimit > maximumManifestCount)
+        precondition(regenerationBaseBackoffSeconds > 0)
         self.maximumRecordCountPerManifest = maximumRecordCountPerManifest
         self.maximumManifestByteCount = maximumManifestByteCount
         self.maximumManifestCount = maximumManifestCount
@@ -85,6 +89,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         self.maximumQuarantineCount = maximumQuarantineCount
         self.maintenanceEntryLimit = maintenanceEntryLimit
         self.minimumAccessRefreshIntervalSeconds = minimumAccessRefreshIntervalSeconds
+        self.regenerationBaseBackoffSeconds = regenerationBaseBackoffSeconds
     }
 }
 
@@ -96,6 +101,7 @@ struct CodeMapRootManifestStoreHooks {
     var beforeMaintenanceLock: @Sendable () async -> Void
     var beforeTerminalAuthorityCheck: @Sendable (CodeMapRootManifestStoreTerminalOperation) -> Void
     var faultAction: @Sendable (CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction
+    var waitForRegenerationBackpressure: @Sendable (UInt64) async throws -> Void
 
     init(
         afterReadAdmission: @escaping @Sendable () async -> Void = {},
@@ -106,7 +112,11 @@ struct CodeMapRootManifestStoreHooks {
         beforeTerminalAuthorityCheck: @escaping @Sendable (CodeMapRootManifestStoreTerminalOperation) ->
             Void = { _ in },
         faultAction: @escaping @Sendable (CodeMapRootManifestStoreFaultPoint) ->
-            CodeMapRootManifestStoreFaultAction = { _ in .proceed }
+            CodeMapRootManifestStoreFaultAction = { _ in .proceed },
+        waitForRegenerationBackpressure: @escaping @Sendable (UInt64) async throws -> Void = { seconds in
+            let (nanoseconds, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+            try await Task.sleep(nanoseconds: overflow ? UInt64.max : nanoseconds)
+        }
     ) {
         self.afterReadAdmission = afterReadAdmission
         self.afterWriteShardAdmission = afterWriteShardAdmission
@@ -115,6 +125,7 @@ struct CodeMapRootManifestStoreHooks {
         self.beforeMaintenanceLock = beforeMaintenanceLock
         self.beforeTerminalAuthorityCheck = beforeTerminalAuthorityCheck
         self.faultAction = faultAction
+        self.waitForRegenerationBackpressure = waitForRegenerationBackpressure
     }
 
     static let none = CodeMapRootManifestStoreHooks()
@@ -151,9 +162,27 @@ struct CodeMapRootManifestMaintenanceResult: Equatable {
     let accounting: CodeMapRootManifestAccounting
 }
 
+struct CodeMapRootManifestDecodeFailureAccounting: Equatable {
+    let counts: [CodeMapRootManifestDecodeFailure: UInt64]
+    let regenerationBackpressureCount: UInt64
+
+    var totalCount: UInt64 {
+        counts.values.reduce(0) { partial, count in
+            let (sum, overflow) = partial.addingReportingOverflow(count)
+            return overflow ? .max : sum
+        }
+    }
+}
+
 private enum ManifestAuthorityReplacementPolicy {
     case unconstrained
     case exactPredecessor(CodeMapRootManifestAuthority?)
+}
+
+private struct ManifestRegenerationFailureState {
+    let authority: CodeMapRootManifestAuthority
+    var failureCount: UInt64
+    var blockedUntilEpochSeconds: UInt64
 }
 
 /// Inert, Git-only root-manifest persistence.
@@ -164,6 +193,8 @@ private enum ManifestAuthorityReplacementPolicy {
 actor CodeMapRootManifestStore {
     private static let directoryMode = mode_t(0o700)
     private static let fileMode = mode_t(0o600)
+    private static let regenerationFailureThreshold: UInt64 = 2
+    private static let regenerationMaximumBackoffExponent: UInt64 = 4
 
     nonisolated let rootURL: URL
     private let policy: CodeMapRootManifestStorePolicy
@@ -178,6 +209,9 @@ actor CodeMapRootManifestStore {
     ] = [:]
     private var pendingAccessRefreshes: [String: ManifestPendingAccessRefresh] = [:]
     private var accessRefreshTask: Task<Void, Never>?
+    private var decodeFailureCounts: [CodeMapRootManifestDecodeFailure: UInt64] = [:]
+    private var regenerationFailures: [String: ManifestRegenerationFailureState] = [:]
+    private var regenerationBackpressureCount: UInt64 = 0
 
     init(
         rootURL: URL,
@@ -221,6 +255,13 @@ actor CodeMapRootManifestStore {
         nextWriterSessionSequence = sequence == .max ? nil : sequence + 1
         activeWriterSessions.insert(token)
         return token
+    }
+
+    func decodeFailureAccounting() -> CodeMapRootManifestDecodeFailureAccounting {
+        CodeMapRootManifestDecodeFailureAccounting(
+            counts: decodeFailureCounts,
+            regenerationBackpressureCount: regenerationBackpressureCount
+        )
     }
 
     func endManifestWriterSession(_ token: CodeMapRootManifestWriterSessionToken) {
@@ -355,6 +396,15 @@ actor CodeMapRootManifestStore {
                 expectedNamespace: namespace,
                 filenameDigest: name
             )
+        } catch let failure as CodeMapRootManifestDecodeFailure {
+            recordDecodeFailure(failure)
+            recordRegenerationFailure(
+                failure: failure,
+                namespace: namespace,
+                authority: currentAuthority
+            )
+            try await quarantineIfCurrent(layout: layout, shard: shard, name: name, descriptor: descriptor)
+            return .miss
         } catch {
             try await quarantineIfCurrent(layout: layout, shard: shard, name: name, descriptor: descriptor)
             return .miss
@@ -378,6 +428,7 @@ actor CodeMapRootManifestStore {
         guard snapshot.authority == currentAuthority else {
             return .stale(existingAuthority: snapshot.authority)
         }
+        clearRegenerationFailure(namespace: namespace, authority: currentAuthority)
         scheduleAccessRefresh(for: snapshot)
         return .hit(snapshot)
     }
@@ -552,6 +603,7 @@ actor CodeMapRootManifestStore {
         guard namespace.isCurrent else {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
+        try await waitForRegenerationBackpressure(namespace: namespace, authority: authority)
         let layout = try Self.openLayout(rootURL: rootURL, create: false)
         await hooks.beforeMaintenanceLock()
         try Self.lock(lockAnchor.rawValue, operation: "manifest-anchor-lock")
@@ -840,6 +892,9 @@ actor CodeMapRootManifestStore {
               )
         else {
             throw CodeMapRootManifestStoreError.insecureDirectory
+        }
+        if removed {
+            regenerationFailures.removeValue(forKey: name)
         }
         return removed
     }
@@ -1358,9 +1413,85 @@ actor CodeMapRootManifestStore {
             return .valid(snapshot, identity)
         } catch CodeMapRootManifestStoreError.insecureLeaf {
             return .insecure
+        } catch is CodeMapRootManifestDecodeFailure {
+            return .corrupt
         } catch {
             return .corrupt
         }
+    }
+
+    private func recordDecodeFailure(_ failure: CodeMapRootManifestDecodeFailure) {
+        let current = decodeFailureCounts[failure, default: 0]
+        decodeFailureCounts[failure] = current == .max ? .max : current + 1
+    }
+
+    private func recordRegenerationFailure(
+        failure: CodeMapRootManifestDecodeFailure,
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority
+    ) {
+        switch failure {
+        case .namespaceValidation, .namespaceDigestMismatch, .expectedNamespaceMismatch,
+             .authorityValidation, .orderingValidation, .contributionValidation,
+             .recordValidation, .trailingPayload, .nonCanonicalEncoding:
+            break
+        case .invalidEnvelope, .checksumMismatch, .invalidMagic, .unsupportedCodecVersion:
+            return
+        }
+        let digest = namespace.storageDigestHex
+        var state: ManifestRegenerationFailureState
+        if let existing = regenerationFailures[digest], existing.authority == authority {
+            state = existing
+            state.failureCount = state.failureCount == .max ? .max : state.failureCount + 1
+        } else {
+            state = ManifestRegenerationFailureState(
+                authority: authority,
+                failureCount: 1,
+                blockedUntilEpochSeconds: 0
+            )
+        }
+        if state.failureCount >= Self.regenerationFailureThreshold {
+            let exponent = min(
+                state.failureCount - Self.regenerationFailureThreshold,
+                Self.regenerationMaximumBackoffExponent
+            )
+            let multiplier = UInt64(1) << exponent
+            let (candidateDelay, delayOverflow) = policy.regenerationBaseBackoffSeconds
+                .multipliedReportingOverflow(by: multiplier)
+            let delay = delayOverflow ? UInt64.max : candidateDelay
+            let now = accessEpochSeconds()
+            let (deadline, overflow) = now.addingReportingOverflow(delay)
+            state.blockedUntilEpochSeconds = max(
+                state.blockedUntilEpochSeconds,
+                overflow ? .max : deadline
+            )
+        }
+        regenerationFailures[digest] = state
+    }
+
+    private func waitForRegenerationBackpressure(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority
+    ) async throws {
+        let digest = namespace.storageDigestHex
+        while let state = regenerationFailures[digest], state.authority == authority {
+            let now = accessEpochSeconds()
+            guard now < state.blockedUntilEpochSeconds else { return }
+            regenerationBackpressureCount = regenerationBackpressureCount == .max
+                ? .max
+                : regenerationBackpressureCount + 1
+            try await hooks.waitForRegenerationBackpressure(state.blockedUntilEpochSeconds - now)
+            try Task.checkCancellation()
+        }
+    }
+
+    private func clearRegenerationFailure(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority
+    ) {
+        let digest = namespace.storageDigestHex
+        guard regenerationFailures[digest]?.authority == authority else { return }
+        regenerationFailures.removeValue(forKey: digest)
     }
 
     private static func openLayout(rootURL: URL, create: Bool) throws -> ManifestStoreLayout {
