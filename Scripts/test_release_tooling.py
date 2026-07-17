@@ -1770,12 +1770,194 @@ sys.stdout.write(str(status))
         self.assertIn('gitleaks git --redact --log-opts="$range" .', workflow)
         self.assertIn("gitleaks dir --redact .", workflow)
 
+    def _make_format_tools_test_environment(
+        self,
+        system_swiftformat_version: str,
+    ) -> tuple[Path, dict[str, str], Path]:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        tools = root / "tools"
+        tools.mkdir()
+        managed = root / "managed"
+        temp = root / "tmp"
+        temp.mkdir()
+        mismatched_invocations = root / "mismatched-swiftformat-invocations"
+
+        fake_swiftformat = tools / "swiftformat"
+        fake_swiftformat.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+if sys.argv[1:] == ["--version"]:
+    print({system_swiftformat_version!r})
+    raise SystemExit(0)
+
+Path({str(mismatched_invocations)!r}).write_text(" ".join(sys.argv[1:]), encoding="utf-8")
+raise SystemExit(99)
+""",
+            encoding="utf-8",
+        )
+        fake_swiftformat.chmod(0o755)
+
+        fake_swiftlint = tools / "swiftlint"
+        fake_swiftlint.write_text(
+            "#!/bin/sh\nif [ \"$1\" = version ] || [ \"$1\" = --version ]; then echo 0.65.0; fi\nexit 0\n",
+            encoding="utf-8",
+        )
+        fake_swiftlint.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{tools}:/usr/bin:/bin",
+                "REPOPROMPT_FORMAT_TOOLS_DIR": str(managed),
+                "TMPDIR": str(temp),
+            }
+        )
+        return root, env, mismatched_invocations
+
+    def _install_fake_swiftformat_download_tools(
+        self,
+        root: Path,
+        archive: Path,
+        checksum: str,
+    ) -> None:
+        tools = root / "tools"
+        fake_curl = tools / "curl"
+        fake_curl.write_text(
+            """#!/usr/bin/env python3
+import os
+import shutil
+import sys
+
+args = sys.argv[1:]
+output = args[args.index("--output") + 1]
+shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
+""",
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+
+        fake_shasum = tools / "shasum"
+        fake_shasum.write_text(
+            f"#!/bin/sh\nprintf '%s  %s\\n' {checksum!r} \"$3\"\n",
+            encoding="utf-8",
+        )
+        fake_shasum.chmod(0o755)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+
+    def test_format_tool_resolver_accepts_only_authoritative_system_swiftformat(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+
+        exact_root, exact_env, _ = self._make_format_tools_test_environment("0.61.1")
+        exact = subprocess.run(
+            [str(installer), "resolve-swiftformat"],
+            env=exact_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        self.assertEqual(Path(exact.stdout.strip()), exact_root / "tools" / "swiftformat")
+
+        _, mismatch_env, mismatch_invocations = self._make_format_tools_test_environment("0.62.1")
+        mismatch = subprocess.run(
+            [str(installer), "resolve-swiftformat"],
+            env=mismatch_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("incompatible (0.62.1", mismatch.stderr)
+        self.assertIn("SwiftFormat 0.61.1 is required", mismatch.stderr)
+        self.assertFalse(mismatch_invocations.exists())
+
+    def test_format_tool_install_verifies_and_resolves_managed_swiftformat(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+        root, env, mismatched_invocations = self._make_format_tools_test_environment("0.62.1")
+        archive = root / "fixtures" / "swiftformat.zip"
+        managed_swiftformat = root / "managed" / "swiftformat" / "0.61.1" / "swiftformat"
+        pinned_checksum = "b990400779aceb7d7020796eb9ba814d4480543f671d38fc0ff48cb72f04c584"
+
+        archive.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(
+                "swiftformat",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.61.1; exit 0; fi\nexit 0\n",
+            )
+        self._install_fake_swiftformat_download_tools(root, archive, pinned_checksum)
+        env["FAKE_SWIFTFORMAT_ARCHIVE"] = str(archive)
+
+        installed = subprocess.run(
+            [str(installer), "install"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertIn(f"Installed SwiftFormat 0.61.1 at {managed_swiftformat}", installed.stdout)
+        self.assertTrue(os.access(managed_swiftformat, os.X_OK))
+        self.assertFalse(mismatched_invocations.exists())
+
+        resolved = subprocess.run(
+            [str(installer), "resolve-swiftformat"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(Path(resolved.stdout.strip()), managed_swiftformat)
+
+    def test_format_tool_install_rejects_bad_swiftformat_checksum(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+        root, env, mismatched_invocations = self._make_format_tools_test_environment("0.62.1")
+        archive = root / "fixtures" / "swiftformat.zip"
+        managed_swiftformat = root / "managed" / "swiftformat" / "0.61.1" / "swiftformat"
+
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"not-the-official-swiftformat-archive")
+        self._install_fake_swiftformat_download_tools(root, archive, "0" * 64)
+        env["FAKE_SWIFTFORMAT_ARCHIVE"] = str(archive)
+
+        result = subprocess.run(
+            [str(installer), "install"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SwiftFormat archive checksum mismatch", result.stderr)
+        self.assertFalse(managed_swiftformat.exists())
+        self.assertFalse(mismatched_invocations.exists())
+
+    def test_swift_style_never_formats_with_mismatched_path_swiftformat(self) -> None:
+        style_script = SCRIPT_DIR / "swift_style.sh"
+        _, env, mismatched_invocations = self._make_format_tools_test_environment("0.62.1")
+
+        result = subprocess.run(
+            [str(style_script), "format-check"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SwiftFormat 0.61.1 is required", result.stderr)
+        self.assertIn("make install-format-tools", result.stderr)
+        self.assertFalse(mismatched_invocations.exists())
+
     def test_swift_style_lint_uses_config_discovery_without_script_input_overhead(self) -> None:
         root = SCRIPT_DIR.parent
         style_script = (SCRIPT_DIR / "swift_style.sh").read_text(encoding="utf-8")
         swiftlint_config = (root / ".swiftlint.yml").read_text(encoding="utf-8")
         lint_body = style_script.split("run_swiftlint(){", 1)[1].split("\n}", 1)[0]
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        style_job = workflow.split("\n  style:", 1)[1].split("\n  build-and-test:", 1)[0]
 
+        installer_step = "./Scripts/install_format_tools.sh install"
+        lint_step = "run: make lint"
+        self.assertIn(installer_step, style_job)
+        self.assertIn(lint_step, style_job)
+        self.assertLess(style_job.index(installer_step), style_job.index(lint_step))
         self.assertIn('local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)', lint_body)
         self.assertNotIn("SCRIPT_INPUT_FILE", lint_body)
         self.assertNotIn("--use-script-input-files", lint_body)
