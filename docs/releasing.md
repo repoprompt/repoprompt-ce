@@ -95,8 +95,10 @@ before the repository reaches that limit.
 
 The workflow uses GitHub concurrency to allow one active and one pending run.
 New successful `main` runs replace an older pending run while an active signing
-or notarization run finishes. Before compiling, it checks for a complete release
-for the immutable `tip-<shortsha>` tag and skips an already-published commit.
+or notarization run finishes. Before compiling, it uses the workflow's read-only
+`github.token` to check for a complete release for the immutable `tip-<shortsha>`
+tag and skips an already-published commit. The protected update-repository token
+remains confined to the publishing job.
 
 Configure a protected GitHub Actions environment named `tip-release`. It can use
 the same Developer ID, provisioning, notarization, and Sparkle secrets as stable

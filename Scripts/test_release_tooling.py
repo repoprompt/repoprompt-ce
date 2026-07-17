@@ -1898,14 +1898,18 @@ sys.stdout.write(str(status))
             package_script,
         )
 
-    def test_main_tip_setup_uses_anonymous_release_lookup_helper(self) -> None:
+    def test_main_tip_setup_uses_read_only_github_token_for_release_lookup_helper(self) -> None:
         tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
         setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  stage:", 1)[0]
+        after_setup = tip_workflow.split("\n  stage:", 1)[1]
         before_publish, publish_job = tip_workflow.split("\n  publish:", 1)
 
         self.assertIn("permissions:\n  contents: read", tip_workflow)
         self.assertIn("./Scripts/lookup_public_tip_release.sh", setup_job)
-        self.assertNotIn("GITHUB_TOKEN", setup_job)
+        self.assertIn("TIP_GH_TOKEN: ${{ github.token }}", setup_job)
+        self.assertEqual(tip_workflow.count("${{ github.token }}"), 1)
+        self.assertNotIn("${{ github.token }}", after_setup)
+        self.assertNotIn("environment: tip-release", setup_job)
         self.assertNotIn("Authorization:", setup_job)
         self.assertNotIn("api.github.com", setup_job)
         self.assertNotIn("TIP_UPDATE_REPOSITORY_TOKEN", before_publish)
@@ -1933,7 +1937,12 @@ def option(name):
     return args[args.index(name) + 1]
 
 request_headers = [args[index + 1] for index, value in enumerate(args) if value == "--header"]
-if any(header.lower().startswith("authorization:") for header in request_headers):
+authorization_headers = [header for header in request_headers if header.lower().startswith("authorization:")]
+expected_tip_gh_token = os.environ.get("FAKE_EXPECTED_TIP_GH_TOKEN", "")
+if expected_tip_gh_token:
+    if authorization_headers != [f"Authorization: Bearer {expected_tip_gh_token}"]:
+        raise SystemExit(90)
+elif authorization_headers:
     raise SystemExit(90)
 if any(option_name in args for option_name in ("--user", "--netrc", "--netrc-file", "-u")):
     raise SystemExit(91)
@@ -2018,23 +2027,33 @@ sys.stdout.write(str(status))
         fake_sleep.chmod(0o755)
 
         scenarios = (
-            ("found", 0, "found", 1, "found"),
-            ("absent", 0, "not-found", 1, "not-found"),
-            ("rate-403-primary", 1, "", 3, "rate-limited"),
-            ("rate-403-secondary", 1, "", 3, "rate-limited"),
-            ("rate-429", 1, "", 3, "rate-limited"),
-            ("server", 1, "", 3, "server-failure"),
-            ("transport", 1, "", 3, "transport-failure"),
-            ("unexpected-403", 1, "", 1, "unexpected-failure"),
-            ("redirect-final-unexpected-403", 1, "", 1, "unexpected-failure"),
-            ("malformed", 1, "", 1, "malformed"),
-            ("malformed-flags", 1, "", 1, "malformed"),
+            ("found-anonymous", "found", "", 0, "found", 1, "found"),
+            ("found-authenticated", "found", "fixture-tip-token", 0, "found", 1, "found"),
+            ("absent", "absent", "", 0, "not-found", 1, "not-found"),
+            ("rate-403-primary", "rate-403-primary", "", 1, "", 3, "rate-limited"),
+            ("rate-403-secondary", "rate-403-secondary", "", 1, "", 3, "rate-limited"),
+            ("rate-429", "rate-429", "", 1, "", 3, "rate-limited"),
+            ("server", "server", "", 1, "", 3, "server-failure"),
+            ("transport", "transport", "", 1, "", 3, "transport-failure"),
+            ("unexpected-403", "unexpected-403", "", 1, "", 1, "unexpected-failure"),
+            (
+                "redirect-final-unexpected-403",
+                "redirect-final-unexpected-403",
+                "",
+                1,
+                "",
+                1,
+                "unexpected-failure",
+            ),
+            ("malformed", "malformed", "", 1, "", 1, "malformed"),
+            ("malformed-flags", "malformed-flags", "", 1, "", 1, "malformed"),
         )
         helper = SCRIPT_DIR / "lookup_public_tip_release.sh"
-        for scenario, returncode, stdout, attempt_count, classification in scenarios:
-            with self.subTest(scenario=scenario):
+        for case_name, scenario, tip_gh_token, returncode, stdout, attempt_count, classification in scenarios:
+            with self.subTest(case=case_name):
                 calls.unlink(missing_ok=True)
                 env = os.environ.copy()
+                env.pop("TIP_GH_TOKEN", None)
                 env.update(
                     {
                         "PATH": f"{tools}:{env['PATH']}",
@@ -2042,8 +2061,11 @@ sys.stdout.write(str(status))
                         "FAKE_CURL_CALLS": str(calls),
                         "FAKE_GITHUB_SCENARIO": scenario,
                         "FAKE_ARCHIVE_BASENAME": archive_basename,
+                        "FAKE_EXPECTED_TIP_GH_TOKEN": tip_gh_token,
                     }
                 )
+                if tip_gh_token:
+                    env["TIP_GH_TOKEN"] = tip_gh_token
                 result = subprocess.run(
                     [str(helper), "example/public-tip", "tip-fixture", archive_basename],
                     env=env,
@@ -2056,6 +2078,8 @@ sys.stdout.write(str(status))
                 self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), attempt_count)
                 self.assertIn(f"classification={classification}", result.stderr)
                 self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
+                if tip_gh_token:
+                    self.assertNotIn(tip_gh_token, result.stdout + result.stderr)
                 if scenario == "redirect-final-unexpected-403":
                     self.assertNotIn("classification=rate-limited", result.stderr)
                     self.assertIn(
