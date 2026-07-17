@@ -11,6 +11,7 @@ import RepoPromptShared
             let condition: String
             let executionDeadlineSeconds: Double
             let cleanupGraceSeconds: Double
+            let cleanupDisposition: MCPToolExecutionCleanupDisposition
         }
 
         struct Entry: Equatable {
@@ -18,6 +19,7 @@ import RepoPromptShared
             let contractKind: MCPToolExecutionContract.Kind
             let executionDeadlineSeconds: Double?
             let cleanupGraceSeconds: Double?
+            let cleanupDisposition: MCPToolExecutionCleanupDisposition?
             let expectedActiveDuration: String
             let evidence: String
             let qualification: String
@@ -74,6 +76,12 @@ import RepoPromptShared
             }
         }
 
+        static var detachAndSettleToolNames: [String] {
+            entries.compactMap { entry in
+                entry.cleanupDisposition == .detachAndSettle ? entry.toolName : nil
+            }
+        }
+
         static var debugSnapshot: [String: Any] {
             [
                 "payload_logging": false,
@@ -93,6 +101,7 @@ import RepoPromptShared
                 "interactive_tools": interactiveToolNames,
                 "workspace_lifecycle_tools": workspaceLifecycleToolNames,
                 "bounded_tools": boundedToolNames,
+                "detach_and_settle_tools": detachAndSettleToolNames,
                 "tools": entries.map { entry in
                     var payload: [String: Any] = [
                         "tool": entry.toolName,
@@ -107,6 +116,9 @@ import RepoPromptShared
                     if let cleanupGraceSeconds = entry.cleanupGraceSeconds {
                         payload["cleanup_grace_seconds"] = cleanupGraceSeconds
                     }
+                    if let cleanupDisposition = entry.cleanupDisposition {
+                        payload["cleanup_disposition"] = cleanupDisposition.rawValue
+                    }
                     if let semanticWaitMaximumSeconds = entry.semanticWaitMaximumSeconds {
                         payload["semantic_wait_maximum_seconds"] = semanticWaitMaximumSeconds
                     }
@@ -117,7 +129,8 @@ import RepoPromptShared
                                 "condition": override.condition,
                                 "execution_contract": MCPToolExecutionContract.Kind.bounded.rawValue,
                                 "execution_deadline_seconds": override.executionDeadlineSeconds,
-                                "cleanup_grace_seconds": override.cleanupGraceSeconds
+                                "cleanup_grace_seconds": override.cleanupGraceSeconds,
+                                "cleanup_disposition": override.cleanupDisposition.rawValue
                             ]
                         }
                     }
@@ -144,19 +157,22 @@ import RepoPromptShared
                         action: "switch",
                         condition: "always",
                         executionDeadlineSeconds: workspaceSwitchExecutionDeadlineSeconds,
-                        cleanupGraceSeconds: boundedCleanupGraceSeconds
+                        cleanupGraceSeconds: boundedCleanupGraceSeconds,
+                        cleanupDisposition: .forceDisconnect
                     ),
                     ConditionalExecutionOverride(
                         action: "create",
                         condition: "switch_to_created != false (handler default)",
                         executionDeadlineSeconds: workspaceSwitchExecutionDeadlineSeconds,
-                        cleanupGraceSeconds: boundedCleanupGraceSeconds
+                        cleanupGraceSeconds: boundedCleanupGraceSeconds,
+                        cleanupDisposition: .forceDisconnect
                     ),
                     ConditionalExecutionOverride(
                         action: "delete",
                         condition: "close_window == true",
                         executionDeadlineSeconds: workspaceSwitchExecutionDeadlineSeconds,
-                        cleanupGraceSeconds: boundedCleanupGraceSeconds
+                        cleanupGraceSeconds: boundedCleanupGraceSeconds,
+                        cleanupDisposition: .forceDisconnect
                     )
                 ]
             } else {
@@ -164,15 +180,18 @@ import RepoPromptShared
             }
 
             switch contract {
-            case let .bounded(deadline, cancellationGrace):
+            case let .bounded(deadline, cancellationGrace, cleanupDisposition):
                 return Entry(
                     toolName: toolName,
                     contractKind: contract.kind,
                     executionDeadlineSeconds: deadline.mcpSeconds,
                     cleanupGraceSeconds: cancellationGrace.mcpSeconds,
+                    cleanupDisposition: cleanupDisposition,
                     expectedActiveDuration: "Ordinary dispatch must complete within \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
                     evidence: "ServerNetworkManager applies MCPToolExecutionWatchdog at the resolved provider boundary.",
-                    qualification: "Cancellation must release provider, limiter, ownership, and run-registration state; an uncooperative handler force-disconnects its connection after grace.",
+                    qualification: cleanupDisposition == .detachAndSettle
+                        ? "At most one read-only provider per window may remain detached after grace. Its ordinary permit and publication ownership are released, creating a bounded +1 provider-capacity exception until eventual settlement; later structure calls return retryable busy only after detachment."
+                        : "Cancellation must release provider, limiter, ownership, and run-registration state; an uncooperative handler force-disconnects its connection after grace.",
                     semanticWaitMaximumSeconds: semanticWaitMaximumSeconds,
                     conditionalExecutionOverrides: conditionalExecutionOverrides
                 )
@@ -182,6 +201,7 @@ import RepoPromptShared
                     contractKind: contract.kind,
                     executionDeadlineSeconds: nil,
                     cleanupGraceSeconds: nil,
+                    cleanupDisposition: nil,
                     expectedActiveDuration: "May remain synchronously active beyond \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
                     evidence: "The product contract explicitly exempts Oracle operations and Context Builder while preserving external cancellation.",
                     qualification: "Keep the \(MCPTimeoutPolicy.codexServerActiveTimeoutSeconds.formatted())-active-second Codex server timeout until this workflow gains a detached lifecycle or separate server.",
@@ -194,6 +214,7 @@ import RepoPromptShared
                     contractKind: contract.kind,
                     executionDeadlineSeconds: nil,
                     cleanupGraceSeconds: nil,
+                    cleanupDisposition: nil,
                     expectedActiveDuration: "Long work is owned by start/poll/wait/cancel lifecycle operations.",
                     evidence: "agent_run and agent_explore expose detached lifecycle control rather than an ordinary synchronous provider contract.",
                     qualification: "Cancelling an individual control request must not implicitly destroy the detached run unless the lifecycle operation requests cancellation.",
@@ -206,6 +227,7 @@ import RepoPromptShared
                     contractKind: contract.kind,
                     executionDeadlineSeconds: nil,
                     cleanupGraceSeconds: nil,
+                    cleanupDisposition: nil,
                     expectedActiveDuration: "May wait for a user interaction beyond \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
                     evidence: "The tool exposes a cancellable UI interaction whose configured timeout remains authoritative.",
                     qualification: "User- or workspace-driven interaction waits are not clamped by the ordinary execution watchdog.",
@@ -218,6 +240,7 @@ import RepoPromptShared
                     contractKind: contract.kind,
                     executionDeadlineSeconds: nil,
                     cleanupGraceSeconds: nil,
+                    cleanupDisposition: nil,
                     expectedActiveDuration: "Workspace or VCS lifecycle work may legitimately exceed \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
                     evidence: "The tool can open, switch, hydrate, create, merge, or inspect workspace/repository lifecycle state.",
                     qualification: toolName == MCPGlobalToolName.manageWorkspaces

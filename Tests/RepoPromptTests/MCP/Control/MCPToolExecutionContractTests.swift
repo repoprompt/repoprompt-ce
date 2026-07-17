@@ -63,11 +63,16 @@ final class MCPToolExecutionContractTests: XCTestCase {
             ], caseLabel)
 
             for toolName in names(for: .bounded) {
-                guard case let .bounded(deadline, cancellationGrace) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
+                guard case let .bounded(deadline, cancellationGrace, cleanupDisposition) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
                     return XCTFail(caseLabel + ": Expected bounded contract for \(toolName)")
                 }
                 XCTAssertEqual(deadline, MCPTimeoutPolicy.boundedToolExecutionDeadline, caseLabel + ": " + toolName)
                 XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, caseLabel + ": " + toolName)
+                XCTAssertEqual(
+                    cleanupDisposition,
+                    toolName == MCPWindowToolName.getCodeStructure ? .detachAndSettle : .forceDisconnect,
+                    caseLabel + ": " + toolName
+                )
             }
         }
 
@@ -128,7 +133,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
         ]
 
         for testCase in boundedCases {
-            guard case let .bounded(deadline, cancellationGrace) = MCPToolExecutionContractCatalog.contract(
+            guard case let .bounded(deadline, cancellationGrace, cleanupDisposition) = MCPToolExecutionContractCatalog.contract(
                 for: MCPGlobalToolName.manageWorkspaces,
                 arguments: testCase.arguments
             ) else {
@@ -137,6 +142,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
             }
             XCTAssertEqual(deadline, MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline, testCase.label)
             XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, testCase.label)
+            XCTAssertEqual(cleanupDisposition, .forceDisconnect, testCase.label)
         }
 
         let unboundedCases: [(label: String, arguments: [String: Value])] = [
