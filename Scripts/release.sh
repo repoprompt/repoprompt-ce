@@ -24,6 +24,9 @@ BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.js
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
 SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"
 SENTRY_API_BASE_URL="${REPOPROMPT_SENTRY_API_BASE_URL:-https://sentry.io/api/0}"
+SENTRY_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS:-10}"
+SENTRY_REQUEST_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS:-60}"
+SENTRY_OPERATION_ATTEMPTS=3
 SENTRY_CURL_CONFIG=""
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
@@ -52,6 +55,21 @@ require_file() {
 
 require_env() {
     [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"
+}
+
+validate_bounded_positive_integer() {
+    local name="$1"
+    local value="$2"
+    local maximum="$3"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer"
+    (( value <= maximum )) || fail "$name must not exceed $maximum seconds"
+}
+
+validate_sentry_network_bounds() {
+    validate_bounded_positive_integer REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS "$SENTRY_CONNECT_TIMEOUT_SECONDS" 60
+    validate_bounded_positive_integer REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS "$SENTRY_REQUEST_TIMEOUT_SECONDS" 300
+    (( SENTRY_CONNECT_TIMEOUT_SECONDS <= SENTRY_REQUEST_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS"
 }
 
 sentry_linking_enabled() {
@@ -180,18 +198,23 @@ write_final_artifact_manifest() {
         --expected-architectures "arm64,x86_64"
 }
 
-require_sentry_publish_configuration() {
+require_sentry_api_configuration() {
     sentry_linking_enabled || return 0
     [[ -n "${SENTRY_AUTH_TOKEN:-}" || -n "${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}" ]] || fail "Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN or REPOPROMPT_SENTRY_AUTH_TOKEN_FILE for Sentry release metadata and debug symbol upload."
     require_env REPOPROMPT_SENTRY_ORG
     require_env REPOPROMPT_SENTRY_PROJECT
     require_command curl
     require_command jq
+}
+
+require_sentry_publish_configuration() {
+    require_sentry_api_configuration
     require_command sentry-cli
 }
 
 prepare_sentry_api_access() {
     sentry_linking_enabled || return 0
+    validate_sentry_network_bounds
     [[ -n "$SENTRY_CURL_CONFIG" && -f "$SENTRY_CURL_CONFIG" ]] && return 0
     [[ -n "$TMP_DIR" ]] || fail "Sentry API access requires an initialized release workspace"
     local token="${SENTRY_AUTH_TOKEN:-}"
@@ -242,6 +265,8 @@ sentry_api_request() {
     local args=(
         --silent
         --show-error
+        --connect-timeout "$SENTRY_CONNECT_TIMEOUT_SECONDS"
+        --max-time "$SENTRY_REQUEST_TIMEOUT_SECONDS"
         --output "$output_file"
         --write-out '%{http_code}'
         --request "$method"
@@ -252,11 +277,26 @@ sentry_api_request() {
         args+=(--header 'Content-Type: application/json' --data-binary "@$body_file")
     fi
 
-    local status
-    status="$(curl "${args[@]}" "$endpoint")" ||
-        fail "Unable to call the Sentry release API"
+    local status curl_status
+    if status="$(curl "${args[@]}" "$endpoint")"; then
+        curl_status=0
+    else
+        curl_status=$?
+    fi
+    if (( curl_status != 0 )); then
+        printf 'transport:%s' "$curl_status"
+        return 0
+    fi
     [[ "$status" =~ ^[0-9]{3}$ ]] || fail "Sentry release API returned an invalid HTTP status"
     printf '%s' "$status"
+}
+
+sentry_transport_failed() {
+    [[ "$1" == transport:* ]]
+}
+
+fail_sentry_unknown_transport_state() {
+    fail "Unable to reconcile Sentry release state after bounded transport failures; no further mutation was attempted"
 }
 
 fail_sentry_release_api_status() {
@@ -294,6 +334,9 @@ preflight_sentry_release_access() {
     local response_file="$TMP_DIR/sentry-release-preflight.json"
     local status
     status="$(sentry_api_request GET "$(sentry_release_preflight_endpoint)" "$response_file")"
+    if sentry_transport_failed "$status"; then
+        fail "Unable to verify Sentry release access within the configured network deadline"
+    fi
     [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
         fail_sentry_release_api_status "verify release access" "$status"
     jq -e 'type == "array" and all(.[]; .version | type == "string")' "$response_file" >/dev/null ||
@@ -309,25 +352,37 @@ prepare_sentry_release() {
     [[ -n "$source_repository" ]] || fail "Missing SOURCE_GITHUB_REPOSITORY for Sentry commit association"
     printf 'Preparing Sentry release %s for %s/%s.\n' "$SENTRY_RELEASE_NAME" "$REPOPROMPT_SENTRY_ORG" "$REPOPROMPT_SENTRY_PROJECT"
     local release_response="$TMP_DIR/sentry-release.json"
-    local status
-    status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
-    if [[ "$status" == "404" ]]; then
-        local create_body="$TMP_DIR/sentry-release-create.json"
-        jq -n \
-            --arg version "$SENTRY_RELEASE_NAME" \
-            --arg project "$REPOPROMPT_SENTRY_PROJECT" \
-            --arg repository "$source_repository" \
-            --arg commit "$RELEASE_COMMIT" \
-            '{version: $version, projects: [$project], refs: [{repository: $repository, commit: $commit}]}' \
-            > "$create_body"
-        chmod 600 "$create_body"
-        status="$(sentry_api_request POST "$(sentry_releases_endpoint)" "$release_response" "$create_body")"
-        [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
-            fail_sentry_release_api_status "create release $SENTRY_RELEASE_NAME" "$status"
-    elif [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-        fail_sentry_release_api_status "look up release $SENTRY_RELEASE_NAME" "$status"
-    fi
-    validate_sentry_release_response "$release_response" "release preparation"
+    local create_body="$TMP_DIR/sentry-release-create.json"
+    local status attempt prepared=0
+    jq -n \
+        --arg version "$SENTRY_RELEASE_NAME" \
+        --arg project "$REPOPROMPT_SENTRY_PROJECT" \
+        --arg repository "$source_repository" \
+        --arg commit "$RELEASE_COMMIT" \
+        '{version: $version, projects: [$project], refs: [{repository: $repository, commit: $commit}]}' \
+        > "$create_body"
+    chmod 600 "$create_body"
+
+    for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
+        status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
+        if sentry_transport_failed "$status"; then
+            continue
+        fi
+        if [[ "$status" == "404" ]]; then
+            status="$(sentry_api_request POST "$(sentry_releases_endpoint)" "$release_response" "$create_body")"
+            if sentry_transport_failed "$status"; then
+                continue
+            fi
+            [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+                fail_sentry_release_api_status "create release $SENTRY_RELEASE_NAME" "$status"
+        elif [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            fail_sentry_release_api_status "look up release $SENTRY_RELEASE_NAME" "$status"
+        fi
+        validate_sentry_release_response "$release_response" "release preparation"
+        prepared=1
+        break
+    done
+    (( prepared == 1 )) || fail_sentry_unknown_transport_state
 
     local refs_body="$TMP_DIR/sentry-release-refs.json"
     jq -n \
@@ -335,38 +390,67 @@ prepare_sentry_release() {
         --arg commit "$RELEASE_COMMIT" \
         '{refs: [{repository: $repository, commit: $commit}]}' > "$refs_body"
     chmod 600 "$refs_body"
-    status="$(sentry_api_request PUT "$(sentry_release_endpoint)" "$release_response" "$refs_body")"
-    [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
-        fail_sentry_release_api_status "associate release commits" "$status"
-    validate_sentry_release_response "$release_response" "commit association"
+    for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
+        status="$(sentry_api_request PUT "$(sentry_release_endpoint)" "$release_response" "$refs_body")"
+        if sentry_transport_failed "$status"; then
+            continue
+        fi
+        [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+            fail_sentry_release_api_status "associate release commits" "$status"
+        validate_sentry_release_response "$release_response" "commit association"
+        return 0
+    done
+    fail "Unable to associate Sentry release commits after bounded retries of the idempotent request"
 }
 
 finalize_sentry_release() {
     sentry_linking_enabled || return 0
     prepare_sentry_api_access
     local release_response="$TMP_DIR/sentry-release-finalize.json"
-    local status
-    status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
-    [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
-        fail_sentry_release_api_status "look up release $SENTRY_RELEASE_NAME before finalization" "$status"
-    validate_sentry_release_response "$release_response" "release finalization"
-    if jq -e '.dateReleased | type == "string"' "$release_response" >/dev/null; then
-        printf 'OK: Sentry release %s is already finalized.\n' "$SENTRY_RELEASE_NAME"
-        return
-    fi
-    jq -e '.dateReleased == null' "$release_response" >/dev/null ||
-        fail "Sentry release API returned malformed finalization state"
-
     local finalize_body="$TMP_DIR/sentry-release-finalize-body.json"
+    local status attempt
     jq -n --arg date_released "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
         '{dateReleased: $date_released}' > "$finalize_body"
     chmod 600 "$finalize_body"
-    status="$(sentry_api_request PUT "$(sentry_release_endpoint)" "$release_response" "$finalize_body")"
-    [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
-        fail_sentry_release_api_status "finalize release $SENTRY_RELEASE_NAME" "$status"
-    validate_sentry_release_response "$release_response" "release finalization"
-    jq -e '.dateReleased | type == "string"' "$release_response" >/dev/null ||
-        fail "Sentry release API did not confirm finalization"
+
+    for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
+        status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
+        if sentry_transport_failed "$status"; then
+            continue
+        fi
+        [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+            fail_sentry_release_api_status "look up release $SENTRY_RELEASE_NAME before finalization" "$status"
+        validate_sentry_release_response "$release_response" "release finalization"
+        if jq -e '.dateReleased | type == "string"' "$release_response" >/dev/null; then
+            printf 'OK: Sentry release %s is already finalized.\n' "$SENTRY_RELEASE_NAME"
+            return 0
+        fi
+        jq -e '.dateReleased == null' "$release_response" >/dev/null ||
+            fail "Sentry release API returned malformed finalization state"
+
+        status="$(sentry_api_request PUT "$(sentry_release_endpoint)" "$release_response" "$finalize_body")"
+        if sentry_transport_failed "$status"; then
+            continue
+        fi
+        [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+            fail_sentry_release_api_status "finalize release $SENTRY_RELEASE_NAME" "$status"
+        validate_sentry_release_response "$release_response" "release finalization"
+        jq -e '.dateReleased | type == "string"' "$release_response" >/dev/null ||
+            fail "Sentry release API did not confirm finalization"
+        return 0
+    done
+    fail_sentry_unknown_transport_state
+}
+
+recover_sentry_finalization() {
+    [[ "${REPOPROMPT_ENABLE_SENTRY:-}" == "1" ]] ||
+        fail "finalize-sentry requires REPOPROMPT_ENABLE_SENTRY=1"
+    require_env RELEASE_TAG
+    require_release_tag_matches_metadata
+    require_sentry_api_configuration
+    TMP_DIR="$(mktemp -d)"
+    preflight_sentry_release_access
+    finalize_sentry_release
 }
 
 upload_required_sentry_symbols() {
@@ -576,7 +660,7 @@ publish_staged_release() {
     )
     local existing_release_state=""
     if existing_release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
-        fail "GitHub release $RELEASE_TAG already exists (isDraft=$existing_release_state). Refusing to repeat Sentry finalization; inspect the existing draft and Sentry release before manual recovery."
+        fail "GitHub release $RELEASE_TAG already exists (isDraft=$existing_release_state). Refusing to repeat publish-staged; inspect the existing release, then run release.sh finalize-sentry to idempotently recover Sentry finalization."
     fi
     gh release create "${release_args[@]}"
     printf 'Created draft GitHub release assets for %s.\n' "$RELEASE_TAG"
@@ -593,6 +677,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         artifact) package_release_candidate ;;
         stage-publish) stage_publish_release ;;
         publish-staged) publish_staged_release ;;
-        *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged" ;;
+        finalize-sentry) recover_sentry_finalization ;;
+        *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged|finalize-sentry" ;;
     esac
 fi

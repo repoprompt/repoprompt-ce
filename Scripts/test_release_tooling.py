@@ -1600,10 +1600,13 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self,
         lookup_mode: str,
         attempts: int = 1,
+        action: str = "full",
+        env_overrides: dict[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         call_log = temp_dir / "sentry-api-calls.jsonl"
+        counter_file = temp_dir / "sentry-api-counters.json"
         release_state = temp_dir / "sentry-release.json"
         api_tmp = temp_dir / "api-tmp"
         api_tmp.mkdir()
@@ -1621,6 +1624,13 @@ args = sys.argv[1:]
 
 def option(name):
     return args[args.index(name) + 1]
+
+if option("--connect-timeout") != os.environ.get("EXPECTED_CONNECT_TIMEOUT", "10"):
+    raise SystemExit(88)
+if option("--max-time") != os.environ.get("EXPECTED_REQUEST_TIMEOUT", "60"):
+    raise SystemExit(89)
+if "--retry" in args or "--retry-all-errors" in args:
+    raise SystemExit(87)
 
 config = Path(option("--config"))
 if stat.S_IMODE(config.stat().st_mode) != 0o600:
@@ -1650,13 +1660,26 @@ if "--data-binary" in args:
     body = json.loads(Path(body_arg[1:]).read_text(encoding="utf-8"))
 
 with Path(os.environ["SENTRY_CALL_LOG"]).open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"method": method, "url": url, "body": body}) + "\\n")
+    handle.write(json.dumps({
+        "method": method,
+        "url": url,
+        "body": body,
+        "connect_timeout": option("--connect-timeout"),
+        "max_time": option("--max-time"),
+    }) + "\\n")
 
 state_path = Path(os.environ["SENTRY_RELEASE_STATE"])
+counter_path = Path(os.environ["SENTRY_COUNTER_FILE"])
 parsed = urlparse(url)
 is_preflight = parsed.query != ""
 is_collection = parsed.path.endswith("/releases/")
 version = unquote(parsed.path.rstrip("/").split("/")[-1])
+
+def bump(key):
+    counters = json.loads(counter_path.read_text(encoding="utf-8")) if counter_path.exists() else {}
+    counters[key] = counters.get(key, 0) + 1
+    counter_path.write_text(json.dumps(counters), encoding="utf-8")
+    return counters[key]
 
 def release_payload():
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1676,21 +1699,42 @@ if is_preflight:
     else:
         status, response = 200, []
 elif method == "GET" and not is_collection:
+    if scenario in {"existing-finalized", "existing-unfinalized"} and not state_path.exists():
+        date_released = "2026-01-01T00:00:00Z" if scenario == "existing-finalized" else None
+        state_path.write_text(json.dumps({"version": version, "dateReleased": date_released}), encoding="utf-8")
+    if scenario == "unknown-create" and counter_path.exists() and json.loads(counter_path.read_text(encoding="utf-8")).get("create", 0) > 0:
+        raise SystemExit(28)
     if state_path.exists():
         status, response = 200, release_payload()
     else:
         status, response = 404, {"detail": "SECRET_BODY_MARKER"}
 elif method == "POST" and is_collection:
+    create_attempt = bump("create")
+    if scenario == "ambiguous-create-lost" and create_attempt == 1:
+        raise SystemExit(28)
+    if scenario == "unknown-create":
+        raise SystemExit(28)
     state_path.write_text(
         json.dumps({"version": body["version"], "dateReleased": None}),
         encoding="utf-8",
     )
+    if scenario == "ambiguous-create-landed" and create_attempt == 1:
+        raise SystemExit(28)
     status, response = 201, release_payload()
 elif method == "PUT" and not is_collection and state_path.exists():
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if "dateReleased" in body:
+        finalize_attempt = bump("finalize")
+        if scenario == "ambiguous-finalize-lost" and finalize_attempt == 1:
+            raise SystemExit(28)
         state["dateReleased"] = body["dateReleased"]
         state_path.write_text(json.dumps(state), encoding="utf-8")
+        if scenario == "ambiguous-finalize-landed" and finalize_attempt == 1:
+            raise SystemExit(28)
+    elif "refs" in body:
+        refs_attempt = bump("refs")
+        if scenario == "ambiguous-refs" and refs_attempt == 1:
+            raise SystemExit(28)
     status, response = 200, release_payload()
 else:
     status, response = 500, {"detail": "unexpected fixture request", "version": version}
@@ -1714,19 +1758,37 @@ sys.stdout.write(str(status))
                 "RELEASE_COMMIT": "0123456789abcdef",
                 "SENTRY_LOOKUP_MODE": lookup_mode,
                 "SENTRY_CALL_LOG": str(call_log),
+                "SENTRY_COUNTER_FILE": str(counter_file),
                 "SENTRY_RELEASE_STATE": str(release_state),
                 "FIXTURE_TMP_DIR": str(api_tmp),
                 "ATTEMPTS": str(attempts),
+                "EXPECTED_CONNECT_TIMEOUT": "10",
+                "EXPECTED_REQUEST_TIMEOUT": "60",
             }
         )
+        if env_overrides:
+            env.update(env_overrides)
+        if action in {"recover", "recover-disabled"}:
+            metadata = dict(
+                line.split("=", 1)
+                for line in (SCRIPT_DIR.parent / "version.env").read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            )
+            env["RELEASE_TAG"] = f'v{metadata["MARKETING_VERSION"].strip(chr(34))}'
+            if action == "recover-disabled":
+                env.pop("REPOPROMPT_ENABLE_SENTRY", None)
+            shell_action = "recover_sentry_finalization"
+        else:
+            shell_action = (
+                "preflight_sentry_release_access; "
+                "for ((attempt = 0; attempt < ATTEMPTS; attempt++)); do prepare_sentry_release; done; "
+                "finalize_sentry_release; finalize_sentry_release"
+            )
         result = subprocess.run(
             [
                 "bash",
                 "-c",
-                'source "$1"; TMP_DIR="$FIXTURE_TMP_DIR"; '
-                "preflight_sentry_release_access; "
-                "for ((attempt = 0; attempt < ATTEMPTS; attempt++)); do prepare_sentry_release; done; "
-                "finalize_sentry_release; finalize_sentry_release",
+                'source "$1"; TMP_DIR="$FIXTURE_TMP_DIR"; ' + shell_action,
                 "sentry-release-test",
                 str(SCRIPT_DIR / "release.sh"),
             ],
@@ -1779,6 +1841,227 @@ sys.stdout.write(str(status))
         self.assertNotIn("fixture-token", result.stdout + result.stderr)
         self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
 
+    def test_sentry_release_requests_are_bounded_without_curl_mutation_retries(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("not-found-once")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(len(calls), 0)
+        self.assertTrue(all(call["connect_timeout"] == "10" for call in calls))
+        self.assertTrue(all(call["max_time"] == "60" for call in calls))
+
+    def test_sentry_release_recovers_ambiguous_create_outcomes_by_observation(self) -> None:
+        for scenario, expected_posts in (
+            ("ambiguous-create-landed", 1),
+            ("ambiguous-create-lost", 2),
+        ):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_sentry_prepare_fixture(scenario)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len([call for call in calls if call["method"] == "POST"]), expected_posts)
+
+    def test_sentry_release_recovers_ambiguous_finalize_outcomes_by_observation(self) -> None:
+        for scenario, expected_finalizations in (
+            ("ambiguous-finalize-landed", 1),
+            ("ambiguous-finalize-lost", 2),
+        ):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_sentry_prepare_fixture(scenario)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                finalizations = [
+                    call
+                    for call in calls
+                    if call["method"] == "PUT" and "dateReleased" in (call["body"] or {})
+                ]
+                self.assertEqual(len(finalizations), expected_finalizations)
+
+    def test_sentry_release_retries_identical_idempotent_refs_after_transport_failure(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("ambiguous-refs")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        refs_updates = [
+            call
+            for call in calls
+            if call["method"] == "PUT" and "refs" in (call["body"] or {})
+        ]
+        self.assertEqual(len(refs_updates), 2)
+        self.assertEqual(refs_updates[0]["body"], refs_updates[1]["body"])
+
+    def test_sentry_release_fails_loudly_when_ambiguous_create_cannot_be_reconciled(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("unknown-create")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len([call for call in calls if call["method"] == "POST"]), 1)
+        self.assertIn("Unable to reconcile Sentry release state", result.stderr)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr)
+
+    def test_finalize_sentry_recovery_mode_accepts_an_existing_finalized_release(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("existing-finalized", action="recover")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
+        self.assertIn("already finalized", result.stdout)
+
+    def test_finalize_sentry_recovery_mode_finalizes_an_existing_unfinalized_release(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("existing-unfinalized", action="recover")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call["method"] == "POST" for call in calls))
+        finalizations = [
+            call
+            for call in calls
+            if call["method"] == "PUT" and "dateReleased" in (call["body"] or {})
+        ]
+        self.assertEqual(len(finalizations), 1)
+
+    def test_finalize_sentry_recovery_mode_requires_sentry_to_be_enabled(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("existing-unfinalized", action="recover-disabled")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("finalize-sentry requires REPOPROMPT_ENABLE_SENTRY=1", result.stderr)
+
+    def test_sentry_timeout_configuration_rejects_unbounded_values_before_network(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture(
+            "not-found-once",
+            env_overrides={"REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS": "301"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("must not exceed 300 seconds", result.stderr)
+
+    def run_sentry_deploy_fixture(self, scenario: str) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        call_log = temp_dir / "calls.jsonl"
+        counter = temp_dir / "counter"
+        state = temp_dir / "state"
+        fake_curl = temp_dir / "curl"
+        fake_curl.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+def option(name):
+    return args[args.index(name) + 1]
+
+if option("--connect-timeout") != "10" or option("--max-time") != "60":
+    raise SystemExit(90)
+if "--retry" in args or "--retry-all-errors" in args:
+    raise SystemExit(91)
+config = Path(option("--config"))
+if stat.S_IMODE(config.stat().st_mode) != 0o600:
+    raise SystemExit(93)
+if config.read_text(encoding="utf-8") != 'header = "Authorization: Bearer fixture-token"\\n':
+    raise SystemExit(94)
+if "SENTRY_AUTH_TOKEN" in os.environ:
+    raise SystemExit(95)
+method = option("--request")
+output = Path(option("--output"))
+body = None
+if "--data-binary" in args:
+    body = json.loads(Path(option("--data-binary")[1:]).read_text(encoding="utf-8"))
+with Path(os.environ["CALL_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"method": method, "body": body}) + "\\n")
+
+state = Path(os.environ["DEPLOY_STATE"])
+counter = Path(os.environ["DEPLOY_COUNTER"])
+if method == "GET":
+    response = ([{"environment": "production", "name": "vfixture"}] if state.exists() else [])
+    status = 200
+elif method == "POST":
+    attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+    counter.write_text(str(attempt), encoding="utf-8")
+    if os.environ["SCENARIO"] == "lost" and attempt == 1:
+        raise SystemExit(28)
+    state.write_text("landed", encoding="utf-8")
+    if os.environ["SCENARIO"] == "landed" and attempt == 1:
+        raise SystemExit(28)
+    response = {"environment": "production", "name": "vfixture"}
+    status = 201
+else:
+    raise SystemExit(92)
+output.write_text(json.dumps(response), encoding="utf-8")
+sys.stdout.write(str(status))
+""",
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+        api_tmp = temp_dir / "api"
+        api_tmp.mkdir()
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{temp_dir}:{env.get('PATH', '')}",
+                "SENTRY_AUTH_TOKEN": "fixture-token",
+                "REPOPROMPT_SENTRY_ORG": "fixture-org",
+                "REPOPROMPT_SENTRY_PROJECT": "fixture-project",
+                "REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT": "production",
+                "RELEASE_TAG": "vfixture",
+                "FIXTURE_TMP_DIR": str(api_tmp),
+                "CALL_LOG": str(call_log),
+                "DEPLOY_STATE": str(state),
+                "DEPLOY_COUNTER": str(counter),
+                "SCENARIO": scenario,
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; TMP_DIR="$FIXTURE_TMP_DIR"; preflight_sentry_deploy_access; record_verified_sentry_deploy_if_needed',
+                "sentry-deploy-test",
+                str(SCRIPT_DIR / "promote_release.sh"),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+        return result, calls
+
+    def test_sentry_deploy_recovers_ambiguous_create_outcomes_without_curl_retry(self) -> None:
+        for scenario, expected_posts in (("landed", 1), ("lost", 2)):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_sentry_deploy_fixture(scenario)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len([call for call in calls if call["method"] == "POST"]), expected_posts)
+                self.assertNotIn("fixture-token", result.stdout + result.stderr + json.dumps(calls))
+
+    def test_promotion_anonymous_downloads_have_bounded_retry_time(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        args_file = temp_dir / "args.json"
+        fake_curl = temp_dir / "curl"
+        fake_curl.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+Path(os.environ["ARGS_FILE"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+        env = os.environ.copy()
+        env.update({"PATH": f"{temp_dir}:{env.get('PATH', '')}", "ARGS_FILE": str(args_file)})
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; curl_anonymous https://example.invalid/artifact', "download-test", str(SCRIPT_DIR / "promote_release.sh")],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(args_file.read_text(encoding="utf-8"))
+        self.assertEqual(args[args.index("--connect-timeout") + 1], "10")
+        self.assertEqual(args[args.index("--max-time") + 1], "120")
+        self.assertEqual(args[args.index("--retry-max-time") + 1], "600")
+
     def test_sentry_release_preflight_distinguishes_invalid_token_without_mutation(self) -> None:
         result, calls = self.run_sentry_prepare_fixture("unauthorized")
 
@@ -1797,6 +2080,14 @@ sys.stdout.write(str(status))
         self.assertEqual(len(calls), 1)
         self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
         self.assertIn("malformed JSON during access preflight", result.stderr)
+
+    def test_sentry_release_preflight_reports_transport_deadline_failure_clearly(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("transport")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("configured network deadline", result.stderr)
+        self.assertNotIn("HTTP transport:", result.stderr)
 
     def test_sentry_symbol_flow_is_explicit_secret_safe_and_release_only_by_default(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
@@ -1841,6 +2132,8 @@ sys.stdout.write(str(status))
         self.assertIn('sentry_api_request PUT', release_script)
         self.assertIn("'{refs: [{repository: $repository, commit: $commit}]}'", release_script)
         self.assertIn('finalize_sentry_release', release_script)
+        self.assertIn('finalize-sentry) recover_sentry_finalization', release_script)
+        self.assertIn('Refusing to repeat publish-staged', release_script)
         self.assertIn("'{dateReleased: $date_released}'", release_script)
         self.assertNotIn('sentry-cli --org', release_script)
         self.assertNotIn('record_sentry_production_deploy', release_script)
@@ -2178,10 +2471,13 @@ raise SystemExit(99)
         fake_curl.write_text(
             """#!/usr/bin/env python3
 import os
+import json
 import shutil
 import sys
 
 args = sys.argv[1:]
+with open(os.environ["FAKE_SWIFTFORMAT_CURL_ARGS"], "w", encoding="utf-8") as handle:
+    json.dump(args, handle)
 output = args[args.index("--output") + 1]
 shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
 """,
@@ -2237,6 +2533,7 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             )
         self._install_fake_swiftformat_download_tools(root, archive, pinned_checksum)
         env["FAKE_SWIFTFORMAT_ARCHIVE"] = str(archive)
+        env["FAKE_SWIFTFORMAT_CURL_ARGS"] = str(root / "curl-args.json")
 
         installed = subprocess.run(
             [str(installer), "install"],
@@ -2248,6 +2545,10 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         self.assertIn(f"Installed SwiftFormat 0.61.1 at {managed_swiftformat}", installed.stdout)
         self.assertTrue(os.access(managed_swiftformat, os.X_OK))
         self.assertFalse(mismatched_invocations.exists())
+        curl_args = json.loads((root / "curl-args.json").read_text(encoding="utf-8"))
+        self.assertEqual(curl_args[curl_args.index("--connect-timeout") + 1], "10")
+        self.assertEqual(curl_args[curl_args.index("--max-time") + 1], "120")
+        self.assertEqual(curl_args[curl_args.index("--retry-max-time") + 1], "300")
 
         resolved = subprocess.run(
             [str(installer), "resolve-swiftformat"],
@@ -2268,6 +2569,7 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         archive.write_bytes(b"not-the-official-swiftformat-archive")
         self._install_fake_swiftformat_download_tools(root, archive, "0" * 64)
         env["FAKE_SWIFTFORMAT_ARCHIVE"] = str(archive)
+        env["FAKE_SWIFTFORMAT_CURL_ARGS"] = str(root / "curl-args.json")
 
         result = subprocess.run(
             [str(installer), "install"],
@@ -2279,6 +2581,30 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         self.assertIn("SwiftFormat archive checksum mismatch", result.stderr)
         self.assertFalse(managed_swiftformat.exists())
         self.assertFalse(mismatched_invocations.exists())
+
+    def test_format_tool_install_rejects_unbounded_download_timeout_before_curl(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+        root, env, _ = self._make_format_tools_test_environment("0.62.1")
+        archive = root / "fixtures" / "swiftformat.zip"
+        self._install_fake_swiftformat_download_tools(root, archive, "0" * 64)
+        curl_args = root / "curl-args.json"
+        env.update(
+            {
+                "FAKE_SWIFTFORMAT_ARCHIVE": str(archive),
+                "FAKE_SWIFTFORMAT_CURL_ARGS": str(curl_args),
+                "REPOPROMPT_FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS": "601",
+            }
+        )
+
+        result = subprocess.run(
+            [str(installer), "install"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not exceed 600 seconds", result.stderr)
+        self.assertFalse(curl_args.exists())
 
     def test_swift_style_never_formats_with_mismatched_path_swiftformat(self) -> None:
         style_script = SCRIPT_DIR / "swift_style.sh"
