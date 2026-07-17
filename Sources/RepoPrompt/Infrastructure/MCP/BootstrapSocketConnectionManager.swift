@@ -372,4 +372,30 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
             bootstrapLog.debug("Failed to send progress notification: \(error)")
         }
     }
+
+    /// Sends standards-compliant request progress when the MCP caller supplied
+    /// `_meta.progressToken` on the original `tools/call` request.
+    func sendMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async {
+        guard !isClosing, handshakeComplete else { return }
+
+        let notification = ProgressNotification.message(
+            .init(
+                progressToken: token,
+                progress: progress,
+                message: message
+            )
+        )
+
+        do {
+            try await server.notify(notification)
+        } catch {
+            // Progress is advisory. A failed notification must not fail or cancel
+            // the underlying tool execution.
+            bootstrapLog.debug("Failed to send standard MCP progress notification: \(error)")
+        }
+    }
 }

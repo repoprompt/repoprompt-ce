@@ -14,6 +14,9 @@ enum CodexIntegrationConfiguration {
     static let desiredSupportsParallelToolCalls = true
     static let desiredToolOutputTokenLimit = 25000
 
+    /// Serializes in-process read-modify-write access to `~/.codex/config.toml` across concurrent
+    /// Codex startup/provisioning paths. Cross-process writers remain outside this lock's scope.
+    private static let fileLock = NSLock()
     private static let tomlBareKeyCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
     private static let repoPromptMCPConfiguration = RepoPromptMCPServerConfiguration.repoPrompt
     private static let repoPromptMCPServerName = RepoPromptMCPServerConfiguration.defaultServerName
@@ -166,6 +169,9 @@ enum CodexIntegrationConfiguration {
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
     static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool) {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let fm = FileManager.default
         let codexDir = configDirectoryURL()
         let configURL = configURL()
@@ -201,6 +207,9 @@ enum CodexIntegrationConfiguration {
     /// `-c` overrides.
     @discardableResult
     static func ensureServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let fm = FileManager.default
         let codexDir = configDirectoryURL()
         let configURL = configURL()
@@ -261,6 +270,9 @@ enum CodexIntegrationConfiguration {
     }
 
     static func removeInstallEntry() {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let fm = FileManager.default
         let configURL = configURL()
         guard fm.fileExists(atPath: configURL.path) else { return }
@@ -293,6 +305,9 @@ enum CodexIntegrationConfiguration {
     /// - Returns: `true` if the RepoPrompt entry was located and now has the desired policy.
     @discardableResult
     static func ensureToolTimeout(force: Bool = false) -> Bool {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let defaults = UserDefaults.standard
         if !force, defaults.bool(forKey: toolTimeoutDefaultsKey) {
             return true

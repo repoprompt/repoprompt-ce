@@ -586,40 +586,15 @@ struct AgentModelsSettingsView: View {
                 .fixedSize()
             }
 
-            if resolution.overrideUnavailable {
+            let pinState = resolution.pinState
+            if let message = pinState.message,
+               let actionTitle = pinState.actionTitle
+            {
                 HStack(spacing: 6) {
-                    Text("Saved override unavailable; using recommended default.")
+                    Text(message)
                         .font(.caption2)
-                        .foregroundColor(.orange)
-                    if resolution.hasStoredOverride {
-                        Button("Clear Pin") {
-                            viewModel.applyRoleDefault(resolution)
-                        }
-                        .font(.caption2)
-                        .buttonStyle(.plain)
-                        .foregroundColor(.accentColor)
-                    }
-                }
-                .padding(.leading, 30)
-            } else if resolution.hasCustomOverride {
-                HStack(spacing: 6) {
-                    Text("Recommended: \(resolution.recommendedDisplayName)")
-                        .font(.caption2)
-                        .foregroundColor(.orange)
-                    Button("Apply") {
-                        viewModel.applyRoleDefault(resolution)
-                    }
-                    .font(.caption2)
-                    .buttonStyle(.plain)
-                    .foregroundColor(.accentColor)
-                }
-                .padding(.leading, 30)
-            } else if resolution.hasStoredOverride {
-                HStack(spacing: 6) {
-                    Text("Pinned to recommended")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                    Button("Clear Pin") {
+                        .foregroundColor(pinState.usesWarningStyle ? .orange : .secondary)
+                    Button(actionTitle) {
                         viewModel.applyRoleDefault(resolution)
                     }
                     .font(.caption2)

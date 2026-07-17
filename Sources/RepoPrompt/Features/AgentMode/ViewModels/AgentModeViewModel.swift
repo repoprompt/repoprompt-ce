@@ -1697,7 +1697,7 @@ final class AgentModeViewModel: ObservableObject {
                             publicationForSessionID: { _ in nil }
                         )
                     },
-                leaseRoutingTimeoutMs: testCodexLeaseRoutingTimeoutMs ?? 2000,
+                leaseRoutingTimeoutMs: testCodexLeaseRoutingTimeoutMs ?? 10000,
                 idleShutdownDelayNanos: testCodexIdleShutdownDelayNanos ?? 300_000_000_000,
                 stallWatchdogPollIntervalNanos: testCodexStallWatchdogPollIntervalNanos ?? 5_000_000_000,
                 stallWatchdogProbeThreshold: testWatchdogProbeThreshold,

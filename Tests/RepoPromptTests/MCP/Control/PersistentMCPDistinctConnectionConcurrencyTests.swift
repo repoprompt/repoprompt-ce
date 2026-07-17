@@ -1887,7 +1887,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 connectionID: connectionID,
                 connection: manager,
                 clientName: clientName,
-                sessionToken: sessionToken
+                sessionToken: sessionToken,
+                bootstrapPeerPID: Int(getpid())
             )
             let startTask = Task {
                 try await manager.start { clientInfo in

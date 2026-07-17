@@ -60,6 +60,61 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
     }
 
+    func testModelSyncClearsAndEnablesPreserveDurableInvariant() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        let service = AppSettingsMCPService(store: store)
+        let model = AIModel.gpt54Pro.rawValue
+
+        func set(_ key: String, _ value: Value) async throws -> Value {
+            try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string(key),
+                "value": value
+            ])
+        }
+
+        let rejectedEnable = try await set("models.sync_chat_model_with_oracle", .bool(true))
+        XCTAssertEqual(rejectedEnable.objectValue?["new_value"]?.boolValue, false)
+        XCTAssertFalse(store.syncChatModelWithOracle())
+
+        _ = try await set("models.planning_model", .string(model))
+        _ = try await set("models.preferred_compose_model", .string(AIModel.claude4Sonnet.rawValue))
+        let validEnable = try await set("models.sync_chat_model_with_oracle", .bool(true))
+        XCTAssertEqual(validEnable.objectValue?["new_value"]?.boolValue, true)
+        XCTAssertEqual(store.planningModelRaw(), model)
+        XCTAssertEqual(store.preferredComposeModelRaw(), model)
+        XCTAssertTrue(store.syncChatModelWithOracle())
+
+        let clearedCompose = try await set("models.preferred_compose_model", .null)
+        XCTAssertNil(clearedCompose.objectValue?["new_value"]?.stringValue)
+        XCTAssertEqual(store.planningModelRaw(), model)
+        XCTAssertNil(store.preferredComposeModelRaw())
+        XCTAssertFalse(store.syncChatModelWithOracle())
+
+        _ = try await set("models.preferred_compose_model", .string(model))
+        _ = try await set("models.sync_chat_model_with_oracle", .bool(true))
+        let clearedPlanning = try await set("models.planning_model", .null)
+        XCTAssertNil(clearedPlanning.objectValue?["new_value"]?.stringValue)
+        XCTAssertNil(store.planningModelRaw())
+        XCTAssertEqual(store.preferredComposeModelRaw(), model)
+        XCTAssertFalse(store.syncChatModelWithOracle())
+
+        let persisted = try fileStore.load()
+        XCTAssertNil(persisted.scalarPreferences?.modelSelection?.planningModel)
+        XCTAssertEqual(persisted.scalarPreferences?.modelSelection?.preferredComposeModel, model)
+        XCTAssertEqual(persisted.scalarPreferences?.modelSelection?.syncChatModelWithOracle, false)
+    }
+
     func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)

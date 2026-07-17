@@ -46,6 +46,7 @@ jobs:
         env:
           REQUESTED_COMMIT: ${{ inputs.commit || github.event.workflow_run.head_sha }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          TIP_GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main

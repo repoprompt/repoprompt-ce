@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-07-12. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-07-14. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -83,9 +83,11 @@ that rollback compatibility guarantee.
 `currentSchemaVersion` increases.
 
 Classic/internal RepoPrompt wrote unlineaged v3/v4 `globalSettings.json` files before CE
-introduced `schemaLineage`. An unlineaged version above the frozen ceiling is therefore
-foreign forever, even after CE reaches v3/v4 numerically. This prevents old live/dev files
-from being silently adopted and overwritten by a newer CE build.
+introduced `schemaLineage`. CE therefore skipped numeric schema v3 rather than claiming a
+version that existing classic/internal installs had already written without lineage. An
+unlineaged version above the frozen ceiling is foreign forever, even after CE reaches v3/v4
+numerically. This prevents old live/dev files from being silently adopted and overwritten by
+a newer CE build.
 
 The guardrail tests are:
 
@@ -105,6 +107,15 @@ the preserved file until the user chooses an action:
   byte-for-byte, decodes CE-known fields, writes a current-schema CE file, and leaves
   unknown fields only in the backup.
 - **Save failure**: offer retry before reset.
+
+Telemetry enablement has a `UserDefaults` mirror so startup can make a safe decision before
+the canonical JSON document is available. A successful settings load synchronizes that
+mirror from JSON. When a same-lineage future or incompatible/foreign schema blocks the
+load, an existing mirror is preserved; if no mirror exists, telemetry defaults off. Other
+load failures, including corrupt input, force the mirror off. Missing settings remove a
+stale mirror so the build default applies, and successful user-initiated recovery
+resynchronizes the mirror from the replacement current-schema document. None of these
+mirror decisions bypass the blocked file's byte-preservation and save latch.
 
 Every save re-checks the on-disk header before writing. This matters because CE dev builds
 can share the live app support folder; a future/foreign file may appear after launch.
@@ -219,3 +230,4 @@ Those keys write the global backing fields. Workspace-specific Agent Models over
 - Do not resurrect the old Context Builder drift resolver. Agent Models and runtime code should use the effective Agent Models profile, not compare against legacy `ChatGlobalSettings.contextBuilder*` fields.
 - Do not add a second global Agent Models blob unless there is a separate migration plan; the global profile intentionally maps to existing fields.
 - Existing workspaces default to `Use global settings`. Workspace overrides are opt-in and materialized from the current global profile.
+- Orphaned workspace-keyed settings are intentionally retained. Pruning remains deferred until authoritative workspace IDs can drive one atomic sweep across every workspace-keyed settings map.

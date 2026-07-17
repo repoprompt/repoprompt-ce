@@ -28,6 +28,7 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
         XCTAssertNotNil(request.params["approvalPolicy"])
         XCTAssertNotNil(request.params["approvalsReviewer"])
         XCTAssertNotNil(request.params["sandboxPolicy"])
+        try assertTextInputPayload(request.params["input"], text: "hello")
         XCTAssertNil(controller.test_authoritativeLifecycleTurnID)
         XCTAssertNil(controller.test_routingCurrentTurnID)
     }
@@ -62,7 +63,39 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
         XCTAssertNil(request.params["approvalPolicy"])
         XCTAssertNil(request.params["approvalsReviewer"])
         XCTAssertNil(request.params["sandboxPolicy"])
+        try assertTextInputPayload(request.params["input"], text: "adjust course")
         XCTAssertEqual(controller.test_authoritativeLifecycleTurnID, "turn-1")
+    }
+
+    func testTurnStartPreservesImageEntriesWhenAddingTextPayload() async throws {
+        let inlineImageDataURL = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+        let recorder = TurnRequestRecorder(result: [
+            "turn": ["id": "submission-1"]
+        ])
+        let controller = makeController(recorder: recorder)
+        controller.test_installThreadState(threadID: "thread-1")
+
+        _ = try await controller.startUserTurn(
+            text: "describe these",
+            images: [
+                AgentImageAttachment(source: .url(inlineImageDataURL)),
+                AgentImageAttachment(source: .localFile(path: "/tmp/local-image.png"))
+            ],
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil
+        )
+
+        let request = try XCTUnwrap(recorder.requests().only)
+        let input = try XCTUnwrap(request.params["input"] as? [[String: Any]])
+        XCTAssertEqual(input.count, 3)
+        XCTAssertEqual(Set(input[0].keys), Set(["type", "url"]))
+        XCTAssertEqual(input[0]["type"] as? String, "image")
+        XCTAssertEqual(input[0]["url"] as? String, inlineImageDataURL)
+        XCTAssertEqual(Set(input[1].keys), Set(["type", "path"]))
+        XCTAssertEqual(input[1]["type"] as? String, "localImage")
+        XCTAssertEqual(input[1]["path"] as? String, "/tmp/local-image.png")
+        try assertTextInputEntry(input[2], text: "describe these")
     }
 
     func testTurnSteerAcceptedMismatchReturnsAcceptedReceiptWithoutResend() async throws {
@@ -288,6 +321,21 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
                 try recorder.handle(method: method, params: params, timeout: timeout)
             }
         )
+    }
+
+    private func assertTextInputPayload(_ rawInput: Any?, text: String) throws {
+        let input = try XCTUnwrap(rawInput as? [[String: Any]])
+        let textInput = try XCTUnwrap(input.only)
+        try assertTextInputEntry(textInput, text: text)
+    }
+
+    private func assertTextInputEntry(_ textInput: [String: Any], text: String) throws {
+        XCTAssertEqual(Set(textInput.keys), Set(["type", "text", "text_elements"]))
+        XCTAssertEqual(textInput["type"] as? String, "text")
+        XCTAssertEqual(textInput["text"] as? String, text)
+        let textElements = try XCTUnwrap(textInput["text_elements"] as? [Any])
+        XCTAssertTrue(textElements.isEmpty)
+        XCTAssertNil(textInput["textElements"])
     }
 }
 

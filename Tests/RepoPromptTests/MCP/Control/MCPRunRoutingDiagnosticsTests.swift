@@ -298,6 +298,208 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
         #endif
     }
 
+    func testAdaptiveRoutingDistinguishesBothDeadlinePhasesAndDoesNotRefreshGrace() async {
+        let beforeClock = MCPRoutingWaitManualClock()
+        let beforeWaiter = MCPRoutingWaiter(clock: beforeClock.routingClock)
+        let beforeRunID = UUID()
+        await beforeWaiter.register(runID: beforeRunID)
+        let beforeTask = Task {
+            await beforeWaiter.waitForRoutingOutcome(
+                runID: beforeRunID,
+                policy: MCPRoutingWaitPolicy(
+                    noConnectionTimeout: .milliseconds(100),
+                    observedConnectionGrace: .milliseconds(200)
+                )
+            )
+        }
+        await beforeClock.waitUntilSleeping(deadline: .milliseconds(100))
+        beforeClock.advance(by: .milliseconds(100))
+        let beforeOutcome = await beforeTask.value
+        XCTAssertEqual(beforeOutcome, .timedOutBeforeConnection)
+        await beforeWaiter.cleanup(runID: beforeRunID)
+
+        let afterClock = MCPRoutingWaitManualClock()
+        let afterWaiter = MCPRoutingWaiter(clock: afterClock.routingClock)
+        let afterRunID = UUID()
+        await afterWaiter.register(runID: afterRunID)
+        let afterTask = Task {
+            await afterWaiter.waitForRoutingOutcome(
+                runID: afterRunID,
+                policy: MCPRoutingWaitPolicy(
+                    noConnectionTimeout: .milliseconds(100),
+                    observedConnectionGrace: .milliseconds(200)
+                )
+            )
+        }
+        await afterClock.waitUntilSleeping(deadline: .milliseconds(100))
+        afterClock.advance(by: .milliseconds(10))
+        let observedConnection = await afterWaiter.notifyConnectionObserved(runID: afterRunID)
+        XCTAssertTrue(observedConnection)
+        await afterClock.waitUntilSleeping(deadline: .milliseconds(210))
+        let graceDeadlines = afterClock.activeDeadlines()
+        let observedConnectionAgain = await afterWaiter.notifyConnectionObserved(runID: afterRunID)
+        XCTAssertFalse(observedConnectionAgain)
+        XCTAssertEqual(afterClock.activeDeadlines(), graceDeadlines)
+
+        afterClock.advance(by: .milliseconds(200))
+        let afterOutcome = await afterTask.value
+        XCTAssertEqual(afterOutcome, .timedOutAfterConnection)
+        await afterWaiter.cleanup(runID: afterRunID)
+    }
+
+    func testAdaptiveRoutingCanCommitDuringObservedGrace() async {
+        let clock = MCPRoutingWaitManualClock()
+        let enrollmentGate = MCPRoutingWaitEnrollmentGate()
+        let waiter = MCPRoutingWaiter(
+            clock: clock.routingClock,
+            beforeWaiterEnrollment: {
+                await enrollmentGate.block()
+            }
+        )
+        let runID = UUID()
+        await waiter.register(runID: runID)
+        let waitTask = Task {
+            await waiter.waitForRoutingOutcome(
+                runID: runID,
+                policy: MCPRoutingWaitPolicy(
+                    noConnectionTimeout: .milliseconds(100),
+                    observedConnectionGrace: .milliseconds(200)
+                )
+            )
+        }
+
+        await enrollmentGate.waitUntilBlocked()
+        clock.advance(by: .milliseconds(40))
+        let observedConnection = await waiter.notifyConnectionObserved(runID: runID)
+        XCTAssertTrue(observedConnection)
+        await enrollmentGate.release()
+        await clock.waitUntilSleeping(deadline: .milliseconds(240))
+        await waiter.notifyRouted(runID: runID)
+
+        let outcome = await waitTask.value
+        XCTAssertEqual(outcome, .routed)
+        await waiter.cleanup(runID: runID)
+    }
+
+    func testLegacyAbsoluteWaitIgnoresObservationAndClassifiesStickyObservation() async {
+        let clock = MCPRoutingWaitManualClock()
+        let waiter = MCPRoutingWaiter(clock: clock.routingClock)
+        let runID = UUID()
+        await waiter.register(runID: runID)
+        let waitTask = Task {
+            await waiter.waitForRoutingOutcome(runID: runID, timeoutSeconds: 0.1)
+        }
+        await clock.waitUntilSleeping(deadline: .milliseconds(100))
+        clock.advance(by: .milliseconds(20))
+        let observedConnection = await waiter.notifyConnectionObserved(runID: runID)
+        XCTAssertTrue(observedConnection)
+        XCTAssertEqual(clock.activeDeadlines(), [.milliseconds(100)])
+
+        clock.advance(by: .milliseconds(80))
+        let outcome = await waitTask.value
+        XCTAssertEqual(outcome, .timedOutAfterConnection)
+        await waiter.cleanup(runID: runID)
+    }
+
+    func testLegacyNonpositiveTimeoutWaitsIndefinitelyUntilCancellationOrRouting() async throws {
+        #if DEBUG
+            let clock = MCPRoutingWaitManualClock()
+            let waiter = MCPRoutingWaiter(clock: clock.routingClock)
+
+            let preCancelledRunID = UUID()
+            await waiter.register(runID: preCancelledRunID)
+            let preCancelledWaiter = Task {
+                withUnsafeCurrentTask { task in
+                    task?.cancel()
+                }
+                return await waiter.waitForRoutingOutcome(
+                    runID: preCancelledRunID,
+                    timeoutSeconds: 0
+                )
+            }
+            let preCancelledOutcome = await preCancelledWaiter.value
+            XCTAssertEqual(preCancelledOutcome, .cancelled)
+            let preCancelledContinuationCount = await waiter.debugContinuationCount(runID: preCancelledRunID)
+            XCTAssertEqual(preCancelledContinuationCount, 0)
+            XCTAssertTrue(clock.activeDeadlines().isEmpty)
+            await waiter.cleanup(runID: preCancelledRunID)
+
+            let runID = UUID()
+            await waiter.register(runID: runID)
+            let cancelledWaiter = Task {
+                await waiter.waitForRoutingOutcome(runID: runID, timeoutSeconds: 0)
+            }
+            let routedWaiter = Task {
+                await waiter.waitUntilRouted(runID: runID, timeoutSeconds: -1)
+            }
+
+            var continuationCount = 0
+            for _ in 0 ..< 100 {
+                continuationCount = await waiter.debugContinuationCount(runID: runID)
+                if continuationCount == 2 { break }
+                await Task.yield()
+            }
+            XCTAssertEqual(continuationCount, 2, "nonpositive legacy timeouts must not resolve immediately")
+            XCTAssertTrue(clock.activeDeadlines().isEmpty)
+
+            cancelledWaiter.cancel()
+            let cancelledOutcome = await cancelledWaiter.value
+            XCTAssertEqual(cancelledOutcome, .cancelled)
+            let remainingContinuationCount = await waiter.debugContinuationCount(runID: runID)
+            XCTAssertEqual(remainingContinuationCount, 1)
+
+            await waiter.notifyRouted(runID: runID)
+            let didRoute = await routedWaiter.value
+            XCTAssertTrue(didRoute)
+            await waiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Routing waiter continuation inspection is DEBUG-only.")
+        #endif
+    }
+
+    func testTypedCancellationAndCleanupRemainDistinct() async {
+        #if DEBUG
+            let clock = MCPRoutingWaitManualClock()
+            let waiter = MCPRoutingWaiter(clock: clock.routingClock)
+            let runID = UUID()
+            await waiter.register(runID: runID)
+            let cancelledWaiter = Task {
+                await waiter.waitForRoutingOutcome(
+                    runID: runID,
+                    policy: MCPRoutingWaitPolicy(
+                        noConnectionTimeout: .seconds(5),
+                        observedConnectionGrace: .seconds(5)
+                    )
+                )
+            }
+            let cleanupWaiter = Task {
+                await waiter.waitForRoutingOutcome(
+                    runID: runID,
+                    policy: MCPRoutingWaitPolicy(
+                        noConnectionTimeout: .seconds(5),
+                        observedConnectionGrace: .seconds(5)
+                    )
+                )
+            }
+            var continuationCount = 0
+            for _ in 0 ..< 100 {
+                continuationCount = await waiter.debugContinuationCount(runID: runID)
+                if continuationCount == 2 { break }
+                await Task.yield()
+            }
+            XCTAssertEqual(continuationCount, 2)
+
+            cancelledWaiter.cancel()
+            let cancelledOutcome = await cancelledWaiter.value
+            XCTAssertEqual(cancelledOutcome, .cancelled)
+            await waiter.cleanup(runID: runID)
+            let cleanupOutcome = await cleanupWaiter.value
+            XCTAssertEqual(cleanupOutcome, .failed(.cleanedUp))
+        #else
+            XCTFail("Routing waiter continuation inspection is DEBUG-only.")
+        #endif
+    }
+
     #if DEBUG
         private func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in
@@ -308,4 +510,153 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         }
     #endif
+}
+
+private final class MCPRoutingWaitManualClock: @unchecked Sendable {
+    private struct Sleeper {
+        let deadline: Duration
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private struct DeadlineWaiter {
+        let deadline: Duration
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private let lock = NSLock()
+    private var nowValue: Duration = .zero
+    private var sleepers: [UUID: Sleeper] = [:]
+    private var cancelledSleeperIDs: Set<UUID> = []
+    private var deadlineWaiters: [DeadlineWaiter] = []
+
+    var routingClock: MCPRoutingWaitClock {
+        MCPRoutingWaitClock(
+            now: { [weak self] in
+                self?.now() ?? .zero
+            },
+            sleep: { [weak self] duration in
+                guard let self else { return }
+                try await sleep(for: duration)
+            }
+        )
+    }
+
+    func activeDeadlines() -> [Duration] {
+        lock.lock()
+        defer { lock.unlock() }
+        return sleepers.values.map(\.deadline).sorted()
+    }
+
+    func advance(by duration: Duration) {
+        lock.lock()
+        nowValue += duration
+        let readyIDs = sleepers.compactMap { id, sleeper in
+            sleeper.deadline <= nowValue ? id : nil
+        }
+        let ready = readyIDs.compactMap { sleepers.removeValue(forKey: $0)?.continuation }
+        lock.unlock()
+        for continuation in ready {
+            continuation.resume()
+        }
+    }
+
+    func waitUntilSleeping(deadline: Duration) async {
+        lock.lock()
+        if sleepers.values.contains(where: { $0.deadline == deadline }) {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if sleepers.values.contains(where: { $0.deadline == deadline }) {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            deadlineWaiters.append(DeadlineWaiter(deadline: deadline, continuation: continuation))
+            lock.unlock()
+        }
+    }
+
+    private func now() -> Duration {
+        lock.lock()
+        defer { lock.unlock() }
+        return nowValue
+    }
+
+    private func sleep(for duration: Duration) async throws {
+        let sleeperID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if Task.isCancelled || cancelledSleeperIDs.remove(sleeperID) != nil {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+
+                let deadline = nowValue + max(.zero, duration)
+                if deadline <= nowValue {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+
+                sleepers[sleeperID] = Sleeper(deadline: deadline, continuation: continuation)
+                let readyWaiters = deadlineWaiters.filter { $0.deadline == deadline }
+                deadlineWaiters.removeAll { $0.deadline == deadline }
+                lock.unlock()
+                for waiter in readyWaiters {
+                    waiter.continuation.resume()
+                }
+            }
+        } onCancel: {
+            cancel(sleeperID: sleeperID)
+        }
+        try Task.checkCancellation()
+    }
+
+    private func cancel(sleeperID: UUID) {
+        lock.lock()
+        let continuation = sleepers.removeValue(forKey: sleeperID)?.continuation
+        if continuation == nil {
+            cancelledSleeperIDs.insert(sleeperID)
+        }
+        lock.unlock()
+        continuation?.resume()
+    }
+}
+
+private actor MCPRoutingWaitEnrollmentGate {
+    private var blocked = false
+    private var released = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func block() async {
+        blocked = true
+        let waiters = blockedWaiters
+        blockedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilBlocked() async {
+        guard !blocked else { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 }

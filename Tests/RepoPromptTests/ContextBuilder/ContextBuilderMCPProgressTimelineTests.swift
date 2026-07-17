@@ -5,6 +5,13 @@ import XCTest
 final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
     func testPhaseCatalogCoversExpectedDiscoveryAndGenerationSequence() {
         XCTAssertEqual(ContextBuilderMCPProgressPhase.allCases, [
+            .providerProcessStarting,
+            .waitingForChildConnection,
+            .childConnectionObserved,
+            .waitingForRouting,
+            .routingConfirmed,
+            .routingTimeoutBeforeConnection,
+            .routingTimeoutAfterConnection,
             .readFileAutoSelectionFinish,
             .tabContextCommit,
             .statePersistence,
@@ -21,7 +28,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         ])
         XCTAssertEqual(
             ContextBuilderMCPProgressPhase.allCases.map(\.stage),
-            Array(repeating: "discovering", count: 6) + Array(repeating: "generating", count: 7)
+            Array(repeating: "discovering", count: 13) + Array(repeating: "generating", count: 7)
         )
     }
 
@@ -381,6 +388,23 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 "generating",
                 "complete"
             ])
+            let startupMessages = stages
+                .filter { $0.stage == "discovering" }
+                .map(\.message)
+            let expectedStartupMarkers = [
+                ContextBuilderMCPProgressPhase.providerProcessStarting.displayName,
+                ContextBuilderMCPProgressPhase.waitingForChildConnection.displayName,
+                ContextBuilderMCPProgressPhase.childConnectionObserved.displayName,
+                ContextBuilderMCPProgressPhase.waitingForRouting.displayName,
+                ContextBuilderMCPProgressPhase.routingConfirmed.displayName
+            ]
+            let startupIndexes = try expectedStartupMarkers.map { marker in
+                try XCTUnwrap(
+                    startupMessages.firstIndex { $0.contains("\(marker) started") },
+                    "Missing production-lineage startup phase: \(marker)"
+                )
+            }
+            XCTAssertEqual(startupIndexes, startupIndexes.sorted())
         #else
             throw XCTSkip("Provider-path Context Builder injection is DEBUG-only.")
         #endif
@@ -942,6 +966,7 @@ private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProv
             continuation.finish()
         }
         if let runID {
+            await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
             await MCPRoutingWaiter.notifyRouted(runID: runID)
         }
         return stream

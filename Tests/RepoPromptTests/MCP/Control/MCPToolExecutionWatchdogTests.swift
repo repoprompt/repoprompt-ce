@@ -50,7 +50,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let recordedEvents = await events.snapshot()
         XCTAssertEqual(recordedEvents, [
             .deadlineExpired,
-            .cancellationRequested,
+            .cancellationRequested(origin: .watchdogDeadline),
             .settledDuringGrace(.cancellation)
         ])
     }
@@ -92,7 +92,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let recordedEvents = await events.snapshot()
         XCTAssertEqual(recordedEvents, [
             .deadlineExpired,
-            .cancellationRequested,
+            .cancellationRequested(origin: .watchdogDeadline),
             .settledDuringGrace(.cancellation)
         ])
     }
@@ -127,11 +127,61 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let recordedEvents = await events.snapshot()
         XCTAssertEqual(recordedEvents, [
             .deadlineExpired,
-            .cancellationRequested,
+            .cancellationRequested(origin: .watchdogDeadline),
             .cleanupGraceExpired
         ])
 
         await gate.release()
+    }
+
+    func testDetachAndSettleReturnsWithoutJoiningAndReportsLateSettlement() async throws {
+        let clock = ExecutionWatchdogManualClock()
+        let events = ExecutionWatchdogEventRecorder()
+        let settlements = ExecutionWatchdogSettlementRecorder()
+        let gate = ExecutionWatchdogUncooperativeGate()
+        let task = Task<Int, Error> {
+            try await MCPToolExecutionWatchdog.execute(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle,
+                environment: clock.environment,
+                onEvent: { await events.append($0) },
+                onDetachedSettlement: { await settlements.append($0) }
+            ) {
+                await gate.wait()
+                return 1
+            }
+        }
+
+        try await clock.waitForSleeperCount(1)
+        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+        try await clock.waitForSleeperCount(1)
+        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected detached execution timeout")
+        } catch let error as MCPToolExecutionWatchdogError {
+            XCTAssertEqual(error, .executionDetached)
+        }
+        let sleeperCountAfterDetach = await clock.sleeperCount()
+        let settlementsAfterDetach = await settlements.snapshot()
+        let eventsAfterDetach = await events.snapshot()
+        XCTAssertEqual(sleeperCountAfterDetach, 0)
+        XCTAssertEqual(settlementsAfterDetach, [])
+        XCTAssertEqual(eventsAfterDetach, [
+            .deadlineExpired,
+            .cancellationRequested(origin: .watchdogDeadline),
+            .cleanupGraceExpired,
+            .detachedForSettlement
+        ])
+
+        await gate.release()
+        try await settlements.waitForCount(1)
+        let finalSettlements = await settlements.snapshot()
+        let finalSleeperCount = await clock.sleeperCount()
+        XCTAssertEqual(finalSettlements, [.success])
+        XCTAssertEqual(finalSleeperCount, 0)
     }
 
     func testManualClockAdvancesElapsedTimeWithoutRegisteredSleepers() async throws {
@@ -179,10 +229,13 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
             contractKind: .bounded,
             executionDeadlineSeconds: 30,
             cleanupGraceSeconds: 5,
+            cleanupDisposition: .detachAndSettle,
             phase: .deadlineExpired,
             elapsedMilliseconds: 2000,
             cancellationRequested: nil,
             cancellationOutcome: nil,
+            cancellationOrigin: nil,
+            settlement: nil,
             graceOutcome: nil,
             escalationReason: nil,
             handlerPhase: phase,
@@ -196,16 +249,47 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         XCTAssertTrue(event.description.contains("handler_phase=manage_selection.auto_selection_drain"))
         XCTAssertTrue(event.description.contains("handler_phase_transition=started"))
         XCTAssertTrue(event.description.contains("handler_phase_age_ms=2000.000"))
+        XCTAssertEqual(
+            [
+                MCPToolExecutionHandlerPhase.getCodeStructureSeedResolution,
+                .getCodeStructureSeedDemand,
+                .getCodeStructureProjectionWait,
+                .getCodeStructureGraphQuery,
+                .getCodeStructureTargetDemand,
+                .getCodeStructureGraphRequery,
+                .getCodeStructureFreeze,
+                .getCodeStructureRender,
+                .getCodeStructureAssembly,
+                .getCodeStructurePublicationRevalidation
+            ].map(\.rawValue),
+            [
+                "get_code_structure.seed_resolution",
+                "get_code_structure.seed_demand",
+                "get_code_structure.projection_wait",
+                "get_code_structure.graph_query",
+                "get_code_structure.target_demand",
+                "get_code_structure.graph_requery",
+                "get_code_structure.freeze",
+                "get_code_structure.render",
+                "get_code_structure.assembly",
+                "get_code_structure.publication_revalidation"
+            ]
+        )
+        XCTAssertTrue(event.description.contains("cleanup_disposition=detach_and_settle"))
+        XCTAssertTrue(MCPToolExecutionTraceEvent.Phase.detachedForSettlement.isAlwaysEmitted)
+        XCTAssertTrue(MCPToolExecutionTraceEvent.Phase.detachedSettled.isAlwaysEmitted)
     }
 
     func testExternalCancellationCancelsOwnedTasksAndPropagatesCancellation() async throws {
         let clock = ExecutionWatchdogManualClock()
+        let events = ExecutionWatchdogEventRecorder()
         let gate = ExecutionWatchdogUncooperativeGate()
         let task = Task<Int, Error> {
             try await MCPToolExecutionWatchdog.execute(
                 deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
                 cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
-                environment: clock.environment
+                environment: clock.environment,
+                onEvent: { await events.append($0) }
             ) {
                 await gate.wait()
                 try Task.checkCancellation()
@@ -222,6 +306,11 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         } catch is CancellationError {
             // Expected.
         }
+        try await events.waitForCount(1)
+        let recordedEvents = await events.snapshot()
+        XCTAssertEqual(recordedEvents, [
+            .cancellationRequested(origin: .requestCancellation)
+        ])
         await gate.release()
     }
 }
@@ -256,6 +345,7 @@ private actor ExecutionWatchdogCallbackGate {
 }
 
 private actor ExecutionWatchdogEventRecorder {
+    private static let synchronizationTimeout: Duration = .seconds(10)
     private var events: [MCPToolExecutionWatchdogEvent] = []
 
     func append(_ event: MCPToolExecutionWatchdogEvent) {
@@ -265,6 +355,63 @@ private actor ExecutionWatchdogEventRecorder {
     func snapshot() -> [MCPToolExecutionWatchdogEvent] {
         events
     }
+
+    func waitForCount(
+        _ expected: Int,
+        timeout: Duration = synchronizationTimeout
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while events.count < expected {
+            try Task.checkCancellation()
+            guard clock.now < deadline else {
+                throw ExecutionWatchdogEventRecorderError.eventDidNotArrive(
+                    expected: expected,
+                    actual: events.count
+                )
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
+private enum ExecutionWatchdogEventRecorderError: Error {
+    case eventDidNotArrive(expected: Int, actual: Int)
+}
+
+private actor ExecutionWatchdogSettlementRecorder {
+    private static let synchronizationTimeout: Duration = .seconds(10)
+    private var settlements: [MCPToolExecutionSettlement] = []
+
+    func append(_ settlement: MCPToolExecutionSettlement) {
+        settlements.append(settlement)
+    }
+
+    func snapshot() -> [MCPToolExecutionSettlement] {
+        settlements
+    }
+
+    func waitForCount(
+        _ expected: Int,
+        timeout: Duration = synchronizationTimeout
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while settlements.count < expected {
+            try Task.checkCancellation()
+            guard clock.now < deadline else {
+                throw ExecutionWatchdogSettlementRecorderError.settlementDidNotArrive(
+                    expected: expected,
+                    actual: settlements.count
+                )
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
+private enum ExecutionWatchdogSettlementRecorderError: Error {
+    case settlementDidNotArrive(expected: Int, actual: Int)
 }
 
 actor ExecutionWatchdogUncooperativeGate {

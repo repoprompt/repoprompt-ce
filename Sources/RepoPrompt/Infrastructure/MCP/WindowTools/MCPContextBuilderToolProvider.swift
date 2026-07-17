@@ -887,7 +887,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         guard let connectionID else {
             return try await operation()
         }
-        let shouldSendProgress = await ServerNetworkManager.shared.supportsControlNotifications(connectionID: connectionID)
+        let shouldSendProgress = await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
         guard shouldSendProgress else {
             return try await operation()
         }

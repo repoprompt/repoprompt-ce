@@ -267,6 +267,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                         maximumCodemapTokens: maximumCodemapTokens
                     )
 
+                    await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
                     let metadata = await dependencies.captureRequestMetadata()
                     try Task.checkCancellation()
                     let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)

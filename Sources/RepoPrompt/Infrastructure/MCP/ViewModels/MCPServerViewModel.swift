@@ -3649,7 +3649,7 @@ final class MCPServerViewModel: ObservableObject {
         guard let connectionID else {
             return try await operation()
         }
-        let shouldSendProgress = await ServerNetworkManager.shared.supportsControlNotifications(connectionID: connectionID)
+        let shouldSendProgress = await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
         guard shouldSendProgress else {
             return try await operation()
         }
@@ -5163,7 +5163,10 @@ final class MCPServerViewModel: ObservableObject {
         #endif
         let presentation = try await WorkspaceCodemapPresentationCoordinator(
             store: store,
-            policy: policy
+            policy: policy,
+            structurePhaseDidChange: { phase in
+                await MCPToolExecutionHandlerPhaseContext.report(phase.mcpToolExecutionHandlerPhase)
+            }
         ).structurePresentation(
             seedFileIDs: orderedFiles.map(\.id),
             direction: request.direction,
@@ -6566,5 +6569,21 @@ final class MCPServerViewModel: ObservableObject {
             slices: sliceSnapshot,
             autoEnabled: selection.codemapAutoEnabled
         )
+    }
+}
+
+private extension WorkspaceCodemapStructureExecutionPhase {
+    var mcpToolExecutionHandlerPhase: MCPToolExecutionHandlerPhase {
+        switch self {
+        case .seedDemand: .getCodeStructureSeedDemand
+        case .projectionWait: .getCodeStructureProjectionWait
+        case .graphQuery: .getCodeStructureGraphQuery
+        case .targetDemand: .getCodeStructureTargetDemand
+        case .graphRequery: .getCodeStructureGraphRequery
+        case .freeze: .getCodeStructureFreeze
+        case .render: .getCodeStructureRender
+        case .assembly: .getCodeStructureAssembly
+        case .publicationRevalidation: .getCodeStructurePublicationRevalidation
+        }
     }
 }

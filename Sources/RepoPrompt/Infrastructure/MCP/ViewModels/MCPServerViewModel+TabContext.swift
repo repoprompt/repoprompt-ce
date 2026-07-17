@@ -957,6 +957,26 @@ extension MCPServerViewModel {
         return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
     }
 
+    /// Returns true only for the current bidirectional run mapping.
+    ///
+    /// Pending-policy mapping tokens identify rollback/replacement generations; they do not own
+    /// application commit authority. ServerNetworkManager composes this mapping with its
+    /// actor-owned application, policy, window/tab, and live-connection state.
+    @MainActor
+    func hasCurrentRunRouteMapping(
+        runID: UUID,
+        connectionID: UUID,
+        expectedTabID: UUID?
+    ) -> Bool {
+        guard connectionIDByRunID[runID] == connectionID,
+              connectionIDToRunID[connectionID] == runID
+        else { return false }
+
+        guard let expectedTabID else { return true }
+        return tabContextByConnectionID[connectionID]?.runID == runID
+            && tabContextByConnectionID[connectionID]?.tabID == expectedTabID
+    }
+
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
     @MainActor
     func purgeClosedTabContext(tabID: UUID) {

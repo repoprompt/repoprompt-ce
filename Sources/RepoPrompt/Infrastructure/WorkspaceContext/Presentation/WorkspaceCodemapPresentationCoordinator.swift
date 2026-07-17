@@ -120,6 +120,18 @@ private actor WorkspaceCodemapOperationPresentationOwnership {
     }
 }
 
+enum WorkspaceCodemapStructureExecutionPhase: Equatable {
+    case seedDemand
+    case projectionWait
+    case graphQuery
+    case targetDemand
+    case graphRequery
+    case freeze
+    case render
+    case assembly
+    case publicationRevalidation
+}
+
 struct WorkspaceCodemapPresentationCoordinator {
     private struct AutomaticPreparation {
         let candidates: [WorkspaceCodemapOperationPresentationCandidate]
@@ -159,6 +171,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         WorkspaceCodemapAutomaticSelectionPublicationReceipt
     ) async throws -> Void
     let structureAttemptDidBegin: @Sendable (Int) -> Void
+    let structurePhaseDidChange: @Sendable (WorkspaceCodemapStructureExecutionPhase) async -> Void
 
     init(
         store: WorkspaceFileContextStore,
@@ -170,7 +183,10 @@ struct WorkspaceCodemapPresentationCoordinator {
         afterAutomaticCandidateReconstruction: @escaping @Sendable (
             WorkspaceCodemapAutomaticSelectionPublicationReceipt
         ) async throws -> Void = { _ in },
-        structureAttemptDidBegin: @escaping @Sendable (Int) -> Void = { _ in }
+        structureAttemptDidBegin: @escaping @Sendable (Int) -> Void = { _ in },
+        structurePhaseDidChange: @escaping @Sendable (
+            WorkspaceCodemapStructureExecutionPhase
+        ) async -> Void = { _ in }
     ) {
         self.store = store
         self.policy = policy
@@ -178,6 +194,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         self.beforePublicationRevalidation = beforePublicationRevalidation
         self.afterAutomaticCandidateReconstruction = afterAutomaticCandidateReconstruction
         self.structureAttemptDidBegin = structureAttemptDidBegin
+        self.structurePhaseDidChange = structurePhaseDidChange
     }
 
     func presentation(
@@ -1551,6 +1568,9 @@ extension WorkspaceCodemapPresentationCoordinator {
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         logicalRootDisplayNamesByRootID: [UUID: String] = [:]
     ) async throws -> WorkspaceCodemapStructurePresentation {
+        // The warm seed-only lookup is part of seed-demand/presentation acquisition,
+        // so a cache hit intentionally remains attributed to this phase.
+        await structurePhaseDidChange(.seedDemand)
         if direction == nil,
            let published = await store.publishedCodemapStructurePresentation(
                seedFileIDs: seedFileIDs,
@@ -1568,6 +1588,9 @@ extension WorkspaceCodemapPresentationCoordinator {
 
         for attemptIndex in 0 ..< policy.maximumStructurePublicationAttempts {
             try Task.checkCancellation()
+            if attemptIndex > 0 {
+                await structurePhaseDidChange(.seedDemand)
+            }
             structureAttemptDidBegin(attemptIndex)
             let ownership = WorkspaceCodemapOperationPresentationOwnership()
             do {
@@ -1599,6 +1622,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                     }
                     return attempt.presentation
                 }
+                await structurePhaseDidChange(.publicationRevalidation)
                 await beforePublicationRevalidation(receipt.presentation)
                 switch await store.revalidateCodemapStructureForPublication(
                     receipt,
@@ -1851,6 +1875,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         }
 
         if direction != nil {
+            await structurePhaseDidChange(.projectionWait)
             let sourceTicketsByRoot = Dictionary(grouping: graphSeeds.map(\.ticket), by: \.rootEpoch)
             let deadlineUptimeNanoseconds = projectionDeadlineUptimeNanoseconds(
                 clock: clock,
@@ -1984,6 +2009,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         var traversalBudgetHit = false
 
         if let direction {
+            await structurePhaseDidChange(.graphQuery)
             var disposition = await store.queryCodemapStructureGraph(
                 WorkspaceCodemapStructureTraversalQuery(
                     seeds: graphSeeds,
@@ -2101,6 +2127,7 @@ extension WorkspaceCodemapPresentationCoordinator {
 
                 let targetIDs = traversalResult.nodes.filter { $0.depth > 0 }.map(\.fileID)
                 if !targetIDs.isEmpty {
+                    await structurePhaseDidChange(.targetDemand)
                     let targetDemand = try await demand(
                         fileIDs: targetIDs,
                         priority: .explicit,
@@ -2201,6 +2228,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                         )
                     }
 
+                    await structurePhaseDidChange(.graphRequery)
                     var revalidated = await store.queryCodemapStructureGraph(
                         WorkspaceCodemapStructureTraversalQuery(
                             seeds: graphSeeds,
@@ -2360,11 +2388,13 @@ extension WorkspaceCodemapPresentationCoordinator {
         var bundleReceipts: [WorkspaceCodemapOperationPresentationBundleReceipt] = []
         for rootEpoch in requestsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
             try Task.checkCancellation()
+            await structurePhaseDidChange(.freeze)
             switch await store.freezeCodemapPresentation(requestsByRoot[rootEpoch] ?? []) {
             case let .unavailable(reason):
                 issues.append(.freezeUnavailable(rootEpoch: rootEpoch, reason: reason))
             case let .ready(bundle):
                 await ownership.record(bundle)
+                await structurePhaseDidChange(.render)
                 switch await store.renderCodemapPresentation(bundle) {
                 case let .unavailable(reason):
                     issues.append(.renderUnavailable(rootEpoch: rootEpoch, reason: reason))
@@ -2389,6 +2419,7 @@ extension WorkspaceCodemapPresentationCoordinator {
             }
         }
 
+        await structurePhaseDidChange(.assembly)
         let separatorTokens = TokenCalculationService.estimateTokens(for: "\n\n")
         var structureEntries: [WorkspaceCodemapStructureRenderedEntry] = []
         var usedTokens = 0

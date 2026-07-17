@@ -121,7 +121,9 @@ is unchanged and does not use the generated workspace.
 - **Codebase orientation**: Combine file trees, selected file contents, line
   slices, CodeMaps, and Git diffs.
 - **Context Builder**: Let an agent explore the repository, identify relevant
-  files, and curate context within a token budget.
+  files, and curate context within a token budget. Long-running MCP calls expose
+  [request-scoped progress](docs/mcp-progress.md) when the client supplies a
+  progress token.
 - **Agent orchestration**: Run and coordinate CLI-backed coding agents from the
   native macOS app. See [`docs/worktrees.md`](docs/worktrees.md) for app-managed
   worktrees and `.worktreeinclude` local file copying.

@@ -783,6 +783,46 @@ enum MCPServiceProxyTaskGroupPolicy {
     }
 }
 
+private final class MCPServiceProxySettlementState: @unchecked Sendable {
+    enum Outcome {
+        case completed(Result<MCPServiceProxyTaskOutcome, Error>)
+        case callerCancelled
+    }
+
+    private let lock = NSLock()
+    private var outcome: Outcome?
+    private var continuation: CheckedContinuation<Outcome, Never>?
+
+    func claim(_ candidate: Outcome) -> Bool {
+        lock.lock()
+        guard outcome == nil else {
+            lock.unlock()
+            return false
+        }
+        outcome = candidate
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+
+        continuation?.resume(returning: candidate)
+        return true
+    }
+
+    func finish() async -> Outcome {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let outcome {
+                lock.unlock()
+                continuation.resume(returning: outcome)
+            } else {
+                precondition(self.continuation == nil)
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+}
+
 // MARK: - Bootstrap Socket Proxy (CLI connects to App)
 
 /// Bootstrap socket proxy - connects to app's single socket server.
@@ -2100,6 +2140,60 @@ actor MCPService: Service {
         killSignalContinuation = nil
     }
 
+    static func awaitFirstProxyOutcome(
+        killSignal: @escaping @Sendable () async throws -> MCPServiceProxyTaskOutcome,
+        watchdog: @escaping @Sendable () async throws -> MCPServiceProxyTaskOutcome,
+        transport: @escaping @Sendable () async throws -> MCPServiceProxyTaskOutcome
+    ) async throws -> MCPServiceProxyTaskOutcome {
+        let settlement = MCPServiceProxySettlementState()
+        let outcome = await withTaskCancellationHandler {
+            guard !Task.isCancelled else {
+                _ = settlement.claim(.callerCancelled)
+                return await settlement.finish()
+            }
+
+            let killSignalTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(killSignal())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+            let watchdogTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(watchdog())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+            let transportTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(transport())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+
+            let outcome = await settlement.finish()
+            killSignalTask.cancel()
+            watchdogTask.cancel()
+            transportTask.cancel()
+            await killSignalTask.value
+            await watchdogTask.value
+            await transportTask.value
+            return outcome
+        } onCancel: {
+            _ = settlement.claim(.callerCancelled)
+        }
+
+        switch outcome {
+        case let .completed(result):
+            return try result.get()
+        case .callerCancelled:
+            throw CancellationError()
+        }
+    }
+
     func run() async throws {
         // Set up kill signal watcher before starting transport
         setupKillSignalWatcher()
@@ -2110,9 +2204,8 @@ actor MCPService: Service {
 
         do {
             // Race between transport loop, kill signal, and PPID watchdog
-            try await withThrowingTaskGroup(of: MCPServiceProxyTaskOutcome.self) { group in
-                // Kill signal monitor task
-                group.addTask {
+            let outcome = try await Self.awaitFirstProxyOutcome(
+                killSignal: {
                     guard let signal = await self.waitForKillSignal() else {
                         return .killSignalWaitCancelled
                     }
@@ -2120,38 +2213,21 @@ actor MCPService: Service {
                         reason: signal.reason,
                         message: signal.message ?? CLIKillSignal.messageForReason(signal.reason)
                     ))
-                }
-
-                // PPID watchdog - detect orphaned CLI when parent dies
-                group.addTask {
+                },
+                watchdog: {
                     try await self.runPPIDWatchdog(initialPPID: initialPPID)
                     return .ppidWatchdogCancelled
-                }
-
-                // Main transport task
-                group.addTask {
+                },
+                transport: {
                     try await self.runTransport()
                     return .transportCompleted
                 }
-
-                // Wait for first to complete (either kill signal, orphan detection, or transport exit),
-                // then stop the watcher tasks so a clean transport exit can return promptly.
-                do {
-                    guard let outcome = try await group.next() else {
-                        group.cancelAll()
-                        throw CancellationError()
-                    }
-                    group.cancelAll()
-                    if let runtimeError = MCPServiceProxyTaskGroupPolicy.terminalRuntimeError(
-                        firstCompletedOutcome: outcome,
-                        serviceTaskIsCancelled: Task.isCancelled
-                    ) {
-                        throw runtimeError
-                    }
-                } catch {
-                    group.cancelAll()
-                    throw error
-                }
+            )
+            if let runtimeError = MCPServiceProxyTaskGroupPolicy.terminalRuntimeError(
+                firstCompletedOutcome: outcome,
+                serviceTaskIsCancelled: Task.isCancelled
+            ) {
+                throw runtimeError
             }
             try Task.checkCancellation()
             await persistProxyTerminalRecord(

@@ -475,6 +475,19 @@ final class CodexNativeSessionController {
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
 
+        /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
+        /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
+        /// launch or thread request. Inject in tests; production uses the default below.
+        var repoPromptMCPProvisioner: () async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
+
+        /// Fails closed only on a real `ensureCodexServerForDiscovery()` directory-create/config-write
+        /// failure — an existing entry needing no change reports success, so a healthy no-op is not misread.
+        private static func ensureDefaultRepoPromptMCPProvisioning() async throws {
+            guard MCPIntegrationHelper.ensureCodexServerForDiscovery().success else {
+                throw MCPBootstrapReadinessError.provisioningUnavailable
+            }
+        }
+
         static func agentModeDefault(
             forceExperimentalSteering: Bool,
             approvalPolicyProvider: @escaping () -> CodexAgentToolPreferences.ApprovalPolicy = { CodexAgentToolPreferences.approvalPolicy() },
@@ -1054,14 +1067,23 @@ final class CodexNativeSessionController {
             try await eventHandlingMutex.withLock {
                 beginBindingSession()
             }
-            let _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+            // Fail closed before any process launch or thread request: a child that expects
+            // RepoPrompt MCP tools must not start without them. The gate runs only for tool-expecting
+            // children; those with no expected client name skip provisioning. A throw here lands in the
+            // catch below — binding cancelled, expected-PID registration cleared, typed error rethrown —
+            // before `client.startIfNeeded()` or any thread/start or thread/resume request.
             if let expectedMCPClientName {
+                try await options.repoPromptMCPProvisioner()
+                // A cancellation racing provisioning must not reach PID registration or process start.
+                try Task.checkCancellation()
                 await client.setExpectedAgentPIDRegistration(
                     .init(clientName: expectedMCPClientName, runID: runID)
                 )
             }
             await client.updateWorkingDirectory(workspacePath)
             await updateClientProcessLaunchPolicy()
+            // Re-check: the pre-launch setup above has suspension points after the first check.
+            try Task.checkCancellation()
             try await client.startIfNeeded()
             await ensureInboundStreamsStarted()
 
@@ -1626,7 +1648,7 @@ final class CodexNativeSessionController {
             input.append([
                 "type": "text",
                 "text": trimmedText,
-                "textElements": []
+                "text_elements": []
             ])
         }
         guard !input.isEmpty else {

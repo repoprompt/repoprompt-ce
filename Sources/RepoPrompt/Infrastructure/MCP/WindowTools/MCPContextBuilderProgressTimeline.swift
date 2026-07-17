@@ -1,6 +1,13 @@
 import Foundation
 
 enum ContextBuilderMCPProgressPhase: String, CaseIterable {
+    case providerProcessStarting = "provider_process_starting"
+    case waitingForChildConnection = "waiting_for_child_connection"
+    case childConnectionObserved = "child_connection_observed"
+    case waitingForRouting = "waiting_for_routing"
+    case routingConfirmed = "routing_confirmed"
+    case routingTimeoutBeforeConnection = "routing_timeout_before_connection"
+    case routingTimeoutAfterConnection = "routing_timeout_after_connection"
     case readFileAutoSelectionFinish = "read_file_auto_selection_finish"
     case tabContextCommit = "tab_context_commit"
     case statePersistence = "state_persistence"
@@ -17,7 +24,14 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
 
     var stage: String {
         switch self {
-        case .childConnectionTermination,
+        case .providerProcessStarting,
+             .waitingForChildConnection,
+             .childConnectionObserved,
+             .waitingForRouting,
+             .routingConfirmed,
+             .routingTimeoutBeforeConnection,
+             .routingTimeoutAfterConnection,
+             .childConnectionTermination,
              .readFileAutoSelectionFinish,
              .tabContextCommit,
              .statePersistence,
@@ -37,6 +51,20 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
 
     var displayName: String {
         switch self {
+        case .providerProcessStarting:
+            "provider process startup"
+        case .waitingForChildConnection:
+            "child MCP connection wait"
+        case .childConnectionObserved:
+            "child MCP connection observation"
+        case .waitingForRouting:
+            "child MCP routing wait"
+        case .routingConfirmed:
+            "child MCP routing confirmation"
+        case .routingTimeoutBeforeConnection:
+            "routing timeout before child connection observation"
+        case .routingTimeoutAfterConnection:
+            "routing timeout after child connection observation"
         case .childConnectionTermination:
             "child MCP connection termination request"
         case .readFileAutoSelectionFinish:
@@ -69,6 +97,15 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
     /// Diagnostic-only threshold. Exceeding this bound reports progress but does not fail the run.
     var softBoundSeconds: TimeInterval? {
         switch self {
+        case .providerProcessStarting:
+            5
+        case .waitingForChildConnection,
+             .childConnectionObserved,
+             .waitingForRouting,
+             .routingConfirmed,
+             .routingTimeoutBeforeConnection,
+             .routingTimeoutAfterConnection:
+            nil
         case .childConnectionTermination:
             1
         case .readFileAutoSelectionFinish:

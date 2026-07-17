@@ -35,11 +35,21 @@ enum ContextBuilderDefaults {
     /// Default timeout (in seconds) for user responses to clarifying questions
     static let questionTimeoutSeconds = MCPTimeoutPolicy.askUserDefaultTimeoutSeconds
 
-    /// Deadline for the provider's run-scoped MCP client to route after stream creation.
-    static let mcpRoutingTimeoutMilliseconds = 10000
+    /// A missing run-owned MCP connection remains a fast failure.
+    static let mcpNoConnectionTimeoutSeconds: TimeInterval = 10
 
-    /// Keeps the one-shot routing policy alive through the routing deadline, with a five-second margin.
-    static let mcpBootstrapConnectionTTL = TimeInterval((mcpRoutingTimeoutMilliseconds / 1000) + 5)
+    /// Once the exact connection is observed, route materialization gets bounded handshake grace.
+    static let mcpObservedConnectionGraceSeconds: TimeInterval = 20
+
+    static let mcpRoutingWaitPolicy = MCPRoutingWaitPolicy(
+        noConnectionTimeoutSeconds: mcpNoConnectionTimeoutSeconds,
+        observedConnectionGraceSeconds: mcpObservedConnectionGraceSeconds
+    )
+
+    /// Leak bound for the pending policy, derived once from both phases plus a safety margin.
+    /// Observation/reconnect never refreshes it.
+    static let mcpBootstrapConnectionTTL =
+        mcpNoConnectionTimeoutSeconds + mcpObservedConnectionGraceSeconds + 5
 
     /// Bounded handoff after response-drain failure while orderly peer-EOF teardown publishes final context ownership.
     static let peerEOFDetachmentHandoffTimeoutSeconds: TimeInterval = 10

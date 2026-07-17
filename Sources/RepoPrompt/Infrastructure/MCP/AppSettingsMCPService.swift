@@ -681,16 +681,10 @@ private enum AppSettingsMCPRegistry {
             read: { stringOrNull($0.preferredComposeModelRaw()) },
             write: { try $0.setPreferredComposeModelRaw(
                 optionalString(from: $1),
-                reason: "app_settings.models.preferred_compose_model"
+                reason: "app_settings.models.preferred_compose_model",
+                honorSync: true
             ) },
-            afterWrite: { store, value, notificationCenter in
-                postModelRawDidWrite(
-                    store: store,
-                    siblingKey: "models.planning_model",
-                    valueJustWritten: value,
-                    notificationCenter: notificationCenter
-                )
-            },
+            afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
         optionalModelRawSetting(
@@ -701,16 +695,10 @@ private enum AppSettingsMCPRegistry {
             read: { stringOrNull($0.planningModelRaw()) },
             write: { try $0.setPlanningModelRaw(
                 optionalString(from: $1),
-                reason: "app_settings.models.planning_model"
+                reason: "app_settings.models.planning_model",
+                honorSync: true
             ) },
-            afterWrite: { store, value, notificationCenter in
-                postModelRawDidWrite(
-                    store: store,
-                    siblingKey: "models.preferred_compose_model",
-                    valueJustWritten: value,
-                    notificationCenter: notificationCenter
-                )
-            },
+            afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
         boolSetting(
@@ -722,8 +710,7 @@ private enum AppSettingsMCPRegistry {
             write: {
                 try $0.setSyncChatModelWithOracle(
                     requiredBool(from: $1),
-                    reason: "app_settings.models.sync_chat_model_with_oracle",
-                    snapOnEnableToPlanning: true
+                    reason: "app_settings.models.sync_chat_model_with_oracle"
                 )
             },
             afterWrite: postRecommendationsDidApply
@@ -1317,70 +1304,6 @@ private enum AppSettingsMCPRegistry {
         { store, _, notificationCenter in
             store.postFileSystemPreferencesDidChange(key: key, notificationCenter: notificationCenter)
         }
-    }
-
-    /// Post-write hook for `models.planning_model` / `models.preferred_compose_model`.
-    ///
-    /// When `GlobalSettingsStore.syncChatModelWithOracle()` is true, mirrors the
-    /// freshly-written value to the sibling model-raw key via the direct store setter
-    /// (which does NOT re-enter `afterWrite`), then posts `.recommendationsDidApply`
-    /// exactly once so UI layers (`AgentModelsSettingsViewModel`,
-    /// `ContextBuilderAgentViewModel`, `PromptViewModel`, `RecommendationWizardViewModel`,
-    /// `MCPServerToggleView`, `MCPSettingsView`) rebuild their derived state.
-    ///
-    /// Mirror-skip cases:
-    /// - sync disabled
-    /// - sibling already holds the same value (avoids spurious disk writes and
-    ///   ensures a single notification fires per MCP write)
-    /// A real model write is mirrored to the sibling. A null/blank clear of the chat model is
-    /// NOT mirrored into the Oracle `models.planning_model` (which is never auto-healed) —
-    /// matching the GUI sync guard; clearing the Oracle stays an explicit
-    /// `models.planning_model = null` write. A null clear of planning still mirrors to compose.
-    @MainActor
-    private static func postModelRawDidWrite(
-        store: GlobalSettingsStore,
-        siblingKey: String,
-        valueJustWritten: Value,
-        notificationCenter: NotificationCenter
-    ) {
-        if store.syncChatModelWithOracle() {
-            let newValue: String? = switch valueJustWritten {
-            case let .string(raw):
-                raw
-            case .null:
-                nil
-            default:
-                nil
-            }
-
-            let siblingCurrent: String? = switch siblingKey {
-            case "models.planning_model":
-                store.planningModelRaw()
-            case "models.preferred_compose_model":
-                store.preferredComposeModelRaw()
-            default:
-                nil
-            }
-
-            if siblingCurrent != newValue {
-                switch siblingKey {
-                case "models.planning_model":
-                    // Symmetric with the GUI sync fix (GlobalSettingsStore.setPreferredComposeModelRaw):
-                    // a blank/nil chat model must NOT be mirrored into the Oracle planningModel,
-                    // which is deliberately never auto-healed and would otherwise persist as
-                    // "Oracle reset to nothing". Clearing the Oracle stays an explicit
-                    // `app_settings models.planning_model = null` action, not a sync side effect.
-                    if let newValue, !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        store.setPlanningModelRaw(newValue, reason: "app_settings.models.sync_sibling")
-                    }
-                case "models.preferred_compose_model":
-                    store.setPreferredComposeModelRaw(newValue, reason: "app_settings.models.sync_sibling")
-                default:
-                    break
-                }
-            }
-        }
-        notificationCenter.post(name: .recommendationsDidApply, object: nil)
     }
 
     // MARK: - Candidate Providers

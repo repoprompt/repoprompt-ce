@@ -124,6 +124,14 @@ enum AgentModelsInheritanceMode: String, Codable, Equatable {
 enum AgentModelsEditingScope: Hashable {
     case global
     case workspace(UUID)
+
+    static func resolve(
+        workspaceID: UUID?,
+        inheritanceMode: AgentModelsInheritanceMode
+    ) -> AgentModelsEditingScope {
+        guard let workspaceID, inheritanceMode == .useWorkspaceOverrides else { return .global }
+        return .workspace(workspaceID)
+    }
 }
 
 /// Stable identity for one Agent Models operation. The source workspace drives
@@ -140,7 +148,10 @@ struct AgentModelsOperationIdentity: Hashable {
 
     init(sourceWorkspaceID: UUID, inheritanceMode: AgentModelsInheritanceMode) {
         self.sourceWorkspaceID = sourceWorkspaceID
-        scope = inheritanceMode == .useWorkspaceOverrides ? .workspace(sourceWorkspaceID) : .global
+        scope = AgentModelsEditingScope.resolve(
+            workspaceID: sourceWorkspaceID,
+            inheritanceMode: inheritanceMode
+        )
     }
 
     func matches(sourceWorkspaceID: UUID, inheritanceMode: AgentModelsInheritanceMode) -> Bool {

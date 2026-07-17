@@ -94,12 +94,18 @@ enum ContextBuilderFollowUpType: String, CaseIterable, Codable {
 }
 
 private enum ContextBuilderMCPRoutingError: LocalizedError {
-    case routingFailed(agentDisplayName: String, clientName: String, timeoutSeconds: TimeInterval)
+    case connectionNotObserved(agentDisplayName: String, clientName: String, timeoutSeconds: TimeInterval)
+    case routeNotCommitted(agentDisplayName: String, clientName: String, graceSeconds: TimeInterval)
+    case routingFailed(agentDisplayName: String, clientName: String)
 
     var errorDescription: String? {
         switch self {
-        case let .routingFailed(agentDisplayName, clientName, timeoutSeconds):
-            "mcp_routing_failed: \(agentDisplayName) did not route the expected MCP client '\(clientName)' to this Context Builder run within \(Self.format(timeoutSeconds))s. The run was terminated and MCP bootstrap state was released."
+        case let .connectionNotObserved(agentDisplayName, clientName, timeoutSeconds):
+            "mcp_connection_not_observed: \(agentDisplayName) did not open the expected MCP client '\(clientName)' within \(Self.format(timeoutSeconds))s. The run was terminated and MCP bootstrap state was released."
+        case let .routeNotCommitted(agentDisplayName, clientName, graceSeconds):
+            "mcp_route_not_committed: \(agentDisplayName) opened the expected MCP client '\(clientName)', but RepoPrompt could not commit its run route within the additional \(Self.format(graceSeconds))s handshake grace. The run was terminated and MCP bootstrap state was released."
+        case let .routingFailed(agentDisplayName, clientName):
+            "mcp_routing_failed: \(agentDisplayName) could not route the expected MCP client '\(clientName)' to this Context Builder run. The run was terminated and MCP bootstrap state was released."
         }
     }
 
@@ -2602,6 +2608,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
                 debugLog("System prompt length: \(message.systemPrompt.count)")
                 debugLog("User message length: \(message.userMessage.count)")
+                await record.reportProgress(.providerProcessStarting)
                 let stream = try await provider.streamAgentMessage(message, runID: runID)
                 guard !Task.isCancelled, acceptsEvents(from: record) else {
                     await lease.failAndCleanup()
@@ -2613,26 +2620,63 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     stage: .running
                 )
 
-                let routed = await lease.releaseWhenRouted(
-                    timeoutMs: ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds
+                let routingOutcome = await lease.releaseWhenRouted(
+                    waitPolicy: ContextBuilderDefaults.mcpRoutingWaitPolicy,
+                    progressReporter: { [weak record] progress in
+                        guard let record else { return }
+                        let phase: ContextBuilderMCPProgressPhase = switch progress {
+                        case .waitingForChildConnection:
+                            .waitingForChildConnection
+                        case .childConnectionObserved:
+                            .childConnectionObserved
+                        case .waitingForRouting:
+                            .waitingForRouting
+                        case .routingConfirmed:
+                            .routingConfirmed
+                        case .routingTimeoutBeforeConnection:
+                            .routingTimeoutBeforeConnection
+                        case .routingTimeoutAfterConnection:
+                            .routingTimeoutAfterConnection
+                        }
+                        await record.reportProgress(phase)
+                    }
                 )
                 guard !Task.isCancelled, acceptsEvents(from: record) else { return .cancelled }
-                debugLog("Routing result for run \(runID): routed=\(routed)")
+                if routingOutcome == .cancelled {
+                    return .cancelled
+                }
+                let routed = routingOutcome.routed
+                debugLog("Routing result for run \(runID): outcome=\(routingOutcome)")
                 if routed {
                     record.finalContextConnectionIDForDiagnostics =
                         mcpServer.contextBuilderFinalContextConnectionID(runID: runID)
                 }
 
                 if !routed, record.origin.isMCP {
-                    let timeoutSeconds = TimeInterval(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000
                     let clientName = record.agentKind.mcpClientNameHint ?? record.agentKind.displayName
-                    return .failed(
-                        ContextBuilderMCPRoutingError.routingFailed(
+                    let routingError: ContextBuilderMCPRoutingError
+                    switch routingOutcome {
+                    case .timedOutBeforeConnection:
+                        routingError = .connectionNotObserved(
                             agentDisplayName: record.agentKind.displayName,
                             clientName: clientName,
-                            timeoutSeconds: timeoutSeconds
-                        ).localizedDescription
-                    )
+                            timeoutSeconds: ContextBuilderDefaults.mcpNoConnectionTimeoutSeconds
+                        )
+                    case .timedOutAfterConnection:
+                        routingError = .routeNotCommitted(
+                            agentDisplayName: record.agentKind.displayName,
+                            clientName: clientName,
+                            graceSeconds: ContextBuilderDefaults.mcpObservedConnectionGraceSeconds
+                        )
+                    case .failed, .cancelled:
+                        routingError = .routingFailed(
+                            agentDisplayName: record.agentKind.displayName,
+                            clientName: clientName
+                        )
+                    case .routed:
+                        preconditionFailure("A routed outcome cannot enter MCP routing failure handling.")
+                    }
+                    return .failed(routingError.localizedDescription)
                 }
 
                 let connectionMessage = if routed {

@@ -654,7 +654,7 @@ final class AutoRecommendationEngine {
     ///
     /// Composes `applyChatModelRecommendation` + `applyContextBuilderRecommendation`
     /// + `applyMCPAgentDefaultsRecommendation` (and optionally `applyMCPPresetExposure`),
-    /// then posts `.recommendationsDidApply` so listeners refresh. Intended for the
+    /// then posts `.recommendationsDidApply` for each unique affected scope so listeners refresh. Intended for the
     /// "Apply Recommended Setup" button on the Agent Models settings page; callers
     /// that want row-level control should keep using the individual apply methods.
     ///
@@ -677,7 +677,11 @@ final class AutoRecommendationEngine {
             applyMCPPresetExposure(presetExposure)
         }
 
-        postRecommendationsDidApply(workspaceID: identity.sourceWorkspaceID, scope: identity.scope)
+        RecommendationApplyNotification.post(
+            sourceWorkspaceID: identity.sourceWorkspaceID,
+            agentModelsScope: rec.hasAgentModelsRecommendations ? identity.scope : nil,
+            includesPresetExposure: includePresetExposure && rec.mcpPresetExposure != nil
+        )
     }
 
     /// Apply MCP preset exposure recommendation.
@@ -724,23 +728,6 @@ final class AutoRecommendationEngine {
         case let .workspace(workspaceID):
             profileSettingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
         }
-    }
-
-    private func postRecommendationsDidApply(workspaceID: UUID, scope: AgentModelsEditingScope) {
-        var userInfo: [String: Any] = [
-            AgentModelsSettingsNotification.scopeKey: scope.notificationScopeRaw
-        ]
-        if let targetWorkspaceID = scope.workspaceID {
-            userInfo["workspaceID"] = targetWorkspaceID
-        }
-        // Keep the initiating workspace available for diagnostics without using
-        // it as a refresh filter for global recommendation writes.
-        userInfo["sourceWorkspaceID"] = workspaceID
-        NotificationCenter.default.post(
-            name: .recommendationsDidApply,
-            object: nil,
-            userInfo: userInfo
-        )
     }
 
     // MARK: - Auto-Apply for New Workspaces
@@ -887,7 +874,9 @@ final class AutoRecommendationEngine {
         let current = currentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let recommended = recommendedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !current.isEmpty, !recommended.isEmpty else { return false }
-        if current.caseInsensitiveCompare(recommended) == .orderedSame { return true }
+        if current.caseInsensitiveCompare(recommended) == .orderedSame {
+            return true
+        }
         guard let currentCodex = codexChatModelIdentity(for: current),
               let recommendedCodex = codexChatModelIdentity(for: recommended),
               currentCodex.baseModel == recommendedCodex.baseModel
@@ -979,21 +968,5 @@ final class AutoRecommendationEngine {
         // If recommendation is to just enable temp disable (shouldTemporarilyDisablePresets = true),
         // presets toggle is already on, just check if temp disable is on
         return temporarilyDisabled
-    }
-}
-
-private extension AgentModelsEditingScope {
-    var workspaceID: UUID? {
-        if case let .workspace(workspaceID) = self { return workspaceID }
-        return nil
-    }
-
-    var notificationScopeRaw: String {
-        switch self {
-        case .global:
-            AgentModelsSettingsNotification.Scope.global.rawValue
-        case .workspace:
-            AgentModelsSettingsNotification.Scope.workspace.rawValue
-        }
     }
 }

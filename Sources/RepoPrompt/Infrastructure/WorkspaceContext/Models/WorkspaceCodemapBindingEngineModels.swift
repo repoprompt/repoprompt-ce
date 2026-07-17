@@ -49,6 +49,8 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
     let maximumStagedProjectionGraphByteCount: UInt64
     let maximumQueuedProjectionManifestMutationByteCountPerRoot: UInt64
     let maximumQueuedProjectionManifestMutationByteCount: UInt64
+    let maximumManifestWriterDeferredItemCount: Int
+    let manifestWriterDeferredRetryMilliseconds: UInt64
     let projectionRetryInitialMilliseconds: UInt64
     let projectionRetryMaximumMilliseconds: UInt64
     let projectionRetryJitterPercent: UInt64
@@ -100,6 +102,8 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         maximumStagedProjectionGraphByteCount: UInt64 = 512 * 1024 * 1024,
         maximumQueuedProjectionManifestMutationByteCountPerRoot: UInt64 = 8 * 1024 * 1024,
         maximumQueuedProjectionManifestMutationByteCount: UInt64 = 32 * 1024 * 1024,
+        maximumManifestWriterDeferredItemCount: Int = 256,
+        manifestWriterDeferredRetryMilliseconds: UInt64 = 100,
         projectionRetryInitialMilliseconds: UInt64 = 250,
         projectionRetryMaximumMilliseconds: UInt64 = 30000,
         projectionRetryJitterPercent: UInt64 = 20
@@ -159,6 +163,8 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
             maximumQueuedProjectionManifestMutationByteCount >=
                 maximumQueuedProjectionManifestMutationByteCountPerRoot
         )
+        precondition(maximumManifestWriterDeferredItemCount > 0)
+        precondition(manifestWriterDeferredRetryMilliseconds > 0)
         precondition(projectionRetryInitialMilliseconds > 0)
         precondition(projectionRetryMaximumMilliseconds >= projectionRetryInitialMilliseconds)
         precondition(projectionRetryJitterPercent <= 100)
@@ -211,9 +217,19 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
             maximumQueuedProjectionManifestMutationByteCountPerRoot
         self.maximumQueuedProjectionManifestMutationByteCount =
             maximumQueuedProjectionManifestMutationByteCount
+        self.maximumManifestWriterDeferredItemCount = maximumManifestWriterDeferredItemCount
+        self.manifestWriterDeferredRetryMilliseconds = manifestWriterDeferredRetryMilliseconds
         self.projectionRetryInitialMilliseconds = projectionRetryInitialMilliseconds
         self.projectionRetryMaximumMilliseconds = projectionRetryMaximumMilliseconds
         self.projectionRetryJitterPercent = projectionRetryJitterPercent
+    }
+}
+
+struct WorkspaceCodemapManifestWriterRetryWaiter {
+    let sleep: @Sendable (Duration) async throws -> Void
+
+    static let production = Self { duration in
+        try await Task.sleep(for: duration)
     }
 }
 
@@ -490,6 +506,7 @@ enum WorkspaceCodemapBindingEngineHookKind: String {
     case manifestLoadMiss
     case manifestAdopted
     case manifestRevisionQueued
+    case manifestWaiterInstalled
     case manifestWrite
     case manifestFailure
     case overlayReady
@@ -574,6 +591,10 @@ struct WorkspaceCodemapBindingEngineHookEvent {
 
 struct WorkspaceCodemapBindingEngineHooks {
     let event: @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void
+    let afterManifestRevisionQueuedBeforeWaiterInstall: @Sendable (
+        WorkspaceCodemapRootEpoch,
+        UInt64
+    ) async -> Void
     let afterManifestStoreWriteBeforeCompletion: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
     #if DEBUG
         /// Deterministic race seam, structurally absent from non-DEBUG products.
@@ -584,9 +605,15 @@ struct WorkspaceCodemapBindingEngineHooks {
 
     init(
         event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+        afterManifestRevisionQueuedBeforeWaiterInstall: @escaping @Sendable (
+            WorkspaceCodemapRootEpoch,
+            UInt64
+        ) async -> Void = { _, _ in },
         afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (WorkspaceCodemapRootEpoch) async -> Void = { _ in }
     ) {
         self.event = event
+        self.afterManifestRevisionQueuedBeforeWaiterInstall =
+            afterManifestRevisionQueuedBeforeWaiterInstall
         self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
         #if DEBUG
             afterPublishedArtifactLookupBeforeCurrentnessValidation = { _ in }
@@ -596,6 +623,10 @@ struct WorkspaceCodemapBindingEngineHooks {
     #if DEBUG
         init(
             event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+            afterManifestRevisionQueuedBeforeWaiterInstall: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch,
+                UInt64
+            ) async -> Void = { _, _ in },
             afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (
                 WorkspaceCodemapRootEpoch
             ) async -> Void = { _ in },
@@ -604,6 +635,8 @@ struct WorkspaceCodemapBindingEngineHooks {
             ) async -> Void
         ) {
             self.event = event
+            self.afterManifestRevisionQueuedBeforeWaiterInstall =
+                afterManifestRevisionQueuedBeforeWaiterInstall
             self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
             self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
                 afterPublishedArtifactLookupBeforeCurrentnessValidation
@@ -628,6 +661,11 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var demandManifestAdoptionWaits: UInt64 = 0
     var manifestWrites: UInt64 = 0
     var manifestFailures: UInt64 = 0
+    var manifestWriteBatches: UInt64 = 0
+    var manifestWriteItems: UInt64 = 0
+    var manifestWriteBatchBytes: UInt64 = 0
+    var manifestWriteCoalescedItems: UInt64 = 0
+    var manifestWriterPeakQueuedItems: UInt64 = 0
     var materializations: UInt64 = 0
     var materializedBytes: UInt64 = 0
     var validatedWorktreeReads: UInt64 = 0
@@ -696,6 +734,11 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         demandManifestAdoptionWaits = initialValue
         manifestWrites = initialValue
         manifestFailures = initialValue
+        manifestWriteBatches = initialValue
+        manifestWriteItems = initialValue
+        manifestWriteBatchBytes = initialValue
+        manifestWriteCoalescedItems = initialValue
+        manifestWriterPeakQueuedItems = initialValue
         materializations = initialValue
         materializedBytes = initialValue
         validatedWorktreeReads = initialValue

@@ -762,26 +762,34 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let loaded = try await store.loadRoot(path: root.path)
         let loadedFiles = await store.files(inRoot: loaded.id)
         let file = try XCTUnwrap(loadedFiles.first)
+        let phases = CodemapLockedValues<WorkspaceCodemapStructureExecutionPhase>()
 
-        let presentation = try await WorkspaceCodemapPresentationCoordinator(store: store)
-            .structurePresentation(
-                seedFileIDs: [file.id],
-                direction: nil,
-                traversalLimits: .init(
-                    maximumDepth: 0,
-                    maximumNodeCount: 10,
-                    maximumEdgeCount: 10,
-                    maximumByteCount: 4096
-                ),
-                outputLimits: .init(
-                    maximumFileCount: 10,
-                    maximumCodemapTokenCount: 6000
-                ),
-                rootScope: .allLoaded,
-                logicalRootDisplayNamesByRootID: [loaded.id: "Logical"]
-            )
+        let presentation = try await WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            structurePhaseDidChange: { phases.append($0) }
+        )
+        .structurePresentation(
+            seedFileIDs: [file.id],
+            direction: nil,
+            traversalLimits: .init(
+                maximumDepth: 0,
+                maximumNodeCount: 10,
+                maximumEdgeCount: 10,
+                maximumByteCount: 4096
+            ),
+            outputLimits: .init(
+                maximumFileCount: 10,
+                maximumCodemapTokenCount: 6000
+            ),
+            rootScope: .allLoaded,
+            logicalRootDisplayNamesByRootID: [loaded.id: "Logical"]
+        )
 
         XCTAssertEqual(presentation.outcome, .ready)
+        XCTAssertEqual(
+            phases.values,
+            [.seedDemand, .freeze, .render, .assembly, .publicationRevalidation]
+        )
         let rendered = try XCTUnwrap(presentation.entries.first)
         XCTAssertTrue(rendered.isSeed)
         XCTAssertEqual(rendered.depth, 0)
