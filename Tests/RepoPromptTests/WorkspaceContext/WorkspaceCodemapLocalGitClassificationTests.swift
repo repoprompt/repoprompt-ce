@@ -211,12 +211,11 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         let gitFixture = try ReviewGitRepositoryFixture(name: #function)
         addTeardownBlock { gitFixture.cleanup() }
         let gitPreflightCount = AsyncCounter()
-        let productionGitEligibility = WorkspaceCodemapGitEligibilityProbe.production().resolve
         let store = WorkspaceFileContextStore(
             codemapLocalGitClassificationProbe: .production,
-            codemapGitEligibilityProbe: .init { rootURL in
+            codemapGitEligibilityProbe: .init { _ in
                 await gitPreflightCount.increment()
-                return await productionGitEligibility(rootURL)
+                return .eligible
             }
         )
         let loaded = try await store.loadRoot(path: root.path)
@@ -230,11 +229,13 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         XCTAssertEqual(initialGitPreflightCount, 0)
 
         _ = try gitFixture.runGit(["init"], at: root)
-        _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: root)
-        _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
-        _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: root)
         _ = try gitFixture.runGit(["add", "."], at: root)
-        _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: root)
+        _ = try gitFixture.runGit([
+            "-c", "user.name=RepoPrompt Test",
+            "-c", "user.email=repoprompt@example.test",
+            "-c", "commit.gpgSign=false",
+            "commit", "-m", "Initial commit"
+        ], at: root)
         await store.replayObservedFileSystemDeltas(rootID: loaded.id, deltas: [.folderAdded(".git")])
 
         let nextDemand = await store.requestCodemapArtifact(forFileID: file.id)
