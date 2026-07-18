@@ -2110,6 +2110,9 @@ with Path(os.environ["ARGS_FILE"]).open("a", encoding="utf-8") as handle:
 counter = Path(os.environ["CURL_COUNTER"])
 attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
 counter.write_text(str(attempt), encoding="utf-8")
+print("https://failed.example/artifact" if attempt == 1 else "https://success.example/artifact", end="")
+if attempt == 1:
+    print("transient diagnostic", file=sys.stderr)
 raise SystemExit(28 if attempt == 1 else 0)
 """,
             encoding="utf-8",
@@ -2144,12 +2147,21 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
             }
         )
         result = subprocess.run(
-            ["bash", "-c", 'source "$1"; curl_anonymous https://example.invalid/artifact', "download-test", str(SCRIPT_DIR / "promote_release.sh")],
+            [
+                "bash",
+                "-c",
+                'source "$1"; curl_anonymous --write-out "%{url_effective}" https://example.invalid/artifact',
+                "download-test",
+                str(SCRIPT_DIR / "promote_release.sh"),
+            ],
             env=env,
             text=True,
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "https://success.example/artifact")
+        self.assertNotIn("https://failed.example/artifact", result.stdout)
+        self.assertIn("transient diagnostic", result.stderr)
         calls = [json.loads(line) for line in args_file.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(
             [args[args.index("--connect-timeout") + 1] for args in calls],

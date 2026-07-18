@@ -260,7 +260,8 @@ update_gh() {
 
 curl_anonymous() {
     validate_release_download_bounds
-    local started now remaining attempt_timeout connect_timeout attempt curl_status=28
+    local started now remaining attempt_timeout connect_timeout attempt curl_status=28 stdout_file
+    stdout_file="$(mktemp "${TMPDIR:-/tmp}/repoprompt-release-curl.XXXXXX")"
     started="$(date +%s)"
     for ((attempt = 1; attempt <= RELEASE_DOWNLOAD_ATTEMPTS; attempt++)); do
         now="$(date +%s)"
@@ -270,13 +271,16 @@ curl_anonymous() {
         (( attempt_timeout <= remaining )) || attempt_timeout="$remaining"
         connect_timeout="$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS"
         (( connect_timeout <= attempt_timeout )) || connect_timeout="$attempt_timeout"
+        : > "$stdout_file"
         if env -u GH_TOKEN -u GITHUB_TOKEN curl \
             --fail \
             --location \
             --connect-timeout "$connect_timeout" \
             --max-time "$attempt_timeout" \
-            "$@"
+            "$@" > "$stdout_file"
         then
+            cat "$stdout_file"
+            rm -f "$stdout_file"
             return 0
         else
             curl_status=$?
@@ -287,6 +291,7 @@ curl_anonymous() {
         (( remaining > 3 )) || break
         sleep 3
     done
+    rm -f "$stdout_file"
     return "$curl_status"
 }
 
@@ -458,7 +463,7 @@ verify_source_release() {
     require_env SOURCE_GH_TOKEN
     require_env SPARKLE_PRIVATE_KEY
     require_release_tag_matches_metadata
-    for command in codesign curl date diff ditto gh hdiutil jq plutil python3 shasum sleep stat xcrun; do
+    for command in cat codesign curl date diff ditto gh hdiutil jq mktemp plutil python3 shasum sleep stat xcrun; do
         require_command "$command"
     done
     require_file "$SIGN_UPDATE"
