@@ -25,7 +25,8 @@ SENTRY_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS:-10}
 SENTRY_REQUEST_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS:-60}"
 RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS:-10}"
 RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS:-120}"
-RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS:-600}"
+RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS:-600}"
+RELEASE_DOWNLOAD_ATTEMPTS=9
 SENTRY_OPERATION_ATTEMPTS=3
 DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"
 UPDATE_ZIP_NAME="$ARCHIVE_BASENAME.zip"
@@ -82,11 +83,11 @@ validate_sentry_network_bounds() {
 validate_release_download_bounds() {
     validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" 60
     validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" 300
-    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS" 1200
+    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS" 1200
     (( RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS <= RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS )) ||
         fail "REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
-    (( RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS <= RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS )) ||
-        fail "REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS must not exceed REPOPROMPT_RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS"
+    (( RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS <= RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS must not exceed REPOPROMPT_RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS"
 }
 
 require_release_tag_matches_metadata() {
@@ -166,12 +167,16 @@ sentry_api_request() {
     printf '%s' "$status"
 }
 
+sentry_request_ambiguous() {
+    [[ "$1" == transport:* || "$1" =~ ^5[0-9][0-9]$ ]]
+}
+
 list_matching_sentry_deploys() {
     local output_file="$1"
     local status
     status="$(sentry_api_request GET "$output_file")"
-    if [[ "$status" == transport:* ]]; then
-        printf 'transport'
+    if sentry_request_ambiguous "$status"; then
+        printf 'ambiguous'
         return 0
     fi
     if [[ "$status" == "403" ]]; then
@@ -195,7 +200,7 @@ preflight_sentry_deploy_access() {
     prepare_sentry_api_access
     local matches
     matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-preflight.json")"
-    [[ "$matches" != "transport" ]] || fail "Unable to call the Sentry deploy API within the configured deadline"
+    [[ "$matches" != "ambiguous" ]] || fail "Unable to call the Sentry deploy API within the configured deadline or server-error boundary"
     [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
     printf 'OK: Sentry deploy access verified for %s.\n' "$SENTRY_RELEASE_NAME"
 }
@@ -211,7 +216,7 @@ record_verified_sentry_deploy_if_needed() {
     local matches status attempt
     for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
         matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-record.json")"
-        if [[ "$matches" == "transport" ]]; then
+        if [[ "$matches" == "ambiguous" ]]; then
             continue
         fi
         [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
@@ -220,7 +225,16 @@ record_verified_sentry_deploy_if_needed() {
             return 0
         fi
         status="$(sentry_api_request POST "$TMP_DIR/sentry-deploy-created.json" "$body_file")"
-        if [[ "$status" == transport:* ]]; then
+        if sentry_request_ambiguous "$status"; then
+            matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-reconcile.json")"
+            if [[ "$matches" == "ambiguous" ]]; then
+                continue
+            fi
+            [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count Sentry deploys during reconciliation"
+            if (( matches > 0 )); then
+                printf 'OK: Sentry production deploy confirmed after an ambiguous response for %s.\n' "$RELEASE_TAG"
+                return 0
+            fi
             continue
         fi
         [[ "$status" =~ ^2[0-9][0-9]$ ]] || fail "Sentry deploy API request failed with HTTP $status"
@@ -233,7 +247,7 @@ record_verified_sentry_deploy_if_needed() {
         printf 'OK: recorded Sentry production deploy for %s.\n' "$RELEASE_TAG"
         return 0
     done
-    fail "Unable to reconcile Sentry deploy state after bounded transport failures; no further mutation was attempted"
+    fail "Unable to reconcile Sentry deploy state after bounded transport or HTTP 5xx responses; no further mutation was attempted"
 }
 
 source_gh() {
@@ -246,16 +260,34 @@ update_gh() {
 
 curl_anonymous() {
     validate_release_download_bounds
-    env -u GH_TOKEN -u GITHUB_TOKEN curl \
-        --fail \
-        --location \
-        --retry 8 \
-        --retry-delay 3 \
-        --retry-all-errors \
-        --connect-timeout "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
-        --max-time "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" \
-        --retry-max-time "$RELEASE_DOWNLOAD_RETRY_TIMEOUT_SECONDS" \
-        "$@"
+    local started now remaining attempt_timeout connect_timeout attempt curl_status=28
+    started="$(date +%s)"
+    for ((attempt = 1; attempt <= RELEASE_DOWNLOAD_ATTEMPTS; attempt++)); do
+        now="$(date +%s)"
+        remaining=$((RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS - (now - started)))
+        (( remaining > 0 )) || break
+        attempt_timeout="$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
+        (( attempt_timeout <= remaining )) || attempt_timeout="$remaining"
+        connect_timeout="$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS"
+        (( connect_timeout <= attempt_timeout )) || connect_timeout="$attempt_timeout"
+        if env -u GH_TOKEN -u GITHUB_TOKEN curl \
+            --fail \
+            --location \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$attempt_timeout" \
+            "$@"
+        then
+            return 0
+        else
+            curl_status=$?
+        fi
+        (( attempt < RELEASE_DOWNLOAD_ATTEMPTS )) || break
+        now="$(date +%s)"
+        remaining=$((RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS - (now - started)))
+        (( remaining > 3 )) || break
+        sleep 3
+    done
+    return "$curl_status"
 }
 
 asset_snapshot() {
@@ -426,7 +458,7 @@ verify_source_release() {
     require_env SOURCE_GH_TOKEN
     require_env SPARKLE_PRIVATE_KEY
     require_release_tag_matches_metadata
-    for command in codesign curl diff ditto gh hdiutil jq plutil python3 shasum stat xcrun; do
+    for command in codesign curl date diff ditto gh hdiutil jq plutil python3 shasum sleep stat xcrun; do
         require_command "$command"
     done
     require_file "$SIGN_UPDATE"

@@ -1704,7 +1704,9 @@ elif method == "GET" and not is_collection:
         state_path.write_text(json.dumps({"version": version, "dateReleased": date_released}), encoding="utf-8")
     if scenario == "unknown-create" and counter_path.exists() and json.loads(counter_path.read_text(encoding="utf-8")).get("create", 0) > 0:
         raise SystemExit(28)
-    if state_path.exists():
+    if scenario == "http-create-unknown" and counter_path.exists() and json.loads(counter_path.read_text(encoding="utf-8")).get("create", 0) > 0:
+        status, response = 503, {"detail": "ambiguous create observation"}
+    elif state_path.exists():
         status, response = 200, release_payload()
     else:
         status, response = 404, {"detail": "SECRET_BODY_MARKER"}
@@ -1714,28 +1716,42 @@ elif method == "POST" and is_collection:
         raise SystemExit(28)
     if scenario == "unknown-create":
         raise SystemExit(28)
-    state_path.write_text(
-        json.dumps({"version": body["version"], "dateReleased": None}),
-        encoding="utf-8",
-    )
-    if scenario == "ambiguous-create-landed" and create_attempt == 1:
-        raise SystemExit(28)
-    status, response = 201, release_payload()
+    if scenario in {"http-create-lost", "http-create-unknown"} and create_attempt == 1:
+        status, response = 503, {"detail": "ambiguous create"}
+    else:
+        state_path.write_text(
+            json.dumps({"version": body["version"], "dateReleased": None}),
+            encoding="utf-8",
+        )
+        if scenario == "ambiguous-create-landed" and create_attempt == 1:
+            raise SystemExit(28)
+        if scenario == "http-create-landed" and create_attempt == 1:
+            status, response = 503, {"detail": "ambiguous create"}
+        else:
+            status, response = 201, release_payload()
 elif method == "PUT" and not is_collection and state_path.exists():
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if "dateReleased" in body:
         finalize_attempt = bump("finalize")
         if scenario == "ambiguous-finalize-lost" and finalize_attempt == 1:
             raise SystemExit(28)
-        state["dateReleased"] = body["dateReleased"]
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-        if scenario == "ambiguous-finalize-landed" and finalize_attempt == 1:
-            raise SystemExit(28)
+        if scenario == "http-finalize-lost" and finalize_attempt == 1:
+            status, response = 503, {"detail": "ambiguous finalize"}
+        else:
+            state["dateReleased"] = body["dateReleased"]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            if scenario == "ambiguous-finalize-landed" and finalize_attempt == 1:
+                raise SystemExit(28)
+            if scenario == "http-finalize-landed" and finalize_attempt == 1:
+                status, response = 503, {"detail": "ambiguous finalize"}
     elif "refs" in body:
         refs_attempt = bump("refs")
         if scenario == "ambiguous-refs" and refs_attempt == 1:
             raise SystemExit(28)
-    status, response = 200, release_payload()
+        if scenario == "http-refs" and refs_attempt == 1:
+            status, response = 503, {"detail": "ambiguous refs"}
+    if "status" not in locals() or status != 503:
+        status, response = 200, release_payload()
 else:
     status, response = 500, {"detail": "unexpected fixture request", "version": version}
 
@@ -1853,16 +1869,22 @@ sys.stdout.write(str(status))
         for scenario, expected_posts in (
             ("ambiguous-create-landed", 1),
             ("ambiguous-create-lost", 2),
+            ("http-create-landed", 1),
+            ("http-create-lost", 2),
         ):
             with self.subTest(scenario=scenario):
                 result, calls = self.run_sentry_prepare_fixture(scenario)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len([call for call in calls if call["method"] == "POST"]), expected_posts)
+                first_post = next(index for index, call in enumerate(calls) if call["method"] == "POST")
+                self.assertEqual(calls[first_post + 1]["method"], "GET")
 
     def test_sentry_release_recovers_ambiguous_finalize_outcomes_by_observation(self) -> None:
         for scenario, expected_finalizations in (
             ("ambiguous-finalize-landed", 1),
             ("ambiguous-finalize-lost", 2),
+            ("http-finalize-landed", 1),
+            ("http-finalize-lost", 2),
         ):
             with self.subTest(scenario=scenario):
                 result, calls = self.run_sentry_prepare_fixture(scenario)
@@ -1873,26 +1895,34 @@ sys.stdout.write(str(status))
                     if call["method"] == "PUT" and "dateReleased" in (call["body"] or {})
                 ]
                 self.assertEqual(len(finalizations), expected_finalizations)
+                first_finalize = calls.index(finalizations[0])
+                self.assertEqual(calls[first_finalize + 1]["method"], "GET")
 
     def test_sentry_release_retries_identical_idempotent_refs_after_transport_failure(self) -> None:
-        result, calls = self.run_sentry_prepare_fixture("ambiguous-refs")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        refs_updates = [
-            call
-            for call in calls
-            if call["method"] == "PUT" and "refs" in (call["body"] or {})
-        ]
-        self.assertEqual(len(refs_updates), 2)
-        self.assertEqual(refs_updates[0]["body"], refs_updates[1]["body"])
+        for scenario in ("ambiguous-refs", "http-refs"):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_sentry_prepare_fixture(scenario)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                refs_updates = [
+                    call
+                    for call in calls
+                    if call["method"] == "PUT" and "refs" in (call["body"] or {})
+                ]
+                self.assertEqual(len(refs_updates), 2)
+                self.assertEqual(refs_updates[0]["body"], refs_updates[1]["body"])
+                first_refs = calls.index(refs_updates[0])
+                self.assertEqual(calls[first_refs + 1]["method"], "GET")
 
     def test_sentry_release_fails_loudly_when_ambiguous_create_cannot_be_reconciled(self) -> None:
-        result, calls = self.run_sentry_prepare_fixture("unknown-create")
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len([call for call in calls if call["method"] == "POST"]), 1)
-        self.assertIn("Unable to reconcile Sentry release state", result.stderr)
-        self.assertNotIn("fixture-token", result.stdout + result.stderr)
+        for scenario in ("unknown-create", "http-create-unknown"):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_sentry_prepare_fixture(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len([call for call in calls if call["method"] == "POST"]), 1)
+                first_post = next(index for index, call in enumerate(calls) if call["method"] == "POST")
+                self.assertEqual(calls[first_post + 1]["method"], "GET")
+                self.assertIn("Unable to reconcile Sentry release state", result.stderr)
+                self.assertNotIn("fixture-token", result.stdout + result.stderr)
 
     def test_finalize_sentry_recovery_mode_accepts_an_existing_finalized_release(self) -> None:
         result, calls = self.run_sentry_prepare_fixture("existing-finalized", action="recover")
@@ -1971,18 +2001,31 @@ with Path(os.environ["CALL_LOG"]).open("a", encoding="utf-8") as handle:
 state = Path(os.environ["DEPLOY_STATE"])
 counter = Path(os.environ["DEPLOY_COUNTER"])
 if method == "GET":
-    response = ([{"environment": "production", "name": "vfixture"}] if state.exists() else [])
-    status = 200
+    if os.environ["SCENARIO"] == "http-unknown" and counter.exists():
+        response = {"detail": "ambiguous deploy observation"}
+        status = 503
+    else:
+        response = ([{"environment": "production", "name": "vfixture"}] if state.exists() else [])
+        status = 200
 elif method == "POST":
     attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
     counter.write_text(str(attempt), encoding="utf-8")
-    if os.environ["SCENARIO"] == "lost" and attempt == 1:
+    scenario = os.environ["SCENARIO"]
+    if scenario == "lost" and attempt == 1:
         raise SystemExit(28)
-    state.write_text("landed", encoding="utf-8")
-    if os.environ["SCENARIO"] == "landed" and attempt == 1:
-        raise SystemExit(28)
-    response = {"environment": "production", "name": "vfixture"}
-    status = 201
+    if scenario in {"http-lost", "http-unknown"} and attempt == 1:
+        response = {"detail": "ambiguous deploy create"}
+        status = 503
+    else:
+        state.write_text("landed", encoding="utf-8")
+        if scenario == "landed" and attempt == 1:
+            raise SystemExit(28)
+        if scenario == "http-landed" and attempt == 1:
+            response = {"detail": "ambiguous deploy create"}
+            status = 503
+        else:
+            response = {"environment": "production", "name": "vfixture"}
+            status = 201
 else:
     raise SystemExit(92)
 output.write_text(json.dumps(response), encoding="utf-8")
@@ -2025,17 +2068,35 @@ sys.stdout.write(str(status))
         return result, calls
 
     def test_sentry_deploy_recovers_ambiguous_create_outcomes_without_curl_retry(self) -> None:
-        for scenario, expected_posts in (("landed", 1), ("lost", 2)):
+        for scenario, expected_posts in (
+            ("landed", 1),
+            ("lost", 2),
+            ("http-landed", 1),
+            ("http-lost", 2),
+        ):
             with self.subTest(scenario=scenario):
                 result, calls = self.run_sentry_deploy_fixture(scenario)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len([call for call in calls if call["method"] == "POST"]), expected_posts)
+                first_post = next(index for index, call in enumerate(calls) if call["method"] == "POST")
+                self.assertEqual(calls[first_post + 1]["method"], "GET")
                 self.assertNotIn("fixture-token", result.stdout + result.stderr + json.dumps(calls))
 
-    def test_promotion_anonymous_downloads_have_bounded_retry_time(self) -> None:
+    def test_sentry_deploy_fails_closed_when_http_ambiguity_cannot_be_reconciled(self) -> None:
+        result, calls = self.run_sentry_deploy_fixture("http-unknown")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len([call for call in calls if call["method"] == "POST"]), 1)
+        first_post = next(index for index, call in enumerate(calls) if call["method"] == "POST")
+        self.assertEqual(calls[first_post + 1]["method"], "GET")
+        self.assertIn("Unable to reconcile Sentry deploy state", result.stderr)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr + json.dumps(calls))
+
+    def test_promotion_anonymous_downloads_cap_each_attempt_to_remaining_budget(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
-        args_file = temp_dir / "args.json"
+        args_file = temp_dir / "args.jsonl"
+        counter_file = temp_dir / "counter"
         fake_curl = temp_dir / "curl"
         fake_curl.write_text(
             """#!/usr/bin/env python3
@@ -2043,13 +2104,45 @@ import json
 import os
 import sys
 from pathlib import Path
-Path(os.environ["ARGS_FILE"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+
+with Path(os.environ["ARGS_FILE"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+counter = Path(os.environ["CURL_COUNTER"])
+attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+counter.write_text(str(attempt), encoding="utf-8")
+raise SystemExit(28 if attempt == 1 else 0)
 """,
             encoding="utf-8",
         )
         fake_curl.chmod(0o755)
+        fake_date = temp_dir / "date"
+        fake_date.write_text(
+            """#!/usr/bin/env python3
+import os
+from pathlib import Path
+
+values = Path(os.environ["DATE_VALUES"])
+remaining = values.read_text(encoding="utf-8").splitlines()
+print(remaining.pop(0))
+values.write_text("\\n".join(remaining), encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        fake_date.chmod(0o755)
+        fake_sleep = temp_dir / "sleep"
+        fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_sleep.chmod(0o755)
+        date_values = temp_dir / "date-values"
+        date_values.write_text("100\n100\n590\n595\n", encoding="utf-8")
         env = os.environ.copy()
-        env.update({"PATH": f"{temp_dir}:{env.get('PATH', '')}", "ARGS_FILE": str(args_file)})
+        env.update(
+            {
+                "PATH": f"{temp_dir}:{env.get('PATH', '')}",
+                "ARGS_FILE": str(args_file),
+                "CURL_COUNTER": str(counter_file),
+                "DATE_VALUES": str(date_values),
+            }
+        )
         result = subprocess.run(
             ["bash", "-c", 'source "$1"; curl_anonymous https://example.invalid/artifact', "download-test", str(SCRIPT_DIR / "promote_release.sh")],
             env=env,
@@ -2057,10 +2150,13 @@ Path(os.environ["ARGS_FILE"]).write_text(json.dumps(sys.argv[1:]), encoding="utf
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        args = json.loads(args_file.read_text(encoding="utf-8"))
-        self.assertEqual(args[args.index("--connect-timeout") + 1], "10")
-        self.assertEqual(args[args.index("--max-time") + 1], "120")
-        self.assertEqual(args[args.index("--retry-max-time") + 1], "600")
+        calls = [json.loads(line) for line in args_file.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(
+            [args[args.index("--connect-timeout") + 1] for args in calls],
+            ["10", "10"],
+        )
+        self.assertEqual([args[args.index("--max-time") + 1] for args in calls], ["120", "105"])
+        self.assertTrue(all("--retry" not in args and "--retry-max-time" not in args for args in calls))
 
     def test_sentry_release_preflight_distinguishes_invalid_token_without_mutation(self) -> None:
         result, calls = self.run_sentry_prepare_fixture("unauthorized")
@@ -2474,10 +2570,21 @@ import os
 import json
 import shutil
 import sys
+from pathlib import Path
 
 args = sys.argv[1:]
 with open(os.environ["FAKE_SWIFTFORMAT_CURL_ARGS"], "w", encoding="utf-8") as handle:
     json.dump(args, handle)
+if "FAKE_SWIFTFORMAT_CURL_LOG" in os.environ:
+    with open(os.environ["FAKE_SWIFTFORMAT_CURL_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(args) + "\\n")
+counter_path = os.environ.get("FAKE_SWIFTFORMAT_CURL_COUNTER")
+if counter_path:
+    counter = Path(counter_path)
+    attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+    counter.write_text(str(attempt), encoding="utf-8")
+    if attempt <= int(os.environ.get("FAKE_SWIFTFORMAT_FAIL_ATTEMPTS", "0")):
+        raise SystemExit(28)
 output = args[args.index("--output") + 1]
 shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
 """,
@@ -2548,7 +2655,8 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         curl_args = json.loads((root / "curl-args.json").read_text(encoding="utf-8"))
         self.assertEqual(curl_args[curl_args.index("--connect-timeout") + 1], "10")
         self.assertEqual(curl_args[curl_args.index("--max-time") + 1], "120")
-        self.assertEqual(curl_args[curl_args.index("--retry-max-time") + 1], "300")
+        self.assertNotIn("--retry", curl_args)
+        self.assertNotIn("--retry-max-time", curl_args)
 
         resolved = subprocess.run(
             [str(installer), "resolve-swiftformat"],
@@ -2592,7 +2700,7 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             {
                 "FAKE_SWIFTFORMAT_ARCHIVE": str(archive),
                 "FAKE_SWIFTFORMAT_CURL_ARGS": str(curl_args),
-                "REPOPROMPT_FORMAT_DOWNLOAD_RETRY_TIMEOUT_SECONDS": "601",
+                "REPOPROMPT_FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS": "601",
             }
         )
 
@@ -2605,6 +2713,62 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must not exceed 600 seconds", result.stderr)
         self.assertFalse(curl_args.exists())
+
+    def test_format_tool_download_caps_each_attempt_to_remaining_budget(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+        root, env, _ = self._make_format_tools_test_environment("0.62.1")
+        archive = root / "fixtures" / "swiftformat.zip"
+        pinned_checksum = "b990400779aceb7d7020796eb9ba814d4480543f671d38fc0ff48cb72f04c584"
+        archive.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(
+                "swiftformat",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.61.1; exit 0; fi\nexit 0\n",
+            )
+        self._install_fake_swiftformat_download_tools(root, archive, pinned_checksum)
+        date_values = root / "date-values"
+        date_values.write_text("100\n100\n395\n", encoding="utf-8")
+        fake_date = root / "tools" / "date"
+        fake_date.write_text(
+            """#!/usr/bin/env python3
+import os
+from pathlib import Path
+
+values = Path(os.environ["FAKE_SWIFTFORMAT_DATE_VALUES"])
+remaining = values.read_text(encoding="utf-8").splitlines()
+print(remaining.pop(0))
+values.write_text("\\n".join(remaining), encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        fake_date.chmod(0o755)
+        curl_log = root / "curl-log.jsonl"
+        env.update(
+            {
+                "FAKE_SWIFTFORMAT_ARCHIVE": str(archive),
+                "FAKE_SWIFTFORMAT_CURL_ARGS": str(root / "curl-args.json"),
+                "FAKE_SWIFTFORMAT_CURL_LOG": str(curl_log),
+                "FAKE_SWIFTFORMAT_CURL_COUNTER": str(root / "curl-counter"),
+                "FAKE_SWIFTFORMAT_FAIL_ATTEMPTS": "1",
+                "FAKE_SWIFTFORMAT_DATE_VALUES": str(date_values),
+            }
+        )
+
+        result = subprocess.run(
+            [str(installer), "install"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(
+            [args[args.index("--connect-timeout") + 1] for args in calls],
+            ["10", "5"],
+        )
+        self.assertEqual([args[args.index("--max-time") + 1] for args in calls], ["120", "5"])
+        self.assertTrue(all("--retry" not in args and "--retry-max-time" not in args for args in calls))
 
     def test_swift_style_never_formats_with_mismatched_path_swiftformat(self) -> None:
         style_script = SCRIPT_DIR / "swift_style.sh"

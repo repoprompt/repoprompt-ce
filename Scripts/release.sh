@@ -295,8 +295,16 @@ sentry_transport_failed() {
     [[ "$1" == transport:* ]]
 }
 
+sentry_http_response_ambiguous() {
+    [[ "$1" =~ ^5[0-9][0-9]$ ]]
+}
+
+sentry_request_ambiguous() {
+    sentry_transport_failed "$1" || sentry_http_response_ambiguous "$1"
+}
+
 fail_sentry_unknown_transport_state() {
-    fail "Unable to reconcile Sentry release state after bounded transport failures; no further mutation was attempted"
+    fail "Unable to reconcile Sentry release state after bounded transport or HTTP 5xx responses; no further mutation was attempted"
 }
 
 fail_sentry_release_api_status() {
@@ -326,6 +334,23 @@ validate_sentry_release_response() {
             any(.projects[]?; .slug == $project)' \
         "$response_file" >/dev/null ||
         fail "Sentry release API returned malformed or mismatched JSON for $label"
+}
+
+reconcile_sentry_release_identity_after_ambiguous_mutation() {
+    local response_file="$1"
+    local label="$2"
+    local status observation
+    for ((observation = 1; observation <= SENTRY_OPERATION_ATTEMPTS; observation++)); do
+        status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$response_file")"
+        if sentry_request_ambiguous "$status"; then
+            continue
+        fi
+        [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+            fail_sentry_release_api_status "reconcile release $SENTRY_RELEASE_NAME after $label" "$status"
+        validate_sentry_release_response "$response_file" "$label reconciliation"
+        return 0
+    done
+    fail_sentry_unknown_transport_state
 }
 
 preflight_sentry_release_access() {
@@ -365,13 +390,24 @@ prepare_sentry_release() {
 
     for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
         status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
-        if sentry_transport_failed "$status"; then
+        if sentry_request_ambiguous "$status"; then
             continue
         fi
         if [[ "$status" == "404" ]]; then
             status="$(sentry_api_request POST "$(sentry_releases_endpoint)" "$release_response" "$create_body")"
-            if sentry_transport_failed "$status"; then
-                continue
+            if sentry_request_ambiguous "$status"; then
+                status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
+                if sentry_request_ambiguous "$status"; then
+                    continue
+                fi
+                if [[ "$status" == "404" ]]; then
+                    continue
+                fi
+                [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+                    fail_sentry_release_api_status "reconcile release $SENTRY_RELEASE_NAME after create" "$status"
+                validate_sentry_release_response "$release_response" "release creation reconciliation"
+                prepared=1
+                break
             fi
             [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
                 fail_sentry_release_api_status "create release $SENTRY_RELEASE_NAME" "$status"
@@ -392,7 +428,8 @@ prepare_sentry_release() {
     chmod 600 "$refs_body"
     for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
         status="$(sentry_api_request PUT "$(sentry_release_endpoint)" "$release_response" "$refs_body")"
-        if sentry_transport_failed "$status"; then
+        if sentry_request_ambiguous "$status"; then
+            reconcile_sentry_release_identity_after_ambiguous_mutation "$release_response" "commit association"
             continue
         fi
         [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
@@ -415,7 +452,7 @@ finalize_sentry_release() {
 
     for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
         status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
-        if sentry_transport_failed "$status"; then
+        if sentry_request_ambiguous "$status"; then
             continue
         fi
         [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
@@ -429,7 +466,20 @@ finalize_sentry_release() {
             fail "Sentry release API returned malformed finalization state"
 
         status="$(sentry_api_request PUT "$(sentry_release_endpoint)" "$release_response" "$finalize_body")"
-        if sentry_transport_failed "$status"; then
+        if sentry_request_ambiguous "$status"; then
+            status="$(sentry_api_request GET "$(sentry_release_endpoint)" "$release_response")"
+            if sentry_request_ambiguous "$status"; then
+                continue
+            fi
+            [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+                fail_sentry_release_api_status "reconcile release $SENTRY_RELEASE_NAME after finalization" "$status"
+            validate_sentry_release_response "$release_response" "release finalization reconciliation"
+            if jq -e '.dateReleased | type == "string"' "$release_response" >/dev/null; then
+                printf 'OK: Sentry release %s finalization confirmed after an ambiguous response.\n' "$SENTRY_RELEASE_NAME"
+                return 0
+            fi
+            jq -e '.dateReleased == null' "$release_response" >/dev/null ||
+                fail "Sentry release API returned malformed finalization state during reconciliation"
             continue
         fi
         [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
