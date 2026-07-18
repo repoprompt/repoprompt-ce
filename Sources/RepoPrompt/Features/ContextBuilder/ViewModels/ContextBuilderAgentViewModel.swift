@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptProcessSupport
 import SwiftUI
 
 // AgentLogEntry and AgentLogEntryType are defined in Models/Agent/AgentLogModels.swift
@@ -12,7 +13,9 @@ enum AgentRunState: Equatable {
     case failed(String)
 
     var isRunning: Bool {
-        if case .running = self { return true }
+        if case .running = self {
+            return true
+        }
         return false
     }
 
@@ -2925,7 +2928,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             activeSession
         }
         guard let session else { return false }
-        if session.isCancelling { return false }
+        if session.isCancelling {
+            return false
+        }
         session.isCancelling = true
         session.didUserCancelActiveContextBuilderRun = true
         updateRuntimeBindings(from: session)
@@ -3293,7 +3298,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
         )
         guard finalizedConnections else {
-            if let contextCommitResult { return contextCommitResult }
+            if let contextCommitResult {
+                return contextCommitResult
+            }
             if !acceptsEvents(from: record) {
                 return MCPServerViewModel.ContextBuilderTabContextCommitResult(
                     outcome: .staleOrNoLongerCurrent,
@@ -5042,7 +5049,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Cancel any pending question for a session (internal helper).
     private func cancelPendingQuestion(for session: TabSession, expectedRunID: UUID? = nil) {
-        if let expectedRunID, session.pendingAskUserRunID != expectedRunID { return }
+        if let expectedRunID, session.pendingAskUserRunID != expectedRunID {
+            return
+        }
         invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
         session.askUserContinuation = nil

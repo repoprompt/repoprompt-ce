@@ -1,6 +1,7 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
+import RepoPromptProcessSupport
 
 enum CodexJSONValue: Equatable {
     case string(String)
@@ -547,7 +548,9 @@ actor CodexAppServerClient {
         requestFailure: ClientError,
         reason: TransportTerminationReason
     ) -> TerminatingTransport? {
-        if let expected = expectedGeneration, expected != transportGeneration { return nil }
+        if let expected = expectedGeneration, expected != transportGeneration {
+            return nil
+        }
         guard !didTerminateTransport else { return nil }
         didTerminateTransport = true
         lastTransportTerminationReason = reason

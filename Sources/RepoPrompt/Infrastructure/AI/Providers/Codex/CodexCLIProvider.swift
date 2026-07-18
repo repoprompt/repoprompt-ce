@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcessSupport
 
 final class CodexCLIProvider: AIProvider {
     private struct StreamAttemptFailure: Error {
@@ -127,9 +128,15 @@ final class CodexCLIProvider: AIProvider {
                 }
             case "message_stop":
                 sawMessageStop = true
-                if let value = result.promptTokens { promptTokens = value }
-                if let value = result.completionTokens { completionTokens = value }
-                if let value = result.cost { cost = value }
+                if let value = result.promptTokens {
+                    promptTokens = value
+                }
+                if let value = result.completionTokens {
+                    completionTokens = value
+                }
+                if let value = result.cost {
+                    cost = value
+                }
             case "error":
                 throw AIProviderError.invalidConfiguration(detail: result.text ?? "Codex app-server reported an error")
             default:
@@ -915,14 +922,28 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private func shouldRetry(detail: String, timedOut: Bool) -> Bool {
-        if timedOut { return true }
+        if timedOut {
+            return true
+        }
         let lower = detail.lowercased()
-        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") { return true }
-        if lower.contains("overload") || lower.contains("overloaded") || lower.contains("busy") { return true }
-        if lower.contains("502") || lower.contains("503") || lower.contains("504") || lower.contains("gateway") { return true }
-        if lower.contains("timeout") || lower.contains("timed out") || lower.contains("context deadline exceeded") { return true }
-        if lower.contains("econnreset") || lower.contains("connection reset") { return true }
-        if lower.contains("network") || lower.contains("unreachable") { return true }
+        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
+            return true
+        }
+        if lower.contains("overload") || lower.contains("overloaded") || lower.contains("busy") {
+            return true
+        }
+        if lower.contains("502") || lower.contains("503") || lower.contains("504") || lower.contains("gateway") {
+            return true
+        }
+        if lower.contains("timeout") || lower.contains("timed out") || lower.contains("context deadline exceeded") {
+            return true
+        }
+        if lower.contains("econnreset") || lower.contains("connection reset") {
+            return true
+        }
+        if lower.contains("network") || lower.contains("unreachable") {
+            return true
+        }
         return false
     }
 

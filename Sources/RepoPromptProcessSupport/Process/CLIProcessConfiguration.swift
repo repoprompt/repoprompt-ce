@@ -1,26 +1,26 @@
 import Foundation
 
-struct CLIProcessConfiguration {
-    var command: String
+package struct CLIProcessConfiguration {
+    package var command: String
     /// Working directory for the CLI process. Defaults to temp directory to avoid macOS security popups.
-    var workingDirectory: String
-    var environment: [String: String]
-    var additionalPaths: [String]
-    var commandSuffix: [String]
-    var enableDebugLogging: Bool
-    var logCollector: CLIProcessLogCollector?
+    package var workingDirectory: String
+    package var environment: [String: String]
+    package var additionalPaths: [String]
+    package var commandSuffix: [String]
+    package var enableDebugLogging: Bool
+    package var logCollector: CLIProcessLogCollector?
     /// Optional: explicit basenames we prefer to resolve to (e.g., ["claude", "codex"]).
     /// If omitted, the resolver will prefer `command` and otherwise behave as before.
-    var resolveCandidates: [String]?
+    package var resolveCandidates: [String]?
     /// Controls whether command resolution queries the user's shell before or after PATH search.
-    var shellLookupMode: CommandPathResolver.ShellLookupMode
+    package var shellLookupMode: CommandPathResolver.ShellLookupMode
     /// Limit how many bytes from child stdout/stderr we retain (per stream).
-    var captureStdoutTailBytes: Int
-    var captureStderrTailBytes: Int
+    package var captureStdoutTailBytes: Int
+    package var captureStderrTailBytes: Int
     /// Limit how many bytes of stdin we sample for logs (0 disables sampling).
-    var logStdinSampleBytes: Int
+    package var logStdinSampleBytes: Int
 
-    init(
+    package init(
         command: String = "claude",
         workingDirectory: String? = nil, // nil → temp directory to avoid macOS security popups
         environment: [String: String] = [:],

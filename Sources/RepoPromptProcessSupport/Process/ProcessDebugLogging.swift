@@ -1,8 +1,8 @@
 import Darwin
 import Foundation
 
-enum ProcessDebugLogging {
-    static func log(
+package enum ProcessDebugLogging {
+    package static func log(
         prefix: String,
         _ message: @autoclosure () -> String,
         enabled: Bool = true,

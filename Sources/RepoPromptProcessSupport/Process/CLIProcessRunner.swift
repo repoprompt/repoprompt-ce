@@ -16,7 +16,9 @@ private actor GateReleaseCoordinator {
     private var released = false
 
     func markReleased() -> Bool {
-        if released { return false }
+        if released {
+            return false
+        }
         released = true
         return true
     }
@@ -37,7 +39,11 @@ private actor ResolvedCommandCache {
     }
 
     func invalidate(_ command: String? = nil) {
-        if let command { map.removeValue(forKey: command) } else { map.removeAll() }
+        if let command {
+            map.removeValue(forKey: command)
+        } else {
+            map.removeAll()
+        }
     }
 }
 
@@ -51,14 +57,14 @@ enum LifecycleGateDiagnostics {
     }
 }
 
-enum CLIProcessRunnerError: Error, LocalizedError {
+package enum CLIProcessRunnerError: Error, LocalizedError {
     case commandNotFound(String)
     case spawnFailed(String)
     case inputEncodingFailed
     case inputWriteFailed(String)
     case waitFailed(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .commandNotFound(command):
             "Command not found: \(command)"
@@ -74,31 +80,31 @@ enum CLIProcessRunnerError: Error, LocalizedError {
     }
 }
 
-final class CLIProcessRunner {
-    struct Result {
-        let stdout: Data
-        let stderr: Data
-        let status: Int32
-        let timedOut: Bool
+package final class CLIProcessRunner {
+    package struct Result {
+        package let stdout: Data
+        package let stderr: Data
+        package let status: Int32
+        package let timedOut: Bool
     }
 
-    enum OutputFlagMode {
+    package enum OutputFlagMode {
         case auto(CLIOutputFormat)
         case none
         case custom([String])
     }
 
-    enum StreamEvent {
+    package enum StreamEvent {
         case stdout(Data)
         case stderr(Data)
         case terminated(status: Int32, timedOut: Bool)
     }
 
-    let config: CLIProcessConfiguration
+    package let config: CLIProcessConfiguration
     private let registry = ProcessRegistry()
     private let gate: TaskSemaphore
 
-    init(config: CLIProcessConfiguration, concurrencyLimit: Int = 1) {
+    package init(config: CLIProcessConfiguration, concurrencyLimit: Int = 1) {
         self.config = config
         gate = TaskSemaphore(max(concurrencyLimit, 1))
     }
@@ -135,7 +141,7 @@ final class CLIProcessRunner {
         return access(path, X_OK) == 0
     }
 
-    func run(
+    package func run(
         args: [String],
         stdin: String?,
         outputMode: OutputFlagMode = .auto(.json),
@@ -356,7 +362,7 @@ final class CLIProcessRunner {
         }
     }
 
-    func runStreaming(
+    package func runStreaming(
         args: [String],
         stdin: String?,
         outputMode: OutputFlagMode = .auto(.streamJson),
@@ -685,7 +691,7 @@ final class CLIProcessRunner {
         }
     }
 
-    func cancelAll() async {
+    package func cancelAll() async {
         // Do not steal cleanup ownership from runStreaming; just request termination.
         let processes = await registry.current()
         let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()

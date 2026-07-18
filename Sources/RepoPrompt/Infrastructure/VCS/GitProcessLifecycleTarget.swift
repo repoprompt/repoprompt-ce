@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptProcessSupport
 
 /// Minimal PID/process-group signal surface for one spawned git child.
 ///

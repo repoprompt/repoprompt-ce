@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptProcessSupport
 import SwiftUI
 
 struct CLIProvidersSettingsView: View {
@@ -785,10 +786,18 @@ struct CLIProvidersSettingsView: View {
 
     private func compatibleBackendTestDisabledReason(for backendID: ClaudeCodeCompatibleBackendID) -> String {
         let config = viewModel.compatibleBackendConfig(for: backendID)
-        if backendID == .custom, !config.isEnabled { return "Enable this backend before testing." }
-        if viewModel.claudeCodeCLIStatus.isKnownMissing { return "Install Claude Code CLI before testing this backend." }
-        if !config.isValid { return "Complete the backend configuration before testing." }
-        if !viewModel.compatibleBackendHasSecret(backendID) { return "Save an API key before testing this backend." }
+        if backendID == .custom, !config.isEnabled {
+            return "Enable this backend before testing."
+        }
+        if viewModel.claudeCodeCLIStatus.isKnownMissing {
+            return "Install Claude Code CLI before testing this backend."
+        }
+        if !config.isValid {
+            return "Complete the backend configuration before testing."
+        }
+        if !viewModel.compatibleBackendHasSecret(backendID) {
+            return "Save an API key before testing this backend."
+        }
         return "Complete setup before testing this backend."
     }
 
@@ -1237,7 +1246,9 @@ struct CLIProvidersSettingsView: View {
         func updateSlot(_ slot: ClaudeSlot, value: String) {
             var updated = viewModel.compatibleBackendConfig(for: backendID)
             var editableMapping: ClaudeCodeCompatibleBackendConfig.ClaudeSlotMapping = {
-                if case let .claudeSlotMapping(current) = updated.modelBehavior { return current }
+                if case let .claudeSlotMapping(current) = updated.modelBehavior {
+                    return current
+                }
                 return mapping
             }()
             switch slot {

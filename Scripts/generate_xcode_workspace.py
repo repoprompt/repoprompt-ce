@@ -147,14 +147,20 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
         )
 
-    expected_test_dependencies = {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"}
+    expected_test_dependencies = {
+        "RepoPromptApp",
+        "RepoPromptMCP",
+        "RepoPromptProcessSupport",
+        "RepoPromptShared",
+    }
     repo_prompt_tests = targets["RepoPromptTests"]
     if (
         len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
         or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
     ):
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, "
+            "RepoPromptProcessSupport, and RepoPromptShared"
         )
 
     unsafe_flags: list[list[str]] = []
