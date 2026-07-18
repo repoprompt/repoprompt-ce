@@ -249,18 +249,9 @@ struct AgentModelsPopoverView: View {
                 selectedAgent: promptViewModel.contextBuilderAgent,
                 selectedModelRaw: promptViewModel.contextBuilderAgentModelRaw
             ) { selectedAgent, selectedOption in
-                let identity = currentOperationIdentity
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
                 promptViewModel.commitContextBuilderSettings()
-                DispatchQueue.main.async {
-                    guard let identity else { return }
-                    RecommendationApplyNotification.post(
-                        sourceWorkspaceID: identity.sourceWorkspaceID,
-                        agentModelsScope: identity.scope,
-                        includesPresetExposure: false
-                    )
-                }
             }
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
