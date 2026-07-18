@@ -11541,10 +11541,10 @@ actor ServerNetworkManager {
                                     arguments: capturedArguments
                                 )
                                 let executionWatchdogEnvironment = await self.toolExecutionWatchdogEnvironment
-                                let executionTraceOrigin = await executionWatchdogEnvironment.now()
+                                let executionTraceOrigin = executionWatchdogEnvironment.now()
                                 let handlerPhaseRecorder = MCPToolExecutionHandlerPhaseRecorder(
                                     origin: executionTraceOrigin,
-                                    now: { await executionWatchdogEnvironment.now() }
+                                    now: { executionWatchdogEnvironment.now() }
                                 )
 
                                 @Sendable func dispatchResolvedProvider(_ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
@@ -11603,7 +11603,7 @@ actor ServerNetworkManager {
                                         graceOutcome: String? = nil,
                                         escalationReason: String? = nil
                                     ) async {
-                                        let now = await executionWatchdogEnvironment.now()
+                                        let now = executionWatchdogEnvironment.now()
                                         let handlerPhase = handlerPhaseRecorder.snapshot()
                                         let handlerPhaseAgeMilliseconds = handlerPhase.map {
                                             max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds - $0.elapsedMilliseconds)
@@ -11782,13 +11782,13 @@ actor ServerNetworkManager {
                                                             cancellationRequested: true,
                                                             cancellationOrigin: origin
                                                         )
-                                                    case let .settledDuringGrace(settlement):
+                                                    case let .settledDuringGrace(settlement, cancellationRequested):
                                                         await emitExecutionTrace(
                                                             .settledDuringGrace,
-                                                            cancellationRequested: true,
+                                                            cancellationRequested: cancellationRequested,
                                                             cancellationOutcome: settlement.rawValue,
-                                                            cancellationOrigin: .watchdogDeadline,
-                                                            graceOutcome: "settled"
+                                                            cancellationOrigin: cancellationRequested ? .watchdogDeadline : nil,
+                                                            graceOutcome: cancellationRequested ? "settled" : "late_completion"
                                                         )
                                                     case .cleanupGraceExpired:
                                                         await emitExecutionTrace(
@@ -11996,7 +11996,7 @@ actor ServerNetworkManager {
                                         metadata: errorMetadata
                                     )
                                     if shouldForceDisconnect {
-                                        let abortNow = await executionWatchdogEnvironment.now()
+                                        let abortNow = executionWatchdogEnvironment.now()
                                         let handlerPhase = handlerPhaseRecorder.snapshot()
                                         let handlerPhaseAgeMilliseconds = handlerPhase.map {
                                             max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds - $0.elapsedMilliseconds)

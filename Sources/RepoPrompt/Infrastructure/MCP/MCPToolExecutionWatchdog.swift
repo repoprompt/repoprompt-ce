@@ -24,7 +24,10 @@ struct MCPToolExecutionCancelledError: Error, Equatable, LocalizedError {
 enum MCPToolExecutionWatchdogEvent: Equatable {
     case deadlineExpired
     case cancellationRequested(origin: MCPToolExecutionCancellationOrigin)
-    case settledDuringGrace(MCPToolExecutionSettlement)
+    case settledDuringGrace(
+        MCPToolExecutionSettlement,
+        cancellationRequested: Bool
+    )
     case cleanupGraceExpired
     case detachedForSettlement
 }
@@ -35,9 +38,32 @@ enum MCPToolExecutionWatchdogError: Error, Equatable {
     case cleanupUnresponsive
 }
 
+enum MCPToolExecutionWatchdogSchedulingPoint: Equatable {
+    case operationCompleted
+    case deadlineExpired
+    case cleanupGraceExpired
+}
+
 struct MCPToolExecutionWatchdogEnvironment {
-    let now: @Sendable () async -> Duration
+    let now: @Sendable () -> Duration
     let sleep: @Sendable (Duration) async throws -> Void
+    let eventDidProduce: @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void
+    let beforeEventConsumption: @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void
+    let beforeCleanupGraceTaskRegistration: @Sendable () async -> Void
+
+    init(
+        now: @escaping @Sendable () -> Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        eventDidProduce: @escaping @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void = { _ in },
+        beforeEventConsumption: @escaping @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void = { _ in },
+        beforeCleanupGraceTaskRegistration: @escaping @Sendable () async -> Void = {}
+    ) {
+        self.now = now
+        self.sleep = sleep
+        self.eventDidProduce = eventDidProduce
+        self.beforeEventConsumption = beforeEventConsumption
+        self.beforeCleanupGraceTaskRegistration = beforeCleanupGraceTaskRegistration
+    }
 
     static func continuous() -> Self {
         let clock = ContinuousClock()
@@ -54,6 +80,7 @@ struct MCPToolExecutionWatchdogEnvironment {
 enum MCPToolExecutionWatchdog {
     private struct ResultBox<T>: @unchecked Sendable {
         let result: Result<T, Error>
+        let completionTime: Duration
     }
 
     private enum Event<T>: @unchecked Sendable {
@@ -109,7 +136,7 @@ enum MCPToolExecutionWatchdog {
             }
         }
 
-        func takeCompletionBeforeDeadline() -> ResultBox<T>? {
+        func takeDeliveredCompletion() -> ResultBox<T>? {
             lock.withLock {
                 guard case .running = mode else { return nil }
                 defer { completed = nil }
@@ -154,15 +181,25 @@ enum MCPToolExecutionWatchdog {
     private final class TaskStore: @unchecked Sendable {
         private let lock = NSLock()
         private var tasks: [Task<Void, Never>] = []
+        private var isCancelled = false
 
         func append(_ task: Task<Void, Never>) {
-            lock.withLock {
+            let shouldCancel = lock.withLock {
+                guard !isCancelled else { return true }
                 tasks.append(task)
+                return false
+            }
+            if shouldCancel {
+                task.cancel()
             }
         }
 
         func cancelAll() {
-            let captured = lock.withLock { tasks }
+            let captured = lock.withLock {
+                isCancelled = true
+                defer { tasks.removeAll() }
+                return tasks
+            }
             captured.forEach { $0.cancel() }
         }
     }
@@ -178,9 +215,14 @@ enum MCPToolExecutionWatchdog {
         onAbandonedSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
+        let deadlineInstant = environment.now() + deadline
         let (stream, continuation) = AsyncStream<Event<T>>.makeStream()
         let tasks = TaskStore()
         let operationState = OperationState<T>()
+
+        func completedBeforeDeadline(_ box: ResultBox<T>) -> Bool {
+            box.completionTime < deadlineInstant
+        }
 
         func settlement(for box: ResultBox<T>) -> MCPToolExecutionSettlement {
             switch box.result {
@@ -198,9 +240,11 @@ enum MCPToolExecutionWatchdog {
             } catch {
                 result = .failure(error)
             }
-            let box = ResultBox(result: result)
+            let completionTime = environment.now()
+            let box = ResultBox(result: result, completionTime: completionTime)
             switch operationState.recordCompletion(box) {
             case .deliver:
+                await environment.eventDidProduce(.operationCompleted)
                 continuation.yield(.operationCompleted(box))
             case .deferred:
                 break
@@ -216,6 +260,7 @@ enum MCPToolExecutionWatchdog {
             do {
                 try await environment.sleep(deadline)
                 guard !Task.isCancelled else { return }
+                await environment.eventDidProduce(.deadlineExpired)
                 continuation.yield(.deadlineExpired)
             } catch {
                 // Cancellation is the normal completion path when the operation wins.
@@ -228,35 +273,77 @@ enum MCPToolExecutionWatchdog {
             var deadlineDidExpire = false
 
             while let event = await iterator.next() {
+                let schedulingPoint: MCPToolExecutionWatchdogSchedulingPoint = switch event {
+                case .operationCompleted:
+                    .operationCompleted
+                case .deadlineExpired:
+                    .deadlineExpired
+                case .cleanupGraceExpired:
+                    .cleanupGraceExpired
+                }
+                await environment.beforeEventConsumption(schedulingPoint)
+                try Task.checkCancellation()
+
+                // Completion timestamps are the sole success/timeout authority.
+                // `deadlineDidExpire` tracks only whether cancellation grace and escalation began.
                 switch event {
                 case let .operationCompleted(box):
                     operationState.consumeDeliveredCompletion()
                     tasks.cancelAll()
                     continuation.finish()
                     let operationSettlement = settlement(for: box)
-                    await onSynchronousSettlement(operationSettlement)
-                    if deadlineDidExpire {
-                        await onEvent(.settledDuringGrace(operationSettlement))
+                    if completedBeforeDeadline(box) {
+                        await onSynchronousSettlement(operationSettlement)
+                        return try box.result.get()
+                    }
+                    if !deadlineDidExpire {
+                        deadlineDidExpire = true
+                        await onEvent(.deadlineExpired)
+                        await onSynchronousSettlement(operationSettlement)
+                        await onEvent(.settledDuringGrace(
+                            operationSettlement,
+                            cancellationRequested: false
+                        ))
+                    } else {
+                        await onSynchronousSettlement(operationSettlement)
+                        await onEvent(.settledDuringGrace(
+                            operationSettlement,
+                            cancellationRequested: true
+                        ))
+                    }
+                    throw MCPToolExecutionWatchdogError.executionTimedOut(
+                        settlement: operationSettlement
+                    )
+
+                case .deadlineExpired:
+                    if let completed = operationState.takeDeliveredCompletion() {
+                        tasks.cancelAll()
+                        continuation.finish()
+                        let operationSettlement = settlement(for: completed)
+                        if completedBeforeDeadline(completed) {
+                            await onSynchronousSettlement(operationSettlement)
+                            return try completed.result.get()
+                        }
+                        deadlineDidExpire = true
+                        await onEvent(.deadlineExpired)
+                        await onSynchronousSettlement(operationSettlement)
+                        await onEvent(.settledDuringGrace(
+                            operationSettlement,
+                            cancellationRequested: false
+                        ))
                         throw MCPToolExecutionWatchdogError.executionTimedOut(
                             settlement: operationSettlement
                         )
                     }
-                    return try box.result.get()
-
-                case .deadlineExpired:
-                    if let completed = operationState.takeCompletionBeforeDeadline() {
-                        tasks.cancelAll()
-                        continuation.finish()
-                        await onSynchronousSettlement(settlement(for: completed))
-                        return try completed.result.get()
-                    }
                     guard !deadlineDidExpire else { continue }
                     deadlineDidExpire = true
                     operationTask.cancel()
+                    await environment.beforeCleanupGraceTaskRegistration()
                     let graceTask = Task {
                         do {
                             try await environment.sleep(cancellationGrace)
                             guard !Task.isCancelled else { return }
+                            await environment.eventDidProduce(.cleanupGraceExpired)
                             continuation.yield(.cleanupGraceExpired)
                         } catch {
                             // Cancellation is the normal path when the operation settles.
@@ -283,7 +370,10 @@ enum MCPToolExecutionWatchdog {
                             continuation.finish()
                             let operationSettlement = settlement(for: box)
                             await onSynchronousSettlement(operationSettlement)
-                            await onEvent(.settledDuringGrace(operationSettlement))
+                            await onEvent(.settledDuringGrace(
+                                operationSettlement,
+                                cancellationRequested: true
+                            ))
                             throw MCPToolExecutionWatchdogError.executionTimedOut(
                                 settlement: operationSettlement
                             )

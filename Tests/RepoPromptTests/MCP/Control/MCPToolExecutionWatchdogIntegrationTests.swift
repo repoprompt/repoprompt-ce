@@ -8,6 +8,96 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPToolExecutionWatchdogIntegrationTests: XCTestCase {
+        func testLateCompletionTraceDoesNotClaimCancellationWasRequested() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let recorder = MCPExecutionTraceRecorder()
+                let clock = ExecutionWatchdogManualClock()
+                let operationGate = MCPExecutionIgnoringCancellationGate()
+                let schedulingGate = ExecutionWatchdogSchedulingGate(blocking: .operationCompleted)
+                let manager = fixture.networkManager
+                let endpoint = try fixture.endpointA()
+                var responseTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment(
+                    eventDidProduce: { await schedulingGate.eventDidProduce($0) },
+                    beforeEventConsumption: { await schedulingGate.beforeEventConsumption($0) }
+                ))
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                    await operationGate.enterAndWait()
+                    return .object(["late": .bool(true)])
+                }
+
+                do {
+                    let activeResponseTask = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: [
+                                "path": fixture.contextA.fileURL.path,
+                                "context_id": fixture.contextA.tabID.uuidString
+                            ]
+                        )
+                    }
+                    responseTask = activeResponseTask
+                    try await clock.waitForSleeperCount(1)
+                    try await clock.advanceWithoutWakingSleepers(
+                        by: MCPTimeoutPolicy.boundedToolExecutionDeadline + .nanoseconds(1)
+                    )
+                    await operationGate.release()
+                    await schedulingGate.waitUntilConsumptionPaused()
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+                    await schedulingGate.waitUntilProduced(.deadlineExpired)
+                    await schedulingGate.open()
+
+                    let response = try await activeResponseTask.value
+                    responseTask = nil
+                    let text = try Self.toolResultText(response)
+                    XCTAssertTrue(text.contains("tool_execution_timeout"), text)
+
+                    let events = recorder.snapshot().filter {
+                        $0.connectionID == endpoint.connectionID
+                            && $0.toolName == MCPWindowToolName.readFile
+                    }
+                    XCTAssertEqual(events.count(where: { $0.phase == .deadlineExpired }), 1)
+                    XCTAssertFalse(events.contains { $0.phase == .cancellationRequested })
+                    let settled = try XCTUnwrap(events.first { $0.phase == .settledDuringGrace })
+                    XCTAssertEqual(settled.cancellationRequested, false)
+                    XCTAssertNil(settled.cancellationOrigin)
+                    XCTAssertEqual(settled.cancellationOutcome, MCPToolExecutionSettlement.success.rawValue)
+                    XCTAssertEqual(settled.graceOutcome, "late_completion")
+                    let sleeperCount = await clock.sleeperCount()
+                    let pendingSchedulingTasks = await schedulingGate.pendingTaskCount()
+                    XCTAssertEqual(sleeperCount, 0)
+                    XCTAssertEqual(pendingSchedulingTasks, 0)
+
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.readFile,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await operationGate.release()
+                    await schedulingGate.open()
+                    responseTask?.cancel()
+                    if let responseTask {
+                        _ = try? await responseTask.value
+                    }
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.readFile,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testBoundedFileToolsEmitHandlerCompletionAndConnectionRemainsUsable() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -1914,7 +2004,7 @@ import XCTest
                     let detachSleepersDrained = await Self.waitUntil { await clock.sleeperCount() == 0 }
                     XCTAssertTrue(detachSleepersDrained)
                     try await clock.advanceWithoutSleepers(by: .seconds(1))
-                    let elapsedAfterTimeout = await clock.currentTime()
+                    let elapsedAfterTimeout = clock.currentTime()
                     XCTAssertEqual(elapsedAfterTimeout, .seconds(36))
 
                     let detachedSnapshot = await manager.debugCodeStructureSettlementSnapshot(windowID: windowID)
