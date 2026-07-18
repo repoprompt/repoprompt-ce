@@ -160,63 +160,110 @@ struct MCPResponseDeliverySnapshot: Equatable {
     }
 }
 
-/// Request-scoped standard MCP progress state. The progress token is supplied by
-/// the caller in `tools/call` metadata and the sequence increases once per emitted
-/// notification for the lifetime of that request.
+enum MCPProgressDeliveryResult: Equatable {
+    case delivered
+    case failed
+    case connectionTerminal
+}
+
+/// Request-scoped standard MCP progress state. Progress is advisory: one delivery
+/// may be in flight and one latest-wins update may be pending. Finalization stops
+/// admission and discards the pending update without waiting for transport I/O;
+/// the already in-flight notification may therefore trail the final result.
 actor MCPRequestProgressState {
+    private struct PendingDelivery {
+        let connection: any MCPServerConnection
+        let message: String?
+    }
+
     private let token: ProgressToken
     private var sequence: Double = 0
     private var acceptsProgress = true
-    private var deliveryTail: Task<Void, Never>?
-    private var inFlightDeliveryCount = 0
-    private var drainContinuations: [CheckedContinuation<Void, Never>] = []
+    private var pendingDelivery: PendingDelivery?
+    private var deliveryWorker: Task<Void, Never>?
+    #if DEBUG
+        private var quiescenceContinuations: [CheckedContinuation<Void, Never>] = []
+    #endif
 
     init(token: ProgressToken) {
         self.token = token
     }
 
-    /// Assigns the next sequence and enqueues it on the connection actor before
-    /// this actor can accept another emission. This preserves wire-enqueue order
-    /// across concurrent heartbeat, soft-bound, and phase emitters.
+    /// Enqueues without waiting for transport delivery. While a notification is
+    /// in flight, repeated emissions coalesce into the single latest pending value.
     func send(
         through connection: any MCPServerConnection,
         message: String?
-    ) async {
+    ) {
         guard acceptsProgress else { return }
-        sequence += 1
-        let progress = sequence
-        inFlightDeliveryCount += 1
-        let precedingDelivery = deliveryTail
-        let delivery = Task {
-            await precedingDelivery?.value
-            await connection.sendMCPProgress(
+        pendingDelivery = PendingDelivery(connection: connection, message: message)
+        guard deliveryWorker == nil else { return }
+
+        deliveryWorker = Task { [weak self] in
+            await self?.deliverBurst()
+        }
+    }
+
+    /// Final results take priority over advisory progress. This cooperatively
+    /// prevents new sends and drops the one bounded pending update, but does not
+    /// cancel or await a socket write that is already in flight.
+    func invalidate() {
+        acceptsProgress = false
+        pendingDelivery = nil
+    }
+
+    private func deliverBurst() async {
+        // Re-evaluate admission after every suspended transport send so
+        // finalization can stop the burst before another delivery is dequeued.
+        while acceptsProgress, let delivery = pendingDelivery {
+            pendingDelivery = nil
+            sequence += 1
+            let progress = sequence
+
+            let result = await delivery.connection.deliverMCPProgress(
                 token: token,
                 progress: progress,
-                message: message
+                message: delivery.message
+            )
+            if result == .connectionTerminal {
+                acceptsProgress = false
+                pendingDelivery = nil
+                break
+            }
+        }
+
+        deliveryWorker = nil
+        #if DEBUG
+            let continuations = quiescenceContinuations
+            quiescenceContinuations = []
+            continuations.forEach { $0.resume() }
+        #endif
+    }
+
+    #if DEBUG
+        struct Snapshot: Equatable {
+            let acceptsProgress: Bool
+            let pendingDeliveryCount: Int
+            let workerActive: Bool
+            let assignedSequence: Double
+        }
+
+        func snapshot() -> Snapshot {
+            Snapshot(
+                acceptsProgress: acceptsProgress,
+                pendingDeliveryCount: pendingDelivery == nil ? 0 : 1,
+                workerActive: deliveryWorker != nil,
+                assignedSequence: sequence
             )
         }
-        deliveryTail = delivery
-        await delivery.value
-        inFlightDeliveryCount -= 1
-        resumeDrainContinuationsIfNeeded()
-    }
 
-    /// Closes the active-request progress lifetime and waits for every accepted
-    /// notification to finish delivery before the final tool result is returned.
-    func invalidateAndDrain() async {
-        acceptsProgress = false
-        guard inFlightDeliveryCount > 0 else { return }
-        await withCheckedContinuation { continuation in
-            drainContinuations.append(continuation)
+        func waitUntilQuiescent() async {
+            guard deliveryWorker != nil else { return }
+            await withCheckedContinuation { continuation in
+                quiescenceContinuations.append(continuation)
+            }
         }
-    }
-
-    private func resumeDrainContinuationsIfNeeded() {
-        guard !acceptsProgress, inFlightDeliveryCount == 0 else { return }
-        let continuations = drainContinuations
-        drainContinuations = []
-        continuations.forEach { $0.resume() }
-    }
+    #endif
 }
 
 protocol MCPServerConnection: Actor {
@@ -260,6 +307,15 @@ protocol MCPServerConnection: Actor {
         progress: Double,
         message: String?
     ) async
+
+    /// Reports whether advisory delivery reached a terminal connection state.
+    /// Request progress uses this to discard its bounded pending update instead
+    /// of attempting more writes after the connection has closed.
+    func deliverMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async -> MCPProgressDeliveryResult
 }
 
 extension MCPServerConnection {
@@ -276,6 +332,15 @@ extension MCPServerConnection {
         progress _: Double,
         message _: String?
     ) async {}
+
+    func deliverMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async -> MCPProgressDeliveryResult {
+        await sendMCPProgress(token: token, progress: progress, message: message)
+        return isViableForRetention() ? .delivered : .connectionTerminal
+    }
 }
 
 // MARK: - Dashboard Models
@@ -11269,7 +11334,7 @@ actor ServerNetworkManager {
                 MCPRequestProgressState(token: $0)
             }
             func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
-                await capturedProgressState?.invalidateAndDrain()
+                await capturedProgressState?.invalidate()
                 return result
             }
 

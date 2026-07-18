@@ -380,7 +380,19 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         progress: Double,
         message: String?
     ) async {
-        guard !isClosing, handshakeComplete else { return }
+        // Preserve the protocol's compatibility entry while bounded request
+        // progress uses the result-bearing delivery method below.
+        _ = await deliverMCPProgress(token: token, progress: progress, message: message)
+    }
+
+    func deliverMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async -> MCPProgressDeliveryResult {
+        guard !isClosing else { return .connectionTerminal }
+        // A pre-handshake call is unavailable, not proof that the transport closed.
+        guard handshakeComplete else { return .failed }
 
         let notification = ProgressNotification.message(
             .init(
@@ -392,10 +404,14 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
 
         do {
             try await server.notify(notification)
+            return .delivered
         } catch {
             // Progress is advisory. A failed notification must not fail or cancel
-            // the underlying tool execution.
+            // the underlying tool execution. Tell the request worker when the
+            // transport is terminal so it can discard its one pending update.
             bootstrapLog.debug("Failed to send standard MCP progress notification: \(error)")
+            let ingress = await transport.ingressSnapshot()
+            return isClosing || ingress.isTerminal ? .connectionTerminal : .failed
         }
     }
 }

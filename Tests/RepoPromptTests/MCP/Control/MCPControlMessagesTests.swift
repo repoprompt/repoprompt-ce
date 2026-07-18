@@ -156,7 +156,8 @@ final class MCPControlMessagesTests: XCTestCase {
         func testStandardMCPProgressUsesRequestTokenWithoutDuplicatingCLIControlFallback() async {
             let manager = ServerNetworkManager()
             let standardConnectionID = UUID()
-            let standardConnection = ProgressRecordingMCPConnection()
+            let standardDeliveryGate = ProgressDeliveryGate(blockedDeliveries: [1])
+            let standardConnection = ProgressRecordingMCPConnection(deliveryGate: standardDeliveryGate)
             await manager.debugInstallDirectAdmissionConnectionForTesting(
                 connectionID: standardConnectionID,
                 connection: standardConnection,
@@ -175,6 +176,7 @@ final class MCPControlMessagesTests: XCTestCase {
                     stage: "discovering",
                     message: "Running Context Builder agent..."
                 )
+                await standardDeliveryGate.waitUntilDeliveryStarts(1)
                 await ServerNetworkManager.withConnectionID(standardConnectionID) {
                     await manager.sendProgress(
                         for: standardConnectionID,
@@ -184,8 +186,10 @@ final class MCPControlMessagesTests: XCTestCase {
                         message: "Still building context..."
                     )
                 }
+                await standardDeliveryGate.releaseDelivery(1)
             }
 
+            await progressState.waitUntilQuiescent()
             let standardEvents = await standardConnection.standardEvents()
             XCTAssertEqual(standardEvents.map(\.token), [
                 .string("context-builder-request"),
@@ -219,6 +223,7 @@ final class MCPControlMessagesTests: XCTestCase {
                 )
             }
 
+            await cliProgressState.waitUntilQuiescent()
             let cliStandardEvents = await tokenBearingCLIConnection.standardEvents()
             XCTAssertEqual(cliStandardEvents.map(\.token), [.integer(510)])
             XCTAssertEqual(cliStandardEvents.map(\.progress), [1])
@@ -253,71 +258,87 @@ final class MCPControlMessagesTests: XCTestCase {
             await manager.debugRemoveConnection(compatibilityConnectionID)
         }
 
-        func testStandardMCPProgressSerializesWireOrderAndStopsAfterRequestInvalidation() async {
-            let manager = ServerNetworkManager()
-            let connectionID = UUID()
-            let deliveryGate = ProgressDeliveryGate()
+        func testStandardMCPProgressCoalescesOnePendingUpdateInWireOrder() async {
+            let deliveryGate = ProgressDeliveryGate(blockedDeliveries: [1])
             let connection = ProgressRecordingMCPConnection(deliveryGate: deliveryGate)
-            await manager.debugInstallDirectAdmissionConnectionForTesting(
-                connectionID: connectionID,
-                connection: connection,
-                pendingClientID: "Generic MCP host"
-            )
+            let progressState = MCPRequestProgressState(token: .string("coalesced-request"))
 
-            let progressState = MCPRequestProgressState(token: .string("serialized-request"))
-            let emissions = Task {
-                await ServerNetworkManager.withConnectionID(
-                    connectionID,
-                    progressState: progressState
-                ) {
-                    async let first: Void = manager.sendProgress(
-                        for: connectionID,
-                        tool: "context_builder",
-                        kind: .stage,
-                        stage: "discovering",
-                        message: "first"
-                    )
-                    async let second: Void = manager.sendProgress(
-                        for: connectionID,
-                        tool: "context_builder",
-                        kind: .heartbeat,
-                        stage: "discovering",
-                        message: "second"
-                    )
-                    await first
-                    await second
-                }
+            await progressState.send(through: connection, message: "first")
+            await deliveryGate.waitUntilDeliveryStarts(1)
+            for index in 2 ... 10 {
+                await progressState.send(through: connection, message: "update-\(index)")
             }
 
-            await deliveryGate.waitUntilFirstDeliveryBlocked()
-            let invalidation = Task {
-                await progressState.invalidateAndDrain()
-            }
-            await deliveryGate.releaseFirstDelivery()
-            await emissions.value
-            await invalidation.value
+            let blockedSnapshot = await progressState.snapshot()
+            XCTAssertEqual(blockedSnapshot.pendingDeliveryCount, 1)
+            XCTAssertTrue(blockedSnapshot.workerActive)
+            XCTAssertEqual(blockedSnapshot.assignedSequence, 1)
 
-            await ServerNetworkManager.withConnectionID(
-                connectionID,
-                progressState: progressState
-            ) {
-                await manager.sendProgress(
-                    for: connectionID,
-                    tool: "context_builder",
-                    kind: .stage,
-                    stage: "complete",
-                    message: "must not be delivered"
-                )
-            }
+            await deliveryGate.releaseDelivery(1)
+            await progressState.waitUntilQuiescent()
 
             let events = await connection.standardEvents()
-            XCTAssertEqual(events.map(\.token), [
-                .string("serialized-request"),
-                .string("serialized-request")
-            ])
+            XCTAssertEqual(events.map(\.token), [.string("coalesced-request"), .string("coalesced-request")])
             XCTAssertEqual(events.map(\.progress), [1, 2])
-            XCTAssertFalse(events.contains { $0.message?.contains("must not be delivered") == true })
-            await manager.debugRemoveConnection(connectionID)
+            XCTAssertEqual(events.compactMap(\.message), ["first", "update-10"])
+            let lifecycle = await deliveryGate.lifecycle()
+            XCTAssertEqual(lifecycle, [.started(1), .completed(1), .started(2), .completed(2)])
+        }
+
+        func testStandardMCPProgressFinalizationDropsPendingWithoutWaitingForInFlightDelivery() async {
+            let deliveryGate = ProgressDeliveryGate(blockedDeliveries: [1])
+            let connection = ProgressRecordingMCPConnection(deliveryGate: deliveryGate)
+            let progressState = MCPRequestProgressState(token: .string("finalized-request"))
+
+            await progressState.send(through: connection, message: "in-flight")
+            await deliveryGate.waitUntilDeliveryStarts(1)
+            for index in 2 ... 20 {
+                await progressState.send(through: connection, message: "pending-\(index)")
+            }
+            let pendingSnapshot = await progressState.snapshot()
+            XCTAssertEqual(pendingSnapshot.pendingDeliveryCount, 1)
+
+            // This call must return while delivery 1 remains blocked. Finalization
+            // cooperatively drops the pending update without cancelling the write.
+            await progressState.invalidate()
+            let finalizedSnapshot = await progressState.snapshot()
+            XCTAssertFalse(finalizedSnapshot.acceptsProgress)
+            XCTAssertEqual(finalizedSnapshot.pendingDeliveryCount, 0)
+            XCTAssertTrue(finalizedSnapshot.workerActive)
+
+            await progressState.send(through: connection, message: "after-finalization")
+            await deliveryGate.releaseDelivery(1)
+            await progressState.waitUntilQuiescent()
+
+            let events = await connection.standardEvents()
+            XCTAssertEqual(events.map(\.progress), [1])
+            XCTAssertEqual(events.compactMap(\.message), ["in-flight"])
+        }
+
+        func testStandardMCPProgressConnectionTerminalFailureDropsPendingAndStopsWorker() async {
+            let deliveryGate = ProgressDeliveryGate(blockedDeliveries: [1])
+            let connection = ProgressRecordingMCPConnection(
+                deliveryGate: deliveryGate,
+                deliveryResults: [.connectionTerminal]
+            )
+            let progressState = MCPRequestProgressState(token: .string("closed-connection"))
+
+            await progressState.send(through: connection, message: "terminal-attempt")
+            await deliveryGate.waitUntilDeliveryStarts(1)
+            await progressState.send(through: connection, message: "must-be-dropped")
+            let pendingSnapshot = await progressState.snapshot()
+            XCTAssertEqual(pendingSnapshot.pendingDeliveryCount, 1)
+
+            await deliveryGate.releaseDelivery(1)
+            await progressState.waitUntilQuiescent()
+            let terminalSnapshot = await progressState.snapshot()
+            XCTAssertFalse(terminalSnapshot.acceptsProgress)
+            XCTAssertEqual(terminalSnapshot.pendingDeliveryCount, 0)
+            XCTAssertFalse(terminalSnapshot.workerActive)
+
+            await progressState.send(through: connection, message: "after-close")
+            let events = await connection.standardEvents()
+            XCTAssertEqual(events.map(\.progress), [1])
         }
     #endif
 }
@@ -340,9 +361,14 @@ final class MCPControlMessagesTests: XCTestCase {
         private var recordedStandardEvents: [StandardEvent] = []
         private var recordedControlEvents: [ControlEvent] = []
         private let deliveryGate: ProgressDeliveryGate?
+        private var deliveryResults: [MCPProgressDeliveryResult]
 
-        init(deliveryGate: ProgressDeliveryGate? = nil) {
+        init(
+            deliveryGate: ProgressDeliveryGate? = nil,
+            deliveryResults: [MCPProgressDeliveryResult] = []
+        ) {
             self.deliveryGate = deliveryGate
+            self.deliveryResults = deliveryResults
         }
 
         nonisolated var isFilesystemBacked: Bool {
@@ -398,14 +424,21 @@ final class MCPControlMessagesTests: XCTestCase {
             progress: Double,
             message: String?
         ) async {
-            if progress == 1 {
-                await deliveryGate?.blockFirstDelivery()
-            }
+            _ = await deliverMCPProgress(token: token, progress: progress, message: message)
+        }
+
+        func deliverMCPProgress(
+            token: ProgressToken,
+            progress: Double,
+            message: String?
+        ) async -> MCPProgressDeliveryResult {
+            await deliveryGate?.beginDelivery(progress)
             recordedStandardEvents.append(StandardEvent(
                 token: token,
                 progress: progress,
                 message: message
             ))
+            return deliveryResults.isEmpty ? .delivered : deliveryResults.removeFirst()
         }
 
         func standardEvents() -> [StandardEvent] {
@@ -418,33 +451,50 @@ final class MCPControlMessagesTests: XCTestCase {
     }
 
     private actor ProgressDeliveryGate {
-        private var blocked = false
-        private var released = false
-        private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiter: CheckedContinuation<Void, Never>?
+        enum Lifecycle: Equatable {
+            case started(Double)
+            case completed(Double)
+        }
 
-        func blockFirstDelivery() async {
-            guard !released else { return }
-            blocked = true
-            let waiters = blockedWaiters
-            blockedWaiters = []
+        private let blockedDeliveries: Set<Double>
+        private var startedDeliveries: Set<Double> = []
+        private var releasedDeliveries: Set<Double> = []
+        private var startWaiters: [Double: [CheckedContinuation<Void, Never>]] = [:]
+        private var releaseWaiters: [Double: CheckedContinuation<Void, Never>] = [:]
+        private var recordedLifecycle: [Lifecycle] = []
+
+        init(blockedDeliveries: Set<Double> = []) {
+            self.blockedDeliveries = blockedDeliveries
+        }
+
+        func beginDelivery(_ progress: Double) async {
+            startedDeliveries.insert(progress)
+            recordedLifecycle.append(.started(progress))
+            let waiters = startWaiters.removeValue(forKey: progress) ?? []
             waiters.forEach { $0.resume() }
+
+            if blockedDeliveries.contains(progress), !releasedDeliveries.contains(progress) {
+                await withCheckedContinuation { continuation in
+                    releaseWaiters[progress] = continuation
+                }
+            }
+            recordedLifecycle.append(.completed(progress))
+        }
+
+        func waitUntilDeliveryStarts(_ progress: Double) async {
+            guard !startedDeliveries.contains(progress) else { return }
             await withCheckedContinuation { continuation in
-                releaseWaiter = continuation
+                startWaiters[progress, default: []].append(continuation)
             }
         }
 
-        func waitUntilFirstDeliveryBlocked() async {
-            guard !blocked else { return }
-            await withCheckedContinuation { continuation in
-                blockedWaiters.append(continuation)
-            }
+        func releaseDelivery(_ progress: Double) {
+            releasedDeliveries.insert(progress)
+            releaseWaiters.removeValue(forKey: progress)?.resume()
         }
 
-        func releaseFirstDelivery() {
-            released = true
-            releaseWaiter?.resume()
-            releaseWaiter = nil
+        func lifecycle() -> [Lifecycle] {
+            recordedLifecycle
         }
     }
 #endif
