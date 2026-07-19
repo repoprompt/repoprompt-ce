@@ -302,7 +302,6 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
 
     func testBoundWorktreeAutoCodemapDoesNotUseMetadataOnlyFastPathWhenAutoCodemapEnabled() async throws {
         let fixture = try await makeBoundFixture()
-        _ = try await fixture.store.loadRoot(path: fixture.worktreeRoot.path)
         let source = makeSource(
             logicalRoot: fixture.logicalRoot,
             worktreeRoot: fixture.worktreeRoot,
@@ -316,6 +315,7 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
             codeMapUsage: .auto
         )
 
+        XCTAssertEqual(model.lookupContext.bindingProjection?.isFullyMaterialized, true)
         XCTAssertEqual(model.rows.first?.displayPath, "Sources/App.swift")
         XCTAssertTrue(model.rows.allSatisfy { $0.directContentPath == nil })
     }
@@ -743,7 +743,10 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
             filePathDisplay: .relative,
             codeMapUsage: .none
         )
-        XCTAssertEqual(model.lookupContext.bindingProjection?.physicalRootPaths, Set([unloadablePhysicalRoot.standardizedFileURL.path]))
+        XCTAssertEqual(
+            model.lookupContext,
+            AgentWorkspaceLookupContextResolver.failClosedLookupContext
+        )
         XCTAssertTrue(model.rows.isEmpty)
         XCTAssertEqual(model.missingPaths, ["Sources/App.swift"])
         XCTAssertFalse(model.missingPaths.contains { $0.contains(unloadablePhysicalRoot.path) })
