@@ -3,6 +3,22 @@ import Foundation
 import XCTest
 
 final class AgentTranscriptAssistantPreviewTests: XCTestCase {
+    func testCollapseLineCountMatchesPreviewSummaryForCRLFAtLimit() {
+        let lineLimit = 10
+        let text = String(repeating: "line\n", count: 8) + "line\r\nfinal"
+
+        let boundedLineCount = AgentAssistantLineDerivation.lineCount(upTo: lineLimit, in: text)
+        let previewSummary = AgentAssistantLineDerivation.previewSummary(
+            for: text,
+            previewLineCount: lineLimit
+        )
+
+        XCTAssertEqual(boundedLineCount.count, 11)
+        XCTAssertFalse(boundedLineCount.isExact)
+        XCTAssertEqual(previewSummary.lineCount, boundedLineCount.count)
+        XCTAssertTrue(previewSummary.needsCollapse)
+    }
+
     func testTerminalResponseJoinsTrailingFragmentsAndPreservesFullDetailRows() throws {
         let user = item(kind: .user, text: "question", sequenceIndex: 0)
         let answer = item(kind: .assistant, text: "answer", sequenceIndex: 1)
