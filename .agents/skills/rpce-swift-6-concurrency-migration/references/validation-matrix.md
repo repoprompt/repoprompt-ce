@@ -54,11 +54,12 @@ Add `make dev-build` when packaging or assembled behavior is affected. Add the d
 
 When test executables change, follow `docs/testing.md`, run the authoritative test list, and verify the curated ledger.
 
-## Package-wide language-mode gate
+## Language-mode acceptance gate
 
-Before changing either manifest from `.v5` to `.v6`:
+Before changing a target or package from `.v5` to `.v6`:
 
-- every Swift target in that package compiles with staged checks;
+- the active-toolchain probe has verified target-local `-swift-version` flags and generated-workspace behavior, or the change explicitly uses the package-wide fallback;
+- every target included in the language-mode change compiles with staged checks;
 - focused behavioral tests pass;
 - public API and sendability changes are reviewed;
 - new escape hatches have written invariants and audit/removal conditions;

@@ -6,14 +6,16 @@ Use these primary sources as the semantic authority. Community skills can supply
 
 | Decision | Xcode/compiler setting | SwiftPM tools 6.2 | Meaning |
 |---|---|---|---|
-| Swift 6 language mode | `SWIFT_VERSION = 6` / `-swift-version 6` | `swiftLanguageModes: [.v6]` | Enables Swift 6 language rules and complete data-race safety enforcement. In this repository the manifest setting applies package-wide. |
-| Stage strict checking in Swift 5 mode | `SWIFT_STRICT_CONCURRENCY = complete` | Target `.enableExperimentalFeature("StrictConcurrency")` | Surfaces complete concurrency checking before the package-wide language-mode switch. Verify the active compiler accepts and applies the setting. |
+| Swift 6 language mode | `SWIFT_VERSION = 6` / `-swift-version 6` | Package `swiftLanguageModes: [.v6]`; target `.swiftLanguageMode(.v6)` | Enables Swift 6 language rules and complete data-race safety enforcement. Verify target-local mixed-mode behavior from actual compiler flags before using it for phased adoption. |
+| Stage strict checking in Swift 5 mode | `SWIFT_STRICT_CONCURRENCY = complete` | Target `.enableExperimentalFeature("StrictConcurrency")` | Surfaces complete concurrency checking before a target or package language-mode switch. Verify the active compiler accepts and applies the setting. |
 | Default main-actor isolation | `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` / `-default-isolation MainActor` | Target `.defaultIsolation(MainActor.self)` | Infers `@MainActor` for eligible unannotated declarations. Suitable only where main-actor ownership is the correct target design. |
 | Caller-actor async execution | `SWIFT_UPCOMING_FEATURE_NONISOLATED_NONSENDING_BY_DEFAULT = YES` | Target `.enableUpcomingFeature("NonisolatedNonsendingByDefault")` | Nonisolated async functions run on the caller's actor by default. This is a semantic change, not merely a warning toggle. |
 | Isolated-conformance inference | `SWIFT_UPCOMING_FEATURE_INFER_ISOLATED_CONFORMANCES = YES` | Target `.enableUpcomingFeature("InferIsolatedConformances")` | Infers isolated conformances where the language rules allow. Explicit syntax expresses the contract directly. |
-| Explicit off-actor work | `@concurrent` on an async declaration | Same language feature support | Switches work off an actor onto the global concurrent executor. Crossing values must satisfy sendability or region-isolation rules. |
+| Explicit off-actor work | `@concurrent` on an async declaration | Swift 6.2 source feature | Explicitly switches work off an actor onto the global concurrent executor. Crossing values must satisfy sendability or region-isolation rules. |
 
 Xcode's `SWIFT_APPROACHABLE_CONCURRENCY = YES` is an umbrella build setting. SwiftPM uses the individual settings; do not invent an `ApproachableConcurrency` package API.
+
+`SwiftSetting.swiftLanguageMode` is available to manifests using PackageDescription 6.0 or newer. Its presence does not prove that this repository's active SwiftPM, generated Xcode workspace, and dependency graph preserve a desired mixed-mode rollout; run the probe in `swiftpm-settings-samples.md` and inspect compiler invocations.
 
 ## Migration implications
 
@@ -25,6 +27,14 @@ Xcode's `SWIFT_APPROACHABLE_CONCURRENCY = YES` is an umbrella build setting. Swi
 - Prefer static actor contracts over widespread `MainActor.run` or runtime isolation assertions.
 - Use migration fix-its as input for review, not proof that runtime ownership is correct.
 
+## Materialized local examples
+
+- `swiftpm-settings-samples.md` contains staged root/provider manifest shapes, independent settings axes, and verification gates.
+- `swift-6-2-semantics-samples.md` contains caller-actor, `@concurrent`, default-isolation, isolated-conformance, and task-inheritance examples.
+- The bounded-fix skill's `references/` directory contains repair samples for isolation/sendability, task lifetime/continuations, and synchronization/interoperability.
+
+Use these local files for routine work. Return to the primary sources only for unresolved semantic ambiguity or a newer toolchain.
+
 ## Primary sources
 
 - [Swift 6.2 release](https://www.swift.org/blog/swift-6.2-released/)
@@ -35,6 +45,7 @@ Xcode's `SWIFT_APPROACHABLE_CONCURRENCY = YES` is an umbrella build setting. Swi
 - [SE-0461: caller-actor execution and `@concurrent`](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0461-async-function-isolation.md)
 - [Compiler documentation: `NonisolatedNonsendingByDefault`](https://docs.swift.org/compiler/documentation/diagnostics/nonisolated-nonsending-by-default/)
 - [SE-0466: default actor isolation](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0466-control-default-actor-isolation.md)
+- [SwiftPM `swiftLanguageMode`](https://docs.swift.org/swiftpm/documentation/packagedescription/swiftsetting/swiftlanguagemode(_:_:))
 - [SwiftPM `defaultIsolation`](https://docs.swift.org/swiftpm/documentation/packagedescription/swiftsetting/defaultisolation(_:_:))
 - [SE-0470: isolated conformances](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0470-isolated-conformances.md)
 - [Swift concurrency language guide](https://docs.swift.org/swift-book/LanguageGuide/Concurrency.html)

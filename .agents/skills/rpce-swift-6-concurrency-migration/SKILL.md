@@ -12,6 +12,8 @@ Treat repository source, current compiler output, AGENTS.md, and official Swift 
 Read `references/repository-concurrency-profile.md` first. Load the other references only when the workflow reaches them:
 
 - `references/official-swift-6-2.md` before interpreting or changing language/concurrency settings;
+- `references/swiftpm-settings-samples.md` before editing either package manifest or designing a settings rollout;
+- `references/swift-6-2-semantics-samples.md` before adopting or diagnosing caller-actor execution, `@concurrent`, default isolation, or isolated conformances;
 - `references/migration-inventory.md` when creating or updating the campaign inventory;
 - `references/validation-matrix.md` before starting coordinated validation.
 
@@ -56,11 +58,11 @@ Prefer this initial order, then adjust it to the verified dependency graph and d
 4. Migrate MCP and provider boundaries.
 5. Migrate app infrastructure and task-heavy feature/runtime code.
 6. Migrate main-actor UI and app composition.
-7. Switch each package to Swift 6 language mode when all of its targets meet the exit gate.
+7. Switch targets to Swift 6 language mode independently only after the active toolchain probe proves mixed-mode behavior; otherwise use a package-wide fallback after every target meets the exit gate.
 8. Adopt Swift 6.2 execution semantics and default isolation deliberately.
 9. Profile, optimize, and run the final safety audit.
 
-SwiftPM's `swiftLanguageModes` is package-wide. Use target `swiftSettings` to stage diagnostic checking and upcoming features; do not claim that the final language-mode switch is target-local.
+SwiftPM exposes package-level `swiftLanguageModes` and target-level `.swiftLanguageMode(.v6)`. Verify target-local compiler flags and generated-workspace behavior with the active toolchain before relying on mixed modes. If the probe fails or settings are ignored, retain target-level complete checking and use the documented package-wide fallback.
 
 ### 4. Execute one coherent batch
 
@@ -109,7 +111,7 @@ Run broader validation only at phase boundaries or when the changed boundary req
 - Treat every suspension point as a reentrancy boundary.
 - Require continuations to finish exactly once across success, failure, and cancellation.
 - Do not replace established locks, queues, or primitives without a demonstrated defect.
-- Do not mix a package-wide language-mode switch with unrelated refactoring.
+- Do not mix a target or package language-mode switch with unrelated refactoring.
 - Keep raw compiler logs in conductor storage or local investigation artifacts; keep only summarized evidence in the migration inventory.
 - Never launch or stop the visible app without explicit user approval.
 

@@ -9,9 +9,12 @@ Resolve the requested diagnostics with the smallest semantic change that makes t
 
 ## Required context
 
-1. Read `references/diagnostic-playbook.md`.
-2. Read `references/repository-patterns.md` when a fix touches tasks, continuations, synchronization, UI publication, or existing concurrency utilities.
-3. For Swift 6.2 settings or execution semantics, read `../rpce-swift-6-concurrency-migration/references/official-swift-6-2.md`.
+1. Read `references/diagnostic-playbook.md`, classify the boundary, then load the matching detailed reference below. Load another only if the traced boundary spans families:
+   - `references/isolation-sendability-samples.md` for actor isolation, Sendable crossings, global state, isolated conformances, reentrancy, or escape-hatch repairs;
+   - `references/tasks-cancellation-continuations-samples.md` for task ownership, detached work, continuation races, streams, or deterministic concurrency tests;
+   - `references/synchronization-interop-samples.md` for locks, queues, `@unchecked Sendable`, Objective-C/C callbacks, runtime assertions, or `@preconcurrency`.
+2. Read `references/repository-patterns.md` before changing an existing RepoPrompt task, continuation, synchronization, UI-publication, or concurrency-utility pattern.
+3. For Swift 6.2 settings or execution semantics, read `../rpce-swift-6-concurrency-migration/references/official-swift-6-2.md` and its linked local samples.
 4. Inspect the owning target's actual manifest settings before interpreting a diagnostic.
 5. Before running builds or tests, read root `AGENTS.md` and the applicable section of `../rpce-swift-6-concurrency-migration/references/validation-matrix.md`.
 

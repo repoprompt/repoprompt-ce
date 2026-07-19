@@ -2,6 +2,8 @@
 
 Use exact compiler output and current settings. Similar wording can have different causes across Swift language modes and upcoming features.
 
+Detailed local examples are split by boundary: `isolation-sendability-samples.md`, `tasks-cancellation-continuations-samples.md`, and `synchronization-interop-samples.md`. Load only the file matching the traced diagnostic family.
+
 | Diagnostic family | First questions | Preferred fix direction | Avoid |
 |---|---|---|---|
 | Main-actor member from nonisolated context | Is the caller actually UI/main-actor owned? Is the call synchronous or async? | Isolate the correct caller/API, or make the boundary async when a real actor hop is required. | Blanket `@MainActor`, scattered runtime assertions |
