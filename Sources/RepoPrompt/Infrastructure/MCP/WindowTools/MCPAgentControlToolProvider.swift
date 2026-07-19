@@ -182,7 +182,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             - `extract_handoff` (`handoff` alias): Export the full `<forked_session ...>` handoff XML for a live or persisted session. Persisted sessions export transcript-only payloads; `include_file_contents` is accepted only for a live source tab that is currently active so file selection can be snapshotted reliably. Use `output_path` to write to a file; inline XML is returned by default only when no output path is provided.
             - `create_session` / `resume_session`: Create or resume a session with a specific `model_id`.
             - `stop_session`: Stop a live session.
-            - `cleanup_sessions`: Delete specific MCP-originated sessions by ID. Only sessions started via MCP are eligible; user-created sessions are never deleted. Skips active sessions. Use `list_sessions` first to find session IDs, then pass them here.
+            - `cleanup_sessions`: Delete up to 256 specific MCP-originated sessions by ID. The entire array must contain unique valid UUID strings; any non-string, invalid UUID, or duplicate rejects the request before lookup or mutation. Only sessions started via MCP are eligible; user-created sessions are never deleted. Skips active sessions. Cancellation before mutation returns the current and remaining IDs as unprocessed/retry IDs. Cancellation after mutation starts reports the current ID as retryable `mutation_cancelled`, returns only later IDs as unprocessed/retry, and stops the batch. Per-ID lookup failures are `resolution_failed`. An open-tab persisted-delete failure after local teardown is `delete_partially_completed` with `durable=false` and `local_cleanup_completed=true`; persisted-only failures remain `delete_failed`. Missing or previously deleted IDs are `already_absent` and do not make an otherwise successful response partial. Use `list_sessions` first to find session IDs, then pass them here.
             - `list_workflows`: Discover workflows usable with `agent_run` operations, including `orchestrate` for planning, decomposition, and sub-agent dispatch.
             """,
             annotations: .repoPromptLocalEphemeralState,
@@ -198,7 +198,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 **create_session**: model_id?, session_name?
                 **resume_session**: session_id (required), model_id?
                 **stop_session**: session_id (required)
-                **cleanup_sessions**: session_ids (required, array of session UUIDs)
+                **cleanup_sessions**: session_ids (required, array of 1...256 session UUIDs)
 
                 Default extraction behavior: `extract_handoff` (or alias `handoff`) returns `handoff_xml` inline when `output_path` is omitted. When `output_path` is provided, XML is written to disk and omitted from the response unless `inline=true`. `output_path` must be absolute (or `~/...`); CLI shorthand resolves relative paths before calling MCP.
                 """,
@@ -217,7 +217,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                     "max_tool_args_characters": .integer(description: "[extract_handoff] Tool argument character budget; clamped to 0...20000. Default 2000."),
                     "state": .string(description: "[list_sessions] Session state filter. Use MCP-facing values such as running, waiting_for_input, completed, failed."),
                     "offset": .integer(description: "[get_log] Turn offset."),
-                    "session_ids": .array(description: "[cleanup_sessions] Array of session UUIDs to delete.", items: .string()),
+                    "session_ids": .array(description: "[cleanup_sessions] Array of 1...256 unique valid session UUID strings. Any non-string, invalid UUID, or duplicate rejects the entire request before lookup or mutation.", items: .string()),
                     "roles_only": .boolean(description: "[list_agents] When true, return only the authoritative role-label mapping (task_labels) and omit the explicit per-agent target catalog. Default false.")
                 ],
                 required: ["op"]

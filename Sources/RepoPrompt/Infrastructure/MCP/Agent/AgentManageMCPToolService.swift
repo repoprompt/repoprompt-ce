@@ -5,6 +5,50 @@ import MCP
 struct AgentManageMCPToolService {
     typealias RequestMetadata = MCPServerViewModel.RequestMetadata
 
+    static let maxCleanupSessionIDs = 256
+
+    struct CleanupDependencies {
+        let loadPersistedMetadata: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> AgentSessionMeta?
+        let deleteOpenSession: @MainActor (
+            _ viewModel: AgentModeViewModel,
+            _ tabID: UUID,
+            _ workspace: WorkspaceModel
+        ) async throws -> Void
+        let deletePersistedSession: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> Void
+        let finalizePersistedReferences: @MainActor (
+            _ viewModel: AgentModeViewModel,
+            _ sessionID: UUID,
+            _ workspaceID: UUID
+        ) async -> Int
+        let checkCancellation: @MainActor () throws -> Void
+
+        static let live = CleanupDependencies(
+            loadPersistedMetadata: { sessionID, workspace in
+                try await AgentSessionDataService.shared
+                    .metadataRecordForSessionID(sessionID, for: workspace)?
+                    .agentSessionMeta()
+            },
+            deleteOpenSession: { viewModel, tabID, workspace in
+                try await viewModel.deleteSession(tabID: tabID, workspace: workspace)
+            },
+            deletePersistedSession: { sessionID, workspace in
+                try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace)
+            },
+            finalizePersistedReferences: { viewModel, sessionID, workspaceID in
+                let result = await viewModel.finalizeDeletedAgentSessionReferences(
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    knownTabIDs: [],
+                    reason: "agent_manage.cleanup_sessions"
+                )
+                return result.affectedTabIDs.count
+            },
+            checkCancellation: {
+                try Task.checkCancellation()
+            }
+        )
+    }
+
     let toolName: String
     let captureRequestMetadata: () async -> RequestMetadata
     let requireTargetWindow: () throws -> WindowState
@@ -12,6 +56,7 @@ struct AgentManageMCPToolService {
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
+    let cleanupDependencies: CleanupDependencies
 
     init(
         toolName: String,
@@ -22,7 +67,8 @@ struct AgentManageMCPToolService {
         bindCurrentRequestToTab: @escaping (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void,
         restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
             GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
-        }
+        },
+        cleanupDependencies: CleanupDependencies = .live
     ) {
         self.toolName = toolName
         self.captureRequestMetadata = captureRequestMetadata
@@ -31,6 +77,7 @@ struct AgentManageMCPToolService {
         self.resolveSpawnParentSessionID = resolveSpawnParentSessionID
         self.bindCurrentRequestToTab = bindCurrentRequestToTab
         self.restrictDiscoveryToRoleLabels = restrictDiscoveryToRoleLabels
+        self.cleanupDependencies = cleanupDependencies
     }
 
     private struct HandoffSessionInfo {
@@ -616,15 +663,33 @@ struct AgentManageMCPToolService {
         guard let sessionIDValues = args["session_ids"]?.arrayValue, !sessionIDValues.isEmpty else {
             throw MCPError.invalidParams("cleanup_sessions requires a non-empty `session_ids` array of session UUIDs to delete.")
         }
-        var seenRequestedIDs = Set<UUID>()
-        let requestedIDs: [UUID] = sessionIDValues.compactMap { value in
-            guard let raw = value.stringValue,
-                  let id = UUID(uuidString: raw),
-                  seenRequestedIDs.insert(id).inserted else { return nil }
-            return id
+        guard sessionIDValues.count <= Self.maxCleanupSessionIDs else {
+            throw MCPError.invalidParams(
+                "cleanup_sessions accepts at most \(Self.maxCleanupSessionIDs) session_ids per call; received \(sessionIDValues.count). Split the request into bounded batches."
+            )
         }
-        guard !requestedIDs.isEmpty else {
-            throw MCPError.invalidParams("cleanup_sessions: none of the provided session_ids are valid UUIDs.")
+        var firstIndexBySessionID: [UUID: Int] = [:]
+        var requestedIDs: [UUID] = []
+        requestedIDs.reserveCapacity(sessionIDValues.count)
+        for (index, value) in sessionIDValues.enumerated() {
+            guard let raw = value.stringValue else {
+                throw MCPError.invalidParams(
+                    "cleanup_sessions session_ids[\(index)] must be a UUID string; received a non-string value."
+                )
+            }
+            guard let sessionID = UUID(uuidString: raw) else {
+                let preview = String(raw.prefix(64)).debugDescription + (raw.count > 64 ? "…" : "")
+                throw MCPError.invalidParams(
+                    "cleanup_sessions session_ids[\(index)] has invalid UUID value \(preview)."
+                )
+            }
+            if let firstIndex = firstIndexBySessionID[sessionID] {
+                throw MCPError.invalidParams(
+                    "cleanup_sessions session_ids[\(index)] duplicates UUID \(sessionID.uuidString) from index \(firstIndex)."
+                )
+            }
+            firstIndexBySessionID[sessionID] = index
+            requestedIDs.append(sessionID)
         }
 
         #if DEBUG
@@ -632,82 +697,120 @@ struct AgentManageMCPToolService {
             var debugOpenDeletedCount = 0
             var debugPersistedDeletedCount = 0
         #endif
-        var persistedMetaByID: [UUID: AgentSessionMeta]?
         var deletedSessions: [[String: Value]] = []
         var skippedSessions: [[String: Value]] = []
+        var unprocessedSessions: [[String: Value]] = []
+        var retrySessionIDs: [UUID] = []
+        var wasCancelled = false
 
-        for sessionID in requestedIDs {
+        for (index, sessionID) in requestedIDs.enumerated() {
+            do {
+                try cleanupDependencies.checkCancellation()
+            } catch is CancellationError {
+                wasCancelled = true
+                let remainingIDs = requestedIDs[index...]
+                unprocessedSessions = remainingIDs.map { remainingID in
+                    [
+                        "session_id": .string(remainingID.uuidString),
+                        "reason": .string("cancelled_before_processing")
+                    ]
+                }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
+            }
+
             let candidate: CleanupSessionCandidate?
-            if let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) {
-                let snapshotStatus = agentModeVM.mcpSnapshot(for: liveSession)?.status
-                let isEffectivelyActive = snapshotStatus.map { !$0.isTerminal }
-                    ?? (
-                        liveSession.runState.isActive
-                            || liveSession.mcpFollowUpRunPending
-                            || liveSession.pendingSupersedingTurnCompletions > 0
+            do {
+                if let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) {
+                    let snapshotStatus = agentModeVM.mcpSnapshot(for: liveSession)?.status
+                    let isEffectivelyActive = snapshotStatus.map { !$0.isTerminal }
+                        ?? (
+                            liveSession.runState.isActive
+                                || liveSession.mcpFollowUpRunPending
+                                || liveSession.pendingSupersedingTurnCompletions > 0
+                        )
+                    candidate = CleanupSessionCandidate(
+                        sessionID: sessionID,
+                        name: targetWindow.workspaceManager.composeTab(with: liveSession.tabID)?.name ?? "Agent Session",
+                        tabID: liveSession.tabID,
+                        isLive: true,
+                        isMCPOriginated: liveSession.isMCPOriginated,
+                        runStateRaw: liveSession.runState.rawValue,
+                        isEffectivelyActive: isEffectivelyActive
                     )
-                candidate = CleanupSessionCandidate(
-                    sessionID: sessionID,
-                    name: targetWindow.workspaceManager.composeTab(with: liveSession.tabID)?.name ?? "Agent Session",
-                    tabID: liveSession.tabID,
-                    isLive: true,
-                    isMCPOriginated: liveSession.isMCPOriginated,
-                    runStateRaw: liveSession.runState.rawValue,
-                    isEffectivelyActive: isEffectivelyActive
-                )
-            } else if let indexEntry = agentModeVM.sessionIndex[sessionID] {
-                let runState = indexEntry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))
-                candidate = CleanupSessionCandidate(
-                    sessionID: sessionID,
-                    name: indexEntry.name,
-                    tabID: indexEntry.tabID,
-                    isLive: agentModeVM.sessions[indexEntry.tabID] != nil,
-                    isMCPOriginated: indexEntry.isMCPOriginated,
-                    runStateRaw: indexEntry.lastRunStateRaw,
-                    isEffectivelyActive: runState?.isActive == true
-                )
-            } else {
-                if persistedMetaByID == nil {
+                } else {
                     #if DEBUG
                         let persistedLoadStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    let persistedMetas = try await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace, limit: nil)
+                    let meta = try await cleanupDependencies.loadPersistedMetadata(sessionID, workspace)
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.loadPersistedMeta",
                             startMS: persistedLoadStartMS,
                             fields: [
                                 "workspaceID": workspace.id.uuidString,
-                                "recordCount": String(persistedMetas.count)
+                                "sessionID": sessionID.uuidString,
+                                "found": String(meta != nil)
                             ]
                         )
                     #endif
-                    persistedMetaByID = Dictionary(
-                        persistedMetas.map { ($0.id, $0) },
-                        uniquingKeysWith: { first, _ in first }
-                    )
+                    if let meta {
+                        let runState = meta.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
+                        candidate = CleanupSessionCandidate(
+                            sessionID: sessionID,
+                            name: meta.name,
+                            tabID: meta.composeTabID,
+                            isLive: false,
+                            isMCPOriginated: meta.isMCPOriginated,
+                            runStateRaw: meta.lastRunState,
+                            isEffectivelyActive: runState?.isActive == true
+                        )
+                    } else {
+                        candidate = nil
+                    }
                 }
-                if let meta = persistedMetaByID?[sessionID] {
-                    let runState = meta.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
-                    candidate = CleanupSessionCandidate(
-                        sessionID: sessionID,
-                        name: meta.name,
-                        tabID: meta.composeTabID,
-                        isLive: false,
-                        isMCPOriginated: meta.isMCPOriginated,
-                        runStateRaw: meta.lastRunState,
-                        isEffectivelyActive: runState?.isActive == true
-                    )
-                } else {
-                    candidate = nil
+            } catch is CancellationError {
+                wasCancelled = true
+                let remainingIDs = requestedIDs[index...]
+                unprocessedSessions = remainingIDs.map { remainingID in
+                    [
+                        "session_id": .string(remainingID.uuidString),
+                        "reason": .string("cancelled_before_mutation")
+                    ]
                 }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
+            } catch {
+                skippedSessions.append([
+                    "session_id": .string(sessionID.uuidString),
+                    "name": .string("Unknown"),
+                    "reason": .string("resolution_failed"),
+                    "message": .string(error.localizedDescription)
+                ])
+                retrySessionIDs.append(sessionID)
+                continue
+            }
+
+            do {
+                try cleanupDependencies.checkCancellation()
+            } catch is CancellationError {
+                wasCancelled = true
+                let remainingIDs = requestedIDs[index...]
+                unprocessedSessions = remainingIDs.map { remainingID in
+                    [
+                        "session_id": .string(remainingID.uuidString),
+                        "reason": .string("cancelled_before_mutation")
+                    ]
+                }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
             }
 
             guard let candidate else {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string("Unknown"),
-                    "reason": .string("not_found")
+                    "reason": .string("already_absent")
                 ])
                 continue
             }
@@ -730,10 +833,12 @@ struct AgentManageMCPToolService {
                 continue
             }
 
+            var usedOpenTabAuthority = false
             do {
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
-                    let activeWorkspace = targetWindow.workspaceManager.activeWorkspace ?? workspace
-                    guard activeWorkspace.composeTabs.contains(where: { $0.id == tabID }) else { return nil }
+                    guard targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
+                          workspace.composeTabs.contains(where: { $0.id == tabID })
+                    else { return nil }
                     let liveSessionID = agentModeVM.sessions[tabID]?.activeAgentSessionID
                     let liveBindingMatches = liveSessionID == sessionID
                     let hasDifferentLiveBinding = liveSessionID != nil && liveSessionID != sessionID
@@ -744,10 +849,11 @@ struct AgentManageMCPToolService {
                     return !hasDifferentLiveBinding && (liveBindingMatches || workspaceBindingMatches) ? tabID : nil
                 }
                 if let openTabID {
+                    usedOpenTabAuthority = true
                     #if DEBUG
                         let deleteOpenStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    await agentModeVM.deleteSession(tabID: openTabID)
+                    try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deleteOpen",
@@ -758,22 +864,15 @@ struct AgentManageMCPToolService {
                                 "tabID": openTabID.uuidString
                             ]
                         )
-                        let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
-                            "cleanup.sessions.deletePersisted",
-                            startMS: deletePersistedStartMS,
-                            fields: ["sessionID": sessionID.uuidString]
-                        )
                         debugOpenDeletedCount += 1
                     #endif
                 } else {
                     #if DEBUG
                         let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace)
+                    try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deletePersisted",
@@ -782,38 +881,69 @@ struct AgentManageMCPToolService {
                         )
                         debugPersistedDeletedCount += 1
                     #endif
-                }
-                #if DEBUG
-                    let finalizeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
-                #endif
-                let finalizeResult = await agentModeVM.finalizeDeletedAgentSessionReferences(
-                    sessionID: sessionID,
-                    workspaceID: workspace.id,
-                    knownTabIDs: openTabID.map { [$0] } ?? [],
-                    reason: "agent_manage.cleanup_sessions"
-                )
-                #if DEBUG
-                    AgentModePerfDiagnostics.durationEvent(
-                        "cleanup.sessions.finalize",
-                        startMS: finalizeStartMS,
-                        fields: [
-                            "sessionID": sessionID.uuidString,
-                            "knownTabCount": String(openTabID == nil ? 0 : 1),
-                            "affectedTabCount": String(finalizeResult.affectedTabIDs.count)
-                        ]
+                    #if DEBUG
+                        let finalizeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                    #endif
+                    let affectedTabCount = await cleanupDependencies.finalizePersistedReferences(
+                        agentModeVM,
+                        sessionID,
+                        workspace.id
                     )
-                #endif
+                    #if DEBUG
+                        AgentModePerfDiagnostics.durationEvent(
+                            "cleanup.sessions.finalize",
+                            startMS: finalizeStartMS,
+                            fields: [
+                                "sessionID": sessionID.uuidString,
+                                "knownTabCount": "0",
+                                "affectedTabCount": String(affectedTabCount)
+                            ]
+                        )
+                    #endif
+                }
                 deletedSessions.append([
                     "session_id": .string(sessionID.uuidString),
-                    "name": .string(candidate.name)
+                    "name": .string(candidate.name),
+                    "durable": .bool(true)
                 ])
-            } catch {
+            } catch is CancellationError {
+                wasCancelled = true
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
-                    "reason": .string("delete_failed"),
-                    "message": .string(error.localizedDescription)
+                    "reason": .string("mutation_cancelled"),
+                    "durable": .bool(false),
+                    "mutation_started": .bool(true)
                 ])
+                retrySessionIDs.append(sessionID)
+                let remainingIDs = requestedIDs.dropFirst(index + 1)
+                unprocessedSessions = remainingIDs.map { remainingID in
+                    [
+                        "session_id": .string(remainingID.uuidString),
+                        "reason": .string("cancelled_after_mutation_started")
+                    ]
+                }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
+            } catch {
+                if usedOpenTabAuthority {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("delete_partially_completed"),
+                        "message": .string(error.localizedDescription),
+                        "durable": .bool(false),
+                        "local_cleanup_completed": .bool(true)
+                    ])
+                } else {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("delete_failed"),
+                        "message": .string(error.localizedDescription)
+                    ])
+                }
+                retrySessionIDs.append(sessionID)
             }
         }
 
@@ -826,17 +956,31 @@ struct AgentManageMCPToolService {
                     "validRequested": String(requestedIDs.count),
                     "deleted": String(deletedSessions.count),
                     "skipped": String(skippedSessions.count),
+                    "unprocessed": String(unprocessedSessions.count),
+                    "cancelled": String(wasCancelled),
                     "openDeleted": String(debugOpenDeletedCount),
                     "persistedDeleted": String(debugPersistedDeletedCount)
                 ]
             )
         #endif
+        let status = if wasCancelled {
+            "cancelled"
+        } else if skippedSessions.allSatisfy({ $0["reason"]?.stringValue == "already_absent" }) {
+            "completed"
+        } else {
+            "partial"
+        }
         return .object([
-            "status": .string(skippedSessions.isEmpty ? "completed" : "partial"),
+            "status": .string(status),
+            "cancelled": .bool(wasCancelled),
+            "processed_count": .int(deletedSessions.count + skippedSessions.count),
             "deleted_count": .int(deletedSessions.count),
             "skipped_count": .int(skippedSessions.count),
+            "unprocessed_count": .int(unprocessedSessions.count),
             "deleted_sessions": .array(deletedSessions.map(Value.object)),
-            "skipped_sessions": .array(skippedSessions.map(Value.object))
+            "skipped_sessions": .array(skippedSessions.map(Value.object)),
+            "unprocessed_sessions": .array(unprocessedSessions.map(Value.object)),
+            "retry_session_ids": .array(retrySessionIDs.map { .string($0.uuidString) })
         ])
     }
 
