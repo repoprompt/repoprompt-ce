@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import RepoPromptRegexCore
 
 struct CodeMapPCRE2Match {
     private let captures: [String?]

@@ -1,6 +1,7 @@
+import CSwiftPCRE2
 import Foundation
 
-public enum PCRE2LimitKind: Sendable, Equatable {
+package enum PCRE2LimitKind: Sendable, Equatable {
 	case match
 	case depth
 	case heap
@@ -20,14 +21,14 @@ public enum PCRE2LimitKind: Sendable, Equatable {
 	}
 }
 
-public enum PCRE2Error: Error, LocalizedError, Sendable, Equatable {
+package enum PCRE2Error: Error, LocalizedError, Sendable, Equatable {
 	case compile(pattern: String, offset: Int, code: Int32, message: String)
 	case match(code: Int32, message: String)
 	case matchLimitExceeded(kind: PCRE2LimitKind, code: Int32, message: String)
 	case jitRequiredButUnavailable(String)
 	case internalInvariant(String)
 
-	public var errorDescription: String? {
+	package var errorDescription: String? {
 		switch self {
 		case let .compile(pattern, offset, code, message):
 			return "PCRE2 compile error at byte offset \(offset) for pattern \(String(reflecting: pattern)) (\(code)): \(message)"

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptRegexCore
 
 // Wildmatch flags for pattern matching
 private let WM_NOESCAPE: UInt32 = 0x01

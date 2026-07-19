@@ -47,6 +47,7 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
     "RepoPromptShared",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
@@ -111,6 +112,11 @@ if benchmarkTestsEnabled {
     repoPromptTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
 
+let swift5CompleteConcurrencyChecking: [SwiftSetting] = [
+    .swiftLanguageMode(.v5),
+    .enableExperimentalFeature("StrictConcurrency")
+]
+
 let package = Package(
     name: "RepoPromptCE",
     platforms: [.macOS(.v14)],
@@ -128,6 +134,12 @@ let package = Package(
         .target(
             name: "RepoPromptWorkspaceCore",
             path: "Sources/RepoPromptWorkspaceCore"
+        ),
+        .target(
+            name: "RepoPromptRegexCore",
+            dependencies: ["CSwiftPCRE2"],
+            path: "Sources/RepoPromptRegexCore",
+            swiftSettings: swift5CompleteConcurrencyChecking
         ),
         .target(
             name: "RepoPromptApp",
@@ -156,6 +168,12 @@ let package = Package(
             name: "RepoPromptWorkspaceCoreTests",
             dependencies: ["RepoPromptWorkspaceCore"],
             path: "Tests/RepoPromptWorkspaceCoreTests"
+        ),
+        .testTarget(
+            name: "RepoPromptRegexCoreTests",
+            dependencies: ["RepoPromptRegexCore"],
+            path: "Tests/RepoPromptRegexCoreTests",
+            swiftSettings: swift5CompleteConcurrencyChecking
         ),
         .testTarget(
             name: "RepoPromptTests",
