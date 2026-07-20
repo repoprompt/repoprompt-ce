@@ -142,50 +142,57 @@ extension FileSystemService {
         name.hasPrefix(".repoprompt.tmp.")
     }
 
-    private static func decodeDirentName(_ entry: dirent) -> DecodedDirentName? {
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
+    private static func decodeDirentName(_ ptr: UnsafeMutablePointer<dirent>) -> DecodedDirentName? {
+        #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+        // macOS dirent is variable-length: the kernel allocates only d_reclen bytes per entry.
+        // Copying ptr.pointee reads the full Swift-sizeof(dirent) bytes, which can extend past
+        // the allocation into unmapped memory, causing EXC_BAD_ACCESS (KERN_INVALID_ADDRESS).
+        // Instead, use raw pointer reads bounded by d_namlen to stay within the allocation.
+        //
+        // Darwin dirent layout (sys/dirent.h, 64-bit):
+        //   +0  d_ino    (UInt64, 8 bytes)
+        //   +8  d_reclen (UInt16, 2 bytes)
+        //   +10 d_type   (UInt8,  1 byte)
+        //   +11 d_namlen (UInt8,  1 byte)
+        //   +12 d_name   (char[256], actual used bytes = d_namlen)
+        let raw = UnsafeRawPointer(ptr)
+        let namlen = Int(raw.load(fromByteOffset: 11, as: UInt8.self))
+        guard namlen > 0 else { return nil }
+        let nameStart = raw.advanced(by: 12).assumingMemoryBound(to: UInt8.self)
+        let bytes = Data(UnsafeBufferPointer(start: nameStart, count: namlen))
+        let name = String(decoding: bytes, as: UTF8.self)
+        return DecodedDirentName(name: name, bytes: bytes, length: namlen)
+        #else
+        // On Linux, glibc allocates full-size dirent entries so copying pointee is safe.
+        // d_namlen is not available; scan for the null terminator instead.
+        let entry = ptr.pointee
+        return withUnsafeBytes(of: entry.d_name) { rawBuffer in
             let buffer = rawBuffer.bindMemory(to: UInt8.self)
             let maxCount = buffer.count
             guard maxCount > 0 else { return nil }
-
-            let nameLen = Int(entry.d_namlen)
-            var length = 0
-            if nameLen > 0 {
-                length = min(nameLen, maxCount)
-                if length > 0, buffer[length - 1] == 0 {
-                    length -= 1
-                }
-            } else {
-                var nulIndex: Int? = nil
-                var i = 0
-                while i < maxCount {
-                    if buffer[i] == 0 {
-                        nulIndex = i
-                        break
-                    }
-                    i += 1
-                }
-                guard let foundIndex = nulIndex else { return nil }
-                length = foundIndex
+            var nulIndex: Int? = nil
+            var i = 0
+            while i < maxCount {
+                if buffer[i] == 0 { nulIndex = i; break }
+                i += 1
             }
-
-            guard length > 0 else { return nil }
-
-            let bytes = Data(buffer.prefix(length))
+            guard let foundIndex = nulIndex, foundIndex > 0 else { return nil }
+            let bytes = Data(buffer.prefix(foundIndex))
             let name = String(decoding: bytes, as: UTF8.self)
-            return DecodedDirentName(name: name, bytes: bytes, length: length)
+            return DecodedDirentName(name: name, bytes: bytes, length: foundIndex)
         }
+        #endif
     }
 
     private static func descriptorRelativeMode(
         dir: UnsafeMutablePointer<DIR>,
-        entry: dirent,
+        nameBytes: Data,
         nameLength: Int
     ) -> UInt16 {
         let fd = dirfd(dir)
         guard fd >= 0 else { return 0 }
         var nameBuffer = [CChar](repeating: 0, count: nameLength + 1)
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
+        nameBytes.withUnsafeBytes { rawBuffer in
             let buffer = rawBuffer.bindMemory(to: UInt8.self)
             for index in 0 ..< min(nameLength, buffer.count) {
                 nameBuffer[index] = CChar(bitPattern: buffer[index])
@@ -201,20 +208,18 @@ extension FileSystemService {
 
     private static func fileTypeFallback(
         dir: UnsafeMutablePointer<DIR>,
-        entry: dirent,
+        nameBytes: Data,
         nameLength: Int
     ) -> (isDir: Bool, isSym: Bool) {
         let fd = dirfd(dir)
         guard fd >= 0 else { return (false, false) }
 
         var nameBuffer = [CChar](repeating: 0, count: nameLength + 1)
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
+        nameBytes.withUnsafeBytes { rawBuffer in
             let buffer = rawBuffer.bindMemory(to: UInt8.self)
             let count = min(nameLength, buffer.count)
-            if count > 0 {
-                for i in 0 ..< count {
-                    nameBuffer[i] = CChar(bitPattern: buffer[i])
-                }
+            for i in 0 ..< count {
+                nameBuffer[i] = CChar(bitPattern: buffer[i])
             }
         }
 
@@ -272,9 +277,9 @@ extension FileSystemService {
                 break // Exit loop on error or end of directory
             }
 
-            // Safely copy the dirent structure
-            let dirent = direntPtr.pointee
-            guard let decoded = decodeDirentName(dirent) else {
+            // Decode the entry name directly from the pointer without copying the
+            // variable-length dirent struct (copying can read past the kernel allocation).
+            guard let decoded = decodeDirentName(direntPtr) else {
                 continue
             }
             let fileName = decoded.name
@@ -295,8 +300,12 @@ extension FileSystemService {
                 hasCursorignore = true
             }
 
-            // Determine file type from d_type
-            let dType = dirent.d_type
+            // Read d_type via raw pointer to avoid copying the full struct.
+            #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+            let dType = UnsafeRawPointer(direntPtr).load(fromByteOffset: 10, as: UInt8.self)
+            #else
+            let dType = direntPtr.pointee.d_type
+            #endif
             var isDir = false
             var isSym = false
 
@@ -306,7 +315,7 @@ extension FileSystemService {
             case DT_LNK:
                 let fallback = fileTypeFallback(
                     dir: dir,
-                    entry: dirent,
+                    nameBytes: decoded.bytes,
                     nameLength: decoded.length
                 )
                 isDir = fallback.isDir
@@ -314,7 +323,7 @@ extension FileSystemService {
             case DT_UNKNOWN:
                 let fallback = fileTypeFallback(
                     dir: dir,
-                    entry: dirent,
+                    nameBytes: decoded.bytes,
                     nameLength: decoded.length
                 )
                 isDir = fallback.isDir
@@ -331,7 +340,7 @@ extension FileSystemService {
                 isSym: isSym,
                 fileSystemMode: descriptorRelativeMode(
                     dir: dir,
-                    entry: dirent,
+                    nameBytes: decoded.bytes,
                     nameLength: decoded.length
                 )
             ))
@@ -370,11 +379,11 @@ extension FileSystemService {
         entries.reserveCapacity(Int(count))
 
         for i in 0 ..< count {
-            // Copy dirent into local var so the pointer remains valid for the entire iteration
-            let localDirent = namelist![Int(i)]!.pointee
+            // Use the pointer directly to avoid copying the variable-length dirent struct.
+            let ptr = namelist![Int(i)]!
 
-            // Safely convert d_name -> Swift String
-            guard let decoded = decodeDirentName(localDirent) else {
+            // Safely convert d_name -> Swift String via pointer (no struct copy).
+            guard let decoded = decodeDirentName(ptr) else {
                 continue
             }
             let rawName = decoded.name
@@ -387,7 +396,12 @@ extension FileSystemService {
                 continue
             }
 
-            let dType = localDirent.d_type // This is a UInt8
+            // Read d_type via raw pointer to avoid copying the full struct.
+            #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+            let dType = UnsafeRawPointer(ptr).load(fromByteOffset: 10, as: UInt8.self)
+            #else
+            let dType = ptr.pointee.d_type
+            #endif
             var isDir = false
             var isSym = false
 
