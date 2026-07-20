@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptCodeMapCore
 
 enum CodeMapArtifactFileStoreError: Error, Equatable {
     case invalidRoot

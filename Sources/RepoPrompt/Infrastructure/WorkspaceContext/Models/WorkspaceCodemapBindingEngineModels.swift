@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 struct WorkspaceCodemapBindingEnginePolicy: Equatable {
     static let `default` = WorkspaceCodemapBindingEnginePolicy()

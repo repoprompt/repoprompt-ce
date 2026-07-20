@@ -2,6 +2,7 @@ import Combine
 import CoreServices
 import CryptoKit
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 private enum CodemapInitializationResetBoundary: String, CaseIterable {

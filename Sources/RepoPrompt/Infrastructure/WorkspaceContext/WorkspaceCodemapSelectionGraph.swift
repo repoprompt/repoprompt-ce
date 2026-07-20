@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 actor WorkspaceCodemapSelectionGraph {
     private let rootEpoch: WorkspaceCodemapRootEpoch

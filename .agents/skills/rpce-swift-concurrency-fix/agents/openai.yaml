@@ -1,0 +1,4 @@
+interface:
+  display_name: "RepoPrompt CE Concurrency Fix"
+  short_description: "Fix bounded Swift concurrency diagnostics"
+  default_prompt: "Use $rpce-swift-concurrency-fix to resolve these RepoPrompt CE concurrency diagnostics with the smallest behavior-preserving change and no drive-by refactors."

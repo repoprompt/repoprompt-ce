@@ -1,21 +1,7 @@
 import Foundation
+import RepoPromptRegexCore
 
-enum RepoPromptRegexRuntime {
-    static var pcre2JITMode: PCRE2JITMode {
-        let rawValue = ProcessInfo.processInfo.environment["REPOPROMPT_PCRE2_JIT"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-
-        switch rawValue {
-        case "0", "false", "off", "no", "disable", "disabled":
-            return .disabled
-        case "require", "required":
-            return .required
-        default:
-            return .auto
-        }
-    }
-
+enum RepoPromptSearchRegexRuntime {
     static var pcre2SearchMatchLimitsEnabled: Bool {
         let rawValue = ProcessInfo.processInfo.environment["REPOPROMPT_PCRE2_MATCH_LIMITS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -32,17 +18,17 @@ enum RepoPromptRegexRuntime {
 
 enum RepoPromptPCRE2MatchPolicy {
     static var fileSearchFullBuffer: PCRE2MatchLimits? {
-        guard RepoPromptRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
+        guard RepoPromptSearchRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
         return PCRE2MatchLimits(matchLimit: 10_000_000, depthLimit: 100_000, heapLimitKiB: 64 * 1024)
     }
 
     static var fileSearchLine: PCRE2MatchLimits? {
-        guard RepoPromptRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
+        guard RepoPromptSearchRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
         return PCRE2MatchLimits(matchLimit: 1_000_000, depthLimit: 10000, heapLimitKiB: 16 * 1024)
     }
 
     static var pathSearchShortSubject: PCRE2MatchLimits? {
-        guard RepoPromptRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
+        guard RepoPromptSearchRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
         return PCRE2MatchLimits(matchLimit: 100_000, depthLimit: 1000, heapLimitKiB: 4 * 1024)
     }
 }

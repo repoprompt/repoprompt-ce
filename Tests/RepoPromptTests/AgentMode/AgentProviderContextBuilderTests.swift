@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class AgentProviderContextBuilderTests: XCTestCase {

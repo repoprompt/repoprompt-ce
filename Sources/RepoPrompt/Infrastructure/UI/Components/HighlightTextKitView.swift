@@ -29,7 +29,7 @@ struct HighlightedTextKitView: NSViewRepresentable {
 
     @ObservedObject private var highlighterHolder = NeonHighlighterHolder()
     class NeonHighlighterHolder: ObservableObject {
-        var highlighter: Highlighter?
+        var highlighter: TextSystemStyler<TextViewSystemInterface>?
     }
 
     // MARK: - Coordinator
@@ -49,10 +49,17 @@ struct HighlightedTextKitView: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
+            let previousLength = internalText.utf16.count
+            let updatedLength = textView.string.utf16.count
+            parent.highlighterHolder.highlighter?.didChangeContent(
+                in: NSRange(location: 0, length: previousLength),
+                delta: updatedLength - previousLength
+            )
             internalText = textView.string
             parent.text = textView.string
             // Reapply highlighting after the text changes
-            parent.highlighterHolder.highlighter?.invalidate()
+            parent.highlighterHolder.highlighter?.invalidate(.all)
+            parent.highlighterHolder.highlighter?.validate()
         }
 
         func undoManager(for view: NSTextView) -> UndoManager? {
@@ -77,12 +84,13 @@ struct HighlightedTextKitView: NSViewRepresentable {
             attributeProvider: neonAttributeProvider
         )
         // Create the Neon highlighter using our token provider
-        let highlighter = Highlighter(textInterface: textInterface, tokenProvider: neonTokenProvider)
+        let highlighter = TextSystemStyler(textSystem: textInterface, tokenProvider: neonTokenProvider)
         highlighterHolder.highlighter = highlighter
 
         // Invalidate once on creation
         DispatchQueue.main.async {
-            highlighter.invalidate()
+            highlighter.invalidate(.all)
+            highlighter.validate()
         }
 
         scrollView.scrollsDynamically = true
@@ -145,10 +153,7 @@ struct HighlightedTextKitView: NSViewRepresentable {
 
     // MARK: - Neon Token Provider
 
-    private func neonTokenProvider(
-        _ invalidRange: NSRange,
-        completionHandler: @escaping (Result<TokenApplication, Error>) -> Void
-    ) {
+    private var neonTokenProvider: TokenProvider {
         let textLength = text.utf16.count
 
         // Filter out ranges that are out of bounds
@@ -163,7 +168,10 @@ struct HighlightedTextKitView: NSViewRepresentable {
         }
 
         let application = TokenApplication(tokens: tokens, action: .replace)
-        completionHandler(.success(application))
+        return TokenProvider(
+            syncValue: { _ in application },
+            asyncValue: { _, _ in application }
+        )
     }
 
     // MARK: - Neon Attribute Provider

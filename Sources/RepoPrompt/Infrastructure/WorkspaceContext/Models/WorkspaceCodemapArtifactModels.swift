@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 struct WorkspaceCodemapArtifactBindingIdentity: Hashable {
     let rootID: UUID

@@ -144,7 +144,7 @@ install-local-production:
 
 xcode: xcode-open
 
-xcode-open: xcode-generate
+xcode-open: xcode-validate
 	open "$$(python3 Scripts/generate_xcode_workspace.py print-path)"
 
 xcode-generate:

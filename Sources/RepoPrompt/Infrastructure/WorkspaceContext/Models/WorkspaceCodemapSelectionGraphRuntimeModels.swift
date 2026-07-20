@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 struct WorkspaceCodemapSelectionGraphRuntimeKey: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch

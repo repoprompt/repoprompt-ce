@@ -39,6 +39,9 @@ CUSTOM_DESTINATION_ROOT = REPO_ROOT / ".build/xcode-custom"
 DEFAULT_DEBUG_APP_BUNDLE = (
     Path.home() / "Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app"
 )
+GITHUB_SSH_TRANSPORT = "git@github.com:"
+GITHUB_HTTPS_TRANSPORT = "https://github.com/"
+GITHUB_TRANSPORT_CONFIG_KEY = f"url.{GITHUB_HTTPS_TRANSPORT}.insteadOf"
 
 
 class GeneratorError(RuntimeError):
@@ -112,7 +115,13 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
+        "RepoPromptWorkspaceCore",
+        "RepoPromptRegexCore",
+        "RepoPromptCodeMapCore",
         "TreeSitterScannerSupport",
+        "RepoPromptWorkspaceCoreTests",
+        "RepoPromptRegexCoreTests",
+        "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
     )
     for name in required_targets:
@@ -147,14 +156,20 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
         )
 
-    expected_test_dependencies = {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"}
+    expected_test_dependencies = {
+        "RepoPromptApp",
+        "RepoPromptCodeMapCore",
+        "RepoPromptMCP",
+        "RepoPromptShared",
+    }
     repo_prompt_tests = targets["RepoPromptTests"]
     if (
         len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
         or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
     ):
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
+            "RepoPromptMCP, and RepoPromptShared"
         )
 
     unsafe_flags: list[list[str]] = []
@@ -174,7 +189,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
         )
 
-    expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}
+    expected_resources = {("Fixtures", True), ("Goldens", True)}
     test_targets_with_codemap_resources = []
     for target in targets.values():
         if target.get("type") != "test":
@@ -185,9 +200,10 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         }
         if expected_resources.issubset(resources):
             test_targets_with_codemap_resources.append(target.get("name"))
-    if len(test_targets_with_codemap_resources) != 1:
+    if test_targets_with_codemap_resources != ["RepoPromptCodeMapCoreTests"]:
         raise GeneratorError(
-            "Exactly one SwiftPM test target must copy CodeMap/Fixtures and CodeMap/Goldens"
+            "RepoPromptCodeMapCoreTests must be the sole SwiftPM test target "
+            "that copies Fixtures and Goldens"
         )
 
     expected_scanners = ["src/javascript/scanner.c", "src/python/scanner.c"]
@@ -872,11 +888,40 @@ def check_outputs(destination: Path, outputs: dict[Path, bytes]) -> None:
         validate_structure(destination)
 
 
+def xcodebuild_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if base is None else base)
+    raw_count = environment.get("GIT_CONFIG_COUNT", "0")
+    try:
+        count = int(raw_count)
+    except ValueError as error:
+        raise GeneratorError("GIT_CONFIG_COUNT must be a non-negative integer") from error
+    if count < 0:
+        raise GeneratorError("GIT_CONFIG_COUNT must be a non-negative integer")
+
+    for index in range(count):
+        if (
+            environment.get(f"GIT_CONFIG_KEY_{index}") == GITHUB_TRANSPORT_CONFIG_KEY
+            and environment.get(f"GIT_CONFIG_VALUE_{index}") == GITHUB_SSH_TRANSPORT
+        ):
+            return environment
+
+    environment["GIT_CONFIG_COUNT"] = str(count + 1)
+    environment[f"GIT_CONFIG_KEY_{count}"] = GITHUB_TRANSPORT_CONFIG_KEY
+    environment[f"GIT_CONFIG_VALUE_{count}"] = GITHUB_SSH_TRANSPORT
+    return environment
+
+
 def validate_xcodebuild_list(destination: Path) -> None:
     workspace = destination / WORKSPACE_NAME
     command = ["xcodebuild", "-list", "-json", "-workspace", str(workspace)]
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=xcodebuild_environment(),
+        )
     except FileNotFoundError as error:
         raise GeneratorError("xcodebuild is required; install/select Xcode") from error
     if result.returncode != 0:

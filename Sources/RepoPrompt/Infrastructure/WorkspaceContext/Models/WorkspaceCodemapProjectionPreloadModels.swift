@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 enum WorkspaceCodemapProjectionPreloadLaunchPhase: Hashable {
     case notScheduled

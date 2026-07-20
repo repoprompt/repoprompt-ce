@@ -7,16 +7,7 @@
 //
 
 import Foundation
-
-struct CodeMapPerfOptions {
-    let enabled: Bool
-    let signposts: Bool
-    let collectCounters: Bool
-
-    static let disabled = CodeMapPerfOptions(enabled: false, signposts: false, collectCounters: false)
-    static let countersOnly = CodeMapPerfOptions(enabled: true, signposts: false, collectCounters: true)
-    static let full = CodeMapPerfOptions(enabled: true, signposts: true, collectCounters: true)
-}
+import RepoPromptCodeMapCore
 
 struct CodeMapSyntaxStartupPerfStats {
     var primeDuration: TimeInterval = 0
@@ -326,7 +317,32 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
         }
     }
 
-    func mergeGeneratorStats(_ stats: CodeMapPerfStats) {
+    func mergeSyntaxCodeMapStats(_ stats: CodeMapPerformanceCollector) {
+        mergeSyntaxCodeMapStats(
+            CodeMapSyntaxPerfStats(
+                languageLookupDuration: stats.syntaxLanguageLookupDuration,
+                oversizeGuardDuration: stats.syntaxOversizeGuardDuration,
+                parserCreateDuration: stats.syntaxParserCreateDuration,
+                setLanguageDuration: stats.syntaxSetLanguageDuration,
+                parseDuration: stats.syntaxParseDuration,
+                codeMapQueryLookupDuration: stats.syntaxCodeMapQueryLookupDuration,
+                queryExecuteDuration: stats.syntaxQueryExecuteDuration,
+                captureMaterializationDuration: stats.syntaxCaptureMaterializationDuration,
+                calls: stats.syntaxCalls,
+                unsupported: stats.syntaxUnsupported,
+                oversized: stats.syntaxOversized,
+                parseNilTree: stats.syntaxParseNilTree,
+                parseNilRoot: stats.syntaxParseNilRoot,
+                parserCreates: stats.syntaxParserCreates,
+                queryExecutes: stats.syntaxQueryExecutes,
+                captures: stats.syntaxCaptures,
+                codeMapQueryCacheHits: stats.syntaxCodeMapQueryCacheHits,
+                codeMapQueryCacheMisses: stats.syntaxCodeMapQueryCacheMisses
+            )
+        )
+    }
+
+    func mergeGeneratorStats(_ stats: CodeMapPerformanceCollector) {
         lock.withLock {
             storage.generatorCaptureIndexDuration += stats.captureIndexDuration
             storage.generatorSwiftContextDuration += stats.swiftContextDuration
@@ -493,8 +509,8 @@ enum CodeMapPerfRuntime {
         isEnabled ? .countersOnly : .disabled
     }
 
-    static func makeGeneratorStats() -> CodeMapPerfStats? {
-        isEnabled ? CodeMapPerfStats() : nil
+    static func makeGeneratorStats() -> CodeMapPerformanceCollector? {
+        isEnabled ? CodeMapPerformanceCollector() : nil
     }
 
     @inline(__always)
@@ -507,7 +523,7 @@ enum CodeMapPerfRuntime {
     }
 
     @inline(__always)
-    static func activeStats(_ stats: CodeMapPerfStats?) -> CodeMapPerfStats? {
+    static func activeStats(_ stats: CodeMapPerformanceCollector?) -> CodeMapPerformanceCollector? {
         #if DEBUG || CODEMAP_PERF
             return stats
         #else
@@ -544,160 +560,4 @@ enum CodeMapPerfRuntime {
     static func durationSince(_ start: DispatchTime) -> TimeInterval {
         Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000.0
     }
-}
-
-final class CodeMapPerfStats {
-    // Capture loop
-    var capturesProcessed = 0
-    var swiftStrategyHandled = 0
-    var tsStrategyHandled = 0
-    var fallbackHandled = 0
-    var captureLoopLineAdvanceCount = 0
-    var captureLoopSwiftStrategyCount = 0
-    var captureLoopTSStrategyCount = 0
-    var captureLoopInterfaceHeuristicCount = 0
-    var captureLoopImportExportCount = 0
-    var captureLoopTypeAliasCount = 0
-    var captureLoopEnumMacroCount = 0
-    var captureLoopFunctionCount = 0
-    var captureLoopVariableCount = 0
-    var captureLoopSkippedCount = 0
-    var captureLoopUnclassifiedCount = 0
-    var swiftStrategyFunctionSignatureCount = 0
-    var swiftStrategyFunctionNameLookupCount = 0
-    var swiftStrategyParameterExtractionCount = 0
-    var swiftStrategyReturnTypeExtractionCount = 0
-    var swiftStrategyPropertyDeclarationCount = 0
-    var swiftStrategyPropertyTypeExtractionCount = 0
-    var swiftStrategyEnclosingTypeLookupCount = 0
-    var swiftStrategyModelInsertionCount = 0
-    var swiftStrategyContextOnlyCount = 0
-    var swiftStrategyHandledFunctionCount = 0
-    var swiftStrategyHandledPropertyCount = 0
-    var fallbackFunctionDeclarationCount = 0
-    var fallbackFunctionJSTSSignatureCount = 0
-    var fallbackFunctionNameExtractionCount = 0
-    var fallbackFunctionLTEParseCount = 0
-    var fallbackFunctionTSFastPathCount = 0
-    var fallbackFunctionReferencedTypesCount = 0
-    var fallbackFunctionRoutingCount = 0
-    var fallbackFunctionModelInsertionCount = 0
-    var fallbackFunctionSkippedCount = 0
-    var fallbackFunctionLightweightCount = 0
-    var fallbackFunctionHeavyweightCount = 0
-    var fallbackFunctionGlobalInsertCount = 0
-    var fallbackFunctionMethodInsertCount = 0
-    var fallbackFunctionInterfaceInsertCount = 0
-
-    // Declaration capture + JS/TS signature extraction
-    var captureDeclarationCalls = 0
-    var jstsSignatureCallsFunctionLike = 0
-    var jstsSignatureCallsStatementLike = 0
-
-    // LanguageTypeExtractor
-    var lteMatchAnyFunctionCalls = 0
-    var lteMatchAnyVariableCalls = 0
-    var tsConstructorMatches = 0
-    var tsAccessorMatches = 0
-    var tsClassMethodMatches = 0
-    var tsClassArrowMatches = 0
-    var tsClassArrowNoParensMatches = 0
-    var tsArrowFunctionMatches = 0
-    var tsArrowFunctionParamsReturnMatches = 0
-    var tsxConstructorMatches = 0
-    var tsxAccessorMatches = 0
-    var tsxClassMethodMatches = 0
-    var tsxClassArrowMatches = 0
-    var tsxClassArrowNoParensMatches = 0
-    var tsxArrowFunctionMatches = 0
-    var tsxArrowFunctionParamsReturnMatches = 0
-    var swiftReturnTypeFastPathHits = 0
-    var tsReturnTypeFastPathHits = 0
-    var tsTypeAnnotationFastPathHits = 0
-    var tsTypeAliasRhsFastPathHits = 0
-
-    // TypeCleaner
-    var typeCleanerExtractCalls = 0
-    var typeCleanerCacheHits = 0
-    var typeCleanerCacheMisses = 0
-    var typeCleanerSwiftCalls = 0
-    var typeCleanerTSCalls = 0
-    var typeCleanerTSXCalls = 0
-    var typeCleanerJSCalls = 0
-    var typeCleanerOtherLanguageCalls = 0
-    var typeCleanerPrecleanCount = 0
-    var typeCleanerTSLogicCount = 0
-    var typeCleanerNonTSLogicCount = 0
-    var typeCleanerTSObjectLiteralCount = 0
-    var typeCleanerFilterCount = 0
-    var typeCleanerDedupCount = 0
-    var referencedTypesRawInsertions = 0
-    var referencedTypesPrefilterSkips = 0
-    var referencedTypesEmptyResults = 0
-    var referencedTypesOutputTypeCount = 0
-
-    // Extraction memo
-    var extractionMemoJSTSHits = 0
-    var extractionMemoJSTSMisses = 0
-    var extractionMemoFunctionHits = 0
-    var extractionMemoFunctionMisses = 0
-    var extractionMemoFunctionParsedHits = 0
-    var extractionMemoFunctionParsedMisses = 0
-    var extractionMemoVariableHits = 0
-    var extractionMemoVariableMisses = 0
-    var extractionMemoTSFastPathHits = 0
-    var extractionMemoTSFastPathMisses = 0
-
-    // Durations
-    var captureIndexDuration: TimeInterval = 0
-    var swiftContextDuration: TimeInterval = 0
-    var tsContextDuration: TimeInterval = 0
-    var captureLoopDuration: TimeInterval = 0
-    var captureLoopLineAdvanceDuration: TimeInterval = 0
-    var captureLoopSwiftStrategyDuration: TimeInterval = 0
-    var captureLoopTSStrategyDuration: TimeInterval = 0
-    var captureLoopInterfaceHeuristicDuration: TimeInterval = 0
-    var captureLoopImportExportDuration: TimeInterval = 0
-    var captureLoopTypeAliasDuration: TimeInterval = 0
-    var captureLoopEnumMacroDuration: TimeInterval = 0
-    var captureLoopFunctionDuration: TimeInterval = 0
-    var captureLoopVariableDuration: TimeInterval = 0
-    var captureLoopSkippedDuration: TimeInterval = 0
-    var captureLoopUnclassifiedDuration: TimeInterval = 0
-    var swiftStrategyFunctionSignatureDuration: TimeInterval = 0
-    var swiftStrategyFunctionNameLookupDuration: TimeInterval = 0
-    var swiftStrategyParameterExtractionDuration: TimeInterval = 0
-    var swiftStrategyReturnTypeExtractionDuration: TimeInterval = 0
-    var swiftStrategyPropertyDeclarationDuration: TimeInterval = 0
-    var swiftStrategyPropertyTypeExtractionDuration: TimeInterval = 0
-    var swiftStrategyEnclosingTypeLookupDuration: TimeInterval = 0
-    var swiftStrategyModelInsertionDuration: TimeInterval = 0
-    var swiftStrategyContextOnlyDuration: TimeInterval = 0
-    var fallbackFunctionDeclarationDuration: TimeInterval = 0
-    var fallbackFunctionJSTSSignatureDuration: TimeInterval = 0
-    var fallbackFunctionNameExtractionDuration: TimeInterval = 0
-    var fallbackFunctionLTEParseDuration: TimeInterval = 0
-    var fallbackFunctionTSFastPathDuration: TimeInterval = 0
-    var fallbackFunctionReferencedTypesDuration: TimeInterval = 0
-    var fallbackFunctionRoutingDuration: TimeInterval = 0
-    var fallbackFunctionModelInsertionDuration: TimeInterval = 0
-    var fallbackFunctionSkippedDuration: TimeInterval = 0
-    var captureDeclarationDuration: TimeInterval = 0
-    var jstsSignatureDuration: TimeInterval = 0
-    var languageTypeExtractorFunctionDuration: TimeInterval = 0
-    var languageTypeExtractorVariableDuration: TimeInterval = 0
-    var typeCleanerDuration: TimeInterval = 0
-    var typeCleanerSwiftDuration: TimeInterval = 0
-    var typeCleanerTSDuration: TimeInterval = 0
-    var typeCleanerTSXDuration: TimeInterval = 0
-    var typeCleanerJSDuration: TimeInterval = 0
-    var typeCleanerOtherLanguageDuration: TimeInterval = 0
-    var typeCleanerPrecleanDuration: TimeInterval = 0
-    var typeCleanerTSLogicDuration: TimeInterval = 0
-    var typeCleanerNonTSLogicDuration: TimeInterval = 0
-    var typeCleanerTSObjectLiteralDuration: TimeInterval = 0
-    var typeCleanerFilterDuration: TimeInterval = 0
-    var typeCleanerDedupDuration: TimeInterval = 0
-    var referencedTypesFinalizeDuration: TimeInterval = 0
-    var fileAPIInitDuration: TimeInterval = 0
 }

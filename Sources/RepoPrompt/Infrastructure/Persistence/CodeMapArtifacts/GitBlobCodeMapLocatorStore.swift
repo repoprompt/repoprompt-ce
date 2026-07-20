@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptCodeMapCore
 
 enum GitBlobCodeMapLocatorStoreError: Error, Equatable {
     case invalidRoot

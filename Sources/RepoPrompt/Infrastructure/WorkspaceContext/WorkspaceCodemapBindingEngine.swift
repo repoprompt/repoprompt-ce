@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 /// Inert orchestration for Git-only, artifact-backed workspace codemap bindings.
 ///

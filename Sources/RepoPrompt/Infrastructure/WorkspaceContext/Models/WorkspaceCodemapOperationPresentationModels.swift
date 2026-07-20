@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 enum WorkspaceCodemapOperationPresentationIntent: Equatable {
     case none

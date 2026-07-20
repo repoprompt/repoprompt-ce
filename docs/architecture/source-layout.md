@@ -1,6 +1,6 @@
 # Source Layout Ownership Map
 
-Current as of 2026-07-15 after the source-layout refactor, provider extraction, upstream Tree-sitter grammar migration, the thin-executable split, and the workspace path-policy core boundary. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
+Current as of 2026-07-19 after the source-layout refactor, provider extraction, upstream Tree-sitter grammar migration, the thin-executable split, and the workspace, regex, and CodeMap core boundaries. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
 
 ## Current source tree shape
 
@@ -20,7 +20,7 @@ Sources/
         Runtime/Providers/       # provider/runtime enum and provider factory shared by Context Builder, Agent Mode, MCP, and recommendations
         History/                 # cross-workspace session history scanner, MCP tool service (history.list_sessions / search / time / get_session)
       Chat/                      # chat/oracle models, services, diff state, view models, and views
-      CodeMap/                   # code-map extraction feature code and FileAPI model
+      CodeMap/                   # app CodeMap orchestration, persistence, provenance/decoding, presentation, and selection policy
       ContextBuilder/            # Context Builder product UI/runtime, view models, settings, prompts, budget defaults, and response-type mapping
       Diagnostics/               # app-integrated benchmark/debug/stress/diagnostic surfaces
       Prompt/                    # prompt UI, copy/prompt models, packaging, accounting, compact selected-files components, and view models
@@ -46,6 +46,8 @@ Sources/
       VCS/                       # git/VCS substrate
       WorkspaceContext/          # context store, indexing, path lookup, slices, search, token accounting
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
+  RepoPromptCodeMapCore/        # internal deterministic synchronous parsing/query/extraction and canonical artifact core
+  RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
   RepoPromptWorkspaceCore/      # internal Foundation-only workspace path values and deterministic policies
   RepoPromptShared/
     MCP/                         # shared app/CLI MCP control protocol definitions
@@ -54,11 +56,13 @@ Sources/
   CSwiftPCRE2/                   # C PCRE2 target
   TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
 Tests/
+  RepoPromptCodeMapCoreTests/    # sole owner of pure CodeMap fixtures, goldens, and deterministic core tests
+  RepoPromptRegexCoreTests/      # direct reusable regex runtime tests
   RepoPromptWorkspaceCoreTests/  # direct deterministic tests owned by RepoPromptWorkspaceCore
-  RepoPromptTests/               # XCTest tests, support, and fixtures
+  RepoPromptTests/               # app integration, persistence, workspace, presentation, UI, and MCP tests
 ```
 
-The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. `RepoPromptWorkspaceCore` is an internal, Foundation-only dependency of `RepoPromptApp`, is not exposed as a package product, and has a direct owning test target. Root app tests import `RepoPromptApp`; the separate `RepoPromptMCP` executable dependency remains unchanged.
+The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, and `RepoPromptWorkspaceCore` are internal dependencies of `RepoPromptApp`, are not exposed as package products, and have direct owning test targets. `RepoPromptCodeMapCoreTests` is the sole resource owner for pure CodeMap parser fixtures and goldens. Root app tests import `RepoPromptApp`; the separate `RepoPromptMCP` executable dependency remains unchanged.
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
@@ -84,6 +88,9 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
 - Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket.
+- Deterministic synchronous CodeMap grammar descriptors, CodeMap-only queries, invocation-local parsing/extraction, provenance-free decoded source values, pipeline/key canonical encoding, artifact outcomes, and path-free canonical rendering belong under `Sources/RepoPromptCodeMapCore`; pure fixtures/goldens and owner tests belong only under `Tests/RepoPromptCodeMapCoreTests`.
+- Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, CAS/persistence, workspace authority, token/path/import presentation, highlighting, UI/MCP, and selection-graph policy in `RepoPromptApp`. App highlighting retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
+- Reusable PCRE2 wrapper/JIT construction belongs under `Sources/RepoPromptRegexCore`; app search policy, limits, repair, and presentation remain app-owned.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
 - Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
@@ -96,7 +103,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
 - New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
-- New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
+- App-owned test doubles, integration fixtures, sample projects, benchmark-only data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target. Pure CodeMap parser fixtures/goldens are the documented exception and belong only to `RepoPromptCodeMapCoreTests`.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
 - Keep `App/WindowState.swift` in `App` until there is a separate composition-root refactor; physical moves must preserve initialization order.
@@ -123,13 +130,13 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 - `App/WindowState.swift` remains the composition root and continues to instantiate/pause the DEBUG-only `AgentChatStressHarness`. This is wiring only; harness implementation lives under Diagnostics.
 - `Infrastructure/Security/EphemeralSecureKeyValueStore.swift` remains with security storage code, not Diagnostics, because it is a required debug-app secure-storage backend rather than a fixture or visible diagnostic harness. It is `#if DEBUG`, in-memory only, and preserves existing debug behavior for ad-hoc/ephemeral secure storage.
 
+No top-level `Sources/RepoPrompt/Notifications` exception remains; app-wide notification-name extensions now live under `Sources/RepoPrompt/App/Notifications`.
+
 ### Tree-sitter scanner linker compatibility target
 
-- `Sources/TreeSitterScannerSupport` is an internal C linker compatibility target, not a restored local grammar target. It contains byte-for-byte exact-snapshot copies of the upstream JavaScript and Python `scanner.c` implementations plus their required `tree_sitter` helper headers. It does not contain parser copies, grammar definitions, queries, or CE-authored scanner code.
-- Clean coordinated SwiftPM root graphs compile the exact-pinned upstream JavaScript and Python parser objects but omit their scanner objects, leaving unresolved external-scanner ABI symbols. `TreeSitterScannerSupport` supplies only those missing symbols while CE continues linking the upstream package products.
-- The tracked checksum manifest at [`ThirdPartyLicenses/tree-sitter/scanner-support.sha256`](../../ThirdPartyLicenses/tree-sitter/scanner-support.sha256) protects the copied snapshots from drift. Do not expand this target, restore the seven retired local grammar directories, or replace the target with transient `.build/checkouts` mutation. Remove the target, guardrails, checksums, and this exception together only after validated upstream revisions or SwiftPM behavior compile the scanners directly from the dependency products in a clean graph.
-
-No top-level `Sources/RepoPrompt/Notifications` exception remains; app-wide notification-name extensions now live under `Sources/RepoPrompt/App/Notifications`.
+- `Sources/TreeSitterScannerSupport` is an internal C linker compatibility target, not a restored local grammar target. It contains byte-for-byte exact-snapshot copies of the pinned upstream JavaScript and Python `scanner.c` implementations plus their required `tree_sitter` helper headers. It does not contain parser copies, grammar definitions, queries, or CE-authored scanner code.
+- Although the upgraded grammar manifests list `scanner.c`, their `FileManager.default.fileExists` source probes evaluate false in this root package graph. A clean coordinated link without this target fails on the JavaScript/Python external-scanner ABI symbols, so `TreeSitterScannerSupport` remains necessary while CE continues linking the upstream grammar products directly.
+- [`ThirdPartyLicenses/tree-sitter/scanner-support.sha256`](../../ThirdPartyLicenses/tree-sitter/scanner-support.sha256) protects the exact snapshots from drift. Do not expand this target, restore retired local grammar directories, or mutate `.build/checkouts`. Remove the target, guardrails, checksums, and this exception together only after a future clean coordinated link proves the pinned upstream products compile their scanners.
 
 ## Generated IDE artifacts
 
@@ -152,13 +159,13 @@ make guardrails
 The guardrail script verifies:
 
 - the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the `RepoPromptApp` implementation declares none;
-- `RepoPromptWorkspaceCore` and its owning test target retain their internal manifest topology, remain unexposed as products, and keep a Foundation-only compiler import boundary;
+- `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and their owning test targets retain internal manifest topology and remain unexposed as products; the CodeMap core owns grammar/scanner edges while the app retains only direct `SwiftTreeSitter` highlighting linkage;
 - `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
-- the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired in `Package.swift`, preserves the seven migrated grammar pins/products in `Package.swift` and `Package.resolved`, and keeps the seven retired local grammar directories absent;
+- the exact SwiftTreeSitter/runtime and complete grammar requirement/resolved-revision set remain pinned in `Package.swift` and `Package.resolved`, `RepoPromptCodeMapCore` imports the grammar modules directly, `SyntaxManager` retains direct `SwiftTreeSitter` linkage for highlighting, retired local grammar directories remain absent, and the narrow `TreeSitterScannerSupport` target contains only its approved exact-snapshot files with matching checksums;
 - Agent/MCP runtime code does not depend on `WorkspaceFilesViewModel`, `FileViewModel`, or `FolderViewModel`;
 - removed native-tree/search artifact paths are not tracked again;
 - removed native-tree/search/eager-loading symbols such as `AgentFileTreeBottomPanelView`, `FileTreeViewWrapper`, `FileTreeViewController`, `NativeFileTree`, `SearchFileTreeViewModel`, `RootDescendantMaterialization`, `legacyMaterializedRootKeys`, `legacyMaterializeDescendantsRecursively`, and `legacyEager` are not referenced from app source;

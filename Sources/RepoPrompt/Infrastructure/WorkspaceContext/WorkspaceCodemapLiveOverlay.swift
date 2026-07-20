@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 actor WorkspaceCodemapLiveOverlay {
     private struct Registration: Equatable {

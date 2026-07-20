@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class PromptContextPreAssemblyServiceTests: XCTestCase {
@@ -410,7 +411,12 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             ]
         )
         addTeardownBlock { repositoryFixture.cleanup() }
-        let store = WorkspaceFileContextStore(codemapProjectionPreloadLaunchPolicyForTesting: .disabled)
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let store = codemapFixture.makeStore(
+            codemapLocalGitClassificationProbe: .production,
+            codemapGitEligibilityProbe: .production(),
+            codemapProjectionPreloadLaunchPolicy: .disabled
+        )
         _ = try await store.loadRoot(path: logicalRoot.path)
         let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
             sessionID: UUID(),

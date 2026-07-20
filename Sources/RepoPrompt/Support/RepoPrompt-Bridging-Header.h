@@ -18,22 +18,6 @@
 #endif
 
 
-// Forward declare TSLanguage so the compiler knows it's a struct.
-typedef struct TSLanguage TSLanguage;
-
-const TSLanguage * tree_sitter_javascript(void);
-const TSLanguage * tree_sitter_python(void);
-const TSLanguage * tree_sitter_c_sharp(void);
-const TSLanguage * tree_sitter_swift(void);
-const TSLanguage * tree_sitter_c(void);
-const TSLanguage * tree_sitter_cpp(void);
-const TSLanguage * tree_sitter_rust(void);
-const TSLanguage * tree_sitter_go(void);
-const TSLanguage * tree_sitter_java(void);    // Java support added
-const TSLanguage * tree_sitter_dart(void);    // Dart support added
-const TSLanguage * tree_sitter_php(void);    // Dart support added
-const TSLanguage * tree_sitter_ruby(void);   // Ruby support added
-
 // Bundled wildmatch matcher for gitignore-compatible pattern matching
 int repo_wildmatch(const char *pattern, const char *text, unsigned int flags);
 

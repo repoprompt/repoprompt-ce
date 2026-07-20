@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 struct WorkspaceCodemapSelectionGraphBindingGeneration: RawRepresentable, Hashable, Comparable {
     let rawValue: UInt64

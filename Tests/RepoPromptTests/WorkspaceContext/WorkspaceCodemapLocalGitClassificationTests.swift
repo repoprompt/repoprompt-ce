@@ -212,7 +212,8 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         addTeardownBlock { gitFixture.cleanup() }
         let gitPreflightCount = AsyncCounter()
         let productionGitEligibility = WorkspaceCodemapGitEligibilityProbe.production().resolve
-        let store = WorkspaceFileContextStore(
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let store = codemapFixture.makeStore(
             codemapLocalGitClassificationProbe: .production,
             codemapGitEligibilityProbe: .init { rootURL in
                 await gitPreflightCount.increment()
