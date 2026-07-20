@@ -215,7 +215,7 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         maximumTotalWaiterCount: Int = 512,
         maximumWaitersPerFlight: Int = 64,
         maximumQueuedBuildCount: Int = 128,
-        maximumConcurrentBuildCount: Int = 1,
+        maximumConcurrentBuildCount: Int = FileSystemService.codeMapArtifactBuildBulkPermitLimit,
         maximumLocatorIdentitiesPerFlight: Int = 16,
         maximumRetainedInputByteCount: Int = 128 * 1024 * 1024,
         maximumPendingHookEventCount: Int = 256,
@@ -332,6 +332,7 @@ struct CodeMapArtifactBuilderClient: @unchecked Sendable {
 
     init(
         clock: CodeMapArtifactBuildCoordinatorClock = .continuous,
+        syntaxManager: SyntaxManager = .shared,
         withPermit: @escaping @Sendable (
             UUID,
             TaskPriority,
@@ -352,7 +353,8 @@ struct CodeMapArtifactBuilderClient: @unchecked Sendable {
                 try Task.checkCancellation()
                 let outcome = try CodeMapSyntaxArtifactBuilder.build(
                     source: input.source,
-                    language: input.language
+                    language: input.language,
+                    syntaxManager: syntaxManager
                 )
                 let buildEnd = clock.nowNanoseconds()
                 try Task.checkCancellation()
