@@ -177,9 +177,9 @@ actor MCPBootstrapLease {
     private var policyInstalled = false
     private var didSignalRoutingFailure = false
     private var didReleaseGate = false
-    // Lease-local terminal memory survives teardown of the process-global waiter state. Because a
-    // lease is permanently scoped to one immutable run and releaseRouting is one-shot, this cache
-    // cannot confer routing authority on a successor run.
+    /// Lease-local terminal memory survives teardown of the process-global waiter state. Because a
+    /// lease is permanently scoped to one immutable run and releaseRouting is one-shot, this cache
+    /// cannot confer routing authority on a successor run.
     private var routingTerminalOutcome: MCPRoutingWaitOutcome?
     // Memoized in-flight cleanup operations backing the joinable clear/teardown (see clearPolicyOnce()).
     private var policyClearOperation: Task<Void, Never>?

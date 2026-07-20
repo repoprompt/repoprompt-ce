@@ -111,7 +111,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertEqual(redundantProgressResult.droppedNonterminalEventCount, 40)
 
         let protectedEventBounded = ContextBuilderRouteSettlementCoordinator(
-            maxBufferedTextCharacters: 1_000,
+            maxBufferedTextCharacters: 1000,
             maxBufferedEventCount: 3
         )
         let protectedEvents = [
