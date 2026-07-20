@@ -695,28 +695,28 @@ enum BashToolResultParser {
         pattern: #"process\s+completed\s+with\s+exit\s+code\s+(-?[0-9]+)"#,
         options: [.caseInsensitive]
     )
-    private static let jsonStatusRegex = try! NSRegularExpression(
-        pattern: #"[\"']status[\"']\s*:\s*[\"']([^\"']+)[\"']"#,
+    private static let jsonStatusRegex = try? NSRegularExpression(
+        pattern: #"["']status["']\s*:\s*["']([^"']+)["']"#,
         options: [.caseInsensitive]
     )
-    private static let jsonProcessIDRegex = try! NSRegularExpression(
-        pattern: #"[\"']process_?id[\"']\s*:\s*[\"']?([^\"',}\s]+)"#,
+    private static let jsonProcessIDRegex = try? NSRegularExpression(
+        pattern: #"["']process_?id["']\s*:\s*["']?([^"',}\s]+)"#,
         options: [.caseInsensitive]
     )
-    private static let jsonExitCodeRegex = try! NSRegularExpression(
-        pattern: #"[\"'](?:exitCode|exit_code|code)[\"']\s*:\s*(-?[0-9]+)"#,
+    private static let jsonExitCodeRegex = try? NSRegularExpression(
+        pattern: #"["'](?:exitCode|exit_code|code)["']\s*:\s*(-?[0-9]+)"#,
         options: [.caseInsensitive]
     )
-    private static let jsonDurationRegex = try! NSRegularExpression(
-        pattern: #"[\"'](?:durationMs|duration_ms|duration)[\"']\s*:"#,
+    private static let jsonDurationRegex = try? NSRegularExpression(
+        pattern: #"["'](?:durationMs|duration_ms|duration)["']\s*:"#,
         options: [.caseInsensitive]
     )
-    private static let jsonSuccessFlagRegex = try! NSRegularExpression(
-        pattern: #"[\"'](?:success|ok)[\"']\s*:\s*true"#,
+    private static let jsonSuccessFlagRegex = try? NSRegularExpression(
+        pattern: #"["'](?:success|ok)["']\s*:\s*true"#,
         options: [.caseInsensitive]
     )
-    private static let jsonErrorTextRegex = try! NSRegularExpression(
-        pattern: #"[\"']error[\"']\s*:\s*[\"'][^\"']+[\"']"#,
+    private static let jsonErrorTextRegex = try? NSRegularExpression(
+        pattern: #"["']error["']\s*:\s*["'][^"']+["']"#,
         options: [.caseInsensitive]
     )
     private static let livenessScanCharacterLimit = 32768
@@ -749,21 +749,21 @@ enum BashToolResultParser {
         }
         let scanText = livenessScanText(from: trimmed)
         let plainTextHint = plainTextCommandExecutionHint(raw: scanText)
-        let capturedStatusWord = captureFirstGroup(in: scanText, regex: jsonStatusRegex, group: 1)?
+        let capturedStatusWord = jsonStatusRegex.flatMap { captureFirstGroup(in: scanText, regex: $0, group: 1) }?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let statusWord = capturedStatusWord ?? plainTextHint.statusWord
-        let capturedExitCode = captureFirstGroup(in: scanText, regex: jsonExitCodeRegex, group: 1).flatMap(Int.init)
+        let capturedExitCode = jsonExitCodeRegex.flatMap { captureFirstGroup(in: scanText, regex: $0, group: 1) }.flatMap(Int.init)
         let exitCode = capturedExitCode ?? plainTextHint.exitCode
-        let processID = captureFirstGroup(in: scanText, regex: jsonProcessIDRegex, group: 1) ?? plainTextHint.processID
+        let processID = jsonProcessIDRegex.flatMap { captureFirstGroup(in: scanText, regex: $0, group: 1) } ?? plainTextHint.processID
         let scanRange = NSRange(scanText.startIndex ..< scanText.endIndex, in: scanText)
-        let hasDurationHint = jsonDurationRegex.firstMatch(
+        let hasDurationHint = jsonDurationRegex?.firstMatch(
             in: scanText,
             options: [],
             range: scanRange
         ) != nil
-        let hasSuccessFlag = jsonSuccessFlagRegex.firstMatch(in: scanText, options: [], range: scanRange) != nil
-        let hasErrorText = jsonErrorTextRegex.firstMatch(in: scanText, options: [], range: scanRange) != nil
+        let hasSuccessFlag = jsonSuccessFlagRegex?.firstMatch(in: scanText, options: [], range: scanRange) != nil
+        let hasErrorText = jsonErrorTextRegex?.firstMatch(in: scanText, options: [], range: scanRange) != nil
         let isSummaryOnly = scanText.range(of: #""summary_only"\s*:\s*true"#, options: [.regularExpression, .caseInsensitive]) != nil
             || scanText.range(of: #""summaryOnly"\s*:\s*true"#, options: [.regularExpression, .caseInsensitive]) != nil
         let isRunning: Bool = {
