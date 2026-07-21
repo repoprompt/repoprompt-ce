@@ -36,9 +36,11 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 TERMINAL_STATES = {"completed", "failed", "canceled"}
-LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
+ROOT_BUILD_LANE = "rootBuild"
+PROVIDER_BUILD_LANE = "providerBuild"
+LANE_NAMES = {ROOT_BUILD_LANE, PROVIDER_BUILD_LANE, "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 SUMMARY_VERSION = 1
@@ -154,7 +156,7 @@ Operation commands:
 Foundation validation operation:
   ./conductor sleep <seconds> [--lane <lane>]... [--message <text>] [--exit-code <n>]
   ./conductor fake-sleep <seconds> [same options]
-  valid lanes: build, debugArtifact, liveApp, release, style
+  valid lanes: rootBuild, providerBuild, debugArtifact, liveApp, release, style
 
 Global operation flags:
   --async              enqueue and return a ticket immediately
@@ -1058,7 +1060,10 @@ def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
     if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
         return True
-    if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
+    if operation in {"sleep", "fake-sleep"} and set(args.get("lanes") or []) & {
+        ROOT_BUILD_LANE,
+        PROVIDER_BUILD_LANE,
+    }:
         return True
     if operation == "release" and args.get("subcommand") in {"artifact", "package", "local-install"}:
         return True
@@ -1338,7 +1343,7 @@ class OperationRegistry:
         if operation == "guardrails":
             return [script("guardrails.sh")], lanes, cwd, env, effective_timeout
         if operation == "format":
-            return [script("swift_style.sh"), "format"], ["style", "build"], cwd, env, effective_timeout
+            return [script("swift_style.sh"), "format"], ["style", ROOT_BUILD_LANE, PROVIDER_BUILD_LANE], cwd, env, effective_timeout
         if operation == "format-check":
             return [script("swift_style.sh"), "format-check"], ["style"], cwd, env, effective_timeout
         if operation == "lint":
@@ -1351,15 +1356,15 @@ class OperationRegistry:
             return [script("install_format_tools.sh"), "install"], ["style"], cwd, env, effective_timeout
         if operation == "swift-build":
             product = args.get("product")
-            lanes = ["build"]
+            lanes = [ROOT_BUILD_LANE]
             if product == "all":
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
             return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
         if operation == "build":
-            return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
+            return [script("package_app.sh"), "debug"], [ROOT_BUILD_LANE, "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
             config = str(args.get("config"))
-            lanes = ["build", "debugArtifact"] + (["release"] if config == "release" else [])
+            lanes = [ROOT_BUILD_LANE, "debugArtifact"] + (["release"] if config == "release" else [])
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
             argv = ["swift", "test"]
@@ -1369,7 +1374,7 @@ class OperationRegistry:
                 argv.append("list")
             elif args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
-            return argv, ["build"], cwd, env, effective_timeout
+            return argv, [ROOT_BUILD_LANE], cwd, env, effective_timeout
         if operation == "provider-test":
             argv = ["swift", "test"]
             if args.get("testProduct"):
@@ -1378,13 +1383,13 @@ class OperationRegistry:
                 argv.append("list")
             elif args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
-            return argv, ["build"], self.repo_root / "Packages" / "RepoPromptAgentProviders", env, effective_timeout
+            return argv, [PROVIDER_BUILD_LANE], self.repo_root / "Packages" / "RepoPromptAgentProviders", env, effective_timeout
         if operation == "install-debug-cli":
-            return [script("install_debug_cli.sh"), "install", "--build"], ["build", "debugArtifact"], cwd, env, effective_timeout
+            return [script("install_debug_cli.sh"), "install", "--build"], [ROOT_BUILD_LANE, "debugArtifact"], cwd, env, effective_timeout
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
         if operation == "run":
-            return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
+            return self._internal_argv("debug_app_build_then_launch", dict(args)), [ROOT_BUILD_LANE, "liveApp"], cwd, env, effective_timeout
         if operation == "app":
             subcommand = args.get("subcommand")
             if subcommand == "stop":
@@ -1395,11 +1400,11 @@ class OperationRegistry:
             if subcommand == "launch-existing":
                 return self._internal_argv("app_launch_existing", dict(args)), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "relaunch":
-                return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
+                return self._internal_argv("debug_app_build_then_launch", dict(args)), [ROOT_BUILD_LANE, "liveApp"], cwd, env, effective_timeout
         if operation == "smoke":
             lanes = ["debugArtifact", "liveApp"]
             if args.get("launch"):
-                lanes = ["liveApp"]
+                lanes = [ROOT_BUILD_LANE, "liveApp"]
             elif args.get("packagedApp"):
                 lanes = ["liveApp"]
             smoke_args = dict(args)
@@ -1414,11 +1419,11 @@ class OperationRegistry:
         if operation == "release":
             subcommand = args.get("subcommand")
             if subcommand == "package":
-                return [script("package_app.sh"), "release"], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
+                return [script("package_app.sh"), "release"], [ROOT_BUILD_LANE, "debugArtifact", "release"], cwd, env, effective_timeout
             if subcommand == "local-install":
-                return [script("install_local_production.sh")], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
+                return [script("install_local_production.sh")], [ROOT_BUILD_LANE, "debugArtifact", "release"], cwd, env, effective_timeout
             if subcommand == "artifact":
-                return [script("release.sh"), "artifact"], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
+                return [script("release.sh"), "artifact"], [ROOT_BUILD_LANE, "debugArtifact", "release"], cwd, env, effective_timeout
             if subcommand == "preflight":
                 release_script = self.repo_root / "Scripts" / "release.sh"
                 if release_script.exists():
@@ -1561,8 +1566,27 @@ class DaemonState:
 
     def _job_payload_locked(self, job: Job, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         payload = job.to_payload(include_tail=include_tail, include_summary=include_summary)
+        queue_end = job.started_at or job.finished_at or now()
+        queue_age_seconds = max(0.0, queue_end - job.created_at)
+        payload["queueAgeSeconds"] = queue_age_seconds
+        payload["resourceWaitSeconds"] = queue_age_seconds if job.lanes else None
         if job.state == "queued":
-            payload["blockedBy"] = self._blocked_by_locked(job)
+            blockers = self._blocked_by_locked(job)
+            payload["blockedBy"] = blockers
+            waiting_for = sorted(
+                {
+                    lane
+                    for blocker in blockers
+                    for lane in blocker.get("conflictingLanes", [])
+                }
+            )
+            payload["resourceStatus"] = "waiting" if waiting_for else "ready"
+            payload["waitingForResources"] = waiting_for
+        elif job.state == "running":
+            payload["resourceStatus"] = "acquired"
+            payload["acquiredResources"] = list(job.lanes)
+        else:
+            payload["resourceStatus"] = "released"
         return payload
 
     def _blocked_by_locked(self, job: Job) -> List[Dict[str, Any]]:

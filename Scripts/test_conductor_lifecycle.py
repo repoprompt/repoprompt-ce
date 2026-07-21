@@ -77,7 +77,7 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 10)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 11)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -189,7 +189,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(enqueue_launch.call_args.args[2], {"subcommand": "launch-existing", "appArgs": ["--demo"]})
 
-    def test_app_relaunch_delegates_split_internal_runner_with_live_lane_and_timeout(self) -> None:
+    def test_app_relaunch_owns_root_build_and_live_app_resources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
             argv, lanes, _cwd, _env, timeout = registry.prepare(
@@ -201,11 +201,24 @@ class LifecycleQueueTests(LifecycleTestCase):
 
         self.assertIn("__operation_runner", argv)
         self.assertIn("debug_app_build_then_launch", argv[-1])
-        self.assertEqual(lanes, ["liveApp"])
+        self.assertEqual(lanes, [conductor.ROOT_BUILD_LANE, "liveApp"])
         self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
         self.assertIn("app_launch_existing", launch_existing_argv[-1])
         self.assertEqual(launch_existing_lanes, ["liveApp"])
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
+
+    def test_run_and_launch_smoke_own_root_build_and_live_app_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            _argv, run_lanes, _cwd, _env, _timeout = registry.prepare(
+                {"operation": "run", "args": {"appArgs": []}}
+            )
+            _argv, smoke_lanes, _cwd, _env, _timeout = registry.prepare(
+                {"operation": "smoke", "args": {"launch": True}}
+            )
+
+        self.assertEqual(run_lanes, [conductor.ROOT_BUILD_LANE, "liveApp"])
+        self.assertEqual(smoke_lanes, [conductor.ROOT_BUILD_LANE, "liveApp"])
 
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,7 +244,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(enqueue.call_args.args[2], {"subcommand": "artifact"})
         self.assertEqual(Path(argv[0]).name, "release.sh")
         self.assertEqual(argv[1], "artifact")
-        self.assertEqual(lanes, ["build", "debugArtifact", "release"])
+        self.assertEqual(lanes, [conductor.ROOT_BUILD_LANE, "debugArtifact", "release"])
         self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
 
     def test_packaged_smoke_uses_only_live_app_lane(self) -> None:
@@ -303,7 +316,7 @@ class LifecycleQueueTests(LifecycleTestCase):
             )
 
         self.assertEqual(Path(argv[0]).name, "install_local_production.sh")
-        self.assertEqual(lanes, ["build", "debugArtifact", "release"])
+        self.assertEqual(lanes, [conductor.ROOT_BUILD_LANE, "debugArtifact", "release"])
         self.assertEqual(env["CONFIRM_LOCAL_PRODUCTION_INSTALL"], "1")
         self.assertNotIn("LOCAL_SELF_SIGNED_CERTIFICATE_NAME", env)
         self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
@@ -779,16 +792,100 @@ class LifecycleQueueTests(LifecycleTestCase):
     def test_queued_payload_identifies_active_lane_blocker(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
-        active = self.make_job(state, "build-active", "build", {}, ["build"], "running")
-        waiting = self.make_job(state, "relaunch", "app", {"subcommand": "relaunch"}, ["build", "debugArtifact", "liveApp"])
+        active = self.make_job(state, "build-active", "build", {}, [conductor.ROOT_BUILD_LANE], "running")
+        waiting = self.make_job(
+            state,
+            "relaunch",
+            "app",
+            {"subcommand": "relaunch"},
+            [conductor.ROOT_BUILD_LANE, "debugArtifact", "liveApp"],
+        )
         state.jobs = {active.ticket: active, waiting.ticket: waiting}
-        state.active_lanes = {"build": active.ticket}
+        state.active_lanes = {conductor.ROOT_BUILD_LANE: active.ticket}
         state.queue = [waiting.ticket]
 
         payload = state.job_status(waiting.ticket, None)
 
         self.assertEqual(payload["blockedBy"][0]["ticket"], active.ticket)
-        self.assertEqual(payload["blockedBy"][0]["conflictingLanes"], ["build"])
+        self.assertEqual(payload["blockedBy"][0]["conflictingLanes"], [conductor.ROOT_BUILD_LANE])
+        self.assertEqual(payload["resourceStatus"], "waiting")
+        self.assertEqual(payload["waitingForResources"], [conductor.ROOT_BUILD_LANE])
+        self.assertGreaterEqual(payload["queueAgeSeconds"], 0)
+        self.assertEqual(payload["resourceWaitSeconds"], payload["queueAgeSeconds"])
+
+    def test_canceled_queued_payload_freezes_resource_wait_at_finish_time(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "now", side_effect=[100.0, 110.0, 200.0]):
+            job = self.make_job(state, "queued-canceled", "build", {}, [conductor.ROOT_BUILD_LANE])
+            state.jobs = {job.ticket: job}
+            state.queue = [job.ticket]
+
+            state.job_cancel(job.ticket, None)
+            payload = state.job_status(job.ticket, None)
+
+        self.assertEqual(job.state, "canceled")
+        self.assertEqual(job.finished_at, 110.0)
+        self.assertEqual(payload["queueAgeSeconds"], 10.0)
+        self.assertEqual(payload["resourceWaitSeconds"], 10.0)
+        self.assertEqual(payload["resourceStatus"], "released")
+
+    def test_scheduler_runs_independent_provider_resource_past_blocked_root_work(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        active = self.make_job(state, "root-active", "test", {}, [conductor.ROOT_BUILD_LANE], "running")
+        older = self.make_job(
+            state,
+            "root-package",
+            "build",
+            {},
+            [conductor.ROOT_BUILD_LANE, "debugArtifact"],
+        )
+        debug = self.make_job(state, "debug-reader", "smoke", {}, ["debugArtifact"])
+        provider = self.make_job(state, "provider", "provider-test", {}, [conductor.PROVIDER_BUILD_LANE])
+        state.jobs = {job.ticket: job for job in [active, older, debug, provider]}
+        state.active_lanes = {conductor.ROOT_BUILD_LANE: active.ticket}
+        state.queue = [older.ticket, debug.ticket, provider.ticket]
+
+        with mock.patch.object(conductor.threading, "Thread") as thread:
+            with state.condition:
+                state._schedule_locked()
+
+        self.assertEqual(state.queue, [older.ticket, debug.ticket])
+        self.assertEqual(older.state, "queued")
+        self.assertEqual(debug.state, "queued")
+        self.assertEqual(provider.state, "running")
+        self.assertEqual(state.active_lanes[conductor.PROVIDER_BUILD_LANE], provider.ticket)
+        thread.assert_called_once_with(target=state._run_job, args=(provider.ticket,), daemon=True)
+        thread.return_value.start.assert_called_once_with()
+
+    def test_scheduler_preserves_fifo_for_each_conflicting_resource(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        active = self.make_job(state, "root-active", "test", {}, [conductor.ROOT_BUILD_LANE], "running")
+        older = self.make_job(
+            state,
+            "older",
+            "build",
+            {},
+            [conductor.ROOT_BUILD_LANE, "debugArtifact"],
+        )
+        later = self.make_job(state, "later", "smoke", {}, ["debugArtifact"])
+        state.jobs = {job.ticket: job for job in [active, older, later]}
+        state.active_lanes = {conductor.ROOT_BUILD_LANE: active.ticket}
+        state.queue = [older.ticket, later.ticket]
+
+        with mock.patch.object(conductor.threading, "Thread") as thread:
+            with state.condition:
+                state._schedule_locked()
+
+        self.assertEqual(state.queue, [older.ticket, later.ticket])
+        self.assertEqual(older.state, "queued")
+        self.assertEqual(later.state, "queued")
+        thread.assert_not_called()
+        later_payload = state.job_status(later.ticket, None)
+        self.assertEqual(later_payload["blockedBy"][0]["ticket"], older.ticket)
+        self.assertEqual(later_payload["waitingForResources"], ["debugArtifact"])
 
     def wait_for_terminal_job(self, state: conductor.DaemonState, ticket: str, timeout: float = 5.0) -> conductor.Job:
         deadline = time.monotonic() + timeout
@@ -824,7 +921,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         )
         return conductor.DaemonState(paths)
 
-    def test_global_heavy_slot_serializes_build_lane_jobs_across_daemons(self) -> None:
+    def test_global_heavy_slot_serializes_heavy_resource_jobs_across_daemons(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -840,13 +937,13 @@ class LifecycleQueueTests(LifecycleTestCase):
             payload_a = state_a.enqueue(
                 {
                     "operation": "fake-sleep",
-                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-a"},
+                    "args": {"seconds": 0.25, "lanes": [conductor.ROOT_BUILD_LANE], "message": "daemon-a"},
                 }
             )
             payload_b = state_b.enqueue(
                 {
                     "operation": "fake-sleep",
-                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-b"},
+                    "args": {"seconds": 0.25, "lanes": [conductor.ROOT_BUILD_LANE], "message": "daemon-b"},
                 }
             )
             job_a = self.wait_for_terminal_job(state_a, payload_a["ticket"])
@@ -885,7 +982,7 @@ class LifecycleQueueTests(LifecycleTestCase):
             payload = state.enqueue(
                 {
                     "operation": "fake-sleep",
-                    "args": {"seconds": 0.5, "lanes": ["build"], "message": "blocked"},
+                    "args": {"seconds": 0.5, "lanes": [conductor.ROOT_BUILD_LANE], "message": "blocked"},
                 }
             )
             ticket = payload["ticket"]
@@ -936,14 +1033,14 @@ class LifecycleQueueTests(LifecycleTestCase):
             payload_a = state_a.enqueue(
                 {
                     "operation": "fake-sleep",
-                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-a"},
+                    "args": {"seconds": 0.25, "lanes": [conductor.ROOT_BUILD_LANE], "message": "daemon-a"},
                     "env": {"REPOPROMPT_DEV_HEAVY_SLOTS": "2"},
                 }
             )
             payload_b = state_b.enqueue(
                 {
                     "operation": "fake-sleep",
-                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-b"},
+                    "args": {"seconds": 0.25, "lanes": [conductor.ROOT_BUILD_LANE], "message": "daemon-b"},
                     "env": {"REPOPROMPT_DEV_HEAVY_SLOTS": "2"},
                 }
             )
@@ -1643,10 +1740,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             root_argv,
             ["swift", "test", "--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
         )
-        self.assertEqual(root_lanes, ["build"])
+        self.assertEqual(root_lanes, [conductor.ROOT_BUILD_LANE])
         self.assertEqual(root_cwd, state.paths.repo_root)
 
-    def test_test_list_cli_preserves_build_lane_and_package_roots(self) -> None:
+    def test_test_list_cli_uses_package_specific_resources_and_roots(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
@@ -1664,10 +1761,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         )
 
         self.assertEqual(root_argv, ["swift", "test", "list"])
-        self.assertEqual(root_lanes, ["build"])
+        self.assertEqual(root_lanes, [conductor.ROOT_BUILD_LANE])
         self.assertEqual(root_cwd, state.paths.repo_root)
         self.assertEqual(provider_argv, ["swift", "test", "list"])
-        self.assertEqual(provider_lanes, ["build"])
+        self.assertEqual(provider_lanes, [conductor.PROVIDER_BUILD_LANE])
         self.assertEqual(
             provider_cwd,
             state.paths.repo_root / "Packages" / "RepoPromptAgentProviders",
