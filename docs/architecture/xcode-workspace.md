@@ -7,14 +7,14 @@ RepoPrompt CE provides a generated, disposable Xcode workspace for development c
 Xcode 26 and Python 3 are required.
 
 ```bash
-make xcode            # generate, validate package acquisition, and open
+make xcode            # generate and open
 make xcode-generate   # generate without opening
 make xcode-check      # verify existing output is current
 make xcode-validate   # regenerate, check structure, and run xcodebuild -list
 make xcode-clean      # remove generated workspace metadata
 ```
 
-The generator writes `.build/xcode/RepoPromptCE.xcworkspace`. Everything under `.build/xcode` is derived and ignored; never edit or commit it. Regenerate after changes to the package manifest, lockfile, generator, or Xcode workflow wrapper. `make xcode` runs the same package-acquisition and `xcodebuild -list` gate as `make xcode-validate` before opening, so Xcode is not launched with an unresolved workspace.
+The generator writes `.build/xcode/RepoPromptCE.xcworkspace`. Everything under `.build/xcode` is derived and ignored; never edit or commit it. Regenerate after changes to the package manifest, lockfile, generator, or Xcode workflow wrapper. `make xcode` generates the workspace before opening it; use `make xcode-validate` when explicit package-acquisition and `xcodebuild -list` validation is required.
 
 ## Schemes in Xcode 26.3
 
@@ -27,8 +27,6 @@ The native `RepoPrompt` product scheme retains the shipped product, target, and 
 - `RepoPrompt CE Tests` delegates to the conductor test runner. Root tests import `RepoPromptApp`, but retain their separate `RepoPromptMCP` dependency/imports; the scheme remains a legacy build target rather than a native Xcode test bundle because `RepoPromptMCP` is executable-only.
 
 The native product schemes are useful for source navigation and indexing. Use `RepoPrompt CE Tests` for the supported full test workflow; optional `REPOPROMPT_XCODE_TEST_FILTER` narrows the delegated run. External dependency test targets are not added to RepoPrompt schemes. Sparkle's vendored XCFramework declares a `dSYMs` directory that is not present in the repository, so native Xcode package builds involving the app can fail before compilation. The generator deliberately does not mutate `Vendor/`; the packaged app convenience scheme remains the supported app build.
-
-Xcode updates repository gitlinks while acquiring the package graph, before scheme reachability can exclude dependency-only test support. The pinned official graph includes a public GitHub submodule URL expressed with SSH syntax. For the validation/acquisition subprocess only, the generator appends a Git configuration environment entry that maps `git@github.com:` to the same official `https://github.com/` transport. Existing caller-supplied `GIT_CONFIG_*` entries are preserved, and the mapping is neither persisted nor redirected to a mirror. Package identities, revisions, manifests, sources, target graphs, and Swift language settings remain exactly those in `Package.swift` and `Package.resolved`.
 
 ## Boundaries
 

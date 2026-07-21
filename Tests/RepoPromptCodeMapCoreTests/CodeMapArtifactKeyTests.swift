@@ -15,7 +15,6 @@ final class CodeMapArtifactKeyTests: XCTestCase {
             .cpp: "class Sample {};",
             .go: "package sample\nfunc run() {}",
             .java: "class Sample {}",
-            .dart: "class Sample {}",
             .ts: "class Sample {}",
             .tsx: "const Sample = () => <div />;",
             .php: "<?php class Sample {}",
@@ -381,7 +380,6 @@ final class CodeMapArtifactKeyTests: XCTestCase {
         case .ruby: "0.23.1"
         case .php: "0.24.2"
         case .swift: "0.7.3-with-generated-files"
-        case .dart: nil
         }
         let requirement = version.map { "exact: \"\($0)\"" }
             ?? "revision: \"\(registration.revision)\""
@@ -431,10 +429,6 @@ final class CodeMapArtifactKeyTests: XCTestCase {
             .java: (
                 .java, "https://github.com/tree-sitter/tree-sitter-java",
                 "94703d5a6bed02b98e438d7cad1136c01a60ba2c", javaCodeMapQuery
-            ),
-            .dart: (
-                .dart, "https://github.com/UserNobody14/tree-sitter-dart",
-                "be07cf7118d3dba06236a3f19541685a68209934", dartCodeMapQuery
             ),
             .ts: (
                 .typescript, "https://github.com/tree-sitter/tree-sitter-typescript",
@@ -552,7 +546,6 @@ final class CodeMapArtifactKeyTests: XCTestCase {
         case .cpp: "cpp"
         case .go: "go"
         case .java: "java"
-        case .dart: "dart"
         case .typescript: "typescript"
         case .tsx: "tsx"
         case .php: "php"

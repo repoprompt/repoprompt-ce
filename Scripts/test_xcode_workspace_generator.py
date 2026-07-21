@@ -179,42 +179,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         path = Path(generator.PROJECT_NAME) / f"xcshareddata/xcschemes/{generator.MCP_SCHEME}.xcscheme"
         self.assertIn(".build/debug/repoprompt-mcp", self.outputs[path].decode())
 
-    def test_xcodebuild_environment_appends_process_local_github_transport(self) -> None:
-        original = {
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.askPass",
-            "GIT_CONFIG_VALUE_0": "false",
-        }
-        environment = generator.xcodebuild_environment(original)
-
-        self.assertEqual(original["GIT_CONFIG_COUNT"], "1")
-        self.assertEqual(environment["GIT_CONFIG_COUNT"], "2")
-        self.assertEqual(environment["GIT_CONFIG_KEY_0"], "core.askPass")
-        self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "false")
-        self.assertEqual(
-            environment["GIT_CONFIG_KEY_1"],
-            "url.https://github.com/.insteadOf",
-        )
-        self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "git@github.com:")
-
-    def test_xcodebuild_environment_handles_empty_and_rejects_invalid_count(self) -> None:
-        environment = generator.xcodebuild_environment({})
-        self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
-        self.assertEqual(
-            environment["GIT_CONFIG_KEY_0"],
-            "url.https://github.com/.insteadOf",
-        )
-        self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "git@github.com:")
-
-        for count in ("invalid", "-1"):
-            with self.subTest(count=count):
-                with self.assertRaisesRegex(
-                    generator.GeneratorError,
-                    "GIT_CONFIG_COUNT must be a non-negative integer",
-                ):
-                    generator.xcodebuild_environment({"GIT_CONFIG_COUNT": count})
-
-    def test_xcodebuild_list_uses_transport_without_changing_command(self) -> None:
+    def test_xcodebuild_list_uses_expected_command(self) -> None:
         payload = {
             "workspace": {
                 "schemes": [
@@ -235,7 +200,6 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
             generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
 
         command = run.call_args.args[0]
-        environment = run.call_args.kwargs["env"]
         self.assertEqual(
             command,
             [
@@ -246,18 +210,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
                 "/tmp/generated-xcode/RepoPromptCE.xcworkspace",
             ],
         )
-        count = int(environment["GIT_CONFIG_COUNT"])
-        pairs = {
-            (
-                environment[f"GIT_CONFIG_KEY_{index}"],
-                environment[f"GIT_CONFIG_VALUE_{index}"],
-            )
-            for index in range(count)
-        }
-        self.assertIn(
-            ("url.https://github.com/.insteadOf", "git@github.com:"),
-            pairs,
-        )
+        self.assertNotIn("env", run.call_args.kwargs)
 
     def test_check_detects_corruption(self) -> None:
         temporary, destination = self.generate_in_temporary_directory()

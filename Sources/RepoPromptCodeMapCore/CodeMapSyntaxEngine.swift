@@ -4,7 +4,6 @@ import SwiftTreeSitter
 import TreeSitterC
 import TreeSitterCPP
 import TreeSitterCSharp
-import TreeSitterDart
 import TreeSitterGo
 import TreeSitterJava
 import TreeSitterJavaScript
@@ -17,7 +16,7 @@ import TreeSitterTSX
 import TreeSitterTypeScript
 
 package enum LanguageType: String, CaseIterable, Comparable, Codable, Sendable {
-    case swift, js, c_sharp, python, c, rust, cpp, go, java, dart, ts, tsx, php, ruby
+    case swift, js, c_sharp, python, c, rust, cpp, go, java, ts, tsx, php, ruby
 
     package var displayName: String {
         switch self {
@@ -30,7 +29,6 @@ package enum LanguageType: String, CaseIterable, Comparable, Codable, Sendable {
         case .cpp: "C++"
         case .go: "Go"
         case .java: "Java"
-        case .dart: "Dart"
         case .ts: "TypeScript"
         case .tsx: "TSX"
         case .php: "PHP"
@@ -100,7 +98,6 @@ package struct CodeMapSyntaxEngine: CodeMapSyntaxPerformanceQuerying, Sendable {
         "cpp": .cpp,
         "go": .go,
         "java": .java,
-        "dart": .dart,
         "ts": .ts,
         "tsx": .tsx,
         "php": .php,
@@ -441,14 +438,6 @@ private enum RegisteredLanguageStore {
                 grammarRevision: "94703d5a6bed02b98e438d7cad1136c01a60ba2c",
                 queryText: javaCodeMapQuery
             )
-        case .dart:
-            CodeMapLanguageRecipe(
-                stableLanguageID: .dart,
-                displayName: "Dart",
-                makeLanguage: { wrapGrammarLanguage(tree_sitter_dart()) },
-                grammarRevision: "be07cf7118d3dba06236a3f19541685a68209934",
-                queryText: dartCodeMapQuery
-            )
         case .ts:
             CodeMapLanguageRecipe(
                 stableLanguageID: .typescript,
@@ -495,7 +484,6 @@ private enum RegisteredLanguageStore {
         case .cpp: try CppDescriptor.result.get()
         case .go: try GoDescriptor.result.get()
         case .java: try JavaDescriptor.result.get()
-        case .dart: try DartDescriptor.result.get()
         case .ts: try TypeScriptDescriptor.result.get()
         case .tsx: try TSXDescriptor.result.get()
         case .php: try PHPDescriptor.result.get()
@@ -512,7 +500,6 @@ private enum RegisteredLanguageStore {
     private enum CppDescriptor { static let result = make(languageType: .cpp) }
     private enum GoDescriptor { static let result = make(languageType: .go) }
     private enum JavaDescriptor { static let result = make(languageType: .java) }
-    private enum DartDescriptor { static let result = make(languageType: .dart) }
     private enum TypeScriptDescriptor { static let result = make(languageType: .ts) }
     private enum TSXDescriptor { static let result = make(languageType: .tsx) }
     private enum PHPDescriptor { static let result = make(languageType: .php) }
@@ -559,7 +546,6 @@ private enum QueryStore {
         case .cpp: try CppQuery.result.get()
         case .go: try GoQuery.result.get()
         case .java: try JavaQuery.result.get()
-        case .dart: try DartQuery.result.get()
         case .ts: try TypeScriptQuery.result.get()
         case .tsx: try TSXQuery.result.get()
         case .php: try PHPQuery.result.get()
@@ -576,7 +562,6 @@ private enum QueryStore {
     private enum CppQuery { static let result = make(languageType: .cpp) }
     private enum GoQuery { static let result = make(languageType: .go) }
     private enum JavaQuery { static let result = make(languageType: .java) }
-    private enum DartQuery { static let result = make(languageType: .dart) }
     private enum TypeScriptQuery { static let result = make(languageType: .ts) }
     private enum TSXQuery { static let result = make(languageType: .tsx) }
     private enum PHPQuery { static let result = make(languageType: .php) }

@@ -517,7 +517,6 @@ private extension LanguageType {
         case .cpp: .cpp
         case .go: .go
         case .java: .java
-        case .dart: .dart
         case .ts: .typescript
         case .tsx: .tsx
         case .php: .php

@@ -270,7 +270,7 @@ struct CodeMapGenerator {
     /// Determines if a language should skip synthetic main class creation
     private static func shouldSkipSyntheticMainClass(for language: LanguageType) -> Bool {
         switch language {
-        case .swift, .ts, .tsx, .js, .c, .cpp, .go, .rust, .python, .php, .ruby, .dart:
+        case .swift, .ts, .tsx, .js, .c, .cpp, .go, .rust, .python, .php, .ruby:
             true // These languages should populate functions[] and globalVars[] directly
         default:
             false
@@ -2546,7 +2546,6 @@ struct CodeMapGenerator {
         case "swift": .swift
         case "cs": .c_sharp
         case "java": .java
-        case "dart": .dart
         case "c": .c
         case "cpp": .cpp
         case "py": .python

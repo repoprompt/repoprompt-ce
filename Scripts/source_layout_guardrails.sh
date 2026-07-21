@@ -116,7 +116,6 @@ from pathlib import Path
 
 expected_packages = {
     "tree-sitter-c": ("https://github.com/tree-sitter/tree-sitter-c", "0.24.2", "b780e47fc780ddc8da13afa35a3f4ed5c157823d", "TreeSitterC"),
-    "tree-sitter-dart": ("https://github.com/UserNobody14/tree-sitter-dart", None, "be07cf7118d3dba06236a3f19541685a68209934", "TreeSitterDart"),
     "tree-sitter-go": ("https://github.com/tree-sitter/tree-sitter-go", "0.25.0", "1547678a9da59885853f5f5cc8a99cc203fa2e2c", "TreeSitterGo"),
     "tree-sitter-java": ("https://github.com/tree-sitter/tree-sitter-java", "0.23.5", "94703d5a6bed02b98e438d7cad1136c01a60ba2c", "TreeSitterJava"),
     "tree-sitter-javascript": ("https://github.com/tree-sitter/tree-sitter-javascript", "0.25.0", "44c892e0be055ac465d5eeddae6d3e194424e7de", "TreeSitterJavaScript"),
@@ -206,10 +205,6 @@ for identity, (url, version, revision, product) in expected_packages.items():
     if (product, identity) not in repo_prompt_code_map_core_products:
         errors.append(f"RepoPromptCodeMapCore missing upstream grammar product dependency: {product} ({identity})")
 
-dart = resolved_pins.get("tree-sitter-dart", {})
-if dart.get("state", {}) != {"revision": "be07cf7118d3dba06236a3f19541685a68209934"}:
-    errors.append("Dart must remain the canonical exact revision exception because it has no releases")
-
 wrapper = resolved_pins.get("swifttreesitter", {})
 if '.package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0")' not in manifest_text:
     errors.append("Package.swift must pin SwiftTreeSitter exactly to 0.10.0")
@@ -266,7 +261,7 @@ core_syntax_source = Path("Sources/RepoPromptCodeMapCore/CodeMapSyntaxEngine.swi
 if "import SwiftTreeSitter\n" not in syntax_source:
     errors.append("SyntaxManager must retain direct SwiftTreeSitter import for highlighting")
 required_core_imports = {
-    "SwiftTreeSitter", "TreeSitterC", "TreeSitterCPP", "TreeSitterCSharp", "TreeSitterDart",
+    "SwiftTreeSitter", "TreeSitterC", "TreeSitterCPP", "TreeSitterCSharp",
     "TreeSitterGo", "TreeSitterJava", "TreeSitterJavaScript", "TreeSitterPHP", "TreeSitterPython",
     "TreeSitterRuby", "TreeSitterRust", "TreeSitterSwift", "TreeSitterTSX", "TreeSitterTypeScript",
 }
@@ -289,7 +284,6 @@ retired_tree_sitter_grammar_dirs=(
   "Sources/RepoPromptTreeSitterCGrammar"
   "Sources/RepoPromptTreeSitterCSharpGrammar"
   "Sources/RepoPromptTreeSitterCPPGrammar"
-  "Sources/RepoPromptTreeSitterDartGrammar"
   "Sources/RepoPromptTreeSitterGoGrammar"
   "Sources/RepoPromptTreeSitterJavaGrammar"
   "Sources/RepoPromptTreeSitterJavaScriptGrammar"

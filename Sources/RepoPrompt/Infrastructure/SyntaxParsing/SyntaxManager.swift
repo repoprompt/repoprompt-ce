@@ -29,7 +29,6 @@ final class SyntaxManager: @unchecked Sendable {
         .cpp: cppQuery,
         .go: goQuery,
         .java: javaQuery,
-        .dart: dartQuery,
         .ts: typeScriptHighlightQuery,
         .tsx: typeScriptHighlightQuery,
         .php: basicPhpQuery,

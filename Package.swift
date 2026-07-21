@@ -23,7 +23,6 @@ var packageDependencies: [Package.Dependency] = [
     // RepoPromptApp and Neon share this exact wrapper/runtime graph.
     .package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-c", exact: "0.24.2"),
-    .package(url: "https://github.com/UserNobody14/tree-sitter-dart", revision: "be07cf7118d3dba06236a3f19541685a68209934"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-go", exact: "0.25.0"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-java", exact: "0.23.5"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-javascript", exact: "0.25.0"),
@@ -136,7 +135,6 @@ let package = Package(
                 "TreeSitterScannerSupport",
                 .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
                 .product(name: "TreeSitterC", package: "tree-sitter-c"),
-                .product(name: "TreeSitterDart", package: "tree-sitter-dart"),
                 .product(name: "TreeSitterGo", package: "tree-sitter-go"),
                 .product(name: "TreeSitterJava", package: "tree-sitter-java"),
                 .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),

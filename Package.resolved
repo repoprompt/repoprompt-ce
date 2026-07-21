@@ -1,5 +1,5 @@
 {
-  "originHash" : "4d625836434b1face0fb399c3f1ac4fecc054bcd824b6c23264f6602af474422",
+  "originHash" : "6e695d097e4d5b45935ca3fd635a6e42a4e8592d11b4c249f6e063f702d3ca80",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -355,14 +355,6 @@
       "state" : {
         "revision" : "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02",
         "version" : "0.23.4"
-      }
-    },
-    {
-      "identity" : "tree-sitter-dart",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/UserNobody14/tree-sitter-dart",
-      "state" : {
-        "revision" : "be07cf7118d3dba06236a3f19541685a68209934"
       }
     },
     {

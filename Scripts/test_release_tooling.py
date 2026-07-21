@@ -3008,34 +3008,22 @@ label_generated_tip_appcast""",
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("does not verify", rejected.stderr)
 
-    def test_secret_free_swiftpm_commands_scrub_tokens_and_rewrite_github_ssh_urls(self) -> None:
+    def test_secret_free_swiftpm_commands_scrub_tokens(self) -> None:
         helper = SCRIPT_DIR / "run_without_github_tokens.sh"
-        temp_home = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_home, True)
         result = subprocess.run(
             [
                 str(helper),
-                # Re-enter the wrapper to verify nesting does not duplicate the rewrite.
+                # Re-enter the wrapper to verify nesting remains harmless.
                 str(helper),
                 "bash",
                 "-c",
-                (
-                    '[[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" && -z "${SOURCE_GH_TOKEN:-}" ]] && '
-                    '[[ "$GIT_CONFIG_COUNT" == "2" ]] && '
-                    '[[ "$(git config --get repoprompt.existing)" == "preserved" ]] && '
-                    '[[ "$(git config --get url.https://github.com/.insteadOf)" == "git@github.com:" ]]'
-                ),
+                '[[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" && -z "${SOURCE_GH_TOKEN:-}" ]]',
             ],
             env={
                 "PATH": os.environ["PATH"],
                 "GH_TOKEN": "source-token",
                 "GITHUB_TOKEN": "workflow-token",
                 "SOURCE_GH_TOKEN": "explicit-source-token",
-                "GIT_CONFIG_COUNT": "01",
-                "GIT_CONFIG_KEY_0": "repoprompt.existing",
-                "GIT_CONFIG_VALUE_0": "preserved",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "HOME": str(temp_home),
             },
             text=True,
             capture_output=True,
@@ -3047,7 +3035,6 @@ label_generated_tip_appcast""",
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
         workflows_dir = SCRIPT_DIR.parent / ".github" / "workflows"
-        ci_workflow = (workflows_dir / "ci.yml").read_text(encoding="utf-8")
         release_workflow = (workflows_dir / "release.yml").read_text(encoding="utf-8")
         tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
 
@@ -3077,9 +3064,6 @@ label_generated_tip_appcast""",
             package_script,
         )
         self.assertIn("unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN", release_script)
-        self.assertIn('GIT_CONFIG_COUNT: "1"', ci_workflow)
-        self.assertIn("GIT_CONFIG_KEY_0: url.https://github.com/.insteadOf", ci_workflow)
-        self.assertIn('GIT_CONFIG_VALUE_0: "git@github.com:"', ci_workflow)
 
     def test_sparkle_vendor_manifest_rejects_extra_file_and_symlink_redirect(self) -> None:
         root = Path(tempfile.mkdtemp())

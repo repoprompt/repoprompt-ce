@@ -1164,7 +1164,7 @@ class SystemPromptService {
         Your Inputs:
 
         - File Tree: Lists the names and paths of all files and folders in the project.
-        - Codemap: Provides brief summaries, definitions, and import statements for files with extensions: "swift", "js", "cs", "py", "c", "rs", "cpp", "go", "java", "dart", "ts", "tsx".
+        - Codemap: Provides brief summaries, definitions, and import statements for files with extensions: "swift", "js", "cs", "py", "c", "rs", "cpp", "go", "java", "ts", "tsx".
         - User Prompt: The user's exact request.
 
         How to Evaluate Relevance:
