@@ -795,7 +795,10 @@ class LifecycleQueueTests(LifecycleTestCase):
         while time.monotonic() < deadline:
             with state.condition:
                 job = state.jobs[ticket]
-                if job.state in conductor.TERMINAL_STATES:
+                # A job becomes terminal before the runner's final persistence
+                # and lane-release work is complete. Wait for that finalizer so
+                # TemporaryDirectory cleanup cannot race its record write.
+                if job.state in conductor.TERMINAL_STATES and ticket not in state.active_lanes.values():
                     return job
             time.sleep(0.01)
         with state.condition:
@@ -1014,6 +1017,94 @@ class LifecycleQueueTests(LifecycleTestCase):
             rows = events.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual([row.split()[0:2] for row in rows], [["start", "a"], ["end", "a"], ["start", "b"], ["end", "b"]])
+
+    def test_terminal_job_status_persists_failure_record_and_summary(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        log = state.paths.jobs_dir / "ticket.log"
+        log.write_text(
+            "==> Building\nSources/Foo.swift:10:5: error: cannot find 'x' in scope\n",
+            encoding="utf-8",
+        )
+        job = self.make_job(
+            state,
+            "ticket",
+            "swift-build",
+            {"product": "RepoPrompt", "message": "secret prompt", "logFile": "/tmp/secret.log"},
+            ["build"],
+            job_state="failed",
+        )
+        job.exit_code = 1
+        job.error = "process exited with status 1"
+        job.finished_at = conductor.now()
+        job.log_path = log
+        state.jobs["ticket"] = job
+
+        payload = state.job_status("ticket", None)
+
+        self.assertIn("outputSummary", payload)
+        self.assertTrue(job.failure_record_written)
+        self.assertFalse(job.failure_record_pending)
+        record_path = state.paths.jobs_dir / "ticket.failure.json"
+        summary_path = state.paths.jobs_dir / "ticket.summary.json"
+        self.assertTrue(record_path.exists())
+        self.assertTrue(summary_path.exists())
+        data = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["ticket"], "ticket")
+        self.assertEqual(data["failureClass"], "compilerFailure")
+        # Unbounded user args are redacted from the aggregate record.
+        self.assertNotIn("message", data["args"])
+        self.assertNotIn("logFile", data["args"])
+        self.assertEqual(data["args"]["product"], "RepoPrompt")
+
+    def test_job_status_is_idempotent_for_failure_record_write(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        log = state.paths.jobs_dir / "ticket.log"
+        log.write_text("error: cannot find 'x' in scope\n", encoding="utf-8")
+        job = self.make_job(
+            state,
+            "ticket",
+            "swift-build",
+            {"product": "RepoPrompt"},
+            ["build"],
+            job_state="failed",
+        )
+        job.exit_code = 1
+        job.finished_at = conductor.now()
+        job.log_path = log
+        state.jobs["ticket"] = job
+
+        with mock.patch.object(state.failure_store, "write") as write_mock:
+            state.job_status("ticket", None)
+            state.job_status("ticket", None)
+
+        write_mock.assert_called_once()
+        self.assertTrue(job.failure_record_written)
+
+    def test_failure_record_write_error_updates_job_under_condition_lock(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "ticket", "swift-build", {"product": "RepoPrompt"}, ["build"], job_state="failed")
+        job.exit_code = 1
+        job.finished_at = conductor.now()
+        state.jobs[job.ticket] = job
+        lock_held: list[bool] = []
+        append_system_line = state._append_system_line_locked
+
+        def record_lock_state(current_job: conductor.Job, text: str) -> None:
+            lock_held.append(state.condition._is_owned())
+            append_system_line(current_job, text)
+
+        with mock.patch.object(state.failure_store, "write", side_effect=OSError("fixture write failure")), mock.patch.object(
+            state, "_append_system_line_locked", side_effect=record_lock_state
+        ):
+            state._refresh_output_summary(job)
+
+        self.assertEqual(lock_held, [True])
+        self.assertFalse(job.failure_record_pending)
+        self.assertFalse(job.failure_record_written)
+        self.assertIn("failure record write failed: fixture write failure", job.log_path.read_text(encoding="utf-8"))
 
 
 class XCTestStallWatchdogTests(LifecycleTestCase):
@@ -2151,6 +2242,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "failure_diagnostics.py", scripts / "failure_diagnostics.py")
             run_script.chmod(0o755)
             package_script = scripts / "package_app.sh"
             package_script.write_text("#!/usr/bin/env bash\necho package failed\nexit 23\n", encoding="utf-8")
@@ -2202,6 +2294,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "failure_diagnostics.py", scripts / "failure_diagnostics.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
             launched_marker = root / "launched"
@@ -2321,6 +2414,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "failure_diagnostics.py", scripts / "failure_diagnostics.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
             launched_marker = root / "launched"

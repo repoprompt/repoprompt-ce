@@ -98,7 +98,7 @@ run_pr_ready_path_validations() {
   files="$tmp_root/range-files.z"
   write_range_files "$files"
 
-  local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/guardrails\.sh|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
+  local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/failure_diagnostics\.py|Scripts/guardrails\.sh|Scripts/source_layout_guardrails\.sh|Scripts/test_conductor_(lifecycle|output|failure_diagnostics)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
   local ci_app_test_runner_paths_pattern='^(Scripts/ci_app_test_runner\.py|Scripts/test_ci_app_test_runner\.py|\.github/workflows/ci\.yml)$'
   local swift_paths_pattern='\.swift$'
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'

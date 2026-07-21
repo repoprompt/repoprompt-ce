@@ -447,6 +447,7 @@ print_matches \
 # 8. Agent-authored reports and working notes stay local unless explicitly
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
+  "docs/architecture/failure-diagnostics.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
+import failure_diagnostics
 
 PROTOCOL_VERSION = 10
 TERMINAL_STATES = {"completed", "failed", "canceled"}
@@ -149,6 +150,7 @@ Operation commands:
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
+  ./conductor diagnostics recent-failures [--limit <n>] [--operation <op>] [--failure-class <class>] [--hours <n>] [--json]
   ./conductor release preflight|artifact|package|local-install
 
 Foundation validation operation:
@@ -1143,6 +1145,8 @@ class Job:
     diagnostic_paths: List[Path] = dataclasses.field(default_factory=list, repr=False)
     output_summary: Optional[Dict[str, Any]] = None
     tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
+    failure_record_pending: bool = False
+    failure_record_written: bool = False
 
     def to_payload(self, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         queue_wait_seconds = None
@@ -1527,6 +1531,11 @@ class DaemonState:
         self.active_lanes: Dict[str, str] = {}
         self.shutdown_requested = False
         self.server: Optional[socketserver.BaseServer] = None
+        self.failure_store = failure_diagnostics.FailureRecordStore(
+            paths.jobs_dir,
+            max_age_seconds=TERMINAL_RETENTION_SECONDS,
+            max_records=MAX_TERMINAL_JOBS,
+        )
 
     def _global_heavy_slot_paths(self, env: Optional[Dict[str, str]] = None) -> List[Path]:
         return global_heavy_slot_paths(env)
@@ -2168,10 +2177,13 @@ class DaemonState:
             self._release_global_heavy_slot(global_heavy_slot)
             if output_transport is not None:
                 output_transport.close_all()
-            refresh_after_release = False
+            # Persist the failure record before any job cleanup (in particular
+            # before retention pass) so the record owns the lifetime of the job
+            # summary and local log it references.
+            if job is not None and job.state in TERMINAL_STATES:
+                self._refresh_output_summary(job)
             with self.condition:
                 if job is not None:
-                    refresh_after_release = job.state in TERMINAL_STATES and job.output_summary is None
                     for lane in list(job.lanes):
                         if self.active_lanes.get(lane) == job.ticket:
                             del self.active_lanes[lane]
@@ -2179,8 +2191,6 @@ class DaemonState:
                     self._retention_pass_locked()
                 self._schedule_locked()
                 self.condition.notify_all()
-            if job is not None and refresh_after_release:
-                threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
 
     @staticmethod
     def _take_complete_output_lines(pending: bytearray, chunk: bytes) -> List[bytes]:
@@ -2559,9 +2569,31 @@ class DaemonState:
         )
         with self.condition:
             current = self.jobs.get(job.ticket)
-            if current is job and current.output_summary is None:
-                current.output_summary = summary
+            if current is None or current is not job:
+                return
+            if current.failure_record_pending or current.failure_record_written:
+                return
+            current.failure_record_pending = True
+            # Snapshot the job state while protected by the condition, then
+            # persist the record outside the critical section.
+            record = failure_diagnostics.FailureRecord.from_job(
+                current,
+                summary,
+                jobs_dir=self.paths.jobs_dir,
+            )
+        try:
+            self.failure_store.write(record, summary)
+        except Exception as exc:
+            with self.condition:
+                current.failure_record_pending = False
+                self._append_system_line_locked(job, f"failure record write failed: {exc}\n")
                 self.condition.notify_all()
+            return
+        with self.condition:
+            current.output_summary = summary
+            current.failure_record_written = True
+            current.failure_record_pending = False
+            self.condition.notify_all()
 
     def _append_tail_locked(self, job: Job, text: str) -> None:
         lines = text.splitlines(keepends=True)
@@ -2897,6 +2929,7 @@ def run_daemon(paths: Paths) -> int:
     with contextlib.suppress(OSError):
         os.chmod(paths.running_processes_path, 0o600)
     state = DaemonState(paths)
+    state.failure_store.retention_pass()
     server = ThreadedUnixServer(str(paths.socket_path), RequestHandler, state)
     with contextlib.suppress(OSError):
         os.chmod(paths.socket_path, 0o600)
@@ -4602,6 +4635,33 @@ def parse_no_args(prog: str, argv: List[str]) -> None:
     parser.parse_args(argv)
 
 
+def handle_recent_failures_query(paths: Paths, args: Dict[str, Any], json_mode: bool) -> int:
+    """Read-only query for recent failure records; does not touch the daemon."""
+    store = failure_diagnostics.FailureRecordStore(
+        paths.jobs_dir,
+        max_age_seconds=TERMINAL_RETENTION_SECONDS,
+        max_records=MAX_TERMINAL_JOBS,
+    )
+    hours = args.get("hours")
+    since = now() - hours * 3600.0 if hours is not None else None
+    requested_limit = int(args.get("limit") or 10)
+    failure_class = args.get("failureClass")
+    # Fetch a generous window so the default "non-success" filter can still
+    # honor the user's limit.
+    records = store.query_recent(
+        limit=MAX_TERMINAL_JOBS,
+        operation=args.get("operation"),
+        failure_class=failure_class,
+        since_timestamp=since,
+    )
+    if failure_class is None:
+        records = [r for r in records if r.failure_class != "none"]
+    records = records[:requested_limit]
+    output = failure_diagnostics.format_recent_failures(records, json_mode=json_mode)
+    print(output)
+    return 0
+
+
 def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     global_flags, rest = split_operation_flags(argv)
     if global_flags.timeout is not None and global_flags.timeout < 0:
@@ -4718,6 +4778,12 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         build_cache = subparsers.add_parser("build-cache")
         build_cache.add_argument("--limit", type=int, default=BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
 
+        recent_failures = subparsers.add_parser("recent-failures")
+        recent_failures.add_argument("--limit", type=int, default=10)
+        recent_failures.add_argument("--operation")
+        recent_failures.add_argument("--failure-class", choices=failure_diagnostics.FAILURE_CLASSES)
+        recent_failures.add_argument("--hours", type=float)
+
         ns = parser.parse_args(rest)
         args["subcommand"] = ns.subcommand
         if ns.subcommand == "agent-mode-on":
@@ -4726,6 +4792,16 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             if ns.limit <= 0:
                 raise ConductorError("diagnostics build-cache --limit must be greater than zero")
             args["limit"] = ns.limit
+        elif ns.subcommand == "recent-failures":
+            if ns.limit <= 0:
+                raise ConductorError("diagnostics recent-failures --limit must be greater than zero")
+            if ns.hours is not None and ns.hours <= 0:
+                raise ConductorError("diagnostics recent-failures --hours must be greater than zero")
+            args["limit"] = ns.limit
+            args["operation"] = ns.operation
+            args["failureClass"] = ns.failure_class
+            args["hours"] = ns.hours
+            return handle_recent_failures_query(paths, args, global_flags.json)
     elif operation == "release":
         parser = argparse.ArgumentParser(prog="conductor release")
         parser.add_argument("subcommand", choices=["preflight", "artifact", "package", "local-install"])
