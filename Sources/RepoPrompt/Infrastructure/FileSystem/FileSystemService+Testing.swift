@@ -75,7 +75,7 @@ import Foundation
             flags: [FSEventStreamEventFlags],
             ids: [FSEventStreamEventId],
             limit: Int? = nil
-        ) -> (paths: [String], flags: [FSEventStreamEventFlags], ids: [FSEventStreamEventId])? {
+        ) -> FSEventCallbackPayload? {
             let safeCount = min(limit ?? pathObjects.count, pathObjects.count, flags.count, ids.count)
             guard safeCount > 0 else { return nil }
             let cfArray = pathObjects as CFArray
@@ -84,16 +84,11 @@ import Foundation
                 guard let flagBase = flagBuffer.baseAddress else { return nil }
                 return ids.withUnsafeBufferPointer { idBuffer in
                     guard let idBase = idBuffer.baseAddress else { return nil }
-                    guard let payload = buildOwnedFSEventPayload(
+                    return buildOwnedFSEventPayload(
                         numEvents: safeCount,
                         eventPaths: eventPaths,
                         eventFlags: flagBase,
                         eventIds: idBase
-                    ) else { return nil }
-                    return (
-                        payload.entries.map(\.path),
-                        payload.entries.map(\.flags),
-                        payload.entries.map(\.id)
                     )
                 }
             }
@@ -151,22 +146,50 @@ import Foundation
         @discardableResult
         func acceptWatcherPayloadForTesting(
             _ events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)],
-            scheduleDrain: Bool = true
+            scheduleDrain: Bool = true,
+            isTruncated: Bool = false
         ) -> FileSystemWatcherIngressMailbox.Watermark? {
             watcherIngressMailbox.startAccepting()
             let payload = FSEventCallbackPayload(
                 entries: events.map { event in
                     FSEventCallbackEntry(path: event.absolutePath, flags: event.flags, id: event.eventId)
-                }
+                },
+                isTruncated: isTruncated
             )
-            let filterResult = watcherEarlyFilter.filter(payload)
+            var evidence = FileSystemWatcherIngressEvidence.callback(
+                sourcePayload: payload,
+                retainedEntryCount: payload.count,
+                earlyFilteredEntryCount: 0,
+                callbackDurationMicroseconds: 0
+            )
+            let analyzedPayload = FSEventCallbackPayload(
+                entries: payload.entries,
+                ingressEvidence: evidence,
+                isTruncated: payload.isTruncated
+            )
+            let filterResult = watcherEarlyFilter.filter(analyzedPayload)
+            evidence = evidence.finalizingCallback(
+                retainedEntryCount: filterResult.payload?.count ?? 0,
+                earlyFilteredEntryCount: filterResult.filteredEntryCount,
+                callbackDurationMicroseconds: 0
+            )
+            watcherRecoveryDiagnostics.recordCallback(evidence)
             guard let retainedPayload = filterResult.payload else { return nil }
+            let acceptedPayload = FSEventCallbackPayload(
+                entries: retainedPayload.entries,
+                ingressEvidence: evidence,
+                isTruncated: retainedPayload.isTruncated
+            )
             let drain: (@Sendable () async -> Void)? = if scheduleDrain {
                 { [weak self] in await self?.drainAcceptedWatcherIngressMailbox() }
             } else {
                 nil
             }
-            return watcherIngressMailbox.accept(retainedPayload, lifecycleCorrelation: nil, scheduleDrain: drain)
+            return watcherIngressMailbox.accept(acceptedPayload, lifecycleCorrelation: nil, scheduleDrain: drain)
+        }
+
+        nonisolated func watcherRecoveryDiagnosticsSnapshotForTesting() -> FileSystemWatcherRecoveryDiagnosticsSnapshot {
+            watcherRecoveryDiagnostics.snapshot()
         }
 
         func watcherIngressMailboxSnapshotForTesting() -> FileSystemWatcherIngressMailbox.Snapshot {
@@ -200,6 +223,24 @@ import Foundation
             } else {
                 folderScanFailuresRemainingForTesting.removeValue(forKey: folder)
             }
+        }
+
+        func setFullResyncFailureCountForTesting(_ count: Int) {
+            fullResyncFailuresRemainingForTesting = max(0, count)
+        }
+
+        func setFullResyncWillStartHandlerForTesting(
+            _ handler: (@Sendable () async -> Void)?
+        ) {
+            fullResyncWillStartHandlerForTesting = handler
+        }
+
+        func waitForWatcherBatchProcessingForTesting() async {
+            await watcherBatchProcessingTask?.value
+        }
+
+        func watcherBatchProcessingTaskForTesting() -> Task<Void, Never>? {
+            watcherBatchProcessingTask
         }
 
         func setContentReadChunkHandlerForTesting(
@@ -241,6 +282,9 @@ import Foundation
             pendingScanTargets: [String: FSEventStreamEventId],
             pendingQuietFolderScanTargets: Set<String>,
             dirtyRecoveryScanTargets: Set<String>,
+            requiresRecoveryFullResync: Bool,
+            recoveryIsQuiescent: Bool,
+            recoveryFullResyncFailureCount: Int,
             recoveryScanFailureCountByFolder: [String: Int],
             lastScannedEventIdByFolder: [String: FSEventStreamEventId],
             lastVerifiedAtByFolder: [String: TimeInterval],
@@ -253,6 +297,9 @@ import Foundation
                 pendingScanTargets,
                 pendingQuietFolderScanTargets,
                 dirtyRecoveryScanTargets,
+                recoveryEpisode != nil,
+                recoveryIsQuiescent,
+                recoveryEpisode?.failedFullResyncCount ?? 0,
                 recoveryScanFailureCountByFolder,
                 lastScannedEventIdByFolder,
                 lastVerifiedAtByFolder,

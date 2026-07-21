@@ -28,9 +28,23 @@ struct FileSystemMutationWaiter {
 
 final class FileSystemServiceFSEventCallbackContext {
     weak var service: FileSystemService?
+    private let lock = NSLock()
+    private var active = true
 
-    init(service: FileSystemService) {
+    init(service: FileSystemService?) {
         self.service = service
+    }
+
+    func deactivate() {
+        lock.lock()
+        active = false
+        lock.unlock()
+    }
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
     }
 }
 
@@ -41,6 +55,8 @@ actor FileSystemService {
     nonisolated let diagnosticRootToken = UUID()
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     nonisolated let watcherEarlyFilter: FileSystemWatcherEarlyFilter
+    nonisolated let watcherRecoveryDiagnostics = FileSystemWatcherRecoveryDiagnostics()
+    static let maximumCallbackEntries = 4096
     static let maxPendingRawEvents = 50000
     static let overflowRescanEventFlags = FSEventStreamEventFlags(
         kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
@@ -196,6 +212,8 @@ actor FileSystemService {
 
     /// The FSEvent stream reference
     var fseventStreamRef: FSEventStreamRef?
+    /// Serial, non-main queue preserving FSEvents callback order without using the UI queue.
+    nonisolated let fseventCallbackQueue: DispatchQueue
     /// The last durable FSEvents journal cut. Captured before the initial crawl so
     /// watcher startup can replay mutations that happen while the crawl is running.
     var nextFSEventStreamStartEventID: FSEventStreamEventId
@@ -225,6 +243,8 @@ actor FileSystemService {
         var freshnessWatcherBatchEventCount = 0
         var freshnessLastWatcherBatchSize = 0
         var freshnessMaxWatcherBatchSize = 0
+        var fullResyncFailuresRemainingForTesting = 0
+        var fullResyncWillStartHandlerForTesting: (@Sendable () async -> Void)?
     #endif
 
     /// Retained FSEvent callback context. The context holds the service weakly so an
@@ -274,6 +294,7 @@ actor FileSystemService {
     var pendingFSEvents: [PendingFSEvent] = []
     var pendingWatcherAcceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark?
     var pendingWatcherPublicationSource: FileSystemDeltaPublicationSource = .watcher
+    var pendingWatcherIngressEvidence = FileSystemWatcherIngressEvidence.empty
     var hasPendingOverflowRescan = false
     var overflowChangedIgnoreDirs: Set<String> = []
     var coalescingTask: Task<Void, Never>?
@@ -296,6 +317,8 @@ actor FileSystemService {
     var dirtyRecoveryScanTargets: Set<String> = []
     var recoveryScanFailureCountByFolder: [String: Int] = [:]
     var recoveryScanRetryTask: Task<Void, Never>?
+    var recoveryEpisode: FileSystemWatcherRecoveryEpisodeState?
+    var recoveryReactivationWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
 
     /// Short-lived cache
     /// results during a directory walk to avoid repeated allocations.
@@ -323,6 +346,7 @@ actor FileSystemService {
     /// Maximum folders to scan in a single batch (bounds per-tick work)
     let maxFoldersPerBatch: Int
     let maxRecoveryScanAttempts: Int
+    let maxRecoveryFullResyncFailures: Int
     let recoveryScanRetryBaseNanoseconds: UInt64
     let recoveryScanSleep: @Sendable (UInt64) async -> Void
 
@@ -359,6 +383,10 @@ actor FileSystemService {
         self.respectCursorignore = respectCursorignore
         self.skipSymlinks = skipSymlinks
         self.enableHierarchicalIgnores = enableHierarchicalIgnores
+        fseventCallbackQueue = DispatchQueue(
+            label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
+            qos: .utility
+        )
 
         watcherIngressMailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: Self.maxPendingRawEvents)
         watcherEarlyFilter = FileSystemWatcherEarlyFilter(rootPath: path)
@@ -369,6 +397,7 @@ actor FileSystemService {
         maxParallelScansPerActor = max(2, min(4, cores / 2))
         maxFoldersPerBatch = 256
         maxRecoveryScanAttempts = 3
+        maxRecoveryFullResyncFailures = 5
         recoveryScanRetryBaseNanoseconds = 50_000_000
         recoveryScanSleep = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
@@ -442,6 +471,7 @@ actor FileSystemService {
             maxFoldersPerBatchOverride: Int? = nil,
             maxPendingWatcherIngressEntriesOverride: Int? = nil,
             maxRecoveryScanAttemptsOverride: Int? = nil,
+            maxRecoveryFullResyncFailuresOverride: Int? = nil,
             recoveryScanRetryBaseNanosecondsOverride: UInt64? = nil,
             recoveryScanSleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
                 try? await Task.sleep(nanoseconds: nanoseconds)
@@ -455,6 +485,10 @@ actor FileSystemService {
             self.respectCursorignore = respectCursorignore
             self.skipSymlinks = skipSymlinks
             self.enableHierarchicalIgnores = enableHierarchicalIgnores
+            fseventCallbackQueue = DispatchQueue(
+                label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
+                qos: .utility
+            )
             self.isTestMode = isTestMode
             self.fileManagerOverride = fileManagerOverride
 
@@ -469,6 +503,7 @@ actor FileSystemService {
             maxParallelScansPerActor = maxParallelScansOverride ?? max(2, min(4, cores / 2))
             maxFoldersPerBatch = maxFoldersPerBatchOverride ?? 256
             maxRecoveryScanAttempts = max(1, maxRecoveryScanAttemptsOverride ?? 3)
+            maxRecoveryFullResyncFailures = max(1, maxRecoveryFullResyncFailuresOverride ?? 5)
             recoveryScanRetryBaseNanoseconds = recoveryScanRetryBaseNanosecondsOverride ?? 50_000_000
             self.recoveryScanSleep = recoveryScanSleep
 

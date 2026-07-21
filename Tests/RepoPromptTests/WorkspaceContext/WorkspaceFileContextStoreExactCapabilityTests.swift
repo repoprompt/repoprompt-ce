@@ -3,10 +3,24 @@ import XCTest
 
 final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
     private var temporaryRoots = FileSystemTemporaryRoots()
+    private var stores: [WorkspaceFileContextStore] = []
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
+        for store in stores {
+            let roots = await store.rootRefs(scope: .allLoaded)
+            for root in roots {
+                await store.unloadRoot(id: root.id)
+            }
+        }
+        stores.removeAll()
         temporaryRoots.removeAll()
-        try super.tearDownWithError()
+        try await super.tearDown()
+    }
+
+    private func makeStore() -> WorkspaceFileContextStore {
+        let store = WorkspaceFileContextStore()
+        stores.append(store)
+        return store
     }
 
     func testExactCatalogCapabilityRequiresRootIdentityKindAndCatalogMembership() async throws {
@@ -18,7 +32,7 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
         try FileSystemTestSupport.write("map", to: cataloged)
         try FileSystemTestSupport.write("must not materialize", to: ignored)
 
-        let store = WorkspaceFileContextStore()
+        let store = makeStore()
         let loaded = try await store.loadRoot(path: gitDataRoot.path, kind: .workspaceGitData)
         let exactRootValue = await store.exactRootRef(
             path: gitDataRoot.path,
@@ -78,7 +92,7 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
         let artifact = gitDataRoot.appendingPathComponent("repos/repo-key/snapshot/MAP.txt")
         try FileSystemTestSupport.write("map", to: artifact)
 
-        let store = WorkspaceFileContextStore()
+        let store = makeStore()
         let first = try await store.loadRoot(path: gitDataRoot.path, kind: .workspaceGitData)
         let frozenRootValue = await store.exactRootRef(
             path: gitDataRoot.path,
@@ -121,7 +135,7 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
         try FileSystemTestSupport.write("seed", to: seedFile)
         try FileSystemTestSupport.write("sibling", to: siblingFile)
 
-        let store = WorkspaceFileContextStore()
+        let store = makeStore()
         let fixture = try await makeSessionAuthorization(
             store: store,
             logicalRoot: logicalRoot,
@@ -205,7 +219,7 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
             to: worktreeRoot.appendingPathComponent(relativePath)
         )
 
-        let store = WorkspaceFileContextStore()
+        let store = makeStore()
         let fixture = try await makeSessionAuthorization(
             store: store,
             logicalRoot: logicalRoot,
@@ -232,7 +246,7 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
         func testContextBuilderExactCandidateClassifiesReplacementDuringEligibilityAsStale() async throws {
             let logicalRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderRaceLogical")
             let worktreeRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderRaceWorktree")
-            let store = WorkspaceFileContextStore()
+            let store = makeStore()
             let fixture = try await makeSessionAuthorization(
                 store: store,
                 logicalRoot: logicalRoot,

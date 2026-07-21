@@ -260,6 +260,14 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
             count: 3
         )
         XCTAssertTrue(didReachTerminalAfterGap)
+        let eventsAfterGap = await store.codemapProjectionPreloadStoreEventsForTesting(rootID: loaded.id)
+        let gapSchedule = try XCTUnwrap(eventsAfterGap.last { $0.kind == .scheduled })
+        XCTAssertEqual(gapSchedule.trigger, .watcherGap)
+        XCTAssertTrue(
+            eventsAfterGap
+                .filter { $0.ordinal >= gapSchedule.ordinal }
+                .allSatisfy { $0.trigger == .watcherGap }
+        )
         XCTAssertEqual(preflightCount.value, 2)
         XCTAssertEqual(fixture.providerAccessCount.value, 0)
         await store.unloadRoot(id: loaded.id)
