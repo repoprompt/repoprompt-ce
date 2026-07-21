@@ -1429,7 +1429,6 @@ final class AgentModeViewModel: ObservableObject {
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
             let options = CodexNativeSessionController.Options.agentModeDefault(
-                forceExperimentalSteering: true,
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },

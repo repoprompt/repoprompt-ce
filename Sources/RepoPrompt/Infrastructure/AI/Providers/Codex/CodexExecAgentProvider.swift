@@ -57,8 +57,6 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: false,
             webSearchRequestEnabled: nil,
-            viewImageToolEnabled: false,
-            includeApplyPatchTool: false,
             multiAgentEnabled: false,
             modelReasoningSummary: nil
         )

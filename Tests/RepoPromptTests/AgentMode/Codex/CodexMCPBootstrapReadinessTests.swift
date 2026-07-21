@@ -178,7 +178,6 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
 
     private func makeAgentModeOptions() -> CodexNativeSessionController.Options {
         .agentModeDefault(
-            forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user }

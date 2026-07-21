@@ -74,19 +74,13 @@ enum CodexIntegrationConfiguration {
             CodexOverrides.ToolPolicy(
                 toolOutputTokenLimit: desiredToolOutputTokenLimit,
                 shellToolEnabled: false,
-                webSearchRequestEnabled: false,
-                viewImageToolEnabled: false,
-                includeApplyPatchTool: false,
-                parallelToolCallsEnabled: nil
+                webSearchRequestEnabled: false
             )
         case .terminal:
             CodexOverrides.ToolPolicy(
                 toolOutputTokenLimit: desiredToolOutputTokenLimit,
                 shellToolEnabled: nil,
-                webSearchRequestEnabled: nil,
-                viewImageToolEnabled: nil,
-                includeApplyPatchTool: false,
-                parallelToolCallsEnabled: nil
+                webSearchRequestEnabled: nil
             )
         }
 
