@@ -135,6 +135,7 @@ extension FileSystemService {
         let name: String
         let bytes: Data
         let length: Int
+        let dType: UInt8
     }
 
     @inline(__always)
@@ -142,54 +143,65 @@ extension FileSystemService {
         name.hasPrefix(".repoprompt.tmp.")
     }
 
-    private static func decodeDirentName(_ entry: dirent) -> DecodedDirentName? {
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
-            let buffer = rawBuffer.bindMemory(to: UInt8.self)
-            let maxCount = buffer.count
-            guard maxCount > 0 else { return nil }
+    // The offset of d_name within dirent: fields before it are d_ino (8), d_seekoff (8),
+    // d_reclen (2), d_namlen (2), d_type (1) = 21 bytes, no padding since char[] is 1-byte aligned.
+    private static let direntNameOffset: Int = {
+        MemoryLayout<dirent>.offset(of: \dirent.d_type)! + MemoryLayout<UInt8>.size
+    }()
 
-            let nameLen = Int(entry.d_namlen)
-            var length = 0
-            if nameLen > 0 {
-                length = min(nameLen, maxCount)
-                if length > 0, buffer[length - 1] == 0 {
-                    length -= 1
-                }
-            } else {
-                var nulIndex: Int? = nil
-                var i = 0
-                while i < maxCount {
-                    if buffer[i] == 0 {
-                        nulIndex = i
-                        break
-                    }
-                    i += 1
-                }
-                guard let foundIndex = nulIndex else { return nil }
-                length = foundIndex
+    /// Decode the name and type from a `dirent` pointer WITHOUT copying the full struct.
+    /// Accessing `direntPtr.pointee` copies `MemoryLayout<dirent>.size` bytes, which can
+    /// cross a page boundary when the record sits near the end of a mapped page and cause
+    /// an EXC_BAD_ACCESS / KERN_INVALID_ADDRESS. We instead read only the bytes we need
+    /// via `UnsafeRawPointer` field offsets.
+    private static func decodeDirentName(_ entryPtr: UnsafePointer<dirent>) -> DecodedDirentName? {
+        let rawPtr = UnsafeRawPointer(entryPtr)
+
+        // Read only the scalar fields we need — each load touches only the bytes for that field.
+        let namlenOffset = MemoryLayout<dirent>.offset(of: \dirent.d_namlen)!
+        let typeOffset   = MemoryLayout<dirent>.offset(of: \dirent.d_type)!
+        let nameLen = Int(rawPtr.load(fromByteOffset: namlenOffset, as: UInt16.self))
+        let dType   = rawPtr.load(fromByteOffset: typeOffset, as: UInt8.self)
+
+        // Access d_name bytes via a raw pointer into the record — no struct copy.
+        let namePtr = rawPtr.advanced(by: direntNameOffset).assumingMemoryBound(to: UInt8.self)
+        // Maximum safe name length is bounded by d_reclen (actual on-disk record size).
+        let recLen      = Int(rawPtr.load(fromByteOffset: MemoryLayout<dirent>.offset(of: \dirent.d_reclen)!, as: UInt16.self))
+        let maxNameLen  = max(0, recLen - direntNameOffset)
+
+        var length = 0
+        if nameLen > 0 {
+            length = min(nameLen, maxNameLen)
+            if length > 0, namePtr[length - 1] == 0 {
+                length -= 1
             }
-
+        } else {
+            var i = 0
+            while i < maxNameLen {
+                if namePtr[i] == 0 { length = i; break }
+                i += 1
+            }
             guard length > 0 else { return nil }
-
-            let bytes = Data(buffer.prefix(length))
-            let name = String(decoding: bytes, as: UTF8.self)
-            return DecodedDirentName(name: name, bytes: bytes, length: length)
         }
+
+        guard length > 0 else { return nil }
+
+        let bytes = Data(bytes: namePtr, count: length)
+        let name  = String(decoding: bytes, as: UTF8.self)
+        return DecodedDirentName(name: name, bytes: bytes, length: length, dType: dType)
     }
 
     private static func descriptorRelativeMode(
         dir: UnsafeMutablePointer<DIR>,
-        entry: dirent,
+        entry: UnsafePointer<dirent>,
         nameLength: Int
     ) -> UInt16 {
         let fd = dirfd(dir)
         guard fd >= 0 else { return 0 }
         var nameBuffer = [CChar](repeating: 0, count: nameLength + 1)
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
-            let buffer = rawBuffer.bindMemory(to: UInt8.self)
-            for index in 0 ..< min(nameLength, buffer.count) {
-                nameBuffer[index] = CChar(bitPattern: buffer[index])
-            }
+        let namePtr = UnsafeRawPointer(entry).advanced(by: direntNameOffset).assumingMemoryBound(to: UInt8.self)
+        for index in 0 ..< nameLength {
+            nameBuffer[index] = CChar(bitPattern: namePtr[index])
         }
         var status = stat()
         let result = nameBuffer.withUnsafeBufferPointer { buffer -> Int32 in
@@ -201,21 +213,16 @@ extension FileSystemService {
 
     private static func fileTypeFallback(
         dir: UnsafeMutablePointer<DIR>,
-        entry: dirent,
+        entry: UnsafePointer<dirent>,
         nameLength: Int
     ) -> (isDir: Bool, isSym: Bool) {
         let fd = dirfd(dir)
         guard fd >= 0 else { return (false, false) }
 
         var nameBuffer = [CChar](repeating: 0, count: nameLength + 1)
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
-            let buffer = rawBuffer.bindMemory(to: UInt8.self)
-            let count = min(nameLength, buffer.count)
-            if count > 0 {
-                for i in 0 ..< count {
-                    nameBuffer[i] = CChar(bitPattern: buffer[i])
-                }
-            }
+        let namePtr = UnsafeRawPointer(entry).advanced(by: direntNameOffset).assumingMemoryBound(to: UInt8.self)
+        for i in 0 ..< nameLength {
+            nameBuffer[i] = CChar(bitPattern: namePtr[i])
         }
 
         var st = stat()
@@ -272,9 +279,9 @@ extension FileSystemService {
                 break // Exit loop on error or end of directory
             }
 
-            // Safely copy the dirent structure
-            let dirent = direntPtr.pointee
-            guard let decoded = decodeDirentName(dirent) else {
+            // Pass the pointer directly — do NOT copy via .pointee, which reads the full
+            // dirent struct (>256 bytes) and can fault if the record sits near a page boundary.
+            guard let decoded = decodeDirentName(direntPtr) else {
                 continue
             }
             let fileName = decoded.name
@@ -295,8 +302,8 @@ extension FileSystemService {
                 hasCursorignore = true
             }
 
-            // Determine file type from d_type
-            let dType = dirent.d_type
+            // d_type was decoded without a full struct copy
+            let dType = decoded.dType
             var isDir = false
             var isSym = false
 
@@ -306,7 +313,7 @@ extension FileSystemService {
             case DT_LNK:
                 let fallback = fileTypeFallback(
                     dir: dir,
-                    entry: dirent,
+                    entry: direntPtr,
                     nameLength: decoded.length
                 )
                 isDir = fallback.isDir
@@ -314,7 +321,7 @@ extension FileSystemService {
             case DT_UNKNOWN:
                 let fallback = fileTypeFallback(
                     dir: dir,
-                    entry: dirent,
+                    entry: direntPtr,
                     nameLength: decoded.length
                 )
                 isDir = fallback.isDir
@@ -331,7 +338,7 @@ extension FileSystemService {
                 isSym: isSym,
                 fileSystemMode: descriptorRelativeMode(
                     dir: dir,
-                    entry: dirent,
+                    entry: direntPtr,
                     nameLength: decoded.length
                 )
             ))
@@ -370,11 +377,12 @@ extension FileSystemService {
         entries.reserveCapacity(Int(count))
 
         for i in 0 ..< count {
-            // Copy dirent into local var so the pointer remains valid for the entire iteration
-            let localDirent = namelist![Int(i)]!.pointee
+            // Pass the pointer directly — avoid .pointee which copies the full dirent struct
+            // and can fault when the record sits near a memory page boundary.
+            let entryPtr = namelist![Int(i)]!
 
             // Safely convert d_name -> Swift String
-            guard let decoded = decodeDirentName(localDirent) else {
+            guard let decoded = decodeDirentName(entryPtr) else {
                 continue
             }
             let rawName = decoded.name
@@ -387,7 +395,7 @@ extension FileSystemService {
                 continue
             }
 
-            let dType = localDirent.d_type // This is a UInt8
+            let dType = decoded.dType
             var isDir = false
             var isSym = false
 
