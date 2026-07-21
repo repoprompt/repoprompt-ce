@@ -279,9 +279,9 @@ LOCAL_SELF_SIGNED_RELEASE=1 \
     SIGN_IDENTITY="$SIGN_IDENTITY" \
     "$ROOT_DIR/Scripts/package_app.sh" release
 
-BUILD_DIR="$(swift build -c release --show-bin-path)"
-SOURCE_APP="$BUILD_DIR/$APP_NAME.app"
-[[ -d "$SOURCE_APP" ]] || fail "Missing packaged local production app: $SOURCE_APP"
+# Source app is the package_app compatibility symlink/path under .build/release.
+SOURCE_APP="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$ROOT_DIR/.build/release/$APP_NAME.app")"
+[[ -n "$SOURCE_APP" && -d "$SOURCE_APP" ]] || fail "Missing packaged local production app: $ROOT_DIR/.build/release/$APP_NAME.app"
 [[ "$(plutil -extract RepoPromptSigningMode raw "$SOURCE_APP/Contents/Info.plist")" == "local-self-signed" ]] ||
     fail "Packaged app is missing the local self-signed signing-mode marker."
 [[ "$(plutil -extract RepoPromptLocalSigningCertificateSHA256 raw "$SOURCE_APP/Contents/Info.plist")" == "$SELECTED_CERTIFICATE_SHA256" ]] ||

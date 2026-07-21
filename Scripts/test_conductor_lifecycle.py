@@ -795,7 +795,16 @@ class LifecycleQueueTests(LifecycleTestCase):
         while time.monotonic() < deadline:
             with state.condition:
                 job = state.jobs[ticket]
-                if job.state in conductor.TERMINAL_STATES:
+                # A job becomes terminal before the runner's final persistence
+                # and lane-release work is complete. The output-summary refresh
+                # is deliberately started after lanes are released, so waiting
+                # only for lane release still lets TemporaryDirectory cleanup
+                # race that final read of the job log.
+                if (
+                    job.state in conductor.TERMINAL_STATES
+                    and ticket not in state.active_lanes.values()
+                    and job.output_summary is not None
+                ):
                     return job
             time.sleep(0.01)
         with state.condition:
@@ -2151,6 +2160,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "cache_inventory.py", scripts / "cache_inventory.py")
             run_script.chmod(0o755)
             package_script = scripts / "package_app.sh"
             package_script.write_text("#!/usr/bin/env bash\necho package failed\nexit 23\n", encoding="utf-8")
@@ -2202,6 +2212,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "cache_inventory.py", scripts / "cache_inventory.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
             launched_marker = root / "launched"
@@ -2321,6 +2332,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "cache_inventory.py", scripts / "cache_inventory.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
             launched_marker = root / "launched"

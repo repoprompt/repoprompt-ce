@@ -76,16 +76,21 @@ case "$ACTION" in
         [[ -x .build/debug/RepoPrompt.app/Contents/MacOS/repoprompt-mcp ]] || fail "embedded repoprompt-mcp is missing"
         ;;
     mcp)
+        SWIFTPM_SCRATCH_PATH="$(python3 "$ROOT_DIR/Scripts/cache_inventory.py" --repo-root "$ROOT_DIR" --configuration Debug --format path)"
         if [[ "${REPOPROMPT_XCODE_UNCOORDINATED:-0}" == "1" ]]; then
-            ./Scripts/run_without_github_tokens.sh swift build -c debug --product repoprompt-mcp
+            ./Scripts/run_without_github_tokens.sh swift build -c debug --scratch-path "$SWIFTPM_SCRATCH_PATH" --product repoprompt-mcp
         else
             ./conductor swift-build --product repoprompt-mcp
         fi
-        [[ -x .build/debug/repoprompt-mcp ]] || fail "debug repoprompt-mcp executable is missing"
+        BUILD_DIR="$(./Scripts/run_without_github_tokens.sh swift build -c debug --scratch-path "$SWIFTPM_SCRATCH_PATH" --show-bin-path)"
+        [[ -x "$BUILD_DIR/repoprompt-mcp" ]] || fail "debug repoprompt-mcp executable is missing"
+        mkdir -p "$ROOT_DIR/.build/debug"
+        ln -sfn "$BUILD_DIR/repoprompt-mcp" "$ROOT_DIR/.build/debug/repoprompt-mcp"
         ;;
     test)
+        SWIFTPM_SCRATCH_PATH="$(python3 "$ROOT_DIR/Scripts/cache_inventory.py" --repo-root "$ROOT_DIR" --configuration Debug --format path)"
         if [[ "${REPOPROMPT_XCODE_UNCOORDINATED:-0}" == "1" ]]; then
-            command=(./Scripts/run_without_github_tokens.sh swift test)
+            command=(./Scripts/run_without_github_tokens.sh swift test --scratch-path "$SWIFTPM_SCRATCH_PATH")
             if [[ -n "${REPOPROMPT_XCODE_TEST_FILTER:-}" ]]; then
                 command+=(--filter "$REPOPROMPT_XCODE_TEST_FILTER")
             fi

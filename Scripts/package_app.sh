@@ -5,6 +5,8 @@ CONF="${1:-debug}"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$ROOT_DIR/Scripts}"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CACHE_INVENTORY_SCRIPT="$SCRIPT_DIR/cache_inventory.py"
 cd "$ROOT_DIR"
 
 [[ "${VERBOSE:-0}" == "1" || "${VERBOSE:-0}" == "true" ]] && set -x
@@ -67,6 +69,16 @@ except OSError:
     print("1" if left_resolved == right_resolved else "0")
 PY
 }
+resolve_swiftpm_scratch_path(){
+    if [[ -n "${REPOPROMPT_SWIFTPM_SCRATCH_PATH:-}" ]]; then
+        SWIFTPM_SCRATCH_PATH="$REPOPROMPT_SWIFTPM_SCRATCH_PATH"
+    else
+        SWIFTPM_SCRATCH_PATH="$(python3 "$CACHE_INVENTORY_SCRIPT" --repo-root "$ROOT_DIR" --configuration "$CONF" --format path)"
+        REPOPROMPT_SWIFTPM_SCRATCH_PATH="$SWIFTPM_SCRATCH_PATH"
+    fi
+    export REPOPROMPT_SWIFTPM_SCRATCH_PATH
+    printf 'SwiftPM scratch path: %s\n' "$SWIFTPM_SCRATCH_PATH"
+}
 finish(){
     local status="$1" now total
     [[ -z "${APP_ENTITLEMENTS:-}" ]] || rm -f "$APP_ENTITLEMENTS"
@@ -107,6 +119,7 @@ fi
 
 phase "Checking build environment"
 run "$CONTROL_PLANE_SCRIPTS_DIR/doctor.sh" --quiet
+resolve_swiftpm_scratch_path
 SIGN_IDENTITY_WAS_EXPLICIT=0
 if [[ -n "${SIGN_IDENTITY:-}" ]]; then
     SIGN_IDENTITY_WAS_EXPLICIT=1
@@ -234,14 +247,14 @@ else
     run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
 
     phase "Building $APP_NAME ($CONF, host-native)"
-    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --scratch-path "$SWIFTPM_SCRATCH_PATH" --product "$APP_NAME"
 
     phase "Building repoprompt-mcp ($CONF, host-native)"
-    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --scratch-path "$SWIFTPM_SCRATCH_PATH" --product repoprompt-mcp
 
     phase "Resolving build artifact paths"
-    echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
-    BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
+    echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --scratch-path "$SWIFTPM_SCRATCH_PATH" --show-bin-path
+    BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --scratch-path "$SWIFTPM_SCRATCH_PATH" --show-bin-path)"
 fi
 if (( PUBLIC_UNIVERSAL_RELEASE )); then
     APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"

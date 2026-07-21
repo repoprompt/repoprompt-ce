@@ -585,9 +585,12 @@ class LocalProductionInstallerTests(unittest.TestCase):
             textwrap.dedent(
                 """\
                 #!/usr/bin/env bash
+                ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
                 set -euo pipefail
                 app="$FAKE_BUILD_DIR/RepoPrompt.app"
                 mkdir -p "$app/Contents"
+                mkdir -p "$ROOT_DIR/.build"
+                ln -sfn "$FAKE_BUILD_DIR" "$ROOT_DIR/.build/release"
                 printf 'new\\n' > "$app/payload.txt"
                 printf '%s|%s|%s\\n' "$LOCAL_SIGNING_CERTIFICATE_SHA1" "$LOCAL_SIGNING_CERTIFICATE_SHA256" "$LOCAL_SIGNING_SERVICE_GENERATION" >> "$PACKAGE_CAPTURE"
                 cat > "$app/Contents/Info.plist" <<EOF
