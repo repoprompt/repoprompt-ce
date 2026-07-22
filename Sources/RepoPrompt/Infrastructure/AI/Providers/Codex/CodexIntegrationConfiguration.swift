@@ -171,10 +171,6 @@ enum CodexIntegrationConfiguration {
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
     static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
-        fileLock.lock()
-        defer { fileLock.unlock() }
-
-        let fm = FileManager.default
         let runtime: CodexRuntimeAuthority.Runtime
         switch CodexRuntimeAuthority.resolve() {
         case let .success(resolved):
@@ -182,6 +178,11 @@ enum CodexIntegrationConfiguration {
         case let .failure(failure):
             return (false, false, failure.localizedDescription)
         }
+
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
+        let fm = FileManager.default
         let configURL = configURL()
 
         do {

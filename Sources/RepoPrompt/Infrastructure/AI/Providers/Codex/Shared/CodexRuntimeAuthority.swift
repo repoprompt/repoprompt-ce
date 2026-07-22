@@ -131,6 +131,15 @@ enum CodexRuntimeAuthority {
         let pathDir: String
     }
 
+    private struct ExternalVersionCacheKey: Hashable {
+        let path: String
+        let modificationDate: Date?
+        let fileSize: UInt64?
+    }
+
+    private static let externalVersionCacheLock = NSLock()
+    private static var externalVersionCache: [ExternalVersionCacheKey: Version] = [:]
+
     static var currentArchitectureTarget: String? {
         #if arch(arm64)
             "aarch64-apple-darwin"
@@ -164,7 +173,7 @@ enum CodexRuntimeAuthority {
         architectureTarget: String? = currentArchitectureTarget,
         applicationSupportURL: URL? = nil,
         explicitExecutableOverride: String? = nil,
-        externalVersionReader: (URL) -> String? = readExternalVersion
+        externalVersionReader: ((URL) -> String?)? = nil
     ) -> Result<Runtime, Failure> {
         let state = statePaths(applicationSupportURL: applicationSupportURL)
         let configuredOverride = explicitExecutableOverride ?? environment[externalExecutableOverrideEnvironmentKey]
@@ -252,7 +261,7 @@ enum CodexRuntimeAuthority {
     private static func resolveExternalOverride(
         _ rawPath: String,
         statePaths: StatePaths,
-        versionReader: (URL) -> String?
+        versionReader: ((URL) -> String?)?
     ) -> Result<Runtime, Failure> {
         let expandedPath = (rawPath as NSString).expandingTildeInPath
         guard expandedPath.hasPrefix("/") else {
@@ -266,7 +275,12 @@ enum CodexRuntimeAuthority {
         guard !isDirectory.boolValue, FileManager.default.isExecutableFile(atPath: url.path) else {
             return .failure(.externalOverrideNotExecutable(url.path))
         }
-        guard let output = versionReader(url), let version = Version.parse(output) else {
+        let version: Version? = if let versionReader {
+            versionReader(url).flatMap(Version.parse)
+        } else {
+            cachedExternalVersion(executableURL: url)
+        }
+        guard let version else {
             return .failure(.externalOverrideVersionUnreadable(url.path))
         }
         guard version >= minimumExternalVersion else {
@@ -280,6 +294,27 @@ enum CodexRuntimeAuthority {
                 statePaths: statePaths
             )
         )
+    }
+
+    private static func cachedExternalVersion(executableURL: URL) -> Version? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: executableURL.path)
+        let key = ExternalVersionCacheKey(
+            path: executableURL.path,
+            modificationDate: attributes?[.modificationDate] as? Date,
+            fileSize: (attributes?[.size] as? NSNumber)?.uint64Value
+        )
+
+        externalVersionCacheLock.lock()
+        defer { externalVersionCacheLock.unlock() }
+        if let cached = externalVersionCache[key] {
+            return cached
+        }
+
+        let version = readExternalVersion(executableURL: executableURL).flatMap(Version.parse)
+        if let version {
+            externalVersionCache[key] = version
+        }
+        return version
     }
 
     private static func readExternalVersion(executableURL: URL) -> String? {

@@ -119,7 +119,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Ensuring Codex MCP server entry")
         }
-        let ensureResult = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+        let ensureResult = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
         guard ensureResult.success else {
             throw AIProviderError.invalidConfiguration(
                 detail: ensureResult.errorMessage ?? "Failed to install RepoPrompt MCP config for Codex."

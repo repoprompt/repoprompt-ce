@@ -144,6 +144,23 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             ),
             .externalOverrideMissing(missing.path)
         )
+
+        let counter = temporaryDirectory.appendingPathComponent("external/version-probes")
+        let cachedOverride = temporaryDirectory.appendingPathComponent("external/cached-codex")
+        try makeExecutable(
+            at: cachedOverride,
+            content: "#!/bin/sh\necho probe >> \(counter.path)\necho 'codex 0.144.6'\n"
+        )
+        for _ in 0 ..< 2 {
+            _ = try CodexRuntimeAuthority.resolve(
+                resourcesURL: nil,
+                applicationSupportURL: temporaryDirectory,
+                explicitExecutableOverride: cachedOverride.path
+            ).get()
+        }
+        let probes = try String(contentsOf: counter, encoding: .utf8)
+            .split(separator: "\n")
+        XCTAssertEqual(probes.count, 1)
     }
 
     func testOverrideEnvironmentIsTheOnlyFallbackWhenBundleIsMissing() throws {
@@ -201,9 +218,9 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         return executable
     }
 
-    private func makeExecutable(at url: URL) throws {
+    private func makeExecutable(at url: URL, content: String = "#!/bin/sh\nexit 0\n") throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: url.path, contents: Data("#!/bin/sh\nexit 0\n".utf8))
+        FileManager.default.createFile(atPath: url.path, contents: Data(content.utf8))
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
 }
