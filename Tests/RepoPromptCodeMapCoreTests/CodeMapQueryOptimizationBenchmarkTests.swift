@@ -91,6 +91,41 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
                 collector.swiftParameterTypeResolutionDuration,
                 collector.swiftParameterTypeLegacyFallbackDuration
             )
+            XCTAssertEqual(
+                collector.swiftPropertyTypeResolutionCount,
+                collector.swiftStrategyPropertyTypeExtractionCount
+            )
+            XCTAssertEqual(
+                collector.swiftPropertyTypeASCIIDirectTypeCount +
+                    collector.swiftPropertyTypeASCIIDirectNilCount +
+                    collector.swiftPropertyTypeLegacyFallbackCount,
+                collector.swiftPropertyTypeResolutionCount
+            )
+            XCTAssertEqual(
+                collector.swiftPropertyTypeLegacyFallbackCount,
+                collector.swiftPropertyTypeUnicodeLegacyFallbackCount +
+                    collector.swiftPropertyTypeASCIIIneligibleFallbackCount
+            )
+            XCTAssertGreaterThan(
+                collector.swiftPropertyTypeASCIIDirectTypeCount +
+                    collector.swiftPropertyTypeASCIIDirectNilCount,
+                0
+            )
+            if collector.swiftPropertyTypeResolutionCount > 0 {
+                XCTAssertGreaterThan(collector.swiftPropertyTypeInputUTF8ByteCount, 0)
+            }
+            XCTAssertGreaterThanOrEqual(
+                collector.swiftPropertyTypeResolutionDuration,
+                collector.swiftPropertyTypeASCIIFastPathDuration
+            )
+            XCTAssertGreaterThanOrEqual(
+                collector.swiftPropertyTypeResolutionDuration,
+                collector.swiftPropertyTypeLegacyFallbackDuration
+            )
+            XCTAssertLessThan(
+                collector.swiftPropertyTypeLegacyFallbackCount,
+                collector.swiftPropertyTypeResolutionCount
+            )
 
             let evidence = try SwiftCodeMapPipelineBenchmarkSupport.makeEvidence(
                 files: files,
@@ -465,6 +500,253 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(collector.swiftParameterTypeLegacyFallbackDuration, 0)
     }
 
+    func testSwiftPropertyTypeASCIIFastPathMatchesLegacyBehavior() {
+        let directCases: [(String, String, SwiftCodeMapStrategy.SwiftASCIIPropertyTypeResolution)] = [
+            ("no type var", "var value", .noType),
+            ("no type let", "let value \t", .noType),
+            ("empty colon", "var value:", .noType),
+            ("simple", "var value: Int", .type("Int")),
+            ("bullet", "- let value: String", .type("String")),
+            ("attribute", "@Published var value: String?", .type("String?")),
+            ("attribute arguments", "@Option(flag: true) var value: Int!", .type("Int!")),
+            ("generic", "let value: Result<String, Error>", .type("Result<String, Error>")),
+            ("nested generic", "var value: Result<[String: (Int, Bool)], Error>", .type("Result<[String: (Int, Bool)], Error>")),
+            ("tuple", "var value: (Int, String)", .type("(Int, String)")),
+            ("function", "var handler: (@escaping (Int) -> Result<String, Error>)?", .type("(@escaping (Int) -> Result<String, Error>)?")),
+            ("array", "var values: [String]", .type("[String]")),
+            ("dictionary", "var values: [String: Int]", .type("[String: Int]")),
+            ("existential", "var value: any Sendable", .type("any Sendable")),
+            ("opaque", "var value: some Sequence", .type("some Sequence")),
+            ("composition", "var value: P & Q", .type("P & Q")),
+            ("initializer", "var value: Int = 42", .type("Int")),
+            ("newline after colon", "var value:\n Int", .type("Int")),
+            ("trailing newlines", "var value: Int\r\n", .type("Int")),
+        ]
+
+        for (name, declaration, expectedResolution) in directCases {
+            let legacy = SwiftCodeMapStrategy.extractSwiftPropertyTypeLegacy(from: declaration)
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.resolveSwiftASCIIPropertyType(in: declaration.utf8),
+                expectedResolution,
+                name
+            )
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftPropertyType(from: declaration),
+                legacy,
+                name
+            )
+        }
+
+        let modifiers = [
+            "private(set)", "public", "private", "internal", "fileprivate", "open",
+            "class", "static", "final", "lazy", "override", "mutating", "actor", "inout",
+            "required", "convenience", "indirect", "weak", "unowned", "dynamic", "distributed", "isolated",
+        ]
+        for modifier in modifiers {
+            let declaration = "\(modifier) var value: Int"
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.resolveSwiftASCIIPropertyType(in: declaration.utf8),
+                .type("Int"),
+                modifier
+            )
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftPropertyType(from: declaration),
+                SwiftCodeMapStrategy.extractSwiftPropertyTypeLegacy(from: declaration),
+                modifier
+            )
+        }
+
+        let fallbackCases = [
+            "var value: \t\r",
+            "@Outer(inner(value)) var value: Int",
+            "@Broken( var value: Int",
+            "unknown var value: Int",
+            "var value /* comment */: Int",
+            "var value: /* comment */ Int",
+            "var value: Int // comment",
+            "var value: Int, other: String",
+            "var value: Result<A = B, C>",
+            "var value: (A = B)",
+            "var value: Int == 42",
+            "var value: Int { get }",
+            "var value: Int = \"text\"",
+            "var value: Result<String, Error",
+            "var value: Int\nlet other: String",
+            "var value): Int",
+        ]
+        for declaration in fallbackCases {
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.resolveSwiftASCIIPropertyType(in: declaration.utf8),
+                .fallback,
+                String(reflecting: declaration)
+            )
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftPropertyType(from: declaration),
+                SwiftCodeMapStrategy.extractSwiftPropertyTypeLegacy(from: declaration),
+                String(reflecting: declaration)
+            )
+        }
+    }
+
+    func testSwiftPropertyTypeGeneratedASCIIEquivalenceAndCounters() {
+        let alphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".utf8) + [
+            0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x3A, 0x3D, 0x23, 0x22, 0x5C, 0x2F, 0x40,
+            0x28, 0x29, 0x5B, 0x5D, 0x7B, 0x7D,
+            0x3C, 0x3E, 0x2C, 0x2E, 0x2D, 0x2A, 0x3F, 0x21, 0x26,
+        ]
+        let directTypes = [
+            "Int", "String?", "Result<String, Error>", "[String: Int]",
+            "(Int, String)", "(Int) -> Void", "any Sendable", "P & Q",
+        ]
+        let caseCount = 2_000
+        var state: UInt64 = 0x6006_5A17_C0DE_0060
+        var totalUTF8ByteCount = 0
+        let collector = CodeMapPerformanceCollector()
+
+        func nextRandom() -> UInt64 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return state
+        }
+
+        for caseIndex in 0 ..< caseCount {
+            let input: String
+            if caseIndex.isMultiple(of: 4) {
+                let keyword = caseIndex.isMultiple(of: 8) ? "var" : "let"
+                let type = directTypes[Int(nextRandom() % UInt64(directTypes.count))]
+                input = "\(keyword) value\(caseIndex): \(type)"
+            } else {
+                let length = Int(nextRandom() % 161)
+                var bytes: [UInt8] = []
+                bytes.reserveCapacity(length)
+                for _ in 0 ..< length {
+                    bytes.append(alphabet[Int(nextRandom() % UInt64(alphabet.count))])
+                }
+                input = String(decoding: bytes, as: UTF8.self)
+            }
+            totalUTF8ByteCount += input.utf8.count
+
+            let legacy = SwiftCodeMapStrategy.extractSwiftPropertyTypeLegacy(from: input)
+            let direct = SwiftCodeMapStrategy.resolveSwiftASCIIPropertyType(in: input.utf8)
+            switch direct {
+            case let .type(type):
+                XCTAssertEqual(type, legacy, "generated direct type \(caseIndex)")
+            case .noType:
+                XCTAssertNil(legacy, "generated direct nil \(caseIndex)")
+            case .fallback:
+                break
+            }
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftPropertyType(from: input, perfStats: collector),
+                legacy,
+                "generated case \(caseIndex): \(String(reflecting: input))"
+            )
+        }
+
+        XCTAssertEqual(collector.swiftPropertyTypeResolutionCount, caseCount)
+        XCTAssertGreaterThan(
+            collector.swiftPropertyTypeASCIIDirectTypeCount +
+                collector.swiftPropertyTypeASCIIDirectNilCount,
+            0
+        )
+        XCTAssertEqual(
+            collector.swiftPropertyTypeASCIIDirectTypeCount +
+                collector.swiftPropertyTypeASCIIDirectNilCount +
+                collector.swiftPropertyTypeLegacyFallbackCount,
+            caseCount
+        )
+        XCTAssertEqual(
+            collector.swiftPropertyTypeLegacyFallbackCount,
+            collector.swiftPropertyTypeASCIIIneligibleFallbackCount
+        )
+        XCTAssertEqual(collector.swiftPropertyTypeUnicodeLegacyFallbackCount, 0)
+        XCTAssertEqual(collector.swiftPropertyTypeInputUTF8ByteCount, totalUTF8ByteCount)
+        XCTAssertGreaterThanOrEqual(
+            collector.swiftPropertyTypeResolutionDuration,
+            collector.swiftPropertyTypeASCIIFastPathDuration
+        )
+        XCTAssertGreaterThanOrEqual(
+            collector.swiftPropertyTypeResolutionDuration,
+            collector.swiftPropertyTypeLegacyFallbackDuration
+        )
+    }
+
+    func testSwiftPropertyTypeUnicodeAlwaysUsesLegacyFallback() {
+        let declarations = [
+            "var café: Type",
+            "var value: Café",
+            "var value:\u{00A0}Type",
+            "var value:\u{2003}Type",
+            "@Wrapper(label: \"🙂\") var value: Int",
+            "var value: String = \"🙂\"",
+            "var mixed: Result<Café, Error>",
+        ]
+        let collector = CodeMapPerformanceCollector()
+
+        for declaration in declarations {
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.resolveSwiftASCIIPropertyType(in: declaration.utf8),
+                .fallback
+            )
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftPropertyType(from: declaration, perfStats: collector),
+                SwiftCodeMapStrategy.extractSwiftPropertyTypeLegacy(from: declaration),
+                String(reflecting: declaration)
+            )
+        }
+
+        XCTAssertEqual(collector.swiftPropertyTypeResolutionCount, declarations.count)
+        XCTAssertEqual(collector.swiftPropertyTypeLegacyFallbackCount, declarations.count)
+        XCTAssertEqual(collector.swiftPropertyTypeUnicodeLegacyFallbackCount, declarations.count)
+        XCTAssertEqual(collector.swiftPropertyTypeASCIIIneligibleFallbackCount, 0)
+        XCTAssertEqual(collector.swiftPropertyTypeASCIIDirectTypeCount, 0)
+        XCTAssertEqual(collector.swiftPropertyTypeASCIIDirectNilCount, 0)
+        XCTAssertEqual(
+            collector.swiftPropertyTypeInputUTF8ByteCount,
+            declarations.reduce(0) { $0 + $1.utf8.count }
+        )
+        XCTAssertGreaterThanOrEqual(
+            collector.swiftPropertyTypeResolutionDuration,
+            collector.swiftPropertyTypeLegacyFallbackDuration
+        )
+    }
+
+    func testSwiftPropertyTypePipelineRoutesTopLevelMemberProtocolAndComputedDeclarations() throws {
+        let source = """
+        let globalValue: Int = 1
+        struct Example {
+            private(set) var memberValue: Result<String, Error> = .success(\"ok\")
+            var computedValue: [String: Int] { [:] }
+        }
+        protocol Shape {
+            var protocolValue: any Sendable { get }
+        }
+        """
+        let collector = CodeMapPerformanceCollector()
+        let artifact = try build(
+            source: source,
+            language: .swift,
+            options: .countersOnly,
+            collector: collector
+        )
+
+        let global = try XCTUnwrap(artifact.globalVars.first { $0.name.contains("globalValue") })
+        XCTAssertEqual(global.typeName, "Int")
+        let example = try XCTUnwrap(artifact.classes.first { $0.name == "Example" })
+        XCTAssertEqual(example.properties.map(\.typeName), ["Result<String, Error>", "[String: Int]"])
+        XCTAssertTrue(example.properties[1].name.contains("computedValue"))
+        XCTAssertFalse(example.properties[1].name.contains("{"))
+        let shape = try XCTUnwrap(artifact.interfaces.first { $0.name == "Shape" })
+        XCTAssertEqual(shape.properties.map(\.typeName), ["any Sendable"])
+
+        XCTAssertEqual(collector.swiftPropertyTypeResolutionCount, 4)
+        XCTAssertEqual(collector.swiftPropertyTypeASCIIDirectTypeCount, 4)
+        XCTAssertEqual(collector.swiftPropertyTypeASCIIDirectNilCount, 0)
+        XCTAssertEqual(collector.swiftPropertyTypeLegacyFallbackCount, 0)
+        XCTAssertEqual(collector.lteMatchAnyVariableCalls, 0)
+        XCTAssertGreaterThan(collector.swiftPropertyTypeInputUTF8ByteCount, 0)
+    }
+
     func testCaptureIndexCountsMissingNamedBuckets() {
         let collector = CodeMapPerformanceCollector()
         let index = CodeMapCaptureIndex([], performanceCollector: collector)
@@ -638,7 +920,9 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         )
         XCTAssertEqual(swiftCollector.syntaxCaptureCountsByName["swift.param.type", default: 0], 0)
         XCTAssertEqual(swiftCollector.syntaxCaptureCountsByName["function.definition", default: 0], 0)
-        XCTAssertEqual(swiftCollector.lteMatchAnyVariableCalls, 1)
+        XCTAssertEqual(swiftCollector.swiftPropertyTypeASCIIDirectTypeCount, 1)
+        XCTAssertEqual(swiftCollector.swiftPropertyTypeLegacyFallbackCount, 0)
+        XCTAssertEqual(swiftCollector.lteMatchAnyVariableCalls, 0)
 
         let tsCollector = CodeMapPerformanceCollector(collectsCaptureNames: true)
         let tsSource = """

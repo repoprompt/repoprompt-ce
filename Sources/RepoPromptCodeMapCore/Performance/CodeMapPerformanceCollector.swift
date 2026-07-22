@@ -104,6 +104,13 @@ package final class CodeMapPerformanceCollector {
     package var swiftStrategyReturnTypeExtractionCount = 0
     package var swiftStrategyPropertyDeclarationCount = 0
     package var swiftStrategyPropertyTypeExtractionCount = 0
+    package var swiftPropertyTypeResolutionCount = 0
+    package var swiftPropertyTypeASCIIDirectTypeCount = 0
+    package var swiftPropertyTypeASCIIDirectNilCount = 0
+    package var swiftPropertyTypeLegacyFallbackCount = 0
+    package var swiftPropertyTypeUnicodeLegacyFallbackCount = 0
+    package var swiftPropertyTypeASCIIIneligibleFallbackCount = 0
+    package var swiftPropertyTypeInputUTF8ByteCount = 0
     package var swiftStrategyEnclosingTypeLookupCount = 0
     package var swiftStrategyModelInsertionCount = 0
     package var swiftStrategyContextOnlyCount = 0
@@ -222,6 +229,9 @@ package final class CodeMapPerformanceCollector {
     package var swiftPropertyDeclarationSubstringDuration: TimeInterval = 0
     package var swiftPropertyInitializerStripDuration: TimeInterval = 0
     package var swiftStrategyPropertyTypeExtractionDuration: TimeInterval = 0
+    package var swiftPropertyTypeResolutionDuration: TimeInterval = 0
+    package var swiftPropertyTypeASCIIFastPathDuration: TimeInterval = 0
+    package var swiftPropertyTypeLegacyFallbackDuration: TimeInterval = 0
     package var swiftStrategyEnclosingTypeLookupDuration: TimeInterval = 0
     package var swiftStrategyModelInsertionDuration: TimeInterval = 0
     package var swiftStrategyContextOnlyDuration: TimeInterval = 0
