@@ -452,11 +452,12 @@ extension AgentModeViewModel {
 
     struct CodexWatchdogState: Equatable {
         var lastProgressAt: Date?
+        var progressGeneration: UInt64 = 0
         var suppressUntil: Date?
+        /// Bounded, in-memory identity for the last ambiguous upstream probe.
+        /// Never logged or persisted; real provider/tool progress clears it.
+        var lastAmbiguousProbeFingerprint: String?
         var ambiguousActiveProbeCount: Int = 0
-        var isPausedAfterWarning: Bool = false
-        var warnedSinceLastProgress: Bool = false
-        var requiresColdTeardownOnCancel: Bool = false
     }
 
     enum CodexNativeStartupDisposition: Equatable {
