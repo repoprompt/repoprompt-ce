@@ -215,8 +215,11 @@ make dev-release-artifact
 The artifact is written under `dist/`. It exercises universal `arm64+x86_64`
 release-mode compilation in isolated SwiftPM directories, resource-equivalence
 checking, unsigned product merging, app bundling, legal-file packaging, and
-archive extraction validation. It is intentionally ad-hoc signed and is not
-suitable for distribution. The ZIP is accompanied by a deterministic external
+archive extraction validation. Coordinated `release artifact` jobs allow up to
+four hours for this dual-architecture path; `package release`, `release package`,
+and `release local-install` retain the normal two-hour release timeout. The
+artifact is intentionally ad-hoc signed and is not suitable for distribution.
+The ZIP is accompanied by a deterministic external
 `*-artifact-manifest.json` and `SHA256SUMS`; the manifest binds bundle versions,
 architecture sets, executable/helper hashes, signing identifiers and teams,
 designated requirements, certificate fingerprints when present, and the
