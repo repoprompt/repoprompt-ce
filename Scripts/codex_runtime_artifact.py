@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -37,6 +38,15 @@ REQUIRED_LAYOUT = {
     "codex-resources",
     "codex-path",
 }
+BUNDLE_TARGETS = (
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+)
+TARGET_ARCHITECTURES = {
+    "aarch64-apple-darwin": "arm64",
+    "x86_64-apple-darwin": "x86_64",
+}
+EXPECTED_DIRECTORY_MODE = 0o755
 
 
 class ContractError(RuntimeError):
@@ -63,10 +73,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if manifest.get("releaseURL") != OFFICIAL_RELEASE_URL:
         raise ContractError(f"pinned manifest releaseURL must be {OFFICIAL_RELEASE_URL}")
     packages = manifest.get("packages")
-    if not isinstance(packages, dict) or set(packages) != {
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-    }:
+    if not isinstance(packages, dict) or set(packages) != set(BUNDLE_TARGETS):
         raise ContractError("pinned manifest must contain exactly both macOS package targets")
     if set(manifest.get("requiredLayout", [])) != REQUIRED_LAYOUT:
         raise ContractError("pinned manifest requiredLayout is incomplete or unexpected")
@@ -77,17 +84,13 @@ def load_manifest(path: Path) -> dict[str, Any]:
     expected_checksums_url = f"{OFFICIAL_DOWNLOAD_URL}/{checksums['asset']}"
     if checksums.get("url") != expected_checksums_url:
         raise ContractError(f"official checksum asset URL must be {expected_checksums_url}")
-    expected_architectures = {
-        "aarch64-apple-darwin": "arm64",
-        "x86_64-apple-darwin": "x86_64",
-    }
     for target, package in packages.items():
         if not isinstance(package, dict):
             raise ContractError(f"{target}: package contract is not an object")
         expected_archive = f"codex-package-{target}.tar.gz"
         if package.get("archive") != expected_archive:
             raise ContractError(f"{target}: expected official archive {expected_archive}")
-        if package.get("architecture") != expected_architectures[target]:
+        if package.get("architecture") != TARGET_ARCHITECTURES[target]:
             raise ContractError(f"{target}: architecture policy mismatch")
         validate_digest(package.get("sha256"), f"{target} archive")
         expected_package_url = f"{OFFICIAL_DOWNLOAD_URL}/{expected_archive}"
@@ -157,6 +160,12 @@ def validate_relative_path(raw: object, context: str) -> PurePosixPath:
     return path
 
 
+def selected_targets(value: str) -> list[str]:
+    if value == "all":
+        return list(BUNDLE_TARGETS)
+    return [normalize_target(value)]
+
+
 def normalize_target(value: str) -> str:
     if value == "host":
         machine = platform.machine()
@@ -214,15 +223,35 @@ def run_tool(argv: list[str], description: str) -> str:
     return output
 
 
+def parse_codesign_metadata(details: str) -> dict[str, list[str]]:
+    fields: dict[str, list[str]] = {}
+    for raw_line in details.splitlines():
+        line = raw_line.strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"Identifier", "TeamIdentifier", "Authority", "Timestamp"}:
+            fields.setdefault(key, []).append(value)
+    return fields
+
+
+def verify_directory_mode(path: Path, context: str) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode != EXPECTED_DIRECTORY_MODE:
+        raise ContractError(f"{context} directory mode must be 0755, got {mode:04o}: {path}")
+
+
 def snapshot_tree(root: Path) -> dict[str, dict[str, Any]]:
     if not root.is_dir() or root.is_symlink():
         raise ContractError(f"package root is not a real directory: {root}")
+    verify_directory_mode(root, "package root")
     snapshot: dict[str, dict[str, Any]] = {}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         if path.is_symlink():
             raise ContractError(f"package contains an unsupported symbolic link: {relative}")
         if path.is_dir():
+            verify_directory_mode(path, f"package directory {relative}")
             snapshot[relative] = {"path": relative, "kind": "directory"}
         elif path.is_file():
             snapshot[relative] = {
@@ -282,17 +311,27 @@ def verify_package(
         binary = root / policy["path"]
         run_tool([codesign, "--verify", "--strict", "--verbose=2", str(binary)], f"signature check for {policy['path']}")
         details = run_tool([codesign, "-dv", "--verbose=4", str(binary)], f"signature metadata for {policy['path']}")
-        required_lines = [
-            f"Identifier={policy['identifier']}",
-            f"TeamIdentifier={policy['teamIdentifier']}",
-            f"Authority={policy['authority']}",
-        ]
-        for value in required_lines:
-            if value not in details:
-                raise ContractError(f"{target}: {policy['path']} signature metadata is missing {value!r}")
+        fields = parse_codesign_metadata(details)
+        exact_single_fields = {
+            "Identifier": policy["identifier"],
+            "TeamIdentifier": policy["teamIdentifier"],
+        }
+        for key, expected in exact_single_fields.items():
+            actual = fields.get(key, [])
+            if actual != [expected]:
+                raise ContractError(
+                    f"{target}: {policy['path']} signature metadata {key} must equal {expected!r}, got {actual!r}"
+                )
+        authorities = fields.get("Authority", [])
+        if not authorities or authorities[0] != policy["authority"]:
+            raise ContractError(
+                f"{target}: {policy['path']} leaf signing authority must equal {policy['authority']!r},"
+                f" got {authorities!r}"
+            )
         if not re.search(r"^CodeDirectory .*flags=.*\([^)]*\bruntime\b[^)]*\)", details, re.MULTILINE):
             raise ContractError(f"{target}: {policy['path']} is missing the hardened-runtime signing flag")
-        if not re.search(r"^Timestamp=.+", details, re.MULTILINE):
+        timestamps = fields.get("Timestamp", [])
+        if len(timestamps) != 1 or not timestamps[0].strip() or timestamps[0].strip().casefold() == "none":
             raise ContractError(f"{target}: {policy['path']} is missing a trusted signing timestamp")
 
 
@@ -361,6 +400,7 @@ def acquire_target(
     final.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(tempfile.mkdtemp(prefix=f".{target}.", dir=final.parent))
     try:
+        temp.chmod(EXPECTED_DIRECTORY_MODE)
         expected_paths = {entry["path"] for entry in package["tree"]}
         safe_extract(archive, temp, expected_paths)
         verify_package(temp, target, manifest, lipo, codesign)
@@ -372,8 +412,58 @@ def acquire_target(
     return final
 
 
+def verify_bundle(
+    root: Path,
+    targets: list[str],
+    manifest: dict[str, Any],
+    lipo: str,
+    codesign: str,
+) -> None:
+    if not root.is_dir() or root.is_symlink():
+        raise ContractError(f"Codex bundle root is not a real directory: {root}")
+    verify_directory_mode(root, "Codex bundle root")
+    actual_targets = {path.name for path in root.iterdir()}
+    expected_targets = set(targets)
+    if actual_targets != expected_targets:
+        raise ContractError(
+            "Codex bundle target layout mismatch"
+            f"\nmissing={sorted(expected_targets - actual_targets)}"
+            f"\nextra={sorted(actual_targets - expected_targets)}"
+        )
+    for target in targets:
+        package = root / target
+        if not package.is_dir() or package.is_symlink():
+            raise ContractError(f"Codex bundle target is not a real directory: {package}")
+        verify_package(package, target, manifest, lipo, codesign)
+    print(f"OK: verified bundled Codex {manifest['version']} targets: {', '.join(targets)}")
+
+
+def stage_bundle(args: argparse.Namespace, manifest: dict[str, Any]) -> None:
+    targets = selected_targets(args.arch)
+    cache_root = Path(args.cache_root)
+    destination = Path(args.bundle)
+    if destination.exists() or destination.is_symlink():
+        raise ContractError(f"Codex bundle destination already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    try:
+        temp.chmod(EXPECTED_DIRECTORY_MODE)
+        for target in targets:
+            source = cache_root / manifest["version"] / target
+            verify_package(source, target, manifest, args.lipo, args.codesign)
+            staged_target = temp / target
+            shutil.copytree(source, staged_target)
+            staged_target.chmod(EXPECTED_DIRECTORY_MODE)
+        verify_bundle(temp, targets, manifest, args.lipo, args.codesign)
+        os.replace(temp, destination)
+    except Exception:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
+    print(f"OK: staged Codex {manifest['version']} bundle: {destination}")
+
+
 def acquire(args: argparse.Namespace, manifest: dict[str, Any]) -> None:
-    targets = list(manifest["packages"]) if args.arch == "all" else [normalize_target(args.arch)]
+    targets = selected_targets(args.arch)
     cache_root = Path(args.cache_root)
     missing: list[str] = []
     for target in targets:
@@ -404,7 +494,7 @@ def acquire(args: argparse.Namespace, manifest: dict[str, Any]) -> None:
 
 def status(args: argparse.Namespace, manifest: dict[str, Any]) -> None:
     failed = False
-    for target in manifest["packages"]:
+    for target in BUNDLE_TARGETS:
         path = Path(args.cache_root) / manifest["version"] / target
         if not path.exists():
             print(f"MISSING: {target}: {path}")
@@ -434,6 +524,19 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify", help="verify an extracted package without network access")
     verify_parser.add_argument("--arch", required=True)
     verify_parser.add_argument("--package", required=True)
+    stage_bundle_parser = subparsers.add_parser(
+        "stage-bundle",
+        help="copy verified cached packages into the stable target-specific bundle layout",
+    )
+    stage_bundle_parser.add_argument("--arch", default="all")
+    stage_bundle_parser.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT))
+    stage_bundle_parser.add_argument("--bundle", required=True)
+    verify_bundle_parser = subparsers.add_parser(
+        "verify-bundle",
+        help="verify the exact stable target-specific bundle layout without network access",
+    )
+    verify_bundle_parser.add_argument("--arch", default="all")
+    verify_bundle_parser.add_argument("--bundle", required=True)
     status_parser = subparsers.add_parser("status", help="verify both cached packages without network access")
     status_parser.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT))
     subparsers.add_parser("validate-manifest", help="validate the repository pin without network or cached packages")
@@ -451,6 +554,10 @@ def main() -> int:
         elif args.command == "verify":
             verify_package(Path(args.package), normalize_target(args.arch), manifest, args.lipo, args.codesign)
             print(f"OK: verified pinned Codex package: {args.package}")
+        elif args.command == "stage-bundle":
+            stage_bundle(args, manifest)
+        elif args.command == "verify-bundle":
+            verify_bundle(Path(args.bundle), selected_targets(args.arch), manifest, args.lipo, args.codesign)
         elif args.command == "status":
             status(args, manifest)
         elif args.command == "manifest-version":

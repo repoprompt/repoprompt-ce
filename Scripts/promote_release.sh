@@ -270,9 +270,9 @@ validate_app_bundle() {
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh" "$app_bundle"
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
-        --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify \
-        --arch aarch64-apple-darwin \
-        --package "$app_bundle/Contents/Resources/BundledRuntimes/Codex"
+        --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \
+        --arch all \
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$app_bundle" \
@@ -295,9 +295,9 @@ validate_dmg_matches_zip_app() {
         fail "DMG app contents do not match the verified update ZIP app"
     validate_embedded_mcp_helper_layout "$dmg_app" "Mounted DMG MCP helper layout"
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
-        --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify \
-        --arch aarch64-apple-darwin \
-        --package "$dmg_app/Contents/Resources/BundledRuntimes/Codex"
+        --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \
+        --arch all \
+        --bundle "$dmg_app/Contents/Resources/BundledRuntimes/Codex"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$dmg_app" \
         "arm64,x86_64" \

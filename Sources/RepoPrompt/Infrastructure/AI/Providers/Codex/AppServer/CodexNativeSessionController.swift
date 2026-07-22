@@ -397,6 +397,8 @@ final class CodexNativeSessionController {
     enum ThreadGoalStatus: String, Equatable {
         case active
         case paused
+        case blocked
+        case usageLimited
         case budgetLimited
         case complete
     }
@@ -1082,19 +1084,12 @@ final class CodexNativeSessionController {
             await ensureInboundStreamsStarted()
 
             let configOverrides = await options.configOverridesProvider()
-            let pathValue = existing?.rolloutPath
             let result: [String: Any]
 
             if let resumeThreadID {
                 var params: [String: Any] = ["threadId": resumeThreadID]
-                if let pathValue {
-                    params["path"] = pathValue
-                }
                 if let model {
                     params["model"] = model
-                }
-                if let reasoningEffort {
-                    params["effort"] = reasoningEffort
                 }
                 Self.addServiceTier(serviceTier, to: &params)
                 if let workspacePath {
@@ -1121,9 +1116,6 @@ final class CodexNativeSessionController {
                 var params: [String: Any] = [:]
                 if let model {
                     params["model"] = model
-                }
-                if let reasoningEffort {
-                    params["effort"] = reasoningEffort
                 }
                 Self.addServiceTier(serviceTier, to: &params)
                 if let workspacePath {
@@ -1294,10 +1286,7 @@ final class CodexNativeSessionController {
             ],
             timeout: options.requestTimeout
         )
-        guard let rawGoal = result["goal"] else {
-            throw CodexAppServerClient.ClientError.invalidResponse
-        }
-        if rawGoal is NSNull {
+        guard let rawGoal = result["goal"], !(rawGoal is NSNull) else {
             return nil
         }
         return try Self.parseThreadGoal(from: rawGoal)
@@ -1939,6 +1928,10 @@ final class CodexNativeSessionController {
             return .active
         case "paused":
             return .paused
+        case "blocked":
+            return .blocked
+        case "usagelimited":
+            return .usageLimited
         case "budgetlimited":
             return .budgetLimited
         case "complete", "completed":

@@ -42,5 +42,26 @@ grep -F "codex-resources/zsh/bin/zsh" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the bundled Zsh notice"
 grep -F "rust-v0.144.6" docs/releasing.md >/dev/null ||
     fail "docs/releasing.md is missing the pinned Codex release"
+grep -F 'Contents/Resources/BundledRuntimes/Codex/<target>/' docs/releasing.md >/dev/null ||
+    fail "docs/releasing.md is missing the target-specific bundled Codex layout"
+grep -F 'CODEX_BUNDLE_ARCH="all"' Scripts/package_app.sh >/dev/null ||
+    fail "public packaging must select all pinned Codex targets"
+grep -F 'stage-bundle' Scripts/package_app.sh >/dev/null ||
+    fail "packaging must use the authoritative Codex bundle staging helper"
+for script in \
+    Scripts/main_tip_release.sh \
+    Scripts/promote_release.sh \
+    Scripts/publish_public_update_test.sh \
+    Scripts/release.sh \
+    Scripts/sign_staged_release.sh \
+    Scripts/validate_staged_release.sh; do
+    grep -F 'verify-bundle' "$script" >/dev/null ||
+        fail "$script must verify the exact target-specific Codex bundle"
+    grep -F -- '--arch all' "$script" >/dev/null ||
+        fail "$script must require both pinned Codex targets"
+    if grep -F -- '--arch aarch64-apple-darwin' "$script" >/dev/null; then
+        fail "$script must not validate only the arm64 Codex package"
+    fi
+done
 
-printf 'OK: pinned Codex artifact and legal inventory contracts are complete.\n'
+printf 'OK: pinned Codex artifact, universal bundle, and legal inventory contracts are complete.\n'

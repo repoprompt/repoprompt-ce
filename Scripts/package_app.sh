@@ -223,35 +223,19 @@ CODEX_ARTIFACT_TOOL="$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py"
 CODEX_MANIFEST="$ROOT_DIR/Vendor/Codex/manifest.json"
 CODEX_VERSION="$(python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" manifest-version)"
 CODEX_CACHE_ROOT="${REPOPROMPT_CODEX_CACHE_ROOT:-$ROOT_DIR/.build/codex-runtime}"
-CODEX_REQUESTED_ARCH="${REPOPROMPT_CODEX_ARCH:-}"
-if [[ -z "$CODEX_REQUESTED_ARCH" ]]; then
-    if (( PUBLIC_UNIVERSAL_RELEASE )); then
-        # Public artifacts use one explicitly stable package selection even though
-        # the outer app is universal. PR 3 owns runtime selection/fallback policy.
-        CODEX_REQUESTED_ARCH="aarch64-apple-darwin"
-    else
-        CODEX_REQUESTED_ARCH="$(uname -m)"
+CODEX_BUNDLE_ARCH="${REPOPROMPT_CODEX_ARCH:-}"
+if (( PUBLIC_UNIVERSAL_RELEASE )); then
+    if [[ -n "$CODEX_BUNDLE_ARCH" && "$CODEX_BUNDLE_ARCH" != "all" ]]; then
+        fail "Public universal release packaging requires REPOPROMPT_CODEX_ARCH=all when explicitly set"
     fi
+    CODEX_BUNDLE_ARCH="all"
+elif [[ -z "$CODEX_BUNDLE_ARCH" ]]; then
+    CODEX_BUNDLE_ARCH="host"
 fi
-case "$CODEX_REQUESTED_ARCH" in
-    arm64|aarch64|aarch64-apple-darwin) CODEX_TARGET="aarch64-apple-darwin" ;;
-    x86_64|x86_64-apple-darwin) CODEX_TARGET="x86_64-apple-darwin" ;;
-    *) fail "Unsupported REPOPROMPT_CODEX_ARCH: $CODEX_REQUESTED_ARCH" ;;
-esac
-if (( PUBLIC_UNIVERSAL_RELEASE )) && [[ "$CODEX_TARGET" != "aarch64-apple-darwin" ]]; then
-    fail "Public release packaging requires the pinned aarch64-apple-darwin Codex selection"
-fi
-CODEX_PACKAGE_DIR="$CODEX_CACHE_ROOT/$CODEX_VERSION/$CODEX_TARGET"
 CODEX_APP_DIR=""
 phase "Acquiring pinned Codex $CODEX_VERSION package artifacts"
-if (( PUBLIC_UNIVERSAL_RELEASE )); then
-    # Validate both official macOS packages in explicit public-release builds.
-    run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" acquire \
-        --arch all --cache-root "$CODEX_CACHE_ROOT"
-else
-    run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" acquire \
-        --arch "$CODEX_TARGET" --cache-root "$CODEX_CACHE_ROOT"
-fi
+run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" acquire \
+    --arch "$CODEX_BUNDLE_ARCH" --cache-root "$CODEX_CACHE_ROOT"
 
 # KeyboardShortcuts' default Bundle.module lookup does not match RepoPrompt's
 # packaged resource layout. Host-native builds patch the default checkout below;
@@ -319,14 +303,12 @@ run ln -sf ../../MacOS/repoprompt-mcp "$APP_BUNDLE/Contents/Resources/bin/repopr
 run mkdir -p "$APP_BUNDLE/Contents/Resources/Legal"
 run cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/Legal/"
 run cp -R "$ROOT_DIR/ThirdPartyLicenses" "$APP_BUNDLE/Contents/Resources/Legal/"
-phase "Embedding verified Codex $CODEX_VERSION package"
+phase "Embedding verified Codex $CODEX_VERSION target package artifacts"
 CODEX_APP_DIR="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
-run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify \
-    --arch "$CODEX_TARGET" --package "$CODEX_PACKAGE_DIR"
-run mkdir -p "$CODEX_APP_DIR"
-run rsync -a "$CODEX_PACKAGE_DIR/" "$CODEX_APP_DIR/"
-run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify \
-    --arch "$CODEX_TARGET" --package "$CODEX_APP_DIR"
+run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" stage-bundle \
+    --arch "$CODEX_BUNDLE_ARCH" \
+    --cache-root "$CODEX_CACHE_ROOT" \
+    --bundle "$CODEX_APP_DIR"
 [[ ! -d AppResources ]] || run rsync -a AppResources/ "$APP_BUNDLE/Contents/Resources/"
 shopt -s nullglob
 for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done
@@ -515,8 +497,8 @@ fi
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 # The outer signature seals the resource tree but must not mutate or replace
 # OpenAI's nested Developer ID signatures. Re-run the byte/signature contract.
-run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify \
-    --arch "$CODEX_TARGET" --package "$CODEX_APP_DIR"
+run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify-bundle \
+    --arch "$CODEX_BUNDLE_ARCH" --bundle "$CODEX_APP_DIR"
 verify_signed_app_identity
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
 if (( PUBLIC_UNIVERSAL_RELEASE )); then

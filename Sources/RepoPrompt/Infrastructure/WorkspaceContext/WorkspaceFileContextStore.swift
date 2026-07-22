@@ -224,6 +224,9 @@ actor WorkspaceFileContextStore {
         let rootEpoch: WorkspaceCodemapRootEpoch
         let kind: CodemapProjectionPreloadStoreEventKind
         let launchPhase: WorkspaceCodemapProjectionPreloadLaunchPhase
+        #if DEBUG
+            let uptimeNanoseconds: UInt64
+        #endif
     }
 
     struct CodemapProjectionPreloadRetryPolicy: @unchecked Sendable {
@@ -370,11 +373,95 @@ actor WorkspaceFileContextStore {
         case unload
     }
 
+    private final class CodemapDemandCompletion: @unchecked Sendable {
+        private struct Waiter {
+            let continuation: CheckedContinuation<Void, Never>
+            var deadlineTask: Task<Void, Never>?
+        }
+
+        private let lock = NSLock()
+        private var didComplete = false
+        private var waitersByID: [UUID: Waiter] = [:]
+
+        var waiterCount: Int {
+            lock.withLock { waitersByID.count }
+        }
+
+        func wait(until deadline: ContinuousClock.Instant) async {
+            let waiterID = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled, ContinuousClock.now < deadline else {
+                        continuation.resume()
+                        return
+                    }
+
+                    lock.lock()
+                    guard !didComplete else {
+                        lock.unlock()
+                        continuation.resume()
+                        return
+                    }
+                    waitersByID[waiterID] = Waiter(
+                        continuation: continuation,
+                        deadlineTask: nil
+                    )
+                    lock.unlock()
+
+                    let deadlineTask = Task { [weak self] in
+                        try? await Task.sleep(until: deadline, clock: .continuous)
+                        guard !Task.isCancelled else { return }
+                        self?.resume(waiterID)
+                    }
+                    lock.lock()
+                    if waitersByID[waiterID] != nil {
+                        waitersByID[waiterID]?.deadlineTask = deadlineTask
+                        lock.unlock()
+                    } else {
+                        lock.unlock()
+                        deadlineTask.cancel()
+                    }
+                    if Task.isCancelled {
+                        resume(waiterID)
+                    }
+                }
+            } onCancel: {
+                self.resume(waiterID)
+            }
+        }
+
+        func resolve() {
+            lock.lock()
+            guard !didComplete else {
+                lock.unlock()
+                return
+            }
+            didComplete = true
+            let waiters = Array(waitersByID.values)
+            waitersByID.removeAll()
+            lock.unlock()
+
+            for waiter in waiters {
+                waiter.deadlineTask?.cancel()
+                waiter.continuation.resume()
+            }
+        }
+
+        private func resume(_ waiterID: UUID) {
+            lock.lock()
+            let waiter = waitersByID.removeValue(forKey: waiterID)
+            lock.unlock()
+            waiter?.deadlineTask?.cancel()
+            waiter?.continuation.resume()
+        }
+    }
+
     private struct CodemapDemandRecord {
         let ticket: WorkspaceCodemapArtifactDemandTicket
         let identity: WorkspaceCodemapArtifactBindingIdentity
         let language: LanguageType
         let owner: WorkspaceCodemapLiveDemandOwner
+        let completion: CodemapDemandCompletion
         var retainIDs: Set<UUID>
         var result: WorkspaceCodemapArtifactDemandResult
         var task: Task<Void, Never>?
@@ -1372,6 +1459,279 @@ actor WorkspaceFileContextStore {
         )? {
             guard let owner = debugCodemapBindingEngine(rootID: rootID) else { return nil }
             return await owner.engine.debugProjectionAdmissionSnapshot(rootEpoch: owner.rootEpoch)
+        }
+
+        private struct DebugCodemapFullLoadCapture {
+            let rootEpoch: WorkspaceCodemapRootEpoch
+            let catalogGeneration: UInt64
+            let ingressGeneration: UInt64
+            let rootKind: WorkspaceRootKind
+            let launchPhase: WorkspaceCodemapProjectionPreloadLaunchPhase?
+            let terminalReason: WorkspaceCodemapGitTerminalUnavailableReason?
+            let engine: WorkspaceCodemapBindingEngine?
+            let milestones: [CodemapFullLoadMilestone]
+
+            var identity: CodemapFullLoadRootIdentity {
+                CodemapFullLoadRootIdentity(
+                    rootEpoch: rootEpoch,
+                    catalogGeneration: catalogGeneration,
+                    ingressGeneration: ingressGeneration,
+                    engineIdentity: engine.map(ObjectIdentifier.init)
+                )
+            }
+        }
+
+        private struct DebugCodemapFullLoadEngineObservation {
+            let projection: WorkspaceCodemapCurrentProjectionSnapshot?
+            let accounting: WorkspaceCodemapBindingEngineAccounting?
+            let queueWaitMilliseconds: [UInt64]
+        }
+
+        func debugCodemapFullLoadAggregateSnapshot(
+            expectedWorkspaceID: UUID
+        ) async -> CodemapFullLoadAggregateSnapshot {
+            let initial = debugCaptureCodemapFullLoadUniverse()
+            let sampled = DispatchTime.now().uptimeNanoseconds
+            guard !initial.isEmpty else {
+                return CodemapFullLoadAggregateSnapshot(
+                    expectedWorkspaceID: expectedWorkspaceID,
+                    state: .incompleteDiagnostics,
+                    sampledUptimeNanoseconds: sampled,
+                    visibleRootCount: 0,
+                    eligibleRootCount: 0,
+                    proofCompleteRootCount: 0,
+                    terminalIneligibleRootCount: 0,
+                    excludedRootCount: 0,
+                    pendingRootCount: 0,
+                    failedRootCount: 0,
+                    supersededRootCount: 0,
+                    cohort: "mixed",
+                    roots: [],
+                    metrics: [:],
+                    resources: [:],
+                    queueWaitMilliseconds: []
+                )
+            }
+
+            var observations: [WorkspaceCodemapRootEpoch: DebugCodemapFullLoadEngineObservation] = [:]
+            for capture in initial {
+                guard let engine = capture.engine else {
+                    observations[capture.rootEpoch] = DebugCodemapFullLoadEngineObservation(
+                        projection: nil,
+                        accounting: nil,
+                        queueWaitMilliseconds: []
+                    )
+                    continue
+                }
+                let projection = await engine.currentProjectionSnapshot(rootEpoch: capture.rootEpoch)
+                let accounting = await engine.accounting()
+                let admission = await engine.debugProjectionAdmissionSnapshot(rootEpoch: capture.rootEpoch)
+                observations[capture.rootEpoch] = DebugCodemapFullLoadEngineObservation(
+                    projection: projection,
+                    accounting: accounting,
+                    queueWaitMilliseconds: admission.queueWaitMilliseconds
+                )
+            }
+
+            let revalidated = debugCaptureCodemapFullLoadUniverse()
+            let universeIsCurrent = CodemapFullLoadDebugSupport.universeMatches(
+                initial.map(\.identity),
+                revalidated.map(\.identity)
+            )
+            let roots = initial.map { capture in
+                debugCodemapFullLoadRootSnapshot(
+                    capture: capture,
+                    observation: observations[capture.rootEpoch],
+                    universeIsCurrent: universeIsCurrent
+                )
+            }
+
+            let metrics = roots.reduce(into: [String: UInt64]()) {
+                $0 = CodemapFullLoadDebugSupport.adding($0, $1.metrics)
+            }
+            let resources = roots.reduce(into: [String: UInt64]()) {
+                $0 = CodemapFullLoadDebugSupport.adding($0, $1.resources)
+            }
+            let queueWaitMilliseconds = roots.flatMap(\.queueWaitMilliseconds)
+            let proofCount = roots.count(where: { $0.state == .proofComplete })
+            let ineligibleCount = roots.count(where: { $0.state == .terminalIneligible })
+            let excludedCount = roots.count(where: { $0.state == .excluded })
+            let pendingCount = roots.count(where: { $0.state == .pending })
+            let failedCount = roots.count(where: { $0.state == .failed })
+            let supersededCount = roots.count(where: { $0.state == .superseded })
+            let eligibleCount = proofCount + pendingCount + failedCount + supersededCount
+
+            return CodemapFullLoadAggregateSnapshot(
+                expectedWorkspaceID: expectedWorkspaceID,
+                state: CodemapFullLoadDebugSupport.aggregateState(for: roots),
+                sampledUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                visibleRootCount: roots.count,
+                eligibleRootCount: eligibleCount,
+                proofCompleteRootCount: proofCount,
+                terminalIneligibleRootCount: ineligibleCount,
+                excludedRootCount: excludedCount,
+                pendingRootCount: pendingCount,
+                failedRootCount: failedCount,
+                supersededRootCount: supersededCount,
+                cohort: CodemapFullLoadDebugSupport.cohort(metrics: metrics),
+                roots: roots,
+                metrics: metrics,
+                resources: resources,
+                queueWaitMilliseconds: queueWaitMilliseconds
+            )
+        }
+
+        private func debugCaptureCodemapFullLoadUniverse() -> [DebugCodemapFullLoadCapture] {
+            rootsForPathLookup(scope: .visibleWorkspace)
+                .sorted { $0.id.uuidString < $1.id.uuidString }
+                .compactMap { root in
+                    guard let state = rootStatesByID[root.id] else { return nil }
+                    let rootEpoch = WorkspaceCodemapRootEpoch(
+                        rootID: root.id,
+                        rootLifetimeID: state.lifetimeID
+                    )
+                    let session = codemapSessionsByRootEpoch[rootEpoch]
+                    let launch = codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch]
+                    let completed = codemapCompletedEligibilityByRootEpoch[rootEpoch]
+                    let authority = session?.authority
+                        ?? launch?.authority
+                        ?? codemapEligibilityFlightsByRootEpoch[rootEpoch]?.authority
+                        ?? completed?.authority
+                        ?? codemapProjectionPreloadRetriesByRootEpoch[rootEpoch]?.authority
+                    let terminalReason: WorkspaceCodemapGitTerminalUnavailableReason? = if case let .terminal(reason, _)? = completed?.result {
+                        reason
+                    } else {
+                        nil
+                    }
+                    let milestones = codemapProjectionPreloadStoreEvents
+                        .filter { $0.rootEpoch == rootEpoch }
+                        .map {
+                            CodemapFullLoadMilestone(
+                                kind: $0.kind.rawValue,
+                                uptimeNanoseconds: $0.uptimeNanoseconds
+                            )
+                        }
+                    return DebugCodemapFullLoadCapture(
+                        rootEpoch: rootEpoch,
+                        catalogGeneration: authority?.catalogGeneration
+                            ?? catalogGenerationsByRootID[root.id]
+                            ?? 0,
+                        ingressGeneration: authority?.ingressGeneration
+                            ?? codemapAuthorityGenerationsByRootEpoch[rootEpoch]
+                            ?? 0,
+                        rootKind: root.kind,
+                        launchPhase: launch?.phase,
+                        terminalReason: terminalReason,
+                        engine: session?.engine,
+                        milestones: milestones
+                    )
+                }
+        }
+
+        private func debugCodemapFullLoadRootSnapshot(
+            capture: DebugCodemapFullLoadCapture,
+            observation: DebugCodemapFullLoadEngineObservation?,
+            universeIsCurrent: Bool
+        ) -> CodemapFullLoadRootSnapshot {
+            let accounting = observation?.accounting
+            let metrics = accounting.map(CodemapFullLoadDebugSupport.metrics) ?? [:]
+            let resources = accounting.map(CodemapFullLoadDebugSupport.resources) ?? [:]
+            let launchPhase = capture.launchPhase.map(CodemapFullLoadDebugSupport.launchPhaseName)
+
+            guard universeIsCurrent else {
+                return CodemapFullLoadRootSnapshot(
+                    rootEpoch: capture.rootEpoch,
+                    catalogGeneration: capture.catalogGeneration,
+                    ingressGeneration: capture.ingressGeneration,
+                    rootKind: CodemapFullLoadDebugSupport.rootKindName(capture.rootKind),
+                    state: .superseded,
+                    reason: "visible_root_universe_or_epoch_changed",
+                    launchPhase: launchPhase,
+                    projectionPhase: nil,
+                    supportedCandidateCount: nil,
+                    processedCandidateCount: nil,
+                    terminalCount: nil,
+                    lastSegmentSequence: nil,
+                    coverageCompletedUptimeNanoseconds: nil,
+                    metrics: metrics,
+                    resources: resources,
+                    queueWaitMilliseconds: observation?.queueWaitMilliseconds ?? [],
+                    milestones: capture.milestones
+                )
+            }
+
+            var state: CodemapFullLoadRootState = .pending
+            var reason: String?
+            var projectionPhase: String?
+            var supportedCandidateCount: UInt64?
+            var processedCandidateCount: UInt64?
+            var terminalCount: UInt64?
+            var lastSegmentSequence: UInt64?
+            var coverageCompletedUptimeNanoseconds: UInt64?
+
+            if let terminalReason = capture.terminalReason {
+                state = .terminalIneligible
+                reason = terminalReason.rawValue
+            } else {
+                switch observation?.projection {
+                case let .authoritativeComplete(proof, completed):
+                    state = .proofComplete
+                    projectionPhase = CodemapFullLoadDebugSupport.projectionPhaseName(.complete)
+                    supportedCandidateCount = proof.counts.supportedCandidateCount
+                    processedCandidateCount = proof.counts.processedCandidateCount
+                    terminalCount = proof.terminalCount
+                    lastSegmentSequence = proof.lastSegmentSequence
+                    coverageCompletedUptimeNanoseconds = completed
+                case let .pending(phase, progress, _, budget):
+                    projectionPhase = CodemapFullLoadDebugSupport.projectionPhaseName(phase)
+                    supportedCandidateCount = progress.counts.supportedCandidateCount
+                    processedCandidateCount = progress.counts.processedCandidateCount
+                    if phase == .budgetLimited || budget != nil {
+                        state = .failed
+                        reason = "projection_budget_limited"
+                    }
+                case let .unavailable(unavailableReason):
+                    if capture.launchPhase == .handedOff {
+                        state = .failed
+                        reason = unavailableReason.rawValue
+                    } else {
+                        reason = unavailableReason.rawValue
+                    }
+                case .nonCurrent:
+                    state = .superseded
+                    reason = "engine_projection_noncurrent"
+                case nil:
+                    if capture.launchPhase == .handedOff {
+                        state = .failed
+                        reason = "eligible_root_missing_engine_after_handoff"
+                    } else if capture.launchPhase == .cancelled || capture.launchPhase == .superseded {
+                        state = .failed
+                        reason = "preload_launch_\(launchPhase ?? "terminal")"
+                    } else {
+                        reason = "awaiting_eligibility_setup_or_engine"
+                    }
+                }
+            }
+
+            return CodemapFullLoadRootSnapshot(
+                rootEpoch: capture.rootEpoch,
+                catalogGeneration: capture.catalogGeneration,
+                ingressGeneration: capture.ingressGeneration,
+                rootKind: CodemapFullLoadDebugSupport.rootKindName(capture.rootKind),
+                state: state,
+                reason: reason,
+                launchPhase: launchPhase,
+                projectionPhase: projectionPhase,
+                supportedCandidateCount: supportedCandidateCount,
+                processedCandidateCount: processedCandidateCount,
+                terminalCount: terminalCount,
+                lastSegmentSequence: lastSegmentSequence,
+                coverageCompletedUptimeNanoseconds: coverageCompletedUptimeNanoseconds,
+                metrics: metrics,
+                resources: resources,
+                queueWaitMilliseconds: observation?.queueWaitMilliseconds ?? [],
+                milestones: capture.milestones
+            )
         }
 
         func debugCodemapEnginePresent(rootID: UUID) -> Bool {
@@ -13044,7 +13404,8 @@ actor WorkspaceFileContextStore {
                 ordinal: nextCodemapProjectionPreloadStoreEventOrdinal,
                 rootEpoch: rootEpoch,
                 kind: kind,
-                launchPhase: phase
+                launchPhase: phase,
+                uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
             ))
             if codemapProjectionPreloadStoreEvents.count > 2048 {
                 codemapProjectionPreloadStoreEvents.removeFirst(
@@ -14215,11 +14576,13 @@ actor WorkspaceFileContextStore {
             ingressGeneration: authority.ingressGeneration
         )
         let owner = WorkspaceCodemapLiveDemandOwner()
+        let completion = CodemapDemandCompletion()
         var record = CodemapDemandRecord(
             ticket: ticket,
             identity: identity,
             language: language,
             owner: owner,
+            completion: completion,
             retainIDs: [ticket.retainID],
             result: .pending(ticket),
             task: nil
@@ -14231,7 +14594,8 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             codemapDemandTaskCreationCountForTesting += 1
         #endif
-        let demandTask = Task { [weak self] in
+        let demandTask = Task { [weak self, completion] in
+            defer { completion.resolve() }
             guard let self else { return }
             await performCodemapDemand(ticket: ticket, priority: priority)
         }
@@ -14257,6 +14621,27 @@ actor WorkspaceFileContextStore {
             return .unavailable(.staleCurrentness)
         }
         return codemapDemandResult(record.result, for: ticket)
+    }
+
+    func waitForCodemapArtifactDemandChange(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket,
+        deadline: ContinuousClock.Instant
+    ) async -> WorkspaceCodemapArtifactDemandResult {
+        guard codemapDemandIsCurrent(ticket),
+              let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
+              .demandsByFileID[ticket.fileID],
+              codemapTicketsShareDemand(record.ticket, ticket),
+              record.retainIDs.contains(ticket.retainID)
+        else {
+            return .unavailable(.staleCurrentness)
+        }
+
+        let current = codemapDemandResult(record.result, for: ticket)
+        guard case .pending = current, record.task != nil else {
+            return current
+        }
+        await record.completion.wait(until: deadline)
+        return codemapArtifactDemandStatus(ticket)
     }
 
     func acquireCodemapProjectionDemand(
@@ -15874,6 +16259,16 @@ actor WorkspaceFileContextStore {
                 codemapTicketsShareDemand(record.ticket, ticket)
             else { return 0 }
             return record.retainIDs.count
+        }
+
+        func codemapArtifactDemandWaiterCountForTesting(
+            _ ticket: WorkspaceCodemapArtifactDemandTicket
+        ) -> Int {
+            guard let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
+                .demandsByFileID[ticket.fileID],
+                codemapTicketsShareDemand(record.ticket, ticket)
+            else { return 0 }
+            return record.completion.waiterCount
         }
 
         func codemapArtifactDemandRetainCountForTesting(

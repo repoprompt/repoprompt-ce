@@ -419,7 +419,7 @@ struct CodeMapGenerator {
             // Prefer range-based class boundaries when available
             let classDeclCaps = captureIndex.captures(named: "type.class.decl")
             let enumDeclCaps = captureIndex.captures(named: "type.enum.decl")
-            var declCaps: [NamedRange] = []
+            var declCaps: [CodeMapIndexedCapture] = []
             declCaps.reserveCapacity(classDeclCaps.count + enumDeclCaps.count)
             declCaps.append(contentsOf: classDeclCaps)
             declCaps.append(contentsOf: enumDeclCaps)
@@ -870,7 +870,9 @@ struct CodeMapGenerator {
             // TS/TSX-specific routing (via strategy)
             // BUG FIX #1: Only route TS/TSX through this, NOT JS
             // ------------------------------------------------------------------
-            if isTSLike, let ctx = tsContext, usesTSRangeContainment {
+            if isTSLike, let ctx = tsContext,
+               usesTSRangeContainment || cap.name == "variable.global"
+            {
                 let handled = TypeScriptCodeMapStrategy.handleCapture(
                     cap,
                     context: ctx,
@@ -1099,13 +1101,6 @@ struct CodeMapGenerator {
             case "function.definition", "function.declaration", "function", "method":
                 // Skip legacy function captures for Swift - we use SwiftCodeMapStrategy
                 if supportedLanguage == .swift {
-                    recordFallbackFunctionAttribution(.skipped, since: attributionStart)
-                    recordCaptureAttribution(.function, since: attributionStart)
-                    continue
-                }
-
-                // Skip for TS/TSX if using range containment - strategy handles these
-                if isTSLike && usesTSRangeContainment && cap.name == "method" {
                     recordFallbackFunctionAttribution(.skipped, since: attributionStart)
                     recordCaptureAttribution(.function, since: attributionStart)
                     continue

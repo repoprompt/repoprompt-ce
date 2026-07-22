@@ -470,6 +470,68 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         }
     }
 
+    func testPendingDemandCompletionDoesNotStarveBusyRetry() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Pending.swift": SwiftFixtureSource.emptyStruct("Pending"),
+                "Sources/Busy.swift": SwiftFixtureSource.emptyStruct("Busy")
+            ]
+        )
+        let pendingGate = CodemapSuspensionGate()
+        let fixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await pendingGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let pendingFileID = CodemapLockedValues<UUID>()
+        let busyFileID = CodemapLockedValues<UUID>()
+        let busyInvocations = CodemapLockedCounter()
+        let store = fixture.makeStore(demandResultHook: { ticket, result in
+            if pendingFileID.values.contains(ticket.fileID) {
+                await pendingGate.enterAndWait()
+                return result
+            }
+            if busyFileID.values.contains(ticket.fileID),
+               busyInvocations.incrementAndGet() == 1
+            {
+                return .busy(retryAfterMilliseconds: 1)
+            }
+            return result
+        })
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let pending = try XCTUnwrap(files.first { $0.name == "Pending.swift" })
+        let busy = try XCTUnwrap(files.first { $0.name == "Busy.swift" })
+        pendingFileID.append(pending.id)
+        busyFileID.append(busy.id)
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                initialBackoffMilliseconds: 1,
+                maximumBackoffMilliseconds: 2,
+                maximumTotalWait: .seconds(5)
+            )
+        )
+        let presentationTask = Task {
+            try await coordinator.presentation(
+                for: .exact(fileIDs: [pending.id, busy.id], completeRootSet: false),
+                rootScope: .allLoaded
+            )
+        }
+
+        let pendingEntered = await pendingGate.waitUntilEntered()
+        XCTAssertTrue(pendingEntered)
+        try await AsyncTestWait.waitUntil("busy demand retried while sibling remains pending", timeout: 5) {
+            busyInvocations.value >= 2
+        }
+        await pendingGate.release()
+        _ = try await presentationTask.value
+        XCTAssertGreaterThanOrEqual(busyInvocations.value, 2)
+    }
+
     func testOperationPresentationMixedReadyAndPendingPublishesReadyReceipt() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
@@ -580,6 +642,132 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let ready = try readyResult(retryResult)
         XCTAssertEqual(demandResults.value, 2)
         _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+    }
+
+    func testStructurePresentationColdAndWarmLatencyAttribution() async throws {
+        let declarationCount = 200
+        let swiftSource = (0 ..< declarationCount).map { index in
+            """
+            struct SwiftLatency\(index) {
+                let value\(index): Result<[String: Int], Error> = .success([:])
+                func transform\(index)<T>(_ input: T) async throws -> Result<T, Error> {
+                    .success(input)
+                }
+            }
+            """
+        }.joined(separator: "\n")
+        let typeScriptSource = (0 ..< declarationCount).map { index in
+            """
+            export interface TypeScriptLatency\(index)<T> {
+                value\(index): Promise<Record<string, T>>;
+                transform\(index)(input: T): Promise<{ value: T }>;
+            }
+            export const transform\(index) = async <T>(input: T): Promise<{ value: T }> => ({ value: input });
+            """
+        }.joined(separator: "\n")
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/SwiftLatency.swift": swiftSource,
+                "Sources/TypeScriptLatency.ts": typeScriptSource
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        XCTAssertEqual(files.count, 2)
+        let demandSleeps = CodemapLockedValues<Duration>()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            waiter: WorkspaceCodemapPresentationWaiter { duration in
+                demandSleeps.append(duration)
+                try await Task.sleep(for: duration)
+            }
+        )
+        let logicalRootNames = [loaded.id: "Latency Δ"]
+
+        func request() async throws -> WorkspaceCodemapStructurePresentation {
+            try await coordinator.structurePresentation(
+                seedFileIDs: files.map(\.id),
+                direction: nil,
+                traversalLimits: .init(
+                    maximumDepth: 0,
+                    maximumNodeCount: 2,
+                    maximumEdgeCount: 1,
+                    maximumByteCount: 8 * 1024 * 1024
+                ),
+                outputLimits: .init(
+                    maximumFileCount: 2,
+                    maximumCodemapTokenCount: 2_000_000
+                ),
+                rootScope: .allLoaded,
+                logicalRootDisplayNamesByRootID: logicalRootNames
+            )
+        }
+
+        let coldStart = ProcessInfo.processInfo.systemUptime
+        let cold = try await request()
+        let coldMS = (ProcessInfo.processInfo.systemUptime - coldStart) * 1000
+        XCTAssertEqual(cold.outcome, .ready)
+        XCTAssertEqual(cold.entries.count, 2)
+        XCTAssertEqual(fixture.buildCount.value, 2)
+        XCTAssertTrue(cold.entries.allSatisfy { entry in
+            entry.entry.tokenCount == TokenCalculationService.estimateTokens(for: entry.entry.text)
+        })
+
+        let engine = try fixture.runtime().bindingEngine()
+        let accountingAfterCold = await engine.accounting()
+        for _ in 0 ..< 5 {
+            let warmup = try await request()
+            XCTAssertEqual(warmup.outcome, .ready)
+        }
+
+        var warmSamplesMS: [Double] = []
+        for _ in 0 ..< 20 {
+            let start = ProcessInfo.processInfo.systemUptime
+            let warm = try await request()
+            warmSamplesMS.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+            XCTAssertEqual(warm.outcome, .ready)
+            XCTAssertEqual(warm.entries.count, 2)
+        }
+        let accountingAfterWarm = await engine.accounting()
+        XCTAssertEqual(fixture.buildCount.value, 2)
+        XCTAssertTrue(demandSleeps.values.isEmpty)
+        XCTAssertEqual(
+            accountingAfterWarm.counters.builds,
+            accountingAfterCold.counters.builds
+        )
+        XCTAssertEqual(
+            accountingAfterWarm.counters.validatedWorktreeReads,
+            accountingAfterCold.counters.validatedWorktreeReads
+        )
+
+        warmSamplesMS.sort()
+        let median = warmSamplesMS[warmSamplesMS.count / 2]
+        let p95Index = min(
+            warmSamplesMS.count - 1,
+            Int((Double(warmSamplesMS.count) * 0.95).rounded(.up)) - 1
+        )
+        let deviations = warmSamplesMS.map { abs($0 - median) }.sorted()
+        let medianAbsoluteDeviation = deviations[deviations.count / 2]
+        print(
+            [
+                "CODEMAP_FILE_API_BENCHMARK",
+                "languages=swift,typescript",
+                "declarations_per_file=\(declarationCount)",
+                "cold_ms=\(String(format: "%.3f", coldMS))",
+                "warm_p50_ms=\(String(format: "%.3f", median))",
+                "warm_p95_ms=\(String(format: "%.3f", warmSamplesMS[p95Index]))",
+                "warm_mad_ms=\(String(format: "%.3f", medianAbsoluteDeviation))",
+                "builds=\(fixture.buildCount.value)"
+            ].joined(separator: " ")
+        )
     }
 
     func testStructureSeedDemandLimitRejectsBeforeRuntimeOrBuild() async throws {
@@ -1194,7 +1382,6 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
             files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
         let resolutionGate = CodemapResolutionGate()
-        let waiterGate = CodemapSuspensionGate()
         let cleanupGate = CodemapSuspensionGate()
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -1203,7 +1390,6 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         )
         addTeardownBlock {
             await cleanupGate.release()
-            await waiterGate.release()
             await resolutionGate.release()
             await fixture.shutdown()
             repositoryFixture.cleanup()
@@ -1216,13 +1402,7 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let loaded = try await store.loadRoot(path: root.path)
         let loadedFiles = await store.files(inRoot: loaded.id)
         let file = try XCTUnwrap(loadedFiles.first)
-        let coordinator = WorkspaceCodemapPresentationCoordinator(
-            store: store,
-            waiter: WorkspaceCodemapPresentationWaiter { _ in
-                await waiterGate.enterAndWait()
-                try Task.checkCancellation()
-            }
-        )
+        let coordinator = WorkspaceCodemapPresentationCoordinator(store: store)
         let task = Task {
             try await coordinator.presentation(
                 for: .exact(fileIDs: [file.id], completeRootSet: false),
@@ -1232,10 +1412,7 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
 
         let resolutionEntered = await resolutionGate.waitUntilEntered()
         XCTAssertTrue(resolutionEntered)
-        let waiterEntered = await waiterGate.waitUntilEntered()
-        XCTAssertTrue(waiterEntered)
         task.cancel()
-        await waiterGate.release()
         await resolutionGate.release()
         do {
             _ = try await task.value
@@ -1250,6 +1427,8 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         XCTAssertEqual(cancelledTickets.values.count, 1)
         let retainCount = await store.codemapArtifactDemandRetainCountForTesting(cancelledTicket)
         XCTAssertEqual(retainCount, 0)
+        let waiterCount = await store.codemapArtifactDemandWaiterCountForTesting(cancelledTicket)
+        XCTAssertEqual(waiterCount, 0)
         let presentationRetainCount = await store.codemapPresentationRetainCountForTesting(
             rootEpoch: cancelledTicket.rootEpoch
         )

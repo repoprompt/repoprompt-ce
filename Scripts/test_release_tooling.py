@@ -206,7 +206,8 @@ APP_SIGN_ARGS=(){app_signing_body}
 
         self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
         self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
-        self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify'), 2)
+        self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
+        self.assertEqual(source.count('--arch all'), 2)
         self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
 
     def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
@@ -1997,15 +1998,15 @@ sys.stdout.write(str(status))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing approved Codex manifest", result.stderr)
 
-    def test_staged_release_validator_rejects_missing_embedded_codex_package(self) -> None:
+    def test_staged_release_validator_rejects_missing_embedded_codex_package_target(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
-        package = staged / ".build" / "release" / "RepoPrompt.app" / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
-        shutil.rmtree(package)
+        bundle = staged / ".build" / "release" / "RepoPrompt.app" / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+        shutil.rmtree(bundle / "x86_64-apple-darwin")
 
         result = self.run_staged_validation(approved, staged, scripts)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("missing embedded Codex package", result.stderr)
+        self.assertIn("missing embedded Codex package targets", result.stderr)
 
     def test_staged_release_validator_rejects_keyboard_shortcuts_app_root_bundle(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
@@ -3589,7 +3590,8 @@ extension Data {
             app / "Contents" / "MacOS",
             app / "Contents" / "Resources" / "bin",
             app / "Contents" / "Resources" / "Legal" / "ThirdPartyLicenses" / "fixture",
-            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "aarch64-apple-darwin",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin",
             scripts,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -3608,7 +3610,7 @@ extension Data {
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
         (scripts / "codex_runtime_artifact.py").write_text(
-            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nexpected_package = Path(os.environ[\"FAKE_CODEX_PACKAGE\"])\nexpected = [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify\",\n    \"--arch\",\n    \"aarch64-apple-darwin\",\n    \"--package\",\n    str(expected_package),\n]\nif sys.argv[1:] != expected:\n    print(f\"ERROR: unexpected Codex verifier arguments: {sys.argv[1:]!r}\", file=sys.stderr)\n    raise SystemExit(64)\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nif not expected_package.is_dir():\n    print(f\"ERROR: missing embedded Codex package: {expected_package}\", file=sys.stderr)\n    raise SystemExit(66)\ncapture = os.environ.get(\"FAKE_CODEX_CAPTURE\")\nif capture:\n    with Path(capture).open(\"a\", encoding=\"utf-8\") as handle:\n        handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\nprint(\"OK: fixture Codex package contract.\")\n",
+            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nexpected_bundle = Path(os.environ[\"FAKE_CODEX_BUNDLE\"])\nexpected = [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n    str(expected_bundle),\n]\nif sys.argv[1:] != expected:\n    print(f\"ERROR: unexpected Codex verifier arguments: {sys.argv[1:]!r}\", file=sys.stderr)\n    raise SystemExit(64)\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not expected_bundle.is_dir() or {path.name for path in expected_bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {expected_bundle}\", file=sys.stderr)\n    raise SystemExit(66)\ncapture = os.environ.get(\"FAKE_CODEX_CAPTURE\")\nif capture:\n    with Path(capture).open(\"a\", encoding=\"utf-8\") as handle:\n        handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
             encoding="utf-8",
         )
         (approved / "Vendor" / "Codex" / "manifest.json").write_text("{}\n", encoding="utf-8")
@@ -3717,7 +3719,7 @@ esac
         app = staged / ".build" / "release" / "RepoPrompt.app"
         return {
             "FAKE_CODEX_MANIFEST": str(approved / "Vendor" / "Codex" / "manifest.json"),
-            "FAKE_CODEX_PACKAGE": str(
+            "FAKE_CODEX_BUNDLE": str(
                 app / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
             ),
         }

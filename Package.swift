@@ -20,8 +20,11 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.8.0"),
     .package(url: "https://github.com/apple/swift-system.git", exact: "1.6.4"),
     .package(url: "https://github.com/provencher/swift-sdk.git", revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"),
-    // RepoPromptApp and Neon share this exact wrapper/runtime graph.
-    .package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0"),
+    // RepoPromptApp and RepoPromptCodeMapCore share this customized wrapper/runtime graph.
+    .package(
+        url: "https://github.com/repoprompt/swift-tree-sitter.git",
+        revision: "a778ef4fb7f0d3ad00185f42ce83c688373c4361"
+    ),
     .package(url: "https://github.com/tree-sitter/tree-sitter-c", exact: "0.24.2"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-go", exact: "0.25.0"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-java", exact: "0.23.5"),
@@ -36,8 +39,6 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/tree-sitter/tree-sitter-php.git", exact: "0.24.2"),
     .package(url: "https://github.com/jamesrochabrun/SwiftAnthropic", revision: "b7d030cd7453f314c780f5492385f73d704cbd5d"),
     .package(url: "https://github.com/provencher/SwiftOpenAI", revision: "1211782eb337e7968124448a20d9260df1952012"),
-    // Released Neon versions predate SwiftTreeSitter 0.10; retain this exact compatible revision.
-    .package(url: "https://github.com/ChimeHQ/Neon.git", revision: "07a325403534f4759c814aff0a58ac69144a524c"),
     .package(path: "Vendor/UniversalCharsetDetection"),
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
@@ -57,10 +58,9 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "MarkdownUI", package: "swift-markdown-ui"),
     .product(name: "Markdown", package: "swift-markdown"),
     .product(name: "MCP", package: "swift-sdk"),
-    .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
+    .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
     .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
     .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
-    .product(name: "Neon", package: "Neon"),
     .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
     .product(name: "Cuchardet", package: "UniversalCharsetDetection"),
     .product(name: "JSONSchema", package: "JSONSchema"),
@@ -133,7 +133,7 @@ let package = Package(
             dependencies: [
                 "RepoPromptRegexCore",
                 "TreeSitterScannerSupport",
-                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
+                .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
                 .product(name: "TreeSitterC", package: "tree-sitter-c"),
                 .product(name: "TreeSitterGo", package: "tree-sitter-go"),
                 .product(name: "TreeSitterJava", package: "tree-sitter-java"),

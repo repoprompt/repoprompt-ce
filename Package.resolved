@@ -1,5 +1,5 @@
 {
-  "originHash" : "6e695d097e4d5b45935ca3fd635a6e42a4e8592d11b4c249f6e063f702d3ca80",
+  "originHash" : "fd6d03b35845f23bcc7a241e790ce22e61f89129f73fa0c127816caa1c7921bf",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -38,14 +38,6 @@
       }
     },
     {
-      "identity" : "neon",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ChimeHQ/Neon.git",
-      "state" : {
-        "revision" : "07a325403534f4759c814aff0a58ac69144a524c"
-      }
-    },
-    {
       "identity" : "networkimage",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/gonzalezreal/NetworkImage",
@@ -61,15 +53,6 @@
       "state" : {
         "revision" : "2cbb952ac1a0b1dc465b05c1a480a922ab767849",
         "version" : "0.6.0"
-      }
-    },
-    {
-      "identity" : "rearrange",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ChimeHQ/Rearrange",
-      "state" : {
-        "revision" : "5ff7f3363f7a08f77e0d761e38e6add31c2136e1",
-        "version" : "1.8.1"
       }
     },
     {
@@ -297,6 +280,14 @@
       }
     },
     {
+      "identity" : "swift-tree-sitter",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/repoprompt/swift-tree-sitter.git",
+      "state" : {
+        "revision" : "a778ef4fb7f0d3ad00185f42ce83c688373c4361"
+      }
+    },
+    {
       "identity" : "swiftanthropic",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jamesrochabrun/SwiftAnthropic",
@@ -310,15 +301,6 @@
       "location" : "https://github.com/provencher/SwiftOpenAI",
       "state" : {
         "revision" : "1211782eb337e7968124448a20d9260df1952012"
-      }
-    },
-    {
-      "identity" : "swifttreesitter",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ChimeHQ/SwiftTreeSitter.git",
-      "state" : {
-        "revision" : "f97df585296977d8fcaf644cbde567151d1367b8",
-        "version" : "0.10.0"
       }
     },
     {

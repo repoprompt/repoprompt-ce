@@ -27,6 +27,7 @@ package final class CodeMapPerformanceCollector {
     package var syntaxCodeMapQueryLookupDuration: TimeInterval = 0
     package var syntaxQueryExecuteDuration: TimeInterval = 0
     package var syntaxCaptureMaterializationDuration: TimeInterval = 0
+    package var syntaxCaptureNameCountingDuration: TimeInterval = 0
     package var syntaxCalls = 0
     package var syntaxUnsupported = 0
     package var syntaxOversized = 0
@@ -35,6 +36,8 @@ package final class CodeMapPerformanceCollector {
     package var syntaxParserCreates = 0
     package var syntaxQueryExecutes = 0
     package var syntaxCaptures = 0
+    package var syntaxCaptureCountsByName: [String: Int] = [:]
+    package let collectsCaptureNames: Bool
     package var syntaxCodeMapQueryCacheHits = 0
     package var syntaxCodeMapQueryCacheMisses = 0
 
@@ -103,6 +106,7 @@ package final class CodeMapPerformanceCollector {
     package var tsxArrowFunctionMatches = 0
     package var tsxArrowFunctionParamsReturnMatches = 0
     package var swiftReturnTypeFastPathHits = 0
+    package var tsDuplicateFunctionVariableSuppressions = 0
     package var tsReturnTypeFastPathHits = 0
     package var tsTypeAnnotationFastPathHits = 0
     package var tsTypeAliasRhsFastPathHits = 0
@@ -192,5 +196,7 @@ package final class CodeMapPerformanceCollector {
     package var referencedTypesFinalizeDuration: TimeInterval = 0
     package var fileAPIInitDuration: TimeInterval = 0
 
-    package init() {}
+    package init(collectsCaptureNames: Bool = false) {
+        self.collectsCaptureNames = collectsCaptureNames
+    }
 }

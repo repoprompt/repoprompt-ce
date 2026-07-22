@@ -74,11 +74,10 @@ let swiftCodeMapQuery = #"""
 (parameter
   name: (simple_identifier) @swift.param.local)
 
-; Capture the parameter's type by position (field label doesn't work reliably)
-(parameter
-  ":"
-  (parameter_modifiers)?
-  (_) @swift.param.type)
+; Parameter types are recovered from the already-bounded @swift.param.node.
+; The grammar's repeated type field does not materialize reliably through the
+; current SwiftTreeSitter wildcard query shape, and a capture per parameter costs
+; more than the bounded colon/default scan in SwiftCodeMapStrategy.
 
 ; ===================================
 ; 7) Property Declarations
@@ -142,5 +141,4 @@ let swiftCodeMapQuery = #"""
 (class_declaration
   name: (type_identifier) @type.class)
 
-(function_declaration) @function.definition
 """#

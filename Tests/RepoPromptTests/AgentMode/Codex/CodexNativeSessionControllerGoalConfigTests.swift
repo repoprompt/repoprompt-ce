@@ -191,21 +191,57 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(requestCountAfterBackgroundRetry, 3)
     }
 
-    func testResumeRequiresThreadIDAndIncludesOptionalPath() async throws {
-        let (controller, recordURL) = try await makeController(options: makeOptions())
+    func testSchemaAlignedThreadRequestsOmitUndeclaredFieldsAndAcceptMissingGoal() async throws {
+        let (startController, startRecordURL) = try await makeController(options: makeOptions())
+        _ = try await startController.startOrResume(
+            existing: nil,
+            baseInstructions: "Agent",
+            model: "gpt-test",
+            reasoningEffort: "high"
+        )
+        let goal = try await startController.getThreadGoal()
+        await startController.shutdown()
+
+        let startParams = try recordedParams(for: "thread/start", at: startRecordURL)
+        XCTAssertEqual(startParams["model"] as? String, "gpt-test")
+        XCTAssertNil(startParams["effort"])
+        XCTAssertNil(goal)
+
+        for (rawStatus, expectedStatus) in [
+            ("blocked", CodexNativeSessionController.ThreadGoalStatus.blocked),
+            ("usageLimited", CodexNativeSessionController.ThreadGoalStatus.usageLimited)
+        ] {
+            let (goalController, _) = try await makeController(
+                options: makeOptions(),
+                goalStatus: rawStatus
+            )
+            _ = try await goalController.startOrResume(existing: nil, baseInstructions: "Agent")
+            let parsedGoal = try await goalController.getThreadGoal()
+            await goalController.shutdown()
+            XCTAssertEqual(parsedGoal?.status, expectedStatus)
+        }
+
+        let (resumeController, resumeRecordURL) = try await makeController(options: makeOptions())
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "  existing-thread  ",
             rolloutPath: "/tmp/existing-thread.jsonl",
             model: nil,
-            reasoningEffort: nil
+            reasoningEffort: "high"
         )
 
-        _ = try await controller.startOrResume(existing: existing, baseInstructions: "Agent")
-        await controller.shutdown()
+        _ = try await resumeController.startOrResume(
+            existing: existing,
+            baseInstructions: "Agent",
+            model: "gpt-test",
+            reasoningEffort: "high"
+        )
+        await resumeController.shutdown()
 
-        let params = try recordedParams(for: "thread/resume", at: recordURL)
+        let params = try recordedParams(for: "thread/resume", at: resumeRecordURL)
         XCTAssertEqual(params["threadId"] as? String, "existing-thread")
-        XCTAssertEqual(params["path"] as? String, "/tmp/existing-thread.jsonl")
+        XCTAssertEqual(params["model"] as? String, "gpt-test")
+        XCTAssertNil(params["path"])
+        XCTAssertNil(params["effort"])
     }
 
     func testResumeWithoutPathSendsRequiredThreadIDOnly() async throws {
@@ -362,7 +398,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
     private func makeController(
         options: CodexNativeSessionController.Options,
-        ignoreMemoryModeRequests: Bool = false
+        ignoreMemoryModeRequests: Bool = false,
+        goalStatus: String? = nil
     ) async throws -> (CodexNativeSessionController, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
@@ -373,7 +410,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let executableURL = try makeFakeCodexAppServer(
             in: directory,
             recordURL: recordURL,
-            ignoreMemoryModeRequests: ignoreMemoryModeRequests
+            ignoreMemoryModeRequests: ignoreMemoryModeRequests,
+            goalStatus: goalStatus
         )
         let client = CodexAppServerClient()
         await client.updateConfig(
@@ -400,7 +438,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     private func makeFakeCodexAppServer(
         in directory: URL,
         recordURL: URL,
-        ignoreMemoryModeRequests: Bool = false
+        ignoreMemoryModeRequests: Bool = false,
+        goalStatus: String? = nil
     ) throws -> URL {
         let scriptURL = directory.appendingPathComponent("fake-codex")
         let script = """
@@ -410,6 +449,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         record_path = \(String(reflecting: recordURL.path))
         ignore_memory_mode_requests = \(ignoreMemoryModeRequests ? "True" : "False")
+        goal_status = \(goalStatus.map { String(reflecting: $0) } ?? "None")
 
         with open(record_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"method": "__process_args", "argv": sys.argv[1:]}) + "\\n")
@@ -435,6 +475,16 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 respond(request["id"], {"thread": {"id": "fresh-thread", "status": "idle", "turns": []}})
             elif method == "thread/resume":
                 respond(request["id"], {"thread": {"id": params.get("threadId", "resumed-thread"), "status": "idle", "turns": []}})
+            elif method == "thread/goal/get" and goal_status is not None:
+                respond(request["id"], {"goal": {
+                    "threadId": "fresh-thread",
+                    "objective": "Exercise schema statuses",
+                    "status": goal_status,
+                    "tokensUsed": 0,
+                    "timeUsedSeconds": 0,
+                    "createdAt": 1,
+                    "updatedAt": 1
+                }})
             else:
                 respond(request["id"], {})
         """

@@ -165,9 +165,9 @@ validate_public_app() {
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$app_bundle" "$label MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$app_bundle" "arm64,x86_64" "$label architectures"
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
-        --manifest "$CODEX_MANIFEST" verify \
-        --arch aarch64-apple-darwin \
-        --package "$app_bundle/Contents/Resources/BundledRuntimes/Codex"
+        --manifest "$CODEX_MANIFEST" verify-bundle \
+        --arch all \
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex"
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
         --app "$app_bundle" \
         --manifest "$manifest" \

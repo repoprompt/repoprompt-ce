@@ -73,9 +73,9 @@ xcrun stapler validate "$APP_BUNDLE"
 "$ROOT_DIR/Scripts/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Public updater ZIP MCP helper layout"
 "$ROOT_DIR/Scripts/validate_app_architectures.sh" "$APP_BUNDLE" "arm64,x86_64" "Public updater ZIP app"
 python3 "$ROOT_DIR/Scripts/codex_runtime_artifact.py" \
-    --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify \
-    --arch aarch64-apple-darwin \
-    --package "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
+    --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \
+    --arch all \
+    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
 "$ROOT_DIR/Scripts/write_app_artifact_manifest.py" verify \
     --app "$APP_BUNDLE" \
     --manifest "$ARTIFACT_MANIFEST" \

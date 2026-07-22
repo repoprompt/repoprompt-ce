@@ -36,7 +36,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -77,11 +77,13 @@ DEBUG_APP_PROVENANCE_RELATIVE_PATH = "Contents/Resources/RepoPromptDebugProvenan
 SHORT_TIMEOUT_SECONDS = 5 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
+RELEASE_ARTIFACT_TIMEOUT_SECONDS = 4 * 60 * 60
 SMOKE_AGENT_WAIT_SECONDS = 120.0
 
 IMPLEMENTED_OPERATIONS = {
     "doctor",
     "guardrails",
+    "codex-schema-check",
     "format",
     "format-check",
     "lint",
@@ -126,6 +128,7 @@ Job commands:
 Operation commands:
   ./conductor doctor
   ./conductor guardrails
+  ./conductor codex-schema-check      # validate bounded RPCE assumptions against generated Codex schemas
   ./conductor format                 # mutates first-party Swift files
   ./conductor format-check           # non-mutating SwiftFormat check
   ./conductor lint                   # non-mutating format-check + SwiftLint strict
@@ -1242,6 +1245,8 @@ class OperationRegistry:
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
+        "REPOPROMPT_CODEX_ARCH",
+        "REPOPROMPT_CODEX_CACHE_ROOT",
     ]
     STYLE_ENV_KEYS = [
         "GITHUB_ACTIONS",
@@ -1337,6 +1342,8 @@ class OperationRegistry:
             return [script("doctor.sh")], lanes, cwd, env, effective_timeout
         if operation == "guardrails":
             return [script("guardrails.sh")], lanes, cwd, env, effective_timeout
+        if operation == "codex-schema-check":
+            return [sys.executable, script("check_codex_app_server_schema.py")], lanes, cwd, env, effective_timeout
         if operation == "format":
             return [script("swift_style.sh"), "format"], ["style", "build"], cwd, env, effective_timeout
         if operation == "format-check":
@@ -1490,11 +1497,20 @@ class OperationRegistry:
         return [sys.executable, "-u", str(self.script_path), "__operation_runner", json_dumps(payload)]
 
     def _default_timeout(self, operation: Any, args: Dict[str, Any]) -> float:
-        if operation in {"doctor", "guardrails", "debug-cli-status", "format-tools-status", "check-format-tools"}:
+        if operation in {
+            "doctor",
+            "guardrails",
+            "codex-schema-check",
+            "debug-cli-status",
+            "format-tools-status",
+            "check-format-tools",
+        }:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
             return SHORT_TIMEOUT_SECONDS
-        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"artifact", "package", "local-install"}):
+        if operation == "release" and args.get("subcommand") == "artifact":
+            return RELEASE_ARTIFACT_TIMEOUT_SECONDS
+        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"package", "local-install"}):
             return RELEASE_TIMEOUT_SECONDS
         if operation == "smoke" and args.get("agentRun"):
             return MEDIUM_TIMEOUT_SECONDS
@@ -4611,6 +4627,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     if operation in {
         "doctor",
         "guardrails",
+        "codex-schema-check",
         "build",
         "install-debug-cli",
         "debug-cli-status",

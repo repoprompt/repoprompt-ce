@@ -45,18 +45,26 @@ make codex-status                          # offline verification of both caches
 ```
 
 The verified cache lives under `.build/codex-runtime/<manifest-version>/<target>/`
-by default and can be relocated with `REPOPROMPT_CODEX_CACHE_ROOT`. Debug packages
-select the host architecture unless `REPOPROMPT_CODEX_ARCH` is set. Public
-universal release builds acquire and verify both official macOS packages and
-deterministically embed the `aarch64-apple-darwin` package; public packaging
-rejects any other selection. Runtime authority, architecture
-fallback, `CODEX_HOME`/`CODEX_SQLITE_HOME`, and override UI are intentionally
-not decided by this packaging milestone.
+by default and can be relocated with `REPOPROMPT_CODEX_CACHE_ROOT`. Ordinary
+host-native debug and non-public packaging defaults to the host target and embeds
+one package under that target name. Setting `REPOPROMPT_CODEX_ARCH=all` explicitly
+for one of those host-native lanes embeds both target packages. Universal
+release-candidate and public release lanes always select `all`, acquire and embed both
+official macOS packages, and reject an explicit single-target selection. Runtime
+authority, host-target selection, architecture fallback,
+`CODEX_HOME`/`CODEX_SQLITE_HOME`, and override UI are intentionally not decided
+by this packaging milestone.
 
-The intact package is copied to
-`Contents/Resources/BundledRuntimes/Codex`. This preserves `codex-package.json`,
-`bin/codex`, `bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and
-all additional package resources. The two primary macOS executables are
+Each intact thin package is copied to the stable target-specific layout
+`Contents/Resources/BundledRuntimes/Codex/<target>/`. Ordinary host-native output
+contains only its selected target directory, while explicit
+`REPOPROMPT_CODEX_ARCH=all` output and universal release-candidate/public
+artifacts contain both `aarch64-apple-darwin/` and
+`x86_64-apple-darwin/`. Each target
+subtree preserves `codex-package.json`, `bin/codex`,
+`bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and all additional
+package resources; the binaries inside remain thin and must match the directory's
+target architecture. The two primary macOS executables are
 Developer ID signed by `OpenAI OpCo, LLC` (team `2DC432GLL2`) with hardened
 runtime and timestamps. RepoPrompt's signing scripts do **not** thin, mutate, or
 re-sign anything in this subtree. The outer app signature seals the resource
@@ -82,6 +90,13 @@ python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
   --package .build/codex-runtime/0.144.6/aarch64-apple-darwin
+python3 Scripts/codex_runtime_artifact.py stage-bundle \
+  --arch all \
+  --cache-root .build/codex-runtime \
+  --bundle /tmp/RepoPrompt-Codex-bundle
+python3 Scripts/codex_runtime_artifact.py verify-bundle \
+  --arch all \
+  --bundle /tmp/RepoPrompt-Codex-bundle
 ```
 
 Rotate the pin only by reviewing a new official release and its checksum asset,
@@ -200,8 +215,11 @@ make dev-release-artifact
 The artifact is written under `dist/`. It exercises universal `arm64+x86_64`
 release-mode compilation in isolated SwiftPM directories, resource-equivalence
 checking, unsigned product merging, app bundling, legal-file packaging, and
-archive extraction validation. It is intentionally ad-hoc signed and is not
-suitable for distribution. The ZIP is accompanied by a deterministic external
+archive extraction validation. Coordinated `release artifact` jobs allow up to
+four hours for this dual-architecture path; `package release`, `release package`,
+and `release local-install` retain the normal two-hour release timeout. The
+artifact is intentionally ad-hoc signed and is not suitable for distribution.
+The ZIP is accompanied by a deterministic external
 `*-artifact-manifest.json` and `SHA256SUMS`; the manifest binds bundle versions,
 architecture sets, executable/helper hashes, signing identifiers and teams,
 designated requirements, certificate fingerprints when present, and the

@@ -75,6 +75,10 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         }
         let preScheduleAccounting = await fixture.engine.accounting()
         XCTAssertEqual(preScheduleAccounting.counters.projectionPreloadsScheduled, 0)
+        let preScheduleProjection = await fixture.engine.currentProjectionSnapshot(
+            rootEpoch: fixture.rootEpoch
+        )
+        XCTAssertEqual(preScheduleProjection, .unavailable(reason: .jobNotScheduled))
 
         let firstSchedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
         let duplicateSchedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
@@ -90,6 +94,14 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         XCTAssertEqual(accounting.queuedProjectionBatchCount, 0)
         XCTAssertEqual(accounting.counters.projectionPreloadsScheduled, 1)
         XCTAssertEqual(accounting.counters.projectionCoveragesCompleted, 1)
+        guard case let .authoritativeComplete(proof, completedUptimeNanoseconds) =
+            await fixture.engine.currentProjectionSnapshot(rootEpoch: fixture.rootEpoch)
+        else {
+            return XCTFail("Expected proof-bearing authoritative completion.")
+        }
+        XCTAssertEqual(proof.generation.rootEpoch, fixture.rootEpoch)
+        XCTAssertEqual(proof.counts.supportedCandidateCount, 0)
+        XCTAssertGreaterThan(completedUptimeNanoseconds, 0)
         let snapshots = await recorder.snapshots
         XCTAssertEqual(snapshots.count, 1)
         guard case .seal = snapshots.first else {
