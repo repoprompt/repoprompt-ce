@@ -605,6 +605,26 @@
           "path": "turn.status",
           "presence": "required",
           "nullable": false
+        },
+        {
+          "path": "turn.error",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "turn.error.message",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "turn.error.codexErrorInfo",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "turn.error.additionalDetails",
+          "presence": "optional",
+          "nullable": true
         }
       ]
     },

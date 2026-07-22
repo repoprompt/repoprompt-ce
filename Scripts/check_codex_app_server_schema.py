@@ -785,7 +785,11 @@ def validate_method_check(
     )
     declared_response = consumed_response_paths + always_sent_response + may_send_response
     response_schema = check.get("responseSchema")
-    if declared_response or check.get("consumedEnumValues"):
+    if (
+        declared_response
+        or check.get("responseEnumValues")
+        or check.get("consumedEnumValues")
+    ):
         response_document = load_json(schema_dir / response_schema)
         for entry in consumed_response:
             path = entry["path"]
@@ -814,9 +818,11 @@ def validate_method_check(
                     f"but {response_schema} does not declare it"
                 )
         if always_sent_response or may_send_response:
-            missing_required = sorted(
-                required_property_names(response_document, response_document)
-                - set(always_sent_response)
+            missing_required = missing_required_sent_paths(
+                response_document,
+                response_document,
+                always_sent=always_sent_response,
+                may_send=may_send_response,
             )
             for name in missing_required:
                 errors.append(

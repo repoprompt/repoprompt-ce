@@ -176,6 +176,66 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             errors, _ = gate.validate_bundle(root, fixture)
             self.assertTrue(any("nullability changed from True to False" in e for e in errors))
 
+    def test_response_enum_only_check_loads_response_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ClientRequest.json").write_text(
+                json.dumps(method_union("thread/example")), encoding="utf-8"
+            )
+            response = object_schema(
+                required=["status"],
+                properties={
+                    "status": {"type": "string", "enum": ["ready"]},
+                },
+            )
+            (root / "Response.json").write_text(json.dumps(response), encoding="utf-8")
+            fixture = contract([
+                {
+                    "union": "ClientRequest.json",
+                    "method": "thread/example",
+                    "responseSchema": "Response.json",
+                    "responseEnumValues": {"status": ["blocked"]},
+                }
+            ])
+
+            errors, _ = gate.validate_bundle(root, fixture)
+
+            self.assertTrue(any("sends response enum value 'blocked'" in e for e in errors))
+
+    def test_nested_required_response_field_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ClientRequest.json").write_text(
+                json.dumps(method_union("thread/example")), encoding="utf-8"
+            )
+            response = object_schema(
+                required=["result"],
+                properties={
+                    "result": object_schema(
+                        required=["existing", "newRequired"],
+                        properties={
+                            "existing": {"type": "string"},
+                            "newRequired": {"type": "string"},
+                        },
+                    )
+                },
+            )
+            (root / "Response.json").write_text(json.dumps(response), encoding="utf-8")
+            fixture = contract([
+                {
+                    "union": "ClientRequest.json",
+                    "method": "thread/example",
+                    "responseSchema": "Response.json",
+                    "alwaysSentResponse": ["result", "result.existing"],
+                }
+            ])
+
+            errors, _ = gate.validate_bundle(root, fixture)
+
+            self.assertTrue(
+                any("requires response field 'result.newRequired'" in e for e in errors)
+            )
+
     def test_discriminated_nested_sent_and_consumed_shapes_are_mutation_checked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
