@@ -88,6 +88,10 @@ var repoPromptTestSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug))
 ]
 
+var repoPromptCodeMapTestSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
+]
+
 if sentryEnabled {
     let sentryDependency = Target.Dependency.product(name: "Sentry", package: "sentry-cocoa")
     repoPromptAppDependencies.append(sentryDependency)
@@ -98,6 +102,7 @@ if sentryEnabled {
 
 if benchmarkTestsEnabled {
     repoPromptTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
+    repoPromptCodeMapTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
 
 let swift6LanguageMode: [SwiftSetting] = [
@@ -194,9 +199,7 @@ let package = Package(
                 .copy("Fixtures"),
                 .copy("Goldens")
             ],
-            swiftSettings: swift6LanguageMode + [
-                .define("DEBUG", .when(configuration: .debug))
-            ]
+            swiftSettings: swift6LanguageMode + repoPromptCodeMapTestSwiftSettings
         ),
         .testTarget(
             name: "RepoPromptTests",

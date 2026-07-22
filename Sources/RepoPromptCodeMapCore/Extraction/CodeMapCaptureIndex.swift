@@ -22,8 +22,12 @@ struct CodeMapCaptureIndex {
     /// Captures grouped by name, each list sorted by location
     let byName: [String: [CodeMapIndexedCapture]]
 
+    /// Present only for benchmark/debug/test attribution. The nil path retains the
+    /// original lookup loops without per-candidate instrumentation.
+    private let performanceCollector: CodeMapPerformanceCollector?
+
     /// Creates an index from an array of captures
-    init(_ captures: [NamedRange]) {
+    init(_ captures: [NamedRange], performanceCollector: CodeMapPerformanceCollector? = nil) {
         let normalized = captures.map { capture in
             CodeMapIndexedCapture(name: capture.name, range: capture.range)
         }
@@ -34,6 +38,9 @@ struct CodeMapCaptureIndex {
             grouped[cap.name, default: []].append(cap)
         }
         byName = grouped
+        self.performanceCollector = performanceCollector
+        performanceCollector?.captureIndexInputCaptureCount += captures.count
+        performanceCollector?.captureIndexBucketCount += grouped.count
     }
 
     /// Returns all captures with the given name, sorted by location
@@ -43,72 +50,76 @@ struct CodeMapCaptureIndex {
 
     /// Returns the first capture with the given name that is fully contained within the parent range
     func firstCapture(named name: String, containedIn parent: NSRange) -> CodeMapIndexedCapture? {
+        guard let performanceCollector else {
+            guard let candidates = byName[name] else { return nil }
+            return firstCapture(in: candidates, containedIn: parent)
+        }
+
+        performanceCollector.captureIndexFirstContainedLookupCount += 1
         guard let candidates = byName[name] else { return nil }
-
-        // Binary search to find the first candidate that could be in range
         let startIdx = candidates.binarySearch { $0.range.location < parent.location }
-
+        var visits = 0
+        var result: CodeMapIndexedCapture?
         for i in startIdx ..< candidates.count {
+            visits += 1
             let cap = candidates[i]
-            // If we've gone past the parent range, stop
             if cap.range.location >= NSMaxRange(parent) { break }
-            // Check containment
             if rangeContains(parent, cap.range) {
-                return cap
+                result = cap
+                break
             }
         }
-        return nil
+        performanceCollector.captureIndexFirstContainedCandidateVisits += visits
+        recordMaximumCandidateVisits(visits, in: performanceCollector)
+        return result
     }
 
     /// Returns all captures with the given name that are fully contained within the parent range
     func captures(named name: String, containedIn parent: NSRange) -> [CodeMapIndexedCapture] {
-        guard let candidates = byName[name] else { return [] }
-
-        var results: [CodeMapIndexedCapture] = []
-
-        // Binary search to find the first candidate that could be in range
-        let startIdx = candidates.binarySearch { $0.range.location < parent.location }
-
-        for i in startIdx ..< candidates.count {
-            let cap = candidates[i]
-            // If we've gone past the parent range, stop
-            if cap.range.location >= NSMaxRange(parent) { break }
-            // Check containment
-            if rangeContains(parent, cap.range) {
-                results.append(cap)
-            }
+        guard let performanceCollector else {
+            guard let candidates = byName[name] else { return [] }
+            return containedCaptures(in: candidates, parent: parent)
         }
-        return results
+
+        performanceCollector.captureIndexAllContainedLookupCount += 1
+        guard let candidates = byName[name] else { return [] }
+        let result = countedContainedCaptures(in: candidates, parent: parent)
+        performanceCollector.captureIndexAllContainedCandidateVisits += result.visits
+        recordMaximumCandidateVisits(result.visits, in: performanceCollector)
+        return result.captures
     }
 
     /// Returns all captures (of any name) that are fully contained within the parent range
     func allCaptures(containedIn parent: NSRange) -> [CodeMapIndexedCapture] {
-        var results: [CodeMapIndexedCapture] = []
-
-        // Binary search to find the first capture that could be in range
-        let startIdx = all.binarySearch { $0.range.location < parent.location }
-
-        for i in startIdx ..< all.count {
-            let cap = all[i]
-            // If we've gone past the parent range, stop
-            if cap.range.location >= NSMaxRange(parent) { break }
-            // Check containment
-            if rangeContains(parent, cap.range) {
-                results.append(cap)
-            }
+        guard let performanceCollector else {
+            return containedCaptures(in: all, parent: parent)
         }
-        return results
+
+        performanceCollector.captureIndexAllContainedLookupCount += 1
+        let result = countedContainedCaptures(in: all, parent: parent)
+        performanceCollector.captureIndexAllContainedCandidateVisits += result.visits
+        recordMaximumCandidateVisits(result.visits, in: performanceCollector)
+        return result.captures
     }
 
     /// Returns the smallest capture with the given name that fully contains the target range.
     func smallestCapture(named name: String, containing target: NSRange) -> CodeMapIndexedCapture? {
+        guard let performanceCollector else {
+            guard let candidates = byName[name] else { return nil }
+            return smallestCapture(in: candidates, containing: target)
+        }
+
+        performanceCollector.captureIndexSmallestContainingLookupCount += 1
         guard let candidates = byName[name] else { return nil }
-        return smallestCapture(in: candidates, containing: target)
+        let result = countedSmallestCapture(in: candidates, containing: target)
+        performanceCollector.captureIndexSmallestContainingCandidateVisits += result.visits
+        recordMaximumCandidateVisits(result.visits, in: performanceCollector)
+        return result.capture
     }
 
     /// Returns the smallest capture with any of the given names that fully contains the target range.
     func smallestCapture(namedAny names: [String], containing target: NSRange) -> CodeMapIndexedCapture? {
-        var best: CodeMapIndexedCapture? = nil
+        var best: CodeMapIndexedCapture?
         for name in names {
             guard let candidate = smallestCapture(named: name, containing: target) else { continue }
             if best == nil || isBetterContainingCandidate(candidate, than: best!) {
@@ -118,6 +129,49 @@ struct CodeMapCaptureIndex {
         return best
     }
 
+    private func firstCapture(
+        in candidates: [CodeMapIndexedCapture],
+        containedIn parent: NSRange
+    ) -> CodeMapIndexedCapture? {
+        let startIdx = candidates.binarySearch { $0.range.location < parent.location }
+        for i in startIdx ..< candidates.count {
+            let cap = candidates[i]
+            if cap.range.location >= NSMaxRange(parent) { break }
+            if rangeContains(parent, cap.range) { return cap }
+        }
+        return nil
+    }
+
+    private func containedCaptures(
+        in candidates: [CodeMapIndexedCapture],
+        parent: NSRange
+    ) -> [CodeMapIndexedCapture] {
+        let startIdx = candidates.binarySearch { $0.range.location < parent.location }
+        var results: [CodeMapIndexedCapture] = []
+        for i in startIdx ..< candidates.count {
+            let cap = candidates[i]
+            if cap.range.location >= NSMaxRange(parent) { break }
+            if rangeContains(parent, cap.range) { results.append(cap) }
+        }
+        return results
+    }
+
+    private func countedContainedCaptures(
+        in candidates: [CodeMapIndexedCapture],
+        parent: NSRange
+    ) -> (captures: [CodeMapIndexedCapture], visits: Int) {
+        let startIdx = candidates.binarySearch { $0.range.location < parent.location }
+        var results: [CodeMapIndexedCapture] = []
+        var visits = 0
+        for i in startIdx ..< candidates.count {
+            visits += 1
+            let cap = candidates[i]
+            if cap.range.location >= NSMaxRange(parent) { break }
+            if rangeContains(parent, cap.range) { results.append(cap) }
+        }
+        return (results, visits)
+    }
+
     private func smallestCapture(
         in candidates: [CodeMapIndexedCapture],
         containing target: NSRange
@@ -125,7 +179,7 @@ struct CodeMapCaptureIndex {
         let endIdx = candidates.binarySearch { $0.range.location <= target.location }
         guard endIdx > 0 else { return nil }
 
-        var best: CodeMapIndexedCapture? = nil
+        var best: CodeMapIndexedCapture?
         for i in stride(from: endIdx - 1, through: 0, by: -1) {
             let candidate = candidates[i]
             if rangeContains(candidate.range, target),
@@ -135,6 +189,35 @@ struct CodeMapCaptureIndex {
             }
         }
         return best
+    }
+
+    private func countedSmallestCapture(
+        in candidates: [CodeMapIndexedCapture],
+        containing target: NSRange
+    ) -> (capture: CodeMapIndexedCapture?, visits: Int) {
+        let endIdx = candidates.binarySearch { $0.range.location <= target.location }
+        guard endIdx > 0 else { return (nil, 0) }
+
+        var best: CodeMapIndexedCapture?
+        for i in stride(from: endIdx - 1, through: 0, by: -1) {
+            let candidate = candidates[i]
+            if rangeContains(candidate.range, target),
+               best == nil || isBetterContainingCandidate(candidate, than: best!)
+            {
+                best = candidate
+            }
+        }
+        return (best, endIdx)
+    }
+
+    private func recordMaximumCandidateVisits(
+        _ visits: Int,
+        in performanceCollector: CodeMapPerformanceCollector
+    ) {
+        performanceCollector.captureIndexMaximumCandidateVisits = max(
+            performanceCollector.captureIndexMaximumCandidateVisits,
+            visits
+        )
     }
 
     private func isBetterContainingCandidate(
@@ -149,8 +232,7 @@ struct CodeMapCaptureIndex {
 
     /// Checks if inner range is fully contained within outer range
     private func rangeContains(_ outer: NSRange, _ inner: NSRange) -> Bool {
-        inner.location >= outer.location &&
-            NSMaxRange(inner) <= NSMaxRange(outer)
+        inner.location >= outer.location && NSMaxRange(inner) <= NSMaxRange(outer)
     }
 }
 

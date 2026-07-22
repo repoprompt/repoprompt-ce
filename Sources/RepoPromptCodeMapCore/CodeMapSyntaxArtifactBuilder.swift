@@ -1,3 +1,5 @@
+import Foundation
+
 package enum CodeMapSyntaxArtifactBuilder {
     package static func build(
         source: CodeMapCoreSourceSnapshot,
@@ -6,6 +8,13 @@ package enum CodeMapSyntaxArtifactBuilder {
         performanceOptions: CodeMapPerfOptions = .disabled,
         performanceCollector: CodeMapPerformanceCollector? = nil
     ) throws -> CodeMapSyntaxArtifactOutcome {
+        let builderStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
+        defer {
+            if let builderStart {
+                performanceCollector?.builderTotalDuration += ProcessInfo.processInfo.systemUptime - builderStart
+            }
+        }
+
         guard case let .decoded(decodedSource) = source.decodeResult else {
             guard case let .failed(failure) = source.decodeResult else {
                 preconditionFailure("CodeMapSourceDecodeResult gained an unhandled case.")
@@ -27,13 +36,18 @@ package enum CodeMapSyntaxArtifactBuilder {
 
         switch syntaxOutcome {
         case let .captures(captures):
-            guard let artifact = CodeMapGenerator.generateSyntaxArtifact(
+            let generatorStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
+            let artifact = CodeMapGenerator.generateSyntaxArtifact(
                 from: captures,
                 content: content,
                 language: language,
                 perfOptions: performanceOptions,
                 perfStats: performanceCollector
-            ) else {
+            )
+            if let generatorStart {
+                performanceCollector?.builderGeneratorDuration += ProcessInfo.processInfo.systemUptime - generatorStart
+            }
+            guard let artifact else {
                 return .readyNoSymbols
             }
             return .ready(artifact)

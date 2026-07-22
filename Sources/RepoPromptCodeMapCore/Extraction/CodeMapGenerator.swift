@@ -306,7 +306,10 @@ struct CodeMapGenerator {
             perfOptions: perfOptions,
             perfStats: perfStats
         )
-        return makeSyntaxArtifact(from: output)
+        return makeSyntaxArtifact(
+            from: output,
+            performanceCollector: perfOptions.enabled ? perfStats : nil
+        )
     }
 
     private static func declarationTerminator(for language: LanguageType) -> Character {
@@ -359,7 +362,10 @@ struct CodeMapGenerator {
         // Build capture index for efficient lookups
         let indexToken = Signpost.begin("codemap.index")
         let indexStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        let captureIndex = CodeMapCaptureIndex(namedRanges)
+        let captureIndex = CodeMapCaptureIndex(
+            namedRanges,
+            performanceCollector: perfEnabled ? activePerfStats : nil
+        )
         if perfEnabled {
             activePerfStats?.captureIndexDuration += (CFAbsoluteTimeGetCurrent() - indexStart)
         }
@@ -699,7 +705,8 @@ struct CodeMapGenerator {
             swiftContext = SwiftCodeMapStrategy.buildContext(
                 index: captureIndex,
                 content: content,
-                boundaries: boundaries
+                boundaries: boundaries,
+                performanceCollector: activePerfStats
             )
             if perfEnabled {
                 activePerfStats?.swiftContextDuration += (CFAbsoluteTimeGetCurrent() - swiftContextStart)
@@ -1919,6 +1926,7 @@ struct CodeMapGenerator {
         let finalReferences = referencedTypes.finalizeSorted()
         if perfEnabled {
             activePerfStats?.referencedTypesFinalizeDuration += (CFAbsoluteTimeGetCurrent() - typeFinalizeStart)
+            activePerfStats?.referencedTypesUniqueCount += finalReferences.count
         }
         Signpost.end("codemap.referenced_types", typeFinalizeToken)
 
@@ -1937,20 +1945,36 @@ struct CodeMapGenerator {
         )
     }
 
-    private static func makeSyntaxArtifact(from output: GenerationOutput) -> CodeMapSyntaxArtifact? {
+    private static func makeSyntaxArtifact(
+        from output: GenerationOutput,
+        performanceCollector: CodeMapPerformanceCollector?
+    ) -> CodeMapSyntaxArtifact? {
+        let finalizationStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        defer {
+            if let finalizationStart {
+                performanceCollector?.artifactFinalizationDuration +=
+                    CFAbsoluteTimeGetCurrent() - finalizationStart
+            }
+        }
+
         let classes = finalizedClasses(output.classesByLine)
         let interfaces = finalizedInterfaces(output.interfacesByLine)
-        guard hasMeaningfulContent(
+        let meaningfulStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let meaningful = hasMeaningfulContent(
             output: output,
             classes: classes,
             interfaces: interfaces,
             functions: output.globalFunctions,
             globalVars: output.globalVariables
-        ) else {
-            return nil
+        )
+        if let meaningfulStart {
+            performanceCollector?.artifactMeaningfulContentCheckDuration +=
+                CFAbsoluteTimeGetCurrent() - meaningfulStart
         }
+        guard meaningful else { return nil }
 
-        return CodeMapSyntaxArtifact(
+        let artifactStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let artifact = CodeMapSyntaxArtifact(
             imports: output.imports,
             exports: output.exports,
             classes: classes,
@@ -1963,6 +1987,14 @@ struct CodeMapGenerator {
             macros: output.macros,
             referencedTypes: output.referencedTypes
         )
+        if let artifactStart {
+            performanceCollector?.fileAPIInitDuration += CFAbsoluteTimeGetCurrent() - artifactStart
+            performanceCollector?.artifactFinalClassCount += classes.count
+            performanceCollector?.artifactFinalInterfaceCount += interfaces.count
+            performanceCollector?.artifactFinalFunctionCount += output.globalFunctions.count
+            performanceCollector?.artifactFinalGlobalVariableCount += output.globalVariables.count
+        }
+        return artifact
     }
 
     private static func finalizedClasses(_ classesByLine: [Int: ClassInfo]) -> [ClassInfo] {

@@ -96,7 +96,8 @@ enum SwiftCodeMapStrategy {
     static func buildContext(
         index: CodeMapCaptureIndex,
         content: String,
-        boundaries: [Int]
+        boundaries: [Int],
+        performanceCollector: CodeMapPerformanceCollector? = nil
     ) -> Context {
         var ctx = Context()
         let nsContent = content as NSString
@@ -150,12 +151,19 @@ enum SwiftCodeMapStrategy {
         // First pass: collect type names
         let typeDeclCaps = index.captures(named: "swift.type.decl")
         let typeNameCaps = index.captures(named: "swift.type.name")
+        performanceCollector?.swiftTypeDeclarationCount += typeDeclCaps.count
+        let typeMappingStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
         ctx.typeNamesByRange = mapNamesToSmallestContainingDecl(
             nameCaps: typeNameCaps,
             declCaps: typeDeclCaps
         )
+        if let typeMappingStart {
+            performanceCollector?.swiftTypeNameMappingDuration +=
+                CFAbsoluteTimeGetCurrent() - typeMappingStart
+        }
 
         // Second pass: build boundaries with full ranges
+        let typeBoundaryStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
         for cap in typeDeclCaps {
             if let name = ctx.typeNamesByRange[cap.range] {
                 let declText = nsContent.substring(with: cap.range)
@@ -182,14 +190,27 @@ enum SwiftCodeMapStrategy {
             }
         }
 
+        if let typeBoundaryStart {
+            performanceCollector?.swiftBoundaryConstructionDuration +=
+                CFAbsoluteTimeGetCurrent() - typeBoundaryStart
+        }
+
         // Also collect protocols
         let protocolDeclCaps = index.captures(named: "swift.protocol.decl")
         let protocolNameCaps = index.captures(named: "swift.protocol.name")
+        performanceCollector?.swiftProtocolDeclarationCount += protocolDeclCaps.count
+        let protocolMappingStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
         ctx.protocolNamesByRange = mapNamesToSmallestContainingDecl(
             nameCaps: protocolNameCaps,
             declCaps: protocolDeclCaps
         )
 
+        if let protocolMappingStart {
+            performanceCollector?.swiftProtocolNameMappingDuration +=
+                CFAbsoluteTimeGetCurrent() - protocolMappingStart
+        }
+
+        let protocolBoundaryStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
         for cap in protocolDeclCaps {
             if let name = ctx.protocolNamesByRange[cap.range] {
                 let lineNo = lineNumber(for: cap.range.location, using: boundaries)
@@ -197,9 +218,26 @@ enum SwiftCodeMapStrategy {
             }
         }
 
+        if let protocolBoundaryStart {
+            performanceCollector?.swiftBoundaryConstructionDuration +=
+                CFAbsoluteTimeGetCurrent() - protocolBoundaryStart
+        }
+
+        let functionAssemblyStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
         let topLevelFunctionCaps = index.captures(named: "swift.function.toplevel")
         let methodFunctionCaps = index.captures(named: "swift.function.method")
         let protocolFunctionCaps = index.captures(named: "swift.protocol.method")
+        performanceCollector?.swiftTopLevelFunctionCount += topLevelFunctionCaps.count
+        performanceCollector?.swiftMethodFunctionCount += methodFunctionCaps.count
+        performanceCollector?.swiftProtocolMethodCount += protocolFunctionCaps.count
+        performanceCollector?.swiftParameterNodeCount += index.captures(named: "swift.param.node").count
+        performanceCollector?.swiftPropertyDeclarationCount += index.captures(named: "swift.property.decl").count
+        performanceCollector?.swiftProtocolPropertyDeclarationCount +=
+            index.captures(named: "swift.protocol.property.decl").count
+        performanceCollector?.swiftPropertyIdentifierCount +=
+            index.captures(named: "swift.property.toplevel").count +
+            index.captures(named: "swift.property.member").count +
+            index.captures(named: "swift.protocol.property").count
         ctx.functionCaptures.reserveCapacity(
             topLevelFunctionCaps.count + methodFunctionCaps.count + protocolFunctionCaps.count
         )
@@ -210,6 +248,11 @@ enum SwiftCodeMapStrategy {
 
         // Sort boundaries by range location
         ctx.typeBoundaries.sort { $0.range.location < $1.range.location }
+        if let functionAssemblyStart {
+            performanceCollector?.swiftFunctionCaptureAssemblyDuration +=
+                CFAbsoluteTimeGetCurrent() - functionAssemblyStart
+            performanceCollector?.swiftTypeBoundaryCount += ctx.typeBoundaries.count
+        }
 
         return ctx
     }
@@ -226,18 +269,33 @@ enum SwiftCodeMapStrategy {
     private static func extractSwiftFunctionSignature(
         from functionRange: NSRange,
         nsContent: NSString,
-        boundaries: [Int]
+        boundaries: [Int],
+        performanceCollector: CodeMapPerformanceCollector?
     ) -> SwiftFunctionSignature {
-        let signatureEnd = signatureEndLocation(forFunctionRange: functionRange, nsContent: nsContent)
+        let scanStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let signatureEnd = signatureEndLocation(
+            forFunctionRange: functionRange,
+            nsContent: nsContent,
+            performanceCollector: performanceCollector
+        )
+        if let scanStart {
+            performanceCollector?.swiftSignatureEndScanDuration +=
+                CFAbsoluteTimeGetCurrent() - scanStart
+        }
         let signatureLength = signatureEnd - functionRange.location
         let signatureRange = NSRange(location: functionRange.location, length: signatureLength)
 
         // Get the signature text
+        let normalizationStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
         var signature = nsContent.substring(with: signatureRange)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Normalize whitespace (collapse multiple whitespace to single space)
         signature = signature.replacing(#/\s+/#, with: " ")
+        if let normalizationStart {
+            performanceCollector?.swiftSignatureNormalizationDuration +=
+                CFAbsoluteTimeGetCurrent() - normalizationStart
+        }
 
         return SwiftFunctionSignature(definitionLine: signature, signatureEnd: signatureEnd)
     }
@@ -271,7 +329,12 @@ enum SwiftCodeMapStrategy {
             // Top-level Swift functions go directly to globalFunctions
             // Use Swift-specific signature extraction to avoid semicolon heuristic issues
             let signatureStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let signature = extractSwiftFunctionSignature(from: cap.range, nsContent: nsContent, boundaries: boundaries)
+			let signature = extractSwiftFunctionSignature(
+				from: cap.range,
+				nsContent: nsContent,
+				boundaries: boundaries,
+				performanceCollector: activePerfStats
+			)
             if perfEnabled {
                 record(.functionSignature, duration: CFAbsoluteTimeGetCurrent() - signatureStart, perfStats: activePerfStats)
             }
@@ -295,7 +358,8 @@ enum SwiftCodeMapStrategy {
                 context: context,
                 index: index,
                 nsContent: nsContent,
-                referencedTypes: &referencedTypes
+                referencedTypes: &referencedTypes,
+                performanceCollector: activePerfStats
             )
             if perfEnabled {
                 record(.parameterExtraction, duration: CFAbsoluteTimeGetCurrent() - parameterStart, perfStats: activePerfStats)
@@ -318,7 +382,11 @@ enum SwiftCodeMapStrategy {
                 lineNumber: lineNo
             )
 
-            if !globalFunctions.contains(where: { $0.definitionLine == decl }) {
+            if !containsFunction(
+                    in: globalFunctions,
+                    definitionLine: decl,
+                    performanceCollector: activePerfStats
+                ) {
                 globalFunctions.append(fnInfo)
             }
             if perfEnabled {
@@ -333,7 +401,12 @@ enum SwiftCodeMapStrategy {
             // Swift methods - use range-based containment to find enclosing type
             // Use Swift-specific signature extraction to avoid semicolon heuristic issues
             let signatureStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let signature = extractSwiftFunctionSignature(from: cap.range, nsContent: nsContent, boundaries: boundaries)
+			let signature = extractSwiftFunctionSignature(
+				from: cap.range,
+				nsContent: nsContent,
+				boundaries: boundaries,
+				performanceCollector: activePerfStats
+			)
             if perfEnabled {
                 record(.functionSignature, duration: CFAbsoluteTimeGetCurrent() - signatureStart, perfStats: activePerfStats)
             }
@@ -357,7 +430,8 @@ enum SwiftCodeMapStrategy {
                 context: context,
                 index: index,
                 nsContent: nsContent,
-                referencedTypes: &referencedTypes
+                referencedTypes: &referencedTypes,
+                performanceCollector: activePerfStats
             )
             if perfEnabled {
                 record(.parameterExtraction, duration: CFAbsoluteTimeGetCurrent() - parameterStart, perfStats: activePerfStats)
@@ -373,7 +447,11 @@ enum SwiftCodeMapStrategy {
             }
             // Find enclosing type by range containment
             let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let resolvedEnclosingType = enclosingType(for: cap.range, in: context.typeBoundaries)
+			let resolvedEnclosingType = enclosingType(
+				for: cap.range,
+				in: context.typeBoundaries,
+				performanceCollector: activePerfStats
+			)
             if perfEnabled {
                 record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
             }
@@ -391,12 +469,20 @@ enum SwiftCodeMapStrategy {
                 if classesByLine[lineNo] == nil {
                     classesByLine[lineNo] = ClassInfo(name: enclosingType.name, methods: [], properties: [])
                 }
-                if !classesByLine[lineNo]!.methods.contains(where: { $0.definitionLine == decl }) {
+                if !containsFunction(
+                    in: classesByLine[lineNo]!.methods,
+                    definitionLine: decl,
+                    performanceCollector: activePerfStats
+                ) {
                     classesByLine[lineNo]?.methods.append(fnInfo)
                 }
             } else {
                 // Fallback: treat as global if no enclosing type found
-                if !globalFunctions.contains(where: { $0.definitionLine == decl }) {
+                if !containsFunction(
+                    in: globalFunctions,
+                    definitionLine: decl,
+                    performanceCollector: activePerfStats
+                ) {
                     globalFunctions.append(fnInfo)
                 }
             }
@@ -412,7 +498,12 @@ enum SwiftCodeMapStrategy {
             // Protocol methods go to interfaces
             // Use Swift-specific signature extraction to avoid semicolon heuristic issues
             let signatureStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let signature = extractSwiftFunctionSignature(from: cap.range, nsContent: nsContent, boundaries: boundaries)
+			let signature = extractSwiftFunctionSignature(
+				from: cap.range,
+				nsContent: nsContent,
+				boundaries: boundaries,
+				performanceCollector: activePerfStats
+			)
             if perfEnabled {
                 record(.functionSignature, duration: CFAbsoluteTimeGetCurrent() - signatureStart, perfStats: activePerfStats)
             }
@@ -433,7 +524,8 @@ enum SwiftCodeMapStrategy {
                 context: context,
                 index: index,
                 nsContent: nsContent,
-                referencedTypes: &referencedTypes
+                referencedTypes: &referencedTypes,
+                performanceCollector: activePerfStats
             )
             if perfEnabled {
                 record(.parameterExtraction, duration: CFAbsoluteTimeGetCurrent() - parameterStart, perfStats: activePerfStats)
@@ -448,7 +540,11 @@ enum SwiftCodeMapStrategy {
             }
             // Find enclosing protocol
             let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let resolvedEnclosingProto = enclosingType(for: cap.range, in: context.typeBoundaries)
+			let resolvedEnclosingProto = enclosingType(
+				for: cap.range,
+				in: context.typeBoundaries,
+				performanceCollector: activePerfStats
+			)
             if perfEnabled {
                 record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
             }
@@ -481,7 +577,12 @@ enum SwiftCodeMapStrategy {
         case "swift.property.toplevel":
             // Top-level Swift properties go to globalVariables
             let propertyDeclarationStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let fullDecl = extractSwiftPropertyDeclaration(from: cap.range, index: index, nsContent: nsContent, fallback: {
+			let fullDecl = extractSwiftPropertyDeclaration(
+				from: cap.range,
+				index: index,
+				nsContent: nsContent,
+				performanceCollector: activePerfStats,
+				fallback: {
                 captureDeclaration(cap.range, "{")
             })
             if perfEnabled {
@@ -498,7 +599,11 @@ enum SwiftCodeMapStrategy {
             let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
             let varInfo = VariableInfo(name: fullDecl, typeName: propType, definitionLine: fullDecl)
 
-            if !globalVariables.contains(where: { $0.definitionLine == fullDecl }) {
+            if !containsVariable(
+                    in: globalVariables,
+                    definitionLine: fullDecl,
+                    performanceCollector: activePerfStats
+                ) {
                 globalVariables.append(varInfo)
             }
             if perfEnabled {
@@ -512,7 +617,12 @@ enum SwiftCodeMapStrategy {
         case "swift.property.member":
             // Swift member properties - use range-based containment
             let propertyDeclarationStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let fullDecl = extractSwiftPropertyDeclaration(from: cap.range, index: index, nsContent: nsContent, fallback: {
+			let fullDecl = extractSwiftPropertyDeclaration(
+				from: cap.range,
+				index: index,
+				nsContent: nsContent,
+				performanceCollector: activePerfStats,
+				fallback: {
                 captureDeclaration(cap.range, "{")
             })
             if perfEnabled {
@@ -528,7 +638,11 @@ enum SwiftCodeMapStrategy {
             }
 
             let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let resolvedEnclosingType = enclosingType(for: cap.range, in: context.typeBoundaries)
+			let resolvedEnclosingType = enclosingType(
+				for: cap.range,
+				in: context.typeBoundaries,
+				performanceCollector: activePerfStats
+			)
             if perfEnabled {
                 record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
             }
@@ -539,13 +653,21 @@ enum SwiftCodeMapStrategy {
                     classesByLine[lineNo] = ClassInfo(name: enclosingType.name, methods: [], properties: [])
                 }
                 let propInfo = PropertyInfo(name: fullDecl, typeName: propType)
-                if !classesByLine[lineNo]!.properties.contains(where: { $0.name == fullDecl }) {
+                if !containsProperty(
+                    in: classesByLine[lineNo]!.properties,
+                    name: fullDecl,
+                    performanceCollector: activePerfStats
+                ) {
                     classesByLine[lineNo]?.properties.append(propInfo)
                 }
             } else {
                 // Fallback: treat as global if no enclosing type found
                 let varInfo = VariableInfo(name: fullDecl, typeName: propType, definitionLine: fullDecl)
-                if !globalVariables.contains(where: { $0.definitionLine == fullDecl }) {
+                if !containsVariable(
+                    in: globalVariables,
+                    definitionLine: fullDecl,
+                    performanceCollector: activePerfStats
+                ) {
                     globalVariables.append(varInfo)
                 }
             }
@@ -560,7 +682,12 @@ enum SwiftCodeMapStrategy {
         case "swift.protocol.property":
             // Protocol properties go to interfaces
             let propertyDeclarationStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let fullDecl = extractSwiftPropertyDeclaration(from: cap.range, index: index, nsContent: nsContent, fallback: {
+			let fullDecl = extractSwiftPropertyDeclaration(
+				from: cap.range,
+				index: index,
+				nsContent: nsContent,
+				performanceCollector: activePerfStats,
+				fallback: {
                 captureDeclaration(cap.range, "{")
             })
             if perfEnabled {
@@ -576,7 +703,11 @@ enum SwiftCodeMapStrategy {
             }
 
             let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let resolvedEnclosingProto = enclosingType(for: cap.range, in: context.typeBoundaries)
+			let resolvedEnclosingProto = enclosingType(
+				for: cap.range,
+				in: context.typeBoundaries,
+				performanceCollector: activePerfStats
+			)
             if perfEnabled {
                 record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
             }
@@ -615,6 +746,54 @@ enum SwiftCodeMapStrategy {
 
     // MARK: - Helpers
 
+	private static func containsFunction(
+		in functions: [FunctionInfo],
+		definitionLine: String,
+		performanceCollector: CodeMapPerformanceCollector?
+	) -> Bool {
+		guard let performanceCollector else {
+			return functions.contains { $0.definitionLine == definitionLine }
+		}
+		performanceCollector.swiftFunctionDuplicateCheckCount += 1
+		for function in functions {
+			performanceCollector.swiftFunctionDuplicateCandidateVisits += 1
+			if function.definitionLine == definitionLine { return true }
+		}
+		return false
+	}
+
+	private static func containsVariable(
+		in variables: [VariableInfo],
+		definitionLine: String,
+		performanceCollector: CodeMapPerformanceCollector?
+	) -> Bool {
+		guard let performanceCollector else {
+			return variables.contains { $0.definitionLine == definitionLine }
+		}
+		performanceCollector.swiftPropertyDuplicateCheckCount += 1
+		for variable in variables {
+			performanceCollector.swiftPropertyDuplicateCandidateVisits += 1
+			if variable.definitionLine == definitionLine { return true }
+		}
+		return false
+	}
+
+	private static func containsProperty(
+		in properties: [PropertyInfo],
+		name: String,
+		performanceCollector: CodeMapPerformanceCollector?
+	) -> Bool {
+		guard let performanceCollector else {
+			return properties.contains { $0.name == name }
+		}
+		performanceCollector.swiftPropertyDuplicateCheckCount += 1
+		for property in properties {
+			performanceCollector.swiftPropertyDuplicateCandidateVisits += 1
+			if property.name == name { return true }
+		}
+		return false
+	}
+
     /// Extracts Swift parameters from a function capture range
     private static func extractSwiftParameters(
         from functionRange: NSRange,
@@ -622,7 +801,8 @@ enum SwiftCodeMapStrategy {
         context: Context,
         index: CodeMapCaptureIndex,
         nsContent: NSString,
-        referencedTypes: inout ReferencedTypesAccumulator
+        referencedTypes: inout ReferencedTypesAccumulator,
+        performanceCollector: CodeMapPerformanceCollector?
     ) -> [ParameterInfo] {
         var params: [ParameterInfo] = []
 
@@ -635,7 +815,11 @@ enum SwiftCodeMapStrategy {
                 continue
             }
             // Exclude params from nested functions inside this function range
-            if let enclosingFn = smallestContainingRange(in: context.functionCaptures, for: paramNode.range),
+            if let enclosingFn = smallestContainingRange(
+                in: context.functionCaptures,
+                for: paramNode.range,
+                performanceCollector: performanceCollector
+            ),
                !NSEqualRanges(enclosingFn.range, functionRange)
             {
                 continue
@@ -670,14 +854,22 @@ enum SwiftCodeMapStrategy {
         return params
     }
 
-    private static func signatureEndLocation(forFunctionRange functionRange: NSRange, nsContent: NSString) -> Int {
+	private static func signatureEndLocation(
+		forFunctionRange functionRange: NSRange,
+		nsContent: NSString,
+		performanceCollector: CodeMapPerformanceCollector?
+	) -> Int {
         let end = NSMaxRange(functionRange)
+		var i = functionRange.location
+		defer {
+			let visited = max(0, min(i, end) - functionRange.location + (i < end ? 1 : 0))
+			performanceCollector?.swiftSignatureCodeUnitVisits += visited
+		}
         var parenDepth = 0
         var inString = false
         var escapeNext = false
         var inLineComment = false
         var inBlockComment = false
-        var i = functionRange.location
 
         while i < end {
             let ch = nsContent.character(at: i)
@@ -878,8 +1070,10 @@ enum SwiftCodeMapStrategy {
         from identifierRange: NSRange,
         index: CodeMapCaptureIndex,
 		nsContent: NSString,
+		performanceCollector: CodeMapPerformanceCollector?,
         fallback: () -> String
     ) -> String {
+		let lookupStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
         let declCap = index.smallestCapture(
             named: "swift.property.decl",
             containing: identifierRange
@@ -887,13 +1081,27 @@ enum SwiftCodeMapStrategy {
             named: "swift.protocol.property.decl",
             containing: identifierRange
         )
+		if let lookupStart {
+			performanceCollector?.swiftPropertyDeclarationLookupDuration +=
+				CFAbsoluteTimeGetCurrent() - lookupStart
+		}
         if let cap = declCap {
+			let substringStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
             var decl = nsContent.substring(with: cap.range)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if let braceIndex = decl.firstIndex(of: "{") {
                 decl = String(decl[..<braceIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
             }
+			if let substringStart {
+				performanceCollector?.swiftPropertyDeclarationSubstringDuration +=
+					CFAbsoluteTimeGetCurrent() - substringStart
+			}
+			let initializerStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
             decl = stripSwiftInitializer(decl)
+			if let initializerStart {
+				performanceCollector?.swiftPropertyInitializerStripDuration +=
+					CFAbsoluteTimeGetCurrent() - initializerStart
+			}
             return decl
         }
         return fallback()
@@ -909,9 +1117,12 @@ enum SwiftCodeMapStrategy {
 
     private static func smallestContainingRange(
         in ranges: [CodeMapIndexedCapture],
-        for target: NSRange
+		for target: NSRange,
+		performanceCollector: CodeMapPerformanceCollector?
     ) -> CodeMapIndexedCapture? {
+		performanceCollector?.swiftNestedFunctionContainmentLookupCount += 1
         let endIdx = ranges.binarySearch { $0.range.location <= target.location }
+		performanceCollector?.swiftNestedFunctionContainmentCandidateVisits += endIdx
         guard endIdx > 0 else { return nil }
 
         var best: CodeMapIndexedCapture? = nil
@@ -927,8 +1138,13 @@ enum SwiftCodeMapStrategy {
     }
 
     /// Finds the smallest enclosing type boundary for a given range
-    private static func enclosingType(for range: NSRange, in typeBoundaries: [TypeBoundary]) -> TypeBoundary? {
+	private static func enclosingType(
+		for range: NSRange,
+		in typeBoundaries: [TypeBoundary],
+		performanceCollector: CodeMapPerformanceCollector?
+	) -> TypeBoundary? {
         let endIdx = typeBoundaries.binarySearch { $0.range.location <= range.location }
+		performanceCollector?.swiftEnclosingTypeCandidateVisits += endIdx
         guard endIdx > 0 else { return nil }
 
         var smallestContaining: TypeBoundary? = nil

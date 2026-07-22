@@ -50,8 +50,7 @@ struct CodeMapSyntaxPerfStats {
     var parserCreates = 0
     var queryExecutes = 0
     var captures = 0
-    var codeMapQueryCacheHits = 0
-    var codeMapQueryCacheMisses = 0
+    var codeMapQuerySuccessfulLookups = 0
 }
 
 struct CodeMapPipelinePerfSnapshot: Equatable {
@@ -142,8 +141,7 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var parseFailures = 0
     var generatedAPIs = 0
     var nilAPIs = 0
-    var codeMapQueryCacheHits = 0
-    var codeMapQueryCacheMisses = 0
+    var codeMapQuerySuccessfulLookups = 0
     var syntaxWarmCacheLanguageCount = 0
     var syntaxLanguageConfigCreateCount = 0
     var syntaxLanguageConfigSuccessCount = 0
@@ -312,8 +310,7 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.syntaxParserCreateCount += stats.parserCreates
             storage.syntaxQueryExecuteCount += stats.queryExecutes
             storage.syntaxCaptureCount += stats.captures
-            storage.codeMapQueryCacheHits += stats.codeMapQueryCacheHits
-            storage.codeMapQueryCacheMisses += stats.codeMapQueryCacheMisses
+            storage.codeMapQuerySuccessfulLookups += stats.codeMapQuerySuccessfulLookups
         }
     }
 
@@ -336,8 +333,7 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
                 parserCreates: stats.syntaxParserCreates,
                 queryExecutes: stats.syntaxQueryExecutes,
                 captures: stats.syntaxCaptures,
-                codeMapQueryCacheHits: stats.syntaxCodeMapQueryCacheHits,
-                codeMapQueryCacheMisses: stats.syntaxCodeMapQueryCacheMisses
+                codeMapQuerySuccessfulLookups: stats.syntaxCodeMapQuerySuccessfulLookups
             )
         )
     }

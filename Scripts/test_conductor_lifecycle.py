@@ -1730,6 +1730,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     "RPCE_ENABLE_BENCHMARK_TESTS": "1",
                     "RPCE_RUN_CODEMAP_E2E": "1",
                     "RPCE_RUN_SCALE_TESTS": "1",
+                    "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK": "1",
+                    "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES": "type.class",
+                    "RP_SWIFT_CODEMAP_REFERENCE_MODE": "compare",
+                    "RP_SWIFT_CODEMAP_REFERENCE_PATH": "/tmp/reference.json",
                     "RPCE_UNRELATED_TEST_GATE": "1",
                 },
                 clear=False,
@@ -1739,6 +1743,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             self.assertEqual(snapshot["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
             self.assertEqual(snapshot["RPCE_RUN_CODEMAP_E2E"], "1")
             self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
+            self.assertEqual(snapshot["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")
             self.assertNotIn("RPCE_UNRELATED_TEST_GATE", snapshot)
 
             _argv, _lanes, _cwd, env, _timeout = registry.prepare(
@@ -1752,6 +1760,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(env["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
         self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
         self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
+        self.assertEqual(env["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")
         self.assertNotIn("RPCE_UNRELATED_TEST_GATE", env)
 
     def test_test_cli_forwards_watchdog_options_and_requires_threshold(self) -> None:

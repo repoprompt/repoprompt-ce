@@ -17,8 +17,13 @@ package struct CodeMapPerfOptions: Sendable {
 }
 
 package final class CodeMapPerformanceCollector {
+    // Builder boundary. Populated only when an invocation-local collector is supplied.
+    package var builderTotalDuration: TimeInterval = 0
+    package var builderGeneratorDuration: TimeInterval = 0
+
     // Syntax parse/query stages. These values are populated only when the app
     // supplies this invocation-local collector.
+    package var syntaxTotalDuration: TimeInterval = 0
     package var syntaxLanguageLookupDuration: TimeInterval = 0
     package var syntaxOversizeGuardDuration: TimeInterval = 0
     package var syntaxParserCreateDuration: TimeInterval = 0
@@ -38,8 +43,34 @@ package final class CodeMapPerformanceCollector {
     package var syntaxCaptures = 0
     package var syntaxCaptureCountsByName: [String: Int] = [:]
     package let collectsCaptureNames: Bool
-    package var syntaxCodeMapQueryCacheHits = 0
-    package var syntaxCodeMapQueryCacheMisses = 0
+    package var syntaxCodeMapQuerySuccessfulLookups = 0
+
+    // Capture index construction and lookup complexity.
+    package var captureIndexInputCaptureCount = 0
+    package var captureIndexBucketCount = 0
+    package var captureIndexFirstContainedLookupCount = 0
+    package var captureIndexFirstContainedCandidateVisits = 0
+    package var captureIndexAllContainedLookupCount = 0
+    package var captureIndexAllContainedCandidateVisits = 0
+    package var captureIndexSmallestContainingLookupCount = 0
+    package var captureIndexSmallestContainingCandidateVisits = 0
+    package var captureIndexMaximumCandidateVisits = 0
+
+    // Swift context construction and declaration volume.
+    package var swiftTypeNameMappingDuration: TimeInterval = 0
+    package var swiftProtocolNameMappingDuration: TimeInterval = 0
+    package var swiftBoundaryConstructionDuration: TimeInterval = 0
+    package var swiftFunctionCaptureAssemblyDuration: TimeInterval = 0
+    package var swiftTypeDeclarationCount = 0
+    package var swiftProtocolDeclarationCount = 0
+    package var swiftTopLevelFunctionCount = 0
+    package var swiftMethodFunctionCount = 0
+    package var swiftProtocolMethodCount = 0
+    package var swiftParameterNodeCount = 0
+    package var swiftPropertyDeclarationCount = 0
+    package var swiftProtocolPropertyDeclarationCount = 0
+    package var swiftPropertyIdentifierCount = 0
+    package var swiftTypeBoundaryCount = 0
 
     // Capture loop
     package var capturesProcessed = 0
@@ -68,6 +99,14 @@ package final class CodeMapPerformanceCollector {
     package var swiftStrategyContextOnlyCount = 0
     package var swiftStrategyHandledFunctionCount = 0
     package var swiftStrategyHandledPropertyCount = 0
+    package var swiftSignatureCodeUnitVisits = 0
+    package var swiftNestedFunctionContainmentLookupCount = 0
+    package var swiftNestedFunctionContainmentCandidateVisits = 0
+    package var swiftEnclosingTypeCandidateVisits = 0
+    package var swiftFunctionDuplicateCheckCount = 0
+    package var swiftFunctionDuplicateCandidateVisits = 0
+    package var swiftPropertyDuplicateCheckCount = 0
+    package var swiftPropertyDuplicateCandidateVisits = 0
     package var fallbackFunctionDeclarationCount = 0
     package var fallbackFunctionJSTSSignatureCount = 0
     package var fallbackFunctionNameExtractionCount = 0
@@ -130,6 +169,7 @@ package final class CodeMapPerformanceCollector {
     package var referencedTypesPrefilterSkips = 0
     package var referencedTypesEmptyResults = 0
     package var referencedTypesOutputTypeCount = 0
+    package var referencedTypesUniqueCount = 0
 
     // Extraction memo
     package var extractionMemoJSTSHits = 0
@@ -160,10 +200,15 @@ package final class CodeMapPerformanceCollector {
     package var captureLoopSkippedDuration: TimeInterval = 0
     package var captureLoopUnclassifiedDuration: TimeInterval = 0
     package var swiftStrategyFunctionSignatureDuration: TimeInterval = 0
+    package var swiftSignatureEndScanDuration: TimeInterval = 0
+    package var swiftSignatureNormalizationDuration: TimeInterval = 0
     package var swiftStrategyFunctionNameLookupDuration: TimeInterval = 0
     package var swiftStrategyParameterExtractionDuration: TimeInterval = 0
     package var swiftStrategyReturnTypeExtractionDuration: TimeInterval = 0
     package var swiftStrategyPropertyDeclarationDuration: TimeInterval = 0
+    package var swiftPropertyDeclarationLookupDuration: TimeInterval = 0
+    package var swiftPropertyDeclarationSubstringDuration: TimeInterval = 0
+    package var swiftPropertyInitializerStripDuration: TimeInterval = 0
     package var swiftStrategyPropertyTypeExtractionDuration: TimeInterval = 0
     package var swiftStrategyEnclosingTypeLookupDuration: TimeInterval = 0
     package var swiftStrategyModelInsertionDuration: TimeInterval = 0
@@ -194,7 +239,13 @@ package final class CodeMapPerformanceCollector {
     package var typeCleanerFilterDuration: TimeInterval = 0
     package var typeCleanerDedupDuration: TimeInterval = 0
     package var referencedTypesFinalizeDuration: TimeInterval = 0
+    package var artifactFinalizationDuration: TimeInterval = 0
+    package var artifactMeaningfulContentCheckDuration: TimeInterval = 0
     package var fileAPIInitDuration: TimeInterval = 0
+    package var artifactFinalClassCount = 0
+    package var artifactFinalInterfaceCount = 0
+    package var artifactFinalFunctionCount = 0
+    package var artifactFinalGlobalVariableCount = 0
 
     package init(collectsCaptureNames: Bool = false) {
         self.collectsCaptureNames = collectsCaptureNames

@@ -3,6 +3,259 @@ import XCTest
 @testable import RepoPromptCodeMapCore
 
 final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
+    #if RPCE_BENCHMARK_TESTS
+        func testSwiftCorpusCorrectnessReference() throws {
+            guard SwiftCodeMapPipelineBenchmarkSupport.isRuntimeEnabled else {
+                throw XCTSkip("Set RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK=1 to run the Swift corpus reference test")
+            }
+
+            let files = SwiftCodeMapPipelineBenchmarkSupport.makeCorpus()
+            let artifacts = try SwiftCodeMapPipelineBenchmarkSupport.buildArtifacts(files: files)
+            let repeated = try SwiftCodeMapPipelineBenchmarkSupport.buildArtifacts(files: files)
+            XCTAssertEqual(artifacts, repeated)
+            let evidence = try SwiftCodeMapPipelineBenchmarkSupport.makeEvidence(
+                files: files,
+                artifacts: artifacts
+            )
+            SwiftCodeMapPipelineBenchmarkSupport.printDigestRecord(evidence.reference)
+            let comparisonMode = try SwiftCodeMapPipelineBenchmarkSupport.configuredReferenceComparisonMode()
+            try SwiftCodeMapPipelineBenchmarkSupport.validateFixedDigests(
+                evidence.reference,
+                comparisonMode: comparisonMode
+            )
+            try SwiftCodeMapPipelineBenchmarkSupport.applyReferenceMode(to: evidence.reference)
+        }
+
+        func testSwiftFileToCodeMapPipelineBenchmark() throws {
+            guard SwiftCodeMapPipelineBenchmarkSupport.isRuntimeEnabled else {
+                throw XCTSkip("Set RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK=1 to run the Swift pipeline benchmark")
+            }
+
+            let files = SwiftCodeMapPipelineBenchmarkSupport.makeCorpus()
+            let expected = try SwiftCodeMapPipelineBenchmarkSupport.buildArtifacts(files: files)
+            for _ in 0 ..< 2 {
+                XCTAssertEqual(
+                    try SwiftCodeMapPipelineBenchmarkSupport.buildArtifacts(files: files),
+                    expected
+                )
+            }
+
+            var samplesMS: [Double] = []
+            samplesMS.reserveCapacity(5)
+            for _ in 0 ..< 5 {
+                let start = ProcessInfo.processInfo.systemUptime
+                let artifacts = try SwiftCodeMapPipelineBenchmarkSupport.buildArtifacts(files: files)
+                samplesMS.append((ProcessInfo.processInfo.systemUptime - start) * 1_000)
+                XCTAssertEqual(artifacts, expected)
+            }
+
+            let collector = CodeMapPerformanceCollector(collectsCaptureNames: true)
+            let attributed = try SwiftCodeMapPipelineBenchmarkSupport.buildArtifacts(
+                files: files,
+                performanceCollector: collector
+            )
+            XCTAssertEqual(attributed, expected)
+            XCTAssertEqual(collector.syntaxCalls, files.count)
+            XCTAssertEqual(collector.syntaxQueryExecutes, files.count)
+            XCTAssertGreaterThan(collector.syntaxCaptures, 0)
+
+            let evidence = try SwiftCodeMapPipelineBenchmarkSupport.makeEvidence(
+                files: files,
+                artifacts: attributed
+            )
+            SwiftCodeMapPipelineBenchmarkSupport.printDigestRecord(evidence.reference)
+            let comparisonMode = try SwiftCodeMapPipelineBenchmarkSupport.configuredReferenceComparisonMode()
+            try SwiftCodeMapPipelineBenchmarkSupport.validateFixedDigests(
+                evidence.reference,
+                comparisonMode: comparisonMode
+            )
+            try SwiftCodeMapPipelineBenchmarkSupport.applyReferenceMode(to: evidence.reference)
+
+            print([
+                "SWIFT_CODEMAP_PIPELINE_PRIMARY",
+                "files=\(files.count)",
+                "raw_samples_ms=\(SwiftCodeMapPipelineBenchmarkSupport.formattedSamples(samplesMS))",
+                "invocation_median_ms=\(String(format: "%.3f", SwiftCodeMapPipelineBenchmarkSupport.median(samplesMS)))",
+                "query_sha256=\(evidence.reference.querySHA256)",
+                "content_sha256=\(evidence.reference.contentDigest)",
+                "capture_sha256=\(evidence.reference.captureDigest)",
+                "artifact_sha256=\(evidence.reference.artifactDigest)",
+                "reference_mode=\(SwiftCodeMapPipelineBenchmarkSupport.referenceMode)",
+                "artifact_parity=true",
+            ].joined(separator: " "))
+            print(SwiftCodeMapPipelineBenchmarkSupport.attributionRecord(
+                collector: collector,
+                reference: evidence.reference
+            ))
+        }
+
+        func testSwiftPipelineReferenceExactComparisonAcceptsOnlyIdenticalRecord() throws {
+            let reference = Self.makeSwiftPipelineReference()
+            XCTAssertNoThrow(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: reference
+            ))
+
+            let changedQuery = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures"
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: changedQuery
+            ))
+        }
+
+        func testSwiftPipelineReferenceAllowsOnlyAllowlistedCaptureRemovals() throws {
+            let reference = Self.makeSwiftPipelineReference()
+            let candidate = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures",
+                captures: [reference.captures[0]]
+            )
+
+            XCTAssertNoThrow(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: candidate,
+                comparisonMode: .allowingCaptureRemovals(named: ["type.class"])
+            ))
+        }
+
+        func testSwiftPipelineReferenceRejectsUnsafeCaptureDeltas() throws {
+            let reference = Self.makeSwiftPipelineReference()
+            let allowedMode = SwiftCodeMapPipelineBenchmarkSupport.ReferenceComparisonMode
+                .allowingCaptureRemovals(named: ["type.class"])
+
+            let added = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures",
+                captures: [
+                    reference.captures[0],
+                    .init(logicalPath: "Sources/Test.swift", name: "zzz.added", location: 40, length: 2)
+                ]
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: added,
+                comparisonMode: allowedMode
+            ))
+
+            let modified = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures",
+                captures: [
+                    .init(logicalPath: "Sources/Test.swift", name: "function.method", location: 10, length: 99)
+                ]
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: modified,
+                comparisonMode: allowedMode
+            ))
+
+            let modifiedAllowlistedCapture = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures",
+                captures: [
+                    reference.captures[0],
+                    .init(logicalPath: "Sources/Test.swift", name: "type.class", location: 20, length: 99)
+                ]
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: modifiedAllowlistedCapture,
+                comparisonMode: allowedMode
+            ))
+
+            let unchangedCaptures = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures"
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: unchangedCaptures,
+                comparisonMode: allowedMode
+            ))
+
+            let disallowedRemoval = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures",
+                captures: [reference.captures[1]]
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: disallowedRemoval,
+                comparisonMode: allowedMode
+            ))
+
+            let changedArtifact = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                captureDigest: "candidate-captures",
+                artifactDigest: "changed-artifact",
+                captures: [reference.captures[0]]
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: changedArtifact,
+                comparisonMode: allowedMode
+            ))
+
+            let changedContent = Self.makeSwiftPipelineReference(
+                querySHA256: "candidate-query",
+                contentDigest: "changed-content",
+                captureDigest: "candidate-captures",
+                captures: [reference.captures[0]]
+            )
+            XCTAssertThrowsError(try SwiftCodeMapPipelineBenchmarkSupport.compareReference(
+                expected: reference,
+                actual: changedContent,
+                comparisonMode: allowedMode
+            ))
+        }
+
+        private static func makeSwiftPipelineReference(
+            querySHA256: String = "base-query",
+            contentDigest: String = "content",
+            captureDigest: String = "base-captures",
+            artifactDigest: String = "base-artifact",
+            captures: [SwiftCodeMapPipelineBenchmarkSupport.CaptureRecord] = [
+                .init(logicalPath: "Sources/Test.swift", name: "function.method", location: 10, length: 4),
+                .init(logicalPath: "Sources/Test.swift", name: "type.class", location: 20, length: 8)
+            ]
+        ) -> SwiftCodeMapPipelineBenchmarkSupport.ReferenceRecord {
+            SwiftCodeMapPipelineBenchmarkSupport.ReferenceRecord(
+                schemaVersion: 1,
+                semanticBase: "base",
+                fileCount: 1,
+                querySHA256: querySHA256,
+                contentDigest: contentDigest,
+                captureDigest: captureDigest,
+                artifactDigest: artifactDigest,
+                artifacts: [
+                    .init(logicalPath: "Sources/Test.swift", canonicalJSON: Data("artifact".utf8))
+                ],
+                captures: captures
+            )
+        }
+    #endif
+
+    func testCaptureIndexCountsMissingNamedBuckets() {
+        let collector = CodeMapPerformanceCollector()
+        let index = CodeMapCaptureIndex([], performanceCollector: collector)
+        let parent = NSRange(location: 0, length: 1)
+
+        XCTAssertNil(index.firstCapture(named: "missing", containedIn: parent))
+        XCTAssertTrue(index.captures(named: "missing", containedIn: parent).isEmpty)
+        XCTAssertNil(index.smallestCapture(named: "missing", containing: parent))
+        XCTAssertEqual(collector.captureIndexFirstContainedLookupCount, 1)
+        XCTAssertEqual(collector.captureIndexAllContainedLookupCount, 1)
+        XCTAssertEqual(collector.captureIndexSmallestContainingLookupCount, 1)
+        XCTAssertEqual(collector.captureIndexFirstContainedCandidateVisits, 0)
+        XCTAssertEqual(collector.captureIndexAllContainedCandidateVisits, 0)
+        XCTAssertEqual(collector.captureIndexSmallestContainingCandidateVisits, 0)
+        XCTAssertEqual(collector.captureIndexMaximumCandidateVisits, 0)
+    }
+
     func testPreMaterializedSwiftAndTypeScriptGeneratorAttribution() throws {
         let cases: [(name: String, language: LanguageType, source: String)] = [
             ("swift", .swift, Self.swiftSource(declarationCount: 200)),
