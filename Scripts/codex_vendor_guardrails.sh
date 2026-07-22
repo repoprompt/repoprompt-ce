@@ -56,12 +56,26 @@ for script in \
     Scripts/sign_staged_release.sh \
     Scripts/validate_staged_release.sh; do
     grep -F 'verify-bundle' "$script" >/dev/null ||
-        fail "$script must verify the exact target-specific Codex bundle"
+        fail "$script must verify the target-specific Codex bundle contract"
     grep -F -- '--arch all' "$script" >/dev/null ||
         fail "$script must require both pinned Codex targets"
     if grep -F -- '--arch aarch64-apple-darwin' "$script" >/dev/null; then
         fail "$script must not validate only the arm64 Codex package"
     fi
+done
+
+grep -F 'list-bundle-mach-o-paths --arch all' Scripts/sign_staged_release.sh >/dev/null ||
+    fail "Developer ID signing must enumerate every manifest-owned Codex Mach-O"
+grep -F 'sign_path "$CODEX_BUNDLE/$relative_path"' Scripts/sign_staged_release.sh >/dev/null ||
+    fail "Developer ID signing must sign each enumerated Codex Mach-O at its final bundle path"
+for script in \
+    Scripts/main_tip_release.sh \
+    Scripts/promote_release.sh \
+    Scripts/publish_public_update_test.sh \
+    Scripts/release.sh \
+    Scripts/sign_staged_release.sh; do
+    grep -F -- '--signed-team-identifier' "$script" >/dev/null ||
+        fail "$script must verify final Codex Mach-Os against the RepoPrompt Developer ID team"
 done
 
 printf 'OK: pinned Codex artifact, universal bundle, and legal inventory contracts are complete.\n'

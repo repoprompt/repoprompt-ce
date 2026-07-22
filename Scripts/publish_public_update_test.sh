@@ -75,7 +75,8 @@ xcrun stapler validate "$APP_BUNDLE"
 python3 "$ROOT_DIR/Scripts/codex_runtime_artifact.py" \
     --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \
     --arch all \
-    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
+    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex" \
+    --signed-team-identifier "$SIGNING_TEAM_ID"
 "$ROOT_DIR/Scripts/write_app_artifact_manifest.py" verify \
     --app "$APP_BUNDLE" \
     --manifest "$ARTIFACT_MANIFEST" \

@@ -201,14 +201,37 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("trap 'finish $?' EXIT", package_script)
         self.assertIn('local status="$1" now total', package_script)
 
-    def test_staged_signing_uses_trusted_verifier_with_approved_codex_identity(self) -> None:
+    def test_staged_signing_resigns_every_codex_mach_o_before_mcp_and_outer_app(self) -> None:
         source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
 
         self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
         self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
         self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
-        self.assertEqual(source.count('--arch all'), 2)
+        self.assertEqual(source.count("list-bundle-mach-o-paths --arch all"), 1)
+        self.assertEqual(source.count('--signed-team-identifier "$SIGNING_TEAM_ID"'), 1)
         self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
+
+        sparkle_sign = source.index('sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"')
+        enumerate_codex = source.index("list-bundle-mach-o-paths --arch all")
+        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path"')
+        mcp_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"')
+        app_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"')
+        outer_sign = source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"')
+        self.assertLess(sparkle_sign, enumerate_codex)
+        self.assertLess(enumerate_codex, codex_sign)
+        self.assertLess(codex_sign, mcp_sign)
+        self.assertLess(mcp_sign, app_sign)
+        self.assertLess(app_sign, outer_sign)
+        self.assertNotIn('sign_path "$CODEX_BUNDLE"', source)
+
+        for release_script_name in (
+            "release.sh",
+            "main_tip_release.sh",
+            "promote_release.sh",
+            "publish_public_update_test.sh",
+        ):
+            release_source = (SCRIPT_DIR / release_script_name).read_text(encoding="utf-8")
+            self.assertIn("--signed-team-identifier", release_source, release_script_name)
 
     def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")

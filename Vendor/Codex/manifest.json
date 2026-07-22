@@ -23,13 +23,15 @@
           "path": "bin/codex",
           "kind": "file",
           "sha256": "80a3933d11a9d13ef806aa24f7bb8afc9169cfe4e9b09d6da6a92922cbde9cff",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "408aaca5c58fa692f797a24b14f74da5e7c6308b6246c97cfe806946d568d194"
         },
         {
           "path": "bin/codex-code-mode-host",
           "kind": "file",
           "sha256": "de329ec247b5ebbdf796b5888a7c2a9d731e221321584c5abdcc686c70b2db81",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "469f2e818590f24b9c829718af3d7297a551448d8ab5f9dff29a3ea13de09ea5"
         },
         {
           "path": "codex-package.json",
@@ -45,7 +47,8 @@
           "path": "codex-path/rg",
           "kind": "file",
           "sha256": "4fdf1d8365af224bc70e3c1490d8461d859c37cc70e739a11e987af0215f3e94",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "ef0ed58c935b6e9e846de2724b15eb6e324ad935607a4984accbfad499f9fe15"
         },
         {
           "path": "codex-resources",
@@ -63,7 +66,8 @@
           "path": "codex-resources/zsh/bin/zsh",
           "kind": "file",
           "sha256": "b69893d9da08786211bac0862212e26a8a31af24eb77da21692671c58d388b8d",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "5cc9238f3e211be71cd25cde1bbe4319849951d4b1fdf942d925091388bd95fd"
         }
       ]
     },
@@ -81,13 +85,15 @@
           "path": "bin/codex",
           "kind": "file",
           "sha256": "bd6ec7e28b4682e010f6bf3953166d2a2b178d50beb448c137d33d53450b2802",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "edd0d961f73cf707f0b00dc4094c8ee06f465d9aca79fbfd7715740472c4d19a"
         },
         {
           "path": "bin/codex-code-mode-host",
           "kind": "file",
           "sha256": "a0e7ae85ff7e70045d2dbe74162c80eb84519e202b66a1e6e3943a321b21664d",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "bb9982f5912db05aacb907865cb5757c8784debee64e4cbf79edbb807862a4d1"
         },
         {
           "path": "codex-package.json",
@@ -103,7 +109,8 @@
           "path": "codex-path/rg",
           "kind": "file",
           "sha256": "3bafa7e6ee51ba3ac4ed065883484a309be09b26ea6dad561ae4049bfe049c50",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "7c4723c1a6f184a274ae07d6bd8b4804b29a5e6c343b6edb8f04a7c5abbe3d62"
         },
         {
           "path": "codex-resources",
@@ -121,7 +128,8 @@
           "path": "codex-resources/zsh/bin/zsh",
           "kind": "file",
           "sha256": "901782b34a9742b9962199332934ac77229073760bf837bc86b156ce4b86b9fa",
-          "executable": true
+          "executable": true,
+          "normalizedSha256": "901782b34a9742b9962199332934ac77229073760bf837bc86b156ce4b86b9fa"
         }
       ]
     }

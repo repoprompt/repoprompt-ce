@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -34,6 +35,59 @@ def write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def mach_o_fixture_bytes(architecture: str, payload: bytes) -> bytes:
+    cpu_type = 0x0100000C if architecture == "arm64" else 0x01000007
+    page_size = 0x4000 if architecture == "arm64" else 0x1000
+    file_offset = 0x1000
+    file_size = len(payload)
+    vm_size = ((file_size + page_size - 1) // page_size) * page_size
+    header = struct.pack(
+        "<IiiIIIII",
+        0xFEEDFACF,
+        cpu_type,
+        0,
+        2,
+        1,
+        72,
+        0,
+        0,
+    )
+    linkedit = struct.pack(
+        "<II16sQQQQiiII",
+        0x19,
+        72,
+        b"__LINKEDIT".ljust(16, b"\0"),
+        0x100000000,
+        vm_size,
+        file_offset,
+        file_size,
+        1,
+        1,
+        0,
+        0,
+    )
+    return header + linkedit + bytes(file_offset - len(header) - len(linkedit)) + payload
+
+
+def write_mach_o_fixture(path: Path, architecture: str, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(mach_o_fixture_bytes(architecture, payload))
+    path.chmod(0o755)
+
+
+def apply_fixture_signature(path: Path, signature: bytes = b"fixture-signature") -> None:
+    data = bytearray(path.read_bytes())
+    command_count, command_bytes = struct.unpack_from("<II", data, 16)
+    signature_offset = len(data)
+    struct.pack_into("<II", data, 16, command_count + 1, command_bytes + 16)
+    struct.pack_into("<IIII", data, 32 + command_bytes, 0x1D, 16, signature_offset, len(signature))
+    linkedit_file_size = struct.unpack_from("<Q", data, 32 + 48)[0] + len(signature)
+    struct.pack_into("<Q", data, 32 + 48, linkedit_file_size)
+    struct.pack_into("<Q", data, 32 + 32, linkedit_file_size + 0x2000)
+    data.extend(signature)
+    path.write_bytes(data)
+
+
 class CodexRuntimeArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = Path(tempfile.mkdtemp(prefix="codex-artifact-test-"))
@@ -46,26 +100,79 @@ class CodexRuntimeArtifactTests(unittest.TestCase):
         self.bin.mkdir()
         self.lipo = self.bin / "lipo"
         self.codesign = self.bin / "codesign"
+        self.signature_stripper = self.bin / "strip_fixture_signature.py"
         write_executable(
             self.lipo,
             """#!/usr/bin/env bash
 set -euo pipefail
 if [[ -n "${FAKE_ARCH:-}" ]]; then printf '%s\\n' "$FAKE_ARCH"; exit 0; fi
-sed -n 's/^ARCH=//p' "$2" | head -1
+case "$2" in
+  *aarch64-apple-darwin*) printf 'arm64\\n' ;;
+  *x86_64-apple-darwin*) printf 'x86_64\\n' ;;
+  *) printf 'unknown\\n' ;;
+esac
+""",
+        )
+        write_executable(
+            self.signature_stripper,
+            """#!/usr/bin/env python3
+import struct
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+command_count, command_bytes = struct.unpack_from("<II", data, 16)
+offset = 32
+signature = None
+for _ in range(command_count):
+    command, size = struct.unpack_from("<II", data, offset)
+    if command == 0x1D:
+        signature = (offset, size, *struct.unpack_from("<II", data, offset + 8))
+        break
+    offset += size
+if signature is None:
+    raise SystemExit(1)
+command_offset, command_size, signature_offset, signature_size = signature
+if signature_offset + signature_size != len(data):
+    raise SystemExit(2)
+del data[signature_offset:]
+remaining_commands = data[32 : 32 + command_bytes]
+relative = command_offset - 32
+del remaining_commands[relative : relative + command_size]
+remaining_commands.extend(bytes(command_size))
+data[32 : 32 + command_bytes] = remaining_commands
+struct.pack_into("<II", data, 16, command_count - 1, command_bytes - command_size)
+file_size = struct.unpack_from("<Q", data, 32 + 48)[0] - signature_size
+struct.pack_into("<Q", data, 32 + 48, file_size)
+path.write_bytes(data)
 """,
         )
         write_executable(
             self.codesign,
             """#!/usr/bin/env bash
 set -euo pipefail
+if [[ "$1" == "--remove-signature" ]]; then
+    "$FAKE_SIGNATURE_STRIPPER" "${!#}"
+    exit
+fi
 if [[ "$1" == "--verify" ]]; then
+    if [[ -n "${FAKE_VERIFY_COUNTER:-}" ]]; then
+        verify_count=0
+        if [[ -f "$FAKE_VERIFY_COUNTER" ]]; then verify_count="$(cat "$FAKE_VERIFY_COUNTER")"; fi
+        verify_count=$((verify_count + 1))
+        printf '%s\n' "$verify_count" > "$FAKE_VERIFY_COUNTER"
+        if [[ -n "${FAKE_VERIFY_FAILURE_AFTER:-}" ]] && (( verify_count > FAKE_VERIFY_FAILURE_AFTER )); then
+            exit 1
+        fi
+    fi
     [[ "${FAKE_SIGNATURE_FAILURE:-0}" != "1" ]]
     exit
 fi
 path="${!#}"
 identifier="$(basename "$path")"
-team_identifier="2DC432GLL2"
-authority="Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)"
+team_identifier="${FAKE_TEAM_IDENTIFIER:-2DC432GLL2}"
+authority="${FAKE_AUTHORITY:-Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)}"
 if [[ "${FAKE_SIGNATURE_METADATA_FAILURE:-0}" == "1" ]]; then identifier=wrong; fi
 case "${FAKE_SIGNATURE_PREFIX_COLLISION:-}" in
   identifier) identifier="${identifier}-collision" ;;
@@ -106,7 +213,11 @@ fi
             "codex-path/rg",
             "codex-resources/zsh/bin/zsh",
         ):
-            write_executable(root / relative, f"ARCH={architecture}\nfixture={relative}\n")
+            write_mach_o_fixture(
+                root / relative,
+                architecture,
+                f"ARCH={architecture}\nfixture={relative}\n".encode(),
+            )
         return root
 
     @staticmethod
@@ -117,14 +228,15 @@ fi
             if path.is_dir():
                 result.append({"path": relative, "kind": "directory"})
             else:
-                result.append(
-                    {
-                        "path": relative,
-                        "kind": "file",
-                        "sha256": digest(path),
-                        "executable": bool(path.stat().st_mode & 0o111),
-                    }
-                )
+                entry: dict[str, object] = {
+                    "path": relative,
+                    "kind": "file",
+                    "sha256": digest(path),
+                    "executable": bool(path.stat().st_mode & 0o111),
+                }
+                if path.read_bytes()[:4] == b"\xcf\xfa\xed\xfe":
+                    entry["normalizedSha256"] = digest(path)
+                result.append(entry)
         return result
 
     @staticmethod
@@ -230,7 +342,18 @@ fi
             str(self.codesign),
             *arguments,
         ]
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={**os.environ, **(env or {})})
+        tool_env = {
+            **os.environ,
+            "FAKE_SIGNATURE_STRIPPER": str(self.signature_stripper),
+            **(env or {}),
+        }
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=tool_env,
+        )
         self.assertEqual(result.returncode, expected, msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         return result
 
@@ -270,15 +393,130 @@ fi
             {path.name for path in self.bundle.iterdir()},
             {"aarch64-apple-darwin", "x86_64-apple-darwin"},
         )
-        self.assertEqual(
-            (self.bundle / "aarch64-apple-darwin" / "bin" / "codex").read_text(encoding="utf-8").splitlines()[0],
-            "ARCH=arm64",
+        self.assertIn(
+            b"ARCH=arm64",
+            (self.bundle / "aarch64-apple-darwin" / "bin" / "codex").read_bytes(),
         )
-        self.assertEqual(
-            (self.bundle / "x86_64-apple-darwin" / "bin" / "codex").read_text(encoding="utf-8").splitlines()[0],
-            "ARCH=x86_64",
+        self.assertIn(
+            b"ARCH=x86_64",
+            (self.bundle / "x86_64-apple-darwin" / "bin" / "codex").read_bytes(),
         )
         self.run_tool("verify-bundle", "--arch", "all", "--bundle", str(self.bundle))
+
+    def test_release_resigned_bundle_verifies_every_manifest_mach_o_for_expected_team(self) -> None:
+        self.acquire_all()
+        self.run_tool(
+            "stage-bundle",
+            "--arch",
+            "all",
+            "--cache-root",
+            str(self.cache),
+            "--bundle",
+            str(self.bundle),
+        )
+        listed = self.run_tool("list-bundle-mach-o-paths", "--arch", "all")
+        expected_paths = [
+            f"{target}/{relative}"
+            for target in ("aarch64-apple-darwin", "x86_64-apple-darwin")
+            for relative in (
+                "bin/codex",
+                "bin/codex-code-mode-host",
+                "codex-path/rg",
+                "codex-resources/zsh/bin/zsh",
+            )
+        ]
+        self.assertEqual(listed.stdout.splitlines(), expected_paths)
+
+        for relative in expected_paths:
+            apply_fixture_signature(
+                self.bundle / relative,
+                signature=f"signature-only:{relative}".encode(),
+            )
+
+        exact = self.run_tool(
+            "verify-bundle",
+            "--arch",
+            "all",
+            "--bundle",
+            str(self.bundle),
+            expected=1,
+        )
+        self.assertIn("package tree does not match pinned manifest", exact.stderr)
+
+        release_env = {
+            "FAKE_TEAM_IDENTIFIER": "648A27MST5",
+            "FAKE_AUTHORITY": "Developer ID Application: RepoPrompt Fixture (648A27MST5)",
+        }
+        verified = self.run_tool(
+            "verify-bundle",
+            "--arch",
+            "all",
+            "--bundle",
+            str(self.bundle),
+            "--signed-team-identifier",
+            "648A27MST5",
+            env=release_env,
+        )
+        self.assertIn("release signatures for team 648A27MST5", verified.stdout)
+
+        wrong_team = self.run_tool(
+            "verify-bundle",
+            "--arch",
+            "all",
+            "--bundle",
+            str(self.bundle),
+            "--signed-team-identifier",
+            "WRONGTEAM",
+            env=release_env,
+            expected=1,
+        )
+        self.assertIn("TeamIdentifier must equal 'WRONGTEAM'", wrong_team.stderr)
+
+        drifted_binary = self.bundle / expected_paths[0]
+        drifted = bytearray(drifted_binary.read_bytes())
+        drifted[0x1000] ^= 0x01
+        drifted_binary.write_bytes(drifted)
+        payload_drift = self.run_tool(
+            "verify-bundle",
+            "--arch",
+            "all",
+            "--bundle",
+            str(self.bundle),
+            "--signed-team-identifier",
+            "648A27MST5",
+            env=release_env,
+            expected=1,
+        )
+        self.assertIn("normalized Mach-O SHA-256 mismatch", payload_drift.stderr)
+
+    def test_release_resigned_bundle_still_rejects_unsigned_payload_drift(self) -> None:
+        self.acquire_all()
+        self.run_tool(
+            "stage-bundle",
+            "--arch",
+            "all",
+            "--cache-root",
+            str(self.cache),
+            "--bundle",
+            str(self.bundle),
+        )
+        metadata = self.bundle / "aarch64-apple-darwin" / "codex-package.json"
+        metadata.write_bytes(metadata.read_bytes() + b"drift")
+        result = self.run_tool(
+            "verify-bundle",
+            "--arch",
+            "all",
+            "--bundle",
+            str(self.bundle),
+            "--signed-team-identifier",
+            "648A27MST5",
+            env={
+                "FAKE_TEAM_IDENTIFIER": "648A27MST5",
+                "FAKE_AUTHORITY": "Developer ID Application: RepoPrompt Fixture (648A27MST5)",
+            },
+            expected=1,
+        )
+        self.assertIn("package tree does not match pinned manifest", result.stderr)
 
     def test_acquired_and_staged_package_roots_are_mode_0755(self) -> None:
         self.acquire_all()
@@ -420,6 +658,55 @@ fi
                 result = self.run_tool("validate-manifest", expected=1)
                 self.assertIn("URL", result.stderr)
 
+    def test_refresh_normalized_digests_derives_manifest_values_from_verified_cache(self) -> None:
+        self.acquire_all()
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        for package in manifest["packages"].values():
+            for entry in package["tree"]:
+                entry.pop("normalizedSha256", None)
+        self.manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        result = self.run_tool(
+            "refresh-normalized-digests",
+            "--arch",
+            "all",
+            "--cache-root",
+            str(self.cache),
+        )
+        self.assertIn("refreshed normalized Codex Mach-O digests", result.stdout)
+        refreshed = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        for target, package in refreshed["packages"].items():
+            entries = {entry["path"]: entry for entry in package["tree"]}
+            for relative in refreshed["machOFiles"]:
+                self.assertEqual(
+                    entries[relative]["normalizedSha256"],
+                    digest(self.cache / "0.144.6" / target / relative),
+                )
+
+    def test_failed_normalized_digest_candidate_leaves_manifest_unchanged(self) -> None:
+        self.acquire_all()
+        original = self.manifest_path.read_bytes()
+        counter = self.temp / "codesign-verify-count"
+
+        result = self.run_tool(
+            "refresh-normalized-digests",
+            "--arch",
+            "all",
+            "--cache-root",
+            str(self.cache),
+            env={
+                "FAKE_VERIFY_COUNTER": str(counter),
+                "FAKE_VERIFY_FAILURE_AFTER": "4",
+            },
+            expected=1,
+        )
+
+        self.assertIn("signature check", result.stderr)
+        self.assertEqual(self.manifest_path.read_bytes(), original)
+        self.assertFalse(
+            self.manifest_path.with_name(f".{self.manifest_path.name}.tmp").exists()
+        )
+
     def test_manifest_version_drives_packaging_cache_path(self) -> None:
         result = self.run_tool("manifest-version")
         self.assertEqual(result.stdout.strip(), "0.144.6")
@@ -473,6 +760,34 @@ fi
             expected=1,
         )
         self.assertIn("unpinned member", result.stderr)
+
+    def test_package_verification_rejects_unlisted_mach_o_helper(self) -> None:
+        self.acquire_all()
+        target = "aarch64-apple-darwin"
+        package = self.cache / "0.144.6" / target
+        hidden = package / "bin" / "future-helper"
+        write_mach_o_fixture(hidden, "arm64", b"future helper payload")
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        manifest["packages"][target]["tree"].append(
+            {
+                "path": "bin/future-helper",
+                "kind": "file",
+                "sha256": digest(hidden),
+                "executable": True,
+            }
+        )
+        self.manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        result = self.run_tool(
+            "verify",
+            "--arch",
+            "arm64",
+            "--package",
+            str(package),
+            expected=1,
+        )
+        self.assertIn("Mach-O inventory does not match pinned manifest", result.stderr)
+        self.assertIn("bin/future-helper", result.stderr)
 
     def test_cached_tree_drift_is_rejected(self) -> None:
         self.acquire_all()

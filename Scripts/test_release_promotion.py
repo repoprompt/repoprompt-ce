@@ -35,7 +35,12 @@ class ReleasePromotionTests(unittest.TestCase):
         for call in calls:
             self.assertIn("--manifest", call)
             self.assertIn("Vendor/Codex/manifest.json verify-bundle --arch all --bundle", call)
-            self.assertTrue(call.endswith("Contents/Resources/BundledRuntimes/Codex"))
+            self.assertTrue(
+                call.endswith(
+                    "Contents/Resources/BundledRuntimes/Codex "
+                    "--signed-team-identifier 648A27MST5"
+                )
+            )
 
     def test_verify_rejects_missing_codex_manifest(self) -> None:
         result, _capture, _tools = self.run_promotion("verify", missing_codex_manifest=True)
@@ -249,7 +254,7 @@ class ReleasePromotionTests(unittest.TestCase):
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
         (scripts / "codex_runtime_artifact.py").write_text(
-            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nargs = sys.argv[1:]\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nif len(args) != 7 or args[:6] != [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n]:\n    print(f\"ERROR: unexpected Codex verifier arguments: {args!r}\", file=sys.stderr)\n    raise SystemExit(64)\nbundle = Path(args[6])\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not bundle.is_dir() or {path.name for path in bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {bundle}\", file=sys.stderr)\n    raise SystemExit(66)\nexpected_suffix = Path(\"Contents/Resources/BundledRuntimes/Codex\")\nif tuple(bundle.parts[-len(expected_suffix.parts):]) != expected_suffix.parts:\n    print(f\"ERROR: unexpected embedded Codex bundle path: {bundle}\", file=sys.stderr)\n    raise SystemExit(67)\nwith Path(os.environ[\"FAKE_TOOL_CAPTURE\"]).open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\"codex \" + \" \".join(args) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
+            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nargs = sys.argv[1:]\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nif len(args) != 9 or args[:6] != [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n] or args[7:] != [\"--signed-team-identifier\", \"648A27MST5\"]:\n    print(f\"ERROR: unexpected Codex verifier arguments: {args!r}\", file=sys.stderr)\n    raise SystemExit(64)\nbundle = Path(args[6])\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not bundle.is_dir() or {path.name for path in bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {bundle}\", file=sys.stderr)\n    raise SystemExit(66)\nexpected_suffix = Path(\"Contents/Resources/BundledRuntimes/Codex\")\nif tuple(bundle.parts[-len(expected_suffix.parts):]) != expected_suffix.parts:\n    print(f\"ERROR: unexpected embedded Codex bundle path: {bundle}\", file=sys.stderr)\n    raise SystemExit(67)\nwith Path(os.environ[\"FAKE_TOOL_CAPTURE\"]).open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\"codex \" + \" \".join(args) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
             encoding="utf-8",
         )
         codex_vendor = root / "Vendor" / "Codex"

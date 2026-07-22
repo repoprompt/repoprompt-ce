@@ -13,6 +13,7 @@ TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
 ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 
 fail() {
@@ -31,7 +32,7 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$TRUSTED_ROOT" \
 python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$CODEX_MANIFEST" verify-bundle \
     --arch all \
-    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
+    --bundle "$CODEX_BUNDLE"
 
 rm -rf "$STAGED_SPARKLE_FRAMEWORK"
 mkdir -p "$(dirname "$STAGED_SPARKLE_FRAMEWORK")"
@@ -95,6 +96,12 @@ sign_sparkle_framework() {
 }
 
 sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"
+codex_mach_o_paths="$(python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$CODEX_MANIFEST" list-bundle-mach-o-paths --arch all)"
+while IFS= read -r relative_path; do
+    [[ -n "$relative_path" ]] || continue
+    sign_path "$CODEX_BUNDLE/$relative_path"
+done <<< "$codex_mach_o_paths"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
@@ -102,7 +109,8 @@ codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$CODEX_MANIFEST" verify-bundle \
     --arch all \
-    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
+    --bundle "$CODEX_BUNDLE" \
+    --signed-team-identifier "$SIGNING_TEAM_ID"
 "$SCRIPT_DIR/validate_app_architectures.sh" \
     "$APP_BUNDLE" \
     "arm64,x86_64" \
