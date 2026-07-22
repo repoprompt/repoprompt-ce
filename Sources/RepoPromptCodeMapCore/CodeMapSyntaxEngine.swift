@@ -298,6 +298,14 @@ package struct CodeMapSyntaxEngine: CodeMapSyntaxPerformanceQuerying, Sendable {
             performanceCollector?.syntaxCaptureMaterializationDuration +=
                 ProcessInfo.processInfo.systemUptime - materializationStart
             performanceCollector?.syntaxCaptures += captures.count
+            if performanceCollector?.collectsCaptureNames == true {
+                let countingStart = ProcessInfo.processInfo.systemUptime
+                for capture in captures {
+                    performanceCollector?.syntaxCaptureCountsByName[capture.name, default: 0] += 1
+                }
+                performanceCollector?.syntaxCaptureNameCountingDuration +=
+                    ProcessInfo.processInfo.systemUptime - countingStart
+            }
         }
         return .captures(captures)
     }

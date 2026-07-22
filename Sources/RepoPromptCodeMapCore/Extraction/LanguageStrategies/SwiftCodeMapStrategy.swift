@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import SwiftTreeSitter
 
 /// Swift-specific code map generation strategy.
 /// Handles Swift type declarations, protocols, functions, and properties using range-based containment.
@@ -38,7 +37,7 @@ enum SwiftCodeMapStrategy {
         var typeBoundaries: [TypeBoundary] = []
         var typeNamesByRange: [NSRange: String] = [:]
         var protocolNamesByRange: [NSRange: String] = [:]
-        var functionCaptures: [NamedRange] = []
+        var functionCaptures: [CodeMapIndexedCapture] = []
     }
 
     private enum SwiftStrategyAttributionCategory {
@@ -103,13 +102,13 @@ enum SwiftCodeMapStrategy {
         let nsContent = content as NSString
 
         func mapNamesToSmallestContainingDecl(
-            nameCaps: [NamedRange],
-            declCaps: [NamedRange]
+            nameCaps: [CodeMapIndexedCapture],
+            declCaps: [CodeMapIndexedCapture]
         ) -> [NSRange: String] {
             var mapping: [NSRange: String] = [:]
             guard !nameCaps.isEmpty, !declCaps.isEmpty else { return mapping }
 
-            var stack: [NamedRange] = []
+            var stack: [CodeMapIndexedCapture] = []
             var declIndex = 0
 
             for nameCap in nameCaps {
@@ -134,7 +133,7 @@ enum SwiftCodeMapStrategy {
                 }
 
                 // Fallback scan (should be rare if ranges are nested)
-                var bestDecl: NamedRange? = nil
+                var bestDecl: CodeMapIndexedCapture? = nil
                 for decl in declCaps where rangeContains(decl.range, nameCap.range) {
                     if bestDecl == nil || decl.range.length < bestDecl!.range.length {
                         bestDecl = decl
@@ -247,7 +246,7 @@ enum SwiftCodeMapStrategy {
 
     /// Handles a Swift-specific capture. Returns true if handled, false to fall through to default handling.
     static func handleCapture(
-        _ cap: NamedRange,
+        _ cap: CodeMapIndexedCapture,
         context: Context,
         index: CodeMapCaptureIndex,
         content: String,
@@ -756,14 +755,100 @@ enum SwiftCodeMapStrategy {
     }
 
     private static func extractSwiftParamType(from paramText: String) -> String? {
-        guard let colonIndex = paramText.firstIndex(of: ":") else { return nil }
-        var afterColon = paramText[paramText.index(after: colonIndex)...]
-        if let eqIndex = afterColon.firstIndex(of: "=") {
+        let parameter = paramText[...]
+        guard let colonIndex = firstTopLevelSwiftDelimiter(":", in: parameter) else { return nil }
+        var afterColon = parameter[parameter.index(after: colonIndex)...]
+        if let eqIndex = firstTopLevelSwiftDelimiter("=", in: afterColon) {
             afterColon = afterColon[..<eqIndex]
         }
         let trimmed = afterColon.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+
+	private static func firstTopLevelSwiftDelimiter(
+		_ target: Character,
+		in text: Substring
+	) -> String.Index? {
+		let characters = Array(text)
+		var delimiterStack: [Character] = []
+		var stringDelimiter: (pounds: Int, quotes: Int)?
+		var offset = 0
+
+		while offset < characters.count {
+			if let activeStringDelimiter = stringDelimiter {
+				if characters[offset] == "\\", activeStringDelimiter.pounds == 0 {
+					offset = min(offset + 2, characters.count)
+					continue
+				}
+				if isSwiftStringTerminator(
+					at: offset,
+					characters: characters,
+					delimiter: activeStringDelimiter
+				) {
+					offset += activeStringDelimiter.quotes + activeStringDelimiter.pounds
+					stringDelimiter = nil
+					continue
+				}
+				offset += 1
+				continue
+			}
+
+			if let opening = swiftStringDelimiterStarting(at: offset, characters: characters) {
+				stringDelimiter = (opening.pounds, opening.quotes)
+				offset += opening.pounds + opening.quotes
+				continue
+			}
+
+			let character = characters[offset]
+			switch character {
+			case "(", "[", "{":
+				delimiterStack.append(character)
+			case ")":
+				if delimiterStack.last == "(" { delimiterStack.removeLast() }
+			case "]":
+				if delimiterStack.last == "[" { delimiterStack.removeLast() }
+			case "}":
+				if delimiterStack.last == "{" { delimiterStack.removeLast() }
+			default:
+				if character == target, delimiterStack.isEmpty {
+					return text.index(text.startIndex, offsetBy: offset)
+				}
+			}
+			offset += 1
+		}
+
+		return nil
+	}
+
+	private static func swiftStringDelimiterStarting(
+		at offset: Int,
+		characters: [Character]
+	) -> (pounds: Int, quotes: Int)? {
+		var quoteOffset = offset
+		while quoteOffset < characters.count, characters[quoteOffset] == "#" {
+			quoteOffset += 1
+		}
+		guard quoteOffset < characters.count, characters[quoteOffset] == "\"" else { return nil }
+		let quoteCount = quoteOffset + 2 < characters.count &&
+			characters[quoteOffset + 1] == "\"" && characters[quoteOffset + 2] == "\"" ? 3 : 1
+		return (quoteOffset - offset, quoteCount)
+	}
+
+	private static func isSwiftStringTerminator(
+		at offset: Int,
+		characters: [Character],
+		delimiter: (pounds: Int, quotes: Int)
+	) -> Bool {
+		guard offset + delimiter.quotes + delimiter.pounds <= characters.count else { return false }
+		for quoteOffset in 0 ..< delimiter.quotes where characters[offset + quoteOffset] != "\"" {
+			return false
+		}
+		for poundOffset in 0 ..< delimiter.pounds
+		where characters[offset + delimiter.quotes + poundOffset] != "#" {
+			return false
+		}
+		return true
+	}
 
 	private static func extractSwiftReturnType(from signature: String, perfStats: CodeMapPerformanceCollector? = nil) -> String? {
         if let fast = SwiftSignatureParser.extractReturnType(from: signature) {
@@ -822,11 +907,14 @@ enum SwiftCodeMapStrategy {
         return trimmed
     }
 
-    private static func smallestContainingRange(in ranges: [NamedRange], for target: NSRange) -> NamedRange? {
+    private static func smallestContainingRange(
+        in ranges: [CodeMapIndexedCapture],
+        for target: NSRange
+    ) -> CodeMapIndexedCapture? {
         let endIdx = ranges.binarySearch { $0.range.location <= target.location }
         guard endIdx > 0 else { return nil }
 
-        var best: NamedRange? = nil
+        var best: CodeMapIndexedCapture? = nil
         for i in stride(from: endIdx - 1, through: 0, by: -1) {
             let candidate = ranges[i]
             if rangeContains(candidate.range, target),

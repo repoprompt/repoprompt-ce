@@ -111,6 +111,7 @@ fi
 
 if ! tree_sitter_dependency_manifest_output="$(python3 <<'PY'
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -205,25 +206,28 @@ for identity, (url, version, revision, product) in expected_packages.items():
     if (product, identity) not in repo_prompt_code_map_core_products:
         errors.append(f"RepoPromptCodeMapCore missing upstream grammar product dependency: {product} ({identity})")
 
-wrapper = resolved_pins.get("swifttreesitter", {})
-if '.package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0")' not in manifest_text:
-    errors.append("Package.swift must pin SwiftTreeSitter exactly to 0.10.0")
-if wrapper.get("state", {}).get("version") != "0.10.0" or wrapper.get("state", {}).get("revision") != "f97df585296977d8fcaf644cbde567151d1367b8":
-    errors.append("SwiftTreeSitter resolved version/revision drifted")
-if ("SwiftTreeSitter", "SwiftTreeSitter") not in repo_prompt_app_products:
-    errors.append("RepoPromptApp missing direct SwiftTreeSitter product dependency for highlighting")
-if ("SwiftTreeSitter", "SwiftTreeSitter") not in repo_prompt_code_map_core_products:
+wrapper = resolved_pins.get("swift-tree-sitter", {})
+wrapper_url = "https://github.com/repoprompt/swift-tree-sitter.git"
+wrapper_revision = "a778ef4fb7f0d3ad00185f42ce83c688373c4361"
+wrapper_manifest_pattern = re.compile(
+    rf'\.package\(\s*url:\s*"{re.escape(wrapper_url)}",\s*revision:\s*"{wrapper_revision}"\s*\)'
+)
+if wrapper_manifest_pattern.search(manifest_text) is None:
+    errors.append("Package.swift must use the unnamed URL/revision declaration for the approved RepoPrompt SwiftTreeSitter fork")
+if wrapper.get("location") != wrapper_url or wrapper.get("state", {}) != {"revision": wrapper_revision}:
+    errors.append("SwiftTreeSitter fork location/revision drifted")
+if ("SwiftTreeSitter", "swift-tree-sitter") not in repo_prompt_app_products:
+    errors.append("RepoPromptApp missing direct SwiftTreeSitter product dependency for syntax parsing")
+if ("SwiftTreeSitter", "swift-tree-sitter") not in repo_prompt_code_map_core_products:
     errors.append("RepoPromptCodeMapCore missing direct SwiftTreeSitter product dependency")
+if "https://github.com/ChimeHQ/SwiftTreeSitter" in manifest_text or "swifttreesitter" in resolved_pins:
+    errors.append("ChimeHQ SwiftTreeSitter must not coexist with the RepoPrompt fork")
+if "https://github.com/ChimeHQ/Neon" in manifest_text or '.product(name: "Neon"' in manifest_text or "neon" in resolved_pins:
+    errors.append("Neon package/product must remain removed")
 
 runtime = resolved_pins.get("tree-sitter", {})
 if runtime.get("location") != "https://github.com/tree-sitter/tree-sitter" or runtime.get("state", {}).get("version") != "0.25.10" or runtime.get("state", {}).get("revision") != "da6fe9beb4f7f67beb75914ca8e0d48ae48d6406":
     errors.append("Tree-sitter runtime must resolve exactly to 0.25.10 / da6fe9beb4f7f67beb75914ca8e0d48ae48d6406")
-
-neon = resolved_pins.get("neon", {})
-if '.package(url: "https://github.com/ChimeHQ/Neon.git", revision: "07a325403534f4759c814aff0a58ac69144a524c")' not in manifest_text:
-    errors.append("Package.swift must retain the unreleased SwiftTreeSitter-0.10-compatible Neon revision; released Neon is older/incompatible")
-if neon.get("state", {}) != {"revision": "07a325403534f4759c814aff0a58ac69144a524c"}:
-    errors.append("Neon must remain an exact revision exception without a version or branch")
 
 support = targets.get("TreeSitterScannerSupport")
 if support is None:

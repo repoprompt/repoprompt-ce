@@ -1,8 +1,9 @@
 # Tree-sitter Attribution Bundle
 
-RepoPrompt CE links the `SwiftTreeSitter` wrapper, the Tree-sitter runtime, and
-Tree-sitter grammar package products through exact, source-preserving SwiftPM
-pins. This directory maps the resolved components to their copied licenses.
+RepoPrompt CE links the `SwiftTreeSitter` wrapper at a fixed remote revision,
+the Tree-sitter runtime, and Tree-sitter grammar package products at exact,
+source-preserving SwiftPM versions. This directory maps the resolved components
+to their copied licenses.
 
 ## Grammar packages
 
@@ -50,13 +51,13 @@ future upstream graph compiles the scanner objects directly.
 
 ## Swift wrapper, runtime, and ICU subset
 
-`SwiftTreeSitter` 0.10.0 resolves the standalone Tree-sitter 0.25.10 SwiftPM
-package. That runtime includes a small subset of ICU headers and the
-corresponding full ICU notice file.
+The customized `SwiftTreeSitter` fork revision resolves the standalone
+Tree-sitter 0.25.10 SwiftPM package. That runtime includes a small subset of ICU
+headers and the corresponding full ICU notice file.
 
 | Component | Source | Resolved version / revision | License copy |
 | --- | --- | --- | --- |
-| `SwiftTreeSitter` | <https://github.com/ChimeHQ/SwiftTreeSitter.git> | `0.10.0` / `f97df585296977d8fcaf644cbde567151d1367b8` | [`LICENSE-SwiftTreeSitter.txt`](LICENSE-SwiftTreeSitter.txt) |
+| `SwiftTreeSitter` | <https://github.com/repoprompt/swift-tree-sitter.git> | fixed revision `a778ef4fb7f0d3ad00185f42ce83c688373c4361` | [`LICENSE-SwiftTreeSitter.txt`](LICENSE-SwiftTreeSitter.txt) |
 | Tree-sitter runtime | <https://github.com/tree-sitter/tree-sitter> | `0.25.10` / `da6fe9beb4f7f67beb75914ca8e0d48ae48d6406` | [`LICENSE-tree-sitter-runtime.txt`](LICENSE-tree-sitter-runtime.txt) |
 | ICU subset used by the runtime | <https://github.com/unicode-org/icu> | `552b01f61127d30d6589aa4bf99468224979b661` from `ICU_SHA` | [`LICENSE-tree-sitter-runtime-ICU.txt`](LICENSE-tree-sitter-runtime-ICU.txt) |
 
