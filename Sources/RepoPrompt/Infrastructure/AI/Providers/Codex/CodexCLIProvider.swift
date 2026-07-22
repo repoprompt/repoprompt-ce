@@ -817,8 +817,6 @@ final class CodexCLIProvider: AIProvider {
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: false,
             webSearchRequestEnabled: false,
-            viewImageToolEnabled: false,
-            includeApplyPatchTool: false,
             multiAgentEnabled: false
         )
     }
@@ -834,8 +832,6 @@ final class CodexCLIProvider: AIProvider {
         for (key, value) in mcpOverrides {
             overrides[key] = value
         }
-        overrides["approval_policy"] = CodexAgentToolPreferences.ApprovalPolicy.never.appServerConfigOverrideValue
-        overrides["sandbox_mode"] = CodexAgentToolPreferences.SandboxMode.readOnly.appServerConfigOverrideValue
         return overrides
     }
 

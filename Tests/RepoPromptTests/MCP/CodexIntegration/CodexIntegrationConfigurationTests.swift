@@ -391,9 +391,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         var policy = CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
             shellToolEnabled: false,
-            webSearchRequestEnabled: false,
-            viewImageToolEnabled: false,
-            includeApplyPatchTool: false
+            webSearchRequestEnabled: false
         )
 
         policy.modelReasoningSummary = CodexOverrides.ReasoningSummary.none
@@ -411,19 +409,15 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         policy.modelReasoningSummary = nil
         XCTAssertNil(CodexOverrides.appServerConfigMap(toolPolicy: policy)["model_reasoning_summary"])
 
-        let omittedDefault = CodexNativeSessionController.defaultAppServerConfigOverrides(
-            forceExperimentalSteering: false
-        )
+        let omittedDefault = CodexNativeSessionController.defaultAppServerConfigOverrides()
         XCTAssertNil(omittedDefault["model_reasoning_summary"])
 
         let explicitOff = CodexNativeSessionController.defaultAppServerConfigOverrides(
-            forceExperimentalSteering: false,
             reasoningSummariesEnabled: false
         )
         XCTAssertEqual(explicitOff["model_reasoning_summary"] as? String, "none")
 
         let optIn = CodexNativeSessionController.defaultAppServerConfigOverrides(
-            forceExperimentalSteering: false,
             reasoningSummariesEnabled: true
         )
         XCTAssertEqual(optIn["model_reasoning_summary"] as? String, "auto")
@@ -434,20 +428,40 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
             shellToolEnabled: false,
             webSearchRequestEnabled: false,
-            viewImageToolEnabled: false,
-            includeApplyPatchTool: false
+            multiAgentEnabled: false
         )
         let cliOverrides = CodexOverrides.cliConfigArgs(toolPolicy: policy)
         XCTAssertFalse(cliOverrides.contains { $0.contains("features.parallel_tool_calls") })
 
         let appServerOverrides = CodexOverrides.appServerConfigMap(toolPolicy: policy)
-        XCTAssertNil(appServerOverrides["features.parallel_tool_calls"])
+        let staleOverrideKeys = [
+            "features.web_search_request",
+            "features.js_repl",
+            "features.js_repl_tools_only",
+            "features.tool_search",
+            "features.tool_search_always_defer_mcp_tools",
+            "features.apply_patch_freeform",
+            "features.steer",
+            "features.view_image_tool",
+            "features.parallel_tool_calls"
+        ]
+        for key in staleOverrideKeys {
+            XCTAssertFalse(cliOverrides.contains { $0.contains(key) }, key)
+            XCTAssertNil(appServerOverrides[key], key)
+        }
+        XCTAssertTrue(cliOverrides.contains("web_search=disabled"))
+        XCTAssertTrue(cliOverrides.contains("features.shell_tool=false"))
+        XCTAssertTrue(cliOverrides.contains("features.unified_exec=false"))
+        XCTAssertTrue(cliOverrides.contains("features.multi_agent=false"))
+        XCTAssertEqual(appServerOverrides["web_search"] as? String, "disabled")
+        XCTAssertEqual(appServerOverrides["features.shell_tool"] as? Bool, false)
+        XCTAssertEqual(appServerOverrides["features.unified_exec"] as? Bool, false)
+        XCTAssertEqual(appServerOverrides["features.multi_agent"] as? Bool, false)
 
         let nativeOverrides = CodexOverrides.appServerConfigMap(
             toolPolicy: CodexNativeSessionController.defaultAppServerToolPolicy(
                 shellToolEnabled: false,
-                webSearchRequestEnabled: false,
-                forceExperimentalSteering: false
+                webSearchRequestEnabled: false
             )
         )
         XCTAssertNil(nativeOverrides["features.parallel_tool_calls"])

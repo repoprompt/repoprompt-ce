@@ -15,21 +15,20 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
     func testAgentModeDefaultCarriesGoalFeatureConfigToStartAndResume() async throws {
         let options = CodexNativeSessionController.Options.agentModeDefault(
-            forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
-            approvalReviewerProvider: { .user }
+            approvalReviewerProvider: { .autoReview }
         )
 
         try await assertStartAndResumeGoalConfig(
             options: options,
-            expectedGoalSupportEnabled: true
+            expectedGoalSupportEnabled: true,
+            expectedApprovalReviewer: "auto_review"
         )
     }
 
     func testAgentModeDefaultCarriesExplicitGoalOptOutToStartAndResume() async throws {
         let options = CodexNativeSessionController.Options.agentModeDefault(
-            forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
@@ -44,7 +43,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
     func testAgentModeDefaultCarriesExplicitGoalOptInToStartAndResume() async throws {
         let options = CodexNativeSessionController.Options.agentModeDefault(
-            forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
@@ -59,7 +57,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
     func testAgentModeDefaultCarriesReasoningSummaryOptInToStartAndResume() async throws {
         let options = CodexNativeSessionController.Options.agentModeDefault(
-            forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
@@ -75,11 +72,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     }
 
     func testDefaultConfigOverridesOmitThreadReasoningSummaryWhenUnspecified() {
-        let config = CodexNativeSessionController.defaultAppServerConfigOverrides(
-            forceExperimentalSteering: false
-        )
+        let config = CodexNativeSessionController.defaultAppServerConfigOverrides()
 
         XCTAssertNil(config["model_reasoning_summary"])
+        XCTAssertEqual(CodexAgentToolPreferences.ApprovalPolicy(storedValue: "on-failure"), .onRequest)
+        XCTAssertEqual(CodexAgentToolPreferences.ApprovalReviewer.autoReview.appServerRequestValue, "auto_review")
     }
 
     func testDefaultAppServerClientLaunchOmitsProcessReasoningSummaryOverride() async throws {
@@ -317,7 +314,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     private func assertStartAndResumeGoalConfig(
         options: CodexNativeSessionController.Options,
         expectedGoalSupportEnabled: Bool,
-        expectedReasoningSummary: String = "none"
+        expectedReasoningSummary: String = "none",
+        expectedApprovalReviewer: String = "user"
     ) async throws {
         let (startController, startRecordURL) = try await makeController(options: options)
         _ = try await startController.startOrResume(existing: nil, baseInstructions: "Agent")
@@ -327,9 +325,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             in: recordedParams(for: "thread/start", at: startRecordURL),
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedReasoningSummary: expectedReasoningSummary,
+            expectedApprovalReviewer: expectedApprovalReviewer,
             label: "thread/start"
         )
         try assertProcessLaunchOmitsReasoningSummaryOverride(at: startRecordURL, label: "thread/start process")
+        try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: startRecordURL, label: "thread/start process")
 
         let (resumeController, resumeRecordURL) = try await makeController(options: options)
         let existing = CodexNativeSessionController.SessionRef(
@@ -345,14 +345,15 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             in: recordedParams(for: "thread/resume", at: resumeRecordURL),
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedReasoningSummary: expectedReasoningSummary,
+            expectedApprovalReviewer: expectedApprovalReviewer,
             label: "thread/resume"
         )
         try assertProcessLaunchOmitsReasoningSummaryOverride(at: resumeRecordURL, label: "thread/resume process")
+        try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: resumeRecordURL, label: "thread/resume process")
     }
 
     private func makeOptions() -> CodexNativeSessionController.Options {
         .agentModeDefault(
-            forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user }
@@ -499,16 +500,38 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         in params: [String: Any],
         expectedGoalSupportEnabled: Bool,
         expectedReasoningSummary: String,
+        expectedApprovalReviewer: String,
         label: String
     ) throws {
+        XCTAssertEqual(params["approvalPolicy"] as? String, "never", label)
+        XCTAssertEqual(params["sandbox"] as? String, "read-only", label)
+        XCTAssertEqual(params["approvalsReviewer"] as? String, expectedApprovalReviewer, label)
         let config = try XCTUnwrap(params["config"] as? [String: Any], label)
         XCTAssertEqual(config["features.goals"] as? Bool, expectedGoalSupportEnabled, label)
         XCTAssertEqual(config["features.computer_use"] as? Bool, false, label)
+        XCTAssertEqual(
+            config["features.code_mode.direct_only_tool_namespaces"] as? [String],
+            ["mcp__RepoPromptCE"],
+            label
+        )
         XCTAssertEqual(config["model_reasoning_summary"] as? String, expectedReasoningSummary, label)
+        XCTAssertEqual(config["features.multi_agent"] as? Bool, false, label)
+        XCTAssertNil(config["features.code_mode.enabled"], label)
+        XCTAssertNil(config["approval_policy"], label)
+        XCTAssertNil(config["sandbox_mode"], label)
+        XCTAssertNil(config["approvals_reviewer"], label)
     }
 
     private func assertProcessLaunchOmitsReasoningSummaryOverride(at recordURL: URL, label: String) throws {
         let arguments = try recordedProcessArguments(at: recordURL)
         XCTAssertFalse(arguments.contains { $0.hasPrefix("model_reasoning_summary=") }, label)
+    }
+
+    private func assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at recordURL: URL, label: String) throws {
+        let arguments = try recordedProcessArguments(at: recordURL)
+        XCTAssertFalse(
+            arguments.contains { $0.hasPrefix("features.code_mode.direct_only_tool_namespaces=") },
+            label
+        )
     }
 }
