@@ -257,6 +257,7 @@ final class AgentRuntimeProviderService {
             )
             var processConfig = CLIProcessConfiguration(
                 command: config.commandName,
+                environment: config.runtimeResolution.environmentOverrides,
                 enableDebugLogging: Self.enableDebugLogging,
                 captureStdoutTailBytes: 128 * 1024,
                 captureStderrTailBytes: 256 * 1024,

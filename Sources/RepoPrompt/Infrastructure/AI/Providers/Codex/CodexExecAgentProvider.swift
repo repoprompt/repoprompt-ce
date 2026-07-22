@@ -89,6 +89,19 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         let actualRunID = runID ?? UUID()
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Preparing context for run \(actualRunID)")
+            print("[DEBUG] CodexExec: \(config.runtimeResolution.debugMessage)")
+        }
+        guard config.runtimeResolution.status == .available,
+              let runtime = config.runtimeResolution.runtime
+        else {
+            throw AIProviderError.invalidConfiguration(detail: config.runtimeResolution.userMessage)
+        }
+        do {
+            try runtime.prepareState()
+        } catch {
+            throw AIProviderError.invalidConfiguration(
+                detail: "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
+            )
         }
 
         // Verify MCP server is running
@@ -106,18 +119,20 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Ensuring Codex MCP server entry")
         }
-        let (ensureSuccess, wasAlreadyPresent) = MCPIntegrationHelper.ensureCodexServerForDiscovery()
-        guard ensureSuccess else {
-            throw AIProviderError.invalidConfiguration(detail: "Failed to install RepoPrompt MCP config for Codex CLI.")
+        let ensureResult = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+        guard ensureResult.success else {
+            throw AIProviderError.invalidConfiguration(
+                detail: ensureResult.errorMessage ?? "Failed to install RepoPrompt MCP config for Codex."
+            )
         }
         if enableDebugLogging {
-            print("[DEBUG] CodexExec: MCP server ensured (wasAlreadyPresent: \(wasAlreadyPresent))")
+            print("[DEBUG] CodexExec: MCP server ensured (wasAlreadyPresent: \(ensureResult.wasAlreadyPresent))")
         }
 
         return HeadlessAgentContext(
             runID: actualRunID,
             configURL: nil,
-            environment: ProcessInfo.processInfo.environment
+            environment: ProcessInfo.processInfo.environment.merging(runtime.statePaths.environment) { _, ownedValue in ownedValue }
         )
     }
 
@@ -920,7 +935,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
         let lower = stderr.lowercased()
         if lower.contains("command not found") || lower.contains("no such file") {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI not found. Install it and ensure it is available on PATH.")
+            return AIProviderError.invalidConfiguration(
+                detail: "The selected Codex runtime could not be started. Reinstall RepoPrompt CE or configure a valid explicit override."
+            )
         }
         if lower.contains("not authenticated") || lower.contains("unauthorized") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI not authenticated. Run `codex login` in a terminal and try again.")

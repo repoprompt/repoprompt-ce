@@ -303,7 +303,12 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
             showInstallFeedback("VS Code configured")
         case "Codex CLI":
             let result = MCPIntegrationHelper.installInCodex()
-            showInstallFeedback(result.success ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured") : "Codex config failed", isError: !result.success)
+            showInstallFeedback(
+                result.success
+                    ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured")
+                    : (result.errorMessage ?? "Codex config failed"),
+                isError: !result.success
+            )
         case "OpenCode":
             let result = MCPIntegrationHelper.installInOpenCode()
             showInstallFeedback(result.success ? (result.wasAlreadyPresent ? "OpenCode already configured" : "OpenCode configured") : "OpenCode config failed", isError: !result.success)

@@ -49,19 +49,16 @@ by default and can be relocated with `REPOPROMPT_CODEX_CACHE_ROOT`. Ordinary
 host-native debug and non-public packaging defaults to the host target and embeds
 one package under that target name. Setting `REPOPROMPT_CODEX_ARCH=all` explicitly
 for one of those host-native lanes embeds both target packages. Universal
-release-candidate and public release lanes always select `all`, acquire and embed both
-official macOS packages, and reject an explicit single-target selection. Runtime
-authority, host-target selection, architecture fallback,
-`CODEX_HOME`/`CODEX_SQLITE_HOME`, and override UI are intentionally not decided
-by this packaging milestone.
+release-candidate and public release lanes always select `all`, acquire and embed
+both official macOS packages, and reject an explicit single-target selection.
 
 Each intact thin package is copied to the stable target-specific layout
 `Contents/Resources/BundledRuntimes/Codex/<target>/`. Ordinary host-native output
 contains only its selected target directory, while explicit
-`REPOPROMPT_CODEX_ARCH=all` output and universal release-candidate/public
-artifacts contain both `aarch64-apple-darwin/` and
-`x86_64-apple-darwin/`. Each target
-subtree preserves `codex-package.json`, `bin/codex`,
+`REPOPROMPT_CODEX_ARCH=all` output and universal release-candidate/public artifacts
+contain both `aarch64-apple-darwin/` and `x86_64-apple-darwin/`. Runtime selection
+fails closed unless the package matching the running app architecture is present.
+Each target subtree preserves `codex-package.json`, `bin/codex`,
 `bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and all additional
 package resources; the binaries inside remain thin and must match the directory's
 target architecture. The two primary macOS executables are
@@ -77,6 +74,23 @@ This mixed-authority layout passes macOS strict deep code
 signature verification without changing the upstream binary hashes. Actual
 notarization remains enforced by the protected release workflow; if Apple ever
 rejects this policy, stop rather than silently re-signing the upstream payload.
+
+The bundled package is RepoPrompt's default Codex runtime authority; runtime
+selection never falls through to the user's shell `PATH`. Advanced users may set
+one explicit absolute external override with `REPOPROMPT_CODEX_EXECUTABLE`.
+RepoPrompt rejects overrides older than 0.142.0 because they do not support the
+owned `direct_only_tool_namespaces` policy. Bundled and external runtimes both use
+RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
+`~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
+`~/.codex` and official Codex App state untouched.
+
+Within that isolated `config.toml`, RepoPrompt owns the
+`[mcp_servers.RepoPromptCE]` launch/policy keys, the managed global tool-output
+limit, and exactly `[features.code_mode].enabled` plus
+`[features.code_mode].direct_only_tool_namespaces`. It preserves other TOML,
+applies repeated updates idempotently, and stops with an actionable conflict
+instead of guessing when the code-mode policy is ambiguous or uses
+`non_prefixed_mcp_tool_names`.
 
 The standalone package also contains the upstream Zsh executable at
 `codex-resources/zsh/bin/zsh`. Its exact Zsh 5.9 licence is included as

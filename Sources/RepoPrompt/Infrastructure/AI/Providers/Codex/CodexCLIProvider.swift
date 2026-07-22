@@ -944,7 +944,9 @@ final class CodexCLIProvider: AIProvider {
             || lower.contains("spawnfailed(errno: 2)")
             || lower.contains("errno: 2")
         {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI is not installed or not in PATH. Install it and run `codex login`.")
+            return AIProviderError.invalidConfiguration(
+                detail: "The selected Codex runtime could not be started. Reinstall RepoPrompt CE or configure a valid explicit override."
+            )
         }
         if lower.contains("permission denied") || lower.contains("spawnfailed(errno: 13)") || lower.contains("errno: 13") {
             return AIProviderError.invalidConfiguration(detail: "Permission denied. Ensure the 'codex' executable is accessible.")

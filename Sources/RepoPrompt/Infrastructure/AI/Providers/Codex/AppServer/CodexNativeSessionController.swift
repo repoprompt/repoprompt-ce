@@ -485,8 +485,11 @@ final class CodexNativeSessionController {
         /// Fails closed only on a real `ensureCodexServerForDiscovery()` directory-create/config-write
         /// failure — an existing entry needing no change reports success, so a healthy no-op is not misread.
         private static func ensureDefaultRepoPromptMCPProvisioning() async throws {
-            guard MCPIntegrationHelper.ensureCodexServerForDiscovery().success else {
-                throw MCPBootstrapReadinessError.provisioningUnavailable
+            let result = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+            guard result.success else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: result.errorMessage ?? MCPBootstrapReadinessError.provisioningUnavailable.localizedDescription
+                )
             }
         }
 

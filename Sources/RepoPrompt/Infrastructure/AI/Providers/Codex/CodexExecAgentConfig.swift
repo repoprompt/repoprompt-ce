@@ -6,6 +6,7 @@ struct CodexExecAgentConfig {
     let additionalPathHints: [String]
     let modelString: String?
     let enableDebugLogging: Bool
+    let runtimeResolution: CodexProviderHelpers.CodexExecutableResolution
 
     init(
         commandName: String? = nil,
@@ -13,10 +14,16 @@ struct CodexExecAgentConfig {
         modelString: String? = nil,
         enableDebugLogging: Bool = false
     ) {
-        let resolvedCommand = commandName ?? "codex"
-        self.commandName = resolvedCommand
+        let requestedCommand = commandName ?? CLILaunchProfiles.codex.commandName
+        let resolution = CodexProviderHelpers.resolveCodexExecutable(
+            commandName: requestedCommand,
+            environment: ProcessInfo.processInfo.environment,
+            additionalPathHints: additionalPathHints
+        )
+        self.commandName = resolution.resolvedCommand
         self.additionalPathHints = additionalPathHints
         self.modelString = modelString
         self.enableDebugLogging = enableDebugLogging
+        runtimeResolution = resolution
     }
 }

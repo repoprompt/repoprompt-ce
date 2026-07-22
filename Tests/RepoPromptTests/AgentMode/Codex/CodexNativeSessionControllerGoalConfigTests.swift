@@ -447,6 +447,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         import json
         import sys
 
+        if sys.argv[1:] == ["--version"]:
+            print("codex 0.144.6")
+            raise SystemExit(0)
+
         record_path = \(String(reflecting: recordURL.path))
         ignore_memory_mode_requests = \(ignoreMemoryModeRequests ? "True" : "False")
         goal_status = \(goalStatus.map { String(reflecting: $0) } ?? "None")

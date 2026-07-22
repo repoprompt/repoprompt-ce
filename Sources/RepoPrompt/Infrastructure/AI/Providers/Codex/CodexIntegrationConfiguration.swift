@@ -14,7 +14,15 @@ enum CodexIntegrationConfiguration {
     static let desiredSupportsParallelToolCalls = true
     static let desiredToolOutputTokenLimit = 25000
 
-    /// Serializes in-process read-modify-write access to `~/.codex/config.toml` across concurrent
+    static let directOnlyToolNamespace = "mcp__RepoPromptCE"
+
+    // RepoPrompt owns the RepoPromptCE MCP block's launch/policy keys, the global
+    // tool output limit already managed by this integration, and exactly these two
+    // [features.code_mode] keys: enabled and direct_only_tool_namespaces. Other
+    // user-authored TOML is preserved; ambiguous/conflicting code-mode layouts fail
+    // before any write.
+
+    /// Serializes in-process read-modify-write access to RepoPrompt's owned Codex config across concurrent
     /// Codex startup/provisioning paths. Cross-process writers remain outside this lock's scope.
     private static let fileLock = NSLock()
     private static let tomlBareKeyCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
@@ -34,6 +42,7 @@ enum CodexIntegrationConfiguration {
         let content: String
         let changed: Bool
         let wasRepoPromptServerPresent: Bool
+        let conflictMessage: String?
     }
 
     private struct BlockRange {
@@ -88,8 +97,7 @@ enum CodexIntegrationConfiguration {
     }
 
     static func configDirectoryURL() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".codex", isDirectory: true)
+        CodexRuntimeAuthority.statePaths().codexHome
     }
 
     static func configURL() -> URL {
@@ -157,21 +165,27 @@ enum CodexIntegrationConfiguration {
         mcpServerEntries().map(\.normalizedName)
     }
 
-    /// Installs the RepoPrompt MCP server into Codex CLI (`~/.codex/config.toml`).
+    /// Installs the RepoPrompt MCP server into RepoPrompt's isolated Codex config.
     ///
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
-    static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool) {
+    static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
         fileLock.lock()
         defer { fileLock.unlock() }
 
         let fm = FileManager.default
-        let codexDir = configDirectoryURL()
+        let runtime: CodexRuntimeAuthority.Runtime
+        switch CodexRuntimeAuthority.resolve() {
+        case let .success(resolved):
+            runtime = resolved
+        case let .failure(failure):
+            return (false, false, failure.localizedDescription)
+        }
         let configURL = configURL()
 
         do {
-            try fm.createDirectory(at: codexDir, withIntermediateDirectories: true, attributes: nil)
+            try runtime.prepareState(fileManager: fm)
 
             let content: String = if fm.fileExists(atPath: configURL.path) {
                 (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
@@ -184,15 +198,18 @@ enum CodexIntegrationConfiguration {
                 defaultEnabledIfMissing: true,
                 forceEnabled: true
             )
+            if let conflictMessage = mutation.conflictMessage {
+                return (false, mutation.wasRepoPromptServerPresent, conflictMessage)
+            }
             if mutation.changed {
                 try mutation.content.write(to: configURL, atomically: true, encoding: .utf8)
             }
 
             UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
-            return (true, mutation.wasRepoPromptServerPresent)
+            return (true, mutation.wasRepoPromptServerPresent, nil)
         } catch {
             print("CodexIntegrationConfiguration – Codex install failed: \(error)")
-            return (false, false)
+            return (false, false, "RepoPrompt could not update its isolated Codex config: \(error.localizedDescription)")
         }
     }
 
@@ -200,16 +217,27 @@ enum CodexIntegrationConfiguration {
     /// `enabled = false` so normal Codex usage stays opt-in, while the agent enables it at runtime via
     /// `-c` overrides.
     @discardableResult
-    static func ensureServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
+    static func ensureServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        switch CodexRuntimeAuthority.resolve() {
+        case let .success(resolved):
+            ensureServerForDiscovery(runtime: resolved)
+        case let .failure(failure):
+            (false, false, failure.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    static func ensureServerForDiscovery(
+        runtime: CodexRuntimeAuthority.Runtime
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
         fileLock.lock()
         defer { fileLock.unlock() }
 
         let fm = FileManager.default
-        let codexDir = configDirectoryURL()
         let configURL = configURL()
 
         do {
-            try fm.createDirectory(at: codexDir, withIntermediateDirectories: true, attributes: nil)
+            try runtime.prepareState(fileManager: fm)
 
             let content: String = if fm.fileExists(atPath: configURL.path) {
                 (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
@@ -222,24 +250,39 @@ enum CodexIntegrationConfiguration {
                 defaultEnabledIfMissing: false,
                 forceEnabled: nil
             )
+            if let conflictMessage = mutation.conflictMessage {
+                return (false, mutation.wasRepoPromptServerPresent, conflictMessage)
+            }
             if mutation.changed {
                 try mutation.content.write(to: configURL, atomically: true, encoding: .utf8)
             }
             UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
 
-            return (true, mutation.wasRepoPromptServerPresent)
+            return (true, mutation.wasRepoPromptServerPresent, nil)
         } catch {
             print("CodexIntegrationConfiguration – Codex discovery ensure failed: \(error)")
-            return (false, false)
+            return (false, false, "RepoPrompt could not update its isolated Codex config: \(error.localizedDescription)")
         }
     }
 
     static func mutatedPersistentMCPConfigContent(
         from content: String,
         defaultEnabledIfMissing: Bool,
-        forceEnabled: Bool?
+        forceEnabled: Bool?,
+        supportsDirectOnlyToolNamespaces: Bool = true
     ) -> PersistentMCPConfigMutationResult {
         var lines = splitTOMLLines(content)
+        if let conflictMessage = codeModePolicyConflict(
+            in: lines,
+            supportsDirectOnlyToolNamespaces: supportsDirectOnlyToolNamespaces
+        ) {
+            return PersistentMCPConfigMutationResult(
+                content: content,
+                changed: false,
+                wasRepoPromptServerPresent: mcpServerEntries(from: content).contains { $0.normalizedName == repoPromptMCPServerName },
+                conflictMessage: conflictMessage
+            )
+        }
         let ensureResult = ensureRepoPromptServer(
             in: &lines,
             defaultEnabledIfMissing: defaultEnabledIfMissing,
@@ -248,12 +291,14 @@ enum CodexIntegrationConfiguration {
 
         _ = stripToolOutputLimitFromRepoPromptBlocks(in: &lines)
         _ = ensureGlobalToolOutputLimit(in: &lines)
+        _ = ensureCodeModePolicy(in: &lines)
 
         let final = lines.joined(separator: "\n")
         return PersistentMCPConfigMutationResult(
             content: final,
             changed: final != content,
-            wasRepoPromptServerPresent: ensureResult.wasPresent
+            wasRepoPromptServerPresent: ensureResult.wasPresent,
+            conflictMessage: nil
         )
     }
 
@@ -823,6 +868,86 @@ enum CodexIntegrationConfiguration {
         }
 
         return result
+    }
+
+    private static func isCodeModeHeader(_ line: String) -> Bool {
+        guard let header = parseTOMLHeader(line), !header.isArrayTable else { return false }
+        return header.keyPath.map(\.normalized) == ["features", "code_mode"]
+    }
+
+    private static func codeModePolicyConflict(
+        in lines: [String],
+        supportsDirectOnlyToolNamespaces: Bool
+    ) -> String? {
+        guard supportsDirectOnlyToolNamespaces else {
+            return "RepoPrompt did not update Codex config because this external Codex version predates direct_only_tool_namespaces (minimum 0.142.0). Update the override or use the bundled runtime."
+        }
+
+        let blocks = blockRanges(in: lines, whereHeaderMatches: isCodeModeHeader)
+        if blocks.count > 1 {
+            return "RepoPrompt did not update Codex config because multiple [features.code_mode] blocks exist. Merge them, then retry."
+        }
+        if let block = blocks.first,
+           !keyLineIndices(for: "non_prefixed_mcp_tool_names", in: lines, within: block).isEmpty
+        {
+            return "RepoPrompt did not update Codex config because [features.code_mode].non_prefixed_mcp_tool_names conflicts with the owned direct-only RepoPrompt namespace policy. Remove that key, then retry."
+        }
+
+        for line in lines {
+            guard let assignment = parseTOMLAssignment(line) else { continue }
+            if assignment.keyPath.map(\.normalized) == ["features", "code_mode", "non_prefixed_mcp_tool_names"] {
+                return "RepoPrompt did not update Codex config because features.code_mode.non_prefixed_mcp_tool_names conflicts with the owned direct-only RepoPrompt namespace policy. Remove that key, then retry."
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    private static func ensureCodeModePolicy(in lines: inout [String]) -> Bool {
+        var changed = false
+        var blocks = blockRanges(in: lines, whereHeaderMatches: isCodeModeHeader)
+        if blocks.isEmpty {
+            appendBlock(
+                [
+                    "[features.code_mode]",
+                    "enabled = true",
+                    "direct_only_tool_namespaces = [\"\(directOnlyToolNamespace)\"]"
+                ],
+                to: &lines
+            )
+            return true
+        }
+
+        var block = blocks.removeFirst()
+        if ensureKey(
+            "enabled",
+            value: "true",
+            in: &lines,
+            blockRange: &block,
+            force: true,
+            isSemanticallyEquivalent: { parseTOMLBooleanValue($0) == true }
+        ) {
+            changed = true
+        }
+        if ensureKey(
+            "direct_only_tool_namespaces",
+            value: "[\"\(directOnlyToolNamespace)\"]",
+            in: &lines,
+            blockRange: &block,
+            afterKey: "enabled",
+            force: true,
+            isSemanticallyEquivalent: isRepoPromptDirectOnlyNamespaceArray
+        ) {
+            changed = true
+        }
+        return changed
+    }
+
+    private static func isRepoPromptDirectOnlyNamespaceArray(_ valueText: Substring) -> Bool {
+        let compact = stripComment(fromValueText: String(valueText))
+            .filter { !$0.isWhitespace }
+        return compact == "[\"\(directOnlyToolNamespace)\"]" ||
+            compact == "['\(directOnlyToolNamespace)']"
     }
 
     static func ensureRepoPromptServer(

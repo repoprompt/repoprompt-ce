@@ -2944,7 +2944,7 @@ public class APISettingsViewModel: ObservableObject {
             await applyCodexConnectionState(
                 connected: true,
                 error: nil,
-                phase: .connected(resolvedExecutable: resolution.resolvedCommand),
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
                 updateModels: true
             )
             return true
@@ -3033,7 +3033,7 @@ public class APISettingsViewModel: ObservableObject {
             await applyCodexConnectionState(
                 connected: ok,
                 error: ok ? nil : "Codex CLI health check returned an empty response.",
-                phase: ok ? .connected(resolvedExecutable: resolution.resolvedCommand) : .failed(message: "Codex CLI health check returned an empty response."),
+                phase: ok ? .connected(resolvedExecutable: resolution.displayDescription) : .failed(message: "Codex CLI health check returned an empty response."),
                 updateModels: true
             )
             if ok {
@@ -3081,7 +3081,7 @@ public class APISettingsViewModel: ObservableObject {
 
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") {
-            return "Codex CLI is not installed. Install it and ensure it's available on PATH."
+            return "The selected Codex runtime is unavailable. Reinstall RepoPrompt CE or configure a valid explicit override."
         }
         if lowered.contains("permission denied") {
             return "Permission denied. Ensure the 'codex' executable is accessible."

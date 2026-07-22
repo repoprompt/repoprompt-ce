@@ -933,7 +933,7 @@ actor CodexAppServerClient {
                 enableDebugLogging: config.enableDebugLogging
             )
         )
-        let environment = environmentResult.environment
+        var environment = environmentResult.environment
         let resolution = CodexProviderHelpers.resolveCodexExecutable(
             commandName: config.commandName,
             environment: environment,
@@ -942,6 +942,25 @@ actor CodexAppServerClient {
         )
         guard resolution.status == .available else {
             throw ClientError.executableUnavailable(resolution.userMessage)
+        }
+        guard let runtime = resolution.runtime else {
+            throw ClientError.executableUnavailable("RepoPrompt could not start Codex: runtime resolution completed without runtime metadata.")
+        }
+        do {
+            try runtime.prepareState()
+        } catch {
+            throw ClientError.executableUnavailable(
+                "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
+            )
+        }
+        environment.merge(resolution.environmentOverrides) { _, ownedValue in ownedValue }
+        if config.commandName == CLILaunchProfiles.codex.commandName {
+            let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+            guard provisioning.success else {
+                throw ClientError.executableUnavailable(
+                    provisioning.errorMessage ?? "RepoPrompt could not prepare its owned Codex configuration."
+                )
+            }
         }
         let processOverrides = CodexOverrides.cliConfigArgs(
             toolPolicy: .init(

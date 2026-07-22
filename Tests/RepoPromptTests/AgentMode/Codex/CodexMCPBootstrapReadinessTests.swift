@@ -195,6 +195,9 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         #!/usr/bin/env python3
         import json
         import sys
+        if sys.argv[1:] == ["--version"]:
+            print("codex 0.144.6")
+            raise SystemExit(0)
         def respond(request_id, result):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
         for line in sys.stdin:

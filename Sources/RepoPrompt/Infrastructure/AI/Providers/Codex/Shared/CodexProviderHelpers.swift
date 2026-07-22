@@ -33,19 +33,32 @@ enum CodexProviderHelpers {
     struct CodexExecutableResolution: Equatable {
         enum Status: Equatable {
             case available
-            case notFound
-            case missingResolvedPath
-            case resolvedToDirectory
-            case notExecutable
+            case bundledRuntimeUnavailable
+            case externalOverrideInvalid
+            case externalOverrideIncompatible
+            case unsupportedArchitecture
         }
 
         let commandName: String
         let resolvedCommand: String
         let status: Status
-        let pathValue: String?
-        let additionalPathHints: [String]
+        let runtime: CodexRuntimeAuthority.Runtime?
         let userMessage: String
         let debugMessage: String
+
+        var environmentOverrides: [String: String] {
+            runtime?.statePaths.environment ?? [:]
+        }
+
+        var displayDescription: String? {
+            guard let runtime else { return nil }
+            return switch runtime.source {
+            case let .bundled(target):
+                "Bundled Codex \(runtime.version) (\(target))"
+            case .externalOverride:
+                "External Codex override \(runtime.version) (\(runtime.executableURL.lastPathComponent))"
+            }
+        }
     }
 
     static func resolveCodexExecutable(
@@ -54,53 +67,48 @@ enum CodexProviderHelpers {
         additionalPathHints: [String] = CLILaunchProfiles.codex.supplementalSearchPaths,
         logger: ((String) -> Void)? = nil
     ) -> CodexExecutableResolution {
-        let environment = normalizedPreflightEnvironment(environment)
-        let expandedHints = normalizedPathHints(additionalPathHints, environment: environment)
-        let preferredBasename = preferredBasename(for: commandName)
-        var resolvedCommand = CommandPathResolver.resolve(
-            commandName,
+        _ = additionalPathHints // Kept for source compatibility; PATH fallback is intentionally disabled.
+        let injectedOverride = commandName == CLILaunchProfiles.codex.commandName ? nil : commandName
+        switch CodexRuntimeAuthority.resolve(
             environment: environment,
-            additionalPaths: expandedHints,
-            logger: logger,
-            preferredBasenames: [preferredBasename],
-            shellLookupMode: .fallbackOnly
-        )
-        var launchability = CommandPathResolver.launchability(of: resolvedCommand)
-
-        if launchability == .bareCommandFallback,
-           let existingCandidate = firstExistingSearchPathCandidate(
-               for: commandName,
-               environment: environment,
-               additionalPathHints: expandedHints
-           )
-        {
-            resolvedCommand = existingCandidate
-            launchability = CommandPathResolver.launchability(of: existingCandidate)
+            explicitExecutableOverride: injectedOverride
+        ) {
+        case let .success(runtime):
+            let debugMessage = runtime.redactedDiagnosticSummary
+            logger?(debugMessage)
+            return CodexExecutableResolution(
+                commandName: commandName,
+                resolvedCommand: runtime.executableURL.path,
+                status: .available,
+                runtime: runtime,
+                userMessage: "",
+                debugMessage: debugMessage
+            )
+        case let .failure(failure):
+            let status: CodexExecutableResolution.Status = switch failure {
+            case .unsupportedArchitecture:
+                .unsupportedArchitecture
+            case .externalOverrideTooOld:
+                .externalOverrideIncompatible
+            case .externalOverrideMustBeAbsolute,
+                 .externalOverrideMissing,
+                 .externalOverrideNotExecutable,
+                 .externalOverrideVersionUnreadable:
+                .externalOverrideInvalid
+            default:
+                .bundledRuntimeUnavailable
+            }
+            let debugMessage = "Codex runtime authority: status=\(status), failure=\(failureDiagnosticCode(failure))"
+            logger?(debugMessage)
+            return CodexExecutableResolution(
+                commandName: commandName,
+                resolvedCommand: "",
+                status: status,
+                runtime: nil,
+                userMessage: failure.localizedDescription,
+                debugMessage: debugMessage
+            )
         }
-
-        let status = codexStatus(for: launchability)
-        let userMessage = codexExecutableUserMessage(
-            status: status,
-            resolvedCommand: resolvedCommand
-        )
-        let debugMessage = codexExecutableDebugMessage(
-            commandName: commandName,
-            resolvedCommand: resolvedCommand,
-            status: status,
-            pathValue: environment["PATH"],
-            additionalPathHints: expandedHints
-        )
-        logger?(debugMessage)
-
-        return CodexExecutableResolution(
-            commandName: commandName,
-            resolvedCommand: resolvedCommand,
-            status: status,
-            pathValue: environment["PATH"],
-            additionalPathHints: expandedHints,
-            userMessage: userMessage,
-            debugMessage: debugMessage
-        )
     }
 
     static func preflightCodexExecutable(
@@ -130,16 +138,8 @@ enum CodexProviderHelpers {
     }
 
     static func isCodexExecutableUnavailableMessage(_ message: String) -> Bool {
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("Codex CLI executable was not found.") {
-            return true
-        }
-        guard trimmed.hasPrefix("Codex CLI resolved to `") else {
-            return false
-        }
-        return trimmed.contains("`, but that file does not exist.") ||
-            trimmed.contains("`, but that path is a directory.") ||
-            trimmed.contains("`, but it is not executable.")
+        message.trimmingCharacters(in: .whitespacesAndNewlines)
+            .hasPrefix("RepoPrompt could not start Codex:")
     }
 
     /// Extracts the name of a broken MCP server from Codex CLI stderr output.
@@ -220,114 +220,20 @@ enum CodexProviderHelpers {
         return "gpt-5.2-codex"
     }
 
-    private static func codexStatus(for launchability: CLIExecutableLaunchability) -> CodexExecutableResolution.Status {
-        switch launchability {
-        case .launchable:
-            .available
-        case .bareCommandFallback:
-            .notFound
-        case .missingPath:
-            .missingResolvedPath
-        case .directory:
-            .resolvedToDirectory
-        case .notExecutable:
-            .notExecutable
+    private static func failureDiagnosticCode(_ failure: CodexRuntimeAuthority.Failure) -> String {
+        switch failure {
+        case .unsupportedArchitecture: "unsupported-architecture"
+        case .bundledResourcesUnavailable: "bundled-resources-unavailable"
+        case .bundledPackageMissing: "bundled-package-missing"
+        case .bundledMetadataUnreadable: "bundled-metadata-unreadable"
+        case .bundledMetadataMismatch: "bundled-metadata-mismatch"
+        case .bundledLayoutIncomplete: "bundled-layout-incomplete"
+        case .externalOverrideMustBeAbsolute: "override-not-absolute"
+        case .externalOverrideMissing: "override-missing"
+        case .externalOverrideNotExecutable: "override-not-executable"
+        case .externalOverrideVersionUnreadable: "override-version-unreadable"
+        case .externalOverrideTooOld: "override-version-too-old"
         }
-    }
-
-    private static func codexExecutableUserMessage(
-        status: CodexExecutableResolution.Status,
-        resolvedCommand: String
-    ) -> String {
-        switch status {
-        case .available:
-            ""
-        case .notFound:
-            "Codex CLI executable was not found. Install Codex CLI and ensure `codex` is available in your login shell PATH. RepoPrompt searched your login-shell PATH plus common Homebrew, npm/pnpm/yarn/Volta, Bun, Cargo, version-manager shim, and Codex.app locations."
-        case .missingResolvedPath:
-            "Codex CLI resolved to `\(resolvedCommand)`, but that file does not exist. Reinstall Codex CLI or fix your shell PATH."
-        case .resolvedToDirectory:
-            "Codex CLI resolved to `\(resolvedCommand)`, but that path is a directory. Fix your shell PATH so `codex` points to the executable."
-        case .notExecutable:
-            "Codex CLI resolved to `\(resolvedCommand)`, but it is not executable. Check file permissions or reinstall Codex CLI."
-        }
-    }
-
-    private static func codexExecutableDebugMessage(
-        commandName: String,
-        resolvedCommand: String,
-        status: CodexExecutableResolution.Status,
-        pathValue: String?,
-        additionalPathHints: [String]
-    ) -> String {
-        let pathDisplay = pathValue?.isEmpty == false ? pathValue! : "(empty)"
-        let hintsDisplay = additionalPathHints.isEmpty ? "(none)" : additionalPathHints.joined(separator: ":")
-        return "Codex executable preflight: command=\(commandName), resolved=\(resolvedCommand), status=\(status), PATH=\(pathDisplay), additionalHints=\(hintsDisplay)"
-    }
-
-    private static func normalizedPreflightEnvironment(_ environment: [String: String]) -> [String: String] {
-        var normalized = environment
-        if normalized["HOME"].map({ !$0.isEmpty }) != true {
-            normalized["HOME"] = NSHomeDirectory()
-        }
-        return normalized
-    }
-
-    private static func normalizedPathHints(_ hints: [String], environment: [String: String]) -> [String] {
-        let home = environment["HOME"].flatMap { $0.isEmpty ? nil : $0 }
-        var normalized: [String] = []
-        for hint in hints {
-            for component in hint.split(separator: ":") {
-                normalized.append(expandTilde(String(component), home: home))
-            }
-        }
-        return orderedUnique(normalized)
-    }
-
-    private static func firstExistingSearchPathCandidate(
-        for commandName: String,
-        environment: [String: String],
-        additionalPathHints: [String]
-    ) -> String? {
-        let expandedCommand = CommandPathResolver.expandPath(commandName, environment: environment)
-        guard !expandedCommand.contains("/") else { return nil }
-        let paths = CommandPathResolver.mergedPathComponents(
-            environment: environment,
-            additionalPaths: additionalPathHints
-        )
-        for path in paths {
-            let candidate = (path as NSString).appendingPathComponent(expandedCommand)
-            if FileManager.default.fileExists(atPath: candidate) {
-                return candidate
-            }
-        }
-        return nil
-    }
-
-    private static func preferredBasename(for commandName: String) -> String {
-        let expanded = (commandName as NSString).expandingTildeInPath
-        let basename = (expanded as NSString).lastPathComponent
-        return basename.isEmpty ? commandName : basename
-    }
-
-    private static func expandTilde(_ path: String, home: String?) -> String {
-        guard path.hasPrefix("~") else { return path }
-        if let home, path == "~" {
-            return home
-        }
-        if let home, path.hasPrefix("~/") {
-            return home + String(path.dropFirst())
-        }
-        return (path as NSString).expandingTildeInPath
-    }
-
-    private static func orderedUnique(_ values: [String]) -> [String] {
-        var ordered: [String] = []
-        var seen = Set<String>()
-        for value in values where !value.isEmpty && seen.insert(value).inserted {
-            ordered.append(value)
-        }
-        return ordered
     }
 
     static func normalizedAssistantDeltaForAppend(existingText: String, delta: String) -> String {
