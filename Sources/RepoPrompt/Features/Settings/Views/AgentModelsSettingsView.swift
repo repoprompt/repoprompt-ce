@@ -672,7 +672,7 @@ struct AgentModelsSettingsView: View {
     /// no longer requires a click to uncover.
     ///
     /// SEARCH-HELPER: Agent Models related settings, Oracle Model Presets link,
-    /// Benchmark Model link, related-settings footer
+    /// related-settings footer
     private var relatedSettingsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Related Settings")
@@ -684,12 +684,6 @@ struct AgentModelsSettingsView: View {
                 title: "Oracle Model Presets",
                 detail: "Named Oracle model choices exposed to MCP clients.",
                 tab: .modelPresets
-            )
-            linkRow(
-                icon: "gauge",
-                title: "Benchmark Model",
-                detail: "Head-to-head model benchmarks.",
-                tab: .benchmark
             )
         }
         .padding(.top, 8)

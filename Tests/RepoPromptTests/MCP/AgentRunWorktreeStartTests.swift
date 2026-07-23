@@ -2,7 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 private final class AgentRunWorktreeStartGitSeedRepository: @unchecked Sendable {
@@ -479,6 +479,658 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             XCTAssertTrue(message.contains(missingWorktree.path), message)
             XCTAssertTrue(message.contains("unbind the session"), message)
         }
+    }
+
+    func testCodexRuntimeWorkspacePathsProjectionCoversBoundUnboundSecondaryAndMissingWorktree() throws {
+        let root = try makeTemporaryDirectory(named: "projection-root")
+        let worktree = try makeTemporaryDirectory(named: "projection-worktree")
+        let secondaryRoot = try makeTemporaryDirectory(named: "projection-secondary-root")
+        let secondaryWorktree = try makeTemporaryDirectory(named: "projection-secondary-worktree")
+        let missingWorktree = root.appendingPathComponent("missing-worktree")
+        let viewModel = makeViewModel(workspacePath: root.path)
+
+        let unboundSession = AgentModeViewModel.TabSession(tabID: UUID())
+        XCTAssertEqual(
+            try viewModel.codexRuntimeWorkspacePaths(for: unboundSession),
+            .uniform(root.path)
+        )
+
+        let boundSession = AgentModeViewModel.TabSession(tabID: UUID())
+        boundSession.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+        let boundPair = CodexRuntimeWorkspacePaths.worktreeBound(
+            logicalRootPath: root.path,
+            validatedWorktreeRootPath: worktree.path
+        )
+        XCTAssertEqual(try viewModel.codexRuntimeWorkspacePaths(for: boundSession), boundPair)
+
+        // Adding a secondary-root binding must not move either directory of the primary pair.
+        boundSession.worktreeBindings.append(
+            makeBinding(logicalRoot: secondaryRoot.path, worktreeRoot: secondaryWorktree.path)
+        )
+        XCTAssertEqual(try viewModel.codexRuntimeWorkspacePaths(for: boundSession), boundPair)
+
+        // A secondary-only binding leaves the session on the unbound fallback pair.
+        let secondaryOnlySession = AgentModeViewModel.TabSession(tabID: UUID())
+        secondaryOnlySession.worktreeBindings = [
+            makeBinding(logicalRoot: secondaryRoot.path, worktreeRoot: secondaryWorktree.path)
+        ]
+        XCTAssertEqual(
+            try viewModel.codexRuntimeWorkspacePaths(for: secondaryOnlySession),
+            .uniform(root.path)
+        )
+
+        // Unavailable worktrees keep the existing typed worktree failure.
+        let missingSession = AgentModeViewModel.TabSession(tabID: UUID())
+        missingSession.worktreeBindings = [
+            makeBinding(logicalRoot: root.path, worktreeRoot: missingWorktree.path, label: "Feature WT")
+        ]
+        XCTAssertThrowsError(try viewModel.codexRuntimeWorkspacePaths(for: missingSession)) { error in
+            XCTAssertTrue(error is AgentWorktreeRuntimeWorkspaceError, String(describing: error))
+        }
+    }
+
+    func testCodexRuntimeWorkspacePathsFailsClosedOnMalformedSelectedLogicalRoot() throws {
+        let worktree = try makeTemporaryDirectory(named: "logical-root-worktree")
+        let missingRoot = worktree.appendingPathComponent("missing-root")
+
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
+                bindings: [makeBinding(logicalRoot: "   ", worktreeRoot: worktree.path)],
+                fallbackWorkspacePath: nil
+            )
+        ) { error in
+            XCTAssertEqual(error as? CodexRuntimeWorkspacePathsError, .emptyLogicalRoot)
+        }
+
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
+                bindings: [makeBinding(logicalRoot: missingRoot.path, worktreeRoot: worktree.path)],
+                fallbackWorkspacePath: missingRoot.path
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? CodexRuntimeWorkspacePathsError,
+                .launchDirectoryUnavailable(path: missingRoot.standardizedFileURL.path)
+            )
+        }
+
+        XCTAssertEqual(
+            try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
+                bindings: [],
+                fallbackWorkspacePath: nil
+            ),
+            .uniform(nil)
+        )
+    }
+
+    func testCodexControllerFailsClosedWhenInstalledLaunchRootBecomesMalformed() async throws {
+        let root = try makeTemporaryDirectory(named: "teardown-root")
+        let worktree = try makeTemporaryDirectory(named: "teardown-worktree")
+
+        var installedController: ReplacementIdentityFakeCodexController?
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                let controller = ReplacementIdentityFakeCodexController()
+                installedController = controller
+                return controller
+            }
+        )
+        viewModel.test_initializeRunService()
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        let controller = try XCTUnwrap(installedController)
+        let installedRunID = try XCTUnwrap(session.runID)
+        XCTAssertNotNil(session.codexController)
+        XCTAssertNotNil(session.codexEventTask)
+        session.pendingApproval = AgentApprovalRequest(
+            requestID: .codex(.int(1)),
+            method: "item/commandExecution/requestApproval",
+            kind: .commandExecution,
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "item"
+        )
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        session.codexPendingTurnKind = .user
+        session.codexFallbackPumpTask = Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+        session.mcpFollowUpRunPending = true
+        let livenessKey = AgentModeViewModel.CodexNativeToolLivenessState.Key(
+            invocationID: UUID(),
+            fallbackSignature: "test"
+        )
+        session.codexNativeToolLiveness.inFlight[livenessKey] = .init(
+            toolName: "bash",
+            startedAt: Date(),
+            lastSignalAt: Date(),
+            processID: "123"
+        )
+        viewModel.test_codexCoordinator.test_installCodexToolTrackingPlaceholder(
+            for: session.tabID
+        )
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+
+        session.worktreeBindings = [makeBinding(logicalRoot: "   ", worktreeRoot: worktree.path)]
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(session.runID, installedRunID)
+        XCTAssertFalse(session.codexNeedsReconnect)
+        XCTAssertNil(session.codexEventTask)
+        XCTAssertNil(session.codexEventTaskRunID)
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.codexControllerPermissionProfile)
+        XCTAssertNil(session.codexControllerTaskLabelKind)
+        XCTAssertNil(session.codexControllerWorkspacePaths)
+        XCTAssertNil(session.codexControllerFeatureState)
+        XCTAssertNil(session.pendingApproval)
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertNil(session.codexPendingTurnKind)
+        XCTAssertNil(session.codexFallbackPumpTask)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+
+        let staleController = ReplacementIdentityFakeCodexController()
+        session.codexController = staleController
+        session.codexControllerWorkspacePaths = .worktreeBound(
+            logicalRootPath: root.path,
+            validatedWorktreeRootPath: worktree.path
+        )
+        session.runState = .running
+        session.beginRunAttempt(source: "test.workspace-resolution-publication-race")
+        let publicationGate = AgentRunWorktreeStartAsyncGate()
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate {
+            await publicationGate.markStartedAndWaitForRelease()
+        }
+
+        let failureTask = Task {
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        }
+        await publicationGate.waitUntilStarted()
+
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let replacementController = ReplacementIdentityFakeCodexController(shutdownGate: shutdownGate)
+        let replacementRunID = UUID()
+        session.codexController = replacementController
+        session.codexControllerWorkspacePaths = .worktreeBound(
+            logicalRootPath: root.path,
+            validatedWorktreeRootPath: worktree.path
+        )
+        session.codexEventTask = Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+        session.codexEventTaskRunID = replacementRunID
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        viewModel.test_codexCoordinator.test_installCodexToolTrackingPlaceholder(
+            for: session.tabID
+        )
+
+        await publicationGate.release()
+        await failureTask.value
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate(nil)
+
+        XCTAssertEqual(controllerIdentity(in: session), ObjectIdentifier(replacementController))
+        XCTAssertNotNil(session.codexControllerWorkspacePaths)
+        XCTAssertNotNil(session.codexEventTask)
+        XCTAssertEqual(session.codexEventTaskRunID, replacementRunID)
+        XCTAssertNotNil(session.pendingCodexComputerUseActivation)
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+        XCTAssertEqual(staleController.shutdownCallCount, 1)
+        XCTAssertEqual(replacementController.shutdownCallCount, 0)
+
+        let matchingCleanupTask = Task {
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        }
+        await shutdownGate.waitUntilStarted()
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+
+        let successorController = ReplacementIdentityFakeCodexController()
+        session.codexController = successorController
+        viewModel.test_codexCoordinator.test_installCodexToolTrackingPlaceholder(
+            for: session.tabID
+        )
+        await shutdownGate.release()
+        await matchingCleanupTask.value
+
+        XCTAssertEqual(replacementController.shutdownCallCount, 1)
+        XCTAssertEqual(controllerIdentity(in: session), ObjectIdentifier(successorController))
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(successorController.shutdownCallCount, 1)
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+    }
+
+    func testCodexWorkspaceResolutionFailureJoinsConcurrentSessionShutdownRetirement() async throws {
+        let root = try makeTemporaryDirectory(named: "workspace-failure-retirement-root")
+        let worktree = try makeTemporaryDirectory(named: "workspace-failure-retirement-worktree")
+        let publicationGate = AgentRunWorktreeStartAsyncGate()
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let controller = ReplacementIdentityFakeCodexController(shutdownGate: shutdownGate)
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        )
+        viewModel.test_initializeRunService()
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate {
+            await publicationGate.markStartedAndWaitForRelease()
+        }
+
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        session.worktreeBindings = [makeBinding(logicalRoot: "   ", worktreeRoot: worktree.path)]
+        var failureCompleted = false
+        let failureTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+            failureCompleted = true
+        }
+        await publicationGate.waitUntilStarted()
+
+        var shutdownCompleted = false
+        let shutdownTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+            shutdownCompleted = true
+        }
+        await shutdownGate.waitUntilStarted()
+
+        XCTAssertNil(
+            session.codexController,
+            "session shutdown must detach the controller before retirement suspends"
+        )
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasPendingCodexControllerRetirement(for: session.tabID)
+        )
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(failureCompleted)
+        XCTAssertFalse(shutdownCompleted)
+
+        await publicationGate.release()
+        await shutdownGate.release()
+        await failureTask.value
+        await shutdownTask.value
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate(nil)
+
+        XCTAssertTrue(failureCompleted)
+        XCTAssertTrue(shutdownCompleted)
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasPendingCodexControllerRetirement(for: session.tabID)
+        )
+    }
+
+    func testCodexCancellationRetirementBlocksSameTabReplacementButNotAnotherTab() async throws {
+        let rootA = try makeTemporaryDirectory(named: "cancel-retirement-root-a")
+        let worktreeA = try makeTemporaryDirectory(named: "cancel-retirement-worktree-a")
+        let rootB = try makeTemporaryDirectory(named: "cancel-retirement-root-b")
+        let worktreeB = try makeTemporaryDirectory(named: "cancel-retirement-worktree-b")
+        let tabAID = UUID()
+        let tabBID = UUID()
+        let interruptGate = AgentRunWorktreeStartAsyncGate()
+        let cancellingController = CancellationRetirementFakeCodexController(interruptGate: interruptGate)
+        var controllerCreationCountByTabID: [UUID: Int] = [:]
+
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, tabID, _, _, _, _ in
+                let creationIndex = controllerCreationCountByTabID[tabID, default: 0]
+                controllerCreationCountByTabID[tabID] = creationIndex + 1
+                if tabID == tabAID, creationIndex == 0 {
+                    return cancellingController
+                }
+                return ReplacementIdentityFakeCodexController()
+            }
+        )
+        viewModel.test_initializeRunService()
+
+        let sessionA = viewModel.session(for: tabAID)
+        sessionA.selectedAgent = .codexExec
+        sessionA.worktreeBindings = [makeBinding(logicalRoot: rootA.path, worktreeRoot: worktreeA.path)]
+        let sessionB = viewModel.session(for: tabBID)
+        sessionB.selectedAgent = .codexExec
+        sessionB.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktreeB.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        XCTAssertEqual(controllerCreationCountByTabID[tabAID], 1)
+
+        let cancelTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.cancelCodexRun(sessionA)
+        }
+        await interruptGate.waitUntilStarted()
+        XCTAssertEqual(cancellingController.recordedOperations, [.interruptStarted])
+
+        let replacementEnsureStarted = expectation(description: "same-tab replacement ensure started")
+        let replaceATask = Task { @MainActor in
+            replacementEnsureStarted.fulfill()
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        }
+        await fulfillment(of: [replacementEnsureStarted], timeout: 1)
+        XCTAssertEqual(
+            controllerCreationCountByTabID[tabAID],
+            1,
+            "same-tab replacement must remain behind the in-flight cancel interrupt and shutdown"
+        )
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionB)
+        XCTAssertEqual(
+            controllerCreationCountByTabID[tabBID],
+            1,
+            "another tab must not serialize behind tab A cancellation retirement"
+        )
+        XCTAssertEqual(controllerCreationCountByTabID[tabAID], 1)
+
+        await interruptGate.release()
+        await cancelTask.value
+        await replaceATask.value
+        XCTAssertEqual(cancellingController.recordedOperations, [.interruptStarted, .interruptFinished, .shutdown])
+        XCTAssertEqual(controllerCreationCountByTabID[tabAID], 2)
+
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionA)
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionB)
+    }
+
+    func testCodexCancellationThenSessionCloseSharesOneJoinedRetirement() async {
+        let interruptGate = AgentRunWorktreeStartAsyncGate()
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let controller = CancellationRetirementFakeCodexController(
+            interruptGate: interruptGate,
+            shutdownGate: shutdownGate
+        )
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        )
+        viewModel.test_initializeRunService()
+
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        var cancellationCompleted = false
+        let cancellationTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.cancelCodexRun(session)
+            cancellationCompleted = true
+        }
+        await interruptGate.waitUntilStarted()
+        XCTAssertNil(
+            session.codexController,
+            "cancellation must detach the controller before its retirement suspends"
+        )
+
+        var closeCompleted = false
+        let closeStarted = expectation(description: "overlapping session close started")
+        let closeTask = Task { @MainActor in
+            closeStarted.fulfill()
+            await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+            closeCompleted = true
+        }
+        await fulfillment(of: [closeStarted], timeout: 1)
+
+        await interruptGate.release()
+        await shutdownGate.waitUntilStarted()
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(controller.shutdownDidFinish)
+        XCTAssertFalse(cancellationCompleted)
+        XCTAssertFalse(closeCompleted, "session close must join the cancellation retirement")
+
+        await shutdownGate.release()
+        await cancellationTask.value
+        await closeTask.value
+
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertTrue(controller.shutdownDidFinish)
+        XCTAssertTrue(cancellationCompleted)
+        XCTAssertTrue(closeCompleted)
+        XCTAssertEqual(
+            controller.recordedOperations,
+            [.interruptStarted, .interruptFinished, .shutdown]
+        )
+    }
+
+    func testCodexControllerRetirementIsPerTabAndJoinedBeforeWorkspaceReplacement() async throws {
+        let rootA = try makeTemporaryDirectory(named: "retirement-root-a")
+        let worktreeA1 = try makeTemporaryDirectory(named: "retirement-worktree-a1")
+        let worktreeA2 = try makeTemporaryDirectory(named: "retirement-worktree-a2")
+        let rootB = try makeTemporaryDirectory(named: "retirement-root-b")
+        let worktreeB1 = try makeTemporaryDirectory(named: "retirement-worktree-b1")
+        let worktreeB2 = try makeTemporaryDirectory(named: "retirement-worktree-b2")
+        let tabAID = UUID()
+        let tabBID = UUID()
+        let retirementGate = AgentRunWorktreeStartAsyncGate()
+        var createdPathsByTabID: [UUID: [CodexRuntimeWorkspacePaths]] = [:]
+        var firstControllerByTabID: [UUID: ReplacementIdentityFakeCodexController] = [:]
+
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, tabID, _, workspacePaths, _, _ in
+                createdPathsByTabID[tabID, default: []].append(workspacePaths)
+                let controller = ReplacementIdentityFakeCodexController(
+                    shutdownGate: tabID == tabAID && firstControllerByTabID[tabID] == nil
+                        ? retirementGate
+                        : nil
+                )
+                if firstControllerByTabID[tabID] == nil {
+                    firstControllerByTabID[tabID] = controller
+                }
+                return controller
+            }
+        )
+        viewModel.test_initializeRunService()
+
+        let sessionA = viewModel.session(for: tabAID)
+        sessionA.selectedAgent = .codexExec
+        sessionA.worktreeBindings = [makeBinding(logicalRoot: rootA.path, worktreeRoot: worktreeA1.path)]
+        let sessionB = viewModel.session(for: tabBID)
+        sessionB.selectedAgent = .codexExec
+        sessionB.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktreeB1.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionB)
+        XCTAssertEqual(createdPathsByTabID[tabAID]?.count, 1)
+        XCTAssertEqual(createdPathsByTabID[tabBID]?.count, 1)
+
+        sessionA.worktreeBindings = [makeBinding(logicalRoot: rootA.path, worktreeRoot: worktreeA2.path)]
+        let replaceATask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        }
+        await retirementGate.waitUntilStarted()
+        XCTAssertEqual(
+            createdPathsByTabID[tabAID]?.count,
+            1,
+            "tab A must not create its replacement while the old controller is still shutting down"
+        )
+
+        sessionB.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktreeB2.path)]
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionB)
+        XCTAssertEqual(
+            createdPathsByTabID[tabBID]?.count,
+            2,
+            "tab B retirement must not serialize behind tab A"
+        )
+        XCTAssertEqual(createdPathsByTabID[tabAID]?.count, 1)
+
+        await retirementGate.release()
+        await replaceATask.value
+        XCTAssertEqual(createdPathsByTabID[tabAID]?.count, 2)
+        XCTAssertEqual(
+            createdPathsByTabID[tabAID]?.last,
+            .worktreeBound(logicalRootPath: rootA.path, validatedWorktreeRootPath: worktreeA2.path)
+        )
+        XCTAssertEqual(
+            createdPathsByTabID[tabBID]?.last,
+            .worktreeBound(logicalRootPath: rootB.path, validatedWorktreeRootPath: worktreeB2.path)
+        )
+        XCTAssertEqual(firstControllerByTabID[tabAID]?.shutdownCallCount, 1)
+        XCTAssertEqual(firstControllerByTabID[tabBID]?.shutdownCallCount, 1)
+
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionA)
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionB)
+    }
+
+    func testCodexControllerReplacementKeysOnExecutionChangeAndSurvivesSecondaryBindingChanges() async throws {
+        let root = try makeTemporaryDirectory(named: "replacement-root")
+        let worktreeA = try makeTemporaryDirectory(named: "replacement-worktree-a")
+        let worktreeB = try makeTemporaryDirectory(named: "replacement-worktree-b")
+        let secondaryRoot = try makeTemporaryDirectory(named: "replacement-secondary-root")
+        let secondaryWorktree = try makeTemporaryDirectory(named: "replacement-secondary-worktree")
+
+        var createdPaths: [CodexRuntimeWorkspacePaths] = []
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: root.path,
+            codexControllerFactory: { _, _, _, workspacePaths, _, _ in
+                createdPaths.append(workspacePaths)
+                return ReplacementIdentityFakeCodexController()
+            }
+        )
+        viewModel.test_initializeRunService()
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktreeA.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(createdPaths, [
+            CodexRuntimeWorkspacePaths.worktreeBound(
+                logicalRootPath: root.path,
+                validatedWorktreeRootPath: worktreeA.path
+            )
+        ])
+        let firstController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+        let firstControllerIdentity = ObjectIdentifier(firstController)
+
+        // Unchanged pair: the controller instance survives another ensure pass.
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(createdPaths.count, 1)
+        XCTAssertEqual(controllerIdentity(in: session), firstControllerIdentity)
+
+        // Secondary-binding-only change: the unchanged primary pair keeps the controller.
+        session.worktreeBindings.append(
+            makeBinding(logicalRoot: secondaryRoot.path, worktreeRoot: secondaryWorktree.path)
+        )
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(createdPaths.count, 1)
+        XCTAssertEqual(controllerIdentity(in: session), firstControllerIdentity)
+
+        // Execution-only change (same launch root, new worktree) replaces the controller.
+        session.worktreeBindings[0] = makeBinding(logicalRoot: root.path, worktreeRoot: worktreeB.path)
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(createdPaths.count, 2)
+        XCTAssertEqual(
+            createdPaths.last,
+            CodexRuntimeWorkspacePaths.worktreeBound(
+                logicalRootPath: root.path,
+                validatedWorktreeRootPath: worktreeB.path
+            )
+        )
+        let replacementController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+        XCTAssertFalse(replacementController === firstController)
+    }
+
+    func testCodexControllerReplacementKeysOnLaunchOnlyChange() async throws {
+        let rootA = try makeTemporaryDirectory(named: "launch-only-root-a")
+        let rootB = try makeTemporaryDirectory(named: "launch-only-root-b")
+        let worktree = try makeTemporaryDirectory(named: "launch-only-worktree")
+
+        var createdPaths: [CodexRuntimeWorkspacePaths] = []
+        // No fallback workspace: the single binding is the selected primary regardless of its
+        // logical root, which lets the launch directory move while the execution directory stays.
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, workspacePaths, _, _ in
+                createdPaths.append(workspacePaths)
+                return ReplacementIdentityFakeCodexController()
+            }
+        )
+        viewModel.test_initializeRunService()
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.worktreeBindings = [makeBinding(logicalRoot: rootA.path, worktreeRoot: worktree.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(createdPaths, [
+            CodexRuntimeWorkspacePaths.worktreeBound(
+                logicalRootPath: rootA.path,
+                validatedWorktreeRootPath: worktree.path
+            )
+        ])
+        let firstController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+
+        session.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktree.path)]
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(createdPaths.count, 2)
+        XCTAssertEqual(
+            createdPaths.last,
+            CodexRuntimeWorkspacePaths.worktreeBound(
+                logicalRootPath: rootB.path,
+                validatedWorktreeRootPath: worktree.path
+            )
+        )
+        let replacementController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+        XCTAssertFalse(replacementController === firstController)
+    }
+
+    func testWorktreeCodexControllerFakesPreserveDistinctStreamAndShutdownSemantics() async {
+        let finishedController = WorktreeStartFakeCodexController()
+        var finishedIterator = finishedController.events.makeAsyncIterator()
+        let finishedEvent = await finishedIterator.next()
+        XCTAssertNil(finishedEvent)
+
+        let replacementController = ReplacementIdentityFakeCodexController()
+        let iteratorStarted = expectation(description: "replacement stream iterator started")
+        let streamFinishedBeforeShutdown = expectation(description: "replacement stream finished before shutdown")
+        streamFinishedBeforeShutdown.isInverted = true
+        let nextEventTask = Task { () -> CodexNativeSessionController.Event? in
+            var iterator = replacementController.events.makeAsyncIterator()
+            iteratorStarted.fulfill()
+            return await iterator.next()
+        }
+        let prematureFinishObserver = Task {
+            _ = await nextEventTask.value
+            guard !Task.isCancelled else { return }
+            streamFinishedBeforeShutdown.fulfill()
+        }
+
+        await fulfillment(of: [iteratorStarted], timeout: 1)
+        await fulfillment(of: [streamFinishedBeforeShutdown], timeout: 0.05)
+        prematureFinishObserver.cancel()
+
+        await replacementController.shutdown()
+        let eventAfterShutdown = await nextEventTask.value
+        _ = await prematureFinishObserver.value
+        XCTAssertNil(eventAfterShutdown)
+        XCTAssertEqual(replacementController.shutdownCallCount, 1)
+    }
+
+    private func controllerIdentity(in session: AgentModeViewModel.TabSession) -> ObjectIdentifier? {
+        session.codexController.map { ObjectIdentifier($0) }
     }
 
     func testAgentRunSnapshotIncludesWorktreeBindingFields() throws {
@@ -2228,6 +2880,226 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let exploreChild = viewModel.session(for: observation.tabID)
         XCTAssertEqual(exploreChild.parentSessionID, exploreParentID)
         XCTAssertEqual(exploreChild.worktreeBindings, observation.bindings)
+    }
+
+    func testAgentStartWorktreeSelectorsDefaultToWorkspacePrimaryRepoWhenRootsLoadedOutOfOrder() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/primary-selector-\(primaryFixture.suffix)"
+        let primaryWorktree = primaryFixture.sandbox.appendingPathComponent(
+            "primary-selector-worktree",
+            isDirectory: true
+        )
+        try runGit(
+            ["worktree", "add", "-b", branch, primaryWorktree.path, "HEAD"],
+            cwd: primaryFixture.repo
+        )
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: primaryFixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: primaryFixture.repo,
+            path: primaryWorktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: primaryFixture.repo) }
+        )
+
+        let primaryRef = WorkspaceRootRef(
+            id: UUID(),
+            name: "primary",
+            fullPath: primaryFixture.repo.path
+        )
+        let secondaryRef = WorkspaceRootRef(
+            id: UUID(),
+            name: "secondary",
+            fullPath: secondaryFixture.repo.path
+        )
+        let discoveryRoots = AgentMCPStartWorktreeCoordinator.repositoryDiscoveryRoots(
+            primaryRoot: primaryFixture.repo.path,
+            visibleRoots: [secondaryRef, primaryRef]
+        )
+        XCTAssertEqual(discoveryRoots, [primaryRef, secondaryRef])
+        let primaryAlias = primaryFixture.sandbox.appendingPathComponent("primary-repo-alias")
+        try FileManager.default.createSymbolicLink(
+            at: primaryAlias,
+            withDestinationURL: primaryFixture.repo
+        )
+        let aliasDiscoveryRoots = AgentMCPStartWorktreeCoordinator.repositoryDiscoveryRoots(
+            primaryRoot: primaryAlias.path,
+            visibleRoots: [secondaryRef, primaryRef]
+        )
+        XCTAssertEqual(aliasDiscoveryRoots, [primaryRef, secondaryRef])
+
+        let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        XCTAssertEqual(workspace.repoPaths.first, primaryFixture.repo.path)
+
+        for testCase in [
+            (label: "implicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: nil),
+            (label: "implicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: nil),
+            (label: "explicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: primaryFixture.repo.path),
+            (label: "explicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: primaryFixture.repo.path)
+        ] {
+            let service = makeAgentRunStartService(window: window, sourceTabID: nil)
+            var args: [String: Value] = [
+                "op": .string("start"),
+                "message": .string(testCase.label),
+                "detach": .bool(true),
+                "timeout": .int(0),
+                testCase.key: .string(testCase.selector)
+            ]
+            if let repoRoot = testCase.repoRoot {
+                args["worktree_repo_root"] = .string(repoRoot)
+            }
+            let value = try await service.execute(args: args)
+            let object = try XCTUnwrap(value.objectValue, testCase.label)
+            let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue, testCase.label)
+            let binding = try XCTUnwrap(bindings.first?.objectValue, testCase.label)
+            XCTAssertEqual(bindings.count, 1, testCase.label)
+            XCTAssertEqual(binding["worktree_id"]?.stringValue, descriptor.worktreeID, testCase.label)
+            XCTAssertEqual(binding["logical_root_path"]?.stringValue, primaryFixture.repo.path, testCase.label)
+            XCTAssertEqual(binding["worktree_root_path"]?.stringValue, descriptor.path, testCase.label)
+        }
+
+        let nestedFixture = try makeGitFixture()
+        let nestedPrimary = nestedFixture.repo.appendingPathComponent("NestedPrimary", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedPrimary, withIntermediateDirectories: true)
+        let nestedBranch = "feature/nested-primary-selector-\(nestedFixture.suffix)"
+        let nestedWorktree = nestedFixture.sandbox.appendingPathComponent("nested-primary-worktree", isDirectory: true)
+        try runGit(
+            ["worktree", "add", "-b", nestedBranch, nestedWorktree.path, "HEAD"],
+            cwd: nestedFixture.repo
+        )
+        let nestedWorktreePrimary = nestedWorktree.appendingPathComponent("NestedPrimary", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedWorktreePrimary, withIntermediateDirectories: true)
+
+        let nestedWindow = try await lifecycleFixture.makeWindow(
+            roots: [nestedPrimary, nestedFixture.repo],
+            loadRoots: false
+        )
+        _ = try await nestedWindow.workspaceManager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+        let nestedStore = nestedWindow.promptManager.workspaceFileContextStore
+        for root in await nestedStore.rootRefs(scope: .visibleWorkspace) {
+            await nestedStore.unloadRoot(id: root.id)
+        }
+        let loadedParent = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: nestedWindow,
+            path: nestedFixture.repo.path
+        )
+        let loadedNestedPrimary = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: nestedWindow,
+            path: nestedPrimary.path
+        )
+        let loadedRoots = await nestedStore.rootRefs(scope: .visibleWorkspace)
+        XCTAssertEqual(loadedRoots.map(\.id), [loadedParent.id, loadedNestedPrimary.id])
+        XCTAssertEqual(nestedWindow.workspaceManager.activeWorkspace?.repoPaths.first, nestedPrimary.path)
+
+        let nestedService = makeAgentRunStartService(window: nestedWindow, sourceTabID: nil)
+        let nestedValue = try await nestedService.execute(args: [
+            "op": .string("start"),
+            "message": .string("git-style repository selector preserves declared nested primary root"),
+            "detach": .bool(true),
+            "timeout": .int(0),
+            "worktree": .string("@branch:\(nestedBranch)"),
+            "worktree_repo_root": .string("@main")
+        ])
+        let nestedObject = try XCTUnwrap(nestedValue.objectValue)
+        let nestedBindings = try XCTUnwrap(nestedObject["worktree_bindings"]?.arrayValue)
+        let nestedBinding = try XCTUnwrap(nestedBindings.first?.objectValue)
+        XCTAssertEqual(nestedBindings.count, 1)
+        XCTAssertEqual(nestedBinding["logical_root_path"]?.stringValue, nestedPrimary.path)
+        XCTAssertEqual(nestedBinding["worktree_root_path"]?.stringValue, nestedWorktreePrimary.path)
+    }
+
+    func testAgentStartWorktreeSelectorsRejectCrossRepositoryMatchesForImplicitAndExplicitPrimaryRoot() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/cross-repo-selector-\(secondaryFixture.suffix)"
+        let secondaryWorktree = secondaryFixture.sandbox.appendingPathComponent(
+            "cross-repo-selector-worktree",
+            isDirectory: true
+        )
+        try runGit(
+            ["worktree", "add", "-b", branch, secondaryWorktree.path, "HEAD"],
+            cwd: secondaryFixture.repo
+        )
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: secondaryFixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: secondaryFixture.repo,
+            path: secondaryWorktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo) }
+        )
+        let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        let viewModel = window.agentModeViewModel
+        let initialTabCount = try XCTUnwrap(window.workspaceManager.activeWorkspace).composeTabs.count
+        let initialSessionCount = viewModel.sessions.count
+
+        for testCase in [
+            (label: "implicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: nil),
+            (label: "implicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: nil),
+            (label: "explicit worktree id", key: "worktree_id", selector: descriptor.worktreeID, repoRoot: primaryFixture.repo.path),
+            (label: "explicit branch selector", key: "worktree", selector: "@branch:\(branch)", repoRoot: primaryFixture.repo.path)
+        ] {
+            let service = makeAgentRunStartService(window: window, sourceTabID: nil)
+            var args: [String: Value] = [
+                "op": .string("start"),
+                "message": .string(testCase.label),
+                "detach": .bool(true),
+                "timeout": .int(0),
+                testCase.key: .string(testCase.selector)
+            ]
+            if let repoRoot = testCase.repoRoot {
+                args["worktree_repo_root"] = .string(repoRoot)
+            }
+            do {
+                _ = try await service.execute(args: args)
+                XCTFail("Expected cross-repository selector rejection: \(testCase.label)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("No worktree found"), testCase.label)
+            }
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.count, initialTabCount, testCase.label)
+            XCTAssertEqual(viewModel.sessions.count, initialSessionCount, testCase.label)
+        }
+    }
+
+    func testAgentStartWorktreeSelectorRejectsSecondaryGitRepoWhenPrimaryRootIsNonGit() async throws {
+        let primaryRoot = try makeTemporaryDirectory(named: "non-git-primary-root")
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/secondary-selector-\(secondaryFixture.suffix)"
+        let secondaryWorktree = secondaryFixture.sandbox.appendingPathComponent(
+            "secondary-selector-worktree",
+            isDirectory: true
+        )
+        try runGit(
+            ["worktree", "add", "-b", branch, secondaryWorktree.path, "HEAD"],
+            cwd: secondaryFixture.repo
+        )
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: secondaryFixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: secondaryFixture.repo,
+            path: secondaryWorktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo) }
+        )
+        let window = try await makeWindow(roots: [primaryRoot, secondaryFixture.repo])
+        let initialTabCount = try XCTUnwrap(window.workspaceManager.activeWorkspace).composeTabs.count
+
+        let service = makeAgentRunStartService(window: window, sourceTabID: nil)
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("start"),
+                "message": .string("reject secondary repository"),
+                "detach": .bool(true),
+                "timeout": .int(0),
+                "worktree_id": .string(descriptor.worktreeID)
+            ])
+            XCTFail("Expected a secondary-repository worktree to be rejected when the primary root is non-Git")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("supports the primary workspace root only"))
+        }
+        XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.count, initialTabCount)
     }
 
     func testSharedStartWorktreeCoordinatorHonorsPreCancelledCreateWithoutMutation() async throws {
@@ -4111,80 +4983,134 @@ private enum CoordinatorPostCreateFailure: Error {
     case injected
 }
 
-private final class WorktreeStartFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults {
-    var hasActiveThread: Bool {
-        false
-    }
-
+private final class WorktreeStartFakeCodexController: CodexSessionControllerPassiveStubDefaults {
     var events: AsyncStream<CodexNativeSessionController.Event> {
         AsyncStream { continuation in continuation.finish() }
     }
 
-    func ensureEventsStreamReady() {}
-
-    func startOrResume(
-        existing: CodexNativeSessionController.SessionRef?,
-        baseInstructions: String
-    ) async throws -> CodexNativeSessionController.SessionRef {
-        CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: nil, reasoningEffort: nil)
-    }
-
-    func startOrResume(
-        existing: CodexNativeSessionController.SessionRef?,
-        baseInstructions: String,
-        model: String?,
-        reasoningEffort: String?
-    ) async throws -> CodexNativeSessionController.SessionRef {
-        CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
-    }
-
-    func startOrResume(
-        existing: CodexNativeSessionController.SessionRef?,
-        baseInstructions: String,
-        model: String?,
-        reasoningEffort: String?,
-        serviceTier: String?
-    ) async throws -> CodexNativeSessionController.SessionRef {
-        CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
-    }
-
-    func readThreadSnapshot(
-        includeTurns: Bool,
-        timeout: TimeInterval?
-    ) async throws -> CodexNativeSessionController.ThreadSnapshot {
-        CodexNativeSessionController.ThreadSnapshot(
-            conversationID: "fake",
-            rolloutPath: nil,
-            model: nil,
-            reasoningEffort: nil,
-            runtimeStatus: .idle,
-            currentTurnID: nil,
-            activeTurnIDs: [],
-            latestTurnStatus: nil
-        )
-    }
-
-    func setThreadName(_ name: String, threadID: String?) async throws {}
-    func compactThread() async throws {}
-    func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
-        nil
-    }
-
-    func setThreadGoalObjective(_ objective: String) async throws -> CodexNativeSessionController.ThreadGoal {
-        throw CancellationError()
-    }
-
-    func setThreadGoalStatus(_ status: CodexNativeSessionController.ThreadGoalStatus) async throws -> CodexNativeSessionController.ThreadGoal {
-        throw CancellationError()
-    }
-
-    func clearThreadGoal() async throws -> Bool {
-        false
-    }
-
-    func cancelCurrentTurn() async {}
     func shutdown() async {}
-    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
+}
+
+/// Cancellation retirement tests keep the controller event stream open so the gated interrupt,
+/// rather than unexpected-stream-end recovery, remains the only replacement fence under test.
+private final class CancellationRetirementFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
+    enum Operation: Equatable {
+        case interruptStarted
+        case interruptFinished
+        case shutdown
+    }
+
+    private let lock = NSLock()
+    private let interruptGate: AgentRunWorktreeStartAsyncGate
+    private let shutdownGate: AgentRunWorktreeStartAsyncGate?
+    private var operations: [Operation] = []
+    private var shutdownCount = 0
+    private var didFinishShutdown = false
+    private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+    private let eventsStream: AsyncStream<CodexNativeSessionController.Event>
+
+    init(
+        interruptGate: AgentRunWorktreeStartAsyncGate,
+        shutdownGate: AgentRunWorktreeStartAsyncGate? = nil
+    ) {
+        self.interruptGate = interruptGate
+        self.shutdownGate = shutdownGate
+        var continuationRef: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+        eventsStream = AsyncStream { continuation in
+            continuationRef = continuation
+        }
+        eventsContinuation = continuationRef
+    }
+
+    deinit {
+        eventsContinuation?.finish()
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        eventsStream
+    }
+
+    var recordedOperations: [Operation] {
+        lock.lock()
+        defer { lock.unlock() }
+        return operations
+    }
+
+    var shutdownCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return shutdownCount
+    }
+
+    var shutdownDidFinish: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didFinishShutdown
+    }
+
+    func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
+        record(.interruptStarted)
+        await interruptGate.markStartedAndWaitForRelease()
+        record(.interruptFinished)
+        return CodexTurnInterruptReceipt(interruptedTurnID: "cancel-retirement-test")
+    }
+
+    func shutdown() async {
+        lock.lock()
+        operations.append(.shutdown)
+        shutdownCount += 1
+        lock.unlock()
+        if let shutdownGate {
+            await shutdownGate.markStartedAndWaitForRelease()
+        }
+        lock.lock()
+        didFinishShutdown = true
+        lock.unlock()
+        eventsContinuation?.finish()
+        eventsContinuation = nil
+    }
+
+    private func record(_ operation: Operation) {
+        lock.lock()
+        operations.append(operation)
+        lock.unlock()
+    }
+}
+
+/// Controller-replacement identity tests need a controller whose events stream stays open:
+/// a finished stream triggers the coordinator's unexpected-stream-end recovery, which would
+/// recycle the controller for reasons unrelated to the workspace-path replacement key.
+private final class ReplacementIdentityFakeCodexController: CodexSessionControllerPassiveStubDefaults {
+    private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+    private(set) var shutdownCallCount = 0
+    private let eventsStream: AsyncStream<CodexNativeSessionController.Event>
+    private let shutdownGate: AgentRunWorktreeStartAsyncGate?
+
+    init(shutdownGate: AgentRunWorktreeStartAsyncGate? = nil) {
+        self.shutdownGate = shutdownGate
+        var continuationRef: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+        eventsStream = AsyncStream { continuation in
+            continuationRef = continuation
+        }
+        eventsContinuation = continuationRef
+    }
+
+    deinit {
+        eventsContinuation?.finish()
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        eventsStream
+    }
+
+    func shutdown() async {
+        shutdownCallCount += 1
+        if let shutdownGate {
+            await shutdownGate.markStartedAndWaitForRelease()
+        }
+        eventsContinuation?.finish()
+        eventsContinuation = nil
+    }
 }
 
 private actor AgentRunWorktreeStartAsyncGate {

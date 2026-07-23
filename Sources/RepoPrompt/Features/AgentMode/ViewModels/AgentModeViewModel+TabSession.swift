@@ -496,9 +496,10 @@ extension AgentModeViewModel {
         /// The task label kind the current Codex controller was created with.
         /// Used to detect when role-specific native tool overrides require controller recycling.
         var codexControllerTaskLabelKind: AgentModelCatalog.TaskLabelKind?
-        /// The effective workspace path the current Codex controller was created with.
-        /// Used to recycle the provider when a session worktree binding changes cwd.
-        var codexControllerWorkspacePath: String?
+        /// The launch/execution directory pair the current Codex controller was created with.
+        /// Controller replacement key: the provider is recycled when either directory changes,
+        /// e.g. when a session worktree binding moves the execution cwd.
+        var codexControllerWorkspacePaths: CodexRuntimeWorkspacePaths?
         struct CodexControllerFeatureState: Equatable {
             var computerUseEnabled: Bool
             var goalSupportEnabled: Bool

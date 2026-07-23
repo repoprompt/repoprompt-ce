@@ -14,6 +14,18 @@ distribution. The copied license is included at
 the downloaded asset checksum and provenance are recorded under
 [`Vendor/Sparkle/`](Vendor/Sparkle/).
 
+## OpenAI Codex
+
+RepoPrompt CE bundles the complete official OpenAI Codex 0.144.6 standalone
+package for the selected macOS architecture. Codex is licensed under the
+Apache License, Version 2.0. Its copied license and notice are included under
+[`ThirdPartyLicenses/codex/`](ThirdPartyLicenses/codex/), and the exact release
+archives, checksums, layouts, architectures, and upstream macOS signing
+identities are pinned in [`Vendor/Codex/manifest.json`](Vendor/Codex/manifest.json).
+The complete Codex package also contains Zsh 5.9 at
+`codex-resources/zsh/bin/zsh`; its upstream licence is copied as
+[`ThirdPartyLicenses/codex/ZSH-LICENCE`](ThirdPartyLicenses/codex/ZSH-LICENCE).
+
 ## UniversalCharsetDetection / uchardet
 
 RepoPrompt CE vendors UniversalCharsetDetection and uchardet source. Their

@@ -11,6 +11,7 @@ struct ReferencedTypesAccumulator {
     let language: LanguageType
     private(set) var types: Set<String> = []
     private var cache: [TypeCleaner.TypeCleanerCacheKey: [String]] = [:]
+    private var seenSwiftRawTypes: Set<String> = []
     private var rawInsertCount = 0
     private let stats: CodeMapPerformanceCollector?
     private let perfOptions: CodeMapPerfOptions
@@ -37,6 +38,27 @@ struct ReferencedTypesAccumulator {
                 activeStats?.referencedTypesEmptyResults += 1
             }
             return
+        }
+        if language == .swift {
+            let dedupStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            if perfCollectCounters {
+                activeStats?.referencedTypesSwiftDedupEligibleCount += 1
+            }
+            let inserted = seenSwiftRawTypes.insert(raw).inserted
+            if perfCollectCounters {
+                if inserted {
+                    activeStats?.referencedTypesSwiftFirstSeenCount += 1
+                } else {
+                    activeStats?.referencedTypesSwiftDuplicateSkipCount += 1
+                    activeStats?.referencedTypesSwiftDuplicateSkippedUTF8ByteCount += raw.utf8.count
+                }
+            }
+            if perfEnabled {
+                activeStats?.referencedTypesSwiftRawTypeDedupDuration += CFAbsoluteTimeGetCurrent() - dedupStart
+            }
+            if !inserted {
+                return
+            }
         }
         let start = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         let extracted = TypeCleaner.extractBaseTypes(from: raw, language: language, cache: &cache, stats: activeStats)

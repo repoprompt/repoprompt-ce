@@ -768,6 +768,7 @@ class WindowState: ObservableObject {
             return nil
         }
         return AgentChatOptionsMenuTarget(
+            windowID: windowID,
             workspaceID: workspace.id,
             tabID: tabID,
             agentSessionID: agentSessionID,
@@ -776,7 +777,8 @@ class WindowState: ObservableObject {
     }
 
     func agentChatTitleClusterMenuTargetIsValid(_ target: AgentChatOptionsMenuTarget) -> Bool {
-        guard let workspace = workspaceManager.activeWorkspace,
+        guard target.windowID == windowID,
+              let workspace = workspaceManager.activeWorkspace,
               workspace.id == target.workspaceID,
               workspace.composeTabs.contains(where: { $0.id == target.tabID })
         else {
@@ -804,7 +806,13 @@ class WindowState: ObservableObject {
         )
     }
 
-    func agentChatTitleClusterMenuActions() -> AgentChatOptionsMenuActions {
+    func agentChatTitleClusterMenuActions(
+        copyToClipboard: @escaping (String) -> Void = { value in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(value, forType: .string)
+        }
+    ) -> AgentChatOptionsMenuActions {
         AgentChatOptionsMenuActions(
             togglePin: { [weak self] target in
                 self?.toggleAgentChatPinFromTitlebar(target: target)
@@ -814,6 +822,12 @@ class WindowState: ObservableObject {
             },
             stash: { [weak self] target in
                 self?.stashAgentChatFromTitlebar(target: target)
+            },
+            copyHandoffPrompt: { [weak self] target in
+                self?.copyAgentChatHandoffPromptFromTitlebar(
+                    target: target,
+                    copyToClipboard: copyToClipboard
+                )
             },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
@@ -831,6 +845,18 @@ class WindowState: ObservableObject {
     private func toggleAgentChatPinFromTitlebar(target: AgentChatOptionsMenuTarget) {
         guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
         promptManager.toggleComposeTabPinned(target.tabID)
+    }
+
+    private func copyAgentChatHandoffPromptFromTitlebar(
+        target: AgentChatOptionsMenuTarget,
+        copyToClipboard: (String) -> Void
+    ) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let prompt = AgentSessionHandoffPrompt.render(
+            target: target,
+            cliCommandName: MCPFilesystemConstants.identity.pathCLICommandName
+        )
+        copyToClipboard(prompt)
     }
 
     private func stashAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {

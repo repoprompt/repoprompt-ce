@@ -269,6 +269,11 @@ validate_app_bundle() {
 
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh" "$app_bundle"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
+        --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \
+        --arch all \
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex" \
+        --signed-team-identifier "$SIGNING_TEAM_ID"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$app_bundle" \
@@ -290,6 +295,11 @@ validate_dmg_matches_zip_app() {
     diff -qr "$APP_BUNDLE" "$dmg_app" ||
         fail "DMG app contents do not match the verified update ZIP app"
     validate_embedded_mcp_helper_layout "$dmg_app" "Mounted DMG MCP helper layout"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
+        --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \
+        --arch all \
+        --bundle "$dmg_app/Contents/Resources/BundledRuntimes/Codex" \
+        --signed-team-identifier "$SIGNING_TEAM_ID"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$dmg_app" \
         "arm64,x86_64" \
@@ -377,6 +387,8 @@ verify_source_release() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py"
+    require_file "$ROOT_DIR/Vendor/Codex/manifest.json"
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"

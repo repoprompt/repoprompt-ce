@@ -795,6 +795,28 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     }
 }
 
+enum WorkspaceCodemapCurrentProjectionUnavailableReason: String, Hashable {
+    case rootNotRegistered
+    case jobNotScheduled
+}
+
+enum WorkspaceCodemapCurrentProjectionSnapshot: Hashable {
+    case unavailable(reason: WorkspaceCodemapCurrentProjectionUnavailableReason)
+    case pending(
+        phase: WorkspaceCodemapProjectionPreloadPhase,
+        progress: WorkspaceCodemapProjectionProgress,
+        retry: WorkspaceCodemapProjectionRetry?,
+        budget: WorkspaceCodemapProjectionBudget?
+    )
+    /// A proof-bearing completion. Coverage proofs and completion uptime are assigned only
+    /// after an accepted or exact-duplicate projection seal.
+    case authoritativeComplete(
+        proof: WorkspaceCodemapProjectionCoverageProof,
+        completedUptimeNanoseconds: UInt64
+    )
+    case nonCurrent
+}
+
 struct WorkspaceCodemapBindingEngineProjectionRootAccounting: Equatable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let phase: WorkspaceCodemapProjectionPreloadPhase

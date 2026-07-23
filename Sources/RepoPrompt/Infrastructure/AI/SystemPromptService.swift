@@ -1,20 +1,6 @@
 import Foundation
 
 class SystemPromptService {
-    static let chatCodeFence = "```"
-
-    // MARK: - Language to Extension Mapping
-
-    private static let languageToExtension: [String: String] = [
-        "Swift": "swift", "JavaScript": "js", "TypeScript": "ts",
-        "Python": "py", "Java": "java", "C#": "cs", "C++": "cpp", "C": "c",
-        "Go": "go", "Rust": "rs", "PHP": "php", "Ruby": "rb", "Dart": "dart"
-    ]
-
-    static func fileExtension(for language: String) -> String {
-        languageToExtension[language] ?? "txt"
-    }
-
     /// Returns the Discover prompt with an optional token budget.
     /// - Parameter tokenBudget: Optional token budget for the final selection. If nil, targets 50-80k tokens.
     /// - Parameter agentKind: The agent that will execute this prompt, affects tool restriction warnings.
@@ -1118,11 +1104,6 @@ class SystemPromptService {
         """
     }
 
-    static func predominantLanguage(from files: [FileViewModel]) -> String {
-        let extensions = files.compactMap { $0.fileExtension?.lowercased() }
-        return predominantLanguage(fromExtensions: extensions)
-    }
-
     static func predominantLanguage(from files: [WorkspaceFileRecord]) -> String {
         let extensions = files.map { file in
             let ext = (file.name as NSString).pathExtension.lowercased()
@@ -1145,16 +1126,6 @@ class SystemPromptService {
             "go": "Go", "rs": "Rust", "php": "PHP", "rb": "Ruby", "dart": "Dart"
         ]
         return map[mostCommon] ?? "Swift"
-    }
-
-    /// Determines the predominant language from selected files
-    @MainActor
-    static func getPredominantLanguage(from fileManager: WorkspaceFilesViewModel) -> (language: String, fileExtension: String) {
-        let files = fileManager.selectedFiles
-        let language = predominantLanguage(from: files)
-        // Keep the old signature for backward compatibility, but the extension is derived from language
-        let ext = fileExtension(for: language)
-        return (language: language, fileExtension: ext)
     }
 
     static func getFileRecommendationPrompt() -> String {

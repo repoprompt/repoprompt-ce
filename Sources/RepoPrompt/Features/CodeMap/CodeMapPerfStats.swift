@@ -9,29 +9,6 @@
 import Foundation
 import RepoPromptCodeMapCore
 
-struct CodeMapSyntaxStartupPerfStats {
-    var primeDuration: TimeInterval = 0
-    var warmCacheDuration: TimeInterval = 0
-    var warmCodeMapQueriesDuration: TimeInterval = 0
-    var languageConfigCreateDuration: TimeInterval = 0
-    var languagePointerDuration: TimeInterval = 0
-    var highlightQueryDataDuration: TimeInterval = 0
-    var highlightQueryCompileDuration: TimeInterval = 0
-    var codeMapQueryDataDuration: TimeInterval = 0
-    var codeMapQueryCompileDuration: TimeInterval = 0
-
-    var warmCacheLanguageCount = 0
-    var languageConfigCreateCount = 0
-    var languageConfigSuccessCount = 0
-    var languageConfigFailureCount = 0
-    var highlightQueryCompileSuccessCount = 0
-    var highlightQueryCompileFailureCount = 0
-    var warmCodeMapQueryLanguageCount = 0
-    var codeMapQueryPrecomputeSuccessCount = 0
-    var codeMapQueryPrecomputeFailureCount = 0
-    var codeMapQueryPrecomputeSkippedCount = 0
-}
-
 struct CodeMapSyntaxPerfStats {
     var languageLookupDuration: TimeInterval = 0
     var oversizeGuardDuration: TimeInterval = 0
@@ -50,8 +27,7 @@ struct CodeMapSyntaxPerfStats {
     var parserCreates = 0
     var queryExecutes = 0
     var captures = 0
-    var codeMapQueryCacheHits = 0
-    var codeMapQueryCacheMisses = 0
+    var codeMapQuerySuccessfulLookups = 0
 }
 
 struct CodeMapPipelinePerfSnapshot: Equatable {
@@ -65,15 +41,6 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var parseAndQueryDuration: TimeInterval = 0
     var generatorDuration: TimeInterval = 0
     var batchApplyDuration: TimeInterval = 0
-    var syntaxManagerPrimeDuration: TimeInterval = 0
-    var syntaxWarmCacheDuration: TimeInterval = 0
-    var syntaxWarmCodeMapQueriesDuration: TimeInterval = 0
-    var syntaxLanguageConfigCreateDuration: TimeInterval = 0
-    var syntaxLanguagePointerDuration: TimeInterval = 0
-    var syntaxHighlightQueryDataDuration: TimeInterval = 0
-    var syntaxHighlightQueryCompileDuration: TimeInterval = 0
-    var syntaxCodeMapQueryDataDuration: TimeInterval = 0
-    var syntaxCodeMapQueryCompileDuration: TimeInterval = 0
     var syntaxLanguageLookupDuration: TimeInterval = 0
     var syntaxOversizeGuardDuration: TimeInterval = 0
     var syntaxParserCreateDuration: TimeInterval = 0
@@ -117,6 +84,8 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var generatorFallbackFunctionSkippedDuration: TimeInterval = 0
     var generatorDeclarationExtractionDuration: TimeInterval = 0
     var generatorJSTSSignatureDuration: TimeInterval = 0
+    var generatorJSTSNormalizationASCIIFastPathDuration: TimeInterval = 0
+    var generatorJSTSNormalizationLegacyFallbackDuration: TimeInterval = 0
     var generatorLanguageTypeExtractorFunctionDuration: TimeInterval = 0
     var generatorLanguageTypeExtractorVariableDuration: TimeInterval = 0
     var generatorTypeCleanerDuration: TimeInterval = 0
@@ -131,6 +100,7 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var generatorTypeCleanerTSObjectLiteralDuration: TimeInterval = 0
     var generatorTypeCleanerFilterDuration: TimeInterval = 0
     var generatorTypeCleanerDedupDuration: TimeInterval = 0
+    var generatorReferencedTypesSwiftRawTypeDedupDuration: TimeInterval = 0
     var generatorReferencedTypesFinalizeDuration: TimeInterval = 0
     var generatorFileAPIInitDuration: TimeInterval = 0
 
@@ -142,18 +112,7 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var parseFailures = 0
     var generatedAPIs = 0
     var nilAPIs = 0
-    var codeMapQueryCacheHits = 0
-    var codeMapQueryCacheMisses = 0
-    var syntaxWarmCacheLanguageCount = 0
-    var syntaxLanguageConfigCreateCount = 0
-    var syntaxLanguageConfigSuccessCount = 0
-    var syntaxLanguageConfigFailureCount = 0
-    var syntaxHighlightQueryCompileSuccessCount = 0
-    var syntaxHighlightQueryCompileFailureCount = 0
-    var syntaxWarmCodeMapQueryLanguageCount = 0
-    var syntaxCodeMapQueryPrecomputeSuccessCount = 0
-    var syntaxCodeMapQueryPrecomputeFailureCount = 0
-    var syntaxCodeMapQueryPrecomputeSkippedCount = 0
+    var codeMapQuerySuccessfulLookups = 0
     var syntaxCodeMapCalls = 0
     var syntaxUnsupportedExtensionCount = 0
     var syntaxOversizedSkipCount = 0
@@ -205,6 +164,9 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var captureDeclarationCalls = 0
     var jstsSignatureCallsFunctionLike = 0
     var jstsSignatureCallsStatementLike = 0
+    var jstsNormalizationASCIINoOpCount = 0
+    var jstsNormalizationASCIIRewriteCount = 0
+    var jstsNormalizationUnicodeFallbackCount = 0
     var lteMatchAnyFunctionCalls = 0
     var lteMatchAnyVariableCalls = 0
     var typeCleanerExtractCalls = 0
@@ -223,6 +185,10 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var typeCleanerDedupCount = 0
     var referencedTypesRawInsertions = 0
     var referencedTypesPrefilterSkips = 0
+    var referencedTypesSwiftDedupEligibleCount = 0
+    var referencedTypesSwiftFirstSeenCount = 0
+    var referencedTypesSwiftDuplicateSkipCount = 0
+    var referencedTypesSwiftDuplicateSkippedUTF8ByteCount = 0
     var referencedTypesEmptyResults = 0
     var referencedTypesOutputTypeCount = 0
     var extractionMemoJSTSHits = 0
@@ -268,31 +234,6 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
         }
     }
 
-    func mergeSyntaxManagerStartupStats(_ stats: CodeMapSyntaxStartupPerfStats) {
-        lock.withLock {
-            storage.syntaxManagerPrimeDuration += stats.primeDuration
-            storage.syntaxWarmCacheDuration += stats.warmCacheDuration
-            storage.syntaxWarmCodeMapQueriesDuration += stats.warmCodeMapQueriesDuration
-            storage.syntaxLanguageConfigCreateDuration += stats.languageConfigCreateDuration
-            storage.syntaxLanguagePointerDuration += stats.languagePointerDuration
-            storage.syntaxHighlightQueryDataDuration += stats.highlightQueryDataDuration
-            storage.syntaxHighlightQueryCompileDuration += stats.highlightQueryCompileDuration
-            storage.syntaxCodeMapQueryDataDuration += stats.codeMapQueryDataDuration
-            storage.syntaxCodeMapQueryCompileDuration += stats.codeMapQueryCompileDuration
-
-            storage.syntaxWarmCacheLanguageCount += stats.warmCacheLanguageCount
-            storage.syntaxLanguageConfigCreateCount += stats.languageConfigCreateCount
-            storage.syntaxLanguageConfigSuccessCount += stats.languageConfigSuccessCount
-            storage.syntaxLanguageConfigFailureCount += stats.languageConfigFailureCount
-            storage.syntaxHighlightQueryCompileSuccessCount += stats.highlightQueryCompileSuccessCount
-            storage.syntaxHighlightQueryCompileFailureCount += stats.highlightQueryCompileFailureCount
-            storage.syntaxWarmCodeMapQueryLanguageCount += stats.warmCodeMapQueryLanguageCount
-            storage.syntaxCodeMapQueryPrecomputeSuccessCount += stats.codeMapQueryPrecomputeSuccessCount
-            storage.syntaxCodeMapQueryPrecomputeFailureCount += stats.codeMapQueryPrecomputeFailureCount
-            storage.syntaxCodeMapQueryPrecomputeSkippedCount += stats.codeMapQueryPrecomputeSkippedCount
-        }
-    }
-
     func mergeSyntaxCodeMapStats(_ stats: CodeMapSyntaxPerfStats) {
         lock.withLock {
             storage.syntaxLanguageLookupDuration += stats.languageLookupDuration
@@ -312,8 +253,7 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.syntaxParserCreateCount += stats.parserCreates
             storage.syntaxQueryExecuteCount += stats.queryExecutes
             storage.syntaxCaptureCount += stats.captures
-            storage.codeMapQueryCacheHits += stats.codeMapQueryCacheHits
-            storage.codeMapQueryCacheMisses += stats.codeMapQueryCacheMisses
+            storage.codeMapQuerySuccessfulLookups += stats.codeMapQuerySuccessfulLookups
         }
     }
 
@@ -336,8 +276,7 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
                 parserCreates: stats.syntaxParserCreates,
                 queryExecutes: stats.syntaxQueryExecutes,
                 captures: stats.syntaxCaptures,
-                codeMapQueryCacheHits: stats.syntaxCodeMapQueryCacheHits,
-                codeMapQueryCacheMisses: stats.syntaxCodeMapQueryCacheMisses
+                codeMapQuerySuccessfulLookups: stats.syntaxCodeMapQuerySuccessfulLookups
             )
         )
     }
@@ -379,6 +318,8 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.generatorFallbackFunctionSkippedDuration += stats.fallbackFunctionSkippedDuration
             storage.generatorDeclarationExtractionDuration += stats.captureDeclarationDuration
             storage.generatorJSTSSignatureDuration += stats.jstsSignatureDuration
+            storage.generatorJSTSNormalizationASCIIFastPathDuration += stats.jstsNormalizationASCIIFastPathDuration
+            storage.generatorJSTSNormalizationLegacyFallbackDuration += stats.jstsNormalizationLegacyFallbackDuration
             storage.generatorLanguageTypeExtractorFunctionDuration += stats.languageTypeExtractorFunctionDuration
             storage.generatorLanguageTypeExtractorVariableDuration += stats.languageTypeExtractorVariableDuration
             storage.generatorTypeCleanerDuration += stats.typeCleanerDuration
@@ -393,6 +334,7 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.generatorTypeCleanerTSObjectLiteralDuration += stats.typeCleanerTSObjectLiteralDuration
             storage.generatorTypeCleanerFilterDuration += stats.typeCleanerFilterDuration
             storage.generatorTypeCleanerDedupDuration += stats.typeCleanerDedupDuration
+            storage.generatorReferencedTypesSwiftRawTypeDedupDuration += stats.referencedTypesSwiftRawTypeDedupDuration
             storage.generatorReferencedTypesFinalizeDuration += stats.referencedTypesFinalizeDuration
             storage.generatorFileAPIInitDuration += stats.fileAPIInitDuration
 
@@ -439,6 +381,9 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.captureDeclarationCalls += stats.captureDeclarationCalls
             storage.jstsSignatureCallsFunctionLike += stats.jstsSignatureCallsFunctionLike
             storage.jstsSignatureCallsStatementLike += stats.jstsSignatureCallsStatementLike
+            storage.jstsNormalizationASCIINoOpCount += stats.jstsNormalizationASCIINoOpCount
+            storage.jstsNormalizationASCIIRewriteCount += stats.jstsNormalizationASCIIRewriteCount
+            storage.jstsNormalizationUnicodeFallbackCount += stats.jstsNormalizationUnicodeFallbackCount
             storage.lteMatchAnyFunctionCalls += stats.lteMatchAnyFunctionCalls
             storage.lteMatchAnyVariableCalls += stats.lteMatchAnyVariableCalls
             storage.typeCleanerExtractCalls += stats.typeCleanerExtractCalls
@@ -457,6 +402,10 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.typeCleanerDedupCount += stats.typeCleanerDedupCount
             storage.referencedTypesRawInsertions += stats.referencedTypesRawInsertions
             storage.referencedTypesPrefilterSkips += stats.referencedTypesPrefilterSkips
+            storage.referencedTypesSwiftDedupEligibleCount += stats.referencedTypesSwiftDedupEligibleCount
+            storage.referencedTypesSwiftFirstSeenCount += stats.referencedTypesSwiftFirstSeenCount
+            storage.referencedTypesSwiftDuplicateSkipCount += stats.referencedTypesSwiftDuplicateSkipCount
+            storage.referencedTypesSwiftDuplicateSkippedUTF8ByteCount += stats.referencedTypesSwiftDuplicateSkippedUTF8ByteCount
             storage.referencedTypesEmptyResults += stats.referencedTypesEmptyResults
             storage.referencedTypesOutputTypeCount += stats.referencedTypesOutputTypeCount
             storage.extractionMemoJSTSHits += stats.extractionMemoJSTSHits

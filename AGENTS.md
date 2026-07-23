@@ -40,6 +40,7 @@ Package without launching:
 
 ```bash
 make dev-build                  # coordinated debug package (preferred)
+make dev-codex-schema-check     # coordinated bounded Codex app-server schema drift check
 # uncoordinated equivalents:
 make build
 ./Scripts/package_app.sh debug
@@ -174,6 +175,7 @@ make dev-format         # mutates first-party Swift files; run only when intende
 make dev-format-tools-status
 make dev-check-format-tools
 make dev-install-format-tools
+make dev-codex-schema-check                         # unlaned generated-schema contract check
 ```
 
 Lane detail: the mutating `format` daemon job also claims `build` (it rewrites files the compiler reads); non-mutating `format-check` and `lint` use only `style`; read-only `format-tools-status` is intentionally unlaned so it never queues behind a build.
@@ -283,6 +285,7 @@ make dev-test FILTER=WorkspaceFileContextStoreTests
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
 make dev-provider-test
+make dev-codex-schema-check
 make guardrails
 make doctor
 make dev-build

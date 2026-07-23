@@ -226,7 +226,13 @@ package struct CodeMapSyntaxEngine: CodeMapSyntaxPerformanceQuerying, Sendable {
         performanceCollector: CodeMapPerformanceCollector?
     ) throws -> CodeMapSyntaxQueryOutcome {
         let collect = performanceCollector != nil
-        if collect { performanceCollector?.syntaxCalls = 1 }
+        let totalStart = collect ? ProcessInfo.processInfo.systemUptime : nil
+        defer {
+            if let totalStart {
+                performanceCollector?.syntaxTotalDuration += ProcessInfo.processInfo.systemUptime - totalStart
+            }
+        }
+        if collect { performanceCollector?.syntaxCalls += 1 }
 
         let oversizeStart = collect ? ProcessInfo.processInfo.systemUptime : nil
         let reason = oversizeReason(for: content)
@@ -282,7 +288,7 @@ package struct CodeMapSyntaxEngine: CodeMapSyntaxPerformanceQuerying, Sendable {
         if let queryLookupStart {
             performanceCollector?.syntaxCodeMapQueryLookupDuration +=
                 ProcessInfo.processInfo.systemUptime - queryLookupStart
-            performanceCollector?.syntaxCodeMapQueryCacheHits += 1
+            performanceCollector?.syntaxCodeMapQuerySuccessfulLookups += 1
         }
 
         let queryStart = collect ? ProcessInfo.processInfo.systemUptime : nil
@@ -298,6 +304,14 @@ package struct CodeMapSyntaxEngine: CodeMapSyntaxPerformanceQuerying, Sendable {
             performanceCollector?.syntaxCaptureMaterializationDuration +=
                 ProcessInfo.processInfo.systemUptime - materializationStart
             performanceCollector?.syntaxCaptures += captures.count
+            if performanceCollector?.collectsCaptureNames == true {
+                let countingStart = ProcessInfo.processInfo.systemUptime
+                for capture in captures {
+                    performanceCollector?.syntaxCaptureCountsByName[capture.name, default: 0] += 1
+                }
+                performanceCollector?.syntaxCaptureNameCountingDuration +=
+                    ProcessInfo.processInfo.systemUptime - countingStart
+            }
         }
         return .captures(captures)
     }

@@ -123,6 +123,8 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`workspace_loading_snapshot` is only available in DEBUG builds.")
                 #endif
+            case "codemap_full_load":
+                return await debugCodemapFullLoadPayload(op: op, arguments: arguments)
             case "mcp_read_search_capture_begin":
                 #if DEBUG
                     return debugMCPReadSearchCaptureBeginPayload(op: op, arguments: arguments)

@@ -41,7 +41,7 @@ enum ProcessExitStatus: Equatable {
     }
 }
 
-enum ProcessTerminationError: Error, LocalizedError {
+enum ProcessTerminationError: Error, Equatable, LocalizedError {
     case childOwnershipLost(pid: pid_t)
     case waitFailed(String)
 
@@ -52,6 +52,202 @@ enum ProcessTerminationError: Error, LocalizedError {
         case let .waitFailed(message):
             "waitpid failed: \(message)"
         }
+    }
+}
+
+/// Process-wide ownership registry for direct-child exit observation. A process
+/// source scales with the number of live children without occupying one worker
+/// thread per child, while the serial queue preserves exactly one destructive
+/// `waitpid` owner for each PID.
+private final class ChildStatusReaperRegistry: @unchecked Sendable {
+    static let shared = ChildStatusReaperRegistry()
+
+    private enum ReapMode {
+        case nonblockingProbe
+        case exitNotification
+
+        var waitOptions: Int32 {
+            switch self {
+            case .nonblockingProbe: WNOHANG
+            case .exitNotification: 0
+            }
+        }
+    }
+
+    private final class Entry {
+        let token: UUID
+        let source: any DispatchSourceProcess
+        let fallbackProbeTimer: any DispatchSourceTimer
+        let beforeReap: @Sendable () -> Void
+        let completion: @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
+
+        init(
+            token: UUID,
+            source: any DispatchSourceProcess,
+            fallbackProbeTimer: any DispatchSourceTimer,
+            beforeReap: @escaping @Sendable () -> Void,
+            completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
+        ) {
+            self.token = token
+            self.source = source
+            self.fallbackProbeTimer = fallbackProbeTimer
+            self.beforeReap = beforeReap
+            self.completion = completion
+        }
+    }
+
+    /// kevent exit delivery is not contractual under load: a process source
+    /// can rarely miss NOTE_EXIT even though it registered while the child was
+    /// alive, which would strand the observer and the child's zombie forever.
+    /// Each registration therefore keeps a low-frequency non-destructive probe
+    /// that self-heals a missed notification through the same token-guarded
+    /// sole-reap path.
+    private static let fallbackProbeInterval: TimeInterval = 0.5
+
+    private let queue = DispatchQueue(
+        label: "com.repoprompt.process-termination.child-status-registry",
+        qos: .userInitiated
+    )
+    private var entries: [pid_t: Entry] = [:]
+
+    func observe(
+        pid: pid_t,
+        beforeReap: @escaping @Sendable () -> Void,
+        completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard entries[pid] == nil else {
+                completion(.failure(.childOwnershipLost(pid: pid)))
+                return
+            }
+
+            let token = UUID()
+            let source = DispatchSource.makeProcessSource(
+                identifier: pid,
+                eventMask: .exit,
+                queue: queue
+            )
+            let fallbackProbeTimer = DispatchSource.makeTimerSource(queue: queue)
+            let entry = Entry(
+                token: token,
+                source: source,
+                fallbackProbeTimer: fallbackProbeTimer,
+                beforeReap: beforeReap,
+                completion: completion
+            )
+            entries[pid] = entry
+
+            source.setRegistrationHandler { [weak self] in
+                self?.probeWithoutBlocking(pid: pid, token: token)
+            }
+            source.setEventHandler { [weak self] in
+                self?.reapAfterExitNotification(pid: pid, token: token)
+            }
+            source.activate()
+
+            fallbackProbeTimer.schedule(
+                deadline: .now() + Self.fallbackProbeInterval,
+                repeating: Self.fallbackProbeInterval,
+                leeway: .milliseconds(100)
+            )
+            fallbackProbeTimer.setEventHandler { [weak self] in
+                self?.probeWithoutBlocking(pid: pid, token: token)
+            }
+            fallbackProbeTimer.activate()
+
+            // Activation and registration are distinct libdispatch steps. This
+            // probe plus the registration-handler probe cover exits on either
+            // side of that boundary without consuming a live child's status.
+            probeWithoutBlocking(pid: pid, token: token)
+        }
+    }
+
+    private func probeWithoutBlocking(pid: pid_t, token: UUID) {
+        reap(pid: pid, token: token, mode: .nonblockingProbe)
+    }
+
+    private func reapAfterExitNotification(pid: pid_t, token: UUID) {
+        reap(pid: pid, token: token, mode: .exitNotification)
+    }
+
+    private func reap(pid: pid_t, token: UUID, mode: ReapMode) {
+        guard let entry = entries[pid], entry.token == token else { return }
+
+        while true {
+            var info = siginfo_t()
+            let probeResult = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+            if probeResult == 0 {
+                guard info.si_pid == pid else { return }
+                break
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == ECHILD {
+                complete(pid: pid, token: token, result: .failure(.childOwnershipLost(pid: pid)))
+                return
+            }
+            complete(
+                pid: pid,
+                token: token,
+                result: .failure(.waitFailed(String(cString: strerror(errno))))
+            )
+            return
+        }
+
+        entry.beforeReap()
+        var status: Int32 = 0
+        while true {
+            let result = waitpid(pid, &status, mode.waitOptions)
+            if result == pid {
+                complete(
+                    pid: pid,
+                    token: token,
+                    result: .success(ProcessTermination.decodeWaitStatus(status))
+                )
+                return
+            }
+            if result == 0 {
+                switch mode {
+                case .nonblockingProbe:
+                    return
+                case .exitNotification:
+                    complete(
+                        pid: pid,
+                        token: token,
+                        result: .failure(.waitFailed("waitpid returned no status after process exit notification"))
+                    )
+                    return
+                }
+            }
+            if result == -1, errno == EINTR {
+                continue
+            }
+            if result == -1, errno == ECHILD {
+                complete(pid: pid, token: token, result: .failure(.childOwnershipLost(pid: pid)))
+                return
+            }
+            let message = String(cString: strerror(errno))
+            complete(pid: pid, token: token, result: .failure(.waitFailed(message)))
+            return
+        }
+    }
+
+    private func complete(
+        pid: pid_t,
+        token: UUID,
+        result: Result<ProcessExitStatus, ProcessTerminationError>
+    ) {
+        guard let entry = entries[pid], entry.token == token else { return }
+
+        // Lifecycle owners close their PID-signaling window synchronously at
+        // the destructive reap boundary, before this PID can be registered again.
+        entry.completion(result)
+        guard entries[pid]?.token == token else { return }
+        entries.removeValue(forKey: pid)
+        entry.source.cancel()
+        entry.fallbackProbeTimer.cancel()
     }
 }
 
@@ -73,12 +269,6 @@ enum ProcessTermination {
     private static let appTerminationCooperativeWaitTimeout: TimeInterval = 0.75
     private static let terminationModeLock = NSLock()
     private static var appTerminationFastPathEnabled = false
-    private static let blockingReapQueue = DispatchQueue(
-        label: "com.repoprompt.process-termination.waitpid",
-        qos: .userInitiated,
-        attributes: .concurrent
-    )
-
     static func beginAppTerminationFastPath() {
         terminationModeLock.lock()
         appTerminationFastPathEnabled = true
@@ -331,43 +521,47 @@ enum ProcessTermination {
         return decodeWaitStatus(status)
     }
 
-    /// Reaps one direct child with a blocking kernel wait performed outside
-    /// Swift's cooperative executor. Git owns cancellation and timeout
-    /// signaling separately; this method is deliberately the sole waitpid
-    /// authority and never abandons the child on task cancellation.
-    ///
-    /// The callback runs synchronously on the blocking reaper queue after a
-    /// successful waitpid and before the async continuation is resumed. This
-    /// lets lifecycle owners close their PID-signaling window at the kernel
-    /// reap boundary rather than after executor scheduling.
+    /// Registers one cancellation-independent direct-child observation. The
+    /// `beforeReap` runs synchronously after a non-destructive terminal probe
+    /// and before the sole destructive wait. The completion must return promptly
+    /// so unrelated child exits can be processed.
+    static func observeChildStatus(
+        pid: pid_t,
+        beforeReap: @escaping @Sendable () -> Void = {},
+        completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
+    ) {
+        ChildStatusReaperRegistry.shared.observe(
+            pid: pid,
+            beforeReap: beforeReap,
+            completion: completion
+        )
+    }
+
+    /// Checks child terminal state without consuming the status owned by the
+    /// sole reaper. ECHILD also closes PID signaling because the child status
+    /// has already been consumed by an observer or ownership was lost.
+    static func childIsTerminalOrAlreadyReaped(_ pid: pid_t) -> Bool {
+        while true {
+            var info = siginfo_t()
+            let result = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+            if result == 0 {
+                return info.si_pid == pid
+            }
+            if errno == EINTR {
+                continue
+            }
+            return errno == ECHILD
+        }
+    }
+
+    /// Async convenience wrapper over the callback-based sole-reaper primitive.
     static func reapChildStatus(
         pid: pid_t,
-        onReaped: @escaping @Sendable () -> Void = {}
+        beforeReap: @escaping @Sendable () -> Void = {}
     ) async throws -> ProcessExitStatus {
         try await withCheckedThrowingContinuation { continuation in
-            blockingReapQueue.async {
-                var status: Int32 = 0
-                while true {
-                    let result = waitpid(pid, &status, 0)
-                    if result == pid {
-                        let exitStatus = decodeWaitStatus(status)
-                        onReaped()
-                        continuation.resume(returning: exitStatus)
-                        return
-                    }
-                    if result == -1, errno == EINTR {
-                        continue
-                    }
-                    if result == -1, errno == ECHILD {
-                        continuation.resume(
-                            throwing: ProcessTerminationError.childOwnershipLost(pid: pid)
-                        )
-                        return
-                    }
-                    let message = String(cString: strerror(errno))
-                    continuation.resume(throwing: ProcessTerminationError.waitFailed(message))
-                    return
-                }
+            observeChildStatus(pid: pid, beforeReap: beforeReap) { result in
+                continuation.resume(with: result)
             }
         }
     }
@@ -414,6 +608,57 @@ enum ProcessTermination {
         if processGroupExists(processGroupID) {
             logger("Process group \(processGroupID) remained after bounded SIGKILL cleanup")
         }
+    }
+
+    /// Applies TERM-to-KILL policy to a child whose sole destructive reap is
+    /// already owned by `ChildProcessExitObserver`. No code in this path calls
+    /// `waitpid`; descendant cleanup starts only after observation settles.
+    static func terminateObservedProcessFamily(
+        observer: ChildProcessExitObserver,
+        processGroupID: pid_t?,
+        sigtermGrace: TimeInterval? = nil,
+        sigkillGrace: TimeInterval? = nil,
+        logger: (String) -> Void = { _ in }
+    ) async {
+        let timing = currentTiming()
+        let termGrace = max(sigtermGrace ?? timing.sigtermGrace, 0)
+        let killGrace = max(sigkillGrace ?? timing.sigkillGrace, 0)
+
+        if await observer.wait(timeout: 0) == nil {
+            _ = observer.signalRootProcessFamilyIfUnreaped(
+                processGroupID: processGroupID,
+                signal: SIGTERM,
+                logger: logger
+            )
+        }
+
+        if await observer.wait(timeout: termGrace) == nil {
+            logger("Process \(observer.pid) did not exit after SIGTERM; sending SIGKILL")
+            _ = observer.signalRootProcessFamilyIfUnreaped(
+                processGroupID: processGroupID,
+                signal: SIGKILL,
+                logger: logger
+            )
+            if await observer.wait(timeout: killGrace) == nil {
+                logger("Process \(observer.pid) has not settled after bounded SIGKILL cleanup; sole-reaper observation remains active")
+                if observer.isRootSignalingClosed {
+                    await terminateProcessGroupAfterRootReap(
+                        processGroupID: processGroupID,
+                        sigtermGrace: termGrace,
+                        sigkillGrace: killGrace,
+                        logger: logger
+                    )
+                }
+                return
+            }
+        }
+
+        await terminateProcessGroupAfterRootReap(
+            processGroupID: processGroupID,
+            sigtermGrace: termGrace,
+            sigkillGrace: killGrace,
+            logger: logger
+        )
     }
 
     static func waitForTermination(

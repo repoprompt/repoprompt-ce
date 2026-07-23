@@ -17,8 +17,13 @@ package struct CodeMapPerfOptions: Sendable {
 }
 
 package final class CodeMapPerformanceCollector {
+    // Builder boundary. Populated only when an invocation-local collector is supplied.
+    package var builderTotalDuration: TimeInterval = 0
+    package var builderGeneratorDuration: TimeInterval = 0
+
     // Syntax parse/query stages. These values are populated only when the app
     // supplies this invocation-local collector.
+    package var syntaxTotalDuration: TimeInterval = 0
     package var syntaxLanguageLookupDuration: TimeInterval = 0
     package var syntaxOversizeGuardDuration: TimeInterval = 0
     package var syntaxParserCreateDuration: TimeInterval = 0
@@ -27,6 +32,7 @@ package final class CodeMapPerformanceCollector {
     package var syntaxCodeMapQueryLookupDuration: TimeInterval = 0
     package var syntaxQueryExecuteDuration: TimeInterval = 0
     package var syntaxCaptureMaterializationDuration: TimeInterval = 0
+    package var syntaxCaptureNameCountingDuration: TimeInterval = 0
     package var syntaxCalls = 0
     package var syntaxUnsupported = 0
     package var syntaxOversized = 0
@@ -35,8 +41,36 @@ package final class CodeMapPerformanceCollector {
     package var syntaxParserCreates = 0
     package var syntaxQueryExecutes = 0
     package var syntaxCaptures = 0
-    package var syntaxCodeMapQueryCacheHits = 0
-    package var syntaxCodeMapQueryCacheMisses = 0
+    package var syntaxCaptureCountsByName: [String: Int] = [:]
+    package let collectsCaptureNames: Bool
+    package var syntaxCodeMapQuerySuccessfulLookups = 0
+
+    // Capture index construction and lookup complexity.
+    package var captureIndexInputCaptureCount = 0
+    package var captureIndexBucketCount = 0
+    package var captureIndexFirstContainedLookupCount = 0
+    package var captureIndexFirstContainedCandidateVisits = 0
+    package var captureIndexAllContainedLookupCount = 0
+    package var captureIndexAllContainedCandidateVisits = 0
+    package var captureIndexSmallestContainingLookupCount = 0
+    package var captureIndexSmallestContainingCandidateVisits = 0
+    package var captureIndexMaximumCandidateVisits = 0
+
+    // Swift context construction and declaration volume.
+    package var swiftTypeNameMappingDuration: TimeInterval = 0
+    package var swiftProtocolNameMappingDuration: TimeInterval = 0
+    package var swiftBoundaryConstructionDuration: TimeInterval = 0
+    package var swiftFunctionCaptureAssemblyDuration: TimeInterval = 0
+    package var swiftTypeDeclarationCount = 0
+    package var swiftProtocolDeclarationCount = 0
+    package var swiftTopLevelFunctionCount = 0
+    package var swiftMethodFunctionCount = 0
+    package var swiftProtocolMethodCount = 0
+    package var swiftParameterNodeCount = 0
+    package var swiftPropertyDeclarationCount = 0
+    package var swiftProtocolPropertyDeclarationCount = 0
+    package var swiftPropertyIdentifierCount = 0
+    package var swiftTypeBoundaryCount = 0
 
     // Capture loop
     package var capturesProcessed = 0
@@ -55,16 +89,41 @@ package final class CodeMapPerformanceCollector {
     package var captureLoopSkippedCount = 0
     package var captureLoopUnclassifiedCount = 0
     package var swiftStrategyFunctionSignatureCount = 0
+    package var swiftSignatureNormalizationASCIINoOpCount = 0
+    package var swiftSignatureNormalizationASCIIRewriteCount = 0
+    package var swiftSignatureNormalizationUnicodeFallbackCount = 0
+    package var swiftSignatureNormalizationInputUTF8ByteCount = 0
+    package var swiftSignatureNormalizationOutputUTF8ByteCount = 0
     package var swiftStrategyFunctionNameLookupCount = 0
     package var swiftStrategyParameterExtractionCount = 0
+    package var swiftParameterTypeDirectCaptureCount = 0
+    package var swiftParameterTypeFallbackParserCount = 0
+    package var swiftParameterTypeASCIIFastPathCount = 0
+    package var swiftParameterTypeUnicodeLegacyFallbackCount = 0
+    package var swiftParameterTypeInputUTF8ByteCount = 0
     package var swiftStrategyReturnTypeExtractionCount = 0
     package var swiftStrategyPropertyDeclarationCount = 0
     package var swiftStrategyPropertyTypeExtractionCount = 0
+    package var swiftPropertyTypeResolutionCount = 0
+    package var swiftPropertyTypeASCIIDirectTypeCount = 0
+    package var swiftPropertyTypeASCIIDirectNilCount = 0
+    package var swiftPropertyTypeLegacyFallbackCount = 0
+    package var swiftPropertyTypeUnicodeLegacyFallbackCount = 0
+    package var swiftPropertyTypeASCIIIneligibleFallbackCount = 0
+    package var swiftPropertyTypeInputUTF8ByteCount = 0
     package var swiftStrategyEnclosingTypeLookupCount = 0
     package var swiftStrategyModelInsertionCount = 0
     package var swiftStrategyContextOnlyCount = 0
     package var swiftStrategyHandledFunctionCount = 0
     package var swiftStrategyHandledPropertyCount = 0
+    package var swiftSignatureCodeUnitVisits = 0
+    package var swiftNestedFunctionContainmentLookupCount = 0
+    package var swiftNestedFunctionContainmentCandidateVisits = 0
+    package var swiftEnclosingTypeCandidateVisits = 0
+    package var swiftFunctionDuplicateCheckCount = 0
+    package var swiftFunctionDuplicateCandidateVisits = 0
+    package var swiftPropertyDuplicateCheckCount = 0
+    package var swiftPropertyDuplicateCandidateVisits = 0
     package var fallbackFunctionDeclarationCount = 0
     package var fallbackFunctionJSTSSignatureCount = 0
     package var fallbackFunctionNameExtractionCount = 0
@@ -84,6 +143,9 @@ package final class CodeMapPerformanceCollector {
     package var captureDeclarationCalls = 0
     package var jstsSignatureCallsFunctionLike = 0
     package var jstsSignatureCallsStatementLike = 0
+    package var jstsNormalizationASCIINoOpCount = 0
+    package var jstsNormalizationASCIIRewriteCount = 0
+    package var jstsNormalizationUnicodeFallbackCount = 0
 
     // LanguageTypeExtractor
     package var lteMatchAnyFunctionCalls = 0
@@ -103,6 +165,7 @@ package final class CodeMapPerformanceCollector {
     package var tsxArrowFunctionMatches = 0
     package var tsxArrowFunctionParamsReturnMatches = 0
     package var swiftReturnTypeFastPathHits = 0
+    package var tsDuplicateFunctionVariableSuppressions = 0
     package var tsReturnTypeFastPathHits = 0
     package var tsTypeAnnotationFastPathHits = 0
     package var tsTypeAliasRhsFastPathHits = 0
@@ -124,8 +187,13 @@ package final class CodeMapPerformanceCollector {
     package var typeCleanerDedupCount = 0
     package var referencedTypesRawInsertions = 0
     package var referencedTypesPrefilterSkips = 0
+    package var referencedTypesSwiftDedupEligibleCount = 0
+    package var referencedTypesSwiftFirstSeenCount = 0
+    package var referencedTypesSwiftDuplicateSkipCount = 0
+    package var referencedTypesSwiftDuplicateSkippedUTF8ByteCount = 0
     package var referencedTypesEmptyResults = 0
     package var referencedTypesOutputTypeCount = 0
+    package var referencedTypesUniqueCount = 0
 
     // Extraction memo
     package var extractionMemoJSTSHits = 0
@@ -156,11 +224,21 @@ package final class CodeMapPerformanceCollector {
     package var captureLoopSkippedDuration: TimeInterval = 0
     package var captureLoopUnclassifiedDuration: TimeInterval = 0
     package var swiftStrategyFunctionSignatureDuration: TimeInterval = 0
+    package var swiftSignatureEndScanDuration: TimeInterval = 0
+    package var swiftSignatureNormalizationDuration: TimeInterval = 0
     package var swiftStrategyFunctionNameLookupDuration: TimeInterval = 0
     package var swiftStrategyParameterExtractionDuration: TimeInterval = 0
+    package var swiftParameterTypeResolutionDuration: TimeInterval = 0
+    package var swiftParameterTypeLegacyFallbackDuration: TimeInterval = 0
     package var swiftStrategyReturnTypeExtractionDuration: TimeInterval = 0
     package var swiftStrategyPropertyDeclarationDuration: TimeInterval = 0
+    package var swiftPropertyDeclarationLookupDuration: TimeInterval = 0
+    package var swiftPropertyDeclarationSubstringDuration: TimeInterval = 0
+    package var swiftPropertyInitializerStripDuration: TimeInterval = 0
     package var swiftStrategyPropertyTypeExtractionDuration: TimeInterval = 0
+    package var swiftPropertyTypeResolutionDuration: TimeInterval = 0
+    package var swiftPropertyTypeASCIIFastPathDuration: TimeInterval = 0
+    package var swiftPropertyTypeLegacyFallbackDuration: TimeInterval = 0
     package var swiftStrategyEnclosingTypeLookupDuration: TimeInterval = 0
     package var swiftStrategyModelInsertionDuration: TimeInterval = 0
     package var swiftStrategyContextOnlyDuration: TimeInterval = 0
@@ -175,6 +253,8 @@ package final class CodeMapPerformanceCollector {
     package var fallbackFunctionSkippedDuration: TimeInterval = 0
     package var captureDeclarationDuration: TimeInterval = 0
     package var jstsSignatureDuration: TimeInterval = 0
+    package var jstsNormalizationASCIIFastPathDuration: TimeInterval = 0
+    package var jstsNormalizationLegacyFallbackDuration: TimeInterval = 0
     package var languageTypeExtractorFunctionDuration: TimeInterval = 0
     package var languageTypeExtractorVariableDuration: TimeInterval = 0
     package var typeCleanerDuration: TimeInterval = 0
@@ -189,8 +269,17 @@ package final class CodeMapPerformanceCollector {
     package var typeCleanerTSObjectLiteralDuration: TimeInterval = 0
     package var typeCleanerFilterDuration: TimeInterval = 0
     package var typeCleanerDedupDuration: TimeInterval = 0
+    package var referencedTypesSwiftRawTypeDedupDuration: TimeInterval = 0
     package var referencedTypesFinalizeDuration: TimeInterval = 0
+    package var artifactFinalizationDuration: TimeInterval = 0
+    package var artifactMeaningfulContentCheckDuration: TimeInterval = 0
     package var fileAPIInitDuration: TimeInterval = 0
+    package var artifactFinalClassCount = 0
+    package var artifactFinalInterfaceCount = 0
+    package var artifactFinalFunctionCount = 0
+    package var artifactFinalGlobalVariableCount = 0
 
-    package init() {}
+    package init(collectsCaptureNames: Bool = false) {
+        self.collectsCaptureNames = collectsCaptureNames
+    }
 }

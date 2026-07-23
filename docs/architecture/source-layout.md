@@ -82,14 +82,14 @@ The old native file-tree visualization is no longer a live product surface. Do n
 
 “File tree” remains valid when it refers to compatibility or textual context contracts, including the MCP `get_file_tree` tool, tool result cards, API/persisted symbols such as `FileTreeOption`, historical plans, and prompt/context output such as `<file_map>` / project structure maps. Contributor-facing UI and docs should prefer “project structure map” when describing generated textual context so it is not confused with the removed native UI.
 
-The old IDE-era Prompt selected-files panel is also removed. Do not add back `PresetBottomBar`, `SelectedFilesContentView`, `SelectedFilesPanelViewModel`, or the Prompt-owned copy/chat preset picker helpers. The live compact selected-files UI remains `SelectedFilesGrid` plus `FilePreviewPopover`, and the Settings chat preset picker lives under `Features/Settings`.
+The old IDE-era Prompt selected-files panel is also removed. Do not add back `PresetBottomBar`, `SelectedFilesContentView`, `SelectedFilesPanelViewModel`, or the Prompt-owned copy/chat preset picker helpers. The live compact selected-files UI remains `SelectedFilesGrid` plus `FilePreviewPopover`, and the Settings chat preset picker lives under `Features/Settings`. Textual file previews use the read-only `TextKitView`; app syntax queries remain a separate parsing and validation concern rather than a colored preview renderer.
 
 ## Placement rules for new files
 
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
 - Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket.
 - Deterministic synchronous CodeMap grammar descriptors, CodeMap-only queries, invocation-local parsing/extraction, provenance-free decoded source values, pipeline/key canonical encoding, artifact outcomes, and path-free canonical rendering belong under `Sources/RepoPromptCodeMapCore`; pure fixtures/goldens and owner tests belong only under `Tests/RepoPromptCodeMapCoreTests`.
-- Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, CAS/persistence, workspace authority, token/path/import presentation, highlighting, UI/MCP, and selection-graph policy in `RepoPromptApp`. App highlighting retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
+- Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, CAS/persistence, workspace authority, token/path/import presentation, syntax-query validation, UI/MCP, and selection-graph policy in `RepoPromptApp`. App syntax parsing retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
 - Reusable PCRE2 wrapper/JIT construction belongs under `Sources/RepoPromptRegexCore`; app search policy, limits, repair, and presentation remain app-owned.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
@@ -159,13 +159,13 @@ make guardrails
 The guardrail script verifies:
 
 - the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the `RepoPromptApp` implementation declares none;
-- `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and their owning test targets retain internal manifest topology and remain unexposed as products; the CodeMap core owns grammar/scanner edges while the app retains only direct `SwiftTreeSitter` highlighting linkage;
+- `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and their owning test targets retain internal manifest topology and remain unexposed as products; the CodeMap core owns grammar/scanner edges while the app retains direct `SwiftTreeSitter` syntax/query linkage;
 - `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
-- the exact SwiftTreeSitter/runtime and complete grammar requirement/resolved-revision set remain pinned in `Package.swift` and `Package.resolved`, `RepoPromptCodeMapCore` imports the grammar modules directly, `SyntaxManager` retains direct `SwiftTreeSitter` linkage for highlighting, retired local grammar directories remain absent, and the narrow `TreeSitterScannerSupport` target contains only its approved exact-snapshot files with matching checksums;
+- the RepoPrompt `SwiftTreeSitter` fork revision, exact runtime, and complete grammar requirement/resolved-revision set remain pinned in `Package.swift` and `Package.resolved`, `RepoPromptCodeMapCore` imports the grammar modules directly, `SyntaxManager` retains direct `SwiftTreeSitter` linkage for query compilation and validation, retired local grammar directories remain absent, and the narrow `TreeSitterScannerSupport` target contains only its approved exact-snapshot files with matching checksums;
 - Agent/MCP runtime code does not depend on `WorkspaceFilesViewModel`, `FileViewModel`, or `FolderViewModel`;
 - removed native-tree/search artifact paths are not tracked again;
 - removed native-tree/search/eager-loading symbols such as `AgentFileTreeBottomPanelView`, `FileTreeViewWrapper`, `FileTreeViewController`, `NativeFileTree`, `SearchFileTreeViewModel`, `RootDescendantMaterialization`, `legacyMaterializedRootKeys`, `legacyMaterializeDescendantsRecursively`, and `legacyEager` are not referenced from app source;

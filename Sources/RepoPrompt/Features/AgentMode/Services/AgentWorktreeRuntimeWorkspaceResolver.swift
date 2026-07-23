@@ -26,32 +26,61 @@ enum AgentWorktreeRuntimeWorkspaceResolver {
         guard let binding else {
             return primaryWorkspacePath
         }
-        let worktreePath = standardizedWorkspacePath(binding.worktreeRootPath)
-        guard let worktreePath else {
-            throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
+        return try validatedWorktreeRootPath(for: binding)
+    }
+
+    /// Codex-specific projection of the same primary-binding selection used by
+    /// `effectiveWorkspacePath`: the app-server process launches from the binding's logical root
+    /// while thread/turn execution targets the bound worktree. The logical root is validated
+    /// eagerly so a launch-directory failure surfaces before provider startup instead of as an
+    /// opaque process-spawn error.
+    static func codexRuntimeWorkspacePaths(
+        bindings: [AgentSessionWorktreeBinding],
+        fallbackWorkspacePath: String?
+    ) throws -> CodexRuntimeWorkspacePaths {
+        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
+        let binding = primaryExecutionBinding(
+            in: bindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
+
+        guard let binding else {
+            return .uniform(primaryWorkspacePath)
         }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: worktreePath, isDirectory: &isDirectory),
-              isDirectory.boolValue
+        let executionDirectory = try validatedWorktreeRootPath(for: binding)
+        guard let processLaunchDirectory = standardizedWorkspacePath(binding.logicalRootPath) else {
+            throw CodexRuntimeWorkspacePathsError.emptyLogicalRoot
+        }
+        guard directoryExists(atPath: processLaunchDirectory) else {
+            throw CodexRuntimeWorkspacePathsError.launchDirectoryUnavailable(path: processLaunchDirectory)
+        }
+        return .worktreeBound(
+            logicalRootPath: processLaunchDirectory,
+            validatedWorktreeRootPath: executionDirectory
+        )
+    }
+
+    static func validateBindingsAvailable(_ bindings: [AgentSessionWorktreeBinding]) throws {
+        for binding in bindings {
+            _ = try validatedWorktreeRootPath(for: binding)
+        }
+    }
+
+    private static func validatedWorktreeRootPath(
+        for binding: AgentSessionWorktreeBinding
+    ) throws -> String {
+        guard let worktreePath = standardizedWorkspacePath(binding.worktreeRootPath),
+              directoryExists(atPath: worktreePath)
         else {
             throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
         }
         return worktreePath
     }
 
-    static func validateBindingsAvailable(_ bindings: [AgentSessionWorktreeBinding]) throws {
-        for binding in bindings {
-            let worktreePath = standardizedWorkspacePath(binding.worktreeRootPath)
-            guard let worktreePath else {
-                throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-            }
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: worktreePath, isDirectory: &isDirectory),
-                  isDirectory.boolValue
-            else {
-                throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-            }
-        }
+    private static func directoryExists(atPath path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
     }
 
     static func standardizedWorkspacePath(_ path: String?) -> String? {

@@ -1,0 +1,1351 @@
+{
+  "schemaVersion": 1,
+  "minimumCodexVersion": "0.144.6",
+  "experimental": true,
+  "methodChecks": [
+    {
+      "union": "ClientRequest.json",
+      "method": "initialize",
+      "alwaysSent": [
+        "clientInfo",
+        "clientInfo.name",
+        "clientInfo.title",
+        "clientInfo.version",
+        "capabilities",
+        "capabilities.experimentalApi"
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "model/list",
+      "alwaysSent": [
+        "limit"
+      ],
+      "maySend": [
+        "cursor"
+      ],
+      "responseSchema": "v2/ModelListResponse.json",
+      "consumedResponse": [
+        {
+          "path": "data",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].model",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].displayName",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].description",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].isDefault",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].defaultReasoningEffort",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].supportedReasoningEfforts",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].supportedReasoningEfforts[].reasoningEffort",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].supportedReasoningEfforts[].description",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "nextCursor",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/start",
+      "alwaysSent": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "sandbox"
+      ],
+      "maySend": [
+        "baseInstructions",
+        "config",
+        "cwd",
+        "model",
+        "serviceTier"
+      ],
+      "responseSchema": "v2/ThreadStartResponse.json",
+      "consumedResponse": [
+        {
+          "path": "thread",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.path",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "thread.status",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "model",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "reasoningEffort",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/resume",
+      "alwaysSent": [
+        "threadId",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "sandbox"
+      ],
+      "maySend": [
+        "config",
+        "cwd",
+        "model",
+        "serviceTier"
+      ],
+      "responseSchema": "v2/ThreadResumeResponse.json",
+      "consumedResponse": [
+        {
+          "path": "thread",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.path",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "thread.status",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "model",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "reasoningEffort",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/memoryMode/set",
+      "alwaysSent": [
+        "threadId",
+        "mode"
+      ],
+      "enumValues": {
+        "mode": [
+          "disabled"
+        ]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/read",
+      "alwaysSent": [
+        "threadId",
+        "includeTurns"
+      ],
+      "responseSchema": "v2/ThreadReadResponse.json",
+      "consumedResponse": [
+        {
+          "path": "thread",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.path",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "thread.status",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/name/set",
+      "alwaysSent": [
+        "threadId",
+        "name"
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/goal/get",
+      "alwaysSent": [
+        "threadId"
+      ],
+      "responseSchema": "v2/ThreadGoalGetResponse.json",
+      "consumedResponse": [
+        {
+          "path": "goal",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "goal.threadId",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "goal.objective",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "goal.status",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "goal.tokenBudget",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "goal.tokensUsed",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "goal.timeUsedSeconds",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "goal.createdAt",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "goal.updatedAt",
+          "presence": "conditional",
+          "nullable": false
+        }
+      ],
+      "consumedEnumValues": {
+        "goal.status": [
+          "active",
+          "paused",
+          "blocked",
+          "usageLimited",
+          "budgetLimited",
+          "complete"
+        ]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/goal/set",
+      "alwaysSent": [
+        "threadId"
+      ],
+      "maySend": [
+        "objective",
+        "status"
+      ],
+      "enumValues": {
+        "status": [
+          "active",
+          "paused",
+          "blocked",
+          "usageLimited",
+          "budgetLimited",
+          "complete"
+        ]
+      },
+      "responseSchema": "v2/ThreadGoalSetResponse.json",
+      "consumedResponse": [
+        {
+          "path": "goal",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "goal.threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "goal.objective",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "goal.status",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "goal.tokenBudget",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "goal.tokensUsed",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "goal.timeUsedSeconds",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "goal.createdAt",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "goal.updatedAt",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "consumedEnumValues": {
+        "goal.status": [
+          "active",
+          "paused",
+          "blocked",
+          "usageLimited",
+          "budgetLimited",
+          "complete"
+        ]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/goal/clear",
+      "alwaysSent": [
+        "threadId"
+      ],
+      "responseSchema": "v2/ThreadGoalClearResponse.json",
+      "consumedResponse": [
+        {
+          "path": "cleared",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "turn/start",
+      "alwaysSent": [
+        "threadId",
+        "input",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "sandboxPolicy"
+      ],
+      "maySend": [
+        "cwd",
+        "effort",
+        "model",
+        "serviceTier"
+      ],
+      "responseSchema": "v2/TurnStartResponse.json",
+      "consumedResponse": [
+        {
+          "path": "turn",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turn.id",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "sentParamVariants": [
+        {
+          "path": "input[]",
+          "discriminator": "type",
+          "value": "text",
+          "alwaysSent": [
+            "type",
+            "text",
+            "text_elements"
+          ]
+        },
+        {
+          "path": "input[]",
+          "discriminator": "type",
+          "value": "image",
+          "alwaysSent": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "path": "input[]",
+          "discriminator": "type",
+          "value": "localImage",
+          "alwaysSent": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "path": "sandboxPolicy",
+          "discriminator": "type",
+          "value": "readOnly",
+          "alwaysSent": [
+            "type"
+          ]
+        },
+        {
+          "path": "sandboxPolicy",
+          "discriminator": "type",
+          "value": "dangerFullAccess",
+          "alwaysSent": [
+            "type"
+          ]
+        },
+        {
+          "path": "sandboxPolicy",
+          "discriminator": "type",
+          "value": "workspaceWrite",
+          "alwaysSent": [
+            "type",
+            "networkAccess"
+          ],
+          "maySend": [
+            "writableRoots"
+          ]
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "turn/steer",
+      "alwaysSent": [
+        "threadId",
+        "input",
+        "expectedTurnId"
+      ],
+      "responseSchema": "v2/TurnSteerResponse.json",
+      "consumedResponse": [
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "sentParamVariants": [
+        {
+          "path": "input[]",
+          "discriminator": "type",
+          "value": "text",
+          "alwaysSent": [
+            "type",
+            "text",
+            "text_elements"
+          ]
+        },
+        {
+          "path": "input[]",
+          "discriminator": "type",
+          "value": "image",
+          "alwaysSent": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "path": "input[]",
+          "discriminator": "type",
+          "value": "localImage",
+          "alwaysSent": [
+            "type",
+            "path"
+          ]
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "turn/interrupt",
+      "alwaysSent": [
+        "threadId",
+        "turnId"
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/compact/start",
+      "alwaysSent": [
+        "threadId"
+      ]
+    },
+    {
+      "union": "ClientNotification.json",
+      "method": "initialized",
+      "alwaysSent": []
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "turn/started",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turn",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turn.id",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "turn/completed",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turn",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turn.id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turn.status",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turn.error",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "turn.error.message",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "turn.error.codexErrorInfo",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "turn.error.additionalDetails",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/compacted",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/started",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "item",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "consumedParamVariants": [
+        {
+          "path": "item",
+          "discriminator": "type",
+          "value": "commandExecution",
+          "consumed": [
+            {
+              "path": "type",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "id",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "command",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "commandActions",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "cwd",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "status",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "aggregatedOutput",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "durationMs",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "exitCode",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "processId",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "source",
+              "presence": "optional",
+              "nullable": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/completed",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "item",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "consumedParamVariants": [
+        {
+          "path": "item",
+          "discriminator": "type",
+          "value": "commandExecution",
+          "consumed": [
+            {
+              "path": "type",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "id",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "command",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "commandActions",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "cwd",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "status",
+              "presence": "required",
+              "nullable": false
+            },
+            {
+              "path": "aggregatedOutput",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "durationMs",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "exitCode",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "processId",
+              "presence": "optional",
+              "nullable": true
+            },
+            {
+              "path": "source",
+              "presence": "optional",
+              "nullable": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/agentMessage/delta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "delta",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/reasoning/summaryTextDelta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "summaryIndex",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "delta",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/reasoning/textDelta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "contentIndex",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "delta",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/tokenUsage/updated",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "tokenUsage",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/commandExecution/outputDelta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "delta",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/commandExecution/terminalInteraction",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "processId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "stdin",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/fileChange/outputDelta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "delta",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/mcpToolCall/progress",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "message",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/status/changed",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "status",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "turn/plan/updated",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "plan",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "turn/diff/updated",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "diff",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "item/plan/delta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "delta",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerRequest.json",
+      "method": "item/tool/requestUserInput",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "questions",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "responseSchema": "ToolRequestUserInputResponse.json",
+      "alwaysSentResponse": [
+        "answers"
+      ]
+    },
+    {
+      "union": "ServerRequest.json",
+      "method": "account/chatgptAuthTokens/refresh",
+      "consumedParams": [
+        {
+          "path": "reason",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "previousAccountId",
+          "presence": "optional",
+          "nullable": true
+        }
+      ],
+      "responseSchema": "ChatgptAuthTokensRefreshResponse.json",
+      "alwaysSentResponse": [
+        "accessToken",
+        "chatgptAccountId"
+      ],
+      "maySendResponse": [
+        "chatgptPlanType"
+      ]
+    },
+    {
+      "union": "ServerRequest.json",
+      "method": "mcpServer/elicitation/request",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "serverName",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "responseSchema": "McpServerElicitationRequestResponse.json",
+      "alwaysSentResponse": [
+        "action"
+      ],
+      "maySendResponse": [
+        "content",
+        "_meta"
+      ],
+      "responseEnumValues": {
+        "action": [
+          "accept",
+          "decline",
+          "cancel"
+        ]
+      }
+    },
+    {
+      "union": "ServerRequest.json",
+      "method": "item/permissions/requestApproval",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "cwd",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "permissions",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "responseSchema": "PermissionsRequestApprovalResponse.json",
+      "alwaysSentResponse": [
+        "permissions",
+        "scope",
+        "strictAutoReview"
+      ],
+      "responseEnumValues": {
+        "scope": [
+          "turn",
+          "session"
+        ]
+      }
+    },
+    {
+      "union": "ServerRequest.json",
+      "method": "item/tool/call",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "callId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "tool",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "arguments",
+          "presence": "required",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ServerRequest.json",
+      "method": "item/commandExecution/requestApproval",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "responseSchema": "CommandExecutionRequestApprovalResponse.json",
+      "alwaysSentResponse": [
+        "decision"
+      ],
+      "responseEnumValues": {
+        "decision": [
+          "accept",
+          "acceptForSession",
+          "decline",
+          "cancel"
+        ]
+      }
+    },
+    {
+      "union": "ServerRequest.json",
+      "method": "item/fileChange/requestApproval",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "turnId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "itemId",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "responseSchema": "FileChangeRequestApprovalResponse.json",
+      "alwaysSentResponse": [
+        "decision"
+      ],
+      "responseEnumValues": {
+        "decision": [
+          "accept",
+          "acceptForSession",
+          "decline",
+          "cancel"
+        ]
+      }
+    }
+  ]
+}

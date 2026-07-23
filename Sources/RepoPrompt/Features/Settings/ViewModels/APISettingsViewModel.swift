@@ -2944,7 +2944,7 @@ public class APISettingsViewModel: ObservableObject {
             await applyCodexConnectionState(
                 connected: true,
                 error: nil,
-                phase: .connected(resolvedExecutable: resolution.resolvedCommand),
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
                 updateModels: true
             )
             return true
@@ -2989,7 +2989,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("User guidance: \(resolution.userMessage)")
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
-        collector.append("Codex executable resolved at \(resolution.resolvedCommand)")
+        collector.append("Codex executable resolved: \(resolution.displayDescription ?? resolution.debugMessage)")
 
         applyCodexConnectionPhase(.refreshingAuth)
         collector.append("Checking Codex managed authentication state before health check")
@@ -3033,7 +3033,7 @@ public class APISettingsViewModel: ObservableObject {
             await applyCodexConnectionState(
                 connected: ok,
                 error: ok ? nil : "Codex CLI health check returned an empty response.",
-                phase: ok ? .connected(resolvedExecutable: resolution.resolvedCommand) : .failed(message: "Codex CLI health check returned an empty response."),
+                phase: ok ? .connected(resolvedExecutable: resolution.displayDescription) : .failed(message: "Codex CLI health check returned an empty response."),
                 updateModels: true
             )
             if ok {
@@ -3081,13 +3081,13 @@ public class APISettingsViewModel: ObservableObject {
 
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") {
-            return "Codex CLI is not installed. Install it and ensure it's available on PATH."
+            return "The selected Codex runtime is unavailable. Reinstall RepoPrompt CE or configure a valid explicit override."
         }
         if lowered.contains("permission denied") {
             return "Permission denied. Ensure the 'codex' executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") {
-            return "Codex CLI is not authenticated. Run 'codex login' in your terminal."
+            return CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage
         }
         return message
     }

@@ -5481,15 +5481,6 @@ class WorkspaceFilesViewModel: ObservableObject {
         return nil
     }
 
-    /// Provides baseline file content for a given path.
-    /// This is a "back door" method that subclasses can override to provide
-    /// content without needing full FileViewModel infrastructure (e.g., for benchmarks).
-    /// Default implementation returns nil.
-    @MainActor
-    func getBaselineContent(forPath relativePath: String, rootIdentifier: UUID?) async -> String? {
-        nil
-    }
-
     private func findFilesByName(_ fileName: String, in folder: FolderViewModel) -> [FileViewModel] {
         let normalizedFileName = (fileName as NSString).lastPathComponent
         let standardizedFileName = (normalizedFileName as NSString).standardizingPath

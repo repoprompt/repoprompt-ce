@@ -201,6 +201,38 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("trap 'finish $?' EXIT", package_script)
         self.assertIn('local status="$1" now total', package_script)
 
+    def test_staged_signing_resigns_every_codex_mach_o_before_mcp_and_outer_app(self) -> None:
+        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+
+        self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
+        self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
+        self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
+        self.assertEqual(source.count("list-bundle-mach-o-paths --arch all"), 1)
+        self.assertEqual(source.count('--signed-team-identifier "$SIGNING_TEAM_ID"'), 1)
+        self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
+
+        sparkle_sign = source.index('sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"')
+        enumerate_codex = source.index("list-bundle-mach-o-paths --arch all")
+        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path"')
+        mcp_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"')
+        app_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"')
+        outer_sign = source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"')
+        self.assertLess(sparkle_sign, enumerate_codex)
+        self.assertLess(enumerate_codex, codex_sign)
+        self.assertLess(codex_sign, mcp_sign)
+        self.assertLess(mcp_sign, app_sign)
+        self.assertLess(app_sign, outer_sign)
+        self.assertNotIn('sign_path "$CODEX_BUNDLE"', source)
+
+        for release_script_name in (
+            "release.sh",
+            "main_tip_release.sh",
+            "promote_release.sh",
+            "publish_public_update_test.sh",
+        ):
+            release_source = (SCRIPT_DIR / release_script_name).read_text(encoding="utf-8")
+            self.assertIn("--signed-team-identifier", release_source, release_script_name)
+
     def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
@@ -1011,9 +1043,11 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('APP_PID=$!', source)
         self.assertIn('launched-process.json', source)
         self.assertIn('verify_packaged_mcp_socket_owner.py', source)
+        self.assertIn('"$SOCKET_OWNER_HELPER" selftest', source)
         self.assertIn('preflight "$MCP_SOCKET_DIR"', source)
         self.assertIn('find-owner "$MCP_SOCKET_DIR" "$APP_PID" "$APP_EXECUTABLE"', source)
         self.assertIn('verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE"', source)
+        self.assertLess(source.index('"$SOCKET_OWNER_HELPER" selftest'), source.index('preflight "$MCP_SOCKET_DIR"'))
         self.assertLess(source.index('preflight "$MCP_SOCKET_DIR"'), source.index('APP_PID=$!'))
         roundtrip_loop = source.split('while (( $(date +%s) <= deadline )); do', 1)[1]
         self.assertLess(
@@ -1026,27 +1060,36 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertNotIn("pkill", source)
         self.assertNotIn("open -n", source)
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_rejects_live_preflight_and_accepts_exact_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         socket_directory = temp_dir / "repoprompt-ce-mcp"
         socket_directory.mkdir(mode=0o700)
         socket_path = socket_directory / "repoprompt-ce-7.sock"
-        listener = self.start_unix_listener(socket_path)
+        listener, accepted_connections = self.start_unix_listener(socket_path)
         expected_executable = self.socket_owner_process_path(listener.pid)
+        wrong_pid = os.getpid()
+        wrong_executable = self.socket_owner_process_path(wrong_pid)
 
+        selftest = self.run_socket_owner_helper("selftest")
         preflight = self.run_socket_owner_helper("preflight", socket_directory)
         found = self.run_socket_owner_helper("find-owner", socket_directory, listener.pid, expected_executable)
         verified = self.run_socket_owner_helper("verify-owner", socket_path, listener.pid, expected_executable)
+        wrong_owner = self.run_socket_owner_helper("verify-owner", socket_path, wrong_pid, wrong_executable)
 
+        self.assertEqual(selftest.returncode, 0, selftest.stderr)
         self.assertNotEqual(preflight.returncode, 0)
         self.assertIn("pre-existing live release socket", preflight.stderr)
         self.assertEqual(found.returncode, 0, found.stderr)
         self.assertEqual(Path(found.stdout.strip()), socket_path)
         self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertNotEqual(wrong_owner.returncode, 0)
+        self.assertIn(str(listener.pid), wrong_owner.stderr)
+        self.assertIn(f"not exclusively launched pid {wrong_pid}", wrong_owner.stderr)
+        self.assertFalse(accepted_connections.exists(), "ownership inspection must not connect to the release socket")
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_allows_stale_and_rejects_wrong_or_replaced_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -1060,18 +1103,54 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertEqual(accepted_stale.returncode, 0, accepted_stale.stderr)
 
         socket_path.unlink()
-        first = self.start_unix_listener(socket_path)
+        first, first_accepted_connections = self.start_unix_listener(socket_path)
         first_executable = self.socket_owner_process_path(first.pid)
+
         socket_path.unlink()
-        second = self.start_unix_listener(socket_path)
+        stale_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale_replacement.bind(os.fspath(socket_path))
+        stale_replacement.close()
+        replaced_by_stale = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        self.assertNotEqual(replaced_by_stale.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_stale.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "stale-replacement inspection must not connect")
+
+        socket_path.unlink()
+        bound_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound_replacement.bind(os.fspath(socket_path))
+        try:
+            replaced_by_bound = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        finally:
+            bound_replacement.close()
+        self.assertNotEqual(replaced_by_bound.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_bound.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "bound-replacement inspection must not connect")
+
+        socket_path.unlink()
+        second, second_accepted_connections = self.start_unix_listener(
+            socket_path,
+            claim_ownership_lock=False,
+        )
         second_executable = self.socket_owner_process_path(second.pid)
 
         replaced = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
-        current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        ambiguous_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
 
         self.assertNotEqual(replaced.returncode, 0)
-        self.assertIn(f"belongs to pid {second.pid}", replaced.stderr)
-        self.assertEqual(current.returncode, 0, current.stderr)
+        self.assertIn("not exclusively launched pid", replaced.stderr)
+        self.assertIn(str(first.pid), replaced.stderr)
+        self.assertIn(str(second.pid), replaced.stderr)
+        self.assertNotEqual(ambiguous_current.returncode, 0)
+        self.assertIn("not exclusively launched pid", ambiguous_current.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "replaced-owner inspection must not connect")
+        self.assertFalse(second_accepted_connections.exists(), "current-owner inspection must not connect")
+
+        first.terminate()
+        first.wait(timeout=5)
+        unlocked_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        self.assertNotEqual(unlocked_current.returncode, 0)
+        self.assertIn("ownership lock is not held", unlocked_current.stderr)
+        self.assertFalse(second_accepted_connections.exists(), "unlocked-owner verification must not connect")
 
         socket_path.unlink()
         socket_path.write_text("not a socket\n", encoding="utf-8")
@@ -1960,6 +2039,44 @@ sys.stdout.write(str(status))
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: staged release payload matches approved source", result.stdout)
+
+    def test_public_app_validation_uses_approved_manifest_from_extracted_stage_layout(self) -> None:
+        for script_name in ("release.sh", "main_tip_release.sh"):
+            with self.subTest(script=script_name):
+                approved, staged, scripts = self.make_staged_release_fixture()
+                self.assertFalse((staged / "Vendor").exists())
+
+                result, capture = self.run_public_app_validation(
+                    approved,
+                    staged,
+                    scripts,
+                    script_name,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = capture.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(calls), 1)
+                self.assertIn(str(approved / "Vendor" / "Codex" / "manifest.json"), calls[0])
+                self.assertNotIn(str(staged / "Vendor"), calls[0])
+
+    def test_staged_release_validator_rejects_missing_approved_codex_manifest(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        (approved / "Vendor" / "Codex" / "manifest.json").unlink()
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing approved Codex manifest", result.stderr)
+
+    def test_staged_release_validator_rejects_missing_embedded_codex_package_target(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        bundle = staged / ".build" / "release" / "RepoPrompt.app" / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+        shutil.rmtree(bundle / "x86_64-apple-darwin")
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing embedded Codex package targets", result.stderr)
 
     def test_staged_release_validator_rejects_keyboard_shortcuts_app_root_bundle(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
@@ -3389,25 +3506,48 @@ fi
         (resources_bin / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         return app
 
-    def start_unix_listener(self, socket_path: Path) -> subprocess.Popen[str]:
+    def start_unix_listener(
+        self,
+        socket_path: Path,
+        *,
+        claim_ownership_lock: bool = True,
+    ) -> tuple[subprocess.Popen[str], Path]:
         ready = socket_path.with_suffix(".ready")
+        accepted_connections = socket_path.with_name(f"{socket_path.name}.{time.monotonic_ns()}.accepted")
         ready.unlink(missing_ok=True)
+        accepted_connections.unlink(missing_ok=True)
         process = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
-                "import socket, sys\n"
+                "import fcntl, os, socket, sys\n"
+                "lock_descriptor = None\n"
+                "if sys.argv[4] == '1':\n"
+                "    lock_descriptor = os.open(sys.argv[1] + '.lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)\n"
+                "    os.fchmod(lock_descriptor, 0o600)\n"
+                "    fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
                 "listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
                 "listener.bind(sys.argv[1])\n"
+                "if lock_descriptor is not None:\n"
+                "    metadata = os.lstat(sys.argv[1])\n"
+                "    record = f'repoprompt-ce-socket-identity-v1 {metadata.st_dev} {metadata.st_ino}\\n'.encode()\n"
+                "    os.ftruncate(lock_descriptor, 0)\n"
+                "    assert os.write(lock_descriptor, record) == len(record)\n"
+                "    os.fsync(lock_descriptor)\n"
                 "listener.listen(8)\n"
                 "open(sys.argv[2], 'w', encoding='utf-8').close()\n"
                 "while True:\n"
                 "    client, _ = listener.accept()\n"
+                "    with open(sys.argv[3], 'a', encoding='utf-8') as accepted:\n"
+                "        accepted.write('accepted\\n')\n"
+                "        accepted.flush()\n"
                 "    with client:\n"
                 "        while client.recv(4096):\n"
                 "            pass\n",
                 os.fspath(socket_path),
                 os.fspath(ready),
+                os.fspath(accepted_connections),
+                "1" if claim_ownership_lock else "0",
             ],
             text=True,
             stdout=subprocess.DEVNULL,
@@ -3432,7 +3572,7 @@ fi
                 self.fail(f"UNIX listener exited early: {process.stderr.read() if process.stderr else ''}")
             time.sleep(0.02)
         self.assertTrue(ready.exists(), "UNIX listener did not become ready")
-        return process
+        return process, accepted_connections
 
     def socket_owner_process_path(self, pid: int) -> Path:
         result = self.run_socket_owner_helper("process-path", pid)
@@ -3536,12 +3676,15 @@ extension Data {
         app = staged / ".build" / "release" / "RepoPrompt.app"
         for directory in (
             approved / "AppBundle",
+            approved / "Vendor" / "Codex",
             approved / "ThirdPartyLicenses" / "fixture",
             staged / "ThirdPartyLicenses" / "fixture",
             app / "Contents" / "Frameworks" / "Sparkle.framework",
             app / "Contents" / "MacOS",
             app / "Contents" / "Resources" / "bin",
             app / "Contents" / "Resources" / "Legal" / "ThirdPartyLicenses" / "fixture",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "aarch64-apple-darwin",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin",
             scripts,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -3553,9 +3696,17 @@ extension Data {
             "validate_packaged_legal.sh",
             "validate_required_swiftpm_resource_bundles.sh",
             "validate_staged_release.sh",
+            "release_sentry_symbols.sh",
+            "release.sh",
+            "main_tip_release.sh",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
+        (scripts / "codex_runtime_artifact.py").write_text(
+            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nexpected_bundle = Path(os.environ[\"FAKE_CODEX_BUNDLE\"])\nexpected = [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n    str(expected_bundle),\n]\nif sys.argv[1:] != expected:\n    print(f\"ERROR: unexpected Codex verifier arguments: {sys.argv[1:]!r}\", file=sys.stderr)\n    raise SystemExit(64)\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not expected_bundle.is_dir() or {path.name for path in expected_bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {expected_bundle}\", file=sys.stderr)\n    raise SystemExit(66)\ncapture = os.environ.get(\"FAKE_CODEX_CAPTURE\")\nif capture:\n    with Path(capture).open(\"a\", encoding=\"utf-8\") as handle:\n        handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
+            encoding="utf-8",
+        )
+        (approved / "Vendor" / "Codex" / "manifest.json").write_text("{}\n", encoding="utf-8")
         metadata = """\
 APP_NAME=RepoPrompt
 DISPLAY_NAME="RepoPrompt CE"
@@ -3657,7 +3808,22 @@ esac
         (resources / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
 
     @staticmethod
-    def run_staged_validation(approved: Path, staged: Path, scripts: Path) -> subprocess.CompletedProcess[str]:
+    def codex_fixture_environment(approved: Path, staged: Path) -> dict[str, str]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        return {
+            "FAKE_CODEX_MANIFEST": str(approved / "Vendor" / "Codex" / "manifest.json"),
+            "FAKE_CODEX_BUNDLE": str(
+                app / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+            ),
+        }
+
+    @classmethod
+    def run_staged_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
             {
@@ -3666,6 +3832,7 @@ esac
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
                 "LIPO": str(scripts / "fake-lipo"),
                 "CODESIGN": str(scripts / "fake-codesign"),
+                **cls.codex_fixture_environment(approved, staged),
             }
         )
         return subprocess.run(
@@ -3674,6 +3841,48 @@ esac
             text=True,
             capture_output=True,
         )
+
+    @classmethod
+    def run_public_app_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+        script_name: str,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        artifact_manifest = staged / ".build" / "release" / "RepoPrompt-artifact-manifest.json"
+        capture = staged.parent / f"{script_name}-codex-calls.txt"
+        env = os.environ.copy()
+        env.update(
+            {
+                "RELEASE_COMMIT": "fixture-release-commit",
+                "REPOPROMPT_APPROVED_SOURCE_ROOT": str(approved),
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
+                "TIP_COMMIT": "fixture-release-commit",
+                "TIP_BUILD_NUMBER": "1.1",
+                "LIPO": str(scripts / "fake-lipo"),
+                "CODESIGN": str(scripts / "fake-codesign"),
+                "FAKE_CODEX_CAPTURE": str(capture),
+                **cls.codex_fixture_environment(approved, staged),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; TMP_DIR="$(mktemp -d)"; validate_public_app "$2" "$3" "Extracted stage fixture"',
+                "bash",
+                str(scripts / script_name),
+                str(app),
+                str(artifact_manifest),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        return result, capture
 
     def make_git_remote(self) -> tuple[Path, Path]:
         parent = Path(tempfile.mkdtemp())

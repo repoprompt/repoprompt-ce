@@ -397,6 +397,8 @@ final class CodexNativeSessionController {
     enum ThreadGoalStatus: String, Equatable {
         case active
         case paused
+        case blocked
+        case usageLimited
         case budgetLimited
         case complete
     }
@@ -477,14 +479,20 @@ final class CodexNativeSessionController {
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
-        /// launch or thread request. Inject in tests; production uses the default below.
-        var repoPromptMCPProvisioner: () async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
+        /// launch or thread request. The runtime is resolved once from the app-server launch
+        /// environment and passed through unchanged. Inject in tests; production uses the default below.
+        var repoPromptMCPProvisioner: (CodexRuntimeAuthority.Runtime) async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
 
-        /// Fails closed only on a real `ensureCodexServerForDiscovery()` directory-create/config-write
+        /// Fails closed only on a real `ensureServerForDiscovery(runtime:)` directory-create/config-write
         /// failure — an existing entry needing no change reports success, so a healthy no-op is not misread.
-        private static func ensureDefaultRepoPromptMCPProvisioning() async throws {
-            guard MCPIntegrationHelper.ensureCodexServerForDiscovery().success else {
-                throw MCPBootstrapReadinessError.provisioningUnavailable
+        private static func ensureDefaultRepoPromptMCPProvisioning(
+            runtime: CodexRuntimeAuthority.Runtime
+        ) async throws {
+            let result = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+            guard result.success else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: result.errorMessage ?? MCPBootstrapReadinessError.provisioningUnavailable.localizedDescription
+                )
             }
         }
 
@@ -570,7 +578,9 @@ final class CodexNativeSessionController {
     private let runID: UUID
     private let tabID: UUID
     private let windowID: Int
-    private let workspacePath: String?
+    /// Launch/execution directory pair; kept whole so the two roles cannot
+    /// drift apart through partial initialization or copying.
+    private let workspacePaths: CodexRuntimeWorkspacePaths
     private let options: Options
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
@@ -737,7 +747,7 @@ final class CodexNativeSessionController {
         runID: UUID,
         tabID: UUID,
         windowID: Int,
-        workspacePath: String?,
+        workspacePaths: CodexRuntimeWorkspacePaths,
         options: Options? = nil,
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
@@ -747,7 +757,7 @@ final class CodexNativeSessionController {
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
-        self.workspacePath = workspacePath
+        self.workspacePaths = workspacePaths
         self.options = options ?? Self.Options.agentModeDefault()
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
@@ -897,7 +907,7 @@ final class CodexNativeSessionController {
     }
 
     private static func makeRawEventLogFileURL(
-        workspacePath: String?,
+        executionDirectory: String?,
         threadID: String
     ) -> URL? {
         let defaults = UserDefaults.standard
@@ -908,10 +918,10 @@ final class CodexNativeSessionController {
                 let expanded = NSString(string: overridePath).expandingTildeInPath
                 return URL(fileURLWithPath: expanded, isDirectory: true)
             }
-            if let workspacePath = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !workspacePath.isEmpty
+            if let executionDirectory = executionDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !executionDirectory.isEmpty
             {
-                return URL(fileURLWithPath: workspacePath, isDirectory: true)
+                return URL(fileURLWithPath: executionDirectory, isDirectory: true)
                     .appendingPathComponent(".codexlogs", isDirectory: true)
             }
             return MCPFilesystemConstants.identity.temporaryRootURL()
@@ -938,7 +948,7 @@ final class CodexNativeSessionController {
             return
         }
         guard let fileURL = Self.makeRawEventLogFileURL(
-            workspacePath: workspacePath,
+            executionDirectory: workspacePaths.executionDirectory,
             threadID: threadIdentifier
         ) else {
             return
@@ -992,7 +1002,7 @@ final class CodexNativeSessionController {
                 "runID": runID.uuidString,
                 "tabID": tabID.uuidString,
                 "threadID": threadID ?? "",
-                "workspacePath": workspacePath ?? ""
+                "workspacePath": workspacePaths.executionDirectory ?? ""
             ])
         }
         var record: [String: Any] = [
@@ -1061,20 +1071,24 @@ final class CodexNativeSessionController {
             try await eventHandlingMutex.withLock {
                 beginBindingSession()
             }
+            // Resolve one authoritative runtime from the captured app-server environment before
+            // provisioning. The same client-held runtime is reused at process launch, including when
+            // the bundled package is unavailable and a valid override exists only in the login shell.
+            let runtime = try await client.prepareRuntimeForLaunch()
             // Fail closed before any process launch or thread request: a child that expects
             // RepoPrompt MCP tools must not start without them. The gate runs only for tool-expecting
             // children; those with no expected client name skip provisioning. A throw here lands in the
             // catch below — binding cancelled, expected-PID registration cleared, typed error rethrown —
             // before `client.startIfNeeded()` or any thread/start or thread/resume request.
             if let expectedMCPClientName {
-                try await options.repoPromptMCPProvisioner()
+                try await options.repoPromptMCPProvisioner(runtime)
                 // A cancellation racing provisioning must not reach PID registration or process start.
                 try Task.checkCancellation()
                 await client.setExpectedAgentPIDRegistration(
                     .init(clientName: expectedMCPClientName, runID: runID)
                 )
             }
-            await client.updateWorkingDirectory(workspacePath)
+            await client.updateProcessLaunchDirectory(workspacePaths.processLaunchDirectory)
             await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
@@ -1082,23 +1096,16 @@ final class CodexNativeSessionController {
             await ensureInboundStreamsStarted()
 
             let configOverrides = await options.configOverridesProvider()
-            let pathValue = existing?.rolloutPath
             let result: [String: Any]
 
             if let resumeThreadID {
                 var params: [String: Any] = ["threadId": resumeThreadID]
-                if let pathValue {
-                    params["path"] = pathValue
-                }
                 if let model {
                     params["model"] = model
                 }
-                if let reasoningEffort {
-                    params["effort"] = reasoningEffort
-                }
                 Self.addServiceTier(serviceTier, to: &params)
-                if let workspacePath {
-                    params["cwd"] = workspacePath
+                if let executionDirectory = workspacePaths.executionDirectory {
+                    params["cwd"] = executionDirectory
                 }
                 if !configOverrides.isEmpty {
                     params["config"] = configOverrides
@@ -1122,12 +1129,9 @@ final class CodexNativeSessionController {
                 if let model {
                     params["model"] = model
                 }
-                if let reasoningEffort {
-                    params["effort"] = reasoningEffort
-                }
                 Self.addServiceTier(serviceTier, to: &params)
-                if let workspacePath {
-                    params["cwd"] = workspacePath
+                if let executionDirectory = workspacePaths.executionDirectory {
+                    params["cwd"] = executionDirectory
                 }
                 if !configOverrides.isEmpty {
                     params["config"] = configOverrides
@@ -1294,10 +1298,7 @@ final class CodexNativeSessionController {
             ],
             timeout: options.requestTimeout
         )
-        guard let rawGoal = result["goal"] else {
-            throw CodexAppServerClient.ClientError.invalidResponse
-        }
-        if rawGoal is NSNull {
+        guard let rawGoal = result["goal"], !(rawGoal is NSNull) else {
             return nil
         }
         return try Self.parseThreadGoal(from: rawGoal)
@@ -1384,8 +1385,8 @@ final class CodexNativeSessionController {
             params["effort"] = reasoningEffort
         }
         Self.addServiceTier(serviceTier, to: &params)
-        if let workspacePath {
-            params["cwd"] = workspacePath
+        if let executionDirectory = workspacePaths.executionDirectory {
+            params["cwd"] = executionDirectory
         }
         #if DEBUG
             print("[CodexNativeSessionController] turn/start request model=\(String(describing: params["model"] ?? "default")) effort=\(String(describing: params["effort"] ?? "default")) serviceTier=\(String(describing: params["serviceTier"] ?? "missing")) threadID=\(threadID)")
@@ -1401,7 +1402,7 @@ final class CodexNativeSessionController {
             requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
             requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
                 mode: sandboxMode,
-                workspacePath: workspacePath
+                executionDirectory: workspacePaths.executionDirectory
             )
             // app-server v2 turn/start does not accept a config override bag.
             // Thread-level config changes take effect on thread/start or thread/resume.
@@ -1939,6 +1940,10 @@ final class CodexNativeSessionController {
             return .active
         case "paused":
             return .paused
+        case "blocked":
+            return .blocked
+        case "usagelimited":
+            return .usageLimited
         case "budgetlimited":
             return .budgetLimited
         case "complete", "completed":
@@ -3441,7 +3446,7 @@ final class CodexNativeSessionController {
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: 1,
-                workspacePath: nil
+                workspacePaths: .uniform(nil)
             )
             return controller.parseExecCommandEndEvent(params: params)?.resultJSON
         }
@@ -7957,7 +7962,7 @@ final class CodexNativeSessionController {
 
     static func appServerTurnSandboxPolicyPayload(
         mode: CodexAgentToolPreferences.SandboxMode,
-        workspacePath: String?
+        executionDirectory: String?
     ) -> [String: Any] {
         switch mode {
         case .readOnly:
@@ -7969,10 +7974,10 @@ final class CodexNativeSessionController {
                 "type": "workspaceWrite",
                 "networkAccess": true
             ]
-            if let workspacePath = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !workspacePath.isEmpty
+            if let executionDirectory = executionDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !executionDirectory.isEmpty
             {
-                payload["writableRoots"] = [workspacePath]
+                payload["writableRoots"] = [executionDirectory]
             }
             return payload
         }

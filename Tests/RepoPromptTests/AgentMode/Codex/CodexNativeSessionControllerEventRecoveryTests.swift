@@ -962,7 +962,7 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: nil
+            workspacePaths: .uniform(nil)
         )
 
         let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
@@ -1592,7 +1592,7 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: nil
+            workspacePaths: .uniform(nil)
         )
     }
 

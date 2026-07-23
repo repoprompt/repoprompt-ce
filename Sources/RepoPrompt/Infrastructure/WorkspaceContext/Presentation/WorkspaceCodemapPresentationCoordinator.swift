@@ -1281,6 +1281,8 @@ struct WorkspaceCodemapPresentationCoordinator {
         for round in 0 ..< policy.maximumReadinessRounds {
             try Task.checkCancellation()
             var hasPending = false
+            var hasBusy = false
+            var pendingTickets: [(fileID: UUID, ticket: WorkspaceCodemapArtifactDemandTicket)] = []
             var retryAfter: [Int] = []
             for fileID in orderedFileIDs {
                 guard let current = results[fileID] else { continue }
@@ -1288,13 +1290,18 @@ struct WorkspaceCodemapPresentationCoordinator {
                 case let .pending(ticket):
                     let refreshed = await store.codemapArtifactDemandStatus(ticket)
                     results[fileID] = refreshed
-                    if case .pending = refreshed { hasPending = true }
+                    if case let .pending(refreshedTicket) = refreshed {
+                        hasPending = true
+                        pendingTickets.append((fileID, refreshedTicket))
+                    }
                     if case let .unavailable(.busy(milliseconds)) = refreshed {
                         hasPending = true
+                        hasBusy = true
                         if let milliseconds { retryAfter.append(milliseconds) }
                     }
                 case let .unavailable(.busy(milliseconds)):
                     hasPending = true
+                    hasBusy = true
                     if let milliseconds { retryAfter.append(milliseconds) }
                 case .ready, .unavailable:
                     break
@@ -1304,6 +1311,32 @@ struct WorkspaceCodemapPresentationCoordinator {
                   round + 1 < policy.maximumReadinessRounds,
                   clock.now < deadline
             else { break }
+
+            if !pendingTickets.isEmpty, !hasBusy {
+                let firstCompletion: (fileID: UUID, result: WorkspaceCodemapArtifactDemandResult)? = try await withThrowingTaskGroup(
+                    of: (fileID: UUID, result: WorkspaceCodemapArtifactDemandResult).self
+                ) { group in
+                    for pending in pendingTickets {
+                        group.addTask {
+                            try Task.checkCancellation()
+                            let result = await store.waitForCodemapArtifactDemandChange(
+                                pending.ticket,
+                                deadline: deadline
+                            )
+                            try Task.checkCancellation()
+                            return (pending.fileID, result)
+                        }
+                    }
+                    guard let first = try await group.next() else { return nil }
+                    group.cancelAll()
+                    return first
+                }
+                if let firstCompletion {
+                    results[firstCompletion.fileID] = firstCompletion.result
+                }
+                continue
+            }
+
             try await wait(
                 round: round,
                 suggestedMilliseconds: retryAfter,

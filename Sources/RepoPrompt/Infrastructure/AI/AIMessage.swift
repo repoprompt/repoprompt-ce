@@ -33,7 +33,6 @@ struct AIMessage {
     let conversationMessages: [ConversationEntry]
 
     let temperature: Double?
-    let disableTemperatureOverrides: Bool
 
     /// User-defined ordering of prompt sections
     let promptSectionsOrder: [PromptSection]
@@ -120,7 +119,6 @@ struct AIMessage {
         gitDiff: String? = nil,
         conversationMessages: [ConversationEntry] = [],
         temperature: Double?,
-        disableTemperatureOverrides: Bool = false,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
         duplicateUserInstructionsAtTop: Bool = false
@@ -132,7 +130,6 @@ struct AIMessage {
         self.gitDiff = gitDiff
         self.conversationMessages = conversationMessages
         self.temperature = temperature
-        self.disableTemperatureOverrides = disableTemperatureOverrides
         self.promptSectionsOrder = promptSectionsOrder
         self.disabledPromptSections = disabledPromptSections
         self.duplicateUserInstructionsAtTop = duplicateUserInstructionsAtTop
@@ -140,14 +137,13 @@ struct AIMessage {
 
     /// Simpler initializer for "system prompt + user message" usage
     /// (e.g. older single-user instructions approach).
-    init(systemPrompt: String, userMessage: String, temperature: Double? = nil, disableTemperatureOverrides: Bool = false) {
+    init(systemPrompt: String, userMessage: String, temperature: Double? = nil) {
         self.systemPrompt = systemPrompt
         metaPrompts = []
         fileTree = ""
         fileBlocks = []
         gitDiff = nil
         self.temperature = temperature
-        self.disableTemperatureOverrides = disableTemperatureOverrides
         // Store the single user message in conversationMessages
         conversationMessages = [
             ConversationEntry(role: .user, content: userMessage)
@@ -296,9 +292,6 @@ struct AIMessage {
     /// Returns the final temperature to send for a specific model,
     /// respecting global on/off and per-model overrides.
     func effectiveTemperature(for model: AIModel) -> Double? {
-        if disableTemperatureOverrides {
-            return nil
-        }
         // 1) Explicit per-model override stored by the user.
         if let override = ModelOverridesSettings.shared
             .temperatureOverride(for: model.rawValue)

@@ -869,6 +869,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "thread",
@@ -914,6 +917,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback.mcp")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "thread",
@@ -941,7 +947,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: "/tmp/workspace",
+            workspacePaths: .uniform("/tmp/workspace"),
             requestExecutor: { method, params, timeout in
                 try recorder.handle(method: method, params: params, timeout: timeout)
             }

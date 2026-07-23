@@ -106,6 +106,12 @@ final class BootstrapSocketOwnershipTests: XCTestCase {
         defer { Darwin.close(originalFD) }
         try owner.captureBoundSocketIdentity()
         XCTAssertEqual(owner.pathStatus(), .owned)
+        let originalIdentity = try XCTUnwrap(BootstrapSocketOwnership.identity(atPath: socketURL.path))
+        let identityRecord = try String(contentsOf: owner.lockURL, encoding: .utf8)
+        XCTAssertEqual(
+            identityRecord,
+            "\(BootstrapSocketOwnership.boundIdentityRecordPrefix) \(originalIdentity.device) \(originalIdentity.inode)\n"
+        )
 
         XCTAssertEqual(unlink(socketURL.path), 0)
         let replacementFD = try bindSocket(at: socketURL, listening: true)

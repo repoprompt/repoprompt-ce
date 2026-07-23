@@ -373,6 +373,12 @@ actor WorkspaceCodemapBindingEngine {
         case budget(WorkspaceCodemapProjectionBudget)
     }
 
+    private struct IndexedProjectionCandidateResolution: @unchecked Sendable {
+        let index: Int
+        let fileID: UUID
+        let resolution: ProjectionCandidateResolution
+    }
+
     private enum ProjectionBatchResult {
         case checkpointed
         case complete
@@ -1726,6 +1732,43 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
+    func currentProjectionSnapshot(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapCurrentProjectionSnapshot {
+        guard case .eligible? = roots[rootEpoch] else {
+            return .unavailable(reason: .rootNotRegistered)
+        }
+        guard let job = projectionJobs[rootEpoch] else {
+            return .unavailable(reason: .jobNotScheduled)
+        }
+        guard projectionJobAuthorityIsCurrent(job) else {
+            return .nonCurrent
+        }
+        guard job.phase == .complete else {
+            return .pending(
+                phase: job.phase,
+                progress: job.progress,
+                retry: job.retry,
+                budget: job.budget
+            )
+        }
+        guard let proof = job.coverageProof,
+              let completedUptimeNanoseconds = job.coverageCompletedUptimeNanoseconds,
+              let generation = job.generation,
+              generation == proof.generation,
+              proof.generation.rootEpoch == rootEpoch,
+              proof.generation.catalogToken.catalogGeneration == job.catalogGeneration,
+              proof.generation.catalogToken.ingressGeneration == job.ingressGeneration,
+              projectionJobIsCurrent(job)
+        else {
+            return .nonCurrent
+        }
+        return .authoritativeComplete(
+            proof: proof,
+            completedUptimeNanoseconds: completedUptimeNanoseconds
+        )
+    }
+
     func accounting() -> WorkspaceCodemapBindingEngineAccounting {
         expireProjectionDemands()
         var eligible = 0
@@ -2670,25 +2713,90 @@ actor WorkspaceCodemapBindingEngine {
             guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .resolvingArtifacts) else {
                 return .cancelled
             }
-            for candidate in misses {
-                guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
-                      let classification = classificationsByPath[
-                          candidate.identity.standardizedRelativePath
-                      ]
-                else { return .retry }
-                let resolution = await resolveProjectionCandidate(
-                    jobID: jobID,
-                    rootEpoch: rootEpoch,
-                    candidate: candidate,
-                    pipelineIdentity: pipelineIdentity,
-                    classification: classification
-                )
-                guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
-                    return .cancelled
+            let maximumConcurrentResolutions = min(
+                misses.count,
+                policy.maximumConcurrentMaterializationCountPerOwner
+            )
+            let indexedResolutions = await withTaskGroup(
+                of: IndexedProjectionCandidateResolution.self,
+                returning: [IndexedProjectionCandidateResolution].self
+            ) { group in
+                var nextIndex = 0
+                var completed: [IndexedProjectionCandidateResolution] = []
+                completed.reserveCapacity(misses.count)
+
+                while nextIndex < maximumConcurrentResolutions {
+                    let index = nextIndex
+                    let candidate = misses[index]
+                    nextIndex += 1
+                    group.addTask {
+                        guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
+                              let classification = classificationsByPath[
+                                  candidate.identity.standardizedRelativePath
+                              ]
+                        else {
+                            return IndexedProjectionCandidateResolution(
+                                index: index,
+                                fileID: candidate.identity.fileID,
+                                resolution: .transient
+                            )
+                        }
+                        let resolution = await self.resolveProjectionCandidate(
+                            jobID: jobID,
+                            rootEpoch: rootEpoch,
+                            candidate: candidate,
+                            pipelineIdentity: pipelineIdentity,
+                            classification: classification
+                        )
+                        return IndexedProjectionCandidateResolution(
+                            index: index,
+                            fileID: candidate.identity.fileID,
+                            resolution: resolution
+                        )
+                    }
                 }
-                switch resolution {
+
+                while let result = await group.next() {
+                    completed.append(result)
+                    guard nextIndex < misses.count else { continue }
+                    let index = nextIndex
+                    let candidate = misses[index]
+                    nextIndex += 1
+                    group.addTask {
+                        guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
+                              let classification = classificationsByPath[
+                                  candidate.identity.standardizedRelativePath
+                              ]
+                        else {
+                            return IndexedProjectionCandidateResolution(
+                                index: index,
+                                fileID: candidate.identity.fileID,
+                                resolution: .transient
+                            )
+                        }
+                        let resolution = await self.resolveProjectionCandidate(
+                            jobID: jobID,
+                            rootEpoch: rootEpoch,
+                            candidate: candidate,
+                            pipelineIdentity: pipelineIdentity,
+                            classification: classification
+                        )
+                        return IndexedProjectionCandidateResolution(
+                            index: index,
+                            fileID: candidate.identity.fileID,
+                            resolution: resolution
+                        )
+                    }
+                }
+                return completed.sorted { $0.index < $1.index }
+            }
+            guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
+                return .cancelled
+            }
+            for result in indexedResolutions {
+                switch result.resolution {
                 case let .entry(entry, manifestRecord):
-                    resolvedByFileID[candidate.identity.fileID] = .entry(
+                    resolvedByFileID[result.fileID] = .entry(
                         entry,
                         manifestRecord: manifestRecord
                     )

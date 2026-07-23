@@ -1,6 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
-import RepoPromptCodeMapCore
+@testable import RepoPromptCodeMapCore
 import XCTest
 
 #if DEBUG
@@ -770,7 +770,7 @@ import XCTest
                         try measurePhase2Synchronous {
                             let totalSource = CodeMapSourceSnapshot(validatedContent: validatedContent)
                             let outcome = try CodeMapSyntaxArtifactBuilder.build(
-                                source: totalSource,
+                                source: totalSource.coreSnapshot,
                                 language: language
                             )
                             return (totalSource, outcome)

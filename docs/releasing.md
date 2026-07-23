@@ -21,6 +21,104 @@ RepoPrompt CE starts a new public release line at `1.0.0 (1)`. Its separate
 bundle identifier, Sparkle key pair, and appcast intentionally do not inherit
 the closed app's version history.
 
+## Bundled Codex artifact
+
+Debug and release packaging include the complete official OpenAI Codex 0.144.6
+standalone package. The authority is the repository-owned
+[`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
+official [`rust-v0.144.6` release](https://github.com/openai/codex/releases/tag/rust-v0.144.6),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.144.6/codex-package_SHA256SUMS),
+both macOS package assets, their complete extracted layouts, file hashes,
+architectures, and primary executable signing identities. The upstream release
+publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
+verification procedure, so acquisition requires both the fixed HTTPS release
+URLs and agreement between the official checksum file and the independently
+pinned repository manifest.
+
+Packaging is the only automatic acquisition boundary; the app never downloads
+Codex at runtime. To acquire or inspect the cache explicitly:
+
+```bash
+make codex-acquire                         # verifies both macOS packages
+make codex-acquire CODEX_ARCH=host         # current host only
+make codex-status                          # offline verification of both caches
+```
+
+The verified cache lives under `.build/codex-runtime/<manifest-version>/<target>/`
+by default and can be relocated with `REPOPROMPT_CODEX_CACHE_ROOT`. Ordinary
+host-native debug and non-public packaging defaults to the host target and embeds
+one package under that target name. Setting `REPOPROMPT_CODEX_ARCH=all` explicitly
+for one of those host-native lanes embeds both target packages. Universal
+release-candidate and public release lanes always select `all`, acquire and embed
+both official macOS packages, and reject an explicit single-target selection.
+
+Each intact thin package is copied to the stable target-specific layout
+`Contents/Resources/BundledRuntimes/Codex/<target>/`. Ordinary host-native output
+contains only its selected target directory, while explicit
+`REPOPROMPT_CODEX_ARCH=all` output and universal release-candidate/public artifacts
+contain both `aarch64-apple-darwin/` and `x86_64-apple-darwin/`. Runtime selection
+fails closed unless the package matching the running app architecture is present.
+Each target subtree preserves `codex-package.json`, `bin/codex`,
+`bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and all additional
+package resources; the binaries inside remain thin and must match the directory's
+target architecture. The two primary macOS executables are
+Developer ID signed by `OpenAI OpCo, LLC` (team `2DC432GLL2`) with hardened
+runtime and timestamps. RepoPrompt's signing scripts do **not** thin, mutate, or
+re-sign anything in this subtree. The outer app signature seals the resource
+tree, after which the artifact verifier rechecks every byte, architecture, and
+upstream signature. Privileged staged signing and post-notarization validation
+run the verifier implementation from trusted control-plane tooling while reading
+artifact identity from `REPOPROMPT_APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json`;
+the intentionally minimal staged payload does not carry a second manifest copy.
+This mixed-authority layout passes macOS strict deep code
+signature verification without changing the upstream binary hashes. Actual
+notarization remains enforced by the protected release workflow; if Apple ever
+rejects this policy, stop rather than silently re-signing the upstream payload.
+
+The bundled package is RepoPrompt's default Codex runtime authority; runtime
+selection never falls through to the user's shell `PATH`. Advanced users may set
+one explicit absolute external override with `REPOPROMPT_CODEX_EXECUTABLE`.
+RepoPrompt rejects overrides older than 0.144.6, matching the bundled runtime and
+the documented app-server contract floor. Bundled and external runtimes both use
+RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
+`~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
+`~/.codex` and official Codex App state untouched.
+
+Within that isolated `config.toml`, RepoPrompt owns the
+`[mcp_servers.RepoPromptCE]` launch/policy keys, the managed global tool-output
+limit, and exactly `[features.code_mode].enabled` plus
+`[features.code_mode].direct_only_tool_namespaces`. It preserves other TOML,
+applies repeated updates idempotently, and stops with an actionable conflict
+instead of guessing when the code-mode policy is ambiguous, uses dotted or inline
+definitions that would redefine the owned table/keys, or uses
+`non_prefixed_mcp_tool_names`.
+
+The standalone package also contains the upstream Zsh executable at
+`codex-resources/zsh/bin/zsh`. Its exact Zsh 5.9 licence is included as
+[`ThirdPartyLicenses/codex/ZSH-LICENCE`](../ThirdPartyLicenses/codex/ZSH-LICENCE)
+and is covered by the packaged legal inventory checksum contract.
+
+To diagnose acquisition independently of a build, run:
+
+```bash
+python3 Scripts/codex_runtime_artifact.py acquire --arch all
+python3 Scripts/codex_runtime_artifact.py verify \
+  --arch aarch64-apple-darwin \
+  --package .build/codex-runtime/0.144.6/aarch64-apple-darwin
+python3 Scripts/codex_runtime_artifact.py stage-bundle \
+  --arch all \
+  --cache-root .build/codex-runtime \
+  --bundle /tmp/RepoPrompt-Codex-bundle
+python3 Scripts/codex_runtime_artifact.py verify-bundle \
+  --arch all \
+  --bundle /tmp/RepoPrompt-Codex-bundle
+```
+
+Rotate the pin only by reviewing a new official release and its checksum asset,
+updating every archive and exact-tree hash in the manifest, capturing the new
+license/notice files, and rerunning the offline artifact tests plus a protected
+release candidate. Never derive a new pin from an unverified local installation.
+
 ## Release ownership
 
 Ordinary contributors prepare release candidates. They do not need Apple
@@ -132,8 +230,11 @@ make dev-release-artifact
 The artifact is written under `dist/`. It exercises universal `arm64+x86_64`
 release-mode compilation in isolated SwiftPM directories, resource-equivalence
 checking, unsigned product merging, app bundling, legal-file packaging, and
-archive extraction validation. It is intentionally ad-hoc signed and is not
-suitable for distribution. The ZIP is accompanied by a deterministic external
+archive extraction validation. Coordinated `release artifact` jobs allow up to
+four hours for this dual-architecture path; `package release`, `release package`,
+and `release local-install` retain the normal two-hour release timeout. The
+artifact is intentionally ad-hoc signed and is not suitable for distribution.
+The ZIP is accompanied by a deterministic external
 `*-artifact-manifest.json` and `SHA256SUMS`; the manifest binds bundle versions,
 architecture sets, executable/helper hashes, signing identifiers and teams,
 designated requirements, certificate fingerprints when present, and the
