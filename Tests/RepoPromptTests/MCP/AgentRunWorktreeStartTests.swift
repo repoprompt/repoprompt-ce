@@ -720,6 +720,274 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         )
     }
 
+    func testCodexWorkspaceResolutionFailureJoinsConcurrentSessionShutdownRetirement() async throws {
+        let root = try makeTemporaryDirectory(named: "workspace-failure-retirement-root")
+        let worktree = try makeTemporaryDirectory(named: "workspace-failure-retirement-worktree")
+        let publicationGate = AgentRunWorktreeStartAsyncGate()
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let controller = ReplacementIdentityFakeCodexController(shutdownGate: shutdownGate)
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        )
+        viewModel.test_initializeRunService()
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate {
+            await publicationGate.markStartedAndWaitForRelease()
+        }
+
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        session.worktreeBindings = [makeBinding(logicalRoot: "   ", worktreeRoot: worktree.path)]
+        var failureCompleted = false
+        let failureTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+            failureCompleted = true
+        }
+        await publicationGate.waitUntilStarted()
+
+        var shutdownCompleted = false
+        let shutdownTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+            shutdownCompleted = true
+        }
+        await shutdownGate.waitUntilStarted()
+
+        XCTAssertNil(
+            session.codexController,
+            "session shutdown must detach the controller before retirement suspends"
+        )
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasPendingCodexControllerRetirement(for: session.tabID)
+        )
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(failureCompleted)
+        XCTAssertFalse(shutdownCompleted)
+
+        await publicationGate.release()
+        await shutdownGate.release()
+        await failureTask.value
+        await shutdownTask.value
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate(nil)
+
+        XCTAssertTrue(failureCompleted)
+        XCTAssertTrue(shutdownCompleted)
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasPendingCodexControllerRetirement(for: session.tabID)
+        )
+    }
+
+    func testCodexCancellationRetirementBlocksSameTabReplacementButNotAnotherTab() async throws {
+        let rootA = try makeTemporaryDirectory(named: "cancel-retirement-root-a")
+        let worktreeA = try makeTemporaryDirectory(named: "cancel-retirement-worktree-a")
+        let rootB = try makeTemporaryDirectory(named: "cancel-retirement-root-b")
+        let worktreeB = try makeTemporaryDirectory(named: "cancel-retirement-worktree-b")
+        let tabAID = UUID()
+        let tabBID = UUID()
+        let interruptGate = AgentRunWorktreeStartAsyncGate()
+        let cancellingController = CancellationRetirementFakeCodexController(interruptGate: interruptGate)
+        var controllerCreationCountByTabID: [UUID: Int] = [:]
+
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, tabID, _, _, _, _ in
+                let creationIndex = controllerCreationCountByTabID[tabID, default: 0]
+                controllerCreationCountByTabID[tabID] = creationIndex + 1
+                if tabID == tabAID, creationIndex == 0 {
+                    return cancellingController
+                }
+                return ReplacementIdentityFakeCodexController()
+            }
+        )
+        viewModel.test_initializeRunService()
+
+        let sessionA = viewModel.session(for: tabAID)
+        sessionA.selectedAgent = .codexExec
+        sessionA.worktreeBindings = [makeBinding(logicalRoot: rootA.path, worktreeRoot: worktreeA.path)]
+        let sessionB = viewModel.session(for: tabBID)
+        sessionB.selectedAgent = .codexExec
+        sessionB.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktreeB.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        XCTAssertEqual(controllerCreationCountByTabID[tabAID], 1)
+
+        let cancelTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.cancelCodexRun(sessionA)
+        }
+        await interruptGate.waitUntilStarted()
+        XCTAssertEqual(cancellingController.recordedOperations, [.interruptStarted])
+
+        let replacementEnsureStarted = expectation(description: "same-tab replacement ensure started")
+        let replaceATask = Task { @MainActor in
+            replacementEnsureStarted.fulfill()
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        }
+        await fulfillment(of: [replacementEnsureStarted], timeout: 1)
+        XCTAssertEqual(
+            controllerCreationCountByTabID[tabAID],
+            1,
+            "same-tab replacement must remain behind the in-flight cancel interrupt and shutdown"
+        )
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionB)
+        XCTAssertEqual(
+            controllerCreationCountByTabID[tabBID],
+            1,
+            "another tab must not serialize behind tab A cancellation retirement"
+        )
+        XCTAssertEqual(controllerCreationCountByTabID[tabAID], 1)
+
+        await interruptGate.release()
+        await cancelTask.value
+        await replaceATask.value
+        XCTAssertEqual(cancellingController.recordedOperations, [.interruptStarted, .interruptFinished, .shutdown])
+        XCTAssertEqual(controllerCreationCountByTabID[tabAID], 2)
+
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionA)
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionB)
+    }
+
+    func testCodexCancellationThenSessionCloseSharesOneJoinedRetirement() async {
+        let interruptGate = AgentRunWorktreeStartAsyncGate()
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let controller = CancellationRetirementFakeCodexController(
+            interruptGate: interruptGate,
+            shutdownGate: shutdownGate
+        )
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        )
+        viewModel.test_initializeRunService()
+
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        var cancellationCompleted = false
+        let cancellationTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.cancelCodexRun(session)
+            cancellationCompleted = true
+        }
+        await interruptGate.waitUntilStarted()
+        XCTAssertNil(
+            session.codexController,
+            "cancellation must detach the controller before its retirement suspends"
+        )
+
+        var closeCompleted = false
+        let closeStarted = expectation(description: "overlapping session close started")
+        let closeTask = Task { @MainActor in
+            closeStarted.fulfill()
+            await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+            closeCompleted = true
+        }
+        await fulfillment(of: [closeStarted], timeout: 1)
+
+        await interruptGate.release()
+        await shutdownGate.waitUntilStarted()
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(controller.shutdownDidFinish)
+        XCTAssertFalse(cancellationCompleted)
+        XCTAssertFalse(closeCompleted, "session close must join the cancellation retirement")
+
+        await shutdownGate.release()
+        await cancellationTask.value
+        await closeTask.value
+
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertTrue(controller.shutdownDidFinish)
+        XCTAssertTrue(cancellationCompleted)
+        XCTAssertTrue(closeCompleted)
+        XCTAssertEqual(
+            controller.recordedOperations,
+            [.interruptStarted, .interruptFinished, .shutdown]
+        )
+    }
+
+    func testCodexControllerRetirementIsPerTabAndJoinedBeforeWorkspaceReplacement() async throws {
+        let rootA = try makeTemporaryDirectory(named: "retirement-root-a")
+        let worktreeA1 = try makeTemporaryDirectory(named: "retirement-worktree-a1")
+        let worktreeA2 = try makeTemporaryDirectory(named: "retirement-worktree-a2")
+        let rootB = try makeTemporaryDirectory(named: "retirement-root-b")
+        let worktreeB1 = try makeTemporaryDirectory(named: "retirement-worktree-b1")
+        let worktreeB2 = try makeTemporaryDirectory(named: "retirement-worktree-b2")
+        let tabAID = UUID()
+        let tabBID = UUID()
+        let retirementGate = AgentRunWorktreeStartAsyncGate()
+        var createdPathsByTabID: [UUID: [CodexRuntimeWorkspacePaths]] = [:]
+        var firstControllerByTabID: [UUID: ReplacementIdentityFakeCodexController] = [:]
+
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, tabID, _, workspacePaths, _, _ in
+                createdPathsByTabID[tabID, default: []].append(workspacePaths)
+                let controller = ReplacementIdentityFakeCodexController(
+                    shutdownGate: tabID == tabAID && firstControllerByTabID[tabID] == nil
+                        ? retirementGate
+                        : nil
+                )
+                if firstControllerByTabID[tabID] == nil {
+                    firstControllerByTabID[tabID] = controller
+                }
+                return controller
+            }
+        )
+        viewModel.test_initializeRunService()
+
+        let sessionA = viewModel.session(for: tabAID)
+        sessionA.selectedAgent = .codexExec
+        sessionA.worktreeBindings = [makeBinding(logicalRoot: rootA.path, worktreeRoot: worktreeA1.path)]
+        let sessionB = viewModel.session(for: tabBID)
+        sessionB.selectedAgent = .codexExec
+        sessionB.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktreeB1.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionB)
+        XCTAssertEqual(createdPathsByTabID[tabAID]?.count, 1)
+        XCTAssertEqual(createdPathsByTabID[tabBID]?.count, 1)
+
+        sessionA.worktreeBindings = [makeBinding(logicalRoot: rootA.path, worktreeRoot: worktreeA2.path)]
+        let replaceATask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionA)
+        }
+        await retirementGate.waitUntilStarted()
+        XCTAssertEqual(
+            createdPathsByTabID[tabAID]?.count,
+            1,
+            "tab A must not create its replacement while the old controller is still shutting down"
+        )
+
+        sessionB.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktreeB2.path)]
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: sessionB)
+        XCTAssertEqual(
+            createdPathsByTabID[tabBID]?.count,
+            2,
+            "tab B retirement must not serialize behind tab A"
+        )
+        XCTAssertEqual(createdPathsByTabID[tabAID]?.count, 1)
+
+        await retirementGate.release()
+        await replaceATask.value
+        XCTAssertEqual(createdPathsByTabID[tabAID]?.count, 2)
+        XCTAssertEqual(
+            createdPathsByTabID[tabAID]?.last,
+            .worktreeBound(logicalRootPath: rootA.path, validatedWorktreeRootPath: worktreeA2.path)
+        )
+        XCTAssertEqual(
+            createdPathsByTabID[tabBID]?.last,
+            .worktreeBound(logicalRootPath: rootB.path, validatedWorktreeRootPath: worktreeB2.path)
+        )
+        XCTAssertEqual(firstControllerByTabID[tabAID]?.shutdownCallCount, 1)
+        XCTAssertEqual(firstControllerByTabID[tabBID]?.shutdownCallCount, 1)
+
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionA)
+        await viewModel.test_codexCoordinator.shutdownCodexSession(sessionB)
+    }
+
     func testCodexControllerReplacementKeysOnExecutionChangeAndSurvivesSecondaryBindingChanges() async throws {
         let root = try makeTemporaryDirectory(named: "replacement-root")
         let worktreeA = try makeTemporaryDirectory(named: "replacement-worktree-a")
@@ -747,7 +1015,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 validatedWorktreeRootPath: worktreeA.path
             )
         ])
-        let firstControllerIdentity = try XCTUnwrap(controllerIdentity(in: session))
+        let firstController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+        let firstControllerIdentity = ObjectIdentifier(firstController)
 
         // Unchanged pair: the controller instance survives another ensure pass.
         await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
@@ -773,7 +1044,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 validatedWorktreeRootPath: worktreeB.path
             )
         )
-        XCTAssertNotEqual(controllerIdentity(in: session), firstControllerIdentity)
+        let replacementController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+        XCTAssertFalse(replacementController === firstController)
     }
 
     func testCodexControllerReplacementKeysOnLaunchOnlyChange() async throws {
@@ -803,7 +1077,9 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 validatedWorktreeRootPath: worktree.path
             )
         ])
-        let firstControllerIdentity = try XCTUnwrap(controllerIdentity(in: session))
+        let firstController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
 
         session.worktreeBindings = [makeBinding(logicalRoot: rootB.path, worktreeRoot: worktree.path)]
         await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
@@ -815,7 +1091,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 validatedWorktreeRootPath: worktree.path
             )
         )
-        XCTAssertNotEqual(controllerIdentity(in: session), firstControllerIdentity)
+        let replacementController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+        XCTAssertFalse(replacementController === firstController)
     }
 
     func testWorktreeCodexControllerFakesPreserveDistinctStreamAndShutdownSemantics() async {
@@ -4710,6 +4989,92 @@ private final class WorktreeStartFakeCodexController: CodexSessionControllerPass
     }
 
     func shutdown() async {}
+}
+
+/// Cancellation retirement tests keep the controller event stream open so the gated interrupt,
+/// rather than unexpected-stream-end recovery, remains the only replacement fence under test.
+private final class CancellationRetirementFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
+    enum Operation: Equatable {
+        case interruptStarted
+        case interruptFinished
+        case shutdown
+    }
+
+    private let lock = NSLock()
+    private let interruptGate: AgentRunWorktreeStartAsyncGate
+    private let shutdownGate: AgentRunWorktreeStartAsyncGate?
+    private var operations: [Operation] = []
+    private var shutdownCount = 0
+    private var didFinishShutdown = false
+    private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+    private let eventsStream: AsyncStream<CodexNativeSessionController.Event>
+
+    init(
+        interruptGate: AgentRunWorktreeStartAsyncGate,
+        shutdownGate: AgentRunWorktreeStartAsyncGate? = nil
+    ) {
+        self.interruptGate = interruptGate
+        self.shutdownGate = shutdownGate
+        var continuationRef: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+        eventsStream = AsyncStream { continuation in
+            continuationRef = continuation
+        }
+        eventsContinuation = continuationRef
+    }
+
+    deinit {
+        eventsContinuation?.finish()
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        eventsStream
+    }
+
+    var recordedOperations: [Operation] {
+        lock.lock()
+        defer { lock.unlock() }
+        return operations
+    }
+
+    var shutdownCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return shutdownCount
+    }
+
+    var shutdownDidFinish: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didFinishShutdown
+    }
+
+    func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
+        record(.interruptStarted)
+        await interruptGate.markStartedAndWaitForRelease()
+        record(.interruptFinished)
+        return CodexTurnInterruptReceipt(interruptedTurnID: "cancel-retirement-test")
+    }
+
+    func shutdown() async {
+        lock.lock()
+        operations.append(.shutdown)
+        shutdownCount += 1
+        lock.unlock()
+        if let shutdownGate {
+            await shutdownGate.markStartedAndWaitForRelease()
+        }
+        lock.lock()
+        didFinishShutdown = true
+        lock.unlock()
+        eventsContinuation?.finish()
+        eventsContinuation = nil
+    }
+
+    private func record(_ operation: Operation) {
+        lock.lock()
+        operations.append(operation)
+        lock.unlock()
+    }
 }
 
 /// Controller-replacement identity tests need a controller whose events stream stays open:
