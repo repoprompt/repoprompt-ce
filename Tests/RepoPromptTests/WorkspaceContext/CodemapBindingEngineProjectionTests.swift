@@ -79,6 +79,17 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
             rootEpoch: fixture.rootEpoch
         )
         XCTAssertEqual(preScheduleProjection, .unavailable(reason: .jobNotScheduled))
+        let statusStream = await fixture.engine.projectionSnapshotUpdates(rootEpoch: fixture.rootEpoch)
+        let observedStatusTask = Task { () -> [WorkspaceCodemapCurrentProjectionSnapshot] in
+            var snapshots: [WorkspaceCodemapCurrentProjectionSnapshot] = []
+            for await snapshot in statusStream {
+                snapshots.append(snapshot)
+                if case .authoritativeComplete = snapshot {
+                    return snapshots
+                }
+            }
+            return snapshots
+        }
 
         let firstSchedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
         let duplicateSchedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
@@ -102,11 +113,255 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         XCTAssertEqual(proof.generation.rootEpoch, fixture.rootEpoch)
         XCTAssertEqual(proof.counts.supportedCandidateCount, 0)
         XCTAssertGreaterThan(completedUptimeNanoseconds, 0)
+        let observedStatuses = await observedStatusTask.value
+        XCTAssertTrue(observedStatuses.contains { snapshot in
+            if case .pending = snapshot { true } else { false }
+        })
+        XCTAssertTrue(observedStatuses.contains { snapshot in
+            if case .authoritativeComplete = snapshot { true } else { false }
+        })
+        for (previous, current) in zip(observedStatuses, observedStatuses.dropFirst()) {
+            XCTAssertNotEqual(previous, current)
+        }
         let snapshots = await recorder.snapshots
         XCTAssertEqual(snapshots.count, 1)
         guard case .seal = snapshots.first else {
             return XCTFail("Expected an empty-catalog coverage seal without a segment.")
         }
+    }
+
+    func testProjectionSnapshotUpdatesExposeResolvedCandidatesBeforeSingleBatchAcceptance() async throws {
+        let candidateCount = 5
+        let paths = (0 ..< candidateCount).map { "Sources/Progress\($0).swift" }
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: Dictionary(uniqueKeysWithValues: paths.map { path in
+                (
+                    path,
+                    SwiftFixtureSource.emptyStruct(
+                        URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                    )
+                )
+            })
+        )
+        let candidateGate = EngineMultiEntryGate()
+        addTeardownBlock { await candidateGate.releaseAll() }
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in
+                await candidateGate.enter()
+                return .readyNoSymbols
+            }),
+            coordinatorPolicy: CodeMapArtifactBuildCoordinatorPolicy(
+                maximumConcurrentBuildCount: candidateCount
+            )
+        )
+        let recorder = EngineProjectionRecorder()
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            policy: WorkspaceCodemapBindingEnginePolicy(
+                maximumConcurrentMaterializationCountPerOwner: candidateCount
+            ),
+            projectionCatalogFactory: { rootEpoch, fileIDs in
+                let candidates = paths.map { path in
+                    WorkspaceCodemapProjectionCatalogCandidate(
+                        identity: WorkspaceCodemapArtifactBindingIdentity(
+                            rootID: rootEpoch.rootID,
+                            rootLifetimeID: rootEpoch.rootLifetimeID,
+                            fileID: fileIDs.id(for: path),
+                            standardizedRootPath: root.path,
+                            standardizedRelativePath: path,
+                            standardizedFullPath: root.appendingPathComponent(path).path
+                        )!,
+                        language: .swift,
+                        requestGeneration: 1,
+                        pathGeneration: 1
+                    )
+                }
+                return EngineProjectionCatalogStub(
+                    rootEpoch: rootEpoch,
+                    entries: candidates,
+                    recorder: recorder
+                ).client
+            }
+        )
+        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected eligible registration.")
+        }
+        let statusStream = await fixture.engine.projectionSnapshotUpdates(rootEpoch: fixture.rootEpoch)
+        let intermediateProgressObserved = expectation(
+            description: "One locally resolved candidate is published before batch acceptance"
+        )
+        let observedStatusTask = Task { () -> [WorkspaceCodemapCurrentProjectionSnapshot] in
+            var snapshots: [WorkspaceCodemapCurrentProjectionSnapshot] = []
+            var fulfilledIntermediateProgress = false
+            for await snapshot in statusStream {
+                snapshots.append(snapshot)
+                if case let .pending(_, progress, inBatchProgress, _, _) = snapshot,
+                   progress.counts.processedCandidateCount == 0,
+                   inBatchProgress?.resolvedCandidateCount == 1,
+                   !fulfilledIntermediateProgress
+                {
+                    fulfilledIntermediateProgress = true
+                    intermediateProgressObserved.fulfill()
+                }
+                if case .authoritativeComplete = snapshot {
+                    return snapshots
+                }
+            }
+            return snapshots
+        }
+        defer { observedStatusTask.cancel() }
+
+        let schedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(schedule, .handedOff)
+        let allCandidatesEntered = await candidateGate.waitUntilEntered(candidateCount)
+        XCTAssertTrue(allCandidatesEntered)
+        await candidateGate.releaseOne()
+        await fulfillment(of: [intermediateProgressObserved], timeout: 2)
+
+        let snapshotsBeforeAcceptance = await recorder.snapshots
+        XCTAssertTrue(snapshotsBeforeAcceptance.isEmpty)
+        let intermediateSnapshot = await fixture.engine.currentProjectionSnapshot(
+            rootEpoch: fixture.rootEpoch
+        )
+        guard case let .pending(_, progress, inBatchProgress, _, _) = intermediateSnapshot else {
+            return XCTFail("Expected pending in-batch projection progress.")
+        }
+        XCTAssertEqual(progress.counts.processedCandidateCount, 0)
+        XCTAssertEqual(inBatchProgress?.resolvedCandidateCount, 1)
+        XCTAssertEqual(inBatchProgress?.locallyResolvedCandidateCountThroughRoot, 1)
+
+        await candidateGate.releaseAll()
+        let completed = await waitForEngineCondition {
+            await fixture.engine.accounting().projectionRoots.first?.phase == .complete
+        }
+        guard completed else {
+            observedStatusTask.cancel()
+            return XCTFail("Expected projection preload completion after releasing the candidates.")
+        }
+        let observedStatuses = await observedStatusTask.value
+        guard case let .authoritativeComplete(proof, _) = observedStatuses.last else {
+            return XCTFail("Expected the snapshot stream to finish at authoritative completion.")
+        }
+        XCTAssertEqual(proof.counts.processedCandidateCount, UInt64(candidateCount))
+        XCTAssertEqual(proof.counts.supportedCandidateCount, UInt64(candidateCount))
+        for (previous, current) in zip(observedStatuses, observedStatuses.dropFirst()) {
+            XCTAssertNotEqual(previous, current)
+        }
+    }
+
+    func testInBatchProgressKeepsPageStartBaselineWhenLaterSegmentRetries() async throws {
+        let candidateCount = 8
+        let paths = (0 ..< candidateCount).map { "Sources/RetryProgress\($0).swift" }
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: Dictionary(uniqueKeysWithValues: paths.map { path in
+                (
+                    path,
+                    SwiftFixtureSource.emptyStruct(
+                        URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                    )
+                )
+            })
+        )
+        let rereadGate = EngineAsyncGate()
+        addTeardownBlock { rereadGate.release() }
+        let publisher = EngineProjectionPartialPageRetryPublisher(rereadGate: rereadGate)
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        let recorder = EngineProjectionRecorder()
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            policy: WorkspaceCodemapBindingEnginePolicy(
+                maximumRetainedProjectionByteCountPerSegment: 2048,
+                projectionRetryInitialMilliseconds: 25,
+                projectionRetryMaximumMilliseconds: 25,
+                projectionRetryJitterPercent: 0
+            ),
+            projectionCatalogFactory: { rootEpoch, fileIDs in
+                let candidates = paths.map { path in
+                    WorkspaceCodemapProjectionCatalogCandidate(
+                        identity: WorkspaceCodemapArtifactBindingIdentity(
+                            rootID: rootEpoch.rootID,
+                            rootLifetimeID: rootEpoch.rootLifetimeID,
+                            fileID: fileIDs.id(for: path),
+                            standardizedRootPath: root.path,
+                            standardizedRelativePath: path,
+                            standardizedFullPath: root.appendingPathComponent(path).path
+                        )!,
+                        language: .swift,
+                        requestGeneration: 1,
+                        pathGeneration: 1
+                    )
+                }
+                return EngineProjectionCatalogStub(
+                    rootEpoch: rootEpoch,
+                    entries: candidates,
+                    recorder: recorder,
+                    publishProjectionOverride: { snapshot in
+                        await publisher.publish(snapshot)
+                    }
+                ).client
+            }
+        )
+        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected eligible registration.")
+        }
+
+        let schedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(schedule, .handedOff)
+        let rereadReachedPublication = await rereadGate.waitUntilEntered()
+        guard rereadReachedPublication else {
+            let publications = await publisher.snapshots
+            let description = publications.map { snapshot in
+                switch snapshot {
+                case let .segment(segment):
+                    let individualBytes = segment.entries.compactMap { entry -> UInt64? in
+                        guard case let .success(bytes) =
+                            WorkspaceCodemapSelectionGraphProjectionByteAccounting.normalizedByteCount(
+                                entries: [entry]
+                            )
+                        else { return nil }
+                        return bytes
+                    }
+                    return "segment(entries: \(segment.entries.count), bytes: \(segment.byteCount), individual: \(individualBytes))"
+                case .seal:
+                    return "seal"
+                }
+            }.joined(separator: ", ")
+            return XCTFail(
+                "Expected two segments, a retry on the later segment, and a page reread; got \(description)."
+            )
+        }
+
+        let snapshot = await fixture.engine.currentProjectionSnapshot(rootEpoch: fixture.rootEpoch)
+        guard case let .pending(_, progress, inBatchProgress, _, _) = snapshot else {
+            return XCTFail("Expected pending progress while the reread publication is blocked.")
+        }
+        XCTAssertGreaterThan(progress.counts.processedCandidateCount, 0)
+        XCTAssertLessThan(progress.counts.processedCandidateCount, UInt64(candidateCount))
+        XCTAssertEqual(inBatchProgress?.acceptedProcessedCandidateBaseline, 0)
+        XCTAssertEqual(inBatchProgress?.resolvedCandidateCount, UInt64(candidateCount))
+        XCTAssertEqual(
+            inBatchProgress?.locallyResolvedCandidateCountThroughRoot,
+            UInt64(candidateCount)
+        )
+        XCTAssertEqual(
+            max(
+                progress.counts.processedCandidateCount,
+                inBatchProgress?.locallyResolvedCandidateCountThroughRoot ?? 0
+            ),
+            UInt64(candidateCount)
+        )
+
+        rereadGate.release()
+        await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
     }
 
     func testProjectionDemandJoinsActiveBatchWithoutPreemptionAndBecomesExactReady() async throws {
@@ -170,6 +425,23 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         await fixture.engine.releaseProjectionDemand(ticket)
         let releasedAccounting = await fixture.engine.accounting()
         XCTAssertEqual(releasedAccounting.retainedProjectionDemandCount, 0)
+
+        let completedAcquisition = await fixture.engine.acquireProjectionDemand(
+            rootEpoch: fixture.rootEpoch,
+            fileIDs: [fixture.fileIDs.id(for: "Sources/Requested.swift")],
+            catalogGeneration: 1,
+            ingressGeneration: 1,
+            deadlineUptimeNanoseconds: .max,
+            owner: WorkspaceCodemapLiveDemandOwner()
+        )
+        guard case let .acquired(completedTicket, completedStatus) = completedAcquisition,
+              case .ready = completedStatus
+        else {
+            return XCTFail("Expected the completed projection to satisfy demand immediately.")
+        }
+        let completedAccounting = await fixture.engine.accounting()
+        XCTAssertEqual(completedAccounting.counters.projectionDemandsJoined, 1)
+        await fixture.engine.releaseProjectionDemand(completedTicket)
     }
 
     func testProjectionDemandClockExpiryBoundsRetryClampAndRevocationAreDeterministic() async throws {
