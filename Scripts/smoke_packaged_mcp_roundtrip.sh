@@ -61,6 +61,7 @@ trap 'exit 130' INT TERM
 
 [[ -n "$APP_BUNDLE" ]] || fail "usage: $0 <app-bundle> [label] [artifact-manifest]"
 [[ -x "$SOCKET_OWNER_HELPER" ]] || fail "missing packaged MCP socket ownership verifier: $SOCKET_OWNER_HELPER"
+"$SOCKET_OWNER_HELPER" selftest || fail "packaged MCP socket ownership verifier failed its passive libproc self-test"
 [[ "$ROUNDTRIP_TIMEOUT" =~ ^[0-9]+$ && "$ROUNDTRIP_TIMEOUT" -gt 0 ]] ||
     fail "REPOPROMPT_PACKAGED_SMOKE_TIMEOUT must be a positive integer, got $ROUNDTRIP_TIMEOUT"
 [[ "$HELPER_REQUEST_TIMEOUT" =~ ^[0-9]+$ && "$HELPER_REQUEST_TIMEOUT" -gt 0 ]] ||

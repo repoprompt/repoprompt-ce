@@ -1043,9 +1043,11 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('APP_PID=$!', source)
         self.assertIn('launched-process.json', source)
         self.assertIn('verify_packaged_mcp_socket_owner.py', source)
+        self.assertIn('"$SOCKET_OWNER_HELPER" selftest', source)
         self.assertIn('preflight "$MCP_SOCKET_DIR"', source)
         self.assertIn('find-owner "$MCP_SOCKET_DIR" "$APP_PID" "$APP_EXECUTABLE"', source)
         self.assertIn('verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE"', source)
+        self.assertLess(source.index('"$SOCKET_OWNER_HELPER" selftest'), source.index('preflight "$MCP_SOCKET_DIR"'))
         self.assertLess(source.index('preflight "$MCP_SOCKET_DIR"'), source.index('APP_PID=$!'))
         roundtrip_loop = source.split('while (( $(date +%s) <= deadline )); do', 1)[1]
         self.assertLess(
@@ -1058,27 +1060,36 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertNotIn("pkill", source)
         self.assertNotIn("open -n", source)
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_rejects_live_preflight_and_accepts_exact_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         socket_directory = temp_dir / "repoprompt-ce-mcp"
         socket_directory.mkdir(mode=0o700)
         socket_path = socket_directory / "repoprompt-ce-7.sock"
-        listener = self.start_unix_listener(socket_path)
+        listener, accepted_connections = self.start_unix_listener(socket_path)
         expected_executable = self.socket_owner_process_path(listener.pid)
+        wrong_pid = os.getpid()
+        wrong_executable = self.socket_owner_process_path(wrong_pid)
 
+        selftest = self.run_socket_owner_helper("selftest")
         preflight = self.run_socket_owner_helper("preflight", socket_directory)
         found = self.run_socket_owner_helper("find-owner", socket_directory, listener.pid, expected_executable)
         verified = self.run_socket_owner_helper("verify-owner", socket_path, listener.pid, expected_executable)
+        wrong_owner = self.run_socket_owner_helper("verify-owner", socket_path, wrong_pid, wrong_executable)
 
+        self.assertEqual(selftest.returncode, 0, selftest.stderr)
         self.assertNotEqual(preflight.returncode, 0)
         self.assertIn("pre-existing live release socket", preflight.stderr)
         self.assertEqual(found.returncode, 0, found.stderr)
         self.assertEqual(Path(found.stdout.strip()), socket_path)
         self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertNotEqual(wrong_owner.returncode, 0)
+        self.assertIn(str(listener.pid), wrong_owner.stderr)
+        self.assertIn(f"not exclusively launched pid {wrong_pid}", wrong_owner.stderr)
+        self.assertFalse(accepted_connections.exists(), "ownership inspection must not connect to the release socket")
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_allows_stale_and_rejects_wrong_or_replaced_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -1092,18 +1103,54 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertEqual(accepted_stale.returncode, 0, accepted_stale.stderr)
 
         socket_path.unlink()
-        first = self.start_unix_listener(socket_path)
+        first, first_accepted_connections = self.start_unix_listener(socket_path)
         first_executable = self.socket_owner_process_path(first.pid)
+
         socket_path.unlink()
-        second = self.start_unix_listener(socket_path)
+        stale_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale_replacement.bind(os.fspath(socket_path))
+        stale_replacement.close()
+        replaced_by_stale = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        self.assertNotEqual(replaced_by_stale.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_stale.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "stale-replacement inspection must not connect")
+
+        socket_path.unlink()
+        bound_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound_replacement.bind(os.fspath(socket_path))
+        try:
+            replaced_by_bound = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        finally:
+            bound_replacement.close()
+        self.assertNotEqual(replaced_by_bound.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_bound.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "bound-replacement inspection must not connect")
+
+        socket_path.unlink()
+        second, second_accepted_connections = self.start_unix_listener(
+            socket_path,
+            claim_ownership_lock=False,
+        )
         second_executable = self.socket_owner_process_path(second.pid)
 
         replaced = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
-        current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        ambiguous_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
 
         self.assertNotEqual(replaced.returncode, 0)
-        self.assertIn(f"belongs to pid {second.pid}", replaced.stderr)
-        self.assertEqual(current.returncode, 0, current.stderr)
+        self.assertIn("not exclusively launched pid", replaced.stderr)
+        self.assertIn(str(first.pid), replaced.stderr)
+        self.assertIn(str(second.pid), replaced.stderr)
+        self.assertNotEqual(ambiguous_current.returncode, 0)
+        self.assertIn("not exclusively launched pid", ambiguous_current.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "replaced-owner inspection must not connect")
+        self.assertFalse(second_accepted_connections.exists(), "current-owner inspection must not connect")
+
+        first.terminate()
+        first.wait(timeout=5)
+        unlocked_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        self.assertNotEqual(unlocked_current.returncode, 0)
+        self.assertIn("ownership lock is not held", unlocked_current.stderr)
+        self.assertFalse(second_accepted_connections.exists(), "unlocked-owner verification must not connect")
 
         socket_path.unlink()
         socket_path.write_text("not a socket\n", encoding="utf-8")
@@ -3459,25 +3506,48 @@ fi
         (resources_bin / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         return app
 
-    def start_unix_listener(self, socket_path: Path) -> subprocess.Popen[str]:
+    def start_unix_listener(
+        self,
+        socket_path: Path,
+        *,
+        claim_ownership_lock: bool = True,
+    ) -> tuple[subprocess.Popen[str], Path]:
         ready = socket_path.with_suffix(".ready")
+        accepted_connections = socket_path.with_name(f"{socket_path.name}.{time.monotonic_ns()}.accepted")
         ready.unlink(missing_ok=True)
+        accepted_connections.unlink(missing_ok=True)
         process = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
-                "import socket, sys\n"
+                "import fcntl, os, socket, sys\n"
+                "lock_descriptor = None\n"
+                "if sys.argv[4] == '1':\n"
+                "    lock_descriptor = os.open(sys.argv[1] + '.lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)\n"
+                "    os.fchmod(lock_descriptor, 0o600)\n"
+                "    fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
                 "listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
                 "listener.bind(sys.argv[1])\n"
+                "if lock_descriptor is not None:\n"
+                "    metadata = os.lstat(sys.argv[1])\n"
+                "    record = f'repoprompt-ce-socket-identity-v1 {metadata.st_dev} {metadata.st_ino}\\n'.encode()\n"
+                "    os.ftruncate(lock_descriptor, 0)\n"
+                "    assert os.write(lock_descriptor, record) == len(record)\n"
+                "    os.fsync(lock_descriptor)\n"
                 "listener.listen(8)\n"
                 "open(sys.argv[2], 'w', encoding='utf-8').close()\n"
                 "while True:\n"
                 "    client, _ = listener.accept()\n"
+                "    with open(sys.argv[3], 'a', encoding='utf-8') as accepted:\n"
+                "        accepted.write('accepted\\n')\n"
+                "        accepted.flush()\n"
                 "    with client:\n"
                 "        while client.recv(4096):\n"
                 "            pass\n",
                 os.fspath(socket_path),
                 os.fspath(ready),
+                os.fspath(accepted_connections),
+                "1" if claim_ownership_lock else "0",
             ],
             text=True,
             stdout=subprocess.DEVNULL,
@@ -3502,7 +3572,7 @@ fi
                 self.fail(f"UNIX listener exited early: {process.stderr.read() if process.stderr else ''}")
             time.sleep(0.02)
         self.assertTrue(ready.exists(), "UNIX listener did not become ready")
-        return process
+        return process, accepted_connections
 
     def socket_owner_process_path(self, pid: int) -> Path:
         result = self.run_socket_owner_helper("process-path", pid)
