@@ -720,6 +720,66 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         )
     }
 
+    func testCodexWorkspaceResolutionFailureJoinsConcurrentSessionShutdownRetirement() async throws {
+        let root = try makeTemporaryDirectory(named: "workspace-failure-retirement-root")
+        let worktree = try makeTemporaryDirectory(named: "workspace-failure-retirement-worktree")
+        let publicationGate = AgentRunWorktreeStartAsyncGate()
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let controller = ReplacementIdentityFakeCodexController(shutdownGate: shutdownGate)
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        )
+        viewModel.test_initializeRunService()
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate {
+            await publicationGate.markStartedAndWaitForRelease()
+        }
+
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        session.worktreeBindings = [makeBinding(logicalRoot: "   ", worktreeRoot: worktree.path)]
+        var failureCompleted = false
+        let failureTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+            failureCompleted = true
+        }
+        await publicationGate.waitUntilStarted()
+
+        var shutdownCompleted = false
+        let shutdownTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+            shutdownCompleted = true
+        }
+        await shutdownGate.waitUntilStarted()
+
+        XCTAssertNil(
+            session.codexController,
+            "session shutdown must detach the controller before retirement suspends"
+        )
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasPendingCodexControllerRetirement(for: session.tabID)
+        )
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(failureCompleted)
+        XCTAssertFalse(shutdownCompleted)
+
+        await publicationGate.release()
+        await shutdownGate.release()
+        await failureTask.value
+        await shutdownTask.value
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate(nil)
+
+        XCTAssertTrue(failureCompleted)
+        XCTAssertTrue(shutdownCompleted)
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasPendingCodexControllerRetirement(for: session.tabID)
+        )
+    }
+
     func testCodexCancellationRetirementBlocksSameTabReplacementButNotAnotherTab() async throws {
         let rootA = try makeTemporaryDirectory(named: "cancel-retirement-root-a")
         let worktreeA = try makeTemporaryDirectory(named: "cancel-retirement-worktree-a")

@@ -210,6 +210,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             || session.codexAnonymousActiveTurn?.turnKind == .compact
     }
 
+    private final class CodexControllerRetirementClaim {
+        weak var controller: (any CodexSessionControlling)?
+
+        init(controller: any CodexSessionControlling) {
+            self.controller = controller
+        }
+    }
+
     private weak var viewModel: AgentModeViewModel?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
     #if DEBUG
@@ -251,6 +259,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private var pendingCodexThreadNameSyncByTabID: [UUID: PendingCodexThreadNameSync] = [:]
     private var codexThreadNameSyncTaskByTabID: [UUID: (generation: UUID, task: Task<Void, Never>)] = [:]
     private var codexControllerRetirementTaskByTabID: [UUID: (generation: UUID, task: Task<Void, Never>)] = [:]
+    private var codexControllerRetirementClaims: [ObjectIdentifier: CodexControllerRetirementClaim] = [:]
 
     private enum CodexRecoveryTrigger: Equatable {
         case unexpectedStreamEnd
@@ -3582,6 +3591,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         source: String,
         beforeShutdown: (@MainActor () async -> Void)? = nil
     ) {
+        codexControllerRetirementClaims = codexControllerRetirementClaims.filter { $0.value.controller != nil }
+        let controllerID = ObjectIdentifier(controller)
+        if let claimedController = codexControllerRetirementClaims[controllerID]?.controller,
+           Self.sameCodexControllerInstance(claimedController, controller)
+        {
+            logCodex("[AgentModeVM][CodexRetirement] joined existing controller retirement tab=\(tabID) source=\(source)")
+            return
+        }
+        codexControllerRetirementClaims[controllerID] = CodexControllerRetirementClaim(controller: controller)
+
         let previousTask = codexControllerRetirementTaskByTabID[tabID]?.task
         let generation = UUID()
         let task = Task { @MainActor [weak self] in
@@ -3793,29 +3812,40 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentModeViewModel.TabSession,
         controller: any CodexSessionControlling
     ) async {
-        guard let activeController = session.codexController,
-              Self.sameCodexControllerInstance(activeController, controller)
-        else {
-            await controller.shutdown()
-            return
+        if let activeController = session.codexController,
+           Self.sameCodexControllerInstance(activeController, controller)
+        {
+            cancelCodexThreadNameSync(for: session.tabID)
+            cancelCodexTabScopedControllerTasks(for: session.tabID)
+            clearCodexControllerRuntimeState(for: session)
+            session.pendingCommandRunningFlushTask?.cancel()
+            session.pendingCommandRunningFlushTask = nil
+            session.pendingCommandRunningByKey.removeAll()
+            abandonCodexFallbackQueue(
+                session: session,
+                reason: "Codex queued follow-up was cancelled because the workspace root became unavailable."
+            )
+            resetTrackedCodexTurns(session)
+            session.pendingCodexComputerUseActivation = nil
+            clearCodexPendingInteractions(in: session)
+            clearCodexNativeToolLiveness(session)
+            retireCodexController(
+                controller,
+                tabID: session.tabID,
+                source: "workspace-resolution-failure",
+                beforeShutdown: { [weak self, weak session] in
+                    guard let self, let session else { return }
+                    await stopCodexToolTrackingAndWait(for: session)
+                }
+            )
+        } else {
+            retireCodexController(
+                controller,
+                tabID: session.tabID,
+                source: "stale-workspace-resolution-failure"
+            )
         }
-
-        cancelCodexThreadNameSync(for: session.tabID)
-        cancelCodexTabScopedControllerTasks(for: session.tabID)
-        clearCodexControllerRuntimeState(for: session)
-        session.pendingCommandRunningFlushTask?.cancel()
-        session.pendingCommandRunningFlushTask = nil
-        session.pendingCommandRunningByKey.removeAll()
-        abandonCodexFallbackQueue(
-            session: session,
-            reason: "Codex queued follow-up was cancelled because the workspace root became unavailable."
-        )
-        resetTrackedCodexTurns(session)
-        session.pendingCodexComputerUseActivation = nil
-        clearCodexPendingInteractions(in: session)
-        clearCodexNativeToolLiveness(session)
-        await stopCodexToolTrackingAndWait(for: session)
-        await controller.shutdown()
+        await awaitCodexControllerRetirement(for: session.tabID)
     }
 
     func ensureCodexNativeSession(
@@ -7304,6 +7334,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         @_spi(TestSupport)
         public func test_hasCodexToolTracking(for tabID: UUID) -> Bool {
             toolTrackingByTabID[tabID] != nil
+        }
+
+        @_spi(TestSupport)
+        public func test_hasPendingCodexControllerRetirement(for tabID: UUID) -> Bool {
+            codexControllerRetirementTaskByTabID[tabID] != nil
         }
 
         @_spi(TestSupport)
