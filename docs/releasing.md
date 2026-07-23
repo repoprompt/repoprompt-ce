@@ -78,8 +78,8 @@ rejects this policy, stop rather than silently re-signing the upstream payload.
 The bundled package is RepoPrompt's default Codex runtime authority; runtime
 selection never falls through to the user's shell `PATH`. Advanced users may set
 one explicit absolute external override with `REPOPROMPT_CODEX_EXECUTABLE`.
-RepoPrompt rejects overrides older than 0.142.0 because they do not support the
-owned `direct_only_tool_namespaces` policy. Bundled and external runtimes both use
+RepoPrompt rejects overrides older than 0.144.6, matching the bundled runtime and
+the documented app-server contract floor. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
@@ -89,7 +89,8 @@ Within that isolated `config.toml`, RepoPrompt owns the
 limit, and exactly `[features.code_mode].enabled` plus
 `[features.code_mode].direct_only_tool_namespaces`. It preserves other TOML,
 applies repeated updates idempotently, and stops with an actionable conflict
-instead of guessing when the code-mode policy is ambiguous or uses
+instead of guessing when the code-mode policy is ambiguous, uses dotted or inline
+definitions that would redefine the owned table/keys, or uses
 `non_prefixed_mcp_tool_names`.
 
 The standalone package also contains the upstream Zsh executable at

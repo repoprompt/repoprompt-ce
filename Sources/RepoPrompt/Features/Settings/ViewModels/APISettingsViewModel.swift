@@ -2989,7 +2989,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("User guidance: \(resolution.userMessage)")
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
-        collector.append("Codex executable resolved at \(resolution.resolvedCommand)")
+        collector.append("Codex executable resolved: \(resolution.displayDescription ?? resolution.debugMessage)")
 
         applyCodexConnectionPhase(.refreshingAuth)
         collector.append("Checking Codex managed authentication state before health check")

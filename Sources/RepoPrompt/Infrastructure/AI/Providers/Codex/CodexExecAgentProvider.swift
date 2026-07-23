@@ -82,6 +82,20 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         return (args, modelSpecifier)
     }
 
+    static func processConfiguration(
+        for resolution: CodexProviderHelpers.CodexExecutableResolution,
+        enableDebugLogging: Bool
+    ) -> CLIProcessConfiguration {
+        CLIProcessConfiguration(
+            command: resolution.resolvedCommand,
+            environment: resolution.environmentOverrides,
+            enableDebugLogging: enableDebugLogging,
+            captureStdoutTailBytes: 128 * 1024,
+            captureStderrTailBytes: 256 * 1024,
+            logStdinSampleBytes: 0
+        )
+    }
+
     // MARK: - HeadlessAgentProvider
 
     func prepare(runID: UUID? = nil) async throws -> HeadlessAgentContext {
@@ -110,13 +124,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             )
         }
 
-        var processConfig = CLIProcessConfiguration(
-            command: resolution.resolvedCommand,
-            environment: resolution.environmentOverrides,
-            enableDebugLogging: enableDebugLogging,
-            captureStdoutTailBytes: 128 * 1024,
-            captureStderrTailBytes: 256 * 1024,
-            logStdinSampleBytes: 0
+        var processConfig = Self.processConfiguration(
+            for: resolution,
+            enableDebugLogging: enableDebugLogging
         )
         processConfig.ensureAdditionalPaths(config.additionalPathHints)
         runner = CLIProcessRunner(config: processConfig)

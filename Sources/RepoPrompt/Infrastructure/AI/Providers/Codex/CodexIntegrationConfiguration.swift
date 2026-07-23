@@ -881,23 +881,60 @@ enum CodexIntegrationConfiguration {
         supportsDirectOnlyToolNamespaces: Bool
     ) -> String? {
         guard supportsDirectOnlyToolNamespaces else {
-            return "RepoPrompt did not update Codex config because this external Codex version predates direct_only_tool_namespaces (minimum 0.142.0). Update the override or use the bundled runtime."
+            return "RepoPrompt did not update Codex config because this external Codex version predates RepoPrompt's app-server contract (minimum \(CodexRuntimeAuthority.minimumExternalVersion)). Update the explicit override or use the bundled runtime."
         }
 
+        let codeModePath = ["features", "code_mode"]
+        let ownedKeys = Set(["enabled", "direct_only_tool_namespaces", "non_prefixed_mcp_tool_names"])
         let blocks = blockRanges(in: lines, whereHeaderMatches: isCodeModeHeader)
         if blocks.count > 1 {
             return "RepoPrompt did not update Codex config because multiple [features.code_mode] blocks exist. Merge them, then retry."
         }
-        if let block = blocks.first,
-           !keyLineIndices(for: "non_prefixed_mcp_tool_names", in: lines, within: block).isEmpty
-        {
-            return "RepoPrompt did not update Codex config because [features.code_mode].non_prefixed_mcp_tool_names conflicts with the owned direct-only RepoPrompt namespace policy. Remove that key, then retry."
-        }
 
+        var currentTablePath: [String] = []
         for line in lines {
+            if let header = parseTOMLHeader(line) {
+                currentTablePath = header.keyPath.map(\.normalized)
+                if header.isArrayTable,
+                   currentTablePath == ["features"] || currentTablePath.starts(with: codeModePath)
+                {
+                    return "RepoPrompt did not update Codex config because an array-table definition conflicts with RepoPrompt's owned [features.code_mode] policy. Preserve the setting in a regular table layout, then retry."
+                }
+                if currentTablePath.count > codeModePath.count,
+                   currentTablePath.starts(with: codeModePath),
+                   ownedKeys.contains(currentTablePath[codeModePath.count])
+                {
+                    return "RepoPrompt did not update Codex config because a table definition redefines an owned [features.code_mode] key. Remove the conflicting table, then retry."
+                }
+                continue
+            }
+
             guard let assignment = parseTOMLAssignment(line) else { continue }
-            if assignment.keyPath.map(\.normalized) == ["features", "code_mode", "non_prefixed_mcp_tool_names"] {
-                return "RepoPrompt did not update Codex config because features.code_mode.non_prefixed_mcp_tool_names conflicts with the owned direct-only RepoPrompt namespace policy. Remove that key, then retry."
+            let localPath = assignment.keyPath.map(\.normalized)
+            let fullPath = currentTablePath + localPath
+            let inlineTableValue = stripComment(fromValueText: String(assignment.valueText))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .hasPrefix("{")
+
+            if currentTablePath == codeModePath {
+                if let key = localPath.first, ownedKeys.contains(key) {
+                    guard localPath.count == 1 else {
+                        return "RepoPrompt did not update Codex config because a dotted definition redefines the owned [features.code_mode].\(key) key. Preserve that key as a scalar or array, then retry."
+                    }
+                    if key == "non_prefixed_mcp_tool_names" {
+                        return "RepoPrompt did not update Codex config because [features.code_mode].non_prefixed_mcp_tool_names conflicts with the owned direct-only RepoPrompt namespace policy. Remove that key, then retry."
+                    }
+                    if inlineTableValue {
+                        return "RepoPrompt did not update Codex config because an inline table redefines the owned [features.code_mode].\(key) key. Preserve that key as a scalar or array, then retry."
+                    }
+                }
+                continue
+            }
+
+            if fullPath == ["features"] || fullPath == codeModePath ||
+                (fullPath.count > codeModePath.count && fullPath.starts(with: codeModePath))
+            {
+                return "RepoPrompt did not update Codex config because a dotted or inline definition conflicts with RepoPrompt's owned [features.code_mode] table. Convert it to a regular [features.code_mode] block, then retry."
             }
         }
         return nil

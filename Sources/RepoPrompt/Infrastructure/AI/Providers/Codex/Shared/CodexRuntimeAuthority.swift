@@ -7,7 +7,7 @@ import Foundation
 /// `REPOPROMPT_CODEX_EXECUTABLE`; ordinary PATH lookup is intentionally not consulted.
 enum CodexRuntimeAuthority {
     static let bundledVersion = Version(major: 0, minor: 144, patch: 6)
-    static let minimumExternalVersion = Version(major: 0, minor: 142, patch: 0)
+    static let minimumExternalVersion = bundledVersion
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
     enum Source: Equatable {
@@ -83,9 +83,9 @@ enum CodexRuntimeAuthority {
             case let .externalOverrideNotExecutable(path):
                 "RepoPrompt could not start Codex: the configured external override is not an executable file at `\(path)`. Fix or remove \(externalExecutableOverrideEnvironmentKey)."
             case let .externalOverrideVersionUnreadable(path):
-                "RepoPrompt could not start Codex: the external override at `\(path)` did not report a compatible Codex version. Version \(minimumExternalVersion) or newer is required for RepoPrompt's direct-only tool policy."
+                "RepoPrompt could not start Codex: the external override at `\(path)` did not report a compatible Codex version. Version \(minimumExternalVersion) or newer is required by RepoPrompt's app-server contract."
             case let .externalOverrideTooOld(actual, minimum):
-                "RepoPrompt could not start Codex: external override version \(actual) is too old. Version \(minimum) or newer is required for direct_only_tool_namespaces; update the override or remove \(externalExecutableOverrideEnvironmentKey) to use bundled Codex \(bundledVersion)."
+                "RepoPrompt could not start Codex: external override version \(actual) is too old. Version \(minimum) or newer is required by RepoPrompt's app-server contract; update the explicit override or remove \(externalExecutableOverrideEnvironmentKey) to use bundled Codex \(bundledVersion)."
             }
         }
     }
@@ -137,8 +137,14 @@ enum CodexRuntimeAuthority {
         let fileSize: UInt64?
     }
 
+    private struct ExternalVersionCacheEntry {
+        let version: Version?
+        let failureExpiresAt: Date?
+    }
+
+    private static let externalVersionFailureCacheDuration: TimeInterval = 5
     private static let externalVersionCacheLock = NSLock()
-    private static var externalVersionCache: [ExternalVersionCacheKey: Version] = [:]
+    private static var externalVersionCache: [ExternalVersionCacheKey: ExternalVersionCacheEntry] = [:]
 
     static var currentArchitectureTarget: String? {
         #if arch(arm64)
@@ -303,17 +309,37 @@ enum CodexRuntimeAuthority {
             modificationDate: attributes?[.modificationDate] as? Date,
             fileSize: (attributes?[.size] as? NSNumber)?.uint64Value
         )
+        let now = Date()
 
         externalVersionCacheLock.lock()
-        defer { externalVersionCacheLock.unlock() }
         if let cached = externalVersionCache[key] {
-            return cached
+            if let version = cached.version {
+                externalVersionCacheLock.unlock()
+                return version
+            }
+            if let failureExpiresAt = cached.failureExpiresAt, failureExpiresAt > now {
+                externalVersionCacheLock.unlock()
+                return nil
+            }
+            externalVersionCache.removeValue(forKey: key)
         }
+        externalVersionCacheLock.unlock()
 
+        // Version probing may launch an invalid or hanging executable. Never hold the global
+        // cache lock while waiting for that child; cache identity-bound failures briefly so
+        // repeated callers do not serialize behind the same bad override.
         let version = readExternalVersion(executableURL: executableURL).flatMap(Version.parse)
+
+        externalVersionCacheLock.lock()
         if let version {
-            externalVersionCache[key] = version
+            externalVersionCache[key] = ExternalVersionCacheEntry(version: version, failureExpiresAt: nil)
+        } else {
+            externalVersionCache[key] = ExternalVersionCacheEntry(
+                version: nil,
+                failureExpiresAt: Date().addingTimeInterval(externalVersionFailureCacheDuration)
+            )
         }
+        externalVersionCacheLock.unlock()
         return version
     }
 

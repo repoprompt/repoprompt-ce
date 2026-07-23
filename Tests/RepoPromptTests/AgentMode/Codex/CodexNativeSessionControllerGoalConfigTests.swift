@@ -520,7 +520,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path))
     }
 
-    func testProtocolShapeRejectionsPreserveMessageAndAdviseCLIUpdate() {
+    func testProtocolShapeRejectionsPreserveMessageAndUseManagedRuntimeGuidance() {
         for method in ["initialize", "thread/resume"] {
             for code in [-32601, -32602] {
                 let error = CodexAppServerClient.ClientError.requestFailed(
@@ -528,7 +528,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 )
 
                 XCTAssertTrue(error.localizedDescription.hasPrefix("server rejected request"))
-                XCTAssertTrue(error.localizedDescription.contains("Update the installed Codex CLI"))
+                XCTAssertTrue(error.localizedDescription.contains("Reinstall or update RepoPrompt CE"))
+                XCTAssertTrue(error.localizedDescription.contains("REPOPROMPT_CODEX_EXECUTABLE"))
+                XCTAssertFalse(error.localizedDescription.contains("Update the installed Codex CLI"))
                 XCTAssertTrue(error.localizedDescription.contains(method))
             }
         }

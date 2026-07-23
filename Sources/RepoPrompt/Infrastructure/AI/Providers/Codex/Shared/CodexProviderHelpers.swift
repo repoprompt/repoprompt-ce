@@ -26,8 +26,7 @@ enum CodexProviderHelpers {
     /// These flows should not share transport/process state across chat, health checks,
     /// and model polling because failures become sticky across otherwise unrelated work.
     static func makeOwnedNonAgentAppServerClient() -> CodexAppServerClient {
-        let _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
-        return CodexAppServerClient()
+        CodexAppServerClient()
     }
 
     struct CodexExecutableResolution: Equatable {

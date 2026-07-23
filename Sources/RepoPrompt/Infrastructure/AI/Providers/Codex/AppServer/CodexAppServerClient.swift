@@ -103,7 +103,7 @@ actor CodexAppServerClient {
             else {
                 return message
             }
-            return "\(message) Update the installed Codex CLI and try again; it rejected RepoPrompt's required \(method) request shape."
+            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if REPOPROMPT_CODEX_EXECUTABLE is set, update or remove that explicit override."
         }
     }
 
@@ -294,6 +294,11 @@ actor CodexAppServerClient {
         let exitObservation: ExitObservation?
     }
 
+    private struct PreparedRuntimeLaunchContext {
+        let environment: [String: String]
+        let resolution: CodexProviderHelpers.CodexExecutableResolution
+    }
+
     private struct TerminatingTransport {
         let activeTransport: ActiveTransport?
         let expectedAgentPIDToClear: RegisteredExpectedAgentPID?
@@ -386,12 +391,15 @@ actor CodexAppServerClient {
     private var startupTask: (id: UUID, task: Task<Void, Error>)?
     private var expectedAgentPIDRegistration: ExpectedAgentPIDRegistration?
     private var registeredExpectedAgentPID: RegisteredExpectedAgentPID?
+    private var preparedRuntimeLaunchContext: PreparedRuntimeLaunchContext?
     private static let maxDecodeRecoveryAttemptsPerGeneration = 128
     private static let stderrTailLimit = 8 * 1024
     private static let exitDiagnosticSettlementWindow: TimeInterval = 0.25
     private let writeFrameHandler: @Sendable (Int32, Data) throws -> Void
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let processSpawnPreparation: @Sendable () async throws -> Void
+    private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
+    private let provisionsRepoPromptMCPOnStart: Bool
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
     #if DEBUG
@@ -410,6 +418,10 @@ actor CodexAppServerClient {
             CodexAppServerClient.defaultProcessAppearsAlive(process)
         },
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
+        processEnvironmentBuilder: @escaping @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult = {
+            await ProcessEnvironmentBuilder.build($0)
+        },
+        provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver(pid: $0)
         },
@@ -418,12 +430,57 @@ actor CodexAppServerClient {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
         self.processSpawnPreparation = processSpawnPreparation
+        self.processEnvironmentBuilder = processEnvironmentBuilder
+        self.provisionsRepoPromptMCPOnStart = provisionsRepoPromptMCPOnStart
         self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
     }
 
     func updateConfig(_ config: Config) {
         self.config = config
+        preparedRuntimeLaunchContext = nil
+    }
+
+    /// Resolves the process environment and Codex runtime once for this client lifetime.
+    /// Native Agent Mode calls this before MCP provisioning, then `startIfNeeded()` reuses
+    /// the same captured launch context instead of consulting a second environment snapshot.
+    func prepareRuntimeForLaunch() async throws -> CodexRuntimeAuthority.Runtime {
+        if let runtime = preparedRuntimeLaunchContext?.resolution.runtime {
+            return runtime
+        }
+
+        let environmentResult = await processEnvironmentBuilder(
+            ProcessEnvironmentRequest(
+                purpose: .codexAppServer,
+                enableDebugLogging: config.enableDebugLogging
+            )
+        )
+        var environment = environmentResult.environment
+        let resolution = CodexProviderHelpers.resolveCodexExecutable(
+            commandName: config.commandName,
+            environment: environment,
+            additionalPathHints: config.additionalPathHints,
+            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
+        )
+        guard resolution.status == .available else {
+            throw ClientError.executableUnavailable(resolution.userMessage)
+        }
+        guard let runtime = resolution.runtime else {
+            throw ClientError.executableUnavailable("RepoPrompt could not start Codex: runtime resolution completed without runtime metadata.")
+        }
+        do {
+            try runtime.prepareState()
+        } catch {
+            throw ClientError.executableUnavailable(
+                "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
+            )
+        }
+        environment.merge(resolution.environmentOverrides) { _, ownedValue in ownedValue }
+        preparedRuntimeLaunchContext = PreparedRuntimeLaunchContext(
+            environment: environment,
+            resolution: resolution
+        )
+        return runtime
     }
 
     func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
@@ -1275,34 +1332,13 @@ actor CodexAppServerClient {
     }
 
     private func startProcess(startupAuthority: UInt64) async throws {
-        let environmentResult = await ProcessEnvironmentBuilder.build(
-            ProcessEnvironmentRequest(
-                purpose: .codexAppServer,
-                enableDebugLogging: config.enableDebugLogging
-            )
-        )
-        var environment = environmentResult.environment
-        let resolution = CodexProviderHelpers.resolveCodexExecutable(
-            commandName: config.commandName,
-            environment: environment,
-            additionalPathHints: config.additionalPathHints,
-            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
-        )
-        guard resolution.status == .available else {
-            throw ClientError.executableUnavailable(resolution.userMessage)
+        let runtime = try await prepareRuntimeForLaunch()
+        guard let launchContext = preparedRuntimeLaunchContext else {
+            throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
-        guard let runtime = resolution.runtime else {
-            throw ClientError.executableUnavailable("RepoPrompt could not start Codex: runtime resolution completed without runtime metadata.")
-        }
-        do {
-            try runtime.prepareState()
-        } catch {
-            throw ClientError.executableUnavailable(
-                "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
-            )
-        }
-        environment.merge(resolution.environmentOverrides) { _, ownedValue in ownedValue }
-        if config.commandName == CLILaunchProfiles.codex.commandName {
+        let environment = launchContext.environment
+        let resolution = launchContext.resolution
+        if provisionsRepoPromptMCPOnStart {
             let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
             guard provisioning.success else {
                 throw ClientError.executableUnavailable(

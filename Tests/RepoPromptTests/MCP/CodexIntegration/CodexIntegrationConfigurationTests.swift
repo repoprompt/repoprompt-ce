@@ -519,19 +519,53 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
     }
 
     func testOwnedCodeModePolicySurfacesNamespaceConflictWithoutMutation() {
-        let input = """
-        model = "preserve"
+        let scenarios: [(label: String, input: String, conflictFragment: String)] = [
+            (
+                "legacy namespace key",
+                """
+                model = "preserve"
 
-        [features.code_mode]
-        enabled = true
-        non_prefixed_mcp_tool_names = ["mcp__RepoPromptCE__read_file"]
-        """
+                [features.code_mode]
+                enabled = true
+                non_prefixed_mcp_tool_names = ["mcp__RepoPromptCE__read_file"]
+                """,
+                "non_prefixed_mcp_tool_names"
+            ),
+            (
+                "dotted owned key",
+                """
+                model = "preserve"
+                features.code_mode.enabled = false
+                """,
+                "dotted or inline definition"
+            ),
+            (
+                "inline features table",
+                """
+                model = "preserve"
+                features = { code_mode = { enabled = false, direct_only_tool_namespaces = ["other"] } }
+                """,
+                "dotted or inline definition"
+            ),
+            (
+                "inline owned value",
+                """
+                model = "preserve"
 
-        let result = mutateCodexPersistentConfigForInstall(input)
+                [features.code_mode]
+                enabled = { value = true }
+                """,
+                "inline table redefines"
+            )
+        ]
 
-        XCTAssertFalse(result.changed)
-        XCTAssertEqual(result.content, input)
-        XCTAssertTrue(result.conflictMessage?.contains("non_prefixed_mcp_tool_names") == true)
+        for scenario in scenarios {
+            let result = mutateCodexPersistentConfigForInstall(scenario.input)
+
+            XCTAssertFalse(result.changed, scenario.label)
+            XCTAssertEqual(result.content, scenario.input, scenario.label)
+            XCTAssertTrue(result.conflictMessage?.contains(scenario.conflictFragment) == true, scenario.label)
+        }
     }
 
     func testOldExternalCodexPolicyIsDeclinedBeforeWritingUnknownKey() {
@@ -546,7 +580,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
 
         XCTAssertFalse(result.changed)
         XCTAssertEqual(result.content, input)
-        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.142.0") == true)
+        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.144.6") == true)
         XCTAssertFalse(result.content.contains("direct_only_tool_namespaces"))
     }
 

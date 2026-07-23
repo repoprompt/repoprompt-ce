@@ -479,13 +479,16 @@ final class CodexNativeSessionController {
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
-        /// launch or thread request. Inject in tests; production uses the default below.
-        var repoPromptMCPProvisioner: () async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
+        /// launch or thread request. The runtime is resolved once from the app-server launch
+        /// environment and passed through unchanged. Inject in tests; production uses the default below.
+        var repoPromptMCPProvisioner: (CodexRuntimeAuthority.Runtime) async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
 
-        /// Fails closed only on a real `ensureCodexServerForDiscovery()` directory-create/config-write
+        /// Fails closed only on a real `ensureServerForDiscovery(runtime:)` directory-create/config-write
         /// failure — an existing entry needing no change reports success, so a healthy no-op is not misread.
-        private static func ensureDefaultRepoPromptMCPProvisioning() async throws {
-            let result = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+        private static func ensureDefaultRepoPromptMCPProvisioning(
+            runtime: CodexRuntimeAuthority.Runtime
+        ) async throws {
+            let result = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
             guard result.success else {
                 throw AIProviderError.invalidConfiguration(
                     detail: result.errorMessage ?? MCPBootstrapReadinessError.provisioningUnavailable.localizedDescription
@@ -1068,13 +1071,17 @@ final class CodexNativeSessionController {
             try await eventHandlingMutex.withLock {
                 beginBindingSession()
             }
+            // Resolve one authoritative runtime from the captured app-server environment before
+            // provisioning. The same client-held runtime is reused at process launch, including when
+            // the bundled package is unavailable and a valid override exists only in the login shell.
+            let runtime = try await client.prepareRuntimeForLaunch()
             // Fail closed before any process launch or thread request: a child that expects
             // RepoPrompt MCP tools must not start without them. The gate runs only for tool-expecting
             // children; those with no expected client name skip provisioning. A throw here lands in the
             // catch below — binding cancelled, expected-PID registration cleared, typed error rethrown —
             // before `client.startIfNeeded()` or any thread/start or thread/resume request.
             if let expectedMCPClientName {
-                try await options.repoPromptMCPProvisioner()
+                try await options.repoPromptMCPProvisioner(runtime)
                 // A cancellation racing provisioning must not reach PID registration or process start.
                 try Task.checkCancellation()
                 await client.setExpectedAgentPIDRegistration(
