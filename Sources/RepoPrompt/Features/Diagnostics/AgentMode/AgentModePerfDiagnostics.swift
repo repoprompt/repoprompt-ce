@@ -127,6 +127,46 @@ import Foundation
             event(name, tabID: tabID, fields: renderedFields)
         }
 
+        enum CodexLifecyclePhase: String, CaseIterable {
+            case runtimeResolution = "runtime_resolution"
+            case provisioning
+            case spawnInitialize = "spawn_initialize"
+            case threadStart = "thread_start"
+            case threadResume = "thread_resume"
+            case turnAcceptance = "turn_acceptance"
+            case shutdownReap = "shutdown_reap"
+        }
+
+        enum CodexLifecycleOutcome: String, CaseIterable {
+            case succeeded
+            case failed
+            case cancelled
+        }
+
+        /// Fixed-field Codex lifecycle timing event. Typed phase/outcome values and numeric generations
+        /// prevent callers from attaching paths, prompts, identifiers, payloads, auth data, or raw errors.
+        static func recordCodexLifecyclePhase(
+            _ phase: CodexLifecyclePhase,
+            outcome: CodexLifecycleOutcome,
+            startMS: Double?,
+            tabID: UUID,
+            transportGeneration: UInt64? = nil
+        ) {
+            var fields = [
+                "phase": phase.rawValue,
+                "outcome": outcome.rawValue
+            ]
+            if let transportGeneration {
+                fields["transportGeneration"] = String(transportGeneration)
+            }
+            durationEvent(
+                "provider.codex.lifecycle.phase",
+                startMS: startMS,
+                tabID: tabID,
+                fields: fields
+            )
+        }
+
         static func counterKey(_ base: String, source: String?) -> String {
             let normalizedSource = source?
                 .trimmingCharacters(in: .whitespacesAndNewlines)

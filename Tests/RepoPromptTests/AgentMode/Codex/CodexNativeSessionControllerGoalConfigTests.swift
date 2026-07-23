@@ -393,6 +393,185 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertEqual(initialized["hasParams"] as? Bool, false)
     }
 
+    func testLifecyclePhaseDiagnosticsUseFixedRedactedFieldsAcrossSuccessAndProvisioningFailure() async throws {
+        let sensitiveSentinel = "SECRET_PATH_PROMPT_TOKEN_AUTH_URL_STDERR_RAW_ERROR"
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        AgentModePerfDiagnostics.clearRecentMetrics()
+        addTeardownBlock {
+            AgentModePerfDiagnostics.clearRecentMetrics()
+            AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(nil)
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexLifecycleDiagnostics-\(sensitiveSentinel)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
+        let registrar = CodexAppServerClient.ExpectedAgentPIDRegistrar(
+            register: { _, _, _ in },
+            clear: { _, _, _ in }
+        )
+
+        let client = CodexAppServerClient(
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar
+        )
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 2,
+            processLaunchDirectory: directory.path
+        ))
+        var options = makeOptions()
+        options.requestTimeout = 2
+        options.repoPromptMCPProvisioner = { _ in }
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown,
+            expectedMCPClientName: sensitiveSentinel
+        )
+        addTeardownBlock { await controller.shutdown() }
+
+        _ = try await controller.startOrResume(
+            existing: nil,
+            baseInstructions: sensitiveSentinel
+        )
+        _ = try await controller.startUserTurn(
+            text: sensitiveSentinel,
+            images: [],
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil
+        )
+        await controller.shutdown()
+
+        let resumeClient = CodexAppServerClient(
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar
+        )
+        await resumeClient.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 2,
+            processLaunchDirectory: directory.path
+        ))
+        let resumeController = CodexNativeSessionController(
+            client: resumeClient,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown,
+            expectedMCPClientName: sensitiveSentinel
+        )
+        addTeardownBlock { await resumeController.shutdown() }
+        _ = try await resumeController.startOrResume(
+            existing: .init(
+                conversationID: "fresh-thread",
+                rolloutPath: nil,
+                model: nil,
+                reasoningEffort: nil
+            ),
+            baseInstructions: sensitiveSentinel
+        )
+        await resumeController.shutdown()
+
+        let successLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 200)
+            .filter { $0.contains("provider.codex.lifecycle.phase") }
+        let expectedSuccessPhaseCounts = [
+            "runtime_resolution": 2,
+            "provisioning": 2,
+            "spawn_initialize": 2,
+            "thread_start": 1,
+            "thread_resume": 1,
+            "turn_acceptance": 1,
+            "shutdown_reap": 2
+        ]
+        XCTAssertEqual(successLines.count, expectedSuccessPhaseCounts.values.reduce(0, +))
+        for (phase, expectedCount) in expectedSuccessPhaseCounts {
+            let lines = successLines.filter { $0.contains("phase=\(phase)") }
+            XCTAssertEqual(lines.count, expectedCount, phase)
+            for line in lines {
+                XCTAssertTrue(line.contains("duration="), phase)
+                XCTAssertTrue(line.contains("outcome=succeeded"), phase)
+                XCTAssertTrue(line.contains("tabID="), phase)
+                XCTAssertFalse(line.contains(sensitiveSentinel), phase)
+                XCTAssertFalse(line.contains("fresh-thread"), phase)
+                XCTAssertFalse(line.contains("turn-1"), phase)
+            }
+        }
+        for phase in ["spawn_initialize", "thread_start", "thread_resume", "turn_acceptance", "shutdown_reap"] {
+            let lines = successLines.filter { $0.contains("phase=\(phase)") }
+            XCTAssertFalse(lines.isEmpty, phase)
+            XCTAssertTrue(lines.allSatisfy { $0.contains("transportGeneration=1") }, phase)
+        }
+        for phase in ["runtime_resolution", "provisioning"] {
+            let lines = successLines.filter { $0.contains("phase=\(phase)") }
+            XCTAssertFalse(lines.isEmpty, phase)
+            XCTAssertTrue(lines.allSatisfy { !$0.contains("transportGeneration=") }, phase)
+        }
+
+        AgentModePerfDiagnostics.clearRecentMetrics()
+        let failingClient = CodexAppServerClient(
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar
+        )
+        await failingClient.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 2,
+            processLaunchDirectory: directory.path
+        ))
+        var failingOptions = makeOptions()
+        failingOptions.requestTimeout = 2
+        failingOptions.repoPromptMCPProvisioner = { _ in
+            throw NSError(
+                domain: sensitiveSentinel,
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: sensitiveSentinel]
+            )
+        }
+        let failingController = CodexNativeSessionController(
+            client: failingClient,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: failingOptions,
+            clientShutdownBehavior: .stopOnShutdown,
+            expectedMCPClientName: sensitiveSentinel
+        )
+        addTeardownBlock { await failingController.shutdown() }
+
+        do {
+            _ = try await failingController.startOrResume(
+                existing: nil,
+                baseInstructions: sensitiveSentinel
+            )
+            XCTFail("Provisioning must fail before process launch")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, sensitiveSentinel)
+        }
+
+        let failureLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 200)
+            .filter { $0.contains("provider.codex.lifecycle.phase") }
+        XCTAssertEqual(failureLines.count, 2)
+        let provisioningFailure = try XCTUnwrap(failureLines.first { $0.contains("phase=provisioning") })
+        XCTAssertTrue(provisioningFailure.contains("duration="))
+        XCTAssertTrue(provisioningFailure.contains("outcome=failed"))
+        XCTAssertFalse(provisioningFailure.contains("transportGeneration="))
+        XCTAssertFalse(failureLines.joined(separator: "\n").contains(sensitiveSentinel))
+        let failingProcessIsRunning = await failingClient.debugIsProcessRunning()
+        XCTAssertFalse(failingProcessIsRunning)
+    }
+
     func testControllerOptionBoundsSilentInitializeAndTearsDownExactGeneration() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
