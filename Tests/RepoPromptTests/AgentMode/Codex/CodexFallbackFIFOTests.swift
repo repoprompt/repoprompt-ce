@@ -869,6 +869,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "thread",
