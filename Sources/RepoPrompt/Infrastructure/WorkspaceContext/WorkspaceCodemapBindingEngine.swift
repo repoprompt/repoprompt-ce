@@ -338,6 +338,13 @@ actor WorkspaceCodemapBindingEngine {
         let terminalOrdinal: UInt64
     }
 
+    private struct ProjectionProgressPublicationSchedule {
+        let token: UUID
+        let jobID: UUID
+        let batchID: UUID
+        let task: Task<Void, Never>
+    }
+
     private struct ProjectionPreloadJob {
         let id: UUID
         let rootEpoch: WorkspaceCodemapRootEpoch
@@ -352,6 +359,8 @@ actor WorkspaceCodemapBindingEngine {
         var cursor: WorkspaceCodemapProjectionCatalogCursor?
         var lastProcessedCursor: WorkspaceCodemapProjectionCatalogCursor?
         var progress: WorkspaceCodemapProjectionProgress
+        var inBatchProgress: WorkspaceCodemapProjectionInBatchProgress?
+        var pageStartProcessedCandidateBaseline: UInt64?
         var nextSegmentSequence: UInt64
         var pipelineScopes: [CodeMapPipelineIdentity: WorkspaceCodemapProjectionPipelineScope]
         var resources: WorkspaceCodemapProjectionResourceAccounting
@@ -504,6 +513,18 @@ actor WorkspaceCodemapBindingEngine {
     private var manifestAdoptionOperations: [PipelineScope: ManifestAdoptionOperation] = [:]
     private var drainingManifestAdoptionTasks: [UUID: Task<ManifestAdoptionOutcome, Never>] = [:]
     private var projectionJobs: [WorkspaceCodemapRootEpoch: ProjectionPreloadJob] = [:]
+    private var projectionSnapshotContinuations: [
+        WorkspaceCodemapRootEpoch: [UUID: AsyncStream<WorkspaceCodemapCurrentProjectionSnapshot>.Continuation]
+    ] = [:]
+    private var lastPublishedProjectionSnapshotsByRootEpoch: [
+        WorkspaceCodemapRootEpoch: WorkspaceCodemapCurrentProjectionSnapshot
+    ] = [:]
+    private var projectionProgressPublicationSchedulesByRootEpoch: [
+        WorkspaceCodemapRootEpoch: ProjectionProgressPublicationSchedule
+    ] = [:]
+    private var lastProjectionProgressPublicationUptimeByRootEpoch: [
+        WorkspaceCodemapRootEpoch: UInt64
+    ] = [:]
     private var latestOverlayContributionGenerationByRootEpoch: [
         WorkspaceCodemapRootEpoch: WorkspaceCodemapSelectionGraphContributionGeneration
     ] = [:]
@@ -752,6 +773,8 @@ actor WorkspaceCodemapBindingEngine {
             cursor: nil,
             lastProcessedCursor: nil,
             progress: .notStarted,
+            inBatchProgress: nil,
+            pageStartProcessedCandidateBaseline: nil,
             nextSegmentSequence: 0,
             pipelineScopes: [:],
             resources: .zero,
@@ -778,6 +801,10 @@ actor WorkspaceCodemapBindingEngine {
         job.task = task
         projectionJobs[rootEpoch] = job
         return .handedOff
+    }
+
+    func cancelProjectionPreload(rootEpoch: WorkspaceCodemapRootEpoch) {
+        _ = cancelProjectionJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
     }
 
     func acquireProjectionDemand(
@@ -879,7 +906,15 @@ actor WorkspaceCodemapBindingEngine {
         )
         let ordinal = nextProjectionDemandOrdinal
         nextProjectionDemandOrdinal = addingChecked(nextProjectionDemandOrdinal, 1) ?? .max
-        let joinedExistingFlight = projectionJobs[rootEpoch] != nil
+        let joinedExistingFlight = projectionJobs[rootEpoch].map { job in
+            guard projectionJobIsCurrent(job) else { return false }
+            return switch job.phase {
+            case .budgetLimited, .complete, .cancelled, .superseded:
+                false
+            default:
+                true
+            }
+        } ?? false
         projectionDemands[ticket.id] = ProjectionDemandRecord(
             ticket: ticket,
             owner: owner,
@@ -1232,6 +1267,18 @@ actor WorkspaceCodemapBindingEngine {
         projectionDemands.removeAll()
         terminalProjectionDemands.removeAll()
         pruneAdmissionHistory()
+        for continuations in projectionSnapshotContinuations.values {
+            for continuation in continuations.values {
+                continuation.finish()
+            }
+        }
+        projectionSnapshotContinuations.removeAll()
+        lastPublishedProjectionSnapshotsByRootEpoch.removeAll()
+        for schedule in projectionProgressPublicationSchedulesByRootEpoch.values {
+            schedule.task.cancel()
+        }
+        projectionProgressPublicationSchedulesByRootEpoch.removeAll()
+        lastProjectionProgressPublicationUptimeByRootEpoch.removeAll()
         shutdownComplete = true
         let waiters = shutdownWaiters
         shutdownWaiters.removeAll()
@@ -1748,6 +1795,7 @@ actor WorkspaceCodemapBindingEngine {
             return .pending(
                 phase: job.phase,
                 progress: job.progress,
+                inBatchProgress: job.inBatchProgress,
                 retry: job.retry,
                 budget: job.budget
             )
@@ -1767,6 +1815,208 @@ actor WorkspaceCodemapBindingEngine {
             proof: proof,
             completedUptimeNanoseconds: completedUptimeNanoseconds
         )
+    }
+
+    func projectionSnapshotUpdates(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> AsyncStream<WorkspaceCodemapCurrentProjectionSnapshot> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let hadSubscribers = projectionSnapshotContinuations[rootEpoch]?.isEmpty == false
+            let snapshot = currentProjectionSnapshot(rootEpoch: rootEpoch)
+            if hadSubscribers {
+                // Bring existing subscribers and the global de-dup baseline to the same
+                // current value before the new subscriber receives its initial snapshot.
+                publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+            }
+            projectionSnapshotContinuations[rootEpoch, default: [:]][id] = continuation
+            continuation.yield(snapshot)
+            if !hadSubscribers {
+                lastPublishedProjectionSnapshotsByRootEpoch[rootEpoch] = snapshot
+            }
+            continuation.onTermination = { _ in
+                Task { await self.removeProjectionSnapshotContinuation(id, rootEpoch: rootEpoch) }
+            }
+        }
+    }
+
+    private func removeProjectionSnapshotContinuation(
+        _ id: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        projectionSnapshotContinuations[rootEpoch]?.removeValue(forKey: id)
+        if projectionSnapshotContinuations[rootEpoch]?.isEmpty == true {
+            projectionSnapshotContinuations.removeValue(forKey: rootEpoch)
+            lastPublishedProjectionSnapshotsByRootEpoch.removeValue(forKey: rootEpoch)
+        }
+    }
+
+    private func publishProjectionSnapshotUpdate(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        finish: Bool = false
+    ) {
+        guard let continuations = projectionSnapshotContinuations[rootEpoch] else { return }
+        let snapshot = currentProjectionSnapshot(rootEpoch: rootEpoch)
+        if lastPublishedProjectionSnapshotsByRootEpoch[rootEpoch] != snapshot {
+            lastPublishedProjectionSnapshotsByRootEpoch[rootEpoch] = snapshot
+            for continuation in continuations.values {
+                continuation.yield(snapshot)
+            }
+        }
+        if finish {
+            for continuation in continuations.values {
+                continuation.finish()
+            }
+            projectionSnapshotContinuations.removeValue(forKey: rootEpoch)
+            lastPublishedProjectionSnapshotsByRootEpoch.removeValue(forKey: rootEpoch)
+        }
+    }
+
+    private func beginProjectionInBatchProgress(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        candidateCount: Int
+    ) -> UUID? {
+        guard candidateCount > 0,
+              let candidateCount = UInt64(exactly: candidateCount),
+              var job = projectionJobs[rootEpoch],
+              job.id == jobID,
+              projectionJobIsCurrent(job)
+        else { return nil }
+        let replacedVisibleProgress = job.inBatchProgress != nil
+        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+        let batchID = UUID()
+        let pageStartProcessedCandidateBaseline = job.pageStartProcessedCandidateBaseline
+            ?? job.checkpoint?.progress.counts.processedCandidateCount
+            ?? job.progress.counts.processedCandidateCount
+        job.pageStartProcessedCandidateBaseline = pageStartProcessedCandidateBaseline
+        job.inBatchProgress = WorkspaceCodemapProjectionInBatchProgress(
+            batchID: batchID,
+            acceptedProcessedCandidateBaseline: pageStartProcessedCandidateBaseline,
+            resolvedCandidateCount: 0,
+            candidateCount: candidateCount
+        )
+        projectionJobs[rootEpoch] = job
+        if replacedVisibleProgress {
+            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+        }
+        return batchID
+    }
+
+    private func recordProjectionCandidateResolved(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        batchID: UUID
+    ) {
+        guard var job = projectionJobs[rootEpoch],
+              job.id == jobID,
+              projectionJobIsCurrent(job),
+              let inBatchProgress = job.inBatchProgress,
+              inBatchProgress.batchID == batchID,
+              let advanced = inBatchProgress.recordingResolvedCandidate()
+        else { return }
+        job.inBatchProgress = advanced
+        projectionJobs[rootEpoch] = job
+        scheduleProjectionProgressPublication(
+            jobID: jobID,
+            rootEpoch: rootEpoch,
+            inBatchProgress: advanced
+        )
+    }
+
+    private func scheduleProjectionProgressPublication(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        inBatchProgress: WorkspaceCodemapProjectionInBatchProgress
+    ) {
+        let now = uptimeNanoseconds()
+        if inBatchProgress.resolvedCandidateCount == 1 ||
+            lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] == nil
+        {
+            cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: false)
+            lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] = now
+            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+            return
+        }
+        guard projectionProgressPublicationSchedulesByRootEpoch[rootEpoch] == nil else { return }
+        let interval = policy.projectionProgressPublicationMinimumIntervalMilliseconds * 1_000_000
+        let last = lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] ?? now
+        let nextEligible = addingSaturating(last, interval)
+        if now >= nextEligible {
+            lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] = now
+            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+            return
+        }
+        let delay = nextEligible - now
+        let token = UUID()
+        let batchID = inBatchProgress.batchID
+        let task = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self?.publishScheduledProjectionProgress(
+                token: token,
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                batchID: batchID
+            )
+        }
+        projectionProgressPublicationSchedulesByRootEpoch[rootEpoch] =
+            ProjectionProgressPublicationSchedule(
+                token: token,
+                jobID: jobID,
+                batchID: batchID,
+                task: task
+            )
+    }
+
+    private func publishScheduledProjectionProgress(
+        token: UUID,
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        batchID: UUID
+    ) {
+        guard let schedule = projectionProgressPublicationSchedulesByRootEpoch[rootEpoch],
+              schedule.token == token,
+              schedule.jobID == jobID,
+              schedule.batchID == batchID,
+              let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+              job.inBatchProgress?.batchID == batchID
+        else { return }
+        projectionProgressPublicationSchedulesByRootEpoch.removeValue(forKey: rootEpoch)
+        lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] = uptimeNanoseconds()
+        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+    }
+
+    private func clearProjectionInBatchProgress(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        publishReset: Bool
+    ) {
+        guard var job = projectionJobs[rootEpoch], job.id == jobID else {
+            cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+            return
+        }
+        let hadVisibleProgress = job.inBatchProgress != nil
+        job.inBatchProgress = nil
+        projectionJobs[rootEpoch] = job
+        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+        if publishReset, hadVisibleProgress {
+            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+        }
+    }
+
+    private func cancelProjectionProgressPublication(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        resetLastPublication: Bool
+    ) {
+        projectionProgressPublicationSchedulesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
+        if resetLastPublication {
+            lastProjectionProgressPublicationUptimeByRootEpoch.removeValue(forKey: rootEpoch)
+        }
     }
 
     func accounting() -> WorkspaceCodemapBindingEngineAccounting {
@@ -2286,6 +2536,11 @@ actor WorkspaceCodemapBindingEngine {
             case .complete, .budgetLimited, .cancelled, .superseded:
                 return
             case .retry:
+                clearProjectionInBatchProgress(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    publishReset: true
+                )
                 guard await waitForProjectionRetry(jobID: jobID, rootEpoch: rootEpoch) else {
                     return
                 }
@@ -2621,6 +2876,12 @@ actor WorkspaceCodemapBindingEngine {
             projectionPhase: .readingCatalogPage
         )
 
+        let inBatchID = beginProjectionInBatchProgress(
+            jobID: jobID,
+            rootEpoch: rootEpoch,
+            candidateCount: page.entries.count
+        )
+        guard page.entries.isEmpty || inBatchID != nil else { return .cancelled }
         guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .loadingEnvelopes) else {
             return .cancelled
         }
@@ -2687,6 +2948,13 @@ actor WorkspaceCodemapBindingEngine {
                     record: record
                 )
                 resolvedByFileID[candidate.identity.fileID] = .entry(entry, manifestRecord: nil)
+                if let inBatchID {
+                    recordProjectionCandidateResolved(
+                        jobID: jobID,
+                        rootEpoch: rootEpoch,
+                        batchID: inBatchID
+                    )
+                }
             } else {
                 misses.append(candidate)
             }
@@ -2757,6 +3025,13 @@ actor WorkspaceCodemapBindingEngine {
                 }
 
                 while let result = await group.next() {
+                    if case .entry = result.resolution, let inBatchID {
+                        recordProjectionCandidateResolved(
+                            jobID: jobID,
+                            rootEpoch: rootEpoch,
+                            batchID: inBatchID
+                        )
+                    }
                     completed.append(result)
                     guard nextIndex < misses.count else { continue }
                     let index = nextIndex
@@ -3041,6 +3316,11 @@ actor WorkspaceCodemapBindingEngine {
                     job.nextSegmentSequence += 1
                     job.retry = nil
                     projectionJobs[rootEpoch] = job
+                    cancelProjectionProgressPublication(
+                        rootEpoch: rootEpoch,
+                        resetLastPublication: false
+                    )
+                    publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
                     incrementCounter(\.projectionSegmentsPublished)
                     addToCounter(\.projectionSegmentBytes, group.byteCount)
                     if job.nextSegmentSequence == 1 {
@@ -3102,10 +3382,14 @@ actor WorkspaceCodemapBindingEngine {
         progress = projectionProgress(progress, phase: .checkpointed)
         job.phase = .checkpointed
         job.progress = progress
+        job.inBatchProgress = nil
+        job.pageStartProcessedCandidateBaseline = nil
         job.retryAttempt = 0
         job.retry = nil
         job.checkpoint = makeProjectionCheckpoint(job)
         projectionJobs[rootEpoch] = job
+        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
 
         guard page.isEnd else { return .checkpointed }
         guard let completion = catalogCompletion,
@@ -3128,11 +3412,15 @@ actor WorkspaceCodemapBindingEngine {
         case let .accepted(accepted), let .exactDuplicate(accepted):
             completedJob.phase = .complete
             completedJob.progress = accepted
+            completedJob.inBatchProgress = nil
+            completedJob.pageStartProcessedCandidateBaseline = nil
             completedJob.coverageProof = proof
             completedJob.coverageCompletedUptimeNanoseconds = uptimeNanoseconds()
             completedJob.retry = nil
             completedJob.checkpoint = makeProjectionCheckpoint(completedJob)
             projectionJobs[rootEpoch] = completedJob
+            cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
             incrementCounter(\.projectionCoveragesCompleted)
             emit(.projectionCoverageComplete, rootEpoch: rootEpoch, projectionPhase: .complete)
             return .complete
@@ -3890,7 +4178,7 @@ actor WorkspaceCodemapBindingEngine {
         let nanoseconds = delay.multipliedReportingOverflow(by: 1_000_000).overflow
             ? UInt64.max
             : delay * 1_000_000
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = uptimeNanoseconds()
         let next = addingSaturating(now, nanoseconds)
         job.phase = .suspendedBusy
         job.retryAttempt = attempt
@@ -3981,6 +4269,8 @@ actor WorkspaceCodemapBindingEngine {
         job.cursor = nil
         job.lastProcessedCursor = nil
         job.progress = .notStarted
+        job.inBatchProgress = nil
+        job.pageStartProcessedCandidateBaseline = nil
         job.nextSegmentSequence = 0
         job.pipelineScopes = [:]
         job.resources = .zero
@@ -3994,6 +4284,8 @@ actor WorkspaceCodemapBindingEngine {
         job.isQueuedForAdmission = false
         job.isActiveBatch = false
         projectionJobs[rootEpoch] = job
+        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
         if recordSupersession {
             incrementCounter(\.projectionCoveragesSuperseded)
             emit(.projectionCoverageSuperseded, rootEpoch: rootEpoch, projectionPhase: .superseded)
@@ -4095,6 +4387,7 @@ actor WorkspaceCodemapBindingEngine {
         job.progress = progress
         job.checkpoint = makeProjectionCheckpoint(job)
         projectionJobs[rootEpoch] = job
+        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
     }
 
     private func updateProjectionPipelineScope(
@@ -4380,26 +4673,34 @@ actor WorkspaceCodemapBindingEngine {
     ) {
         guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
         incrementCounter(\.projectionBudgetRejections)
+        job.phase = .budgetLimited
+        job.progress = projectionProgress(job.progress, phase: .budgetLimited)
+        job.inBatchProgress = nil
+        job.pageStartProcessedCandidateBaseline = nil
+        job.retry = nil
+        job.budget = budget
+        job.checkpoint = makeProjectionCheckpoint(job)
+        projectionJobs[rootEpoch] = job
+        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
         emit(
             .projectionBudget,
             rootEpoch: rootEpoch,
             numericValue: budget.attempted,
             projectionPhase: .budgetLimited
         )
-        job.phase = .budgetLimited
-        job.progress = projectionProgress(job.progress, phase: .budgetLimited)
-        job.retry = nil
-        job.budget = budget
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
     }
 
     private func supersedeProjectionJob(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
         guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
         job.phase = .superseded
         job.progress = projectionProgress(job.progress, phase: .superseded)
+        job.inBatchProgress = nil
+        job.pageStartProcessedCandidateBaseline = nil
         job.checkpoint = makeProjectionCheckpoint(job)
         projectionJobs[rootEpoch] = job
+        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
         incrementCounter(\.projectionCoveragesSuperseded)
         emit(.projectionCoverageSuperseded, rootEpoch: rootEpoch, projectionPhase: .superseded)
     }
@@ -4440,6 +4741,8 @@ actor WorkspaceCodemapBindingEngine {
         terminalPhase: WorkspaceCodemapProjectionPreloadPhase
     ) -> Task<Void, Never>? {
         guard var job = projectionJobs.removeValue(forKey: rootEpoch) else { return nil }
+        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
+        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
         let wasComplete = job.phase == .complete
         let wasActive = activeProjectionJobIDs.contains(job.id)
         job.phase = terminalPhase
@@ -8102,5 +8405,23 @@ actor WorkspaceCodemapBindingEngine {
             publishedArtifactLookupMissReason: publishedArtifactLookupMissReason,
             invalidationReason: invalidationReason
         ))
+        if let rootEpoch, projectionStatusChanged(for: kind) {
+            let finish = if case .rootUnload = kind { true } else { false }
+            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch, finish: finish)
+        }
+    }
+
+    private func projectionStatusChanged(for kind: WorkspaceCodemapBindingEngineHookKind) -> Bool {
+        switch kind {
+        case .capabilityEligible, .capabilityTerminalUnavailable, .rootUnload,
+             .projectionPreloadScheduled, .projectionPreloadStarted,
+             .projectionBatchStarted, .projectionBatchCompleted,
+             .projectionSegmentPublished, .projectionCoverageComplete,
+             .projectionCoverageCancelled, .projectionCoverageSuperseded,
+             .projectionRetry, .projectionBudget:
+            true
+        default:
+            false
+        }
     }
 }

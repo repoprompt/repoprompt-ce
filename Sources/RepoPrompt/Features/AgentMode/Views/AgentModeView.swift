@@ -38,6 +38,14 @@ struct AgentModeView: View {
             rootChanges: windowState.workspaceFilesViewModel.rootShellProjectionsChangedPublisher,
             gitContextLookup: { promptManager.gitViewModel.gitWorktreeContext(forStandardizedRootPath: $0) },
             gitContextChanges: promptManager.gitViewModel.gitWorktreeContextChanges,
+            codemapStatusLookup: { windowState.workspaceFilesViewModel.codemapRootStatus(rootID: $0) },
+            codemapStatusChanges: windowState.workspaceFilesViewModel.codemapRootStatusesChangedPublisher,
+            setCodemapSuspended: { rootID, suspended in
+                await windowState.workspaceFilesViewModel.setCodemapGenerationSuspended(
+                    rootID: rootID,
+                    suspended: suspended
+                )
+            },
             workspaceManager: windowState.workspaceManager,
             windowID: windowState.windowID
         ))
