@@ -2724,6 +2724,9 @@ actor WorkspaceFileContextStore {
     private var codemapRootMutationFenceWaitersByRootEpoch: [
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
+    private var codemapPathQuiescenceWaitersByRootEpoch: [
+        WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
+    ] = [:]
     private var codemapProjectionPreloadReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
     private var codemapPathLocalCatalogMutationDepthByRootID: [UUID: Int] = [:]
     private var codemapAuthorityGenerationsByRootEpoch: [WorkspaceCodemapRootEpoch: UInt64] = [:]
@@ -10406,6 +10409,12 @@ actor WorkspaceFileContextStore {
             for continuation in rootMutationWaiters.values {
                 continuation.resume()
             }
+            let pathQuiescenceWaiters = codemapPathQuiescenceWaitersByRootEpoch.removeValue(
+                forKey: rootEpoch
+            ) ?? [:]
+            for continuation in pathQuiescenceWaiters.values {
+                continuation.resume()
+            }
             codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
             if let cleanup = detachCodemapSession(
                 rootEpoch: rootEpoch,
@@ -10419,8 +10428,11 @@ actor WorkspaceFileContextStore {
             codemapAuthorityGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapProjectionInvalidationGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
             terminalNonGitCodemapCacheByEpoch.removeValue(forKey: rootEpoch)
-            codemapPathFenceTokensByID = codemapPathFenceTokensByID.filter {
-                $0.value.rootEpoch != rootEpoch
+            let pathFenceTokenIDs = codemapPathFenceTokensByID.compactMap { entry in
+                entry.value.rootEpoch == rootEpoch ? entry.key : nil
+            }
+            for tokenID in pathFenceTokenIDs {
+                removeCodemapPathFenceToken(id: tokenID)
             }
             statesToUnload.append((rootID, state))
         }
@@ -16176,6 +16188,12 @@ actor WorkspaceFileContextStore {
             codemapPathInvalidationStageHandlerForTesting = handler
         }
 
+        func codemapPathQuiescenceWaiterCountForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> Int {
+            codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?.count ?? 0
+        }
+
         func revokeReadyCodemapArtifactContributionForTesting(
             _ ticket: WorkspaceCodemapArtifactDemandTicket
         ) async -> Bool {
@@ -18716,14 +18734,28 @@ actor WorkspaceFileContextStore {
         #endif
     }
 
+    @discardableResult
+    private func removeCodemapPathInvalidationFlight(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        flightID: UUID
+    ) -> Bool {
+        guard codemapPathInvalidationFlightsByRootEpoch[rootEpoch]?.id == flightID else { return false }
+        codemapPathInvalidationFlightsByRootEpoch.removeValue(forKey: rootEpoch)
+        return true
+    }
+
+    private func removeCodemapPathFenceToken(id: UUID) {
+        codemapPathFenceTokensByID.removeValue(forKey: id)
+    }
+
     private func finishCodemapPathInvalidationWithoutAuthority(
         flightID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        guard codemapPathInvalidationFlightsByRootEpoch[rootEpoch]?.id == flightID else { return }
-        codemapPathInvalidationFlightsByRootEpoch.removeValue(forKey: rootEpoch)
+        guard removeCodemapPathInvalidationFlight(rootEpoch: rootEpoch, flightID: flightID) else { return }
         scheduleDirtyCodemapGraphPublicationIfUnfenced(rootEpoch: rootEpoch)
         schedulePendingCodemapProjectionPreloadIfFullyUnfenced(rootEpoch: rootEpoch)
+        resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: rootEpoch)
     }
 
     private func finishCodemapPathInvalidation(
@@ -18735,14 +18767,14 @@ actor WorkspaceFileContextStore {
             return
         }
         defer {
-            if codemapPathInvalidationFlightsByRootEpoch[authority.rootEpoch]?.id == flightID {
-                codemapPathInvalidationFlightsByRootEpoch.removeValue(forKey: authority.rootEpoch)
+            if removeCodemapPathInvalidationFlight(rootEpoch: authority.rootEpoch, flightID: flightID) {
                 scheduleDirtyCodemapGraphPublicationIfUnfenced(
                     rootEpoch: authority.rootEpoch
                 )
                 schedulePendingCodemapProjectionPreloadIfFullyUnfenced(
                     rootEpoch: authority.rootEpoch
                 )
+                resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: authority.rootEpoch)
             }
         }
         guard codemapAuthorityIsCurrent(authority) else { return }
@@ -18795,7 +18827,7 @@ actor WorkspaceFileContextStore {
         didCommitMutation: Bool = true
     ) {
         guard let token else { return }
-        codemapPathFenceTokensByID.removeValue(forKey: token.id)
+        removeCodemapPathFenceToken(id: token.id)
         scheduleDirtyCodemapGraphPublicationIfUnfenced(rootEpoch: token.rootEpoch)
         // The fence itself advanced projection/path authority and cancelled old work. A failed
         // disk mutation still needs one restoration preload, while committed work needs the same
@@ -18805,6 +18837,7 @@ actor WorkspaceFileContextStore {
         }
         _ = didCommitMutation
         schedulePendingCodemapProjectionPreloadIfFullyUnfenced(rootEpoch: token.rootEpoch)
+        resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: token.rootEpoch)
     }
 
     private func cancelCodemapProjectionPreloadLaunchForInvalidation(
@@ -19088,21 +19121,18 @@ actor WorkspaceFileContextStore {
             else {
                 return nil
             }
-            if codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil,
-               !codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch })
-            {
+            if codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) {
                 token = CodemapRootMutationFenceToken(id: UUID(), rootEpoch: rootEpoch)
                 codemapRootMutationFenceTokensByRootEpoch[rootEpoch] = token
                 break
             }
             // Drain path work before acquiring the root fence. Retained path flights wait on an
             // already-held root fence, so installing the root fence first would make each side
-            // wait for the other. Recheck the root-fence lane after every suspension so competing
-            // root mutations remain serialized.
-            // Do not hot-spin on this actor while retained path-derived work settles. A tight
-            // yield loop can repeatedly reacquire the store executor and starve the explicit
-            // mutation that owns the path fence from reaching its release boundary.
-            try? await Task.sleep(for: .milliseconds(1))
+            // wait for the other. After path work drains, loop back through the root-fence lane so
+            // competing root mutations remain serialized.
+            guard await waitForCodemapPathQuiescenceIfNeeded(rootEpoch: rootEpoch) else {
+                return nil
+            }
         }
         var didTransferFenceOwnership = false
         defer {
@@ -19118,6 +19148,62 @@ actor WorkspaceFileContextStore {
         }
         didTransferFenceOwnership = true
         return token
+    }
+
+    private func codemapPathWorkIsQuiescent(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> Bool {
+        codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil &&
+            !codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch })
+    }
+
+    private func waitForCodemapPathQuiescenceIfNeeded(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async -> Bool {
+        while !codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) {
+            let waiterID = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) ||
+                        Task.isCancelled ||
+                        rootStatesByID[rootEpoch.rootID]?.lifetimeID != rootEpoch.rootLifetimeID
+                    {
+                        continuation.resume()
+                    } else {
+                        codemapPathQuiescenceWaitersByRootEpoch[rootEpoch, default: [:]][waiterID] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelCodemapPathQuiescenceWaiter(rootEpoch: rootEpoch, waiterID: waiterID) }
+            }
+            guard !Task.isCancelled,
+                  rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
+            else { return false }
+        }
+        return true
+    }
+
+    private func cancelCodemapPathQuiescenceWaiter(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        waiterID: UUID
+    ) {
+        guard let continuation = codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?
+            .removeValue(forKey: waiterID)
+        else { return }
+        if codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?.isEmpty == true {
+            codemapPathQuiescenceWaitersByRootEpoch.removeValue(forKey: rootEpoch)
+        }
+        continuation.resume()
+    }
+
+    private func resumeCodemapPathQuiescenceWaitersIfNeeded(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) else { return }
+        let waiters = codemapPathQuiescenceWaitersByRootEpoch.removeValue(forKey: rootEpoch) ?? [:]
+        for continuation in waiters.values {
+            continuation.resume()
+        }
     }
 
     private func waitForCodemapRootMutationFenceIfNeeded(

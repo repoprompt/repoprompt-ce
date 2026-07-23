@@ -57,9 +57,26 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         }
 
         let rootFenceTask = Task {
-            await store.fenceCodemapAuthorityForCheckoutMutation(rootIDs: [loaded.id])
+            try await store.replayPublisherFileSystemDeltasForCodemapIndependenceTesting(
+                rootID: loaded.id,
+                deltas: [.fileModified(".git/HEAD", nil)],
+                servicePublicationSequence: 42
+            )
         }
-        try await Task.sleep(for: .milliseconds(20))
+        var rootFenceParked = false
+        for _ in 0 ..< 200 {
+            if await store.codemapPathQuiescenceWaiterCountForTesting(rootEpoch: ticket.rootEpoch) == 1 {
+                rootFenceParked = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(rootFenceParked, "Root fence acquisition should park behind retained path work")
+        guard rootFenceParked else {
+            codemapGate.release()
+            _ = try? await rootFenceTask.value
+            return
+        }
 
         let explicitlyCreatedRelativePath = "Sources/Explicit.swift"
         let explicitlyCreatedURL = root.appendingPathComponent(explicitlyCreatedRelativePath)
@@ -83,6 +100,10 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             "Explicit create must not wait for publisher-derived codemap convergence"
         )
         _ = try await createTask.value
+        let waiterCountWhileStalled = await store.codemapPathQuiescenceWaiterCountForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        XCTAssertEqual(waiterCountWhileStalled, 1)
 
         let deleteTask = Task {
             try await store.deleteFile(rootID: loaded.id, relativePath: createdRelativePath)
@@ -102,7 +123,11 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
 
         await codemapGate.release()
         try await deleteTask.value
-        await rootFenceTask.value
+        try await rootFenceTask.value
+        let waiterCountAfterRelease = await store.codemapPathQuiescenceWaiterCountForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        XCTAssertEqual(waiterCountAfterRelease, 0)
         await store.setCodemapPathInvalidationStageHandlerForTesting(nil)
 
         let refreshed = try await readyArtifactDemand(store: store, forFileID: seed.id)
