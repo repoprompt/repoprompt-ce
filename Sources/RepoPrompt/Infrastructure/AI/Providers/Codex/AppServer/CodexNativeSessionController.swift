@@ -704,6 +704,7 @@ final class CodexNativeSessionController {
     private func requestWithCompatibleAppServerRequestValueStyle(
         method: String,
         timeout: TimeInterval?,
+        useDefaultTimeout: Bool = true,
         paramsBuilder: (CodexAgentToolPreferences.AppServerRequestValueStyle) async -> [String: Any]
     ) async throws -> [String: Any] {
         let attemptedStyle = appServerRequestValueStyle
@@ -711,7 +712,8 @@ final class CodexNativeSessionController {
             return try await performRequest(
                 method: method,
                 params: paramsBuilder(attemptedStyle),
-                timeout: timeout
+                timeout: timeout,
+                useDefaultTimeout: useDefaultTimeout
             )
         } catch {
             guard Self.shouldRetryWithAlternateAppServerRequestValueStyle(error) else {
@@ -724,7 +726,8 @@ final class CodexNativeSessionController {
             let result = try await performRequest(
                 method: method,
                 params: paramsBuilder(fallbackStyle),
-                timeout: timeout
+                timeout: timeout,
+                useDefaultTimeout: useDefaultTimeout
             )
             appServerRequestValueStyle = fallbackStyle
             return result
@@ -734,12 +737,18 @@ final class CodexNativeSessionController {
     private func performRequest(
         method: String,
         params: [String: Any]?,
-        timeout: TimeInterval?
+        timeout: TimeInterval?,
+        useDefaultTimeout: Bool = true
     ) async throws -> [String: Any] {
         if let requestExecutor {
             return try await requestExecutor(method, params, timeout)
         }
-        return try await client.request(method: method, params: params, timeout: timeout)
+        return try await client.request(
+            method: method,
+            params: params,
+            timeout: timeout,
+            useDefaultTimeout: useDefaultTimeout
+        )
     }
 
     init(
@@ -1071,6 +1080,7 @@ final class CodexNativeSessionController {
             try await eventHandlingMutex.withLock {
                 beginBindingSession()
             }
+            await client.updateDefaultRequestTimeout(options.requestTimeout)
             // Resolve one authoritative runtime from the captured app-server environment before
             // provisioning. The same client-held runtime is reused at process launch, including when
             // the bundled package is unavailable and a valid override exists only in the login shell.
@@ -1395,7 +1405,8 @@ final class CodexNativeSessionController {
         // turn/start can block for extended model reasoning — no timeout.
         let result = try await requestWithCompatibleAppServerRequestValueStyle(
             method: "turn/start",
-            timeout: nil
+            timeout: nil,
+            useDefaultTimeout: false
         ) { requestValueStyle in
             var requestParams = params
             requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)

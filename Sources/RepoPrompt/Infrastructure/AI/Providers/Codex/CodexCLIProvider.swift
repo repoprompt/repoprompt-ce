@@ -389,7 +389,10 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
                 _ = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
@@ -561,7 +564,10 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             let text = try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
                 _ = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
@@ -692,7 +698,10 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
-    private func ensureAppServerReady(appServerClient: CodexAppServerClient?) async throws {
+    private func ensureAppServerReady(
+        appServerClient: CodexAppServerClient?,
+        requestTimeout: TimeInterval
+    ) async throws {
         if let appServerReadyHook {
             try await appServerReadyHook()
             return
@@ -708,6 +717,7 @@ final class CodexCLIProvider: AIProvider {
                 )
             )
         }
+        await appServerClient.updateDefaultRequestTimeout(requestTimeout)
         try await appServerClient.startIfNeeded()
     }
 

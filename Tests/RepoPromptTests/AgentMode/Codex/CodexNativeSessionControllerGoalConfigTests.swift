@@ -393,6 +393,149 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertEqual(initialized["hasParams"] as? Bool, false)
     }
 
+    func testControllerOptionBoundsSilentInitializeAndTearsDownExactGeneration() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoreInitializeRequests: true
+        )
+        let client = CodexAppServerClient()
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: nil,
+            processLaunchDirectory: directory.path
+        ))
+        var options = makeOptions()
+        options.requestTimeout = 0.2
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown
+        )
+        addTeardownBlock { await controller.shutdown() }
+
+        let startup = Task {
+            try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        }
+        let cancellationSafety = Task {
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch {
+                return
+            }
+            startup.cancel()
+        }
+        defer { cancellationSafety.cancel() }
+
+        let didRecordInitialize = try await waitForRecordedRequestCount(
+            for: "initialize",
+            at: recordURL,
+            minimumCount: 1
+        ) == 1
+        XCTAssertTrue(didRecordInitialize)
+        let timedOutGeneration = await client.debugTransportGeneration()
+
+        do {
+            _ = try await startup.value
+            XCTFail("The silent initialize request must time out")
+        } catch let CodexAppServerClient.ClientError.requestFailed(failure) {
+            XCTAssertEqual(failure.method, "initialize")
+            XCTAssertTrue(failure.message.contains("timed out"))
+        } catch is CancellationError {
+            XCTFail("The controller option did not bound silent initialize")
+        } catch {
+            XCTFail("Expected initialize timeout, got \(error)")
+        }
+
+        let didStopTimedOutTransport = await waitUntil {
+            await !client.debugIsProcessRunning()
+        }
+        XCTAssertTrue(didStopTimedOutTransport)
+        let finalGeneration = await client.debugTransportGeneration()
+        XCTAssertEqual(finalGeneration, timedOutGeneration)
+        XCTAssertEqual(try recordedRequests(for: "initialize", at: recordURL).count, 1)
+        guard case .timeout(method: "initialize", requestID: _) = await client.debugLastTransportTerminationReason() else {
+            return XCTFail("Silent initialize did not tear down its exact transport generation")
+        }
+    }
+
+    func testControllerDefaultTimeoutDoesNotScheduleTurnStartDeadline() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoreTurnStartRequests: true
+        )
+        let client = CodexAppServerClient()
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: nil,
+            processLaunchDirectory: directory.path
+        ))
+        var options = makeOptions()
+        options.requestTimeout = 0.2
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown
+        )
+        addTeardownBlock { await controller.shutdown() }
+
+        _ = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        let turnStart = Task {
+            try await controller.startUserTurn(
+                text: "Do not duplicate this turn",
+                images: [],
+                model: nil,
+                reasoningEffort: nil,
+                serviceTier: nil
+            )
+        }
+        let didRecordTurnStart = try await waitForRecordedRequestCount(
+            for: "turn/start",
+            at: recordURL,
+            minimumCount: 1
+        ) == 1
+        XCTAssertTrue(didRecordTurnStart)
+
+        let pendingRequestCount = await client.debugPendingRequestCount()
+        let timeoutTaskCount = await client.debugTimeoutTaskCount()
+        XCTAssertEqual(pendingRequestCount, 1)
+        XCTAssertEqual(timeoutTaskCount, 0)
+        XCTAssertEqual(try recordedRequests(for: "turn/start", at: recordURL).count, 1)
+
+        turnStart.cancel()
+        do {
+            _ = try await turnStart.value
+            XCTFail("The ignored turn/start must remain pending until cancellation")
+        } catch is CancellationError {
+            // Expected: uncertain turn acceptance is not timed out or retried.
+        } catch {
+            XCTFail("Expected cancellation of the pending turn/start, got \(error)")
+        }
+    }
+
     func testOptionalMemoryModeRetriesDoNotFailStartup() async throws {
         let options = CodexNativeSessionController.Options(
             requestTimeout: 0.2,
@@ -677,6 +820,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         in directory: URL,
         recordURL: URL,
         ignoreMemoryModeRequests: Bool = false,
+        ignoreInitializeRequests: Bool = false,
+        ignoreTurnStartRequests: Bool = false,
         goalStatus: String? = nil
     ) throws -> URL {
         let scriptURL = directory.appendingPathComponent("fake-codex")
@@ -692,6 +837,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         record_path = \(String(reflecting: recordURL.path))
         ignore_memory_mode_requests = \(ignoreMemoryModeRequests ? "True" : "False")
+        ignore_initialize_requests = \(ignoreInitializeRequests ? "True" : "False")
+        ignore_turn_start_requests = \(ignoreTurnStartRequests ? "True" : "False")
         goal_status = \(goalStatus.map { String(reflecting: $0) } ?? "None")
 
         with open(record_path, "a", encoding="utf-8") as handle:
@@ -712,7 +859,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 handle.write(json.dumps({"method": method, "hasParams": has_params, "params": params}) + "\\n")
             if "id" not in request:
                 continue
+            if method == "initialize" and ignore_initialize_requests:
+                continue
             if method == "thread/memoryMode/set" and ignore_memory_mode_requests:
+                continue
+            if method == "turn/start" and ignore_turn_start_requests:
                 continue
             if method == "thread/start":
                 respond(request["id"], {"thread": {"id": "fresh-thread", "status": "idle", "turns": []}})
@@ -778,12 +929,26 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         timeout: TimeInterval = 2
     ) async throws -> Int {
         let deadline = Date().addingTimeInterval(timeout)
-        var latestCount = try recordedRequests(for: method, at: recordURL).count
+        var latestCount = (try? recordedRequests(for: method, at: recordURL).count) ?? 0
         while latestCount < minimumCount, Date() < deadline {
             try await Task.sleep(nanoseconds: 50_000_000)
-            latestCount = try recordedRequests(for: method, at: recordURL).count
+            latestCount = (try? recordedRequests(for: method, at: recordURL).count) ?? 0
         }
         return latestCount
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @escaping () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
     }
 
     private func recordedRequests(for method: String, at recordURL: URL) throws -> [[String: Any]] {
