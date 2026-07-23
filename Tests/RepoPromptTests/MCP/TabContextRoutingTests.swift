@@ -2589,6 +2589,692 @@ final class TabContextRoutingTests: XCTestCase {
         }
     #endif
 
+    #if DEBUG
+        @MainActor
+        func testAgentRunDetachedStartPreservesCallerBindingAndOwnsChildBySessionID() async throws {
+            try await withCallerBindingFixture(named: "detached-caller-binding") { fixture in
+                var dispatchedChild: CallerBindingChildIdentity?
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    sessionID, tabID, _, _, viewModel in
+                    viewModel.session(for: tabID).runState = .running
+                    dispatchedChild = CallerBindingChildIdentity(sessionID: sessionID, tabID: tabID)
+                    return .startedRun
+                }
+                installCallerBindingStartMetadata(for: fixture)
+
+                let value = try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("Start a detached caller-binding child."),
+                    "model_id": .string("claudeCode:sonnet"),
+                    "detach": .bool(true),
+                    "timeout": .int(0)
+                ])
+                let child = try agentRunChild(from: value)
+
+                XCTAssertEqual(child, dispatchedChild)
+                XCTAssertNotEqual(child.tabID, fixture.sourceTabID)
+                XCTAssertEqual(
+                    fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                    fixture.sourceTabID
+                )
+                let controlContext = try XCTUnwrap(
+                    fixture.window.agentModeViewModel.mcpControlledSession(sessionID: child.sessionID)?.mcpControlContext
+                )
+                XCTAssertEqual(controlContext.originatingConnectionID, fixture.connectionID)
+
+                let pollValue = try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("poll"),
+                    "session_id": .string(child.sessionID.uuidString)
+                ])
+                let pollObject = try XCTUnwrap(pollValue.objectValue)
+                let pollSession = try XCTUnwrap(pollObject["session"]?.objectValue)
+                XCTAssertEqual(pollObject["session_id"]?.stringValue, child.sessionID.uuidString)
+                XCTAssertEqual(pollSession["context_id"]?.stringValue, child.tabID.uuidString)
+
+                await deactivateCallerBindingChild(child, in: fixture)
+            }
+        }
+
+        @MainActor
+        func testAgentRunStartOverlapRoutesManageSelectionToCallerSourceTab() async throws {
+            try await withCallerBindingFixture(named: "overlap-selection-routing") { fixture in
+                let gate = CallerBindingDispatchGate()
+                var dispatchedChild: CallerBindingChildIdentity?
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    sessionID, tabID, _, _, viewModel in
+                    viewModel.session(for: tabID).runState = .running
+                    dispatchedChild = CallerBindingChildIdentity(sessionID: sessionID, tabID: tabID)
+                    await gate.markStartedAndWaitForRelease()
+                    return .startedRun
+                }
+                installCallerBindingStartMetadata(for: fixture)
+
+                let startTask = Task { @MainActor in
+                    try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("start"),
+                        "message": .string("Hold caller binding while selection routes."),
+                        "model_id": .string("claudeCode:sonnet"),
+                        "detach": .bool(true),
+                        "timeout": .int(0)
+                    ])
+                }
+                await gate.waitUntilStarted()
+                fixture.window.mcpServer.setRequestMetadataOverrideForTesting(nil)
+
+                do {
+                    let child = try XCTUnwrap(dispatchedChild)
+                    let childSelectionBefore = try XCTUnwrap(
+                        fixture.window.workspaceManager.composeTab(with: child.tabID)
+                    ).selection
+                    XCTAssertEqual(
+                        fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                        fixture.sourceTabID
+                    )
+
+                    let inFlightValue = try await setCallerSourceSelection(
+                        [fixture.alternateFile.path],
+                        in: fixture
+                    )
+                    XCTAssertEqual(try selectedPaths(from: inFlightValue), [fixture.alternateFile.path])
+                    XCTAssertEqual(
+                        try XCTUnwrap(fixture.window.workspaceManager.composeTab(with: fixture.sourceTabID))
+                            .selection.selectedPaths,
+                        [fixture.alternateFile.path]
+                    )
+                    XCTAssertEqual(
+                        try XCTUnwrap(fixture.window.workspaceManager.composeTab(with: child.tabID)).selection,
+                        childSelectionBefore
+                    )
+                    XCTAssertEqual(
+                        fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                        fixture.sourceTabID
+                    )
+
+                    await gate.release()
+                    let startValue = try await startTask.value
+                    XCTAssertEqual(try agentRunChild(from: startValue), child)
+
+                    let postCompletionValue = try await setCallerSourceSelection(
+                        [fixture.sourceFile.path],
+                        in: fixture
+                    )
+                    XCTAssertEqual(try selectedPaths(from: postCompletionValue), [fixture.sourceFile.path])
+                    XCTAssertEqual(
+                        try XCTUnwrap(fixture.window.workspaceManager.composeTab(with: fixture.sourceTabID))
+                            .selection.selectedPaths,
+                        [fixture.sourceFile.path]
+                    )
+                    XCTAssertEqual(
+                        try XCTUnwrap(fixture.window.workspaceManager.composeTab(with: child.tabID)).selection,
+                        childSelectionBefore
+                    )
+                    XCTAssertEqual(
+                        fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                        fixture.sourceTabID
+                    )
+
+                    await deactivateCallerBindingChild(child, in: fixture)
+                } catch {
+                    await gate.release()
+                    _ = try? await startTask.value
+                    if let child = dispatchedChild {
+                        await deactivateCallerBindingChild(child, in: fixture)
+                    }
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
+        func testAgentRunNonDetachedStartPreservesCallerBindingThroughTerminalWait() async throws {
+            try await withCallerBindingFixture(named: "terminal-wait-caller-binding") { fixture in
+                let capture = CallerBindingDispatchCapture()
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    sessionID, tabID, _, _, viewModel in
+                    let session = viewModel.session(for: tabID)
+                    await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+                    session.runState = .running
+                    let context = try XCTUnwrap(session.mcpControlContext)
+                    let epoch = try XCTUnwrap(context.currentEpoch)
+                    let child = CallerBindingWaitChild(
+                        sessionID: sessionID,
+                        tabID: tabID,
+                        registration: context.registration,
+                        epoch: epoch
+                    )
+                    let runningSnapshot = try XCTUnwrap(viewModel.mcpSnapshot(cursor: child.cursor))
+                    XCTAssertEqual(runningSnapshot.status, .running)
+                    await AgentRunSessionStore.signalSnapshot(runningSnapshot, cursor: child.cursor)
+                    capture.record(child)
+                    return .startedRun
+                }
+                installCallerBindingStartMetadata(for: fixture)
+
+                let startTask = Task { @MainActor in
+                    try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("start"),
+                        "message": .string("Wait for a controlled terminal publication."),
+                        "model_id": .string("claudeCode:sonnet"),
+                        "detach": .bool(false),
+                        "timeout": .int(60)
+                    ])
+                }
+                let child = await capture.waitUntilCaptured()
+
+                do {
+                    try await waitForAgentRunSessionStoreWaiter(registration: child.registration)
+                    XCTAssertEqual(
+                        fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                        fixture.sourceTabID
+                    )
+                    let terminal = completedCallerBindingSnapshot(for: child)
+                    _ = await AgentRunSessionStore.publishTerminal(
+                        .init(epoch: child.epoch, snapshot: terminal),
+                        registration: child.registration,
+                        commitID: UUID(),
+                        successorKind: nil
+                    )
+
+                    let value = try await startTask.value
+                    XCTAssertEqual(value.objectValue?["session_id"]?.stringValue, child.sessionID.uuidString)
+                    XCTAssertEqual(
+                        value.objectValue?["status"]?.stringValue,
+                        AgentRunMCPSnapshot.Status.completed.rawValue
+                    )
+                    XCTAssertEqual(
+                        fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                        fixture.sourceTabID
+                    )
+                    try await waitForAgentRunSessionStoreWaiter(
+                        registration: child.registration,
+                        expectedCount: 0
+                    )
+                    await deactivateCallerBindingChild(child.identity, in: fixture)
+                } catch {
+                    startTask.cancel()
+                    _ = try? await startTask.value
+                    await deactivateCallerBindingChild(child.identity, in: fixture)
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
+        func testAgentRunNonDetachedWaitCancellationPreservesCallerBindingAndChildControl() async throws {
+            try await withCallerBindingFixture(named: "wait-cancellation-caller-binding") { fixture in
+                let capture = CallerBindingDispatchCapture()
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    sessionID, tabID, _, _, viewModel in
+                    let session = viewModel.session(for: tabID)
+                    await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+                    session.runState = .running
+                    let context = try XCTUnwrap(session.mcpControlContext)
+                    let epoch = try XCTUnwrap(context.currentEpoch)
+                    let child = CallerBindingWaitChild(
+                        sessionID: sessionID,
+                        tabID: tabID,
+                        registration: context.registration,
+                        epoch: epoch
+                    )
+                    let runningSnapshot = try XCTUnwrap(viewModel.mcpSnapshot(cursor: child.cursor))
+                    XCTAssertEqual(runningSnapshot.status, .running)
+                    await AgentRunSessionStore.signalSnapshot(runningSnapshot, cursor: child.cursor)
+                    capture.record(child)
+                    return .startedRun
+                }
+                installCallerBindingStartMetadata(for: fixture)
+
+                let startTask = Task { @MainActor in
+                    try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("start"),
+                        "message": .string("Cancel only the caller wait."),
+                        "model_id": .string("claudeCode:sonnet"),
+                        "detach": .bool(false),
+                        "timeout": .int(60)
+                    ])
+                }
+                let child = await capture.waitUntilCaptured()
+
+                do {
+                    try await waitForAgentRunSessionStoreWaiter(registration: child.registration)
+                    XCTAssertEqual(
+                        fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                        fixture.sourceTabID
+                    )
+                    startTask.cancel()
+                    do {
+                        _ = try await startTask.value
+                        XCTFail("Expected non-actionable caller wait cancellation")
+                    } catch is CancellationError {}
+
+                    try await waitForAgentRunSessionStoreWaiter(
+                        registration: child.registration,
+                        expectedCount: 0
+                    )
+                    XCTAssertEqual(
+                        fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                        fixture.sourceTabID
+                    )
+                    XCTAssertNotNil(
+                        fixture.window.agentModeViewModel.mcpControlledSession(sessionID: child.sessionID)
+                    )
+                    XCTAssertEqual(
+                        fixture.window.agentModeViewModel.mcpRegistration(sessionID: child.sessionID),
+                        child.registration
+                    )
+                    let registrationRemainsActive = await AgentRunSessionStore.hasActiveRegistration(
+                        sessionID: child.sessionID
+                    )
+                    XCTAssertTrue(registrationRemainsActive)
+
+                    let pollValue = try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("poll"),
+                        "session_id": .string(child.sessionID.uuidString)
+                    ])
+                    let pollSession = try XCTUnwrap(pollValue.objectValue?["session"]?.objectValue)
+                    XCTAssertEqual(pollValue.objectValue?["session_id"]?.stringValue, child.sessionID.uuidString)
+                    XCTAssertEqual(pollSession["context_id"]?.stringValue, child.tabID.uuidString)
+
+                    _ = try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("cancel"),
+                        "session_id": .string(child.sessionID.uuidString)
+                    ])
+                    await deactivateCallerBindingChild(child.identity, in: fixture)
+                } catch {
+                    startTask.cancel()
+                    _ = try? await startTask.value
+                    await deactivateCallerBindingChild(child.identity, in: fixture)
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
+        func testAgentRunDispatchFailureDiscardsChildAndPreservesCallerBinding() async throws {
+            try await withCallerBindingFixture(named: "dispatch-failure-caller-binding") { fixture in
+                let initialTabCount = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace).composeTabs.count
+                var child: CallerBindingChildIdentity?
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    sessionID, tabID, _, _, _ in
+                    child = CallerBindingChildIdentity(sessionID: sessionID, tabID: tabID)
+                    throw CallerBindingDispatchFailure.injected
+                }
+                installCallerBindingStartMetadata(for: fixture)
+
+                await XCTAssertThrowsErrorAsync {
+                    try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("start"),
+                        "message": .string("Fail after child control activation."),
+                        "model_id": .string("claudeCode:sonnet"),
+                        "detach": .bool(true),
+                        "timeout": .int(0)
+                    ])
+                }
+
+                let capturedChild = try XCTUnwrap(child)
+                XCTAssertEqual(
+                    try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace).composeTabs.count,
+                    initialTabCount
+                )
+                XCTAssertNil(fixture.window.workspaceManager.composeTab(with: capturedChild.tabID))
+                XCTAssertNil(fixture.window.agentModeViewModel.mcpControlledSession(sessionID: capturedChild.sessionID))
+                XCTAssertNil(fixture.window.agentModeViewModel.mcpRegistration(sessionID: capturedChild.sessionID))
+                let registrationRemainsActive = await AgentRunSessionStore.hasActiveRegistration(
+                    sessionID: capturedChild.sessionID
+                )
+                XCTAssertFalse(registrationRemainsActive)
+                XCTAssertEqual(
+                    fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                    fixture.sourceTabID
+                )
+            }
+        }
+
+        @MainActor
+        func testAgentRunPreActivationFailureDiscardsCreatedChildAndPreservesCallerBinding() async throws {
+            try await withCallerBindingFixture(named: "pre-activation-caller-binding") { fixture in
+                let initialTabIDs = try Set(
+                    XCTUnwrap(fixture.window.workspaceManager.activeWorkspace).composeTabs.map(\.id)
+                )
+                var dispatchCount = 0
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    _, _, _, _, _ in
+                    dispatchCount += 1
+                    return .startedRun
+                }
+                installCallerBindingStartMetadata(for: fixture)
+
+                await XCTAssertThrowsErrorAsync({
+                    try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("start"),
+                        "message": .string("Fail during target worktree preparation."),
+                        "model_id": .string("claudeCode:sonnet"),
+                        "worktree_create": .bool(true),
+                        "detach": .bool(true),
+                        "timeout": .int(0)
+                    ])
+                }) { error in
+                    XCTAssertTrue(
+                        String(describing: error).contains("No Git repository found in loaded roots"),
+                        String(describing: error)
+                    )
+                }
+
+                let remainingTabs = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace).composeTabs
+                XCTAssertEqual(Set(remainingTabs.map(\.id)), initialTabIDs)
+                XCTAssertEqual(dispatchCount, 0)
+                XCTAssertFalse(remainingTabs.contains { tab in
+                    guard let sessionID = tab.activeAgentSessionID else { return false }
+                    return fixture.window.agentModeViewModel.mcpRegistration(sessionID: sessionID) != nil
+                })
+                XCTAssertEqual(
+                    fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                    fixture.sourceTabID
+                )
+            }
+        }
+
+        @MainActor
+        func testAgentRunStartRejectsMismatchedHintAndPreservesCallerBinding() async throws {
+            try await withCallerBindingFixture(named: "mismatched-hint-caller-binding") { fixture in
+                let conflictingTabID = UUID()
+                let workspaceIndex = try XCTUnwrap(
+                    fixture.window.workspaceManager.workspaces.firstIndex { $0.id == fixture.workspaceID }
+                )
+                fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: conflictingTabID, name: "Conflicting context")
+                )
+                let initialTabCount = fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs.count
+                var dispatchCount = 0
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    _, _, _, _, _ in
+                    dispatchCount += 1
+                    return .startedRun
+                }
+                installCallerBindingStartMetadata(for: fixture, tabID: conflictingTabID)
+
+                await XCTAssertThrowsErrorAsync({
+                    try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                        "op": .string("start"),
+                        "message": .string("Reject a mismatched caller hint."),
+                        "model_id": .string("claudeCode:sonnet"),
+                        "detach": .bool(true),
+                        "timeout": .int(0)
+                    ])
+                }) { error in
+                    let description = String(describing: error)
+                    XCTAssertTrue(description.contains(fixture.sourceTabID.uuidString), description)
+                    XCTAssertTrue(description.contains(conflictingTabID.uuidString), description)
+                }
+
+                XCTAssertEqual(dispatchCount, 0)
+                XCTAssertEqual(
+                    try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace).composeTabs.count,
+                    initialTabCount
+                )
+                XCTAssertEqual(
+                    fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                    fixture.sourceTabID
+                )
+            }
+        }
+
+        @MainActor
+        private func withCallerBindingFixture<Result>(
+            named name: String,
+            operation: @MainActor (CallerBindingFixture) async throws -> Result
+        ) async throws -> Result {
+            let fixture = try await makeCallerBindingFixture(named: name)
+            do {
+                let result = try await operation(fixture)
+                await cleanupCallerBindingFixture(fixture)
+                return result
+            } catch {
+                await cleanupCallerBindingFixture(fixture)
+                throw error
+            }
+        }
+
+        @MainActor
+        private func makeCallerBindingFixture(named name: String) async throws -> CallerBindingFixture {
+            let root = try makeTemporaryDirectory(named: name)
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            WindowStatesManager.shared.registerWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+
+            do {
+                let sources = root.appendingPathComponent("Sources", isDirectory: true)
+                try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+                let sourceFile = sources.appendingPathComponent("Source.swift")
+                let alternateFile = sources.appendingPathComponent("Alternate.swift")
+                try "let source = true\n".write(to: sourceFile, atomically: true, encoding: .utf8)
+                try "let alternate = true\n".write(to: alternateFile, atomically: true, encoding: .utf8)
+
+                let workspace = window.workspaceManager.createWorkspace(
+                    name: "Caller binding \(UUID().uuidString.prefix(8))",
+                    repoPaths: [root.path],
+                    ephemeral: true
+                )
+                await window.workspaceManager.switchWorkspace(
+                    to: workspace,
+                    saveState: false,
+                    reason: "callerBindingRegressionFixture"
+                )
+                let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+                _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                    in: window,
+                    path: root.path
+                )
+                let sourceTabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+                var sourceTab = try XCTUnwrap(window.workspaceManager.composeTab(with: sourceTabID))
+                sourceTab.selection = StoredSelection(
+                    selectedPaths: [sourceFile.path],
+                    codemapAutoEnabled: false
+                )
+                window.workspaceManager.updateComposeTab(sourceTab, markDirty: false)
+                window.workspaceManager.publishActiveComposeTabSnapshot(
+                    commitToMemory: true,
+                    touchModified: false
+                )
+
+                let connectionID = UUID()
+                let clientName = "caller-binding-\(UUID().uuidString)"
+                try window.mcpServer.bindTabForConnection(
+                    connectionID: connectionID,
+                    clientName: clientName,
+                    tabID: sourceTabID,
+                    workspaceID: activeWorkspace.id,
+                    windowID: window.windowID
+                )
+                let previousClaudeCodeConnected = window.apiSettingsViewModel.isClaudeCodeConnected
+                window.apiSettingsViewModel.isClaudeCodeConnected = true
+                return CallerBindingFixture(
+                    window: window,
+                    root: root,
+                    workspaceID: activeWorkspace.id,
+                    sourceTabID: sourceTabID,
+                    sourceFile: sourceFile,
+                    alternateFile: alternateFile,
+                    connectionID: connectionID,
+                    clientName: clientName,
+                    previousClaudeCodeConnected: previousClaudeCodeConnected
+                )
+            } catch {
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+                try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+                throw error
+            }
+        }
+
+        @MainActor
+        private func cleanupCallerBindingFixture(_ fixture: CallerBindingFixture) async {
+            fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting(nil)
+            fixture.window.mcpServer.setRequestMetadataOverrideForTesting(nil)
+            let sessionIDs = Set(
+                fixture.window.workspaceManager.activeWorkspace?.composeTabs.compactMap(\.activeAgentSessionID) ?? []
+            )
+            for sessionID in sessionIDs {
+                await fixture.window.agentModeViewModel.mcpDeactivateControlContext(
+                    sessionID: sessionID,
+                    cleanupSessionStore: true
+                )
+            }
+            _ = fixture.window.mcpServer.clearNonRunScopedBinding(forConnection: fixture.connectionID)
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = fixture.previousClaudeCodeConnected
+            await fixture.window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(fixture.window)
+            try? FileManager.default.removeItem(at: fixture.root.deletingLastPathComponent())
+        }
+
+        @MainActor
+        private func installCallerBindingStartMetadata(
+            for fixture: CallerBindingFixture,
+            tabID: UUID? = nil
+        ) {
+            let targetTabID = tabID ?? fixture.sourceTabID
+            fixture.window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: fixture.connectionID,
+                clientName: fixture.clientName,
+                windowID: fixture.window.windowID,
+                runPurpose: .unknown,
+                tabContextHint: .init(
+                    tabID: targetTabID,
+                    workspaceID: fixture.workspaceID,
+                    windowID: fixture.window.windowID
+                )
+            ))
+        }
+
+        @MainActor
+        private func setCallerSourceSelection(
+            _ paths: [String],
+            in fixture: CallerBindingFixture
+        ) async throws -> Value {
+            let tools = await fixture.window.mcpServer.windowMCPTools
+            let manageSelection = try XCTUnwrap(
+                tools.first { $0.name == MCPWindowToolName.manageSelection }
+            )
+            let hint = MCPServerViewModel.TabContextHint(
+                tabID: fixture.sourceTabID,
+                workspaceID: fixture.workspaceID,
+                windowID: fixture.window.windowID
+            )
+            return try await ServerNetworkManager.withConnectionID(fixture.connectionID) {
+                try await ServerNetworkManager.$currentTabContextHint.withValue(hint) {
+                    try await manageSelection([
+                        "op": .string("set"),
+                        "paths": .array(paths.map(Value.string)),
+                        "mode": .string("full"),
+                        "view": .string("files"),
+                        "path_display": .string("full"),
+                        "strict": .bool(true)
+                    ])
+                }
+            }
+        }
+
+        private func agentRunChild(from value: Value) throws -> CallerBindingChildIdentity {
+            let object = try XCTUnwrap(value.objectValue)
+            let session = try XCTUnwrap(object["session"]?.objectValue)
+            let sessionID = try XCTUnwrap(object["session_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            let tabID = try XCTUnwrap(session["context_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            return CallerBindingChildIdentity(sessionID: sessionID, tabID: tabID)
+        }
+
+        @MainActor
+        private func deactivateCallerBindingChild(
+            _ child: CallerBindingChildIdentity,
+            in fixture: CallerBindingFixture
+        ) async {
+            await fixture.window.agentModeViewModel.mcpDeactivateControlContext(
+                sessionID: child.sessionID,
+                cleanupSessionStore: true
+            )
+            let registrationRemainsActive = await AgentRunSessionStore.hasActiveRegistration(
+                sessionID: child.sessionID
+            )
+            XCTAssertFalse(registrationRemainsActive)
+        }
+
+        private func completedCallerBindingSnapshot(for child: CallerBindingWaitChild) -> AgentRunMCPSnapshot {
+            AgentRunMCPSnapshot(
+                sessionID: child.sessionID,
+                runID: UUID(),
+                tabID: child.tabID,
+                sessionName: "Caller binding child",
+                agentRaw: AgentProviderKind.claudeCode.rawValue,
+                agentDisplayName: AgentProviderKind.claudeCode.displayName,
+                modelRaw: "claudeCode:sonnet",
+                reasoningEffortRaw: nil,
+                status: .completed,
+                statusText: "completed",
+                latestAssistantPreview: nil,
+                interaction: nil,
+                transcriptItemCount: 0,
+                updatedAt: Date(),
+                parentSessionID: nil,
+                failureReason: nil,
+                worktreeBindings: [],
+                activeWorktreeMerges: []
+            )
+        }
+
+        private struct CallerBindingFixture {
+            let window: WindowState
+            let root: URL
+            let workspaceID: UUID
+            let sourceTabID: UUID
+            let sourceFile: URL
+            let alternateFile: URL
+            let connectionID: UUID
+            let clientName: String
+            let previousClaudeCodeConnected: Bool
+        }
+
+        private struct CallerBindingChildIdentity: Equatable {
+            let sessionID: UUID
+            let tabID: UUID
+        }
+
+        private struct CallerBindingWaitChild {
+            let sessionID: UUID
+            let tabID: UUID
+            let registration: AgentRunSessionStore.Registration
+            let epoch: AgentRunTurnEpoch
+
+            var identity: CallerBindingChildIdentity {
+                CallerBindingChildIdentity(sessionID: sessionID, tabID: tabID)
+            }
+
+            var cursor: AgentRunSessionStore.WaitCursor {
+                .init(registration: registration, epoch: epoch)
+            }
+        }
+
+        @MainActor
+        private final class CallerBindingDispatchCapture {
+            private var child: CallerBindingWaitChild?
+            private var waiters: [CheckedContinuation<CallerBindingWaitChild, Never>] = []
+
+            func record(_ child: CallerBindingWaitChild) {
+                guard self.child == nil else { return }
+                self.child = child
+                let pendingWaiters = waiters
+                waiters.removeAll()
+                pendingWaiters.forEach { $0.resume(returning: child) }
+            }
+
+            func waitUntilCaptured() async -> CallerBindingWaitChild {
+                if let child { return child }
+                return await withCheckedContinuation { waiters.append($0) }
+            }
+        }
+    #endif
+
     func testAgentRunStartWithoutSourceRejectsNestedOriginsButAllowsLegitimateTopLevelOrigins() {
         XCTAssertTrue(MCPServerViewModel.shouldRejectAgentRunStartWithoutResolvedSource(
             capturedPurpose: .agentModeRun,
@@ -2737,6 +3423,43 @@ final class TabContextRoutingTests: XCTestCase {
         )
     }
 }
+
+#if DEBUG
+    private enum CallerBindingDispatchFailure: Error {
+        case injected
+    }
+
+    private actor CallerBindingDispatchGate {
+        private var started = false
+        private var released = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func markStartedAndWaitForRelease() async {
+            if !started {
+                started = true
+                let pendingStartWaiters = startWaiters
+                startWaiters.removeAll()
+                pendingStartWaiters.forEach { $0.resume() }
+            }
+            guard !released else { return }
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation { startWaiters.append($0) }
+        }
+
+        func release() {
+            guard !released else { return }
+            released = true
+            let pendingReleaseWaiters = releaseWaiters
+            releaseWaiters.removeAll()
+            pendingReleaseWaiters.forEach { $0.resume() }
+        }
+    }
+#endif
 
 private actor TabContextHydrationGate {
     private var isReleased = false
