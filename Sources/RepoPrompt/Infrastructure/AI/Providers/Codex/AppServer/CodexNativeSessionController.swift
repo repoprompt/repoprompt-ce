@@ -1950,14 +1950,14 @@ final class CodexNativeSessionController {
         }
         if clientShutdownBehavior == .stopOnShutdown {
             #if DEBUG
-                let shutdownReapStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let shutdownStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
             #endif
             await client.stop()
             #if DEBUG
                 await recordLifecyclePhase(
-                    .shutdownReap,
+                    .shutdown,
                     outcome: .succeeded,
-                    startMS: shutdownReapStartMS,
+                    startMS: shutdownStartMS,
                     includeTransportGeneration: true
                 )
             #endif

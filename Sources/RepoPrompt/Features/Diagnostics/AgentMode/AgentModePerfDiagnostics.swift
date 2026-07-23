@@ -134,7 +134,7 @@ import Foundation
             case threadStart = "thread_start"
             case threadResume = "thread_resume"
             case turnAcceptance = "turn_acceptance"
-            case shutdownReap = "shutdown_reap"
+            case shutdown
         }
 
         enum CodexLifecycleOutcome: String, CaseIterable {

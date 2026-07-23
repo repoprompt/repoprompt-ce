@@ -210,6 +210,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             || session.codexAnonymousActiveTurn?.turnKind == .compact
     }
 
+    private struct CodexRecoveryAttemptKey: Hashable {
+        let runID: UUID
+        let runAttemptID: UUID
+    }
+
     private final class CodexControllerRetirementClaim {
         weak var controller: (any CodexSessionControlling)?
 
@@ -254,7 +259,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let codexStallWatchdogTasksByTabID = PerKeyTaskStore<UUID>()
     private let codexTransportClosedFallbackTasksByTabID = PerKeyTaskStore<UUID>()
     private let codexRecoveryProbeTimeout: TimeInterval
-    private var codexRecoveryAttemptedRunIDs: Set<UUID> = []
+    private var codexRecoveryAttemptKeys: Set<CodexRecoveryAttemptKey> = []
     private var codexAuthRecoveryAttemptedRunIDs: Set<UUID> = []
     private var pendingCodexThreadNameSyncByTabID: [UUID: PendingCodexThreadNameSync] = [:]
     private var codexThreadNameSyncTaskByTabID: [UUID: (generation: UUID, task: Task<Void, Never>)] = [:]
@@ -455,12 +460,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentModeViewModel.TabSession,
         controller: any CodexSessionControlling,
         expectedRunID: UUID,
+        expectedRunAttemptID: UUID,
         expectedProgressGeneration: UInt64,
         checkpoint: String
     ) -> Bool {
         guard !Task.isCancelled,
               session.selectedAgent == .codexExec,
               session.runID == expectedRunID,
+              session.activeRunAttemptID == expectedRunAttemptID,
               session.runState.isActive,
               session.codexWatchdogState.progressGeneration == expectedProgressGeneration,
               !hasPendingCodexInteraction(for: session),
@@ -1002,7 +1009,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         stopAllCodexStallWatchdogTasks()
         stopAllCodexTransportClosedFallbackTasks()
         stopAllCodexThreadNameSyncTasks()
-        codexRecoveryAttemptedRunIDs.removeAll()
+        codexRecoveryAttemptKeys.removeAll()
     }
 
     func updateCodexModelPolling() {
@@ -3147,9 +3154,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         ObjectIdentifier(lhs as AnyObject) == ObjectIdentifier(rhs as AnyObject)
     }
 
-    private func clearCodexRecoveryAttempt(for runID: UUID?) {
+    private func clearCodexRecoveryAttempt(
+        for runID: UUID?,
+        runAttemptID: UUID? = nil
+    ) {
         guard let runID else { return }
-        codexRecoveryAttemptedRunIDs.remove(runID)
+        if let runAttemptID {
+            codexRecoveryAttemptKeys.remove(.init(runID: runID, runAttemptID: runAttemptID))
+        } else {
+            codexRecoveryAttemptKeys = Set(
+                codexRecoveryAttemptKeys.filter { $0.runID != runID }
+            )
+        }
     }
 
     func scheduleCodexThreadNameSyncIfPossible(
@@ -3239,10 +3255,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         source: String
     ) -> Bool {
         if let expectedRunID {
-            if session.runID != expectedRunID {
-                clearCodexRecoveryAttempt(for: expectedRunID)
+            guard session.runID == expectedRunID,
+                  session.activeRunAttemptID == expectedRunAttemptID,
+                  session.runState.isActive
+            else {
+                if session.runID != expectedRunID {
+                    clearCodexRecoveryAttempt(
+                        for: expectedRunID,
+                        runAttemptID: expectedRunAttemptID
+                    )
+                }
                 let currentRunID = session.runID?.uuidString ?? "nil"
-                logCodex("[AgentModeVM][CodexRecovery] ignoring stale \(source) recovery result for tab \(session.tabID); run moved on from \(expectedRunID.uuidString) to \(currentRunID)")
+                logCodex("[AgentModeVM][CodexRecovery] ignoring stale \(source) recovery result for tab \(session.tabID); run/attempt moved on from \(expectedRunID.uuidString) to \(currentRunID)")
                 return false
             }
             return true
@@ -3326,6 +3350,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentModeViewModel.TabSession,
         controller: any CodexSessionControlling,
         expectedRunID: UUID,
+        expectedRunAttemptID: UUID,
         expectedProgressGeneration: UInt64,
         reason: String
     ) async -> Bool {
@@ -3333,6 +3358,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             controller: controller,
             expectedRunID: expectedRunID,
+            expectedRunAttemptID: expectedRunAttemptID,
             expectedProgressGeneration: expectedProgressGeneration,
             checkpoint: "prepare"
         ) else {
@@ -3342,6 +3368,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let authoritativeIdentity = session.codexAuthoritativeActiveTurn
         let exactTurnID: String? = if let authoritativeIdentity,
                                       authoritativeIdentity.runID == expectedRunID,
+                                      authoritativeIdentity.runAttemptID == expectedRunAttemptID,
                                       authoritativeCodexTurnIsCurrent(authoritativeIdentity, session: session),
                                       authoritativeIdentity.controllerInstanceID == ObjectIdentifier(controller)
         {
@@ -3355,6 +3382,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session,
                 controller: controller,
                 expectedRunID: expectedRunID,
+                expectedRunAttemptID: expectedRunAttemptID,
                 expectedProgressGeneration: expectedProgressGeneration,
                 checkpoint: "before-interrupt"
             ) else {
@@ -3371,6 +3399,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     controller: controller,
                     expectedRunID: expectedRunID,
+                    expectedRunAttemptID: expectedRunAttemptID,
                     expectedProgressGeneration: expectedProgressGeneration,
                     checkpoint: "after-interrupt"
                 ) else {
@@ -3389,6 +3418,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     controller: controller,
                     expectedRunID: expectedRunID,
+                    expectedRunAttemptID: expectedRunAttemptID,
                     expectedProgressGeneration: expectedProgressGeneration,
                     checkpoint: "after-interrupt-failure"
                 ) else {
@@ -3418,6 +3448,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             controller: controller,
             expectedRunID: expectedRunID,
+            expectedRunAttemptID: expectedRunAttemptID,
             expectedProgressGeneration: expectedProgressGeneration,
             checkpoint: "before-invalidation"
         ) else {
@@ -3446,9 +3477,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func attemptCodexRecovery(
         session: AgentModeViewModel.TabSession,
         trigger: CodexRecoveryTrigger,
-        sourceController: (any CodexSessionControlling)?
+        sourceController: (any CodexSessionControlling)?,
+        expectedRunAttemptID: UUID
     ) async -> CodexRecoveryOutcome {
-        guard session.selectedAgent == .codexExec, session.runState.isActive else {
+        guard session.selectedAgent == .codexExec,
+              session.runState.isActive,
+              session.activeRunAttemptID == expectedRunAttemptID
+        else {
             return .skipped
         }
         if trigger == .stallWatchdog {
@@ -3513,6 +3548,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     controller: probeController,
                     expectedRunID: runID,
+                    expectedRunAttemptID: expectedRunAttemptID,
                     expectedProgressGeneration: expectedProgressGeneration,
                     checkpoint: "after-snapshot"
                 ) else {
@@ -3555,6 +3591,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session: session,
                         controller: probeController,
                         expectedRunID: runID,
+                        expectedRunAttemptID: expectedRunAttemptID,
                         expectedProgressGeneration: expectedProgressGeneration,
                         checkpoint: "after-pending-failure"
                     ) else {
@@ -3571,6 +3608,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             session: session,
                             controller: probeController,
                             expectedRunID: runID,
+                            expectedRunAttemptID: expectedRunAttemptID,
                             expectedProgressGeneration: expectedProgressGeneration,
                             checkpoint: "after-auth-recovery"
                         ) else {
@@ -3605,6 +3643,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session: session,
                         controller: probeController,
                         expectedRunID: runID,
+                        expectedRunAttemptID: expectedRunAttemptID,
                         expectedProgressGeneration: expectedProgressGeneration,
                         reason: "no-active-turn"
                     ) else {
@@ -3626,6 +3665,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     controller: probeController,
                     expectedRunID: runID,
+                    expectedRunAttemptID: expectedRunAttemptID,
                     expectedProgressGeneration: expectedProgressGeneration,
                     reason: "repeated-active"
                 ) else {
@@ -3637,6 +3677,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     controller: probeController,
                     expectedRunID: runID,
+                    expectedRunAttemptID: expectedRunAttemptID,
                     expectedProgressGeneration: expectedProgressGeneration,
                     checkpoint: "after-probe-failure"
                 ) else {
@@ -3654,6 +3695,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     controller: probeController,
                     expectedRunID: runID,
+                    expectedRunAttemptID: expectedRunAttemptID,
                     expectedProgressGeneration: expectedProgressGeneration,
                     reason: "probe-failed"
                 ) else {
@@ -3670,7 +3712,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
 
-        guard codexRecoveryAttemptedRunIDs.insert(runID).inserted else {
+        let recoveryAttemptKey = CodexRecoveryAttemptKey(
+            runID: runID,
+            runAttemptID: expectedRunAttemptID
+        )
+        guard codexRecoveryAttemptKeys.insert(recoveryAttemptKey).inserted else {
             return .unrecoverable(recoveryFailureMessage(for: trigger, recoveryAlreadyAttempted: true))
         }
 
@@ -3713,6 +3759,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
 
         guard session.runID == runID,
+              session.activeRunAttemptID == expectedRunAttemptID,
               session.runState.isActive,
               let recoveredController = session.codexController,
               recoveredController.hasActiveThread
@@ -4034,6 +4081,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         let tabID = session.tabID
         let runID = session.runID
+        guard let runAttemptID = session.activeRunAttemptID else { return }
         let graceIntervalNanos = UInt64(codexTransportClosedRecoveryGraceInterval * 1_000_000_000)
         codexTransportClosedFallbackTasksByTabID.set(
             tabID,
@@ -4043,6 +4091,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 guard !Task.isCancelled else { return }
                 guard let session,
                       session.runID == runID,
+                      session.activeRunAttemptID == runAttemptID,
                       session.selectedAgent == .codexExec,
                       session.runState.isActive,
                       !self.hasPendingCodexInteraction(for: session),
@@ -4055,14 +4104,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 switch await attemptCodexRecovery(
                     session: session,
                     trigger: .unexpectedStreamEnd,
-                    sourceController: sourceController
+                    sourceController: sourceController,
+                    expectedRunAttemptID: runAttemptID
                 ) {
                 case .recovered:
                     return
                 case .skipped:
                     return
                 case let .unrecoverable(errorMessage):
-                    guard shouldFinalizeAfterRecovery(session: session, expectedRunID: runID, source: "transport-closed-fallback") else { return }
+                    guard shouldFinalizeAfterRecovery(
+                        session: session,
+                        expectedRunID: runID,
+                        expectedRunAttemptID: runAttemptID,
+                        source: "transport-closed-fallback"
+                    ) else { return }
                     await finalizeCodexRun(
                         session,
                         turnStatus: .failed,
@@ -4474,17 +4529,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
 
+                    guard let recoveryRunAttemptID = session.activeRunAttemptID else { return }
                     switch await attemptCodexRecovery(
                         session: session,
                         trigger: .unexpectedStreamEnd,
-                        sourceController: controller
+                        sourceController: controller,
+                        expectedRunAttemptID: recoveryRunAttemptID
                     ) {
                     case .recovered:
                         return
                     case .skipped:
                         return
                     case let .unrecoverable(errorMessage):
-                        guard shouldFinalizeAfterRecovery(session: session, expectedRunID: taskRunID, source: "unexpected-stream-end") else { return }
+                        guard shouldFinalizeAfterRecovery(
+                            session: session,
+                            expectedRunID: taskRunID,
+                            expectedRunAttemptID: recoveryRunAttemptID,
+                            source: "unexpected-stream-end"
+                        ) else { return }
                         await finalizeCodexRun(
                             session,
                             turnStatus: .failed,
@@ -6036,7 +6098,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let expectedRunID = session.runID
         drainCodexTerminalOutput(session, turnStatus: turnStatus)
 
-        clearCodexRecoveryAttempt(for: session.runID)
+        clearCodexRecoveryAttempt(
+            for: session.runID,
+            runAttemptID: ownership.attemptID
+        )
         clearCodexAuthRecoveryAttempt(for: session.runID)
         clearCodexPendingAuthRetryTurn(session)
         cancelCodexTransportClosedFallback(for: session.tabID)
@@ -7637,10 +7702,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         public func test_attemptCodexStallRecovery(
             session: AgentModeViewModel.TabSession
         ) async -> Bool {
-            switch await attemptCodexRecovery(
+            guard let runAttemptID = session.activeRunAttemptID else { return false }
+            return switch await attemptCodexRecovery(
                 session: session,
                 trigger: .stallWatchdog,
-                sourceController: session.codexController
+                sourceController: session.codexController,
+                expectedRunAttemptID: runAttemptID
             ) {
             case .unrecoverable:
                 true
@@ -8011,11 +8078,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     }
                     logCodex("[AgentModeVM][CodexWatchdog] probe threshold reached for tab \(tabID); evaluating recovery")
                     let watchdogRunID = session.runID
-                    let watchdogRunAttemptID = session.activeRunAttemptID
+                    guard let watchdogRunAttemptID = session.activeRunAttemptID else {
+                        codexStallWatchdogTasksByTabID.remove(tabID)
+                        removedTaskEntry = true
+                        return
+                    }
                     switch await attemptCodexRecovery(
                         session: session,
                         trigger: .stallWatchdog,
-                        sourceController: session.codexController
+                        sourceController: session.codexController,
+                        expectedRunAttemptID: watchdogRunAttemptID
                     ) {
                     case .recovered, .skipped:
                         codexStallWatchdogTasksByTabID.remove(tabID)

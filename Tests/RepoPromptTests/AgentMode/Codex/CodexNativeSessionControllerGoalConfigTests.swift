@@ -492,7 +492,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             "thread_start": 1,
             "thread_resume": 1,
             "turn_acceptance": 1,
-            "shutdown_reap": 2
+            "shutdown": 2
         ]
         XCTAssertEqual(successLines.count, expectedSuccessPhaseCounts.values.reduce(0, +))
         for (phase, expectedCount) in expectedSuccessPhaseCounts {
@@ -507,7 +507,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 XCTAssertFalse(line.contains("turn-1"), phase)
             }
         }
-        for phase in ["spawn_initialize", "thread_start", "thread_resume", "turn_acceptance", "shutdown_reap"] {
+        for phase in ["spawn_initialize", "thread_start", "thread_resume", "turn_acceptance", "shutdown"] {
             let lines = successLines.filter { $0.contains("phase=\(phase)") }
             XCTAssertFalse(lines.isEmpty, phase)
             XCTAssertTrue(lines.allSatisfy { $0.contains("transportGeneration=1") }, phase)
@@ -572,7 +572,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertFalse(failingProcessIsRunning)
     }
 
-    func testControllerOptionBoundsSilentInitializeAndTearsDownExactGeneration() async throws {
+    func testControllerOptionBoundsSilentInitializeAndPoisonsExactTransportGeneration() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -637,15 +637,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             XCTFail("Expected initialize timeout, got \(error)")
         }
 
-        let didStopTimedOutTransport = await waitUntil {
-            await !client.debugIsProcessRunning()
-        }
-        XCTAssertTrue(didStopTimedOutTransport)
         let finalGeneration = await client.debugTransportGeneration()
         XCTAssertEqual(finalGeneration, timedOutGeneration)
         XCTAssertEqual(try recordedRequests(for: "initialize", at: recordURL).count, 1)
         guard case .timeout(method: "initialize", requestID: _) = await client.debugLastTransportTerminationReason() else {
-            return XCTFail("Silent initialize did not tear down its exact transport generation")
+            return XCTFail("Silent initialize did not poison its exact transport generation")
         }
     }
 

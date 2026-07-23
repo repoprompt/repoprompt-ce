@@ -115,6 +115,64 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
     }
 
+    func testPriorAttemptSuspendedSnapshotProbeCannotSettleSuccessorWithAliasedGeneration() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            snapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let runID = UUID()
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: runID)
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+        let attemptA = try XCTUnwrap(session.activeRunOwnership)
+        let aliasedProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        let recoveryTask = Task {
+            await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+        }
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+        }
+
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: attemptA, source: "test.watchdog.attemptA.terminal"))
+        let attemptB = session.beginRunAttempt(source: "test.watchdog.attemptB")
+        session.runID = runID
+        session.runState = .running
+        session.codexController = controller
+        session.codexWatchdogState = .init()
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, aliasedProgressGeneration)
+        session.codexAuthoritativeActiveTurn = .init(
+            threadID: "fake",
+            turnID: "turn-b",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: attemptB.attemptID
+        )
+        session.codexRoutingObservedTurnID = "turn-b"
+
+        snapshotGate.release()
+
+        let attemptedTerminalSettlement = await recoveryTask.value
+        XCTAssertFalse(attemptedTerminalSettlement)
+        XCTAssertEqual(session.runID, runID)
+        XCTAssertEqual(session.activeRunAttemptID, attemptB.attemptID)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNotNil(session.codexController)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
+    }
+
     func testAlternatingStableSnapshotAndProbeFailureKeepsOriginalRecoveryDeadline() async throws {
         let controller = LivenessFakeCodexController(
             snapshot: .active(activeFlags: []),
