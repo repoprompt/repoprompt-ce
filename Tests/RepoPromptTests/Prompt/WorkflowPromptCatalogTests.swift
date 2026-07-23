@@ -46,14 +46,14 @@ final class WorkflowPromptCatalogTests: XCTestCase {
     }
 
     func testRenderedManagedPromptFrontmatterCompatibility() {
-        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 61)
+        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 62)
 
         for descriptor in WorkflowPromptCatalog.installDescriptors {
             let rendered = RepoPromptWorkflowPrompts.render(id: descriptor.id, variant: .mcp)
             XCTAssertTrue(rendered.hasPrefix("---\n"), descriptor.name)
             XCTAssertTrue(rendered.contains("name: \"\(descriptor.name)\""), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_managed: true"), descriptor.name)
-            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 61"), descriptor.name)
+            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 62"), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_variant: mcp"), descriptor.name)
             XCTAssertFalse(RepoPromptWorkflowPrompts.stripYAMLFrontmatter(rendered).hasPrefix("---"), descriptor.name)
         }
