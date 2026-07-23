@@ -45,6 +45,21 @@ final class WorkflowPromptCatalogTests: XCTestCase {
         }
     }
 
+    func testDeepPlanCatalogMetadataTracksPreservationWorkflow() throws {
+        let description = try XCTUnwrap(
+            WorkflowPromptCatalog.descriptors.first(where: { $0.id == .deepPlan })?.description
+        )
+
+        XCTAssertTrue(description.contains("complete implementation-ready specification"))
+        XCTAssertTrue(description.contains("preservation baseline"))
+        XCTAssertTrue(description.contains("evidence-backed correction and lossless consolidation"))
+        XCTAssertTrue(description.contains("completeness and correctness critique"))
+        XCTAssertTrue(description.contains("final fidelity check"))
+        XCTAssertFalse(description.contains("architectural bones"))
+        XCTAssertFalse(description.contains("one-page critique"))
+        XCTAssertFalse(description.contains("tighter, executable document"))
+    }
+
     func testRenderedManagedPromptFrontmatterCompatibility() {
         XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 62)
 
