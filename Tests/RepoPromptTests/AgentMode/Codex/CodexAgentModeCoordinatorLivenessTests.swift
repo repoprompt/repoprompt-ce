@@ -68,6 +68,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             .assistantDelta("progress"),
             session: session
         )
+        // Model a suite-loaded watchdog whose first probe begins after the recovery deadline.
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
+
         try await waitUntil {
             controller.readSnapshotCountSync() >= 3
         }

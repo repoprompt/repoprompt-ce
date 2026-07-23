@@ -972,6 +972,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         } else {
             session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
+            if deferCodexWatchdogAfterAmbiguousProbe(
+                for: session,
+                kind: kind,
+                referenceDate: referenceDate,
+                now: now
+            ) {
+                return true
+            }
+            // A late first poll has no comparison sample. Grant one probe interval;
+            // an identical follow-up still settles against the expired original deadline.
+            return deferCodexWatchdogUntilNextProbeWindow(
+                for: session,
+                reason: "late-first-\(kind)-probe",
+                now: now
+            )
         }
         return deferCodexWatchdogAfterAmbiguousProbe(
             for: session,
