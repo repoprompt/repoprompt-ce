@@ -1187,6 +1187,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexLiveness")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "fake"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "fake",

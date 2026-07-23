@@ -790,6 +790,64 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         await viewModel.test_codexCoordinator.shutdownCodexSession(sessionB)
     }
 
+    func testCodexCancellationThenSessionCloseSharesOneJoinedRetirement() async {
+        let interruptGate = AgentRunWorktreeStartAsyncGate()
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let controller = CancellationRetirementFakeCodexController(
+            interruptGate: interruptGate,
+            shutdownGate: shutdownGate
+        )
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        )
+        viewModel.test_initializeRunService()
+
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        var cancellationCompleted = false
+        let cancellationTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.cancelCodexRun(session)
+            cancellationCompleted = true
+        }
+        await interruptGate.waitUntilStarted()
+        XCTAssertNil(
+            session.codexController,
+            "cancellation must detach the controller before its retirement suspends"
+        )
+
+        var closeCompleted = false
+        let closeStarted = expectation(description: "overlapping session close started")
+        let closeTask = Task { @MainActor in
+            closeStarted.fulfill()
+            await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+            closeCompleted = true
+        }
+        await fulfillment(of: [closeStarted], timeout: 1)
+
+        await interruptGate.release()
+        await shutdownGate.waitUntilStarted()
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertFalse(controller.shutdownDidFinish)
+        XCTAssertFalse(cancellationCompleted)
+        XCTAssertFalse(closeCompleted, "session close must join the cancellation retirement")
+
+        await shutdownGate.release()
+        await cancellationTask.value
+        await closeTask.value
+
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        XCTAssertTrue(controller.shutdownDidFinish)
+        XCTAssertTrue(cancellationCompleted)
+        XCTAssertTrue(closeCompleted)
+        XCTAssertEqual(
+            controller.recordedOperations,
+            [.interruptStarted, .interruptFinished, .shutdown]
+        )
+    }
+
     func testCodexControllerRetirementIsPerTabAndJoinedBeforeWorkspaceReplacement() async throws {
         let rootA = try makeTemporaryDirectory(named: "retirement-root-a")
         let worktreeA1 = try makeTemporaryDirectory(named: "retirement-worktree-a1")
@@ -4884,12 +4942,19 @@ private final class CancellationRetirementFakeCodexController: CodexSessionContr
 
     private let lock = NSLock()
     private let interruptGate: AgentRunWorktreeStartAsyncGate
+    private let shutdownGate: AgentRunWorktreeStartAsyncGate?
     private var operations: [Operation] = []
+    private var shutdownCount = 0
+    private var didFinishShutdown = false
     private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
     private let eventsStream: AsyncStream<CodexNativeSessionController.Event>
 
-    init(interruptGate: AgentRunWorktreeStartAsyncGate) {
+    init(
+        interruptGate: AgentRunWorktreeStartAsyncGate,
+        shutdownGate: AgentRunWorktreeStartAsyncGate? = nil
+    ) {
         self.interruptGate = interruptGate
+        self.shutdownGate = shutdownGate
         var continuationRef: AsyncStream<CodexNativeSessionController.Event>.Continuation?
         eventsStream = AsyncStream { continuation in
             continuationRef = continuation
@@ -4911,6 +4976,18 @@ private final class CancellationRetirementFakeCodexController: CodexSessionContr
         return operations
     }
 
+    var shutdownCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return shutdownCount
+    }
+
+    var shutdownDidFinish: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didFinishShutdown
+    }
+
     func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
         record(.interruptStarted)
         await interruptGate.markStartedAndWaitForRelease()
@@ -4919,7 +4996,16 @@ private final class CancellationRetirementFakeCodexController: CodexSessionContr
     }
 
     func shutdown() async {
-        record(.shutdown)
+        lock.lock()
+        operations.append(.shutdown)
+        shutdownCount += 1
+        lock.unlock()
+        if let shutdownGate {
+            await shutdownGate.markStartedAndWaitForRelease()
+        }
+        lock.lock()
+        didFinishShutdown = true
+        lock.unlock()
         eventsContinuation?.finish()
         eventsContinuation = nil
     }

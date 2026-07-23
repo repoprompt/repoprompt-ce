@@ -8492,11 +8492,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         resetTrackedCodexTurns(session)
         session.pendingCodexComputerUseActivation = nil
-        if let controller = session.codexController {
-            await controller.shutdown()
+        let controllerToRetire = session.codexController
+        clearCodexControllerRuntimeState(for: session)
+        if let controllerToRetire {
+            retireCodexController(
+                controllerToRetire,
+                tabID: session.tabID,
+                source: "session-shutdown"
+            )
         }
         await awaitCodexControllerRetirement(for: session.tabID)
-        clearCodexControllerRuntimeState(for: session)
         session.runID = nil
         if clearTabScopedCoordinatorState {
             await stopCodexToolTrackingAndWait(for: session)
