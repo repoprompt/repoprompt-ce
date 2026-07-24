@@ -482,6 +482,119 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(execArguments.contains { $0.contains("features.parallel_tool_calls") })
     }
 
+    func testOwnedCodeModePolicyIsExactIdempotentAndPreservesUnrelatedSettings() {
+        let input = """
+        model = "user-model"
+
+        [features]
+        web_search = true
+
+        [features.code_mode]
+        enabled = false
+        unrelated_setting = "preserve-me"
+        direct_only_tool_namespaces = ["wrong-case"]
+
+        [mcp_servers.OtherServer]
+        command = "/tmp/other"
+        """
+
+        let first = mutateCodexPersistentConfigForInstall(input)
+        let second = mutateCodexPersistentConfigForInstall(first.content)
+
+        XCTAssertNil(first.conflictMessage)
+        XCTAssertTrue(first.changed)
+        XCTAssertFalse(second.changed)
+        XCTAssertEqual(second.content, first.content)
+        XCTAssertTrue(first.content.contains("model = \"user-model\""))
+        XCTAssertTrue(first.content.contains("web_search = true"))
+        XCTAssertTrue(first.content.contains("unrelated_setting = \"preserve-me\""))
+        XCTAssertTrue(first.content.contains("[mcp_servers.OtherServer]"))
+        XCTAssertTrue(first.content.contains("[mcp_servers.RepoPromptCE]"))
+        XCTAssertTrue(first.content.contains("enabled = true"))
+        XCTAssertTrue(
+            first.content.contains("direct_only_tool_namespaces = [\"mcp__RepoPromptCE\"]")
+        )
+        XCTAssertFalse(first.content.contains("direct_only_tool_namespaces = [\"wrong-case\"]"))
+        XCTAssertFalse(first.content.contains("non_prefixed_mcp_tool_names"))
+    }
+
+    func testOwnedCodeModePolicySurfacesNamespaceConflictWithoutMutation() {
+        let scenarios: [(label: String, input: String, conflictFragment: String)] = [
+            (
+                "legacy namespace key",
+                """
+                model = "preserve"
+
+                [features.code_mode]
+                enabled = true
+                non_prefixed_mcp_tool_names = ["mcp__RepoPromptCE__read_file"]
+                """,
+                "non_prefixed_mcp_tool_names"
+            ),
+            (
+                "dotted owned key",
+                """
+                model = "preserve"
+                features.code_mode.enabled = false
+                """,
+                "dotted or inline definition"
+            ),
+            (
+                "inline features table",
+                """
+                model = "preserve"
+                features = { code_mode = { enabled = false, direct_only_tool_namespaces = ["other"] } }
+                """,
+                "dotted or inline definition"
+            ),
+            (
+                "inline owned value",
+                """
+                model = "preserve"
+
+                [features.code_mode]
+                enabled = { value = true }
+                """,
+                "inline table redefines"
+            )
+        ]
+
+        for scenario in scenarios {
+            let result = mutateCodexPersistentConfigForInstall(scenario.input)
+
+            XCTAssertFalse(result.changed, scenario.label)
+            XCTAssertEqual(result.content, scenario.input, scenario.label)
+            XCTAssertTrue(result.conflictMessage?.contains(scenario.conflictFragment) == true, scenario.label)
+        }
+    }
+
+    func testOldExternalCodexPolicyIsDeclinedBeforeWritingUnknownKey() {
+        let input = "model = \"preserve\""
+
+        let result = CodexIntegrationConfiguration.mutatedPersistentMCPConfigContent(
+            from: input,
+            defaultEnabledIfMissing: true,
+            forceEnabled: true,
+            supportsDirectOnlyToolNamespaces: false
+        )
+
+        XCTAssertFalse(result.changed)
+        XCTAssertEqual(result.content, input)
+        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.144.6") == true)
+        XCTAssertFalse(result.content.contains("direct_only_tool_namespaces"))
+    }
+
+    func testCodexConfigUsesRepoPromptOwnedBuildSeparatedState() {
+        let path = CodexIntegrationConfiguration.configURL().path
+        XCTAssertTrue(path.contains("/RepoPrompt CE/Codex/"))
+        #if DEBUG
+            XCTAssertTrue(path.contains("/Debug/home/config.toml"))
+        #else
+            XCTAssertTrue(path.contains("/Release/home/config.toml"))
+        #endif
+        XCTAssertNotEqual(path, ("~/.codex/config.toml" as NSString).expandingTildeInPath)
+    }
+
     func testToolTimeoutMutationRejectsQuotedNumericTimeout() {
         let input = """
         tool_output_token_limit = 25_000

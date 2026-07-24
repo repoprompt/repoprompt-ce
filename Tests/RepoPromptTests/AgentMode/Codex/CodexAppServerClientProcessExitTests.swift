@@ -529,6 +529,43 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         await client.stop()
     }
 
+    func testTypedSpawnErrnosMapToExecutableUnavailable() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executable = try makePersistentServer(in: directory, recordURL: recordURL)
+        let cases: [(errno: Int32, expectedMessageFragment: String)] = [
+            (ENOENT, "selected runtime could not be started"),
+            (EACCES, "permission was denied")
+        ]
+
+        for testCase in cases {
+            let client = try await makeClient(
+                executable: executable,
+                launchDirectory: directory,
+                timeout: 1,
+                processSpawnPreparation: {
+                    throw ProcessLauncherError.spawnFailed(errno: testCase.errno)
+                },
+                provisionsRepoPromptMCPOnStart: false
+            )
+
+            do {
+                try await client.startIfNeeded()
+                XCTFail("Expected typed spawn errno \(testCase.errno) to fail startup")
+            } catch let error as CodexAppServerClient.ClientError {
+                if case let .executableUnavailable(message) = error {
+                    XCTAssertTrue(CodexProviderHelpers.isCodexExecutableUnavailableMessage(message))
+                    XCTAssertTrue(message.localizedCaseInsensitiveContains(testCase.expectedMessageFragment))
+                } else {
+                    XCTFail("Expected executableUnavailable for errno \(testCase.errno), got \(error)")
+                }
+            } catch {
+                XCTFail("Expected CodexAppServerClient.ClientError for errno \(testCase.errno), got \(error)")
+            }
+            await client.stop()
+        }
+    }
+
     func testDeinitLeavesReapOwnershipWithObserver() async throws {
         let directory = try makeTemporaryDirectory()
         let recordURL = directory.appendingPathComponent("requests.jsonl")
@@ -576,6 +613,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         launchDirectory: URL?,
         timeout: TimeInterval,
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
+        provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver(pid: $0)
         },
@@ -583,6 +621,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
     ) async throws -> CodexAppServerClient {
         let client = CodexAppServerClient(
             processSpawnPreparation: processSpawnPreparation,
+            provisionsRepoPromptMCPOnStart: provisionsRepoPromptMCPOnStart,
             processExitObserverFactory: processExitObserverFactory,
             expectedAgentPIDRegistrar: expectedAgentPIDRegistrar
         )
@@ -748,7 +787,12 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
     }
 
     private func writeExecutable(_ script: String, to url: URL) throws -> URL {
-        try script.write(to: url, atomically: true, encoding: .utf8)
+        let versionAwareScript = script.replacingOccurrences(
+            of: "#!/usr/bin/env python3\n",
+            with: "#!/usr/bin/env python3\nimport sys\n\nif sys.argv[1:] == [\"--version\"]:\n    print(\"codex 0.144.6\")\n    raise SystemExit(0)\n\n",
+            options: .anchored
+        )
+        try versionAwareScript.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         return url
     }

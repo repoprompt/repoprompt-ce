@@ -351,7 +351,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let resumeParams = try recordedParams(for: "thread/resume", at: recordURL)
         XCTAssertEqual(resumeParams["cwd"] as? String, worktreeRoot.path)
         XCTAssertEqual(resumeParams["threadId"] as? String, "existing-thread")
-        XCTAssertNil(resumeParams["path"])
+        XCTAssertEqual(resumeParams["path"] as? String, "/tmp/existing-thread.jsonl")
 
         let turnParams = try recordedRequests(for: "turn/start", at: recordURL)
             .map { try XCTUnwrap($0["params"] as? [String: Any]) }
@@ -391,6 +391,324 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let initialized = try recordedRequest(for: "initialized", at: recordURL)
         XCTAssertEqual(initialized["hasParams"] as? Bool, false)
+    }
+
+    func testLifecyclePhaseDiagnosticsUseFixedRedactedFieldsAcrossSuccessAndProvisioningFailure() async throws {
+        let sensitiveSentinel = "SECRET_PATH_PROMPT_TOKEN_AUTH_URL_STDERR_RAW_ERROR"
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        AgentModePerfDiagnostics.clearRecentMetrics()
+        addTeardownBlock {
+            AgentModePerfDiagnostics.clearRecentMetrics()
+            AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(nil)
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexLifecycleDiagnostics-\(sensitiveSentinel)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
+        let registrar = CodexAppServerClient.ExpectedAgentPIDRegistrar(
+            register: { _, _, _ in },
+            clear: { _, _, _ in }
+        )
+
+        let client = CodexAppServerClient(
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar
+        )
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 2,
+            processLaunchDirectory: directory.path
+        ))
+        var options = makeOptions()
+        options.requestTimeout = 2
+        options.repoPromptMCPProvisioner = { _ in }
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown,
+            expectedMCPClientName: sensitiveSentinel
+        )
+        addTeardownBlock { await controller.shutdown() }
+
+        _ = try await controller.startOrResume(
+            existing: nil,
+            baseInstructions: sensitiveSentinel
+        )
+        _ = try await controller.startUserTurn(
+            text: sensitiveSentinel,
+            images: [],
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil
+        )
+        await controller.shutdown()
+
+        let resumeClient = CodexAppServerClient(
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar
+        )
+        await resumeClient.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 2,
+            processLaunchDirectory: directory.path
+        ))
+        let resumeController = CodexNativeSessionController(
+            client: resumeClient,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown,
+            expectedMCPClientName: sensitiveSentinel
+        )
+        addTeardownBlock { await resumeController.shutdown() }
+        _ = try await resumeController.startOrResume(
+            existing: .init(
+                conversationID: "fresh-thread",
+                rolloutPath: nil,
+                model: nil,
+                reasoningEffort: nil
+            ),
+            baseInstructions: sensitiveSentinel
+        )
+        await resumeController.shutdown()
+
+        let successLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 200)
+            .filter { $0.contains("provider.codex.lifecycle.phase") }
+        let expectedSuccessPhaseCounts = [
+            "runtime_resolution": 2,
+            "provisioning": 2,
+            "spawn_initialize": 2,
+            "thread_start": 1,
+            "thread_resume": 1,
+            "turn_acceptance": 1,
+            "shutdown": 2
+        ]
+        XCTAssertEqual(successLines.count, expectedSuccessPhaseCounts.values.reduce(0, +))
+        for (phase, expectedCount) in expectedSuccessPhaseCounts {
+            let lines = successLines.filter { $0.contains("phase=\(phase)") }
+            XCTAssertEqual(lines.count, expectedCount, phase)
+            for line in lines {
+                XCTAssertTrue(line.contains("duration="), phase)
+                XCTAssertTrue(line.contains("outcome=succeeded"), phase)
+                XCTAssertTrue(line.contains("tabID="), phase)
+                XCTAssertFalse(line.contains(sensitiveSentinel), phase)
+                XCTAssertFalse(line.contains("fresh-thread"), phase)
+                XCTAssertFalse(line.contains("turn-1"), phase)
+            }
+        }
+        for phase in ["spawn_initialize", "thread_start", "thread_resume", "turn_acceptance", "shutdown"] {
+            let lines = successLines.filter { $0.contains("phase=\(phase)") }
+            XCTAssertFalse(lines.isEmpty, phase)
+            XCTAssertTrue(lines.allSatisfy { $0.contains("transportGeneration=1") }, phase)
+        }
+        for phase in ["runtime_resolution", "provisioning"] {
+            let lines = successLines.filter { $0.contains("phase=\(phase)") }
+            XCTAssertFalse(lines.isEmpty, phase)
+            XCTAssertTrue(lines.allSatisfy { !$0.contains("transportGeneration=") }, phase)
+        }
+
+        AgentModePerfDiagnostics.clearRecentMetrics()
+        let failingClient = CodexAppServerClient(
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar
+        )
+        await failingClient.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 2,
+            processLaunchDirectory: directory.path
+        ))
+        var failingOptions = makeOptions()
+        failingOptions.requestTimeout = 2
+        failingOptions.repoPromptMCPProvisioner = { _ in
+            throw NSError(
+                domain: sensitiveSentinel,
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: sensitiveSentinel]
+            )
+        }
+        let failingController = CodexNativeSessionController(
+            client: failingClient,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: failingOptions,
+            clientShutdownBehavior: .stopOnShutdown,
+            expectedMCPClientName: sensitiveSentinel
+        )
+        addTeardownBlock { await failingController.shutdown() }
+
+        do {
+            _ = try await failingController.startOrResume(
+                existing: nil,
+                baseInstructions: sensitiveSentinel
+            )
+            XCTFail("Provisioning must fail before process launch")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, sensitiveSentinel)
+        }
+
+        let failureLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 200)
+            .filter { $0.contains("provider.codex.lifecycle.phase") }
+        XCTAssertEqual(failureLines.count, 2)
+        let provisioningFailure = try XCTUnwrap(failureLines.first { $0.contains("phase=provisioning") })
+        XCTAssertTrue(provisioningFailure.contains("duration="))
+        XCTAssertTrue(provisioningFailure.contains("outcome=failed"))
+        XCTAssertFalse(provisioningFailure.contains("transportGeneration="))
+        XCTAssertFalse(failureLines.joined(separator: "\n").contains(sensitiveSentinel))
+        let failingProcessIsRunning = await failingClient.debugIsProcessRunning()
+        XCTAssertFalse(failingProcessIsRunning)
+    }
+
+    func testControllerOptionBoundsSilentInitializeAndPoisonsExactTransportGeneration() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoreInitializeRequests: true
+        )
+        let client = CodexAppServerClient()
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: nil,
+            processLaunchDirectory: directory.path
+        ))
+        var options = makeOptions()
+        options.requestTimeout = 0.2
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown
+        )
+        addTeardownBlock { await controller.shutdown() }
+
+        let startup = Task {
+            try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        }
+        let cancellationSafety = Task {
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch {
+                return
+            }
+            startup.cancel()
+        }
+        defer { cancellationSafety.cancel() }
+
+        let didRecordInitialize = try await waitForRecordedRequestCount(
+            for: "initialize",
+            at: recordURL,
+            minimumCount: 1
+        ) == 1
+        XCTAssertTrue(didRecordInitialize)
+        let timedOutGeneration = await client.debugTransportGeneration()
+
+        do {
+            _ = try await startup.value
+            XCTFail("The silent initialize request must time out")
+        } catch let CodexAppServerClient.ClientError.requestFailed(failure) {
+            XCTAssertEqual(failure.method, "initialize")
+            XCTAssertTrue(failure.message.contains("timed out"))
+        } catch is CancellationError {
+            XCTFail("The controller option did not bound silent initialize")
+        } catch {
+            XCTFail("Expected initialize timeout, got \(error)")
+        }
+
+        let finalGeneration = await client.debugTransportGeneration()
+        XCTAssertEqual(finalGeneration, timedOutGeneration)
+        XCTAssertEqual(try recordedRequests(for: "initialize", at: recordURL).count, 1)
+        guard case .timeout(method: "initialize", requestID: _) = await client.debugLastTransportTerminationReason() else {
+            return XCTFail("Silent initialize did not poison its exact transport generation")
+        }
+    }
+
+    func testControllerDefaultTimeoutDoesNotScheduleTurnStartDeadline() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executableURL = try makeFakeCodexAppServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoreTurnStartRequests: true
+        )
+        let client = CodexAppServerClient()
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: nil,
+            processLaunchDirectory: directory.path
+        ))
+        var options = makeOptions()
+        options.requestTimeout = 0.2
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown
+        )
+        addTeardownBlock { await controller.shutdown() }
+
+        _ = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        let turnStart = Task {
+            try await controller.startUserTurn(
+                text: "Do not duplicate this turn",
+                images: [],
+                model: nil,
+                reasoningEffort: nil,
+                serviceTier: nil
+            )
+        }
+        let didRecordTurnStart = try await waitForRecordedRequestCount(
+            for: "turn/start",
+            at: recordURL,
+            minimumCount: 1
+        ) == 1
+        XCTAssertTrue(didRecordTurnStart)
+
+        let pendingRequestCount = await client.debugPendingRequestCount()
+        let timeoutTaskCount = await client.debugTimeoutTaskCount()
+        XCTAssertEqual(pendingRequestCount, 1)
+        XCTAssertEqual(timeoutTaskCount, 0)
+        XCTAssertEqual(try recordedRequests(for: "turn/start", at: recordURL).count, 1)
+
+        turnStart.cancel()
+        do {
+            _ = try await turnStart.value
+            XCTFail("The ignored turn/start must remain pending until cancellation")
+        } catch is CancellationError {
+            // Expected: uncertain turn acceptance is not timed out or retried.
+        } catch {
+            XCTFail("Expected cancellation of the pending turn/start, got \(error)")
+        }
     }
 
     func testOptionalMemoryModeRetriesDoNotFailStartup() async throws {
@@ -460,7 +778,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let (resumeController, resumeRecordURL) = try await makeController(options: makeOptions())
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "  existing-thread  ",
-            rolloutPath: "/tmp/existing-thread.jsonl",
+            rolloutPath: "  \n/tmp/existing-thread.jsonl\t ",
             model: nil,
             reasoningEffort: "high"
         )
@@ -476,7 +794,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let params = try recordedParams(for: "thread/resume", at: resumeRecordURL)
         XCTAssertEqual(params["threadId"] as? String, "existing-thread")
         XCTAssertEqual(params["model"] as? String, "gpt-test")
-        XCTAssertNil(params["path"])
+        XCTAssertEqual(params["path"] as? String, "/tmp/existing-thread.jsonl")
         XCTAssertNil(params["effort"])
     }
 
@@ -485,6 +803,23 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "existing-thread",
             rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil
+        )
+
+        _ = try await controller.startOrResume(existing: existing, baseInstructions: "Agent")
+        await controller.shutdown()
+
+        let params = try recordedParams(for: "thread/resume", at: recordURL)
+        XCTAssertEqual(params["threadId"] as? String, "existing-thread")
+        XCTAssertNil(params["path"])
+    }
+
+    func testResumeWithBlankPathOmitsPathAndSendsRequiredThreadID() async throws {
+        let (controller, recordURL) = try await makeController(options: makeOptions())
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: "existing-thread",
+            rolloutPath: " \n\t ",
             model: nil,
             reasoningEffort: nil
         )
@@ -520,7 +855,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path))
     }
 
-    func testProtocolShapeRejectionsPreserveMessageAndAdviseCLIUpdate() {
+    func testProtocolShapeRejectionsPreserveMessageAndUseManagedRuntimeGuidance() {
         for method in ["initialize", "thread/resume"] {
             for code in [-32601, -32602] {
                 let error = CodexAppServerClient.ClientError.requestFailed(
@@ -528,7 +863,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 )
 
                 XCTAssertTrue(error.localizedDescription.hasPrefix("server rejected request"))
-                XCTAssertTrue(error.localizedDescription.contains("Update the installed Codex CLI"))
+                XCTAssertTrue(error.localizedDescription.contains("Reinstall or update RepoPrompt CE"))
+                XCTAssertTrue(error.localizedDescription.contains("REPOPROMPT_CODEX_EXECUTABLE"))
+                XCTAssertFalse(error.localizedDescription.contains("Update the installed Codex CLI"))
                 XCTAssertTrue(error.localizedDescription.contains(method))
             }
         }
@@ -675,6 +1012,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         in directory: URL,
         recordURL: URL,
         ignoreMemoryModeRequests: Bool = false,
+        ignoreInitializeRequests: Bool = false,
+        ignoreTurnStartRequests: Bool = false,
         goalStatus: String? = nil
     ) throws -> URL {
         let scriptURL = directory.appendingPathComponent("fake-codex")
@@ -684,8 +1023,14 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         import os
         import sys
 
+        if sys.argv[1:] == ["--version"]:
+            print("codex 0.144.6")
+            raise SystemExit(0)
+
         record_path = \(String(reflecting: recordURL.path))
         ignore_memory_mode_requests = \(ignoreMemoryModeRequests ? "True" : "False")
+        ignore_initialize_requests = \(ignoreInitializeRequests ? "True" : "False")
+        ignore_turn_start_requests = \(ignoreTurnStartRequests ? "True" : "False")
         goal_status = \(goalStatus.map { String(reflecting: $0) } ?? "None")
 
         with open(record_path, "a", encoding="utf-8") as handle:
@@ -706,7 +1051,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 handle.write(json.dumps({"method": method, "hasParams": has_params, "params": params}) + "\\n")
             if "id" not in request:
                 continue
+            if method == "initialize" and ignore_initialize_requests:
+                continue
             if method == "thread/memoryMode/set" and ignore_memory_mode_requests:
+                continue
+            if method == "turn/start" and ignore_turn_start_requests:
                 continue
             if method == "thread/start":
                 respond(request["id"], {"thread": {"id": "fresh-thread", "status": "idle", "turns": []}})
@@ -772,12 +1121,26 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         timeout: TimeInterval = 2
     ) async throws -> Int {
         let deadline = Date().addingTimeInterval(timeout)
-        var latestCount = try recordedRequests(for: method, at: recordURL).count
+        var latestCount = (try? recordedRequests(for: method, at: recordURL).count) ?? 0
         while latestCount < minimumCount, Date() < deadline {
             try await Task.sleep(nanoseconds: 50_000_000)
-            latestCount = try recordedRequests(for: method, at: recordURL).count
+            latestCount = (try? recordedRequests(for: method, at: recordURL).count) ?? 0
         }
         return latestCount
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @escaping () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
     }
 
     private func recordedRequests(for method: String, at recordURL: URL) throws -> [[String: Any]] {

@@ -124,6 +124,33 @@ final class CodexNativeSessionController {
         #endif
     }
 
+    #if DEBUG
+        private static func lifecycleOutcome(for error: Error) -> AgentModePerfDiagnostics.CodexLifecycleOutcome {
+            error is CancellationError ? .cancelled : .failed
+        }
+
+        private func recordLifecyclePhase(
+            _ phase: AgentModePerfDiagnostics.CodexLifecyclePhase,
+            outcome: AgentModePerfDiagnostics.CodexLifecycleOutcome,
+            startMS: Double?,
+            includeTransportGeneration: Bool
+        ) async {
+            guard startMS != nil else { return }
+            let transportGeneration: UInt64? = if includeTransportGeneration {
+                await client.debugTransportGeneration()
+            } else {
+                nil
+            }
+            AgentModePerfDiagnostics.recordCodexLifecyclePhase(
+                phase,
+                outcome: outcome,
+                startMS: startMS,
+                tabID: tabID,
+                transportGeneration: transportGeneration
+            )
+        }
+    #endif
+
     private static let maxRunningAggregatedOutputCharacters = 24000
     private static let maxCompletedCanonicalItemScopes = 512
     private static let maxCanonicalCompletionTurnIDs = 128
@@ -479,14 +506,20 @@ final class CodexNativeSessionController {
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
-        /// launch or thread request. Inject in tests; production uses the default below.
-        var repoPromptMCPProvisioner: () async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
+        /// launch or thread request. The runtime is resolved once from the app-server launch
+        /// environment and passed through unchanged. Inject in tests; production uses the default below.
+        var repoPromptMCPProvisioner: (CodexRuntimeAuthority.Runtime) async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
 
-        /// Fails closed only on a real `ensureCodexServerForDiscovery()` directory-create/config-write
+        /// Fails closed only on a real `ensureServerForDiscovery(runtime:)` directory-create/config-write
         /// failure — an existing entry needing no change reports success, so a healthy no-op is not misread.
-        private static func ensureDefaultRepoPromptMCPProvisioning() async throws {
-            guard MCPIntegrationHelper.ensureCodexServerForDiscovery().success else {
-                throw MCPBootstrapReadinessError.provisioningUnavailable
+        private static func ensureDefaultRepoPromptMCPProvisioning(
+            runtime: CodexRuntimeAuthority.Runtime
+        ) async throws {
+            let result = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+            guard result.success else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: result.errorMessage ?? MCPBootstrapReadinessError.provisioningUnavailable.localizedDescription
+                )
             }
         }
 
@@ -698,6 +731,7 @@ final class CodexNativeSessionController {
     private func requestWithCompatibleAppServerRequestValueStyle(
         method: String,
         timeout: TimeInterval?,
+        useDefaultTimeout: Bool = true,
         paramsBuilder: (CodexAgentToolPreferences.AppServerRequestValueStyle) async -> [String: Any]
     ) async throws -> [String: Any] {
         let attemptedStyle = appServerRequestValueStyle
@@ -705,7 +739,8 @@ final class CodexNativeSessionController {
             return try await performRequest(
                 method: method,
                 params: paramsBuilder(attemptedStyle),
-                timeout: timeout
+                timeout: timeout,
+                useDefaultTimeout: useDefaultTimeout
             )
         } catch {
             guard Self.shouldRetryWithAlternateAppServerRequestValueStyle(error) else {
@@ -718,7 +753,8 @@ final class CodexNativeSessionController {
             let result = try await performRequest(
                 method: method,
                 params: paramsBuilder(fallbackStyle),
-                timeout: timeout
+                timeout: timeout,
+                useDefaultTimeout: useDefaultTimeout
             )
             appServerRequestValueStyle = fallbackStyle
             return result
@@ -728,12 +764,18 @@ final class CodexNativeSessionController {
     private func performRequest(
         method: String,
         params: [String: Any]?,
-        timeout: TimeInterval?
+        timeout: TimeInterval?,
+        useDefaultTimeout: Bool = true
     ) async throws -> [String: Any] {
         if let requestExecutor {
             return try await requestExecutor(method, params, timeout)
         }
-        return try await client.request(method: method, params: params, timeout: timeout)
+        return try await client.request(
+            method: method,
+            params: params,
+            timeout: timeout,
+            useDefaultTimeout: useDefaultTimeout
+        )
     }
 
     init(
@@ -1065,15 +1107,67 @@ final class CodexNativeSessionController {
             try await eventHandlingMutex.withLock {
                 beginBindingSession()
             }
+            await client.updateDefaultRequestTimeout(options.requestTimeout)
+            // Resolve one authoritative runtime from the captured app-server environment before
+            // provisioning. The same client-held runtime is reused at process launch, including when
+            // the bundled package is unavailable and a valid override exists only in the login shell.
+            #if DEBUG
+                let runtimeResolutionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            #endif
+            let runtime: CodexRuntimeAuthority.Runtime
+            do {
+                runtime = try await client.prepareRuntimeForLaunch()
+                #if DEBUG
+                    await recordLifecyclePhase(
+                        .runtimeResolution,
+                        outcome: .succeeded,
+                        startMS: runtimeResolutionStartMS,
+                        includeTransportGeneration: false
+                    )
+                #endif
+            } catch {
+                #if DEBUG
+                    await recordLifecyclePhase(
+                        .runtimeResolution,
+                        outcome: Self.lifecycleOutcome(for: error),
+                        startMS: runtimeResolutionStartMS,
+                        includeTransportGeneration: false
+                    )
+                #endif
+                throw error
+            }
             // Fail closed before any process launch or thread request: a child that expects
             // RepoPrompt MCP tools must not start without them. The gate runs only for tool-expecting
             // children; those with no expected client name skip provisioning. A throw here lands in the
             // catch below — binding cancelled, expected-PID registration cleared, typed error rethrown —
             // before `client.startIfNeeded()` or any thread/start or thread/resume request.
             if let expectedMCPClientName {
-                try await options.repoPromptMCPProvisioner()
-                // A cancellation racing provisioning must not reach PID registration or process start.
-                try Task.checkCancellation()
+                #if DEBUG
+                    let provisioningStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                #endif
+                do {
+                    try await options.repoPromptMCPProvisioner(runtime)
+                    // A cancellation racing provisioning must not reach PID registration or process start.
+                    try Task.checkCancellation()
+                    #if DEBUG
+                        await recordLifecyclePhase(
+                            .provisioning,
+                            outcome: .succeeded,
+                            startMS: provisioningStartMS,
+                            includeTransportGeneration: false
+                        )
+                    #endif
+                } catch {
+                    #if DEBUG
+                        await recordLifecyclePhase(
+                            .provisioning,
+                            outcome: Self.lifecycleOutcome(for: error),
+                            startMS: provisioningStartMS,
+                            includeTransportGeneration: false
+                        )
+                    #endif
+                    throw error
+                }
                 await client.setExpectedAgentPIDRegistration(
                     .init(clientName: expectedMCPClientName, runID: runID)
                 )
@@ -1082,63 +1176,117 @@ final class CodexNativeSessionController {
             await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
-            try await client.startIfNeeded()
+            #if DEBUG
+                let spawnInitializeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            #endif
+            do {
+                try await client.startIfNeeded()
+                #if DEBUG
+                    await recordLifecyclePhase(
+                        .spawnInitialize,
+                        outcome: .succeeded,
+                        startMS: spawnInitializeStartMS,
+                        includeTransportGeneration: true
+                    )
+                #endif
+            } catch {
+                #if DEBUG
+                    await recordLifecyclePhase(
+                        .spawnInitialize,
+                        outcome: Self.lifecycleOutcome(for: error),
+                        startMS: spawnInitializeStartMS,
+                        includeTransportGeneration: true
+                    )
+                #endif
+                throw error
+            }
             await ensureInboundStreamsStarted()
 
             let configOverrides = await options.configOverridesProvider()
             let result: [String: Any]
+            #if DEBUG
+                let threadPhase: AgentModePerfDiagnostics.CodexLifecyclePhase = resumeThreadID == nil
+                    ? .threadStart
+                    : .threadResume
+                let threadRequestStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            #endif
 
-            if let resumeThreadID {
-                var params: [String: Any] = ["threadId": resumeThreadID]
-                if let model {
-                    params["model"] = model
+            do {
+                if let resumeThreadID {
+                    var params: [String: Any] = ["threadId": resumeThreadID]
+                    if let rolloutPath = existing?.rolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !rolloutPath.isEmpty
+                    {
+                        params["path"] = rolloutPath
+                    }
+                    if let model {
+                        params["model"] = model
+                    }
+                    Self.addServiceTier(serviceTier, to: &params)
+                    if let executionDirectory = workspacePaths.executionDirectory {
+                        params["cwd"] = executionDirectory
+                    }
+                    if !configOverrides.isEmpty {
+                        params["config"] = configOverrides
+                    }
+                    // baseInstructions is intentionally omitted on thread/resume: the app-server
+                    // preserves original instructions across resume (confirmed by Codex protocol
+                    // tests: resume_switches_models_preserves_base_instructions). Resending them
+                    // wastes ~5-6k tokens on every reconnect for no benefit.
+                    result = try await requestWithCompatibleAppServerRequestValueStyle(
+                        method: "thread/resume",
+                        timeout: options.requestTimeout
+                    ) { requestValueStyle in
+                        var requestParams = params
+                        requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+                        requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
+                        requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                        return requestParams
+                    }
+                } else {
+                    var params: [String: Any] = [:]
+                    if let model {
+                        params["model"] = model
+                    }
+                    Self.addServiceTier(serviceTier, to: &params)
+                    if let executionDirectory = workspacePaths.executionDirectory {
+                        params["cwd"] = executionDirectory
+                    }
+                    if !configOverrides.isEmpty {
+                        params["config"] = configOverrides
+                    }
+                    if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        params["baseInstructions"] = baseInstructions
+                    }
+                    result = try await requestWithCompatibleAppServerRequestValueStyle(
+                        method: "thread/start",
+                        timeout: options.requestTimeout
+                    ) { requestValueStyle in
+                        var requestParams = params
+                        requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+                        requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
+                        requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                        return requestParams
+                    }
                 }
-                Self.addServiceTier(serviceTier, to: &params)
-                if let executionDirectory = workspacePaths.executionDirectory {
-                    params["cwd"] = executionDirectory
-                }
-                if !configOverrides.isEmpty {
-                    params["config"] = configOverrides
-                }
-                // baseInstructions is intentionally omitted on thread/resume: the app-server
-                // preserves original instructions across resume (confirmed by Codex protocol
-                // tests: resume_switches_models_preserves_base_instructions). Resending them
-                // wastes ~5-6k tokens on every reconnect for no benefit.
-                result = try await requestWithCompatibleAppServerRequestValueStyle(
-                    method: "thread/resume",
-                    timeout: options.requestTimeout
-                ) { requestValueStyle in
-                    var requestParams = params
-                    requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                    requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                    requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
-                    return requestParams
-                }
-            } else {
-                var params: [String: Any] = [:]
-                if let model {
-                    params["model"] = model
-                }
-                Self.addServiceTier(serviceTier, to: &params)
-                if let executionDirectory = workspacePaths.executionDirectory {
-                    params["cwd"] = executionDirectory
-                }
-                if !configOverrides.isEmpty {
-                    params["config"] = configOverrides
-                }
-                if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    params["baseInstructions"] = baseInstructions
-                }
-                result = try await requestWithCompatibleAppServerRequestValueStyle(
-                    method: "thread/start",
-                    timeout: options.requestTimeout
-                ) { requestValueStyle in
-                    var requestParams = params
-                    requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                    requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                    requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
-                    return requestParams
-                }
+                #if DEBUG
+                    await recordLifecyclePhase(
+                        threadPhase,
+                        outcome: .succeeded,
+                        startMS: threadRequestStartMS,
+                        includeTransportGeneration: true
+                    )
+                #endif
+            } catch {
+                #if DEBUG
+                    await recordLifecyclePhase(
+                        threadPhase,
+                        outcome: Self.lifecycleOutcome(for: error),
+                        startMS: threadRequestStartMS,
+                        includeTransportGeneration: true
+                    )
+                #endif
+                throw error
             }
 
             let pendingSessionRef = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort).sessionRef
@@ -1382,28 +1530,52 @@ final class CodexNativeSessionController {
             print("[CodexNativeSessionController] turn/start request model=\(String(describing: params["model"] ?? "default")) effort=\(String(describing: params["effort"] ?? "default")) serviceTier=\(String(describing: params["serviceTier"] ?? "missing")) threadID=\(threadID)")
         #endif
         let sandboxMode = options.sandboxModeProvider()
-        // turn/start can block for extended model reasoning — no timeout.
-        let result = try await requestWithCompatibleAppServerRequestValueStyle(
-            method: "turn/start",
-            timeout: nil
-        ) { requestValueStyle in
-            var requestParams = params
-            requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-            requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
-            requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
-                mode: sandboxMode,
-                executionDirectory: workspacePaths.executionDirectory
-            )
-            // app-server v2 turn/start does not accept a config override bag.
-            // Thread-level config changes take effect on thread/start or thread/resume.
-            return requestParams
+        #if DEBUG
+            let turnAcceptanceStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+        #endif
+        do {
+            // turn/start can block for extended model reasoning — no timeout.
+            let result = try await requestWithCompatibleAppServerRequestValueStyle(
+                method: "turn/start",
+                timeout: nil,
+                useDefaultTimeout: false
+            ) { requestValueStyle in
+                var requestParams = params
+                requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
+                    mode: sandboxMode,
+                    executionDirectory: workspacePaths.executionDirectory
+                )
+                // app-server v2 turn/start does not accept a config override bag.
+                // Thread-level config changes take effect on thread/start or thread/resume.
+                return requestParams
+            }
+            guard let turn = result["turn"] as? [String: Any],
+                  let submissionID = Self.nonEmptyString(turn["id"] as? String)
+            else {
+                throw CodexAppServerClient.ClientError.invalidResponse
+            }
+            #if DEBUG
+                await recordLifecyclePhase(
+                    .turnAcceptance,
+                    outcome: .succeeded,
+                    startMS: turnAcceptanceStartMS,
+                    includeTransportGeneration: true
+                )
+            #endif
+            return CodexTurnStartReceipt(provisionalSubmissionID: submissionID)
+        } catch {
+            #if DEBUG
+                await recordLifecyclePhase(
+                    .turnAcceptance,
+                    outcome: Self.lifecycleOutcome(for: error),
+                    startMS: turnAcceptanceStartMS,
+                    includeTransportGeneration: true
+                )
+            #endif
+            throw error
         }
-        guard let turn = result["turn"] as? [String: Any],
-              let submissionID = Self.nonEmptyString(turn["id"] as? String)
-        else {
-            throw CodexAppServerClient.ClientError.invalidResponse
-        }
-        return CodexTurnStartReceipt(provisionalSubmissionID: submissionID)
     }
 
     func steerUserTurn(
@@ -1782,7 +1954,18 @@ final class CodexNativeSessionController {
             await client.clearExpectedAgentPIDRegistration()
         }
         if clientShutdownBehavior == .stopOnShutdown {
+            #if DEBUG
+                let shutdownStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            #endif
             await client.stop()
+            #if DEBUG
+                await recordLifecyclePhase(
+                    .shutdown,
+                    outcome: .succeeded,
+                    startMS: shutdownStartMS,
+                    includeTransportGeneration: true
+                )
+            #endif
         }
     }
 

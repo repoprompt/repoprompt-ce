@@ -389,7 +389,10 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
                 _ = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
@@ -561,7 +564,10 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             let text = try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
                 _ = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
@@ -692,7 +698,10 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
-    private func ensureAppServerReady(appServerClient: CodexAppServerClient?) async throws {
+    private func ensureAppServerReady(
+        appServerClient: CodexAppServerClient?,
+        requestTimeout: TimeInterval
+    ) async throws {
         if let appServerReadyHook {
             try await appServerReadyHook()
             return
@@ -708,6 +717,7 @@ final class CodexCLIProvider: AIProvider {
                 )
             )
         }
+        await appServerClient.updateDefaultRequestTimeout(requestTimeout)
         try await appServerClient.startIfNeeded()
     }
 
@@ -939,18 +949,8 @@ final class CodexCLIProvider: AIProvider {
         if isTimeoutDetail(detail) {
             return timeoutError(for: timeoutValue)
         }
-        if lower.contains("command not found")
-            || lower.contains("no such file")
-            || lower.contains("spawnfailed(errno: 2)")
-            || lower.contains("errno: 2")
-        {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI is not installed or not in PATH. Install it and run `codex login`.")
-        }
-        if lower.contains("permission denied") || lower.contains("spawnfailed(errno: 13)") || lower.contains("errno: 13") {
-            return AIProviderError.invalidConfiguration(detail: "Permission denied. Ensure the 'codex' executable is accessible.")
-        }
         if lower.contains("unauthorized") || lower.contains("not authenticated") {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI is not authenticated. Run `codex login` in your terminal.")
+            return AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
         }
         if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI rate limited. Please wait a moment and try again.")

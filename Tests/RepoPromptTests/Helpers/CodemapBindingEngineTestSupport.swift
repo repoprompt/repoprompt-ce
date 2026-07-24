@@ -948,6 +948,10 @@ actor EngineMultiEntryGate {
         }
     }
 
+    func releaseOne() {
+        state.releaseOne()
+    }
+
     func releaseAll() {
         state.releaseAll()
     }
@@ -1031,6 +1035,14 @@ private final class EngineMultiEntryGateState: @unchecked Sendable {
             throw error
         }
         return count >= expectedCount
+    }
+
+    func releaseOne() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            guard let id = continuations.keys.first else { return nil }
+            return continuations.removeValue(forKey: id)
+        }
+        continuation?.resume()
     }
 
     func releaseAll() {
@@ -1399,6 +1411,48 @@ actor EngineProjectionRecorder {
             }
         }
         return .accepted(progress)
+    }
+}
+
+actor EngineProjectionPartialPageRetryPublisher {
+    private let rereadGate: EngineAsyncGate
+    private var acceptedProgress = WorkspaceCodemapProjectionProgress.notStarted
+    private var segmentPublicationCount = 0
+    private(set) var snapshots: [WorkspaceCodemapProjectionSnapshot] = []
+
+    init(rereadGate: EngineAsyncGate) {
+        self.rereadGate = rereadGate
+    }
+
+    func publish(
+        _ snapshot: WorkspaceCodemapProjectionSnapshot
+    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
+        snapshots.append(snapshot)
+        switch snapshot {
+        case let .segment(segment):
+            segmentPublicationCount += 1
+            switch segmentPublicationCount {
+            case 1:
+                acceptedProgress = segment.progress
+                return .accepted(acceptedProgress)
+            case 2:
+                return .busy(retryAfterMilliseconds: nil)
+            case 3:
+                await rereadGate.enterAndWait()
+                return .exactDuplicate(acceptedProgress)
+            default:
+                acceptedProgress = segment.progress
+                return .accepted(acceptedProgress)
+            }
+        case let .seal(proof):
+            guard case let .success(completed) = acceptedProgress.advancing(
+                to: .complete,
+                by: .zero,
+                catalogCompletion: proof.catalogCompletion
+            ) else { return .unavailable(.invalidCompletenessProof) }
+            acceptedProgress = completed
+            return .accepted(completed)
+        }
     }
 }
 

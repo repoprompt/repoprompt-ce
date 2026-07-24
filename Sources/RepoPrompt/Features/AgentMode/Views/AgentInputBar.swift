@@ -1263,7 +1263,7 @@ struct AgentComposerView: View, Equatable {
 
                 Section {
                     if codexTools.mcpServerEntries.isEmpty {
-                        Text("No servers in ~/.codex/config.toml")
+                        Text("No servers in RepoPrompt's isolated Codex config")
                             .foregroundStyle(.tertiary)
                     } else {
                         ForEach(codexTools.mcpServerEntries, id: \.normalizedName) { entry in

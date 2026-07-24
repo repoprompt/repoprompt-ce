@@ -730,11 +730,31 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     var onRootFoldersChanged: (() -> Void)?
     private let rootShellProjectionsChangedSubject = PassthroughSubject<Void, Never>()
+    private let codemapRootStatusesChangedSubject = PassthroughSubject<Void, Never>()
+    private var codemapRootStatusesByRootID: [UUID: WorkspaceCodemapRootStatusSnapshot] = [:]
+    private var acceptedCodemapRootStatusRevision: UInt64?
     private var rootShellProjectionChangeBatchDepth = 0
     private var hasPendingRootShellProjectionChange = false
 
     var rootShellProjectionsChangedPublisher: AnyPublisher<Void, Never> {
         rootShellProjectionsChangedSubject.eraseToAnyPublisher()
+    }
+
+    var codemapRootStatusesChangedPublisher: AnyPublisher<Void, Never> {
+        codemapRootStatusesChangedSubject.eraseToAnyPublisher()
+    }
+
+    func codemapRootStatus(rootID: UUID) -> WorkspaceCodemapRootStatusSnapshot? {
+        codemapRootStatusesByRootID[rootID]
+    }
+
+    func setCodemapGenerationSuspended(rootID: UUID, suspended: Bool) async {
+        _ = await workspaceFileContextStore.setCodemapGenerationSuspended(
+            rootID: rootID,
+            suspended: suspended
+        )
+        let update = await workspaceFileContextStore.currentCodemapRootStatusUpdate()
+        handleCodemapRootStatus(update)
     }
 
     @MainActor
@@ -1222,6 +1242,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
     private var codemapSelectionGraphReadinessTask: Task<Void, Never>?
     private var codemapMarkerReadinessTask: Task<Void, Never>?
+    private var codemapRootStatusTask: Task<Void, Never>?
     private let alwaysReadableHomeDirectoryURL: URL
     private let automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
@@ -1250,6 +1271,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         subscribeToWorkspaceStoreDeltaEvents()
         subscribeToCodemapSelectionGraphReadinessUpdates()
         subscribeToCodemapMarkerReadinessUpdates()
+        subscribeToCodemapRootStatusUpdates()
         subscribeToPartitionStoreSaves()
         subscribeToFileSystemPreferenceChanges()
     }
@@ -1268,6 +1290,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspaceStoreDeltaBridgeTask?.cancel()
         codemapSelectionGraphReadinessTask?.cancel()
         codemapMarkerReadinessTask?.cancel()
+        codemapRootStatusTask?.cancel()
         autoCodemapSyncTask?.cancel()
         for task in sliceRebaseTasksByFullPath.values {
             task.cancel()
@@ -1461,6 +1484,17 @@ class WorkspaceFilesViewModel: ObservableObject {
             let stream = await workspaceFileContextStore.codemapMarkerReadinessUpdates()
             for await event in stream {
                 handleCodemapMarkerReadiness(event)
+            }
+        }
+    }
+
+    private func subscribeToCodemapRootStatusUpdates() {
+        let store = workspaceFileContextStore
+        codemapRootStatusTask = Task { [weak self, store] in
+            let stream = await store.codemapRootStatusUpdates()
+            for await update in stream {
+                guard let self else { return }
+                handleCodemapRootStatus(update)
             }
         }
     }
@@ -2463,6 +2497,22 @@ class WorkspaceFilesViewModel: ObservableObject {
     ) {
         guard visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID }) else { return }
         codemapMarkerReadinessRevision &+= 1
+    }
+
+    @MainActor
+    private func handleCodemapRootStatus(_ update: WorkspaceCodemapRootStatusUpdate) {
+        if let acceptedCodemapRootStatusRevision,
+           update.revision <= acceptedCodemapRootStatusRevision
+        {
+            return
+        }
+        acceptedCodemapRootStatusRevision = update.revision
+        let next = Dictionary(uniqueKeysWithValues: update.roots.map {
+            ($0.rootEpoch.rootID, $0)
+        })
+        guard next != codemapRootStatusesByRootID else { return }
+        codemapRootStatusesByRootID = next
+        codemapRootStatusesChangedSubject.send(())
     }
 
     func cancelAllLoadingTasks() {

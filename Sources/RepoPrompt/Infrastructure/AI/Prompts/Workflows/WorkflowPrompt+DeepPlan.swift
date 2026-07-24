@@ -19,7 +19,7 @@ extension RepoPromptWorkflowPrompts {
 
 Plan: $ARGUMENTS
 
-You are a deep-planning orchestrator. Produce one polished, executable plan document at `docs/plans/<topic>-<YYYY-MM-DD>.md` — and nothing else. No code, no implementation, no half-built scaffolding.
+You are a deep-planning orchestrator. Produce one polished, executable plan document at `docs/plans/<topic>-<YYYY-MM-DD>.md`. No code, no implementation, no half-built scaffolding — the workflow's own artifacts (plan export, Phase 6 critique) are expected, but the plan is the sole deliverable.
 
 \(variant.preamble)\(rpDeepPlanCore(variant: variant, includeSessionCleanupGuidance: includeSessionCleanupGuidance))
 """
@@ -39,14 +39,15 @@ You are a deep-planning orchestrator. Produce one polished, executable plan docu
 		_ = chatToolName
 
 		return """
-This workflow is delegation-heavy. Explore agents map seams and pull external research. \(builderName) produces architectural bones in plan mode. A design agent does a bounded critique. **You own the writing**, the structure, and the final shape.
+This workflow is delegation-heavy. Explore agents map seams and pull external research. \(builderName) produces the draft plan in plan mode. A design agent does a bounded critique. **You own the writing**, the structure, and the final shape.
 
 ## Core principles
 
 - **Plan only.** Implementation belongs in `rp-build` or `rp-orchestrate`. End at a polished document.
 - **Delegate evidence, not voice.** Sub-agents gather; you write.
-- **Concise > comprehensive.** The plan should get *shorter* as it matures, not longer. Cut anything readers won't act on.
-- **Reference, don't reproduce.** Point to `file:line` and external links. Don't paste full files into the plan.
+- **The \(builderName) export is the preservation baseline, not an authority over code or explicit user decisions.** Preserve every supported implementation-bearing fact, decision, rationale, constraint, edge case, sequencing requirement, and verification requirement. A detail is *supported* when explicit requirements, observed code, established repository patterns, or sound architectural reasoning about the task justifies it — a proposed design need not already exist in the code to be supported.
+- **Removal needs evidence; consolidation must be lossless.** Remove or replace a baseline detail only when code, user direction, or task scope shows it is incorrect, unsupported, out of scope, or duplicated — or when you can name a simpler design that meets the same requirements with the same verification coverage. Consolidation is lossless when the same facts, decisions, rationale, constraints, and verification stay equally easy to find; never generalize accurate detail merely for brevity.
+- **Reference, don't reproduce.** Point to `file:line` and external links. Don't paste full source files, raw transcripts, or tool dumps into the plan.
 - **Ground every user question in something you found.** Generic interview questions waste the user's time.
 - **Honor the involvement promise.** Once the user has picked **Up front** or **Mid-flow**, every downstream `ask_user` is a checkpoint they asked for. If one returns `timed_out: true`, **halt** — don't proceed with assumed answers and silently break the promise. Resume from the same prompt when the user replies. (Phase 1 itself is exempt: a timeout on the involvement-mode question means "no signal yet," and the documented Hands-off default applies.) `skipped: true` is always an explicit user choice and falls back to documented defaults.
 \(workspaceVerificationBlock(variant: variant, heading: "## Phase 0", beforeAction: "the involvement question", nextStep: "Phase 1"))
@@ -175,13 +176,13 @@ rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>"] time
 
 Skip lanes that don't apply. **Don't dispatch external research just because you can** — the relevance trigger is "the plan depends on facts I can't see in this workspace."
 
+**Capture the findings — don't just absorb them.** The explore agents did real reconnaissance, but they also return a lot. Curate: distill the *load-bearing* evidence — file:line refs, type names, extension points, links, prior art (including anything useful the Phase 1.5 ambiguity scouts surfaced) — into the plan's `## Background` when you scaffold the file next. The goal is enough grounding that \(builderName) doesn't re-derive seams from scratch — not a verbatim dump of every agent's output. When unsure whether a concrete reference matters, keep it; leave the raw transcripts and narration behind.
+
 ---
 
 ## Phase 3: Scaffold the Plan File
 
-Create `docs/plans/<topic>-<YYYY-MM-DD>.md`. Match the convention of existing files in `docs/plans/` — peek at one or two for the expected sections.
-
-Seed it with a **lightweight scaffold**, not a full draft. The architectural meat comes from \(builderName) next.
+Create `docs/plans/<topic>-<YYYY-MM-DD>.md`. Seed it with a **lightweight pre-draft scaffold** containing **Goal**, **Background**, **Open Questions**, and **References**, with `## Background` populated substantively from the curated Phase 2 findings. This scaffold is input to \(builderName), not the final plan schema — Phase 4 replaces it with the export's full set of substantive sections. The background is distilled evidence — not draft prose or raw agent output — and the goal stays a sentence or two until the planning export is integrated.
 
 \(example(variant,
 	mcp: """
@@ -218,13 +219,13 @@ Don't write the Approach or Work Items yet — \(builderName) produces those.
 
 ## Phase 4: \(builderName) Plan Pass
 
-Call \(builderName) in plan mode with `export_response: true`. Pass the plan path and the contextualized prompt — pointing at the scaffold lets the builder ground its output in the same context you've already gathered:
+Call \(builderName) in plan mode with `export_response: true`. Request the full implementation-ready specification — don't narrow the builder to a short approach or checklist — and point it at the plan file so it builds on the explore findings in `## Background`:
 
 \(example(variant,
 	mcp: """
 ```json
 {"tool":"context_builder","args":{
-	"instructions":"<task><user task, restated in the codebase's terms></task>\\n\\n<context>See the in-progress plan at `docs/plans/<topic>-<YYYY-MM-DD>.md` for goal, background, and open questions gathered so far.\\n\\nKey findings from explore agents:\\n- <finding 1 with file:line>\\n- <finding 2 with file:line>\\n\\nProduce a concrete approach + ordered work items. Note tradeoffs only when they change the recommended path.</context>",
+	"instructions":"<task><user task, restated in the codebase's terms></task>\\n\\n<context>See the in-progress plan at `docs/plans/<topic>-<YYYY-MM-DD>.md` — its `## Background` section holds the curated explore-agent findings (seams, file:line refs, prior art, external research), plus the goal and open questions gathered so far. Build on that context rather than re-deriving it.\\n\\nFollow the full output structure and specificity requirements of your planning instructions. Produce a complete implementation-ready specification, not only an approach and ordered work items. Preserve detailed current-state analysis, component and interface design, file-by-file impact, state and data flow, errors and edge cases, tradeoffs, risks, implementation order, and verification wherever applicable.</context>",
 	"response_type":"plan",
 	"export_response":true
 }}
@@ -234,46 +235,35 @@ Call \(builderName) in plan mode with `export_response: true`. Pass the plan pat
 ```bash
 rpce-cli -w <window_id> -e 'builder "<task><user task, restated in the codebase'\\''s terms></task>
 
-<context>See the in-progress plan at docs/plans/<topic>-<YYYY-MM-DD>.md for goal, background, and open questions gathered so far.
+<context>See the in-progress plan at docs/plans/<topic>-<YYYY-MM-DD>.md. Its Background section holds the curated explore-agent findings, plus the goal and open questions gathered so far. Build on that context rather than re-deriving it.
 
-Key findings from explore agents:
-- <finding 1 with file:line>
-- <finding 2 with file:line>
-
-Produce a concrete approach + ordered work items. Note tradeoffs only when they change the recommended path.</context>" --response-type plan --export'
+Follow the full output structure and specificity requirements of your planning instructions. Produce a complete implementation-ready specification, preserving current-state analysis, component and interface design, file-by-file impact, state and data flow, errors and edge cases, tradeoffs, risks, implementation order, and verification wherever applicable.</context>" --response-type plan --export'
 ```
 """))
 
-The tool returns `oracle_export_path`. **Merge, don't append.**
+The tool returns `oracle_export_path`. **Use the export's generated plan as the preservation baseline.** Export files may open with the composed prompt and a selected-file dump; the baseline is the generated response that follows, not that context echo. The codebase and explicit user decisions stay authoritative.
 
-1. Read the export with `read_file`.
-2. Extract the **architectural bones** — proposed approach, ordered work items, named seams. Skip meta-narration about tradeoffs unless one is genuinely load-bearing for the recommendation.
-3. Apply targeted edits to the plan file: insert `## Approach` and `## Work Items` sections based on the extracted bones, in your voice.
-4. Delete the standalone export so `prompt-exports/` doesn't accumulate.
+1. Read the complete export with `read_file`; if a read is truncated, continue in chunks until every line has been read. While reading, build a compact coverage ledger of the baseline: each section and its concrete implementation-bearing items (facts, decisions, rationale, constraints, edge cases, sequencing, verification), a few words apiece. Phase 7.5 walks this ledger.
+2. Integrate all substantive, supported plan content rather than mining the export for a shorter summary. Preserve applicable current-state analysis, design, file-by-file impact, tradeoffs, risks, implementation order, and verification. Exclude only tool wrappers, raw transcripts, raw file dumps, and other non-plan artifacts.
+3. Fold the scaffold's `## Goal`, curated `## Background`, user answers, open questions, and references into that body.
+4. Check the export's claims against the code and the user's answers. Correct or remove a detail only under the removal standard in Core principles, and note what changed and why so a corrected item doesn't later read as a dropped one.
+5. Add an execution index using **Goal**, **Done when**, **Key files**, **Dependencies**, and **Size** for each work item. This index organizes the detailed specification rather than replacing it.
+6. Normalize headings and phrasing, integrate Phase 2 evidence, and fill genuine gaps. Do not collapse distinct behavior cases or replace concrete detail with broad instructions such as “update callers” or “add tests.”
+7. Keep the export through the Phase 6 critique and Phase 7.5 fidelity check; delete it only after that check passes.
 
 \(example(variant,
 	mcp: """
 ```json
 {"tool":"read_file","args":{"path":"<oracle_export_path>"}}
-
-{"tool":"apply_edits","args":{
-	"path":"docs/plans/<topic>-<YYYY-MM-DD>.md",
-	"search":"## Open Questions",
-	"replace":"## Approach\\n<distilled approach in your own words>\\n\\n## Work Items\\n1. <item 1 — concrete, with file references>\\n2. <item 2>\\n3. <item 3>\\n\\n## Open Questions"
-}}
-
-{"tool":"file_actions","args":{"action":"delete","path":"<oracle_export_path>"}}
 ```
 """,
 	cli: """
 ```bash
 rpce-cli -w <window_id> -e 'read <oracle_export_path>'
-rpce-cli -w <window_id> -e 'call apply_edits {"path":"docs/plans/<topic>-<YYYY-MM-DD>.md","search":"## Open Questions","replace":"## Approach\\n<distilled approach in your own words>\\n\\n## Work Items\\n1. <item 1>\\n2. <item 2>\\n3. <item 3>\\n\\n## Open Questions"}'
-rpce-cli -w <window_id> -e 'call file_actions {"action":"delete","path":"<oracle_export_path>"}'
 ```
 """))
 
-The merge is where you start asserting voice. \(builderName) rambles; the plan won't.
+The Phase 6 critique checks correctness, completeness, and preservation against this baseline.
 
 ---
 
@@ -285,9 +275,9 @@ The user picked **Mid-flow** — they explicitly asked to be involved here. If a
 
 ---
 
-## Phase 6: Bounded Design Critique
+## Phase 6: Bounded Completeness and Design Critique
 
-Dispatch a design agent — **once**, with tight scope — to spot-check the plan. The design agent is a critic, not a co-author.
+Dispatch a design agent **once**, with tight scope, to check the plan against both the codebase and the original \(builderName) export. The design agent is a correctness and completeness critic, not a co-author.
 
 \(example(variant,
 	mcp: """
@@ -296,40 +286,55 @@ Dispatch a design agent — **once**, with tight scope — to spot-check the pla
 	"op":"start",
 	"model_id":"design",
 	"session_name":"Plan critique: <topic>",
-	"message":"Read the plan at `docs/plans/<topic>-<YYYY-MM-DD>.md` and produce a max-1-page critique under `docs/reviews/`. Cover ONLY:\\n1. Top 3 under-specified seams (with file:line if applicable)\\n2. Contradictions or missing dependencies in the plan\\n3. Risk of over-planning — sections that should be cut or simplified\\n4. Questions whose answers would change implementation order\\n\\nDo NOT expand scope, do NOT rewrite the plan, do NOT do broad codebase exploration unless one named seam needs spot-checking. Prefer deletion or clarification over adding detail.",
+	"message":"Read the plan at `docs/plans/<topic>-<YYYY-MM-DD>.md` and the complete original context_builder export at `<oracle_export_path>` — treat only its generated plan response as the baseline; any composed prompt or selected-file dump it opens with is context, not plan content. Produce a focused critique under `docs/reviews/`. Cover ONLY:\\n1. Implementation-bearing content from the export that is missing, weakened, or generalized in the plan\\n2. Under-specified seams, unresolved material decisions, contradictions, incorrect references, or missing dependencies\\n3. Plan or export details that the code disproves, the task does not require, or a named simpler design fully replaces — give the precise correction and its justification\\n4. Requirements, edge cases, dependencies, or architectural problems absent from both the export and the plan — ownership, lifecycle, failure behavior, cancellation, testability\\n5. Questions whose answers would materially change the design or implementation order\\n\\nDo not recommend removing accurate content merely because it is specific or low-level. Do not expand user scope, rewrite the plan, or perform broad codebase exploration unless one named seam needs a focused spot-check.",
 	"wait":true
 }}
 ```
 """,
 	cli: """
 ```bash
-rpce-cli -w <window_id> -e 'agent_run op=start model_id=design session_name="Plan critique: <topic>" message="Read the plan at docs/plans/<topic>-<YYYY-MM-DD>.md and produce a max-1-page critique under docs/reviews/. Cover ONLY: top 3 under-specified seams (with file:line if applicable); contradictions or missing dependencies; risk of over-planning (sections to cut or simplify); questions whose answers would change implementation order. Do NOT expand scope, rewrite the plan, or do broad exploration. Prefer deletion or clarification over adding detail." wait=true'
+rpce-cli -w <window_id> -e 'agent_run op=start model_id=design session_name="Plan critique: <topic>" message="Read the plan at docs/plans/<topic>-<YYYY-MM-DD>.md and the complete original builder export at <oracle_export_path> — treat only its generated plan response as the baseline; any composed prompt or selected-file dump is context, not plan content. Check for implementation-bearing content missing, weakened, or generalized; under-specified seams, contradictions, or incorrect references; details the code disproves, the task does not require, or a named simpler design replaces (give the correction); requirements or architectural problems absent from both — ownership, lifecycle, failure behavior, cancellation, testability; and material questions. Do not remove accurate content merely because it is specific or low-level, expand scope, rewrite the plan, or explore broadly." wait=true'
 ```
 """))
 
-When the critique returns, fold actionable findings into the plan: tighten under-specified seams, resolve contradictions, cut what should be cut. **Don't fold in the critique itself** — its job is to inform your edits, not to live in the plan.
-
-It's still a plan, not an implementation. Don't over-engineer this pass — the design agent is looking for genuine gaps, not nitpicks.
+Apply verified findings rather than pasting the critique into the plan. Restore supported omissions, resolve material ambiguities and contradictions, and correct or remove content under the same removal standard as Phase 4. Keep the export until the Phase 7.5 fidelity check passes.
 
 ---
 
-## Phase 7: Editorial Polish + Final Hand-off
+## Phase 7: Fidelity-Preserving Editorial Polish + Final Hand-off
 
-The plan should be **shorter and clearer** after this pass than after Phase 4. Specific moves:
+Make the plan clear and executable. Fidelity is about preserving supported content, not preserving wording or maximizing length.
 
-- Drop tradeoff narration unless one tradeoff is load-bearing.
-- Promote concrete next steps; demote speculation.
-- Verify `file:line` refs and external links are accurate.
-- Trim duplicate context — Phase 2 and Phase 4 both produced background; keep the better version.
-- Make sure each section earns its space; remove anything that doesn't.
+- Remove generic filler, raw artifacts, and semantic duplication; keep any consolidation lossless.
+- Preserve concise rationale for the chosen approach and its most plausible rejected alternative when that rationale guides implementation or review.
+- Verify every `file:line` reference, symbol name, command, and external link that the plan relies on.
+- Scan for accidental generalization: phrases such as “update callers,” “handle errors,” or “add tests” must not replace named call sites, failure behavior, or verification cases.
 
 **Acceptance criteria for the final plan:**
 
-- [ ] Lives at `docs/plans/<topic>-<YYYY-MM-DD>.md`
-- [ ] Sections are concise and well-organized (Goal, Background, Approach, Work Items, Open Questions, References — adjust as the task warrants)
-- [ ] No transcript dumps, no raw agent output
-- [ ] Open questions only if they would block or shape implementation
-- [ ] A reader unfamiliar with the area can pick it up and execute
+- [ ] Lives at `docs/plans/<topic>-<YYYY-MM-DD>.md` and retains every applicable substantive section of the export — current-state analysis, detailed design, file-by-file impact, tradeoffs, risks, implementation order, verification — not collapsed into only a summary and work-item list
+- [ ] Passes the Phase 7.5 fidelity check against the export
+- [ ] Resolves every material design decision that current evidence makes resolvable and names the tests, commands, and manual checks that prove completion
+- [ ] Contains no transcript dumps, raw agent output, generic advice, or repeated narration
+- [ ] Retains only material open questions and can be executed by a reader without prior conversation context
+
+## Phase 7.5: Final Fidelity Check and Cleanup
+
+Walk the coverage ledger from Phase 4 — no need to reread both documents cold. Confirm the final plan keeps each ledger item equally explicit and discoverable, losslessly consolidated, or corrected or removed under the removal standard in Core principles. Restore anything that became weaker or merely implied, and spot-check the export directly wherever the ledger feels thin. This is a fidelity check, not a length target.
+
+Delete the export only after this check passes:
+
+\(example(variant,
+	mcp: """
+```json
+{"tool":"file_actions","args":{"action":"delete","path":"<oracle_export_path>"}}
+```
+""",
+	cli: """
+```bash
+rpce-cli -w <window_id> -e 'call file_actions {"action":"delete","path":"<oracle_export_path>"}'
+```
+"""))
 
 If the user picked **Hands-off**, surface the plan now and offer interactive refinement: *"Plan is at `<path>`. Want me to revise any section, expand scope, or trim anything?"* Treat each round as a focused edit pass on the file, not a re-plan.
 
@@ -339,6 +344,8 @@ For **all** modes, report:
 - 2–3 sentence summary
 - Any open questions that survived the polish pass
 - Suggested next workflow (`rp-build` for direct implementation, `rp-orchestrate` for multi-agent execution)
+
+The current Phase 4 export is not fully consumed until the Phase 7.5 fidelity check passes, so no earlier housekeeping rule may delete it.
 
 \(sharedSessionCleanupSection(variant: variant, heading: "### Housekeeping", includeSessionCleanupGuidance: includeSessionCleanupGuidance, includeStrayPlanExportCleanup: true))
 ---
@@ -350,10 +357,10 @@ For **all** modes, report:
 - 🚫 More than 4 questions per checkpoint — interrogation isn't shaping
 - 🚫 Implementing code — this workflow ends at a plan
 - 🚫 Pasting full file contents into the plan — refer to `file:line`, don't reproduce
-- 🚫 Appending the \(builderName) export verbatim — merge architectural bones, leave the rambling
-- 🚫 Forgetting to delete the standalone \(builderName) export after merging
-- 🚫 Letting the design critique rewrite the plan — it's a critic, not a co-author
-- 🚫 Letting Phase 7 polish make the plan *longer* than after Phase 4 — it should be tighter
+- 🚫 Losing the Phase 2 findings or dumping raw explore-agent output into `## Background` — preserve distilled, load-bearing evidence
+- 🚫 Summarizing or generalizing supported implementation-bearing content merely for brevity — lossless consolidation is fine, lossy is not
+- 🚫 Letting the design critique reopen settled decisions without evidence, expand scope, or rewrite the plan
+- 🚫 Deleting the \(builderName) export before the Phase 7.5 fidelity check passes
 - 🚫 Dispatching external/web research when the plan only depends on in-repo facts — the trigger is real external dependency
 - 🚫 Doing broad codebase reading yourself instead of dispatching an explore agent — keep your context lean for writing
 - 🚫 Forgetting to poll dispatched agents — they may block on permission approvals

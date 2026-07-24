@@ -436,6 +436,45 @@ struct WorkspaceCodemapProjectionRetry: Hashable {
     let nextEligibleAdmissionUptimeNanoseconds: UInt64?
 }
 
+struct WorkspaceCodemapProjectionInBatchProgress: Hashable {
+    let batchID: UUID
+    let acceptedProcessedCandidateBaseline: UInt64
+    let resolvedCandidateCount: UInt64
+    let candidateCount: UInt64
+
+    init(
+        batchID: UUID,
+        acceptedProcessedCandidateBaseline: UInt64,
+        resolvedCandidateCount: UInt64,
+        candidateCount: UInt64
+    ) {
+        precondition(resolvedCandidateCount <= candidateCount)
+        precondition(acceptedProcessedCandidateBaseline <= UInt64.max - resolvedCandidateCount)
+        self.batchID = batchID
+        self.acceptedProcessedCandidateBaseline = acceptedProcessedCandidateBaseline
+        self.resolvedCandidateCount = resolvedCandidateCount
+        self.candidateCount = candidateCount
+    }
+
+    var locallyResolvedCandidateCountThroughRoot: UInt64 {
+        acceptedProcessedCandidateBaseline + resolvedCandidateCount
+    }
+
+    func recordingResolvedCandidate() -> Self? {
+        guard resolvedCandidateCount < candidateCount else { return nil }
+        let (nextResolvedCandidateCount, overflow) = resolvedCandidateCount.addingReportingOverflow(1)
+        guard !overflow,
+              acceptedProcessedCandidateBaseline <= UInt64.max - nextResolvedCandidateCount
+        else { return nil }
+        return Self(
+            batchID: batchID,
+            acceptedProcessedCandidateBaseline: acceptedProcessedCandidateBaseline,
+            resolvedCandidateCount: nextResolvedCandidateCount,
+            candidateCount: candidateCount
+        )
+    }
+}
+
 struct WorkspaceCodemapProjectionProgress: Hashable {
     static let notStarted = Self(
         phase: .scheduled,

@@ -12,7 +12,6 @@ struct AgentExploreMCPToolService {
     let requireTargetWindow: () throws -> WindowState
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
-    let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
     var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> UUID? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
@@ -122,7 +121,6 @@ struct AgentExploreMCPToolService {
             resolveRequestedTabID: { _ in nil },
             resolveSpawnParentSourceTabID: resolveSpawnSourceTabID,
             resolveSpawnParentSessionID: resolveSpawnParentSessionID,
-            bindCurrentRequestToTab: bindCurrentRequestToTab,
             withHeartbeat: withHeartbeat,
             beginAgentRunWait: beginAgentRunWait,
             endAgentRunWait: endAgentRunWait,
@@ -303,7 +301,6 @@ struct AgentExploreMCPToolService {
             target,
             message,
             context.metadata,
-            bindCurrentRequestToTab,
             context.agentModeVM,
             context.selection.agentRaw,
             context.selection.modelRaw,

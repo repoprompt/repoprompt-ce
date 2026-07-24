@@ -2147,6 +2147,7 @@ import XCTest
                             )
                         }
                         if bindings.isEmpty {
+                            window.mcpServer.setRequestMetadataOverrideForTesting(nil)
                             try await configureAgentModeEndpoint(
                                 endpoint,
                                 context: childContext,

@@ -894,7 +894,7 @@ private struct MCPSetupStepView: View {
                         }
 
                         Section {
-                            Text("Codex CLI (~/.codex/prompts)")
+                            Text("RepoPrompt Codex (isolated prompts)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
 
