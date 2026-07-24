@@ -1256,7 +1256,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         }
     }
 
-    func testActiveCodexNativeSendFailsWithoutSendingWhenAgentRunDrainFails() async {
+    func testActiveCodexNativeSendRejectsBeforeDispatchWhenAgentRunDrainFails() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller) { _, _ in false }
         let session = preparedCodexSession(in: viewModel, controller: controller)
@@ -1267,13 +1267,83 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             attachments: []
         )
 
-        guard case let .failed(message) = outcome else {
-            return XCTFail("Expected failed outcome, got \(outcome)")
+        guard case let .preDispatchRejected(message) = outcome else {
+            return XCTFail("Expected pre-dispatch rejection, got \(outcome)")
         }
         XCTAssertTrue(message.contains("agent_run.wait"))
         XCTAssertEqual(controller.startUserTurnCountSync(), 0)
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text == message })
         XCTAssertEqual(session.runState, .running)
+    }
+
+    func testComposerActiveSendDrainRejectionRemovesOnlyOptimisticBubbleAndRestoresRawDraft() async throws {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _ in
+            await drainGate.wait()
+            return false
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        defer {
+            drainGate.release()
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let existingUserItem = AgentChatItem.user(
+            "existing confirmed user item",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(existingUserItem)
+        let rawDraft = "\n  restore this draft  \n"
+        let providerText = rawDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        viewModel.storeDraftText(for: session.tabID, rawDraft)
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: rawDraft
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch viewModel.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected composer submit claim, got \(rejection)")
+        }
+
+        let result = await viewModel.executeComposerSubmitAttempt(text: providerText, claim: claim)
+
+        XCTAssertEqual(result, .submitted)
+        try await waitUntil {
+            drainGate.isWaitingSync()
+        }
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "")
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.text),
+            [existingUserItem.text, providerText]
+        )
+
+        drainGate.release()
+        try await waitUntil {
+            viewModel.draftRestorationEvent?.text == rawDraft
+                && session.items.contains { $0.kind == .error && $0.text.contains("agent_run.wait") }
+        }
+
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.id),
+            [existingUserItem.id]
+        )
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), rawDraft)
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .prependAlways)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
     }
 
     func testInactiveCodexNativeSendStartsTurnWithoutInstallingLifecycleIdentity() async {

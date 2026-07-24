@@ -11231,7 +11231,11 @@ final class AgentModeViewModel: ObservableObject {
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                let result = submitUserTurn(text: text, tabID: target.tabID)
+                let result = submitUserTurn(
+                    text: text,
+                    tabID: target.tabID,
+                    rawDraftText: claim.attempt.rawDraftSnapshot
+                )
                 if result == .submitted {
                     clearComposerDraftIfUnchanged(for: claim)
                 }
@@ -11294,7 +11298,11 @@ final class AgentModeViewModel: ObservableObject {
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            let result = submitUserTurn(text: text, tabID: target.tabID)
+            let result = submitUserTurn(
+                text: text,
+                tabID: target.tabID,
+                rawDraftText: claim.attempt.rawDraftSnapshot
+            )
             if result == .submitted {
                 clearComposerDraftIfUnchanged(for: claim)
             }
@@ -11423,7 +11431,11 @@ final class AgentModeViewModel: ObservableObject {
             if destinationTabID == currentTabID {
                 applySessionToBindings(destinationSession)
             }
-            let result = submitUserTurn(text: text, tabID: destinationTabID)
+            let result = submitUserTurn(
+                text: text,
+                tabID: destinationTabID,
+                rawDraftText: claim.attempt.rawDraftSnapshot
+            )
             guard result == .submitted else {
                 clearPendingUserTurnState(on: destinationSession)
                 return result
@@ -11735,7 +11747,8 @@ final class AgentModeViewModel: ObservableObject {
     func submitUserTurn(
         text: String,
         tabID: UUID,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID? = nil,
+        rawDraftText: String? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -11842,7 +11855,8 @@ final class AgentModeViewModel: ObservableObject {
                     taggedFilesToSend: taggedFilesToSend,
                     activeWorkflow: bubbleWorkflow,
                     nativePreparedTurn: nativePreparedTurn,
-                    codexAttemptID: codexAttemptID
+                    codexAttemptID: codexAttemptID,
+                    rawDraftText: rawDraftText
                 )
             }
             return .submitted
@@ -11856,7 +11870,8 @@ final class AgentModeViewModel: ObservableObject {
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: bubbleWorkflow,
             nativePreparedTurn: nativePreparedTurn,
-            codexAttemptID: codexAttemptID
+            codexAttemptID: codexAttemptID,
+            rawDraftText: rawDraftText
         )
     }
 
@@ -11867,7 +11882,8 @@ final class AgentModeViewModel: ObservableObject {
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID? = nil,
+        rawDraftText: String? = nil
     ) async {
         guard let session = sessions[tabID] else { return }
         await prepareSessionForRunStart(tabID: tabID, session: session)
@@ -11880,7 +11896,8 @@ final class AgentModeViewModel: ObservableObject {
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: activeWorkflow,
             nativePreparedTurn: nativePreparedTurn,
-            codexAttemptID: codexAttemptID
+            codexAttemptID: codexAttemptID,
+            rawDraftText: rawDraftText
         )
     }
 
@@ -11903,7 +11920,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     #endif
 
-    private func removeUnconfirmedMCPOptimisticCodexUserItem(
+    private func removeUnconfirmedOptimisticCodexUserItem(
         session: TabSession,
         tabID: UUID,
         itemID: UUID?,
@@ -11914,7 +11931,7 @@ final class AgentModeViewModel: ObservableObject {
         else { return }
         guard session.removeItem(at: index) != nil else { return }
         Self.steeringDebugLog(
-            "[AgentRunSteeringWake] removed unconfirmed MCP Codex optimistic item tab=\(tabID) itemID=\(itemID) reason=\(reason)"
+            "[AgentRunSteeringWake] removed unconfirmed Codex optimistic item tab=\(tabID) itemID=\(itemID) reason=\(reason)"
         )
         requestUIRefresh(tabID: tabID, urgent: true)
         scheduleSave(for: tabID)
@@ -11929,9 +11946,12 @@ final class AgentModeViewModel: ObservableObject {
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID? = nil,
+        rawDraftText: String? = nil
     ) -> UserTurnSubmissionResult {
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
+        // Composer claims preserve the exact raw snapshot separately from provider-normalized text.
+        let restorationDraftText = rawDraftText ?? trimmedText
 
         let bubbleText: String
         if !trimmedText.isEmpty {
@@ -12057,7 +12077,7 @@ final class AgentModeViewModel: ObservableObject {
                 providerText: wrappedText,
                 images: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
-                draftText: trimmedText,
+                draftText: restorationDraftText,
                 optimisticUserItemID: userItem.id,
                 origin: codexAttemptID.map(TabSession.CodexFallbackOrigin.mcp) ?? .manual,
                 dispatchTicket: dispatchTicket
@@ -12073,7 +12093,7 @@ final class AgentModeViewModel: ObservableObject {
                     guard await session.codexSteerAckTracker.awaitDispatchAuthorization(
                         attemptID: codexAttemptID
                     ) else {
-                        self.removeUnconfirmedMCPOptimisticCodexUserItem(
+                        self.removeUnconfirmedOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
                             itemID: userItem.id,
@@ -12096,7 +12116,7 @@ final class AgentModeViewModel: ObservableObject {
                         activationID: stagedCodexComputerUseActivationID
                     )
                     if codexAttemptID != nil {
-                        self.removeUnconfirmedMCPOptimisticCodexUserItem(
+                        self.removeUnconfirmedOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
                             itemID: userItem.id,
@@ -12104,12 +12124,30 @@ final class AgentModeViewModel: ObservableObject {
                         )
                     }
                 }
+                if case let .preDispatchRejected(message)? = sendOutcome,
+                   codexAttemptID == nil
+                {
+                    self.removeUnconfirmedOptimisticCodexUserItem(
+                        session: session,
+                        tabID: tabID,
+                        itemID: userItem.id,
+                        reason: "manual send was rejected before provider dispatch"
+                    )
+                    self.restoreComposerDraft(
+                        tabID: tabID,
+                        text: fallbackContext.draftText,
+                        message: message,
+                        strategy: .prependAlways
+                    )
+                }
                 guard let codexAttemptID else { return }
                 let terminalState: CodexSteerAckTracker.TerminalState = switch sendOutcome {
                 case .sent:
                     .steerAccepted
                 case let .queuedFallback(queueID, _):
                     .durablyQueued(queueID: queueID)
+                case let .preDispatchRejected(message):
+                    .failed(message: message)
                 case let .stale(reason):
                     .stale(reason: reason)
                 case .cancelled:

@@ -190,6 +190,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     enum NativeSendOutcome: Equatable {
         case sent
         case queuedFallback(queueID: UUID, reason: CodexTurnFallbackDecision)
+        case preDispatchRejected(message: String)
         case stale(reason: String)
         case cancelled
         case failed(message: String)
@@ -198,7 +199,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             switch self {
             case .sent, .queuedFallback:
                 true
-            case .stale, .cancelled, .failed:
+            case .preDispatchRejected, .stale, .cancelled, .failed:
                 false
             }
         }
@@ -4957,7 +4958,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 viewModel?.scheduleSave(for: session.tabID)
-                return .failed(message: message)
+                return .preDispatchRejected(message: message)
             }
             guard session.runID == activeSendRunID,
                   session.runState.isActive,
