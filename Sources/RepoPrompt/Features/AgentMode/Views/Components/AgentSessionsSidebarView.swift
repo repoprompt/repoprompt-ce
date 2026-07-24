@@ -317,7 +317,7 @@ struct AgentModeSessionsListView: View {
             let snapshotStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let sidebarSnapshot = sidebarUI.snapshot
-        let filteredSessions = agentModeVM.filteredSidebarSessions(
+        let filteredSessions = agentModeVM.displaySidebarSessions(
             for: promptManager.currentComposeTabs,
             currentTabID: currentTabID,
             searchText: sidebarSnapshot.searchText,
