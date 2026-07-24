@@ -363,11 +363,210 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         )
     }
 
+    func testCodexDynamicMapperPreservesKnownAndFutureReasoningEfforts() {
+        let record = CodexDynamicModelRecord(
+            id: "gpt-5.6-sol",
+            model: "gpt-5.6-sol",
+            displayName: "GPT-5.6 Sol",
+            description: "Frontier model",
+            isDefault: true,
+            supportedReasoningEfforts: [
+                .init(reasoningEffort: "low", description: "Low effort"),
+                .init(reasoningEffort: "medium", description: "Medium effort"),
+                .init(reasoningEffort: "high", description: "High effort"),
+                .init(reasoningEffort: "xhigh", description: "Extra high effort"),
+                .init(reasoningEffort: "max", description: "Maximum effort"),
+                .init(reasoningEffort: "ultra", description: "Ultra effort"),
+                .init(reasoningEffort: "quantum", description: "Future effort")
+            ],
+            defaultReasoningEffort: "low"
+        )
+
+        let options = CodexDynamicModelMapper.options(from: [record])
+
+        XCTAssertEqual(
+            options.map(\.id),
+            [
+                "gpt-5.6-sol-low",
+                "gpt-5.6-sol-medium",
+                "gpt-5.6-sol-high",
+                "gpt-5.6-sol-xhigh",
+                "gpt-5.6-sol-max",
+                "gpt-5.6-sol-ultra",
+                "gpt-5.6-sol-quantum"
+            ]
+        )
+        XCTAssertEqual(options.last?.displayName, "GPT-5.6 Sol Quantum")
+    }
+
+    func testCodexDynamicStoreCanonicalizationRetainsUnknownEfforts() {
+        let model = CodexAppServerClient.RemoteModel(
+            id: "gpt-5.6-luna",
+            model: "gpt-5.6-luna",
+            displayName: "GPT-5.6 Luna",
+            description: "Fast model",
+            isDefault: false,
+            supportedReasoningEfforts: [
+                .init(reasoningEffort: "low", description: "Low"),
+                .init(reasoningEffort: "max", description: "Max"),
+                .init(reasoningEffort: "quantum", description: "Future")
+            ],
+            defaultReasoningEffort: "max"
+        )
+
+        let records = CodexDynamicModelStore.canonicalRecords(from: [model])
+
+        XCTAssertEqual(records.first?.supportedReasoningEfforts.map(\.reasoningEffort), ["low", "max", "quantum"])
+        XCTAssertEqual(records.first?.defaultReasoningEffort, "max")
+    }
+
+    func testCodexModelSpecifierRecognizesNewEffortsWithoutBreakingCodexMaxBaseModel() {
+        let lunaMax = CodexModelSpecifier(raw: "gpt-5.6-luna-max")
+        XCTAssertEqual(lunaMax.baseModel, "gpt-5.6-luna")
+        XCTAssertEqual(lunaMax.reasoningEffort, .max)
+        XCTAssertEqual(lunaMax.appServerEffortParam, "max")
+
+        let solUltra = CodexModelSpecifier(raw: "gpt-5.6-sol-ultra")
+        XCTAssertEqual(solUltra.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(solUltra.reasoningEffort, .ultra)
+
+        let existingCodexMax = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
+        XCTAssertEqual(existingCodexMax.baseModel, "gpt-5.1-codex-max")
+        XCTAssertNil(existingCodexMax.reasoningEffort)
+    }
+
+    @MainActor
+    func testCollapsedDynamicOptionUsesMetadataForUnknownEffortSuffix() throws {
+        let collapsed = CodexAgentModeCoordinator.test_collapseCodexModelOptions([
+            option(
+                raw: "gpt-5.6-luna-quantum",
+                displayName: "GPT-5.6 Luna Quantum",
+                codexBaseModelID: "gpt-5.6-luna",
+                supportedReasoningEfforts: [.custom("quantum")]
+            )
+        ])
+
+        let luna = try XCTUnwrap(collapsed.first)
+        XCTAssertEqual(luna.rawValue, "gpt-5.6-luna")
+        XCTAssertEqual(luna.supportedReasoningEfforts, [.custom("quantum")])
+    }
+
+    func testCodexCLIAndAppServerSerializeMaxUltraAndCustomEfforts() {
+        let maxSpec = CodexModelSpecifier(baseModel: "gpt-5.6-sol", reasoningEffort: .max)
+        XCTAssertEqual(maxSpec.cliModelArgs, ["--model", "gpt-5.6-sol"])
+        XCTAssertEqual(maxSpec.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=max"])
+        XCTAssertEqual(maxSpec.appServerModelParam, "gpt-5.6-sol")
+        XCTAssertEqual(maxSpec.appServerEffortParam, "max")
+
+        let ultraSpec = CodexModelSpecifier(baseModel: "gpt-5.6-sol", reasoningEffort: .ultra)
+        XCTAssertEqual(ultraSpec.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=ultra"])
+        XCTAssertEqual(ultraSpec.appServerEffortParam, "ultra")
+
+        let customSpec = CodexModelSpecifier(baseModel: "gpt-5.6-sol", reasoningEffort: .custom("quantum"))
+        XCTAssertEqual(customSpec.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=quantum"])
+        XCTAssertEqual(customSpec.appServerEffortParam, "quantum")
+        XCTAssertEqual(customSpec.appServerServiceTierParam, nil)
+    }
+
+    func testSynthesizedFastVariantIDsPreserveEffortAndServiceTier() throws {
+        let fastUltra = try XCTUnwrap(
+            CodexServiceTierVariantCatalog.fastVariantID(
+                baseModelID: "gpt-5.6-sol",
+                reasoningEffort: .ultra
+            )
+        )
+        XCTAssertEqual(fastUltra, "gpt-5.6-sol-fast-ultra")
+
+        let specifier = CodexModelSpecifier(raw: fastUltra)
+        XCTAssertEqual(specifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(specifier.reasoningEffort, .ultra)
+        XCTAssertEqual(specifier.serviceTier, "fast")
+        XCTAssertEqual(specifier.appServerServiceTierParam, "fast")
+        XCTAssertEqual(specifier.appServerEffortParam, "ultra")
+        XCTAssertEqual(specifier.cliServiceTierConfigArgs, ["-c", "service_tier=fast"])
+        XCTAssertEqual(specifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=ultra"])
+    }
+
+    @MainActor
+    func testEffectiveCodexSelectionUsesExplicitEffortAndFastServiceTier() {
+        let coordinator = makeSelectionCoordinator(
+            initialLastUsed: nil,
+            byModelSlug: [:]
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        // Compound Fast + effort selection used at launch time.
+        session.selectedModelRaw = "gpt-5.6-sol-fast-high"
+        session.selectedReasoningEffortRaw = "high"
+
+        let selection = coordinator.test_effectiveCodexSelection(for: session)
+        XCTAssertEqual(selection.model, "gpt-5.6-sol")
+        XCTAssertEqual(selection.reasoningEffort, "high")
+        XCTAssertEqual(selection.serviceTier, "fast")
+    }
+
+    @MainActor
+    func testEffectiveCodexSelectionRestoresPersistedLastUsedEffortWhenExplicitMissing() {
+        let coordinator = makeSelectionCoordinator(
+            initialLastUsed: .medium,
+            byModelSlug: ["gpt-5.6-sol": .ultra]
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-5.6-sol"
+        session.selectedReasoningEffortRaw = nil
+
+        let selection = coordinator.test_effectiveCodexSelection(for: session)
+        XCTAssertEqual(selection.model, "gpt-5.6-sol")
+        // Slug-scoped last-used ultra wins over global medium when still valid for the model.
+        XCTAssertEqual(selection.reasoningEffort, "ultra")
+        XCTAssertNil(selection.serviceTier)
+    }
+
+    @MainActor
+    func testEffectiveCodexSelectionPrefersExplicitEffortOverPersistedLastUsed() {
+        let coordinator = makeSelectionCoordinator(
+            initialLastUsed: .ultra,
+            byModelSlug: ["gpt-5.6-sol": .ultra]
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-5.6-sol"
+        session.selectedReasoningEffortRaw = "low"
+
+        let selection = coordinator.test_effectiveCodexSelection(for: session)
+        XCTAssertEqual(selection.model, "gpt-5.6-sol")
+        XCTAssertEqual(selection.reasoningEffort, "low")
+    }
+
+    @MainActor
+    private func makeSelectionCoordinator(
+        initialLastUsed: CodexReasoningEffort?,
+        byModelSlug: [String: CodexReasoningEffort]
+    ) -> CodexAgentModeCoordinator {
+        let suiteName = "codex.selection.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        return CodexAgentModeCoordinator(
+            windowID: 9451,
+            workspacePathProvider: { _ in nil },
+            codexControllerFactory: { _, _, _, _, _, _, _ in
+                fatalError("selection tests do not start Codex sessions")
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            shouldManageCodexTooling: false,
+            preferenceDefaults: defaults,
+            initialLastUsedReasoningEffort: initialLastUsed,
+            initialLastUsedReasoningEffortsByModelSlug: byModelSlug
+        )
+    }
+
     private func option(
         raw: String,
         displayName: String,
         placeholderDefault: Bool = false,
         providerDefault: Bool = false,
+        codexBaseModelID: String? = nil,
         supportedReasoningEfforts: [CodexReasoningEffort] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil
     ) -> AgentModelOption {
@@ -377,6 +576,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             description: nil,
             isPlaceholderDefault: placeholderDefault,
             isProviderDefault: providerDefault,
+            codexBaseModelID: codexBaseModelID,
             supportedReasoningEfforts: supportedReasoningEfforts,
             defaultReasoningEffort: defaultReasoningEffort
         )

@@ -599,15 +599,18 @@ enum AgentModelCatalog {
 
         func effortFromDisplayName(_ displayName: String) -> CodexReasoningEffort? {
             guard let suffix = displayName.split(separator: " ").last else { return nil }
-            return CodexReasoningEffort.parse(String(suffix))
+            return CodexReasoningEffort.parseKnown(String(suffix))
         }
 
         func stripEffortSuffix(_ label: String) -> String {
             let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return trimmed }
+            if trimmed.caseInsensitiveCompare("GPT-5.1 Codex Max") == .orderedSame {
+                return trimmed
+            }
             var tokens = trimmed.split(separator: " ").map(String.init)
             guard let last = tokens.last,
-                  CodexReasoningEffort.parse(last) != nil
+                  CodexReasoningEffort.parseKnown(last) != nil
             else {
                 return trimmed
             }
@@ -646,8 +649,7 @@ enum AgentModelCatalog {
         }
 
         func rank(for effort: CodexReasoningEffort?) -> Int {
-            guard let effort else { return -1 }
-            return CodexReasoningEffort.displayOrder.firstIndex(of: effort) ?? Int.max
+            CodexReasoningEffort.rank(effort)
         }
 
         func displayNameForBaseModel(
@@ -684,8 +686,11 @@ enum AgentModelCatalog {
         let entries = modelOptions.map { option -> Entry in
             let specifier = CodexModelSpecifier(raw: option.rawValue)
             let normalizedRaw = option.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            let baseModelID = CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: normalizedRaw)
-            let reasoningEffort = specifier.reasoningEffort ?? effortFromDisplayName(option.displayName)
+            let baseModelID = option.codexBaseModelID
+                ?? CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: normalizedRaw)
+            let reasoningEffort = option.supportedReasoningEfforts.count == 1
+                ? option.supportedReasoningEfforts.first
+                : specifier.reasoningEffort ?? effortFromDisplayName(option.displayName)
             let groupDisplayName = displayNameForBaseModel(
                 baseModelID: baseModelID,
                 fallbackDisplayName: option.displayName
@@ -2023,7 +2028,9 @@ enum AgentModelCatalog {
                     modelRaw: option.rawValue,
                     name: "\(agent.displayName) \(option.displayName)",
                     description: option.description,
-                    reasoningEffort: specifier.reasoningEffort,
+                    reasoningEffort: option.supportedReasoningEfforts.count == 1
+                        ? option.supportedReasoningEfforts.first
+                        : specifier.reasoningEffort,
                     available: true,
                     isDefault: option.isProviderDefault || option.rawValue.caseInsensitiveCompare(defaultModelRaw) == .orderedSame,
                     contextWindowTokens: contextWindow
@@ -2031,10 +2038,19 @@ enum AgentModelCatalog {
             }
             // Use the first option's metadata for family-level fields
             let representative = group.options.first
-            let allEfforts = group.options.compactMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
+            let allEfforts = group.options.flatMap { option -> [CodexReasoningEffort] in
+                if !option.supportedReasoningEfforts.isEmpty {
+                    return option.supportedReasoningEfforts
+                }
+                return CodexModelSpecifier(raw: option.rawValue).reasoningEffort.map { [$0] } ?? []
+            }
             let defaultEffort = representative?.defaultReasoningEffort
                 ?? group.options.first(where: \.isProviderDefault)
-                .flatMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
+                .flatMap {
+                    $0.supportedReasoningEfforts.count == 1
+                        ? $0.supportedReasoningEfforts.first
+                        : CodexModelSpecifier(raw: $0.rawValue).reasoningEffort
+                }
             let familyDescription = representative?.description
 
             // Union child tags, de-duplicated, in fixed display order
@@ -2053,7 +2069,7 @@ enum AgentModelCatalog {
                 available: true,
                 tags: allTags,
                 contextWindowTokens: nil,
-                supportedReasoningEfforts: allEfforts.isEmpty ? [] : CodexReasoningEffort.displayOrder.filter(allEfforts.contains),
+                supportedReasoningEfforts: CodexReasoningEffort.ordered(allEfforts),
                 defaultReasoningEffort: defaultEffort,
                 startTargets: targets
             ))

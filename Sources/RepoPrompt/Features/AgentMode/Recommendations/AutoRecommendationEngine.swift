@@ -867,7 +867,7 @@ final class AutoRecommendationEngine {
     }
 
     private func effortRank(_ effort: CodexReasoningEffort) -> Int {
-        CodexReasoningEffort.displayOrder.firstIndex(of: effort) ?? 0
+        CodexReasoningEffort.rank(effort)
     }
 
     private func chatModelSelection(_ currentRaw: String, satisfiesRecommended recommendedRaw: String) -> Bool {

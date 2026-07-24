@@ -31,6 +31,28 @@ final class ToolOutputFormatterAgentManageTests: XCTestCase {
         XCTAssertTrue(text.contains("`codex:gpt-5.1-codex-max` — GPT-5.1 Codex Max"), text)
     }
 
+    func testListAgentsCollapsesFutureCustomEffortsWithoutDuplicatedSuffixes() throws {
+        let value: Value = .object([
+            "agents": .array([
+                .object([
+                    "name": .string("Codex"),
+                    "available": .bool(true),
+                    "default_model_id": .string("codex:gpt-5.6-sol-low"),
+                    "models": .array([
+                        model(id: "codex:gpt-5.6-sol-low", name: "GPT-5.6 Sol Low", effort: "low"),
+                        model(id: "codex:gpt-5.6-sol-warp", name: "GPT-5.6 Sol Warp", effort: "warp")
+                    ])
+                ])
+            ])
+        ])
+
+        let text = try onlyText(ToolOutputFormatter.formatAgentManage(args: ["op": .string("list_agents")], value: value))
+
+        XCTAssertTrue(text.contains("`codex:gpt-5.6-sol-{low|warp}` — GPT-5.6 Sol"), text)
+        XCTAssertFalse(text.contains("gpt-5.6-sol-warp-{warp}"), text)
+        XCTAssertFalse(text.contains("gpt-5.6-sol-warp-warp"), text)
+    }
+
     private func model(id: String, name: String, effort: String?) -> Value {
         var object: [String: Value] = [
             "model_id": .string(id),

@@ -95,22 +95,30 @@ final class AgentCodexModelRegistry {
 
         for option in options where !option.isPlaceholderDefault {
             let specifier = CodexModelSpecifier(raw: option.rawValue)
+            let reasoningEffort = option.supportedReasoningEfforts.count == 1
+                ? option.supportedReasoningEfforts.first
+                : specifier.reasoningEffort
+            let baseModel = option.codexBaseModelID ?? specifier.baseModel
             guard specifier.serviceTier == nil,
-                  let baseModel = specifier.baseModel,
+                  let baseModel,
                   let fastID = CodexServiceTierVariantCatalog.fastVariantID(
                       baseModelID: baseModel,
-                      reasoningEffort: specifier.reasoningEffort
+                      reasoningEffort: reasoningEffort
                   ) else { continue }
             guard seen.insert(fastID.lowercased()).inserted else { continue }
 
             synthesized.append(AgentModelOption(
                 rawValue: fastID,
-                displayName: fastDisplayName(for: option, reasoningEffort: specifier.reasoningEffort),
+                displayName: fastDisplayName(for: option, reasoningEffort: reasoningEffort),
                 description: fastDescription(for: option.description),
                 isPlaceholderDefault: false,
                 isProviderDefault: false,
-                supportedReasoningEfforts: specifier.reasoningEffort == nil ? option.supportedReasoningEfforts : [],
-                defaultReasoningEffort: specifier.reasoningEffort == nil ? option.defaultReasoningEffort : nil
+                codexBaseModelID: CodexServiceTierVariantCatalog.fastVariantID(
+                    baseModelID: baseModel,
+                    reasoningEffort: nil
+                ) ?? fastID,
+                supportedReasoningEfforts: reasoningEffort.map { [$0] } ?? option.supportedReasoningEfforts,
+                defaultReasoningEffort: reasoningEffort == nil ? option.defaultReasoningEffort : nil
             ))
         }
 
@@ -118,7 +126,14 @@ final class AgentCodexModelRegistry {
     }
 
     private func fastDisplayName(for option: AgentModelOption, reasoningEffort: CodexReasoningEffort?) -> String {
-        let baseLabel = AIModel.stripCodexReasoningSuffix(from: option.displayName)
+        let baseLabel = if let codexBaseModelID = option.codexBaseModelID {
+            AIModel.codexBaseDisplayName(
+                for: codexBaseModelID,
+                fallbackDisplayName: AIModel.stripCodexReasoningSuffix(from: option.displayName)
+            )
+        } else {
+            AIModel.stripCodexReasoningSuffix(from: option.displayName)
+        }
         let fastLabel = baseLabel.range(of: " fast", options: [.caseInsensitive, .backwards]) == nil
             ? "\(baseLabel) Fast"
             : baseLabel
@@ -159,7 +174,10 @@ final class AgentCodexModelRegistry {
                 displayName: model.displayName,
                 description: model.description,
                 isPlaceholderDefault: false,
-                isProviderDefault: model.isDefault
+                isProviderDefault: model.isDefault,
+                codexBaseModelID: model.baseID,
+                supportedReasoningEfforts: model.reasoningEffort.map { [$0] } ?? [],
+                defaultReasoningEffort: model.isDefault ? model.reasoningEffort : nil
             )
         }
         options.append(contentsOf: mapped)
