@@ -1230,7 +1230,7 @@ public class APISettingsViewModel: ObservableObject {
 
     private func probeCachedCodexConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
-        switch await CodexManagedAuthRecoveryService.shared.refreshManagedAccount() {
+        switch await CodexManagedAuthRecoveryService.shared.checkManagedAccount() {
         case .recovered:
             return true
         case .requiresUserLogin, .executableUnavailable:
@@ -2993,7 +2993,7 @@ public class APISettingsViewModel: ObservableObject {
 
         applyCodexConnectionPhase(.refreshingAuth)
         collector.append("Checking Codex managed authentication state before health check")
-        switch await CodexManagedAuthRecoveryService.shared.refreshManagedAccount() {
+        switch await CodexManagedAuthRecoveryService.shared.checkManagedAccount() {
         case .recovered:
             collector.append("Codex managed authentication preflight succeeded")
         case let .requiresUserLogin(message):
