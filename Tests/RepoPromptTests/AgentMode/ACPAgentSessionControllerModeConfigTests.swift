@@ -710,8 +710,12 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
 
         let diagnostic = try XCTUnwrap(results.first { $0.type == "final_content" }?.text)
         XCTAssertTrue(diagnostic.contains("OpenCode ACP completed with stopReason=end_turn"))
-        XCTAssertTrue(diagnostic.contains("OpenCode stderr reported: Authentication Failed."))
         XCTAssertTrue(diagnostic.contains("RepoPrompt did not receive model text to render."))
+        // stderr and JSON-RPC stdout arrive on independent pipes, so process-side
+        // write order cannot guarantee that the terminal diagnostic sees this line.
+        // The controller must still surface the provider error as a system event.
+        let stderr = try XCTUnwrap(results.first { $0.type == "system" }?.text)
+        XCTAssertTrue(stderr.contains("Authentication Failed"))
     }
 
     func testTransportTerminationDrainsPromptSettlementWaiters() async throws {

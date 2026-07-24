@@ -82,6 +82,13 @@ SWIFT_BUILD_ARGS=(-c release)
 if sentry_linking_enabled; then
     SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)
 fi
+if [[ -n "${REPOPROMPT_SWIFT_JOBS:-}" ]]; then
+    if [[ "$REPOPROMPT_SWIFT_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+        SWIFT_BUILD_ARGS+=("--jobs" "$REPOPROMPT_SWIFT_JOBS")
+    else
+        fail "REPOPROMPT_SWIFT_JOBS must be a positive integer"
+    fi
+fi
 
 ARM64_BIN_DIR=""
 X86_64_BIN_DIR=""
