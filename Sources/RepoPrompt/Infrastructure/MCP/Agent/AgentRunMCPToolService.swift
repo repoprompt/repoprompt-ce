@@ -2292,6 +2292,14 @@ struct AgentRunMCPToolService {
             ParsedAnswers(flat: [:], structured: [:], hasStructuredObjects: false)
         }
 
+        let responseArgument: AgentModeViewModel.MCPInteractionResponsePayload.ResponseArgument = switch args["response"] {
+        case nil:
+            .missing
+        case let value? where value.stringValue != nil:
+            .scalar(value.stringValue ?? "")
+        case .some:
+            .nonScalar
+        }
         let responseRaw = normalizedString(args["response"])
         let explicitSkip: Bool
         if let skipValue = args["skip"] {
@@ -2310,7 +2318,7 @@ struct AgentRunMCPToolService {
         if explicitSkip, responseRaw != nil, !responseIsSkipSentinel {
             throw MCPError.invalidParams("skip cannot be combined with response.")
         }
-        let decisionRaw = responseRaw
+        let containsDecisionArgument = args.keys.contains("decision")
 
         let content = try parseAgentJSONObject(args["content"], name: "content")
         let meta = try parseAgentJSONObject(args["meta"] ?? args["_meta"], name: "meta")
@@ -2319,7 +2327,8 @@ struct AgentRunMCPToolService {
             text: responseRaw,
             skip: isSkip,
             explicitSkip: explicitSkip,
-            decisionRaw: isSkip ? nil : decisionRaw,
+            responseArgument: responseArgument,
+            containsDecisionArgument: containsDecisionArgument,
             amendment: normalizedString(args["amendment"]),
             answersByQuestionID: parsedAnswers.flat,
             askUserAnswersByQuestionID: parsedAnswers.structured,

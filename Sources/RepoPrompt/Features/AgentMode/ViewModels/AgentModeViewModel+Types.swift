@@ -318,10 +318,17 @@ extension AgentModeViewModel {
     }
 
     struct MCPInteractionResponsePayload: Equatable {
+        enum ResponseArgument: Equatable {
+            case missing
+            case scalar(String)
+            case nonScalar
+        }
+
         let text: String?
         let skip: Bool
         let explicitSkip: Bool
-        let decisionRaw: String?
+        let responseArgument: ResponseArgument
+        let containsDecisionArgument: Bool
         let amendment: String?
         let answersByQuestionID: [String: [String]]
         let askUserAnswersByQuestionID: [String: AgentAskUserAnswer]
@@ -334,7 +341,8 @@ extension AgentModeViewModel {
             text: String?,
             skip: Bool,
             explicitSkip: Bool = false,
-            decisionRaw: String?,
+            responseArgument: ResponseArgument,
+            containsDecisionArgument: Bool,
             amendment: String?,
             answersByQuestionID: [String: [String]],
             askUserAnswersByQuestionID: [String: AgentAskUserAnswer] = [:],
@@ -346,7 +354,8 @@ extension AgentModeViewModel {
             self.text = text
             self.skip = skip
             self.explicitSkip = explicitSkip
-            self.decisionRaw = decisionRaw
+            self.responseArgument = responseArgument
+            self.containsDecisionArgument = containsDecisionArgument
             self.amendment = amendment
             self.answersByQuestionID = answersByQuestionID
             self.askUserAnswersByQuestionID = askUserAnswersByQuestionID

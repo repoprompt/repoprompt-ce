@@ -42,6 +42,25 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testAgentRunRespondSchemaAdvertisesCanonicalScalarResponseOnly() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let agentRun = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
+        let schema = try XCTUnwrap(Value(agentRun.inputSchema).objectValue)
+        let properties = try Self.schemaProperties(for: agentRun)
+        let response = try XCTUnwrap(properties["response"]?.objectValue)
+        let responseDescription = try XCTUnwrap(response["description"]?.stringValue)
+        let required = try XCTUnwrap(schema["required"]?.arrayValue?.compactMap(\.stringValue))
+
+        XCTAssertEqual(response["type"]?.stringValue, "string")
+        XCTAssertTrue(responseDescription.contains("top-level scalar string"), responseDescription)
+        XCTAssertTrue(responseDescription.contains("response=\"accept\""), responseDescription)
+        XCTAssertTrue(responseDescription.contains("decision and nested response objects are unsupported"), responseDescription)
+        XCTAssertNil(properties["decision"])
+        XCTAssertEqual(required, ["op"])
+        XCTAssertTrue(agentRun.description.contains("response=\"accept\""), agentRun.description)
+    }
+
     func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {
         do {
             let caseLabel = "testAgentLifecycleSchemasAdvertiseTwoMinuteDefaultsWithoutMaximumClamp"
@@ -488,7 +507,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
-        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=9ce2d8314f17c1b37ce3bc41b699cb9b6e0d3190ae7a66da6a5f8152109214df|schema=e3bd3dd90b43617a964b62b0f6b130f4199466d52b50508204428333211f2603",
+        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=1c320626fae4f63a4fe884d3f03b0b1b6fd1b4bccd9f131c72bcd8624eb36a4c|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=09d41fa6b1f6356ac8b7acee84d187ff47ad5bdf772c86a15aed81b3f0d70f02|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
         "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",

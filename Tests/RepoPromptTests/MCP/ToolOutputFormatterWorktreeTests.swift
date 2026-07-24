@@ -489,6 +489,56 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
     }
 
+    func testAgentRunApprovalGuidanceUsesCopyableCanonicalResponseCommand() throws {
+        let sessionID = "11111111-1111-1111-1111-111111111111"
+        let interactionID = "22222222-2222-2222-2222-222222222222"
+        let cases: [([Value], Bool)] = [
+            (
+                [
+                    .object(["label": .string("accept")]),
+                    .object(["label": .string("accept_with_amendment")]),
+                    .object(["label": .string("decline")])
+                ],
+                true
+            ),
+            (
+                [
+                    .object(["label": .string("accept")]),
+                    .object(["label": .string("decline")])
+                ],
+                false
+            )
+        ]
+
+        for (options, expectsAmendment) in cases {
+            let value = Value.object([
+                "op": .string("wait"),
+                "status": .string("waiting_for_input"),
+                "session_id": .string(sessionID),
+                "interaction_id": .string(interactionID),
+                "interaction": .object([
+                    "id": .string(interactionID),
+                    "kind": .string("approval"),
+                    "options": .array(options)
+                ])
+            ])
+            let text = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: value))
+
+            XCTAssertTrue(text.contains("### How to respond"), text)
+            XCTAssertTrue(
+                text.contains(
+                    "- Copyable response: `agent_run op=respond session_id=\"\(sessionID)\" interaction_id=\"\(interactionID)\" response=\"accept\"`"
+                ),
+                text
+            )
+            XCTAssertFalse(text.contains("Use `agent_run` with"), text)
+            XCTAssertTrue(text.contains("- Allowed response values:"), text)
+            XCTAssertFalse(text.contains("Allowed decisions"), text)
+            XCTAssertFalse(text.contains("decision="), text)
+            XCTAssertEqual(text.contains("response=\"accept_with_amendment\""), expectsAmendment, text)
+        }
+    }
+
     func testAgentRunOutputShowsWorktreeSummaryAndUnavailableState() throws {
         let cases = [
             (

@@ -108,7 +108,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             "wait": .boolean(description: "[steer] Wait for an interesting/terminal state after steering. Implied when timeout_seconds is provided."),
             "timeout_seconds": .number(description: "[steer] Max wait seconds when wait=true. 0 = immediate post-steer snapshot. Default \(defaultWaitSeconds)."),
             "interaction_id": .string(description: "[respond] Pending interaction UUID from the snapshot. Returned as a top-level field in poll/wait responses when the run is waiting_for_input."),
-            "response": .string(description: "[respond] Text answer or decision token (accept, decline, cancel, skip, etc). For MCP elicitation use accept, decline, or cancel; a non-action string is sent as content.response."),
+            "response": .string(description: "[respond] Canonical top-level scalar string. For approvals, pass one advertised response option, for example response=\"accept\"; decision and nested response objects are unsupported. For instructions and questions, pass response text. For MCP elicitation, pass accept, decline, or cancel; a non-action string is sent as content.response."),
             "answers": .object(description: "[respond] Structured answers keyed by question ID."),
             "content": .object(description: "[respond] MCP elicitation content object to send with action=accept."),
             "meta": .object(description: "[respond] Optional MCP elicitation _meta object."),
@@ -138,7 +138,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             - `wait`: Block until the run finishes or needs input. Default \(defaultWaitSeconds)s. `timeout: 0` = poll. Accepts `session_id` (single) or `session_ids` (array — returns when first session reaches interesting state). Returns `interaction_id` when input is pending.
             - `cancel`: Stop an active agent run. Only valid when the run is `running` or `waiting_for_input`. Requires `session_id`.
             - `steer`: Continue an existing agent session by sending a follow-up instruction to the `session_id` returned by `start`. If the run is still active, the instruction is steered into that run; if the last run already finished or the MCP wait/control handle expired, RepoPrompt reactivates the existing Agent session and starts the next run in the same session when it still exists. Pass `wait: true` (or `timeout_seconds`) to block until the steered run finishes or needs input. Do NOT use `steer` when status is `waiting_for_input` — use `respond` instead.
-            - `respond`: Resolve a pending interaction (question, approval, MCP elicitation, etc). Requires `session_id` and `interaction_id` from the snapshot. The `interaction_id` is returned as a top-level field in poll/wait responses when input is pending. For MCP elicitation, use `response` (`accept`, `decline`, or `cancel`) plus optional object `content` and `meta`.
+            - `respond`: Resolve the current pending interaction. Requires `session_id` and the exact `interaction_id` from the latest snapshot. For approvals, send the advertised choice in the top-level scalar `response` field, for example `response="accept"`. For MCP elicitation, use `response` (`accept`, `decline`, or `cancel`) plus optional object `content` and `meta`.
 
             **session_id lifecycle**: `start` creates a new session and returns `session_id` in the response. All subsequent operations on that run require passing the same `session_id` back. Do NOT invent session IDs — always use the value returned by `start`.
 
@@ -157,7 +157,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only)
                 **cancel**: session_id (required)
                 **steer**: session_id (required, from a prior `start`/`steer` response), message (required), wait?, timeout_seconds?, workflow_id|workflow_name?
-                **respond**: session_id (required), interaction_id (required), response?, answers?, amendment?, content?, meta?
+                **respond**: session_id (required), interaction_id (required), response? (top-level scalar string; approval example: response="accept"), answers?, amendment?, content?, meta?
                 """,
                 properties: properties,
                 required: ["op"]

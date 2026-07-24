@@ -5026,6 +5026,33 @@ final class AgentModeViewModel: ObservableObject {
         return labels
     }
 
+    private func mcpCanonicalApprovalResponse(from payload: MCPInteractionResponsePayload) throws -> String {
+        if payload.containsDecisionArgument {
+            throw MCPError.invalidParams(
+                "decision is not a supported field for agent_run op=respond. For approval interactions, use the top-level scalar response field, for example response=\"accept\". No response was applied."
+            )
+        }
+
+        switch payload.responseArgument {
+        case .missing:
+            throw MCPError.invalidParams(
+                "response is required for approval interactions. Provide a top-level scalar string, for example response=\"accept\". No response was applied."
+            )
+        case .nonScalar:
+            throw MCPError.invalidParams(
+                "response must be a non-empty top-level scalar string for approval interactions, for example response=\"accept\"; nested response objects are not supported. No response was applied."
+            )
+        case let .scalar(response):
+            let canonicalResponse = response.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !canonicalResponse.isEmpty else {
+                throw MCPError.invalidParams(
+                    "response must be a non-empty top-level scalar string for approval interactions, for example response=\"accept\"; nested response objects are not supported. No response was applied."
+                )
+            }
+            return canonicalResponse
+        }
+    }
+
     private func mcpPendingInteraction(for session: TabSession) -> AgentRunMCPSnapshot.Interaction? {
         if let review = session.pendingWorktreeMergeReview {
             var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
@@ -6978,7 +7005,9 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("No pending interaction found for the active run.")
         }
         guard currentInteraction.id == interactionID else {
-            throw MCPError.invalidParams("The pending interaction no longer matches interaction_id.")
+            throw MCPError.invalidParams(
+                "interaction_id \"\(interactionID.uuidString)\" does not match the current pending \(currentInteraction.kind.rawValue) interaction_id \"\(currentInteraction.id.uuidString)\". No response was applied. Call agent_run with op=\"poll\" or op=\"wait\" and session_id=\"\(sessionID.uuidString)\" to fetch the latest snapshot before responding."
+            )
         }
         let kind = currentInteraction.kind
         switch kind {
@@ -7110,7 +7139,7 @@ final class AgentModeViewModel: ObservableObject {
             handleObservedMCPStateChange(for: session)
             return nil
         case .approval:
-            let rawDecision = payload.decisionRaw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            let rawDecision = try mcpCanonicalApprovalResponse(from: payload)
             if let review = session.pendingWorktreeMergeReview,
                review.id == interactionID
             {
@@ -7125,7 +7154,7 @@ final class AgentModeViewModel: ObservableObject {
                 case "cancel":
                     decision = .cancelled(reason: reason?.isEmpty == false ? reason! : "Worktree merge review cancelled.")
                 default:
-                    throw MCPError.invalidParams("decision must be one of: accept, decline, cancel.")
+                    throw MCPError.invalidParams("response must be one of: accept, decline, cancel.")
                 }
                 submitWorktreeMergeReviewDecision(tabID: session.tabID, reviewID: interactionID, decision: decision)
                 handleObservedMCPStateChange(for: session)
@@ -7148,7 +7177,7 @@ final class AgentModeViewModel: ObservableObject {
                     throw MCPError.invalidParams("accept_with_amendment is not supported for permission approvals.")
                 default:
                     throw MCPError.invalidParams(
-                        "decision must be one of: accept, accept_for_session, decline, cancel."
+                        "response must be one of: accept, accept_for_session, decline, cancel."
                     )
                 }
                 codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
@@ -7181,7 +7210,7 @@ final class AgentModeViewModel: ObservableObject {
                 decision = .cancel
             default:
                 throw MCPError.invalidParams(
-                    "decision must be one of: \(mcpApprovalDecisionLabels(for: approval).joined(separator: ", "))."
+                    "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", "))."
                 )
             }
             submitApprovalDecision(tabID: session.tabID, decision: decision)
