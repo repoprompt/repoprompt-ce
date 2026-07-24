@@ -832,7 +832,10 @@ class LifecycleQueueTests(LifecycleTestCase):
         while time.monotonic() < deadline:
             with state.condition:
                 job = state.jobs[ticket]
-                if job.state in conductor.TERMINAL_STATES:
+                # A job becomes terminal before the runner's final persistence
+                # and lane-release work is complete. Wait for that finalizer so
+                # TemporaryDirectory cleanup cannot race its record write.
+                if job.state in conductor.TERMINAL_STATES and ticket not in state.active_lanes.values():
                     return job
             time.sleep(0.01)
         with state.condition:
