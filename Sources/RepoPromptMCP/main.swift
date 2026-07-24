@@ -128,11 +128,21 @@ struct CLIHostDisconnectProvenance: Equatable, CustomStringConvertible {
 
     var description: String {
         var fields = ["reason=\(reason.rawValue)"]
-        if let errno { fields.append("errno=\(errno)") }
-        if let bytesWritten { fields.append("bytes_written=\(bytesWritten)") }
-        if let totalBytes { fields.append("total_bytes=\(totalBytes)") }
-        if let initialParentPID { fields.append("initial_parent_pid=\(initialParentPID)") }
-        if let currentParentPID { fields.append("current_parent_pid=\(currentParentPID)") }
+        if let errno {
+            fields.append("errno=\(errno)")
+        }
+        if let bytesWritten {
+            fields.append("bytes_written=\(bytesWritten)")
+        }
+        if let totalBytes {
+            fields.append("total_bytes=\(totalBytes)")
+        }
+        if let initialParentPID {
+            fields.append("initial_parent_pid=\(initialParentPID)")
+        }
+        if let currentParentPID {
+            fields.append("current_parent_pid=\(currentParentPID)")
+        }
         return fields.joined(separator: " ")
     }
 }
@@ -413,6 +423,7 @@ enum SocketProxyError: Swift.Error, LocalizedError {
     case cancelled
     case serverClosed
     case approvalDenied
+    case frameTooLarge(MCPNewlineFrameTooLargeError)
     case terminatedByServer(reason: TerminationReason?, message: String?)
     case handshakeFailed(reason: String)
     case handshakeRejected(errorCode: String?, reason: String?)
@@ -470,6 +481,8 @@ enum SocketProxyError: Swift.Error, LocalizedError {
             return "Server closed connection"
         case .approvalDenied:
             return "Connection approval denied by user"
+        case let .frameTooLarge(error):
+            return error.description
         case let .terminatedByServer(reason, message):
             return "Terminated by server: \(message ?? reason?.rawValue ?? "unknown reason")"
         case let .handshakeFailed(reason):
@@ -522,6 +535,7 @@ enum CLIProxyRuntimePolicy {
             switch socketError {
             case .approvalDenied,
                  .handshakeFailed,
+                 .frameTooLarge,
                  .protocolVersionMismatch,
                  .socketCreationFailed,
                  .descriptorConfigurationFailed,
@@ -600,6 +614,7 @@ enum CLIProxyRuntimePolicy {
                 case .cancelled: return "transport_cancelled"
                 case .serverClosed: return "app_socket_closed"
                 case .approvalDenied: return "approval_denied"
+                case .frameTooLarge: return "mcp_frame_too_large"
                 case let .terminatedByServer(reason, _): return reason?.rawValue ?? "terminated_by_server"
                 case .handshakeFailed: return "handshake_failed"
                 case .handshakeRejected: return "handshake_rejected"
@@ -719,6 +734,8 @@ enum CLIProxyRuntimePolicy {
             return .host
         case .approvalDenied, .terminatedByServer:
             return .app
+        case .frameTooLarge:
+            return .peer
         case .serverClosed, .connectionReset:
             return .peer
         case let .readFailed(errno):
@@ -837,6 +854,7 @@ actor BootstrapSocketProxy {
     private let replayInitializationOnStart: Bool
     private let bridgeLedger: JSONRPCBridgeLedger
     private let faultRule: JSONRPCBridgeFaultRule?
+    private let maximumFrameByteCount: Int
     private var socketFD: Int32 = -1
 
     init(
@@ -847,7 +865,8 @@ actor BootstrapSocketProxy {
         outstandingRequestReplayState: MCPOutstandingRequestReplayState,
         replayInitializationOnStart: Bool,
         bridgeLedger: JSONRPCBridgeLedger,
-        faultRule: JSONRPCBridgeFaultRule?
+        faultRule: JSONRPCBridgeFaultRule?,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount
     ) {
         socketURL = MCPFilesystemConstants.bootstrapSocketURL()
         self.sessionToken = sessionToken
@@ -858,6 +877,7 @@ actor BootstrapSocketProxy {
         self.replayInitializationOnStart = replayInitializationOnStart
         self.bridgeLedger = bridgeLedger
         self.faultRule = faultRule
+        self.maximumFrameByteCount = max(1, maximumFrameByteCount)
     }
 
     func start() async throws {
@@ -885,7 +905,11 @@ actor BootstrapSocketProxy {
             debugLog("Handshake accepted, starting stdin/stdout bridge")
             if replayInitializationOnStart {
                 let plan = try await Self.requireReplayPlan(from: initializeReplayState)
-                initialSocketBytes = try await Self.replayInitializedSession(plan, socketFD: socketFD)
+                initialSocketBytes = try await Self.replayInitializedSession(
+                    plan,
+                    socketFD: socketFD,
+                    maximumFrameByteCount: maximumFrameByteCount
+                )
                 try await Self.replayOutstandingClientRequests(
                     outstandingRequestReplayState.replayFrames(),
                     socketFD: socketFD
@@ -923,6 +947,7 @@ actor BootstrapSocketProxy {
             outstandingRequestReplayState: outstandingReplayState,
             bridgeLedger: ledger,
             faultRule: faultRule,
+            maximumFrameByteCount: maximumFrameByteCount,
             initialSocketBytes: initialSocketBytes
         )
     }
@@ -1042,7 +1067,10 @@ actor BootstrapSocketProxy {
     private func readHandshakeResponse(
         timeout: TimeInterval
     ) async throws -> MCPBootstrapResponse {
-        var buffer = Data()
+        var frameAccumulator = MCPNewlineFrameAccumulator(
+            maximumFrameByteCount: maximumFrameByteCount,
+            bufferReservation: 4096
+        )
         let readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
         defer { readBuffer.deallocate() }
 
@@ -1060,7 +1088,9 @@ actor BootstrapSocketProxy {
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.pollFailed(errno: errno)
             }
 
@@ -1080,15 +1110,16 @@ actor BootstrapSocketProxy {
                 throw SocketProxyError.serverClosed
             }
 
-            buffer.append(readBuffer, count: bytesRead)
+            frameAccumulator.append(UnsafeBufferPointer(start: readBuffer, count: bytesRead))
 
-            // Check for complete message
-            if let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let jsonData = buffer[..<newlineIndex]
-                guard let response = try? JSONDecoder().decode(MCPBootstrapResponse.self, from: Data(jsonData)) else {
+            do {
+                guard let jsonData = try frameAccumulator.nextFrame() else { continue }
+                guard let response = try? JSONDecoder().decode(MCPBootstrapResponse.self, from: jsonData) else {
                     throw SocketProxyError.handshakeFailed(reason: "Invalid response JSON")
                 }
                 return response
+            } catch let error as MCPNewlineFrameTooLargeError {
+                throw SocketProxyError.frameTooLarge(error)
             }
         }
 
@@ -1161,7 +1192,8 @@ extension BootstrapSocketProxy {
     static func replayInitializedSession(
         _ plan: MCPInitializeReplayPlan,
         socketFD: Int32,
-        timeout: TimeInterval = MCPBootstrapTiming.initialResponseTimeout
+        timeout: TimeInterval = MCPBootstrapTiming.initialResponseTimeout,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount
     ) async throws -> Data {
         debugLog("BootstrapSocketProxy: replaying MCP initialize after reconnect")
         try writeToSocket(plan.initializeFrame, socketFD: socketFD)
@@ -1173,7 +1205,8 @@ extension BootstrapSocketProxy {
             socketFD: socketFD,
             expectedID: plan.initializeRequestID,
             expectedResultFingerprint: expectedResultFingerprint,
-            timeout: timeout
+            timeout: timeout,
+            maximumFrameByteCount: maximumFrameByteCount
         )
         if let initializedFrame = plan.initializedFrame {
             try writeToSocket(initializedFrame, socketFD: socketFD)
@@ -1199,9 +1232,13 @@ extension BootstrapSocketProxy {
         socketFD: Int32,
         expectedID: JSONRPCBridgeID,
         expectedResultFingerprint: String,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        maximumFrameByteCount: Int
     ) async throws -> Data {
-        var buffer = Data()
+        var frameAccumulator = MCPNewlineFrameAccumulator(
+            maximumFrameByteCount: maximumFrameByteCount,
+            bufferReservation: 4096
+        )
         var bufferedServerFrames = Data()
         let deadline = Date().addingTimeInterval(timeout)
 
@@ -1215,10 +1252,14 @@ extension BootstrapSocketProxy {
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.pollFailed(errno: errno)
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
                 throw SocketProxyError.connectionReset
@@ -1229,17 +1270,19 @@ extension BootstrapSocketProxy {
                 Darwin.read(socketFD, ptr, 1)
             }
             if bytesRead < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
+                if errno == EAGAIN || errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.readFailed(errno: errno)
             }
             if bytesRead == 0 {
                 throw SocketProxyError.serverClosed
             }
 
-            buffer.append(byte)
-            if byte == UInt8(ascii: "\n") {
-                let frame = buffer
-                buffer.removeAll(keepingCapacity: true)
+            frameAccumulator.append(byte)
+            do {
+                guard var frame = try frameAccumulator.nextFrame() else { continue }
+                frame.append(UInt8(ascii: "\n"))
                 guard let response = MCPInitializeReplayState.jsonObject(from: frame) else {
                     throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_response_mismatch")
                 }
@@ -1262,6 +1305,10 @@ extension BootstrapSocketProxy {
                     throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_result_mismatch")
                 }
                 return bufferedServerFrames
+            } catch is MCPNewlineFrameTooLargeError {
+                throw JSONRPCBridgeLedgerError.terminal(
+                    "mcp_session_resume_initialize_replay_response_too_large"
+                )
             }
         }
 
@@ -1283,6 +1330,7 @@ extension BootstrapSocketProxy {
         drainVisibilityInterval: TimeInterval = 30,
         drainLogDescriptor: Int32 = STDERR_FILENO,
         onStdinClosed: @escaping @Sendable () async -> Void = {},
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount,
         initialSocketBytes: Data = Data()
     ) async throws {
         let drainState = BridgeDrainState(clock: drainClock)
@@ -1295,7 +1343,8 @@ extension BootstrapSocketProxy {
                     initializeReplayState: initializeReplayState,
                     outstandingRequestReplayState: outstandingRequestReplayState,
                     bridgeLedger: bridgeLedger,
-                    faultRule: faultRule
+                    faultRule: faultRule,
+                    maximumFrameByteCount: maximumFrameByteCount
                 )
                 await drainState.markStdinClosed()
                 await onStdinClosed()
@@ -1312,6 +1361,7 @@ extension BootstrapSocketProxy {
                     faultRule: faultRule,
                     socketPoller: socketPoller,
                     initialSocketBytes: initialSocketBytes,
+                    maximumFrameByteCount: maximumFrameByteCount,
                     drainDeadline: drainDeadline,
                     drainVisibilityInterval: drainVisibilityInterval,
                     drainLogDescriptor: drainLogDescriptor
@@ -1438,7 +1488,8 @@ extension BootstrapSocketProxy {
         initializeReplayState: MCPInitializeReplayState?,
         outstandingRequestReplayState: MCPOutstandingRequestReplayState?,
         bridgeLedger: JSONRPCBridgeLedger,
-        faultRule: JSONRPCBridgeFaultRule?
+        faultRule: JSONRPCBridgeFaultRule?,
+        maximumFrameByteCount: Int
     ) async throws {
         let flags = fcntl(stdinFD, F_GETFL)
         if flags >= 0 {
@@ -1447,18 +1498,26 @@ extension BootstrapSocketProxy {
         debugLog("BootstrapSocketProxy: pumpStdinToSocket started")
 
         var buffer = [UInt8](repeating: 0, count: 8192)
-        var pending = Data()
+        var frameAccumulator = MCPNewlineFrameAccumulator(
+            maximumFrameByteCount: maximumFrameByteCount,
+            bufferReservation: buffer.count
+        )
         var hasCachedIdentity = false // Stop parsing after first capture
 
         while !Task.isCancelled {
             var pfd = pollfd(fd: stdinFD, events: Int16(POLLIN), revents: 0)
-            let pollResult = poll(&pfd, 1, 1000)
+            let pollResult = poll(&pfd, 1, 100)
 
+            if Task.isCancelled {
+                return
+            }
             if pollResult < 0 {
                 try validateCLIHostInputPollResult(pollResult, errno: errno)
                 continue
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             let revents = Int32(pfd.revents)
             if revents & (POLLERR | POLLNVAL) != 0 {
@@ -1472,7 +1531,7 @@ extension BootstrapSocketProxy {
                     try await requireCleanBridgeStop(
                         ledger: bridgeLedger,
                         direction: .clientToServer,
-                        pendingByteCount: pending.count,
+                        pendingByteCount: frameAccumulator.residualByteCount,
                         reason: "stdin_hangup"
                     )
                     return
@@ -1493,43 +1552,49 @@ extension BootstrapSocketProxy {
                 try await requireCleanBridgeStop(
                     ledger: bridgeLedger,
                     direction: .clientToServer,
-                    pendingByteCount: pending.count,
+                    pendingByteCount: frameAccumulator.residualByteCount,
                     reason: "stdin_eof"
                 )
                 return
             }
 
-            pending.append(contentsOf: buffer[0 ..< bytesRead])
-            debugLog("BootstrapSocketProxy: read \(bytesRead) bytes from stdin, pending=\(pending.count)")
+            buffer.withUnsafeBufferPointer { bytes in
+                frameAccumulator.append(UnsafeBufferPointer(start: bytes.baseAddress, count: bytesRead))
+            }
+            debugLog(
+                "BootstrapSocketProxy: read \(bytesRead) bytes from stdin, pending=\(frameAccumulator.residualByteCount)"
+            )
 
-            while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
-                let message = pending[..<newline]
-                pending = Data(pending[(newline + 1)...])
+            do {
+                while let message = try frameAccumulator.nextFrame() {
+                    // Parse MCP initialize to extract clientInfo.name (best-effort, once only)
+                    if !hasCachedIdentity, let name = extractMCPClientName(from: message) {
+                        hasCachedIdentity = true
+                        await identityCache.setIfEmpty(name)
+                    }
 
-                // Parse MCP initialize to extract clientInfo.name (best-effort, once only)
-                if !hasCachedIdentity, let name = extractMCPClientName(from: Data(message)) {
-                    hasCachedIdentity = true
-                    await identityCache.setIfEmpty(name)
-                }
-
-                var payload = Data(message)
-                payload.append(UInt8(ascii: "\n"))
-                debugLog("BootstrapSocketProxy: → socket bytes=\(payload.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(payload))")
-                let prepared = try await Self.forwardClientFrameToSocket(
-                    frame: payload,
-                    socketFD: socketFD,
-                    ledger: bridgeLedger,
-                    initializeReplayState: initializeReplayState,
-                    outstandingRequestReplayState: outstandingRequestReplayState,
-                    faultRule: faultRule
-                )
-                if prepared.deliveryFrame != nil {
-                    MCPResponseDeliveryTracer.emitPreparedFrame(
-                        layer: "proxy_app_uds",
-                        phase: "socket_write_completed",
-                        prepared: prepared
+                    var payload = message
+                    payload.append(UInt8(ascii: "\n"))
+                    debugLog("BootstrapSocketProxy: → socket bytes=\(payload.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(payload))")
+                    let prepared = try await Self.forwardClientFrameToSocket(
+                        frame: payload,
+                        socketFD: socketFD,
+                        ledger: bridgeLedger,
+                        initializeReplayState: initializeReplayState,
+                        outstandingRequestReplayState: outstandingRequestReplayState,
+                        faultRule: faultRule
                     )
+                    if prepared.deliveryFrame != nil {
+                        MCPResponseDeliveryTracer.emitPreparedFrame(
+                            layer: "proxy_app_uds",
+                            phase: "socket_write_completed",
+                            prepared: prepared
+                        )
+                    }
                 }
+            } catch is MCPNewlineFrameTooLargeError {
+                let terminalReason = await bridgeLedger.terminalizeConnection(reason: "client_frame_too_large")
+                throw JSONRPCBridgeLedgerError.terminal(terminalReason)
             }
 
             if sawHangup {
@@ -1537,7 +1602,7 @@ extension BootstrapSocketProxy {
                 try await requireCleanBridgeStop(
                     ledger: bridgeLedger,
                     direction: .clientToServer,
-                    pendingByteCount: pending.count,
+                    pendingByteCount: frameAccumulator.residualByteCount,
                     reason: "stdin_hangup"
                 )
                 return
@@ -1642,12 +1707,17 @@ extension BootstrapSocketProxy {
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
         initialSocketBytes: Data = Data(),
+        maximumFrameByteCount: Int,
         drainDeadline: TimeInterval,
         drainVisibilityInterval: TimeInterval,
         drainLogDescriptor: Int32
     ) async throws {
         var buffer = [UInt8](repeating: 0, count: 8192)
-        var pending = initialSocketBytes
+        var frameAccumulator = MCPNewlineFrameAccumulator(
+            maximumFrameByteCount: maximumFrameByteCount,
+            bufferReservation: max(8192, initialSocketBytes.count)
+        )
+        frameAccumulator.append(initialSocketBytes)
         debugLog("BootstrapSocketProxy: pumpSocketToStdout started")
         let originalStdoutFlags: Int32
         do {
@@ -1664,64 +1734,68 @@ extension BootstrapSocketProxy {
         }
 
         func forwardCompletePendingFrames() async throws {
-            while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
-                let data = Data(pending[...newline])
-                pending = Data(pending[(newline + 1)...])
-                debugLog("BootstrapSocketProxy: ← stdout bytes=\(data.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(data))")
+            do {
+                while var data = try frameAccumulator.nextFrame() {
+                    data.append(UInt8(ascii: "\n"))
+                    debugLog("BootstrapSocketProxy: ← stdout bytes=\(data.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(data))")
 
-                if let termination = Self.extractTerminateParams(from: data) {
-                    let terminalReason = await bridgeLedger.terminalizeConnection(reason: termination.reason.rawValue)
-                    throw SocketProxyError.terminatedByServer(
-                        reason: TerminationReason(rawValue: terminalReason) ?? termination.reason,
-                        message: termination.message
-                    )
-                }
-
-                let prepared = try await JSONRPCBridgeDelivery.forward(
-                    frame: data,
-                    direction: .serverToClient,
-                    ledger: bridgeLedger,
-                    faultRule: faultRule
-                ) { framed in
-                    // Progress notifications are an intentional stderr-only control surface.
-                    // Delivery is best-effort: if the host closed stderr, drop the progress
-                    // line and keep the stdout transport alive rather than raising an ObjC
-                    // exception that would abort the helper mid-ledger-transaction.
-                    if let progressMessage = Self.extractProgressMessage(from: framed) {
-                        let delivered = BestEffortStderrWriter.writeNonBlocking(
-                            Data("[progress] \(progressMessage)\n".utf8)
+                    if let termination = Self.extractTerminateParams(from: data) {
+                        let terminalReason = await bridgeLedger.terminalizeConnection(reason: termination.reason.rawValue)
+                        throw SocketProxyError.terminatedByServer(
+                            reason: TerminationReason(rawValue: terminalReason) ?? termination.reason,
+                            message: termination.message
                         )
-                        if !delivered {
-                            debugLog("BootstrapSocketProxy: dropped progress output, stderr unavailable")
+                    }
+
+                    let prepared = try await JSONRPCBridgeDelivery.forward(
+                        frame: data,
+                        direction: .serverToClient,
+                        ledger: bridgeLedger,
+                        faultRule: faultRule
+                    ) { framed in
+                        // Progress notifications are an intentional stderr-only control surface.
+                        // Delivery is best-effort: if the host closed stderr, drop the progress
+                        // line and keep the stdout transport alive rather than raising an ObjC
+                        // exception that would abort the helper mid-ledger-transaction.
+                        if let progressMessage = Self.extractProgressMessage(from: framed) {
+                            let delivered = BestEffortStderrWriter.writeNonBlocking(
+                                Data("[progress] \(progressMessage)\n".utf8)
+                            )
+                            if !delivered {
+                                debugLog("BootstrapSocketProxy: dropped progress output, stderr unavailable")
+                            }
+                            return
                         }
-                        return
+                        do {
+                            try NonBlockingFDWriter.writeAll(
+                                framed,
+                                to: stdoutFD,
+                                stallTimeout: stdoutWriteStallTimeout,
+                                pollIntervalMilliseconds: stdoutWritePollIntervalMilliseconds,
+                                setNonBlocking: false
+                            )
+                        } catch let writeError as NonBlockingFDWriteError {
+                            debugLog("BootstrapSocketProxy: stdout bridge write failed provenance=\(writeError.provenance)")
+                            throw mapStdoutWriteError(writeError)
+                        }
                     }
-                    do {
-                        try NonBlockingFDWriter.writeAll(
-                            framed,
-                            to: stdoutFD,
-                            stallTimeout: stdoutWriteStallTimeout,
-                            pollIntervalMilliseconds: stdoutWritePollIntervalMilliseconds,
-                            setNonBlocking: false
+                    if let delivered = prepared.deliveryFrame,
+                       Self.extractProgressMessage(from: delivered) == nil
+                    {
+                        MCPResponseDeliveryTracer.emitPreparedFrame(
+                            layer: "proxy_stdout",
+                            phase: "stdout_write_completed",
+                            prepared: prepared,
+                            publicationPending: false,
+                            terminalBarrier: false
                         )
-                    } catch let writeError as NonBlockingFDWriteError {
-                        debugLog("BootstrapSocketProxy: stdout bridge write failed provenance=\(writeError.provenance)")
-                        throw mapStdoutWriteError(writeError)
+                        await initializeReplayState?.recordDeliveredServerFrame(delivered)
+                        await outstandingRequestReplayState?.recordDeliveredServerFrame(delivered, prepared: prepared)
                     }
                 }
-                if let delivered = prepared.deliveryFrame,
-                   Self.extractProgressMessage(from: delivered) == nil
-                {
-                    MCPResponseDeliveryTracer.emitPreparedFrame(
-                        layer: "proxy_stdout",
-                        phase: "stdout_write_completed",
-                        prepared: prepared,
-                        publicationPending: false,
-                        terminalBarrier: false
-                    )
-                    await initializeReplayState?.recordDeliveredServerFrame(delivered)
-                    await outstandingRequestReplayState?.recordDeliveredServerFrame(delivered, prepared: prepared)
-                }
+            } catch is MCPNewlineFrameTooLargeError {
+                let terminalReason = await bridgeLedger.terminalizeConnection(reason: "server_frame_too_large")
+                throw JSONRPCBridgeLedgerError.terminal(terminalReason)
             }
         }
 
@@ -1732,10 +1806,15 @@ extension BootstrapSocketProxy {
                 readiness = try await socketPoller(socketFD)
             } else {
                 var pfd = pollfd(fd: socketFD, events: Int16(POLLIN), revents: 0)
-                let pollResult = poll(&pfd, 1, 1000)
+                let pollResult = poll(&pfd, 1, 100)
 
+                if Task.isCancelled {
+                    return
+                }
                 if pollResult < 0 {
-                    if errno == EINTR { continue }
+                    if errno == EINTR {
+                        continue
+                    }
                     throw SocketProxyError.pollFailed(errno: errno)
                 }
                 readiness = pollResult == 0 ? .timedOut : .events(pfd.revents)
@@ -1745,7 +1824,7 @@ extension BootstrapSocketProxy {
                 if try await shouldFinishSocketDrain(
                     drainState: drainState,
                     ledger: bridgeLedger,
-                    pendingByteCount: pending.count,
+                    pendingByteCount: frameAccumulator.residualByteCount,
                     deadline: drainDeadline,
                     visibilityInterval: drainVisibilityInterval,
                     logDescriptor: drainLogDescriptor
@@ -1766,7 +1845,7 @@ extension BootstrapSocketProxy {
                     try await handleAppSocketClosed(
                         ledger: bridgeLedger,
                         drainState: drainState,
-                        pendingByteCount: pending.count,
+                        pendingByteCount: frameAccumulator.residualByteCount,
                         drainDeadline: drainDeadline,
                         visibilityInterval: drainVisibilityInterval,
                         logDescriptor: drainLogDescriptor,
@@ -1782,14 +1861,16 @@ extension BootstrapSocketProxy {
             }
 
             if bytesRead < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
+                if errno == EAGAIN || errno == EINTR {
+                    continue
+                }
                 throw SocketProxyError.readFailed(errno: errno)
             }
             if bytesRead == 0 {
                 try await handleAppSocketClosed(
                     ledger: bridgeLedger,
                     drainState: drainState,
-                    pendingByteCount: pending.count,
+                    pendingByteCount: frameAccumulator.residualByteCount,
                     drainDeadline: drainDeadline,
                     visibilityInterval: drainVisibilityInterval,
                     logDescriptor: drainLogDescriptor,
@@ -1798,15 +1879,19 @@ extension BootstrapSocketProxy {
                 return
             }
 
-            pending.append(contentsOf: buffer[0 ..< bytesRead])
-            debugLog("BootstrapSocketProxy: read \(bytesRead) bytes from socket, pending=\(pending.count)")
+            buffer.withUnsafeBufferPointer { bytes in
+                frameAccumulator.append(UnsafeBufferPointer(start: bytes.baseAddress, count: bytesRead))
+            }
+            debugLog(
+                "BootstrapSocketProxy: read \(bytesRead) bytes from socket, pending=\(frameAccumulator.residualByteCount)"
+            )
             try await forwardCompletePendingFrames()
 
             if sawHangup {
                 try await handleAppSocketClosed(
                     ledger: bridgeLedger,
                     drainState: drainState,
-                    pendingByteCount: pending.count,
+                    pendingByteCount: frameAccumulator.residualByteCount,
                     drainDeadline: drainDeadline,
                     visibilityInterval: drainVisibilityInterval,
                     logDescriptor: drainLogDescriptor,
@@ -1817,7 +1902,7 @@ extension BootstrapSocketProxy {
             if try await shouldFinishSocketDrain(
                 drainState: drainState,
                 ledger: bridgeLedger,
-                pendingByteCount: pending.count,
+                pendingByteCount: frameAccumulator.residualByteCount,
                 deadline: drainDeadline,
                 visibilityInterval: drainVisibilityInterval,
                 logDescriptor: drainLogDescriptor
@@ -1960,7 +2045,9 @@ extension BootstrapSocketProxy {
 
             if written < 0 {
                 let err = errno
-                if err == EINTR { continue }
+                if err == EINTR {
+                    continue
+                }
                 if err == EAGAIN || err == EWOULDBLOCK {
                     let remainingMs = Int32(deadline.timeIntervalSinceNow * 1000)
                     if remainingMs <= 0 {
@@ -1970,7 +2057,9 @@ extension BootstrapSocketProxy {
                     var pfd = pollfd(fd: socketFD, events: Int16(POLLOUT), revents: 0)
                     let result = poll(&pfd, 1, min(remainingMs, 250))
                     if result < 0 {
-                        if errno == EINTR { continue }
+                        if errno == EINTR {
+                            continue
+                        }
                         throw SocketProxyError.pollFailed(errno: errno)
                     }
                     if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
@@ -2110,7 +2199,9 @@ actor MCPService: Service {
         }
 
         // Check if already cancelled before waiting
-        if Task.isCancelled { return nil }
+        if Task.isCancelled {
+            return nil
+        }
 
         return await withTaskCancellationHandler {
             await withCheckedContinuation { cont in

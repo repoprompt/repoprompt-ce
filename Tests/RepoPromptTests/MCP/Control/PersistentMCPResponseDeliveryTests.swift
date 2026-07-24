@@ -180,6 +180,98 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         Self.assertJSONLineEqual(frames[0], newRequest)
     }
 
+    func testBridgeFailsClosedWhenClientFrameExceedsCap() async throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        var stdinPipe = [Int32](repeating: -1, count: 2)
+        var stdoutPipe = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        XCTAssertEqual(Darwin.pipe(&stdinPipe), 0)
+        XCTAssertEqual(Darwin.pipe(&stdoutPipe), 0)
+        defer {
+            (sockets + stdinPipe + stdoutPipe).forEach(Self.closeIfOpen)
+        }
+
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        let resultBox = BridgeTaskResultBox()
+        let bridgeTask = Task {
+            do {
+                try await BootstrapSocketProxy.runBridge(
+                    socketFD: sockets[0],
+                    stdinFD: stdinPipe[0],
+                    stdoutFD: stdoutPipe[1],
+                    identityCache: ClientIdentityCache(),
+                    bridgeLedger: ledger,
+                    faultRule: nil,
+                    maximumFrameByteCount: 4
+                )
+                resultBox.store(.success(()))
+            } catch {
+                resultBox.store(.failure(error))
+            }
+        }
+        defer { bridgeTask.cancel() }
+
+        try Self.writeAll(Data("12345\n".utf8), to: stdinPipe[1])
+        let completed = await resultBox.waitUntilStored(timeout: .seconds(5))
+        XCTAssertTrue(completed)
+        guard case let .failure(error) = resultBox.load() else {
+            return XCTFail("Expected oversized client frame to fail the bridge")
+        }
+        XCTAssertEqual(
+            error as? JSONRPCBridgeLedgerError,
+            .terminal("client_frame_too_large")
+        )
+        let snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.terminalReason, "client_frame_too_large")
+    }
+
+    func testBridgeFailsClosedWhenInitialServerFrameExceedsCap() async throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        var stdinPipe = [Int32](repeating: -1, count: 2)
+        var stdoutPipe = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        XCTAssertEqual(Darwin.pipe(&stdinPipe), 0)
+        XCTAssertEqual(Darwin.pipe(&stdoutPipe), 0)
+        defer {
+            (sockets + stdinPipe + stdoutPipe).forEach(Self.closeIfOpen)
+        }
+
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        let resultBox = BridgeTaskResultBox()
+        let bridgeTask = Task {
+            do {
+                try await BootstrapSocketProxy.runBridge(
+                    socketFD: sockets[0],
+                    stdinFD: stdinPipe[0],
+                    stdoutFD: stdoutPipe[1],
+                    identityCache: ClientIdentityCache(),
+                    bridgeLedger: ledger,
+                    faultRule: nil,
+                    maximumFrameByteCount: 4,
+                    initialSocketBytes: Data("12345\n".utf8)
+                )
+                resultBox.store(.success(()))
+            } catch {
+                resultBox.store(.failure(error))
+            }
+        }
+        defer { bridgeTask.cancel() }
+
+        let completed = await resultBox.waitUntilStored(timeout: .seconds(5))
+        XCTAssertTrue(completed)
+        guard case let .failure(error) = resultBox.load() else {
+            return XCTFail("Expected oversized server frame to fail the bridge")
+        }
+        XCTAssertEqual(
+            error as? JSONRPCBridgeLedgerError,
+            .terminal("server_frame_too_large")
+        )
+        let snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.terminalReason, "server_frame_too_large")
+    }
+
     func testTerminateControlNotificationSurfacesAsServerTermination() async throws {
         var sockets = [Int32](repeating: -1, count: 2)
         var stdinPipe = [Int32](repeating: -1, count: 2)
@@ -1615,14 +1707,22 @@ private actor ManualBridgeSocketPoller {
     }
 
     func waitUntilStdinClosed() async -> Bool {
-        if stdinClosed { return true }
-        if bridgeCompleted { return false }
+        if stdinClosed {
+            return true
+        }
+        if bridgeCompleted {
+            return false
+        }
         return await withCheckedContinuation { stdinClosedWaiters.append($0) }
     }
 
     func waitUntilWaiting(count: Int) async -> Bool {
-        if waitingCount >= count { return true }
-        if bridgeCompleted { return false }
+        if waitingCount >= count {
+            return true
+        }
+        if bridgeCompleted {
+            return false
+        }
         return await withCheckedContinuation { continuation in
             waitingCountWaiters.append((count, continuation))
         }
@@ -2049,10 +2149,14 @@ private extension PersistentMCPResponseDeliveryTests {
             let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             let revents = Int32(pfd.revents)
             if revents & POLLNVAL != 0 {
@@ -2064,9 +2168,13 @@ private extension PersistentMCPResponseDeliveryTests {
             if revents & POLLIN != 0 {
                 var byte: UInt8 = 0
                 let peeked = Darwin.recv(fd, &byte, 1, MSG_PEEK)
-                if peeked == 0 { return true }
+                if peeked == 0 {
+                    return true
+                }
                 if peeked < 0 {
-                    if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                    if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK {
+                        continue
+                    }
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
             }
@@ -2089,9 +2197,15 @@ private extension PersistentMCPResponseDeliveryTests {
             let result = payload.withUnsafeBytes { bytes in
                 Darwin.write(fd, bytes.baseAddress, bytes.count)
             }
-            if result > 0 { continue }
-            if result < 0, errno == EINTR { continue }
-            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
+            if result > 0 {
+                continue
+            }
+            if result < 0, errno == EINTR {
+                continue
+            }
+            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
@@ -2120,7 +2234,9 @@ private extension PersistentMCPResponseDeliveryTests {
             let result = Darwin.read(fd, &byte, 1)
             if result == 1 {
                 data.append(byte)
-                if byte == UInt8(ascii: "\n") { return data }
+                if byte == UInt8(ascii: "\n") {
+                    return data
+                }
             } else if result < 0, errno == EINTR {
                 continue
             } else if result == 0 {
@@ -2141,10 +2257,14 @@ private extension PersistentMCPResponseDeliveryTests {
             let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0, data.isEmpty {
                 throw POSIXError(.ECONNRESET)
@@ -2153,7 +2273,9 @@ private extension PersistentMCPResponseDeliveryTests {
             let result = Darwin.read(fd, &byte, 1)
             if result == 1 {
                 data.append(byte)
-                if byte == UInt8(ascii: "\n") { return data }
+                if byte == UInt8(ascii: "\n") {
+                    return data
+                }
             } else if result < 0, errno == EINTR {
                 continue
             } else if result < 0, errno == EAGAIN {
@@ -2188,7 +2310,9 @@ private extension PersistentMCPResponseDeliveryTests {
         let deadline = Date().addingTimeInterval(timeout)
         var result = await replayState.replayPlan()
         while Date() < deadline {
-            if case .success = result { return result }
+            if case .success = result {
+                return result
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
             result = await replayState.replayPlan()
         }

@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 import Logging
 @testable import RepoPromptApp
+import RepoPromptShared
 import XCTest
 
 final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
@@ -134,6 +135,78 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
         XCTAssertEqual(state.errors.count, 1)
         XCTAssertTrue(state.frames.isEmpty)
         XCTAssertTrue(state.eofResiduals.isEmpty)
+    }
+
+    func testFrameCapDeliversPriorFramesThenFailsExactlyOnce() {
+        let script = ScriptedReadOperation(outcomes: [
+            .data(Data("1234\n12345\n".utf8)),
+            .wouldBlock
+        ])
+        let state = ReaderCallbackState()
+        let reader = makeReader(
+            maximumFrameByteCount: 4,
+            readOperation: script.read,
+            state: state
+        )
+
+        reader.processReadableEvent()
+        reader.processReadableEvent()
+
+        XCTAssertEqual(state.frames, ["1234"])
+        XCTAssertEqual(state.errors.count, 1)
+        XCTAssertEqual(
+            state.errors.first as? MCPNewlineFrameTooLargeError,
+            MCPNewlineFrameTooLargeError(maximumByteCount: 4, accumulatedByteCount: 5)
+        )
+        XCTAssertTrue(state.eofResiduals.isEmpty)
+        XCTAssertEqual(script.readAttemptCount, 1)
+    }
+
+    func testFrameMaySpanMultiplePerEventByteBudgets() {
+        let queue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests.largeFrame")
+        let script = ScriptedReadOperation(outcomes: [
+            .data(Data("larg".utf8)),
+            .data(Data("e-fr".utf8)),
+            .data(Data("ame\n".utf8)),
+            .wouldBlock
+        ])
+        let state = ReaderCallbackState()
+        let reader = makeReader(
+            queue: queue,
+            maxBytesPerEvent: 4,
+            maximumFrameByteCount: 16,
+            readOperation: script.read,
+            state: state
+        )
+
+        reader.processReadableEvent()
+        for _ in 0 ..< 4 {
+            queue.sync {}
+        }
+        reader.stop()
+
+        XCTAssertEqual(state.frames, ["large-frame"])
+        XCTAssertTrue(state.errors.isEmpty)
+        XCTAssertEqual(script.readAttemptCount, 4)
+    }
+
+    func testNonPositiveChunkSizesAreSanitizedBeforeReading() {
+        for chunkSize in [0, -1] {
+            let script = ScriptedReadOperation(outcomes: [.wouldBlock])
+            let state = ReaderCallbackState()
+            let reader = makeReader(
+                chunkSize: chunkSize,
+                readOperation: script.read,
+                state: state
+            )
+
+            reader.processReadableEvent()
+            reader.stop()
+
+            XCTAssertEqual(script.requestedByteCounts, [1])
+            XCTAssertTrue(state.errors.isEmpty)
+            XCTAssertTrue(state.eofResiduals.isEmpty)
+        }
     }
 
     func testReentrantReadableEventDoesNotNestFrameDelivery() {
@@ -284,7 +357,10 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
 
     private func makeReader(
         queue: DispatchQueue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests"),
+        chunkSize: Int = 64,
         maxReadCallsPerEvent: Int = 32,
+        maxBytesPerEvent: Int = 256 * 1024,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount,
         readOperation: @escaping NewlineDelimitedSocketReader.ReadOperation,
         state: ReaderCallbackState
     ) -> NewlineDelimitedSocketReader {
@@ -292,8 +368,10 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
             fd: -1,
             queue: queue,
             logger: Logger(label: "NewlineDelimitedSocketReaderFairnessTests"),
-            chunkSize: 64,
+            chunkSize: chunkSize,
+            maximumFrameByteCount: maximumFrameByteCount,
             maxReadCallsPerEvent: maxReadCallsPerEvent,
+            maxBytesPerEvent: maxBytesPerEvent,
             readOperation: readOperation,
             onFrame: { frame in
                 let text = String(decoding: frame, as: UTF8.self)
@@ -359,6 +437,7 @@ private final class ScriptedReadOperation {
 
     private var outcomes: [Outcome]
     private(set) var readAttemptCount = 0
+    private(set) var requestedByteCounts: [Int] = []
 
     init(outcomes: [Outcome]) {
         self.outcomes = outcomes
@@ -371,6 +450,7 @@ private final class ScriptedReadOperation {
     ) -> Int {
         _ = fd
         readAttemptCount += 1
+        requestedByteCounts.append(count)
         guard !outcomes.isEmpty else {
             errno = EAGAIN
             return -1

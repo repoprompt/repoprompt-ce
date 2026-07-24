@@ -179,6 +179,9 @@ final class AgentProviderContextBuilderTests: XCTestCase {
 
         var countsBeforeSummary: WorkspaceFileContextStore.CodemapPresentationOperationCounts?
         #if DEBUG
+            try await AsyncTestWait.waitUntil("setup virtual token refreshes drain", timeout: 5) {
+                window.mcpServer.virtualTokenRefreshTaskCountForTesting() == 0
+            }
             let refreshStartsBeforeHandoff = window.mcpServer.virtualTokenRefreshStartCountForTesting()
         #endif
         let block = await window.agentModeViewModel.buildCurrentTabHandoffFileContentsBlock(

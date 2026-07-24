@@ -357,6 +357,7 @@ actor InteractiveMCPClientSession {
     private let timeoutSleep: TimeoutSleep
     private let cancellationDeliveryDrainSleep: TimeoutSleep
     private let cancellationDeliveryDrainTimeoutNanoseconds: UInt64
+    private let maximumFrameByteCount: Int
 
     private var client: MCP.Client?
     private var transport: (any Transport)?
@@ -393,7 +394,12 @@ actor InteractiveMCPClientSession {
     /// If true, emit progress notifications to stderr (for exec mode).
     private var progressEnabled: Bool = false
 
-    init(sessionToken: String, clientName: String, logger: Logger? = nil) {
+    init(
+        sessionToken: String,
+        clientName: String,
+        logger: Logger? = nil,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount
+    ) {
         self.sessionToken = sessionToken
         self.clientName = clientName
         self.logger = logger ?? Logger(label: "mcp.interactive.session") { _ in
@@ -406,6 +412,7 @@ actor InteractiveMCPClientSession {
             try await Task.sleep(nanoseconds: nanoseconds)
         }
         cancellationDeliveryDrainTimeoutNanoseconds = Self.cancellationDeliveryDrainTimeoutNanoseconds
+        self.maximumFrameByteCount = max(1, maximumFrameByteCount)
         #if DEBUG
             requestSendWillStart = nil
             toolListRefreshWillAwait = nil
@@ -436,6 +443,7 @@ actor InteractiveMCPClientSession {
             self.timeoutSleep = timeoutSleep
             self.cancellationDeliveryDrainSleep = cancellationDeliveryDrainSleep
             self.cancellationDeliveryDrainTimeoutNanoseconds = cancellationDeliveryDrainTimeoutNanoseconds
+            maximumFrameByteCount = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount
             self.client = client
             self.requestSendBarrier = requestSendBarrier
             self.requestSendWillStart = requestSendWillStart
@@ -458,7 +466,11 @@ actor InteractiveMCPClientSession {
         // Create transport with the connected FD and observe completed request writes.
         let socketTransport: BootstrapSocketMCPTransport
         do {
-            socketTransport = try BootstrapSocketMCPTransport(connectedFD: connectedFD, logger: logger)
+            socketTransport = try BootstrapSocketMCPTransport(
+                connectedFD: connectedFD,
+                logger: logger,
+                maximumFrameByteCount: maximumFrameByteCount
+            )
         } catch let error as POSIXDescriptorConfigurationError {
             throw InteractiveSessionError.descriptorConfigurationFailed(errno: error.errnoValue)
         }
@@ -1104,7 +1116,9 @@ actor InteractiveMCPClientSession {
         guard result.isError == true else { return false }
         let needle = "Tool not found: \(toolName)"
         return result.content.contains { block in
-            if case let .text(t, _, _) = block { return t.contains(needle) }
+            if case let .text(t, _, _) = block {
+                return t.contains(needle)
+            }
             return false
         }
     }
@@ -1293,7 +1307,9 @@ actor InteractiveMCPClientSession {
 
     private func decodeBindContextResponse(from result: CallTool.Result) throws -> BindContextResponse {
         guard let text = result.content.compactMap({
-            if case let .text(text, _, _) = $0 { return text }
+            if case let .text(text, _, _) = $0 {
+                return text
+            }
             return nil
         }).first else {
             throw InteractiveSessionError.handshakeFailed(reason: "bind_context returned no text payload")
@@ -1433,7 +1449,10 @@ actor InteractiveMCPClientSession {
         fd: Int32,
         timeout: TimeInterval
     ) async throws -> MCPBootstrapResponse {
-        var buffer = Data()
+        var frameAccumulator = MCPNewlineFrameAccumulator(
+            maximumFrameByteCount: maximumFrameByteCount,
+            bufferReservation: 4096
+        )
         let readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
         defer { readBuffer.deallocate() }
 
@@ -1449,11 +1468,15 @@ actor InteractiveMCPClientSession {
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw InteractiveSessionError.pollFailed(errno: errno)
             }
 
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
                 throw InteractiveSessionError.connectionReset
@@ -1461,18 +1484,22 @@ actor InteractiveMCPClientSession {
 
             let bytesRead = Darwin.read(fd, readBuffer, 4096)
             if bytesRead <= 0 {
-                if bytesRead < 0, errno == EAGAIN || errno == EINTR { continue }
+                if bytesRead < 0, errno == EAGAIN || errno == EINTR {
+                    continue
+                }
                 throw InteractiveSessionError.serverClosed
             }
 
-            buffer.append(readBuffer, count: bytesRead)
+            frameAccumulator.append(UnsafeBufferPointer(start: readBuffer, count: bytesRead))
 
-            if let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let jsonData = buffer[..<newlineIndex]
-                guard let response = try? JSONDecoder().decode(MCPBootstrapResponse.self, from: Data(jsonData)) else {
+            do {
+                guard let jsonData = try frameAccumulator.nextFrame() else { continue }
+                guard let response = try? JSONDecoder().decode(MCPBootstrapResponse.self, from: jsonData) else {
                     throw InteractiveSessionError.handshakeFailed(reason: "Invalid response JSON")
                 }
                 return response
+            } catch let error as MCPNewlineFrameTooLargeError {
+                throw InteractiveSessionError.frameTooLarge(error)
             }
         }
 
@@ -1490,6 +1517,7 @@ enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
     case connectFailed(errno: Int32)
     case appNotRunning
     case approvalDenied
+    case frameTooLarge(MCPNewlineFrameTooLargeError)
     case handshakeFailed(reason: String)
     case bootstrapResponseTimeout
     case toolCallTimeout(toolName: String, seconds: TimeInterval)
@@ -1522,6 +1550,8 @@ enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
             return "RepoPrompt app is not running or MCP is disabled"
         case .approvalDenied:
             return "Connection approval was denied"
+        case let .frameTooLarge(error):
+            return error.description
         case let .handshakeFailed(reason):
             return "Handshake failed: \(reason)"
         case .bootstrapResponseTimeout:
