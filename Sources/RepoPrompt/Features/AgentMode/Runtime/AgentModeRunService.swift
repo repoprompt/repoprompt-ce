@@ -46,6 +46,10 @@ final class AgentModeRunService {
         case replaceIfEmpty
         /// Always prepend the restored text, even if the user has started typing.
         case prependAlways
+        /// Replace the composer content with the restored text. Used when the
+        /// caller has already composed the restored draft together with any
+        /// newer typing, so applying the event again must not re-prepend.
+        case replaceAlways
     }
 
     struct Hooks {

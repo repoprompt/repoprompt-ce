@@ -862,6 +862,7 @@ extension AgentModeViewModel {
         let text: String
         let message: String
         let strategy: AgentModeRunService.DraftRestorationStrategy
+        let operation: AgentComposerDraftRestorationOperation?
     }
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.

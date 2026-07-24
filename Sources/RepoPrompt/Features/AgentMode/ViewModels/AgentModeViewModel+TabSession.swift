@@ -59,6 +59,12 @@ extension AgentModeViewModel {
         @Published var runningStatusText: String? = nil
         var activeAgentRunStartedAt: Date?
 
+        struct DeferredActiveAgentRunTimerRollback {
+            let originalStartedAt: Date?
+        }
+
+        var deferredActiveAgentRunTimerRollback: DeferredActiveAgentRunTimerRollback?
+
         enum RunningStatusSource: Equatable {
             case transport
             case reasoning
@@ -452,6 +458,7 @@ extension AgentModeViewModel {
 
         /// Selected workflow template for next message
         var selectedWorkflow: AgentWorkflowDefinition?
+        var userWorkflowSelectionMutationGeneration: UInt64 = 0
 
         // Pending image attachments for the next user turn
         @Published var pendingImageAttachments: [AgentImageAttachment] = []
@@ -1535,6 +1542,7 @@ extension AgentModeViewModel {
             setItemsSilently(items, reason: .testOverride)
             pendingTurnRuntimeAnchors.removeAll()
             agentMessageRuntimeFootersByItemID.removeAll()
+            deferredActiveAgentRunTimerRollback = nil
             pendingSourceItemsMutationSummary = nil
             onSourceItemsChanged?(self, .replaceAll)
             lastActivityAt = Date()
