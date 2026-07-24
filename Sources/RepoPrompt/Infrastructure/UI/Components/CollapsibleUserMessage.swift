@@ -72,15 +72,9 @@ private struct MeasuredPlainTextView: View {
 /// Provides expand/collapse functionality with smooth animations.
 struct CollapsibleUserMessage: View {
     let text: String
-
-    /// Number of characters to show in collapsed state
-    var previewCharCount: Int = 500
-
-    /// Label shown on expand button
-    var expandLabel: String = "Show more…"
-
-    /// Label shown on collapse button
-    var collapseLabel: String = "Show less"
+    let previewCharCount: Int
+    let expandLabel: String
+    let collapseLabel: String
 
     // UI state
     @State private var isCollapsed = true
@@ -91,15 +85,34 @@ struct CollapsibleUserMessage: View {
         fontScale.preset
     }
 
+    /// Whether the text exceeds the preview threshold.
+    /// Computed in O(previewCharCount) by short-circuiting at the threshold,
+    /// avoiding a full O(N) grapheme-cluster traversal via `text.count`.
+    private let needsCollapse: Bool
+
+    init(
+        text: String,
+        previewCharCount: Int = 500,
+        expandLabel: String = "Show more…",
+        collapseLabel: String = "Show less"
+    ) {
+        self.text = text
+        self.previewCharCount = previewCharCount
+        self.expandLabel = expandLabel
+        self.collapseLabel = collapseLabel
+        // O(previewCharCount+1) at most — short-circuits instead of counting the full string.
+        self.needsCollapse = text.index(
+            text.startIndex,
+            offsetBy: previewCharCount + 1,
+            limitedBy: text.endIndex
+        ) != nil
+    }
+
     private var displayText: String {
-        if text.count > previewCharCount, isCollapsed {
+        if needsCollapse, isCollapsed {
             return String(text.prefix(previewCharCount))
         }
         return text
-    }
-
-    private var needsCollapse: Bool {
-        text.count > previewCharCount
     }
 
     private func updateLastKnownContentWidth(_ width: CGFloat) {
