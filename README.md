@@ -94,7 +94,11 @@ another Mac or redistributed.
 ### Source-build requirements
 
 - macOS 26 or later
-- Xcode 26, or matching Command Line Tools with the macOS 26 SDK
+- Xcode 26 — full `Xcode.app`, not Command Line Tools alone. RepoPrompt CE and
+  its dependencies use the `@Entry` and `#Preview` Swift macros, whose plugins
+  (`SwiftUIMacros`, `PreviewsMacros`) ship only with `Xcode.app`. Its bundled
+  macOS 26 SDK satisfies the SDK requirement. Run `./Scripts/doctor.sh` to
+  verify your toolchain before building.
 
 ### Develop in Xcode
 

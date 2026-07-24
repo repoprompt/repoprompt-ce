@@ -104,6 +104,28 @@ SWIFT
 ARCH="$(uname -m)"
 run xcrun swiftc -typecheck -parse-as-library -target "${ARCH}-apple-macos14.0" "$TMP/GlassProbe.swift"
 log "OK: toolchain can compile SwiftUI Liquid Glass symbols."
+phase "Compiling Swift macro plugin probe"
+cat > "$TMP/MacroProbe.swift" <<'SWIFT'
+import SwiftUI
+
+// Mirrors real RepoPrompt CE usage: `@Entry` (SwiftUIMacros) in an
+// EnvironmentValues extension, plus `#Preview` (PreviewsMacros) carried by
+// dependencies such as KeyboardShortcuts. Both macro plugins ship only with
+// full Xcode.app; Command Line Tools alone cannot expand them, so a typecheck
+// (which runs macro expansion) is enough to detect their absence.
+extension EnvironmentValues {
+    @Entry var repoPromptDoctorMacroProbe: Bool = false
+}
+
+#Preview("doctor macro probe") {
+    Text("OK")
+}
+SWIFT
+if ! xcrun swiftc -typecheck -parse-as-library -target "${ARCH}-apple-macos14.0" "$TMP/MacroProbe.swift" 2>"$TMP/MacroProbe.err"; then
+    (( quiet )) || cat "$TMP/MacroProbe.err" >&2
+    fail "Swift macro plugins unavailable (SwiftUIMacros / PreviewsMacros). RepoPrompt CE uses the @Entry and #Preview macros, whose plugins ship only with full Xcode.app — Command Line Tools alone cannot build it. Install Xcode 26 and select it: sudo xcode-select -s /Applications/Xcode.app"
+fi
+log "OK: toolchain provides Swift macro plugins (@Entry, #Preview)."
 if (( install_debug_cli )); then
     phase "Installing debug CLI"
     run "$ROOT_DIR/Scripts/install_debug_cli.sh" install --build
