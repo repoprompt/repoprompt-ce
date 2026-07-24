@@ -4613,6 +4613,28 @@ class WorkspaceManagerViewModel: ObservableObject {
         return true
     }
 
+    struct WorkspaceTabSliceRebasePlan: Equatable {
+        let identity: WorkspaceSelectionIdentity
+        let fullPath: String
+        let expectedRanges: [LineRange]
+        let rebasedRanges: [LineRange]
+
+        init?(
+            identity: WorkspaceSelectionIdentity,
+            fullPath: String,
+            expectedRanges: [LineRange],
+            rebasedRanges: [LineRange]
+        ) {
+            guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath) else {
+                return nil
+            }
+            self.identity = identity
+            self.fullPath = standardizedFullPath
+            self.expectedRanges = SliceRangeMath.normalize(expectedRanges)
+            self.rebasedRanges = SliceRangeMath.normalize(rebasedRanges)
+        }
+    }
+
     nonisolated static func rebasedStoredSelectionSlices(
         _ selection: StoredSelection,
         for fullPath: String,
@@ -4628,6 +4650,43 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         let nextRanges = SliceRangeMath.normalize(transform(existingRanges))
+        return storedSelection(
+            selection,
+            replacingSlices: normalizedSlices,
+            for: standardizedFullPath,
+            with: nextRanges
+        )
+    }
+
+    nonisolated static func rebasedStoredSelectionSlices(
+        _ selection: StoredSelection,
+        applying plan: WorkspaceTabSliceRebasePlan
+    ) -> StoredSelection? {
+        let normalizedSlices = StoredSelectionPathNormalization.standardizedSlices(selection.slices)
+        guard let currentRanges = normalizedSlices[plan.fullPath] else {
+            return nil
+        }
+        let normalizedCurrent = SliceRangeMath.normalize(currentRanges)
+        if normalizedCurrent == plan.rebasedRanges {
+            return nil
+        }
+        guard normalizedCurrent == plan.expectedRanges else {
+            return nil
+        }
+        return storedSelection(
+            selection,
+            replacingSlices: normalizedSlices,
+            for: plan.fullPath,
+            with: plan.rebasedRanges
+        )
+    }
+
+    private nonisolated static func storedSelection(
+        _ selection: StoredSelection,
+        replacingSlices normalizedSlices: [String: [LineRange]],
+        for standardizedFullPath: String,
+        with nextRanges: [LineRange]
+    ) -> StoredSelection? {
         var nextSlices = normalizedSlices
         if nextRanges.isEmpty {
             nextSlices.removeValue(forKey: standardizedFullPath)
@@ -4731,50 +4790,51 @@ class WorkspaceManagerViewModel: ObservableObject {
         asyncTransform: @Sendable (WorkspaceSelectionIdentity, String, [LineRange]) async -> [LineRange]
     ) async {
         var seen = Set<String>()
+        var plans: [WorkspaceTabSliceRebasePlan] = []
         for target in targets {
             guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(target.fullPath) else {
                 continue
             }
             let dedupeKey = "\(target.identity.workspaceID.uuidString):\(target.identity.tabID.uuidString):\(standardizedFullPath)"
             guard seen.insert(dedupeKey).inserted else { continue }
+            guard let currentTab = composeTab(for: target.identity),
+                  !currentTab.selection.slices.isEmpty
+            else { continue }
+            let currentSlices = StoredSelectionPathNormalization.standardizedSlices(currentTab.selection.slices)
+            guard let currentRanges = currentSlices[standardizedFullPath] else { continue }
+            let nextRanges = await asyncTransform(target.identity, standardizedFullPath, currentRanges)
+            if let plan = WorkspaceTabSliceRebasePlan(
+                identity: target.identity,
+                fullPath: standardizedFullPath,
+                expectedRanges: currentRanges,
+                rebasedRanges: nextRanges
+            ) {
+                plans.append(plan)
+            }
+        }
+        await applyPlannedSliceRebasesAcrossTabs(plans)
+    }
+
+    @MainActor
+    func applyPlannedSliceRebasesAcrossTabs(_ plans: [WorkspaceTabSliceRebasePlan]) async {
+        var seen = Set<String>()
+        for plan in plans {
+            let dedupeKey = "\(plan.identity.workspaceID.uuidString):\(plan.identity.tabID.uuidString):\(plan.fullPath)"
+            guard seen.insert(dedupeKey).inserted else { continue }
             #if DEBUG
-                MCPApplyEditsRebaseProbeRecorder.recordTabInspection(fullPath: standardizedFullPath)
+                MCPApplyEditsRebaseProbeRecorder.recordTabInspection(fullPath: plan.fullPath)
             #endif
             for _ in 0 ..< 3 {
-                guard let currentTab = composeTab(for: target.identity),
-                      !currentTab.selection.slices.isEmpty
+                guard var latestTab = composeTab(for: plan.identity),
+                      let nextSelection = Self.rebasedStoredSelectionSlices(latestTab.selection, applying: plan)
                 else { break }
-                let currentSlices = StoredSelectionPathNormalization.standardizedSlices(currentTab.selection.slices)
-                guard let currentRanges = currentSlices[standardizedFullPath] else { break }
-
-                let nextRanges = await SliceRangeMath.normalize(
-                    asyncTransform(target.identity, standardizedFullPath, currentRanges)
-                )
-                guard var latestTab = composeTab(for: target.identity) else { break }
-                let latestSlices = StoredSelectionPathNormalization.standardizedSlices(latestTab.selection.slices)
-                guard let latestRanges = latestSlices[standardizedFullPath] else { break }
-                guard latestRanges == currentRanges else { continue }
-
-                var nextSlices = latestSlices
-                if nextRanges.isEmpty {
-                    nextSlices.removeValue(forKey: standardizedFullPath)
-                } else {
-                    nextSlices[standardizedFullPath] = nextRanges
-                }
-                guard nextSlices != latestTab.selection.slices else { break }
 
                 let expectedSelection = latestTab.selection
-                let nextSelection = StoredSelection(
-                    selectedPaths: expectedSelection.selectedPaths,
-                    manualCodemapPaths: expectedSelection.manualCodemapPaths,
-                    slices: nextSlices,
-                    codemapAutoEnabled: expectedSelection.codemapAutoEnabled
-                )
                 let persistedSelection: StoredSelection
                 if let selectionCoordinator {
                     persistedSelection = await selectionCoordinator.persistSelection(
                         nextSelection,
-                        for: target.identity,
+                        for: plan.identity,
                         source: .mcpTabContext,
                         mirrorToUIIfActive: true,
                         expectedCurrentSelection: expectedSelection
@@ -4784,12 +4844,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                     latestTab.lastModified = Date()
                     persistedSelection = updateComposeTabStoredOnly(
                         latestTab,
-                        inWorkspaceID: target.identity.workspaceID
+                        inWorkspaceID: plan.identity.workspaceID
                     ) ? nextSelection : expectedSelection
                 }
                 guard persistedSelection == nextSelection else { continue }
                 #if DEBUG
-                    MCPApplyEditsRebaseProbeRecorder.recordTabWrite(fullPath: standardizedFullPath)
+                    MCPApplyEditsRebaseProbeRecorder.recordTabWrite(fullPath: plan.fullPath)
                 #endif
                 break
             }

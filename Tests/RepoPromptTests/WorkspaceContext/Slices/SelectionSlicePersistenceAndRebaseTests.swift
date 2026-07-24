@@ -304,6 +304,79 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
         XCTAssertFalse(result.isStale)
     }
 
+    func testPlannedTabSliceRebaseIsIdempotentAndFailsClosed() throws {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let editedPath = "/tmp/Selected.swift"
+        let unrelatedPath = "/tmp/Unrelated.swift"
+        let expectedRanges = [LineRange(start: 10, end: 12, description: "edited")]
+        let rebasedRanges = [LineRange(start: 15, end: 17, description: "edited")]
+        let selection = StoredSelection(
+            selectedPaths: [editedPath, unrelatedPath],
+            slices: [
+                editedPath: expectedRanges,
+                unrelatedPath: [LineRange(start: 30, end: 35, description: "unrelated")]
+            ],
+            codemapAutoEnabled: false
+        )
+        let plan = try XCTUnwrap(WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan(
+            identity: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+            fullPath: editedPath,
+            expectedRanges: expectedRanges,
+            rebasedRanges: rebasedRanges
+        ))
+
+        let applied = try XCTUnwrap(WorkspaceManagerViewModel.rebasedStoredSelectionSlices(selection, applying: plan))
+        XCTAssertEqual(applied.slices[editedPath], rebasedRanges)
+        XCTAssertEqual(applied.slices[unrelatedPath], selection.slices[unrelatedPath])
+        XCTAssertNil(WorkspaceManagerViewModel.rebasedStoredSelectionSlices(applied, applying: plan))
+
+        let independentlyChanged = StoredSelection(
+            selectedPaths: selection.selectedPaths,
+            slices: [
+                editedPath: [LineRange(start: 40, end: 42, description: "manual")],
+                unrelatedPath: [LineRange(start: 30, end: 35, description: "unrelated")]
+            ],
+            codemapAutoEnabled: false
+        )
+        XCTAssertNil(WorkspaceManagerViewModel.rebasedStoredSelectionSlices(independentlyChanged, applying: plan))
+    }
+
+    func testApplyPlannedSliceRebasesPlanRebuildsAgainstLatestExpectedRangesAfterCASDrift() throws {
+        // Models the applyPlannedSliceRebasesAcrossTabs retry loop: a failed CAS leaves the
+        // tab on its current selection; the next iteration rebuilds from latest expected
+        // ranges. Once applied, the same plan fails closed (idempotent).
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let editedPath = "/tmp/CAS-retry.swift"
+        let expectedRanges = [LineRange(start: 2, end: 3, description: "edited")]
+        let rebasedRanges = [LineRange(start: 5, end: 6, description: "edited")]
+        let initialSelection = StoredSelection(
+            selectedPaths: [editedPath],
+            slices: [editedPath: expectedRanges],
+            codemapAutoEnabled: false
+        )
+        let plan = try XCTUnwrap(WorkspaceManagerViewModel.WorkspaceTabSliceRebasePlan(
+            identity: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+            fullPath: editedPath,
+            expectedRanges: expectedRanges,
+            rebasedRanges: rebasedRanges
+        ))
+
+        // Simulated first attempt: CAS fails, tab stays on initialSelection.
+        XCTAssertEqual(
+            WorkspaceManagerViewModel.rebasedStoredSelectionSlices(initialSelection, applying: plan)?.slices[editedPath],
+            rebasedRanges
+        )
+        // Simulated successful attempt: apply against still-matching expected ranges.
+        let afterApply = try XCTUnwrap(
+            WorkspaceManagerViewModel.rebasedStoredSelectionSlices(initialSelection, applying: plan)
+        )
+        XCTAssertEqual(afterApply.slices[editedPath], rebasedRanges)
+        // Next retry against already-rebased selection fails closed (no double apply).
+        XCTAssertNil(WorkspaceManagerViewModel.rebasedStoredSelectionSlices(afterApply, applying: plan))
+    }
+
     func testSliceRebaseTransformsOverlapMatrixWithStableAffinity() {
         struct Case {
             let name: String
