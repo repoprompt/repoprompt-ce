@@ -2985,10 +2985,10 @@ func printUsage() {
           tree src/                                    Tree from specific path
           get_file_tree type=files mode=selected       Show only selected files
 
-        get_code_structure (structure, map) - Get function/type signatures
-          structure src/auth/                          Codemaps for directory (default considers up to 10 files)
-          structure --scope selected                   Codemaps for selection (~6k token cap still applies)
-          get_code_structure paths=["src/"] max_results=50   Opt in to consider more files (response still capped)
+        get_code_structure (structure, map) - Traverse root-local code graphs
+          structure                                   Current selection, seed nodes only
+          structure src/auth/ --expand uses --depth 2  Traverse referenced definitions
+          get_code_structure paths=["src/"] signatures=false max_tokens=12000
 
         workspace_context (context) - Get workspace snapshot
           context                                      Default snapshot

@@ -1240,7 +1240,6 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     #endif
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
-    private var codemapSelectionGraphReadinessTask: Task<Void, Never>?
     private var codemapMarkerReadinessTask: Task<Void, Never>?
     private var codemapRootStatusTask: Task<Void, Never>?
     private let alwaysReadableHomeDirectoryURL: URL
@@ -1269,7 +1268,6 @@ class WorkspaceFilesViewModel: ObservableObject {
         syncFileSystemPreferencesFromGlobalSettings()
 
         subscribeToWorkspaceStoreDeltaEvents()
-        subscribeToCodemapSelectionGraphReadinessUpdates()
         subscribeToCodemapMarkerReadinessUpdates()
         subscribeToCodemapRootStatusUpdates()
         subscribeToPartitionStoreSaves()
@@ -1288,7 +1286,6 @@ class WorkspaceFilesViewModel: ObservableObject {
     deinit {
         // Cancel the subscriptions if this VM goes away
         workspaceStoreDeltaBridgeTask?.cancel()
-        codemapSelectionGraphReadinessTask?.cancel()
         codemapMarkerReadinessTask?.cancel()
         codemapRootStatusTask?.cancel()
         autoCodemapSyncTask?.cancel()
@@ -1464,16 +1461,6 @@ class WorkspaceFilesViewModel: ObservableObject {
             let stream = await workspaceFileContextStore.appliedIndexEvents()
             for await event in stream {
                 await handleWorkspaceAppliedIndexEvent(event)
-            }
-        }
-    }
-
-    private func subscribeToCodemapSelectionGraphReadinessUpdates() {
-        codemapSelectionGraphReadinessTask = Task { [weak self] in
-            guard let self else { return }
-            let stream = await workspaceFileContextStore.codemapSelectionGraphReadinessUpdates()
-            for await event in stream {
-                handleCodemapSelectionGraphReadiness(event)
             }
         }
     }
@@ -2481,17 +2468,6 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     @MainActor
-    private func handleCodemapSelectionGraphReadiness(
-        _ event: WorkspaceCodemapSelectionGraphReadinessEvent
-    ) {
-        guard codemapAutoEnabled,
-              autoCodemapReadinessRetryPending,
-              visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID })
-        else { return }
-        scheduleAutoCodemapSync(readinessTriggered: true)
-    }
-
-    @MainActor
     private func handleCodemapMarkerReadiness(
         _ event: WorkspaceCodemapMarkerReadinessEvent
     ) {
@@ -2513,6 +2489,17 @@ class WorkspaceFilesViewModel: ObservableObject {
         guard next != codemapRootStatusesByRootID else { return }
         codemapRootStatusesByRootID = next
         codemapRootStatusesChangedSubject.send(())
+        if codemapAutoEnabled, autoCodemapReadinessRetryPending,
+           update.roots.contains(where: { root in
+               visibleRootFolders.contains(where: { $0.id == root.rootEpoch.rootID }) &&
+                   (
+                       root.availability == .ready || root.availability == .updating ||
+                           root.availability == .reconciling
+                   )
+           })
+        {
+            scheduleAutoCodemapSync(readinessTriggered: true)
+        }
     }
 
     func cancelAllLoadingTasks() {
@@ -11036,15 +11023,6 @@ extension WorkspaceFilesViewModel {
         }
 
         @MainActor
-        func handleAutomaticCodemapReadinessForTesting(
-            rootEpoch: WorkspaceCodemapRootEpoch
-        ) {
-            handleCodemapSelectionGraphReadiness(
-                WorkspaceCodemapSelectionGraphReadinessEvent(rootEpoch: rootEpoch)
-            )
-        }
-
-        @MainActor
         func waitForAutoCodemapSyncForTesting() async {
             await autoCodemapSyncTask?.value
         }
@@ -11224,58 +11202,45 @@ extension WorkspaceFilesViewModel {
             generation: generation,
             sourceIDs: sourceIDs
         ) else { return }
-        switch result.aggregateCoverage {
-        case .complete, .partial, .provisional:
+        switch result.status {
+        case .ok, .partial:
             break
-        case .incomplete, .pending, .busy:
+        case .pending:
             resetAutoCodemapFiles([])
             if autoCodemapReadinessRetryAvailable {
                 autoCodemapReadinessRetryPending = true
             }
             return
-        case .unavailable, .stale, .budget:
+        case .unavailable:
             resetAutoCodemapFiles([])
             return
         }
-        guard let receipt = result.publicationReceipt else {
+        guard let receipt = result.receipt else {
             resetAutoCodemapFiles([])
             return
         }
-        let publication = await workspaceFileContextStore
-            .revalidateAutomaticCodemapSelectionForPublication(
-                receipt,
-                rootScope: .visibleWorkspace
-            )
+        let revalidation = await workspaceFileContextStore.revalidateAutomaticCodemapSelection(
+            receipt,
+            rootScope: .visibleWorkspace
+        )
 
         guard automaticCodemapSelectionIsCurrent(
             generation: generation,
             sourceIDs: sourceIDs
         ) else { return }
-        guard case let .current(targets) = publication else {
-            rejectAutomaticCodemapPublicationForRetry()
-            return
-        }
+        let receiptTargets = receipt.roots.flatMap(\.targets)
         guard let resolvedTargets = reconstructAutomaticCodemapTargets(
-            receiptTargets: receipt.targets,
-            revalidatedTargets: targets,
+            receiptTargets: receiptTargets,
+            revalidatedTargets: revalidation.validTargets,
             sourceIDs: sourceIDs,
             filesByID: fileHierarchyIndex.filesByID
         ) else {
             rejectAutomaticCodemapPublicationForRetry()
             return
         }
-        guard receipt.publicationPermit.withCurrent({
-            autoCodemapReadinessRetryAvailable = true
-            autoCodemapReadinessRetryPending = false
-            resetAutoCodemapFiles(resolvedTargets)
-            return true
-        }) == true else {
-            resetAutoCodemapFiles([])
-            if autoCodemapReadinessRetryAvailable {
-                autoCodemapReadinessRetryPending = true
-            }
-            return
-        }
+        autoCodemapReadinessRetryAvailable = true
+        autoCodemapReadinessRetryPending = false
+        resetAutoCodemapFiles(resolvedTargets)
     }
 
     @MainActor

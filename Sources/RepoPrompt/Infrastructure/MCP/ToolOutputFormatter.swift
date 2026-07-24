@@ -2914,43 +2914,87 @@ extension ToolOutputFormatter {
             return formatGeneric(value: value)
         }
         let icon = switch dto.status {
-        case "ready": "✅"
-        case "partial", "pending", "budget": "⚠️"
-        default: "❌"
+        case .ok: "✅"
+        case .partial, .pending: "⚠️"
+        case .unavailable: "❌"
         }
         var out: [String] = [
             "## Code Structure \(icon)",
-            "- **Status**: `\(dto.status)`",
-            "- **Files**: \(dto.summary.returnedFiles) (\(dto.summary.returnedSeeds) seeds, \(dto.summary.returnedRelated) related)",
-            "- **Codemap content tokens**: \(dto.summary.codemapContentTokens)",
-            "- **Examined edges**: \(dto.summary.examinedEdges)"
+            "- **Status**: `\(dto.status.rawValue)`",
+            "- **Roots**: \(dto.roots.count)",
+            "- **Graph**: \(dto.summary.seeds) seeds • \(dto.summary.nodes) nodes • \(dto.summary.edges) edges",
+            "- **Signatures**: \(dto.summary.files) files • \(dto.summary.tokens) tokens"
         ]
         out.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .codeStructure))
         if !dto.issues.isEmpty {
             out.append("")
             out.append("### Issues")
-            for issue in dto.issues {
-                var detail = "- `\(issue.code)` (\(issue.phase)): \(issue.message)"
-                if let path = issue.path { detail += " [`\(path)`]" }
-                if let attempted = issue.attempted, let limit = issue.limit {
-                    detail += " (attempted \(attempted), limit \(limit))"
+            appendCodeStructureIssues(dto.issues, to: &out)
+        }
+        for root in dto.roots {
+            out.append("")
+            out.append("### `\(root.root)` — \(root.status.rawValue)")
+            out.append("- Index: \(root.index.state.rawValue) (\(root.index.indexed)/\(root.index.total))")
+            if root.updatesPending == true { out.append("- Updates pending: committed graph data is still usable") }
+            if let truncated = root.truncated {
+                out.append("- Truncated: \(truncated.reason) (\(truncated.droppedNodes) dropped nodes)")
+            }
+            if !root.issues.isEmpty {
+                out.append("- Issues:")
+                appendCodeStructureIssues(root.issues, to: &out)
+            }
+            if !root.seeds.isEmpty {
+                out.append("- Seeds: " + root.seeds.map { "`\($0.path)` [\($0.state.rawValue)]" }.joined(separator: ", "))
+            }
+            if !root.nodes.isEmpty {
+                out.append("")
+                out.append("#### Nodes")
+                for node in root.nodes {
+                    let seed = node.seed == true ? " seed" : ""
+                    let reached = node.reachedBy.isEmpty ? "" : " via \(node.reachedBy.joined(separator: ", "))"
+                    out.append("- `\(node.path)` — depth \(node.depth)\(seed)\(reached)")
                 }
-                if issue.retryable { detail += " — retryable" }
-                out.append(detail)
+            }
+            if !root.edges.isEmpty {
+                out.append("")
+                out.append("#### Edges")
+                for edge in root.edges {
+                    let ambiguous = edge.ambiguous == true ? " (ambiguous)" : ""
+                    out.append("- `\(edge.from)` → `\(edge.to)` — \(edge.symbols.joined(separator: ", "))\(ambiguous)")
+                }
+            }
+            if !root.unresolved.isEmpty {
+                out.append("")
+                out.append("#### Unresolved")
+                for unresolved in root.unresolved {
+                    out.append("- `\(unresolved.from)`: \(unresolved.name) — \(unresolved.reason.rawValue)")
+                }
             }
         }
         if !dto.files.isEmpty {
             out.append("")
-            out.append("### Files")
+            out.append("### Signatures")
             for file in dto.files {
-                let directions = file.reachedBy.isEmpty
-                    ? ""
-                    : ", reached by \(file.reachedBy.joined(separator: ", "))"
-                out.append("#### `\(file.path)` — \(file.role), depth \(file.depth)\(directions), \(file.tokens) tokens")
+                out.append("#### `\(file.path)` — \(file.role), depth \(file.depth), \(file.tokens) tokens")
                 out.append("```text\n\(file.content)\n```")
             }
         }
         return [.text(out.joined(separator: "\n"))]
+    }
+
+    private static func appendCodeStructureIssues(
+        _ issues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO],
+        to output: inout [String]
+    ) {
+        for issue in issues {
+            var detail = "- `\(issue.code)` (\(issue.phase)): \(issue.message)"
+            if let path = issue.path { detail += " [`\(path)`]" }
+            if let attempted = issue.attempted, let limit = issue.limit {
+                detail += " (attempted \(attempted), limit \(limit))"
+            }
+            if issue.retryable { detail += " — retryable" }
+            output.append(detail)
+        }
     }
 
     // (Removed) formatTokenStats – token stats are part of workspace_context

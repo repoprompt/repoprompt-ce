@@ -244,30 +244,35 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
     }
 
     func testCodeStructureOutputShowsTypedPendingIssueAndWorktreeScope() throws {
+        let issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO(
+            code: "graph_indexing",
+            phase: "graph_snapshot",
+            path: "Project/Sources/App.swift",
+            retryable: true,
+            retryAfterMilliseconds: 50,
+            attempted: nil,
+            limit: nil,
+            message: "The committed graph is still indexing."
+        )
         let dto = ToolResultDTOs.CodeStructureReplyDTO(
-            status: "pending",
-            files: [],
-            summary: .init(
-                requestedSeeds: 1,
-                resolvedSeeds: 0,
-                returnedSeeds: 0,
-                returnedRelated: 0,
-                returnedFiles: 0,
-                codemapContentTokens: 0,
-                examinedEdges: 0
-            ),
-            issues: [
+            status: .pending,
+            roots: [
                 .init(
-                    code: "artifact_pending",
-                    phase: "seed_demand",
-                    path: "Project/Sources/App.swift",
-                    retryable: true,
-                    retryAfterMilliseconds: 50,
-                    attempted: nil,
-                    limit: nil,
-                    message: "Codemap generation is still pending."
+                    root: "Project",
+                    status: .pending,
+                    index: .init(state: .indexing, indexed: 0, total: 1),
+                    updatesPending: nil,
+                    seeds: [.init(path: "Project/Sources/App.swift", state: .pending)],
+                    nodes: [],
+                    edges: [],
+                    unresolved: [],
+                    truncated: nil,
+                    issues: [issue]
                 )
             ],
+            files: [],
+            summary: .init(seeds: 1, nodes: 0, edges: 0, files: 0, tokens: 0),
+            issues: [],
             retry: .init(retryable: true, retryAfterMilliseconds: 50),
             worktreeScope: Self.scope()
         )
@@ -276,7 +281,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
 
         XCTAssertTrue(text.contains("## Code Structure ⚠️"), text)
         XCTAssertTrue(text.contains("**Status**: `pending`"), text)
-        XCTAssertTrue(text.contains("`artifact_pending`"), text)
+        XCTAssertTrue(text.contains("`graph_indexing`"), text)
         XCTAssertTrue(text.contains("`Project/Sources/App.swift`"), text)
         XCTAssertTrue(text.contains("codemap scans use"), text)
         XCTAssertTrue(text.contains("Displayed paths use logical/canonical roots"), text)

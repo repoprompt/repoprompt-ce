@@ -2353,7 +2353,7 @@ def self_test_command(_args: argparse.Namespace) -> int:
     )["ok"]
     non_git_structure_actual = routed_response({
         "status": "unavailable", "files": [],
-        "issues": [{"code": "git_root_unavailable", "phase": "seed_demand"}],
+        "issues": [{"code": "git_root_unavailable", "phase": "seed_resolution"}],
         "summary": {"requested_seeds": 1, "resolved_seeds": 0, "returned_files": 0},
     }, payload={"scope": "paths", "paths": [str(fixture_file)]})
     checks["actual_non_git_structure_shape"] = structured_removed_evidence(

@@ -78,15 +78,11 @@ enum ToolArgsDTOs {
     }
 
     struct CodeStructureArgs: Decodable {
-        let scope: String?
         let paths: [String]?
-        let maxResults: Int?
-
-        enum CodingKeys: String, CodingKey {
-            case scope
-            case paths
-            case maxResults = "max_results"
-        }
+        let expand: String?
+        let depth: Int?
+        let signatures: Bool?
+        let maxTokens: Int?
     }
 
     struct ManageSelectionArgs: Decodable {
