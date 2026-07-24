@@ -11792,7 +11792,13 @@ extension WorkspaceFilesViewModel {
         guard standardizedPath.hasPrefix("/") else { return false }
 
         let fileURL = URL(fileURLWithPath: standardizedPath)
-        return NSWorkspace.shared.open(fileURL)
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open(fileURL, configuration: configuration) { _, error in
+            if let error {
+                print("Unable to open file: \(standardizedPath): \(error)")
+            }
+        }
+        return true
     }
 
     @MainActor

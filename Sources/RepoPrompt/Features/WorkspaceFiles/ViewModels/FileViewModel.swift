@@ -992,9 +992,11 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
     func openInDefaultApp() {
         let fileURL = URL(fileURLWithPath: standardizedFullPath)
-        let opened = NSWorkspace.shared.open(fileURL)
-        if !opened {
-            print("Unable to open file: \(standardizedFullPath)")
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open(fileURL, configuration: configuration) { _, error in
+            if let error {
+                print("Unable to open file: \(self.standardizedFullPath): \(error)")
+            }
         }
     }
 
