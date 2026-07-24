@@ -182,7 +182,6 @@ struct AgentRunMCPToolService {
         _ target: AgentModeViewModel.MCPSessionTarget,
         _ message: String,
         _ metadata: RequestMetadata,
-        _ bindCurrentRequestToTab: @escaping AgentExternalMCPRunStarter.BindCurrentRequestToTab,
         _ agentModeVM: AgentModeViewModel,
         _ agentRaw: String?,
         _ modelRaw: String?,
@@ -246,7 +245,6 @@ struct AgentRunMCPToolService {
     var validateSpawnRouting: (_ metadata: RequestMetadata, _ sourceTabID: UUID?) async throws -> Void = { _, _ in }
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     var resolveSpawnParentSessionIDFromSourceTabID: ((_ sourceTabID: UUID, _ targetWindow: WindowState) async -> UUID?)?
-    let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
     var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> UUID? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
@@ -642,7 +640,6 @@ struct AgentRunMCPToolService {
                 target,
                 message,
                 metadata,
-                bindCurrentRequestToTab,
                 agentModeVM,
                 selection.agentRaw,
                 selection.modelRaw,

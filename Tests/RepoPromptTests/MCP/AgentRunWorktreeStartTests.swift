@@ -1265,6 +1265,9 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             parentSessionID: nil
         )
         let targetSessionID = try XCTUnwrap(target.sessionID)
+        let modelRawBeforeConfiguration = "unconfigured-starter-ordering-model"
+        viewModel.session(for: target.tabID).selectedModelRaw = modelRawBeforeConfiguration
+        let orderingRecorder = StarterOrderingRecorder()
         let source = AgentRunOracleReviewSource.captured(.init(
             sourceTabID: sourceTabID,
             workspaceID: workspaceID,
@@ -1278,7 +1281,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             sourceWorktreeBindings: []
         ))
 
-        _ = try await AgentExternalMCPRunStarter.start(
+        _ = try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
             target: target,
             message: "Review the frozen source.",
             metadata: .init(
@@ -1287,15 +1290,29 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 windowID: window.windowID,
                 runPurpose: .unknown
             ),
-            bindCurrentRequestToTab: { _, _ in },
+            bindCurrentRequestToTab: { tabID, _ in
+                let configuredModelRaw = await MainActor.run {
+                    viewModel.session(for: tabID).selectedModelRaw
+                }
+                XCTAssertNotEqual(configuredModelRaw, modelRawBeforeConfiguration)
+                await orderingRecorder.record(.configuration)
+                await orderingRecorder.record(.requestBindingPolicy)
+            },
             agentModeVM: viewModel,
             agentRaw: nil,
             modelRaw: nil,
             reasoningEffortRaw: nil,
             expectedParentSessionID: nil,
             oracleReviewSource: source,
-            dispatchInstruction: { _, _, _, _, _ in .startedRun }
+            dispatchInstruction: { _, _, _, _, _ in
+                let eventsBeforeDispatch = await orderingRecorder.recordedEvents()
+                XCTAssertEqual(eventsBeforeDispatch, [.configuration, .requestBindingPolicy])
+                await orderingRecorder.record(.dispatch)
+                return .startedRun
+            }
         )
+        let orderingEvents = await orderingRecorder.recordedEvents()
+        XCTAssertEqual(orderingEvents, [.configuration, .requestBindingPolicy, .dispatch])
 
         let runID = UUID()
         let delegated = try XCTUnwrap(
@@ -4619,6 +4636,24 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         case cancellation
     }
 
+    private actor StarterOrderingRecorder {
+        enum Event: Equatable {
+            case configuration
+            case requestBindingPolicy
+            case dispatch
+        }
+
+        private var events: [Event] = []
+
+        func record(_ event: Event) {
+            events.append(event)
+        }
+
+        func recordedEvents() -> [Event] {
+            events
+        }
+    }
+
     private final class WorktreeTransitionRecorder {
         struct Observation {
             let sessionID: UUID
@@ -4687,9 +4722,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             requireTargetWindow: { window },
             resolveSpawnSourceTabID: { _ in sourceTabID },
             resolveSpawnParentSessionID: { _, _ in nil },
-            bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, message, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
+            startRun: { target, message, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Test explore target did not resolve a session ID.")
                 }
@@ -4771,9 +4805,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             resolveRequestedTabID: { _ in nil },
             resolveSpawnParentSourceTabID: { _ in sourceTabID },
             resolveSpawnParentSessionID: { _, _ in fallbackParentSessionID },
-            bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, _, _ in
+            startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Test start target did not resolve a session ID.")
                 }

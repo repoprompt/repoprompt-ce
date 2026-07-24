@@ -132,7 +132,7 @@ actor CodexAppServerClient {
         let commandName: String
         let additionalPathHints: [String]
         let enableDebugLogging: Bool
-        let requestTimeout: TimeInterval?
+        private(set) var requestTimeout: TimeInterval?
         /// Launch directory for the Codex app-server process. Distinct from the thread/turn
         /// execution cwd, which the controller sends per request.
         /// When nil, falls back to temp directory via CLIProcessConfiguration default.
@@ -159,6 +159,10 @@ actor CodexAppServerClient {
             self.processLaunchDirectory = processLaunchDirectory
             self.processFeaturePolicy = processFeaturePolicy
             self.processModelReasoningSummary = processModelReasoningSummary
+        }
+
+        mutating func replaceRequestTimeout(_ timeout: TimeInterval?) {
+            requestTimeout = timeout
         }
 
         mutating func replaceProcessLaunchDirectory(_ path: String?) {
@@ -352,7 +356,7 @@ actor CodexAppServerClient {
 
     private static func shouldPoisonTransportOnTimeout(method: String) -> Bool {
         switch method {
-        case "thread/start", "thread/resume":
+        case "initialize", "thread/start", "thread/resume":
             true
         default:
             false
@@ -439,6 +443,12 @@ actor CodexAppServerClient {
     func updateConfig(_ config: Config) {
         self.config = config
         preparedRuntimeLaunchContext = nil
+    }
+
+    /// Updates only the default JSON-RPC request deadline. Unlike whole-config replacement,
+    /// this does not invalidate the already prepared runtime launch context.
+    func updateDefaultRequestTimeout(_ timeout: TimeInterval?) {
+        config.replaceRequestTimeout(timeout)
     }
 
     /// Resolves the process environment and Codex runtime once for this client lifetime.

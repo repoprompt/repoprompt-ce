@@ -582,9 +582,6 @@ final class MCPServerViewModel: ObservableObject {
             resolveSpawnParentSessionIDFromSourceTabID: { sourceTabID, targetWindow in
                 targetWindow.agentModeViewModel.mcpSpawnParentSessionID(sourceTabID: sourceTabID)
             },
-            bindCurrentRequestToTab: { [self] tabID, metadata in
-                try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
-            },
             withHeartbeat: { [self] connectionID, tool, stage, message, operation in
                 try await withHeartbeat(
                     connectionID: connectionID,
@@ -600,12 +597,11 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
-                try await AgentExternalMCPRunStarter.start(
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
+                try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
                     target: target,
                     message: message,
                     metadata: metadata,
-                    bindCurrentRequestToTab: bindCurrentRequestToTab,
                     agentModeVM: agentModeVM,
                     agentRaw: agentRaw,
                     modelRaw: modelRaw,
@@ -841,9 +837,6 @@ final class MCPServerViewModel: ObservableObject {
             resolveSpawnParentSessionID: { [self] metadata, targetWindow in
                 await resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
             },
-            bindCurrentRequestToTab: { [self] tabID, metadata in
-                try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
-            },
             withHeartbeat: { [self] connectionID, tool, stage, message, operation in
                 try await withHeartbeat(
                     connectionID: connectionID,
@@ -859,12 +852,14 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
-                try await AgentExternalMCPRunStarter.start(
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
+                try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
                     target: target,
                     message: message,
                     metadata: metadata,
-                    bindCurrentRequestToTab: bindCurrentRequestToTab,
+                    bindCurrentRequestToTab: { tabID, requestMetadata in
+                        try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: requestMetadata)
+                    },
                     agentModeVM: agentModeVM,
                     agentRaw: agentRaw,
                     modelRaw: modelRaw,
