@@ -11,6 +11,10 @@ FORMAT_TOOLS_DIR="${REPOPROMPT_FORMAT_TOOLS_DIR:-$ROOT_DIR/.build/format-tools}"
 MANAGED_SWIFTFORMAT_DIR="$FORMAT_TOOLS_DIR/swiftformat/$SWIFTFORMAT_REQUIRED_VERSION"
 MANAGED_SWIFTFORMAT_PATH="$MANAGED_SWIFTFORMAT_DIR/swiftformat"
 TEMP_DIR=""
+FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS:-10}"
+FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS="${REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS:-120}"
+FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS="${REPOPROMPT_FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS:-300}"
+FORMAT_DOWNLOAD_ATTEMPTS=4
 
 cleanup(){
     if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
@@ -52,6 +56,20 @@ EOF
 done
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+validate_bounded_positive_integer(){
+    local name="$1" value="$2" maximum="$3"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer"
+    (( value <= maximum )) || fail "$name must not exceed $maximum seconds"
+}
+validate_download_bounds(){
+    validate_bounded_positive_integer REPOPROMPT_FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS "$FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" 60
+    validate_bounded_positive_integer REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS "$FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" 300
+    validate_bounded_positive_integer REPOPROMPT_FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS "$FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS" 600
+    (( FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS <= FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
+    (( FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS <= FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS must not exceed REPOPROMPT_FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS"
+}
 has_tool(){ command -v "$1" >/dev/null 2>&1; }
 
 swiftformat_version_at(){
@@ -153,10 +171,39 @@ require_install_tool(){
     has_tool "$1" || fail "Missing required installer tool: $1."
 }
 
+download_swiftformat_archive(){
+    local archive="$1"
+    local started now remaining attempt_timeout connect_timeout attempt curl_status=28
+    started="$(date +%s)"
+    for ((attempt = 1; attempt <= FORMAT_DOWNLOAD_ATTEMPTS; attempt++)); do
+        now="$(date +%s)"
+        remaining=$((FORMAT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS - (now - started)))
+        (( remaining > 0 )) || break
+        attempt_timeout="$FORMAT_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
+        (( attempt_timeout <= remaining )) || attempt_timeout="$remaining"
+        connect_timeout="$FORMAT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS"
+        (( connect_timeout <= attempt_timeout )) || connect_timeout="$attempt_timeout"
+        if curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$attempt_timeout" \
+            --silent --show-error \
+            "$SWIFTFORMAT_ARCHIVE_URL" \
+            --output "$archive"
+        then
+            return 0
+        else
+            curl_status=$?
+        fi
+    done
+    return "$curl_status"
+}
+
 install_authoritative_swiftformat(){
     local archive extracted_path actual_sha installed_version destination_tmp tool
 
-    for tool in curl shasum unzip awk mktemp mkdir cp chmod mv rm; do
+    validate_download_bounds
+
+    for tool in curl date shasum unzip awk mktemp mkdir cp chmod mv rm; do
         require_install_tool "$tool"
     done
 
@@ -164,9 +211,8 @@ install_authoritative_swiftformat(){
     archive="$TEMP_DIR/swiftformat.zip"
 
     echo "Installing SwiftFormat $SWIFTFORMAT_REQUIRED_VERSION from the verified official release..."
-    curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --silent --show-error \
-        "$SWIFTFORMAT_ARCHIVE_URL" \
-        --output "$archive"
+    download_swiftformat_archive "$archive" ||
+        fail "Unable to download SwiftFormat within the configured total deadline"
 
     actual_sha="$(shasum -a 256 "$archive" | awk '{print $1}')"
     if [[ "$actual_sha" != "$SWIFTFORMAT_ARCHIVE_SHA256" ]]; then
