@@ -137,11 +137,11 @@ final class TooltipOverlayController {
             owner.removeChildWindow(w)
         }
 
-        // Remove notification observer
-        if let token = ownerWillCloseObserver {
+        // Remove notification observers
+        for token in ownerLifecycleObservers {
             NotificationCenter.default.removeObserver(token)
-            ownerWillCloseObserver = nil
         }
+        ownerLifecycleObservers.removeAll()
 
         win = nil
         owner = nil
@@ -158,7 +158,7 @@ final class TooltipOverlayController {
     private var cachedPlacement: TooltipPlacement = .top
     private var cachedPreset: FontScalePreset?
 
-    private var ownerWillCloseObserver: NSObjectProtocol?
+    private var ownerLifecycleObservers: [NSObjectProtocol] = []
 
     /// Distance (in points) between the tooltip bubble and its anchor view.
     /// Kept small to avoid a large visual gap; still multiplied by
@@ -178,15 +178,22 @@ final class TooltipOverlayController {
         // This avoids hierarchy issues with menus
         win = tooltipWindow
 
-        ownerWillCloseObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification,
-            object: owner,
-            queue: .main
-        ) // ensure main thread
-            { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.hide()
+        for notification in [
+            NSWindow.willCloseNotification,
+            NSWindow.didResignKeyNotification,
+            NSWindow.didMoveNotification
+        ] {
+            ownerLifecycleObservers.append(
+                NotificationCenter.default.addObserver(
+                    forName: notification,
+                    object: owner,
+                    queue: .main
+                ) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        self?.hide()
+                    }
                 }
+            )
         }
     }
 
