@@ -10,7 +10,7 @@ import Foundation
     }
 
     enum CodemapFullLoadRootState: String, Equatable {
-        case proofComplete = "proof_complete"
+        case ready
         case terminalIneligible = "terminal_ineligible"
         case excluded
         case pending
@@ -38,12 +38,12 @@ import Foundation
         let state: CodemapFullLoadRootState
         let reason: String?
         let launchPhase: String?
-        let projectionPhase: String?
+        let graphIndexPhase: String?
         let supportedCandidateCount: UInt64?
         let processedCandidateCount: UInt64?
         let terminalCount: UInt64?
-        let lastSegmentSequence: UInt64?
-        let coverageCompletedUptimeNanoseconds: UInt64?
+        let lastGraphChangeSequence: UInt64?
+        let readyUptimeNanoseconds: UInt64?
         let metrics: [String: UInt64]
         let resources: [String: UInt64]
         let queueWaitMilliseconds: [UInt64]
@@ -56,7 +56,7 @@ import Foundation
         let sampledUptimeNanoseconds: UInt64
         let visibleRootCount: Int
         let eligibleRootCount: Int
-        let proofCompleteRootCount: Int
+        let readyRootCount: Int
         let terminalIneligibleRootCount: Int
         let excludedRootCount: Int
         let pendingRootCount: Int
@@ -157,14 +157,14 @@ import Foundation
             if roots.contains(where: { $0.state == .failed }) {
                 return .failed
             }
-            if roots.allSatisfy({ $0.state == .proofComplete || $0.state == .terminalIneligible || $0.state == .excluded }) {
+            if roots.allSatisfy({ $0.state == .ready || $0.state == .terminalIneligible || $0.state == .excluded }) {
                 return .ready
             }
             return .pending
         }
 
         static func cohort(metrics: [String: UInt64]) -> String {
-            if (metrics["projection_builds_started"] ?? 0) > 0 ||
+            if (metrics["graph_index_artifact_builds_started"] ?? 0) > 0 ||
                 (metrics["materializations"] ?? 0) > 0
             {
                 return "cold-build"
@@ -175,8 +175,8 @@ import Foundation
             {
                 return "reuse-partial"
             }
-            let candidates = metrics["projection_catalog_candidates"] ?? 0
-            if candidates > 0, (metrics["projection_envelope_hits"] ?? 0) >= candidates {
+            let candidates = metrics["graph_index_catalog_candidates"] ?? 0
+            if candidates > 0, (metrics["graph_index_envelope_hits"] ?? 0) >= candidates {
                 return "warm-envelope"
             }
             return "mixed"
@@ -245,7 +245,7 @@ import Foundation
             return sorted[min(rank - 1, sorted.count - 1)]
         }
 
-        static func projectionPhaseName(_ phase: WorkspaceCodemapProjectionPreloadPhase) -> String {
+        static func graphIndexPhaseName(_ phase: WorkspaceCodemapGraphIndexPhase) -> String {
             switch phase {
             case .scheduled: "scheduled"
             case .waitingForAdmission: "waiting_for_admission"
@@ -254,7 +254,7 @@ import Foundation
             case .classifyingBatch: "classifying_batch"
             case .resolvingArtifacts: "resolving_artifacts"
             case .writingManifestCheckpoint: "writing_manifest_checkpoint"
-            case .publishingProjectionSegment: "publishing_projection_segment"
+            case .publishingGraphChanges: "publishing_graph_changes"
             case .checkpointed: "checkpointed"
             case .suspendedBusy: "suspended_busy"
             case .budgetLimited: "budget_limited"
@@ -264,7 +264,7 @@ import Foundation
             }
         }
 
-        static func launchPhaseName(_ phase: WorkspaceCodemapProjectionPreloadLaunchPhase) -> String {
+        static func launchPhaseName(_ phase: WorkspaceCodemapGraphIndexLaunchPhase) -> String {
             switch phase {
             case .notScheduled: "not_scheduled"
             case .eligibilityQueued: "eligibility_queued"
@@ -297,22 +297,24 @@ import Foundation
                 "materialized_bytes": counters.materializedBytes,
                 "validated_worktree_reads": counters.validatedWorktreeReads,
                 "validated_worktree_bytes": counters.validatedWorktreeBytes,
-                "projection_envelope_hits": counters.projectionEnvelopeHits,
-                "projection_envelope_stale": counters.projectionEnvelopeStale,
-                "projection_envelope_invalid": counters.projectionEnvelopeInvalid,
-                "projection_locator_misses": counters.projectionLocatorMisses,
-                "projection_locator_corruptions": counters.projectionLocatorCorruptions,
-                "projection_cas_misses": counters.projectionCASMisses,
-                "projection_builds_joined": counters.projectionBuildsJoined,
-                "projection_builds_started": counters.projectionBuildsStarted,
-                "projection_builds_completed": counters.projectionBuildsCompleted,
-                "projection_catalog_pages": counters.projectionCatalogPages,
-                "projection_catalog_candidates": counters.projectionCatalogCandidates,
-                "projection_catalog_path_bytes": counters.projectionCatalogPathBytes,
-                "projection_segments_published": counters.projectionSegmentsPublished,
-                "projection_segment_bytes": counters.projectionSegmentBytes,
-                "projection_retries": counters.projectionRetries,
-                "projection_budget_rejections": counters.projectionBudgetRejections,
+                "graph_index_runs_scheduled": counters.graphIndexRunsScheduled,
+                "graph_index_runs_started": counters.graphIndexRunsStarted,
+                "graph_index_envelope_hits": counters.graphIndexEnvelopeHits,
+                "graph_index_envelope_stale": counters.graphIndexEnvelopeStale,
+                "graph_index_envelope_invalid": counters.graphIndexEnvelopeInvalid,
+                "graph_index_locator_misses": counters.graphIndexLocatorMisses,
+                "graph_index_locator_corruptions": counters.graphIndexLocatorCorruptions,
+                "graph_index_cas_misses": counters.graphIndexCASMisses,
+                "graph_index_artifact_builds_joined": counters.graphIndexArtifactBuildsJoined,
+                "graph_index_artifact_builds_started": counters.graphIndexArtifactBuildsStarted,
+                "graph_index_artifact_builds_completed": counters.graphIndexArtifactBuildsCompleted,
+                "graph_index_catalog_pages": counters.graphIndexCatalogPages,
+                "graph_index_catalog_candidates": counters.graphIndexCatalogCandidates,
+                "graph_index_catalog_path_bytes": counters.graphIndexCatalogPathBytes,
+                "graph_index_changes_published": counters.graphIndexChangesPublished,
+                "graph_index_change_bytes": counters.graphIndexChangeBytes,
+                "graph_index_retries": counters.graphIndexRetries,
+                "graph_index_budget_rejections": counters.graphIndexBudgetRejections,
                 "manifest_writes": counters.manifestWrites,
                 "manifest_failures": counters.manifestFailures,
                 "failures": counters.failures
@@ -320,11 +322,11 @@ import Foundation
         }
 
         static func resources(_ accounting: WorkspaceCodemapBindingEngineAccounting) -> [String: UInt64] {
-            let resources = accounting.projectionResources
+            let resources = accounting.graphIndexResources
             return [
                 "retained_path_bytes": resources.retainedPathBytes,
                 "retained_source_bytes": resources.retainedSourceBytes,
-                "retained_projection_bytes": resources.retainedProjectionBytes,
+                "retained_graph_index_bytes": resources.retainedGraphIndexBytes,
                 "staged_graph_bytes": resources.stagedGraphBytes,
                 "resident_graph_bytes": resources.residentGraphBytes,
                 "queued_manifest_mutation_bytes": resources.queuedManifestMutationBytes
@@ -341,12 +343,12 @@ import Foundation
                 "state": root.state.rawValue,
                 "reason": root.reason ?? NSNull(),
                 "launch_phase": root.launchPhase ?? NSNull(),
-                "projection_phase": root.projectionPhase ?? NSNull(),
+                "graph_index_phase": root.graphIndexPhase ?? NSNull(),
                 "supported_candidate_count": root.supportedCandidateCount ?? NSNull(),
                 "processed_candidate_count": root.processedCandidateCount ?? NSNull(),
                 "terminal_count": root.terminalCount ?? NSNull(),
-                "last_segment_sequence": root.lastSegmentSequence ?? NSNull(),
-                "coverage_completed_uptime_ns": root.coverageCompletedUptimeNanoseconds ?? NSNull(),
+                "last_graph_change_sequence": root.lastGraphChangeSequence ?? NSNull(),
+                "ready_uptime_ns": root.readyUptimeNanoseconds ?? NSNull(),
                 "metrics": root.metrics,
                 "resources": root.resources,
                 "queue_wait_ms": root.queueWaitMilliseconds,

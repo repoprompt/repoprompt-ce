@@ -532,125 +532,42 @@ extension MCPServerViewModel {
             _ coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
         ) -> [UUID: CodemapIssueDisposition] {
             var dispositions: [UUID: CodemapIssueDisposition] = [:]
-
-            func merged(
-                _ existing: CodemapIssueDisposition?,
-                _ next: CodemapIssueDisposition
-            ) -> CodemapIssueDisposition {
-                guard let existing else { return next }
-                switch (existing, next) {
-                case (.unmapped(terminal: true), _), (_, .unmapped(terminal: true)):
-                    return .unmapped(terminal: true)
-                case (.pending, _), (_, .pending):
-                    return .pending
-                case (.unmapped, .unmapped):
-                    return .unmapped(terminal: false)
-                }
-            }
-
             func record(_ fileID: UUID, _ disposition: CodemapIssueDisposition) {
-                dispositions[fileID] = merged(dispositions[fileID], disposition)
+                let existing = dispositions[fileID]
+                switch (existing, disposition) {
+                case (.unmapped(terminal: true), _), (_, .unmapped(terminal: true)):
+                    dispositions[fileID] = .unmapped(terminal: true)
+                case (.pending, _), (_, .pending):
+                    dispositions[fileID] = .pending
+                default:
+                    dispositions[fileID] = disposition
+                }
             }
-
-            func recordPending(_ fileID: UUID) {
-                record(fileID, .pending)
+            let issues: [WorkspaceCodemapAutomaticSelectionIssue] = switch coverage {
+            case .ok: []
+            case let .partial(value), let .pending(value), let .unavailable(value): value
             }
-
-            func recordUnavailable(
-                _ fileID: UUID,
-                _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
-            ) {
-                record(fileID, unavailableDisposition(reason))
-            }
-
-            func recordSourceIssue(_ issue: WorkspaceCodemapAutomaticSelectionSourceIssue) {
+            for issue in issues {
                 switch issue {
-                case let .outsideRootScope(source):
+                case let .sourceOutsideRootScope(source), let .sourceExcluded(source),
+                     let .sourceFenced(source):
                     record(source.fileID, .unmapped(terminal: true))
-                case let .notCataloged(source), let .notDemanded(source),
-                     let .staleCatalogGeneration(source, _):
-                    recordPending(source.fileID)
-                case let .pending(source, _):
-                    recordPending(source.fileID)
-                case let .unavailable(source, reason):
-                    recordUnavailable(source.fileID, reason)
-                }
-            }
-
-            func recordTargetIssue(_ issue: WorkspaceCodemapAutomaticSelectionTargetIssue) {
-                switch issue {
-                case let .notCataloged(_, fileID), let .staleGeneration(_, fileID, _):
-                    recordPending(fileID)
-                case let .logicalPathUnavailable(_, fileID):
+                case let .sourceNotCataloged(source), let .sourcePending(source),
+                     let .sourceNotIndexed(source), let .sourceGenerationChanged(source, _):
+                    record(source.fileID, .pending)
+                case let .targetNotCataloged(_, fileID), let .targetGenerationChanged(_, fileID),
+                     let .targetDemandPending(_, fileID):
+                    record(fileID, .pending)
+                case let .targetLogicalPathUnavailable(_, fileID):
                     record(fileID, .unmapped(terminal: true))
-                }
-            }
-
-            func recordPartialReason(_ reason: WorkspaceCodemapAutomaticSelectionPartialReason) {
-                switch reason {
-                case .graph:
-                    break
-                case let .source(issue):
-                    recordSourceIssue(issue)
-                case let .sourceDemandTimedOut(source):
-                    recordPending(source.fileID)
-                case let .candidateUnavailable(_, fileID, reason):
-                    recordUnavailable(fileID, reason)
-                }
-            }
-
-            func recordPendingReason(_ reason: WorkspaceCodemapAutomaticSelectionPendingReason) {
-                switch reason {
-                case let .sourceDemand(source, _), let .sourceBusy(source, _):
-                    recordPending(source.fileID)
-                case let .candidateDemand(_, fileID, _), let .candidateBusy(_, fileID, _):
-                    recordPending(fileID)
-                case .manifestAdmission, .graphRebuild:
+                case let .targetDemandUnavailable(_, fileID, reason):
+                    record(fileID, unavailableDisposition(reason))
+                case .emptySources, .rootEpochChanged, .rootScopeChanged, .graphNotInitialized,
+                     .updatesPending, .reconciling, .graphUnavailable, .graphRevoked,
+                     .receiptInvalid, .budget:
                     break
                 }
             }
-
-            func recordUnavailableReason(_ reason: WorkspaceCodemapAutomaticSelectionUnavailableReason) {
-                switch reason {
-                case .noReadySources, .graph:
-                    break
-                case let .candidate(_, fileID, reason):
-                    recordUnavailable(fileID, reason)
-                }
-            }
-
-            func recordStaleReason(_ reason: WorkspaceCodemapAutomaticSelectionStaleReason) {
-                switch reason {
-                case let .sourceStateChanged(source), let .sourceCatalogGeneration(source, _):
-                    recordPending(source.fileID)
-                case let .targetStateChanged(issue):
-                    recordTargetIssue(issue)
-                case .rootEpochNotCurrent, .rootScopeChanged, .coverageProof, .graph,
-                     .publicationReceipt:
-                    break
-                }
-            }
-
-            switch coverage {
-            case .complete:
-                break
-            case let .partial(_, reasons):
-                reasons.forEach(recordPartialReason)
-            case let .provisional(_, pending, partial):
-                pending.forEach(recordPendingReason)
-                partial.forEach(recordPartialReason)
-            case .incomplete:
-                break
-            case let .pending(reasons):
-                reasons.forEach(recordPendingReason)
-            case let .unavailable(reason):
-                recordUnavailableReason(reason)
-            case let .stale(reason):
-                recordStaleReason(reason)
-            case .busy, .budget:
-                break
-            }
-
             return dispositions
         }
 

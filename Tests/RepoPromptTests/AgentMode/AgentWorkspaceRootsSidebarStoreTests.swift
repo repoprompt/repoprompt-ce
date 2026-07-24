@@ -63,94 +63,6 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         }
     }
 
-    func testRowsMapCompactCodemapProgressAndUnavailableState() {
-        let rootA = makeProjection(name: "A", path: "/tmp/A")
-        let rootB = makeProjection(name: "B", path: "/tmp/B")
-        let snapshots = [
-            rootA.id: WorkspaceCodemapRootStatusSnapshot(
-                rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
-                state: .generating,
-                processedCandidateCount: 7,
-                totalCandidateCount: 12
-            ),
-            rootB.id: WorkspaceCodemapRootStatusSnapshot(
-                rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootB.id, rootLifetimeID: UUID()),
-                state: .unavailable,
-                processedCandidateCount: 0,
-                totalCandidateCount: nil
-            )
-        ]
-
-        let rows = AgentWorkspaceRootsSidebarStore.rows(
-            from: [rootA, rootB],
-            codemapStatusLookup: { snapshots[$0] }
-        )
-
-        XCTAssertEqual(rows[0].codemap.state, .mapping)
-        XCTAssertEqual(rows[0].codemap.percentageText, "58%")
-        XCTAssertTrue(rows[0].codemap.canToggle)
-        XCTAssertEqual(rows[1].codemap.state, .unavailable)
-        XCTAssertNil(rows[1].codemap.progressFraction)
-        XCTAssertFalse(rows[1].codemap.canToggle)
-
-        let localOnly = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
-            state: .generating,
-            processedCandidateCount: 0,
-            locallyResolvedCandidateCountThroughRoot: 17,
-            totalCandidateCount: 64
-        ))
-        XCTAssertEqual(localOnly.processedCandidateCount, 0)
-        XCTAssertEqual(localOnly.displayProcessedCandidateCount, 17)
-        XCTAssertEqual(localOnly.percentageText, "26%")
-        XCTAssertEqual(localOnly.progressFraction ?? 0, 17.0 / 64.0, accuracy: 0.000_001)
-        XCTAssertTrue(localOnly.tooltip.contains("processed for mapping"))
-
-        let belowOnePercent = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
-            state: .generating,
-            processedCandidateCount: 1,
-            totalCandidateCount: 1000
-        ))
-        XCTAssertEqual(belowOnePercent.progressFraction ?? 0, 0.001, accuracy: 0.000_001)
-        XCTAssertEqual(belowOnePercent.percentageText, "<1%")
-        XCTAssertEqual(belowOnePercent.statusText, "Mapping <1%")
-
-        let acceptedAndLocal = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
-            state: .generating,
-            processedCandidateCount: 12,
-            locallyResolvedCandidateCountThroughRoot: 17,
-            totalCandidateCount: 64
-        ))
-        XCTAssertEqual(acceptedAndLocal.displayProcessedCandidateCount, 17)
-
-        let locallyResolvedAll = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
-            state: .generating,
-            processedCandidateCount: 0,
-            locallyResolvedCandidateCountThroughRoot: 64,
-            totalCandidateCount: 64
-        ))
-        XCTAssertEqual(locallyResolvedAll.progressFraction, 0.99)
-        XCTAssertEqual(locallyResolvedAll.percentageText, "99%")
-
-        let nearlyComplete = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
-            state: .generating,
-            processedCandidateCount: 199,
-            totalCandidateCount: 200
-        ))
-        XCTAssertEqual(nearlyComplete.percentageText, "99%")
-        let complete = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
-            state: .ready,
-            processedCandidateCount: 200,
-            totalCandidateCount: 200
-        ))
-        XCTAssertEqual(complete.percentageText, "100%")
-    }
-
     func testRowsAttachGitContextByStandardizedRootPathWithoutChangingOrder() {
         let rootA = makeProjection(name: "A", path: "/tmp/A")
         let rootB = makeProjection(name: "B", path: "/tmp/B")
@@ -196,23 +108,89 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(store.rootRows.map(\.id), [rootB.id])
     }
 
+    func testPresentationMapsEveryGraphNativeAvailabilityState() {
+        let expected: [(WorkspaceCodemapRootAvailability, AgentWorkspaceCodemapPresentation.State)] = [
+            (.notInitialized, .notInitialized),
+            (.indexing, .indexing),
+            (.ready, .ready),
+            (.updating, .updating),
+            (.reconciling, .reconciling),
+            (.unavailable, .unavailable),
+            (.revoked, .revoked)
+        ]
+
+        for (availability, state) in expected {
+            XCTAssertEqual(
+                AgentWorkspaceCodemapPresentation.make(snapshot(availability: availability)).state,
+                state
+            )
+        }
+    }
+
+    func testSuspensionOverridesAvailabilityWithoutDestroyingGraphObservability() {
+        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot(
+            availability: .updating,
+            suspended: true,
+            updatesPending: true,
+            graphRevision: 9
+        ))
+
+        XCTAssertEqual(presentation.state, .paused)
+        XCTAssertTrue(presentation.updatesPending)
+        XCTAssertEqual(presentation.graphRevision, 9)
+        XCTAssertTrue(presentation.canToggle)
+    }
+
+    func testCoverageAndPendingUpdatesDriveProgressAndStatus() throws {
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        let coverage = try XCTUnwrap(try? WorkspaceCodemapGraphCatalogCoverage.validated(
+            rootEpoch: rootEpoch,
+            catalogWatermark: WorkspaceCodemapGraphIndexCatalogToken(
+                rootEpoch: rootEpoch,
+                topologyGeneration: 1,
+                appliedIndexGeneration: 1,
+                catalogGeneration: 1,
+                ingressGeneration: 1,
+                graphIndexInvalidationGeneration: 1
+            ),
+            enumerationState: .partial,
+            supportedCount: 10,
+            classifiedCount: 6,
+            pendingCount: 4,
+            contributedCount: 6,
+            emptyCount: 0,
+            terminalArtifactCount: 0,
+            terminalExcludedCount: 0
+        ).get())
+        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .updating,
+            coverage: coverage,
+            updatesPending: true,
+            graphRevision: 12
+        ))
+
+        XCTAssertEqual(presentation.state, .updating)
+        XCTAssertEqual(presentation.classifiedCount, 6)
+        XCTAssertEqual(presentation.supportedCount, 10)
+        XCTAssertEqual(presentation.pendingCount, 4)
+        XCTAssertEqual(presentation.percentageText, "60%")
+        XCTAssertEqual(presentation.statusText, "Updating 60%")
+        XCTAssertTrue(presentation.tooltip.contains("pending updates"))
+    }
+
     func testCodemapStatusNotificationsCoalesceRootRowResnapshots() async {
         let root = makeProjection(name: "A", path: "/tmp/A")
         let manager = makeWorkspaceManager()
         let codemapChanges = PassthroughSubject<Void, Never>()
         var lookupCount = 0
-        let snapshot = WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: root.id, rootLifetimeID: UUID()),
-            state: .generating,
-            processedCandidateCount: 1,
-            totalCandidateCount: 2
-        )
+        let status = snapshot(availability: .indexing)
         let store = AgentWorkspaceRootsSidebarStore(
             rootProjections: { [root] },
             rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
             codemapStatusLookup: { _ in
                 lookupCount += 1
-                return snapshot
+                return status
             },
             codemapStatusChanges: codemapChanges.eraseToAnyPublisher(),
             workspaceManager: manager,
@@ -225,31 +203,21 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         await waitUntil { lookupCount >= 2 }
 
         XCTAssertEqual(lookupCount, 2)
-        XCTAssertEqual(store.rootRows.first?.codemap.displayProcessedCandidateCount, 1)
+        XCTAssertEqual(store.rootRows.first?.codemap.state, .indexing)
     }
 
     func testCodemapToggleResnapshotsAuthoritativeStateBeforeClearingPending() async {
         let root = makeProjection(name: "A", path: "/tmp/A")
         let manager = makeWorkspaceManager()
-        var snapshot = WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: root.id, rootLifetimeID: UUID()),
-            state: .paused,
-            processedCandidateCount: 0,
-            totalCandidateCount: nil
-        )
+        var status = snapshot(availability: .ready, suspended: true)
         var actions: [(UUID, Bool)] = []
         let store = AgentWorkspaceRootsSidebarStore(
             rootProjections: { [root] },
             rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
-            codemapStatusLookup: { _ in snapshot },
+            codemapStatusLookup: { _ in status },
             setCodemapSuspended: { rootID, suspended in
                 actions.append((rootID, suspended))
-                snapshot = WorkspaceCodemapRootStatusSnapshot(
-                    rootEpoch: snapshot.rootEpoch,
-                    state: suspended ? .paused : .generating,
-                    processedCandidateCount: 0,
-                    totalCandidateCount: nil
-                )
+                status = self.snapshot(availability: .ready, suspended: suspended)
             },
             workspaceManager: manager,
             windowID: -1
@@ -564,6 +532,42 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
                 isMain: false
             ),
             "1a98df1a"
+        )
+    }
+
+    private func snapshot(
+        rootEpoch: WorkspaceCodemapRootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID()),
+        availability: WorkspaceCodemapRootAvailability,
+        suspended: Bool = false,
+        coverage: WorkspaceCodemapGraphCatalogCoverage? = nil,
+        updatesPending: Bool = false,
+        graphRevision: UInt64? = nil
+    ) -> WorkspaceCodemapRootStatusSnapshot {
+        WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: rootEpoch,
+            availability: availability,
+            isGenerationSuspended: suspended,
+            coverage: coverage,
+            graphRevision: graphRevision,
+            appliedGeneration: .init(rawValue: 3),
+            observedGeneration: .init(rawValue: updatesPending ? 4 : 3),
+            updatesPending: updatesPending,
+            reconciliationAttempt: availability == .reconciling ? 2 : nil,
+            reconciliationDeadlineUptimeNanoseconds: availability == .reconciling ? 50000 : nil,
+            commitCadence: WorkspaceCodemapGraphCommitCadence(
+                successfulCommitCount: 7,
+                resyncCommitCount: 1,
+                lastCommittedUptimeNanoseconds: 40000,
+                lastCommitIntervalMilliseconds: 25
+            ),
+            diagnostics: WorkspaceCodemapGraphRootDiagnostics(
+                rejectedApplyCount: 0,
+                fencedFileCount: 0,
+                activeApply: false,
+                safetyCounter: 8,
+                revocationReason: availability == .revoked ? .rootUnloaded : nil
+            ),
+            unavailableReason: availability == .unavailable ? .graphUnavailable : nil
         )
     }
 

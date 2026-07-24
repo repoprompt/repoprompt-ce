@@ -89,19 +89,19 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         }
     }
 
-    func testProjectionMutationKeepsAdmissionOrderAheadOfLaterSessionMutation() {
+    func testGraphIndexMutationKeepsAdmissionOrderAheadOfLaterSessionMutation() {
         var queue = WorkspaceCodemapManifestFIFO<ManifestQueueTestItem>()
-        queue.append(ManifestQueueTestItem(revision: 2, proof: .projection, byteCount: 1))
+        queue.append(ManifestQueueTestItem(revision: 2, proof: .graphIndex, byteCount: 1))
         queue.append(ManifestQueueTestItem(revision: 3, proof: .session, byteCount: 1))
         queue.append(ManifestQueueTestItem(revision: 4, proof: .session, byteCount: 1))
 
-        let projection = queue.popBatch(
+        let graphIndex = queue.popBatch(
             maximumItemCount: 64,
             maximumByteCount: 64,
             byteCount: { $0.byteCount },
             canAppend: ManifestQueueTestItem.compatible
         )
-        XCTAssertEqual(projection.map(\.revision), [2])
+        XCTAssertEqual(graphIndex.map(\.revision), [2])
 
         let sessions = queue.popBatch(
             maximumItemCount: 64,
@@ -113,15 +113,15 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
 
         queue.append(ManifestQueueTestItem(revision: 6, proof: .session, byteCount: 1))
         queue.prepend(contentsOf: [
-            ManifestQueueTestItem(revision: 5, proof: .projection, byteCount: 1)
+            ManifestQueueTestItem(revision: 5, proof: .graphIndex, byteCount: 1)
         ])
-        let retainedProjection = queue.popBatch(
+        let retainedGraphIndex = queue.popBatch(
             maximumItemCount: 64,
             maximumByteCount: 64,
             byteCount: { $0.byteCount },
             canAppend: ManifestQueueTestItem.compatible
         )
-        XCTAssertEqual(retainedProjection.map(\.revision), [5])
+        XCTAssertEqual(retainedGraphIndex.map(\.revision), [5])
         XCTAssertEqual(queue.first?.revision, 6)
     }
 
@@ -146,8 +146,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 )
             ),
             policy: WorkspaceCodemapBindingEnginePolicy(
-                maximumQueuedProjectionManifestMutationByteCountPerRoot: 1,
-                maximumQueuedProjectionManifestMutationByteCount: 1
+                maximumQueuedGraphIndexManifestMutationByteCountPerRoot: 1,
+                maximumQueuedGraphIndexManifestMutationByteCount: 1
             ),
             hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
         )
@@ -1519,7 +1519,7 @@ private actor ManifestRetryStepper {
 private struct ManifestQueueTestItem: Equatable {
     enum Proof: Equatable {
         case session
-        case projection
+        case graphIndex
     }
 
     let revision: UInt64

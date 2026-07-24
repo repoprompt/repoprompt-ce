@@ -703,56 +703,38 @@ enum MCPCommandParser {
             args["mode"] = UncheckedSendableValue(mode)
             return .aliasCall(toolName: "get_file_tree", args: args)
 
-        // Code structure: structure <path> [path2] ... [--scope paths|selected]
+        // Code structure: structure [path ...] [--expand uses|used_by|both] [--depth 1...4]
+        // Omitting paths targets the current selection.
         case "structure", "struct", "map":
             let remaining = Array(parts.dropFirst())
             let flags = parseFlagArgs(remaining)
 
             var args: [String: UncheckedSendableValue] = [:]
-            let scope = (flags["scope"] ?? flags["s"] ?? "paths").lowercased()
-            args["scope"] = UncheckedSendableValue(scope)
-
             var paths = flags.positional.map { ctx.resolveWorkspacePathArg($0) }
             if let pathsArg = flags["paths"] ?? flags["path"] ?? flags["p"] {
                 paths.append(contentsOf: pathsArg.split(separator: ",").map {
                     ctx.resolveWorkspacePathArg(String($0).trimmingCharacters(in: .whitespaces))
                 })
             }
-            if scope == "selected" {
-                guard paths.isEmpty else {
-                    throw CommandParseError.invalidArgument("paths are forbidden with --scope selected")
-                }
-            } else if paths.isEmpty {
-                throw CommandParseError.missingArgument("file or directory path (or use --scope selected)")
-            } else {
+            if !paths.isEmpty {
                 args["paths"] = UncheckedSendableValue(paths)
             }
 
-            if let direction = flags["direction"] ?? flags["expand"] {
-                var expand: [String: UncheckedSendableValue] = [
-                    "direction": UncheckedSendableValue(direction)
-                ]
-                if let raw = flags["max-depth"] ?? flags["max_depth"] ?? flags["depth"],
-                   let depth = Int(raw)
-                {
-                    expand["max_depth"] = UncheckedSendableValue(depth)
-                }
+            if let expand = flags["expand"] {
                 args["expand"] = UncheckedSendableValue(expand)
             }
-
-            var limits: [String: UncheckedSendableValue] = [:]
-            let limitFlags = [
-                ("max_files", flags["max-files"] ?? flags["max_files"]),
-                ("max_edges", flags["max-edges"] ?? flags["max_edges"]),
-                ("max_codemap_tokens", flags["max-codemap-tokens"] ?? flags["max_codemap_tokens"])
-            ]
-            for (key, raw) in limitFlags {
-                if let raw, let value = Int(raw) {
-                    limits[key] = UncheckedSendableValue(value)
-                }
+            if let rawDepth = flags["depth"], let depth = Int(rawDepth) {
+                args["depth"] = UncheckedSendableValue(depth)
             }
-            if !limits.isEmpty {
-                args["limits"] = UncheckedSendableValue(limits)
+            if let signatures = parseBoolFlag(flags["signatures"]) {
+                args["signatures"] = UncheckedSendableValue(signatures)
+            } else if flags["signatures"] != nil {
+                args["signatures"] = UncheckedSendableValue(true)
+            }
+            if let rawMaxTokens = flags["max-tokens"] ?? flags["max_tokens"],
+               let maxTokens = Int(rawMaxTokens)
+            {
+                args["max_tokens"] = UncheckedSendableValue(maxTokens)
             }
 
             return .aliasCall(toolName: "get_code_structure", args: args)

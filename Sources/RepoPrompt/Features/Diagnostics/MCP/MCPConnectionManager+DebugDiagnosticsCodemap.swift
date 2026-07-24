@@ -298,8 +298,8 @@ import MCP
             {
                 base["accepted_to_authoritative_ready_ms"] =
                     Double(aggregate.sampledUptimeNanoseconds - accepted) / 1_000_000
-                let lastProof = aggregate.roots.compactMap(\.coverageCompletedUptimeNanoseconds).max()
-                base["accepted_to_last_eligible_proof_ms"] = lastProof.map {
+                let lastReady = aggregate.roots.compactMap(\.readyUptimeNanoseconds).max()
+                base["accepted_to_last_eligible_ready_ms"] = lastReady.map {
                     Double($0 >= accepted ? $0 - accepted : 0) / 1_000_000
                 } ?? NSNull()
             }
@@ -329,7 +329,7 @@ import MCP
                 "sampled_uptime_ns": aggregate.sampledUptimeNanoseconds,
                 "visible_root_count": aggregate.visibleRootCount,
                 "eligible_root_count": aggregate.eligibleRootCount,
-                "proof_complete_root_count": aggregate.proofCompleteRootCount,
+                "ready_root_count": aggregate.readyRootCount,
                 "terminal_ineligible_root_count": aggregate.terminalIneligibleRootCount,
                 "excluded_root_count": aggregate.excludedRootCount,
                 "pending_root_count": aggregate.pendingRootCount,

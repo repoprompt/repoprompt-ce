@@ -415,7 +415,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         let store = codemapFixture.makeStore(
             codemapLocalGitClassificationProbe: .production,
             codemapGitEligibilityProbe: .production(),
-            codemapProjectionPreloadLaunchPolicy: .disabled
+            codemapGraphIndexBuildLaunchPolicy: .disabled
         )
         _ = try await store.loadRoot(path: logicalRoot.path)
         let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(

@@ -89,6 +89,16 @@ struct WorkspaceCodemapManifestFIFO<Element> {
 }
 
 actor WorkspaceCodemapBindingEngine {
+    private enum GraphIndexPublicationDisposition {
+        case accepted(WorkspaceCodemapGraphIndexProgress)
+        case exactDuplicate(WorkspaceCodemapGraphIndexProgress)
+        case stale
+        case superseded
+        case busy(retryAfterMilliseconds: UInt64?)
+        case budget(dimension: WorkspaceCodemapGraphIndexBudgetDimension, attempted: UInt64, limit: UInt64)
+        case unavailable
+    }
+
     private static let maximumManifestWriterBatchItemCount = 64
     private static let maximumManifestWriterDeferredAttempts = 3
 
@@ -256,16 +266,16 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private enum ManifestMutationProof: Equatable {
+    private enum ManifestMutationAuthority: Equatable {
         case session(invalidationGeneration: UInt64)
-        case projection(jobID: UUID, generation: WorkspaceCodemapProjectionGeneration)
+        case graphIndex(jobID: UUID, generation: WorkspaceCodemapGraphIndexGeneration)
     }
 
     private enum ManifestMutationSubmissionResult {
         case persisted
         case durabilityFailure
         case retry
-        case budget(WorkspaceCodemapProjectionBudget)
+        case budget(WorkspaceCodemapGraphIndexBudget)
     }
 
     private struct ManifestWriterWorkKey: Hashable {
@@ -278,7 +288,7 @@ actor WorkspaceCodemapBindingEngine {
         let id: UUID
         let workKey: ManifestWriterWorkKey
         let revision: UInt64
-        let proof: ManifestMutationProof
+        let proof: ManifestMutationAuthority
         let mutations: [ManifestMutation]
         let byteCount: UInt64
     }
@@ -286,7 +296,7 @@ actor WorkspaceCodemapBindingEngine {
     private struct ManifestMutationBatch {
         let id: UUID
         let workKey: ManifestWriterWorkKey
-        let proof: ManifestMutationProof
+        let proof: ManifestMutationAuthority
         let items: [ManifestMutationWorkItem]
         let highestRevision: UInt64
         let changesByPath: [String: PendingManifestChange]
@@ -314,38 +324,18 @@ actor WorkspaceCodemapBindingEngine {
         var waiterWorkKeyByID: [UUID: ManifestWriterWorkKey] = [:]
     }
 
-    private struct ProjectionAdmissionWaiter {
+    private struct GraphIndexAdmissionWaiter {
         let jobID: UUID
         let rootEpoch: WorkspaceCodemapRootEpoch
         var enqueueOrdinal: UInt64
-        var demandOvertakeRecorded: Bool
+        var rootOvertakeRecorded: Bool
         var explicitOvertakeRecorded: Bool
         let continuation: CheckedContinuation<Bool, Never>
     }
 
-    private struct ProjectionDemandRecord {
-        let ticket: WorkspaceCodemapProjectionDemandTicket
-        let owner: WorkspaceCodemapLiveDemandOwner
-        let fileIDs: [UUID]
-        let deadlineUptimeNanoseconds: UInt64
-        var enqueueOrdinal: UInt64
-        let metadataByteCount: UInt64
-    }
-
-    private struct TerminalProjectionDemandRecord {
-        let ticket: WorkspaceCodemapProjectionDemandTicket
-        let status: WorkspaceCodemapProjectionDemandStatus
-        let terminalOrdinal: UInt64
-    }
-
-    private struct ProjectionProgressPublicationSchedule {
-        let token: UUID
-        let jobID: UUID
-        let batchID: UUID
-        let task: Task<Void, Never>
-    }
-
-    private struct ProjectionPreloadJob {
+    /// Root-local warm index state and progress accounting. Graph publication is
+    /// exclusively overlay-driven.
+    private struct GraphIndexJob {
         let id: UUID
         let rootEpoch: WorkspaceCodemapRootEpoch
         let sessionID: UUID
@@ -354,41 +344,39 @@ actor WorkspaceCodemapBindingEngine {
         let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
         let catalogGeneration: UInt64
         let ingressGeneration: UInt64
-        var phase: WorkspaceCodemapProjectionPreloadPhase
-        var generation: WorkspaceCodemapProjectionGeneration?
-        var cursor: WorkspaceCodemapProjectionCatalogCursor?
-        var lastProcessedCursor: WorkspaceCodemapProjectionCatalogCursor?
-        var progress: WorkspaceCodemapProjectionProgress
-        var inBatchProgress: WorkspaceCodemapProjectionInBatchProgress?
+        var phase: WorkspaceCodemapGraphIndexPhase
+        var generation: WorkspaceCodemapGraphIndexGeneration?
+        var cursor: WorkspaceCodemapGraphIndexCatalogCursor?
+        var lastProcessedCursor: WorkspaceCodemapGraphIndexCatalogCursor?
+        var progress: WorkspaceCodemapGraphIndexProgress
+        var inBatchProgress: WorkspaceCodemapGraphIndexInBatchProgress?
         var pageStartProcessedCandidateBaseline: UInt64?
-        var nextSegmentSequence: UInt64
-        var pipelineScopes: [CodeMapPipelineIdentity: WorkspaceCodemapProjectionPipelineScope]
-        var resources: WorkspaceCodemapProjectionResourceAccounting
+        var nextGraphChangeSequence: UInt64
+        var pipelineScopes: [CodeMapPipelineIdentity: WorkspaceCodemapGraphIndexPipelineScope]
+        var resources: WorkspaceCodemapGraphIndexResourceAccounting
         var pendingManifestMutationCount: UInt64
         var retryAttempt: UInt64
-        var retry: WorkspaceCodemapProjectionRetry?
-        var budget: WorkspaceCodemapProjectionBudget?
-        var checkpoint: WorkspaceCodemapProjectionPreloadCheckpoint?
-        var coverageProof: WorkspaceCodemapProjectionCoverageProof?
-        var coverageCompletedUptimeNanoseconds: UInt64?
+        var retry: WorkspaceCodemapGraphIndexRetry?
+        var budget: WorkspaceCodemapGraphIndexBudget?
+        var checkpoint: WorkspaceCodemapGraphIndexCheckpoint?
         var task: Task<Void, Never>?
         var isQueuedForAdmission: Bool
         var isActiveBatch: Bool
     }
 
-    private enum ProjectionCandidateResolution {
-        case entry(WorkspaceCodemapProjectionEntry, manifestRecord: CodeMapRootManifestRecord?)
+    private enum GraphIndexCandidateResolution {
+        case entry(WorkspaceCodemapGraphIndexEntry, manifestRecord: CodeMapRootManifestRecord?)
         case transient
-        case budget(WorkspaceCodemapProjectionBudget)
+        case budget(WorkspaceCodemapGraphIndexBudget)
     }
 
-    private struct IndexedProjectionCandidateResolution: @unchecked Sendable {
+    private struct IndexedGraphIndexCandidateResolution: @unchecked Sendable {
         let index: Int
         let fileID: UUID
-        let resolution: ProjectionCandidateResolution
+        let resolution: GraphIndexCandidateResolution
     }
 
-    private enum ProjectionBatchResult {
+    private enum GraphIndexBatchResult {
         case checkpointed
         case complete
         case retry
@@ -399,13 +387,13 @@ actor WorkspaceCodemapBindingEngine {
         case superseded
     }
 
-    private enum ProjectionResourceReservationResult {
+    private enum GraphIndexResourceReservationResult {
         case reserved
         case retry
-        case budget(WorkspaceCodemapProjectionBudget)
+        case budget(WorkspaceCodemapGraphIndexBudget)
     }
 
-    private enum ProjectionPublicationStalenessResult {
+    private enum GraphIndexPublicationStalenessResult {
         case restartGeneration
         case retry
         case terminal
@@ -490,6 +478,7 @@ actor WorkspaceCodemapBindingEngine {
     private let sourceReader: WorkspaceCodemapValidatedSourceReaderClient
     private let catalogClient: WorkspaceCodemapBindingCatalogClient
     private let overlay: WorkspaceCodemapLiveOverlay
+    private let selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory
     private let policy: WorkspaceCodemapBindingEnginePolicy
     private let hooks: WorkspaceCodemapBindingEngineHooks
     private let manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter
@@ -512,33 +501,21 @@ actor WorkspaceCodemapBindingEngine {
     private var retainedAdoptions: [PipelineScope: AdoptionReservation] = [:]
     private var manifestAdoptionOperations: [PipelineScope: ManifestAdoptionOperation] = [:]
     private var drainingManifestAdoptionTasks: [UUID: Task<ManifestAdoptionOutcome, Never>] = [:]
-    private var projectionJobs: [WorkspaceCodemapRootEpoch: ProjectionPreloadJob] = [:]
-    private var projectionSnapshotContinuations: [
-        WorkspaceCodemapRootEpoch: [UUID: AsyncStream<WorkspaceCodemapCurrentProjectionSnapshot>.Continuation]
-    ] = [:]
-    private var lastPublishedProjectionSnapshotsByRootEpoch: [
-        WorkspaceCodemapRootEpoch: WorkspaceCodemapCurrentProjectionSnapshot
-    ] = [:]
-    private var projectionProgressPublicationSchedulesByRootEpoch: [
-        WorkspaceCodemapRootEpoch: ProjectionProgressPublicationSchedule
-    ] = [:]
-    private var lastProjectionProgressPublicationUptimeByRootEpoch: [
-        WorkspaceCodemapRootEpoch: UInt64
+    private var graphIndexJobs: [WorkspaceCodemapRootEpoch: GraphIndexJob] = [:]
+    private var selectionGraphsByRootEpoch: [WorkspaceCodemapRootEpoch: WorkspaceCodemapSelectionGraph] = [:]
+    private var graphPullTasksByRootEpoch: [
+        WorkspaceCodemapRootEpoch: (id: UUID, task: Task<Void, Never>)
     ] = [:]
     private var latestOverlayContributionGenerationByRootEpoch: [
         WorkspaceCodemapRootEpoch: WorkspaceCodemapSelectionGraphContributionGeneration
     ] = [:]
-    private var projectionAdmissionQueue: [ProjectionAdmissionWaiter] = []
-    private var activeProjectionJobIDs: Set<UUID> = []
-    private var drainingProjectionTasks: [UUID: Task<Void, Never>] = [:]
-    private var drainingProjectionResources: [UUID: WorkspaceCodemapProjectionResourceAccounting] = [:]
-    private var drainingProjectionRootEpochs: [UUID: WorkspaceCodemapRootEpoch] = [:]
-    private var nextProjectionQueueOrdinal: UInt64 = 1
-    private var projectionRootLastAdmission: [WorkspaceCodemapRootEpoch: UInt64] = [:]
-    private var projectionDemands: [UUID: ProjectionDemandRecord] = [:]
-    private var terminalProjectionDemands: [UUID: TerminalProjectionDemandRecord] = [:]
-    private var nextProjectionDemandOrdinal: UInt64 = 1
-    private var nextTerminalProjectionDemandOrdinal: UInt64 = 1
+    private var graphIndexAdmissionQueue: [GraphIndexAdmissionWaiter] = []
+    private var activeGraphIndexJobIDs: Set<UUID> = []
+    private var drainingGraphIndexTasks: [UUID: Task<Void, Never>] = [:]
+    private var drainingGraphIndexResources: [UUID: WorkspaceCodemapGraphIndexResourceAccounting] = [:]
+    private var drainingGraphIndexRootEpochs: [UUID: WorkspaceCodemapRootEpoch] = [:]
+    private var nextGraphIndexQueueOrdinal: UInt64 = 1
+    private var graphIndexRootLastAdmission: [WorkspaceCodemapRootEpoch: UInt64] = [:]
     private var registrationOperations: Set<UUID> = []
     private var replacementCancelledRegistrationAttemptIDs: Set<UUID> = []
     private var registrationDrainWaiters: [CheckedContinuation<Void, Never>] = []
@@ -547,17 +524,17 @@ actor WorkspaceCodemapBindingEngine {
     private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
     private var counters = WorkspaceCodemapBindingEngineCounters()
     #if DEBUG
-        private struct DebugProjectionAdmissionHold {
+        private struct DebugGraphIndexAdmissionHold {
             let rootEpoch: WorkspaceCodemapRootEpoch
             let expiryTask: Task<Void, Never>
         }
 
-        private var debugProjectionAdmissionHolds: [UUID: DebugProjectionAdmissionHold] = [:]
-        private var debugProjectionAdmissionEnqueuedAtNanoseconds: [UUID: UInt64] = [:]
-        private var debugProjectionQueueWaitMillisecondsByRootEpoch: [
+        private var debugGraphIndexAdmissionHolds: [UUID: DebugGraphIndexAdmissionHold] = [:]
+        private var debugGraphIndexAdmissionEnqueuedAtNanoseconds: [UUID: UInt64] = [:]
+        private var debugGraphIndexQueueWaitMillisecondsByRootEpoch: [
             WorkspaceCodemapRootEpoch: [UInt64]
         ] = [:]
-        private var debugProjectionQueueWaitSampleOrdinalByRootEpoch: [
+        private var debugGraphIndexQueueWaitSampleOrdinalByRootEpoch: [
             WorkspaceCodemapRootEpoch: UInt64
         ] = [:]
     #endif
@@ -570,6 +547,7 @@ actor WorkspaceCodemapBindingEngine {
         sourceReader: WorkspaceCodemapValidatedSourceReaderClient,
         catalogClient: WorkspaceCodemapBindingCatalogClient = .unavailable,
         overlay: WorkspaceCodemapLiveOverlay = WorkspaceCodemapLiveOverlay(),
+        selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
         policy: WorkspaceCodemapBindingEnginePolicy = .default,
         hooks: WorkspaceCodemapBindingEngineHooks = .none,
         manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter = .production,
@@ -590,6 +568,7 @@ actor WorkspaceCodemapBindingEngine {
         self.sourceReader = sourceReader
         self.catalogClient = catalogClient
         self.overlay = overlay
+        self.selectionGraphFactory = selectionGraphFactory
         self.policy = policy
         self.hooks = hooks
         self.manifestWriterRetryWaiter = manifestWriterRetryWaiter
@@ -601,7 +580,8 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     func registerRoot(
-        _ registration: WorkspaceCodemapBindingRootRegistration
+        _ registration: WorkspaceCodemapBindingRootRegistration,
+        selectionGraph providedSelectionGraph: WorkspaceCodemapSelectionGraph? = nil
     ) async -> WorkspaceCodemapBindingRegistrationResult {
         guard !isShuttingDown else { return .failed }
         let operationID = UUID()
@@ -668,10 +648,6 @@ actor WorkspaceCodemapBindingEngine {
                 registration: registration,
                 state: capabilityState
             ))
-            revokeProjectionDemands(
-                rootEpoch: rootEpoch,
-                status: .unavailable(reason: .capabilityUnavailable, retryAfterMilliseconds: nil)
-            )
             switch capabilityState {
             case .terminalUnavailable:
                 emit(.capabilityTerminalUnavailable, rootEpoch: rootEpoch)
@@ -686,6 +662,7 @@ actor WorkspaceCodemapBindingEngine {
             catalogGeneration: registration.catalogGeneration
         )
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
+            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
@@ -710,6 +687,7 @@ actor WorkspaceCodemapBindingEngine {
         do {
             manifestWriterSession = try await runtime.manifestStore.registerManifestWriterSession()
         } catch {
+            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
@@ -718,6 +696,7 @@ actor WorkspaceCodemapBindingEngine {
         }
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
             await runtime.manifestStore.endManifestWriterSession(manifestWriterSession)
+            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
@@ -733,33 +712,213 @@ actor WorkspaceCodemapBindingEngine {
             generation: 1,
             invalidationGeneration: 1
         ))
-        activateProjectionDemands(rootEpoch: rootEpoch)
+        let graph = providedSelectionGraph ?? selectionGraphFactory.make(rootEpoch: rootEpoch)
+        selectionGraphsByRootEpoch[rootEpoch] = graph
+        await graph.installReconciliationExpiryHandler { [weak self] in
+            await self?.graphReconciliationDidExpire(rootEpoch: rootEpoch)
+        }
+        let pullTaskID = UUID()
+        let pullTask = Task(priority: .utility) {
+            await self.runGraphPullLoop(rootEpoch: rootEpoch, graph: graph)
+            self.graphPullLoopDidFinish(rootEpoch: rootEpoch, taskID: pullTaskID)
+        }
+        graphPullTasksByRootEpoch[rootEpoch] = (pullTaskID, pullTask)
         emit(.capabilityEligible, rootEpoch: rootEpoch)
         return .registered(adoptedReadyCount: 0)
     }
 
-    /// Hands an already-public, Git-eligible root to the projection preloader.
+    func selectionGraph(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapSelectionGraph? {
+        selectionGraphsByRootEpoch[rootEpoch]
+    }
+
+    private func runGraphPullLoop(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        graph: WorkspaceCodemapSelectionGraph
+    ) async {
+        let notifications = await overlay.graphChangeNotifications(rootEpoch: rootEpoch)
+        var shouldPull = true
+        var iterator = notifications.makeAsyncIterator()
+        while !Task.isCancelled {
+            if shouldPull {
+                let accounting = await graph.incrementalAccounting()
+                let changes = await overlay.graphChanges(
+                    rootEpoch: rootEpoch,
+                    since: accounting.appliedGeneration
+                )
+                switch changes {
+                case let .unchanged(generation):
+                    await graph.observe(generation: generation)
+                    shouldPull = false
+                case let .revoked(reason):
+                    await graph.shutdown(reason: reason)
+                    return
+                case let .diff(_, _, _, generation):
+                    await graph.observe(generation: generation)
+                    let disposition = await graph.apply(changes)
+                    switch disposition {
+                    case .committed, .unchanged:
+                        // Pull again immediately. The overlay answers from current state, so a
+                        // wakeup arriving during a non-preemptive apply cannot be lost.
+                        shouldPull = true
+                    case .cancelled, .revoked:
+                        return
+                    case .rejected:
+                        // A continuity failure gets exactly one authoritative checkpoint. A
+                        // rejected checkpoint below is terminal, preventing a deterministic spin.
+                        _ = await overlay.advanceGraphResyncFloor(rootEpoch: rootEpoch)
+                        shouldPull = true
+                    }
+                case let .resync(_, generation):
+                    await graph.observe(generation: generation)
+                    let disposition = await graph.apply(changes)
+                    switch disposition {
+                    case let .committed(_, _, _, _, resync):
+                        shouldPull = true
+                        if resync {
+                            await scheduleFollowingWatcherReconciliationIfNeeded(
+                                rootEpoch: rootEpoch,
+                                graph: graph
+                            )
+                        }
+                    case .unchanged:
+                        shouldPull = true
+                    case .cancelled, .revoked:
+                        return
+                    case .rejected:
+                        let accounting = await graph.incrementalAccounting()
+                        if accounting.reconciling {
+                            _ = await graph.recordWatcherGapReconciliationFailure()
+                        } else {
+                            await graph.shutdown(reason: .accountingOverflow)
+                        }
+                        return
+                    }
+                }
+                if shouldPull { continue }
+            }
+            guard let notification = await iterator.next() else {
+                if !Task.isCancelled {
+                    await revokeGraphAfterOverlayTermination(
+                        rootEpoch: rootEpoch,
+                        graph: graph,
+                        reason: .rootUnloaded
+                    )
+                }
+                return
+            }
+            switch notification {
+            case .changed:
+                shouldPull = true
+            case let .revoked(reason):
+                await revokeGraphAfterOverlayTermination(
+                    rootEpoch: rootEpoch,
+                    graph: graph,
+                    reason: reason
+                )
+                return
+            }
+        }
+    }
+
+    private func revokeGraphAfterOverlayTermination(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        graph: WorkspaceCodemapSelectionGraph,
+        reason: WorkspaceCodemapGraphRevocationReason
+    ) async {
+        await graph.shutdown(reason: reason)
+        if let draining = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled) {
+            await draining.value
+        }
+        detachManifestAdoptionOperations(rootEpoch: rootEpoch)
+    }
+
+    private func scheduleFollowingWatcherReconciliationIfNeeded(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        graph: WorkspaceCodemapSelectionGraph
+    ) async {
+        let accounting = await graph.incrementalAccounting()
+        guard accounting.reconciling,
+              case var .eligible(session)? = roots[rootEpoch],
+              session.invalidationGeneration < UInt64.max
+        else { return }
+        _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
+        session.invalidationGeneration += 1
+        roots[rootEpoch] = .eligible(session)
+        detachManifestAdoptionOperations(rootEpoch: rootEpoch)
+        guard await overlay.beginGraphReconciliation(rootEpoch: rootEpoch) else {
+            _ = await graph.recordWatcherGapReconciliationFailure()
+            return
+        }
+        let launch = scheduleGraphIndex(rootEpoch: rootEpoch)
+        if launch != .handedOff {
+            _ = await graph.recordWatcherGapReconciliationFailure()
+        }
+    }
+
+    private func graphReconciliationDidExpire(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async {
+        guard selectionGraphsByRootEpoch[rootEpoch] != nil else { return }
+        if let draining = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled) {
+            await draining.value
+        }
+        detachManifestAdoptionOperations(rootEpoch: rootEpoch)
+    }
+
+    private func graphPullLoopDidFinish(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        taskID: UUID
+    ) {
+        guard graphPullTasksByRootEpoch[rootEpoch]?.id == taskID else { return }
+        graphPullTasksByRootEpoch.removeValue(forKey: rootEpoch)
+    }
+
+    private func shutdownGraphRoot(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        reason: WorkspaceCodemapGraphRevocationReason
+    ) async {
+        // Revoke first so a detached candidate observes cooperative cancellation. Only then drain
+        // the pull task; waiting for the pull before revocation can deadlock root replacement on a
+        // large candidate build.
+        if let graph = selectionGraphsByRootEpoch.removeValue(forKey: rootEpoch) {
+            await graph.shutdown(reason: reason)
+        }
+        if let pull = graphPullTasksByRootEpoch.removeValue(forKey: rootEpoch) {
+            pull.task.cancel()
+            await pull.task.value
+        }
+    }
+
+    #if DEBUG
+        func graphPullTaskCountForTesting() -> Int {
+            graphPullTasksByRootEpoch.count
+        }
+    #endif
+
+    /// Hands an already-public, Git-eligible root to the graph indexer.
     ///
     /// Root readiness scheduling remains owned by `WorkspaceFileContextStore`; this method is
     /// deliberately idempotent and never performs catalog, manifest, CAS, or source work inline.
     @discardableResult
-    func scheduleProjectionPreload(
+    func scheduleGraphIndex(
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> WorkspaceCodemapProjectionPreloadLaunchPhase {
+    ) -> WorkspaceCodemapGraphIndexLaunchPhase {
         guard !isShuttingDown else { return .cancelled }
         guard case let .eligible(session)? = roots[rootEpoch] else { return .superseded }
-        if let existing = projectionJobs[rootEpoch] {
+        if let existing = graphIndexJobs[rootEpoch] {
             if existing.phase == .superseded {
                 return .superseded
             }
             if existing.phase == .cancelled {
                 return .cancelled
             }
-            return projectionJobIsCurrent(existing) ? .handedOff : .superseded
+            return graphIndexJobIsCurrent(existing) ? .handedOff : .superseded
         }
 
         let jobID = UUID()
-        projectionJobs[rootEpoch] = ProjectionPreloadJob(
+        graphIndexJobs[rootEpoch] = GraphIndexJob(
             id: jobID,
             rootEpoch: rootEpoch,
             sessionID: session.id,
@@ -775,7 +934,7 @@ actor WorkspaceCodemapBindingEngine {
             progress: .notStarted,
             inBatchProgress: nil,
             pageStartProcessedCandidateBaseline: nil,
-            nextSegmentSequence: 0,
+            nextGraphChangeSequence: 0,
             pipelineScopes: [:],
             resources: .zero,
             pendingManifestMutationCount: 0,
@@ -783,171 +942,26 @@ actor WorkspaceCodemapBindingEngine {
             retry: nil,
             budget: nil,
             checkpoint: nil,
-            coverageProof: nil,
-            coverageCompletedUptimeNanoseconds: nil,
             task: nil,
             isQueuedForAdmission: false,
             isActiveBatch: false
         )
-        incrementCounter(\.projectionPreloadsScheduled)
-        emit(.projectionPreloadScheduled, rootEpoch: rootEpoch, projectionPhase: .scheduled)
+        incrementCounter(\.graphIndexRunsScheduled)
+        emit(.graphIndexRunScheduled, rootEpoch: rootEpoch, graphIndexPhase: .scheduled)
         let task = Task(priority: .background) {
-            await self.runProjectionPreload(jobID: jobID, rootEpoch: rootEpoch)
+            await self.runGraphIndex(jobID: jobID, rootEpoch: rootEpoch)
         }
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else {
             task.cancel()
             return .superseded
         }
         job.task = task
-        projectionJobs[rootEpoch] = job
+        graphIndexJobs[rootEpoch] = job
         return .handedOff
     }
 
-    func cancelProjectionPreload(rootEpoch: WorkspaceCodemapRootEpoch) {
-        _ = cancelProjectionJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
-    }
-
-    func acquireProjectionDemand(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        fileIDs: [UUID],
-        catalogGeneration: UInt64,
-        ingressGeneration: UInt64,
-        deadlineUptimeNanoseconds: UInt64,
-        owner: WorkspaceCodemapLiveDemandOwner
-    ) -> WorkspaceCodemapProjectionDemandAcquisition {
-        expireProjectionDemands()
-        guard !isShuttingDown else {
-            return .unavailable(reason: .capabilityUnavailable, retryAfterMilliseconds: nil)
-        }
-        let registration: WorkspaceCodemapBindingRootRegistration
-        switch roots[rootEpoch] {
-        case let .registering(attempt):
-            registration = attempt.registration
-        case let .eligible(session):
-            registration = session.registration
-        case .unavailable:
-            return .unavailable(reason: .capabilityUnavailable, retryAfterMilliseconds: nil)
-        case nil:
-            return .unavailable(reason: .rootNotRegistered, retryAfterMilliseconds: nil)
-        }
-        guard registration.catalogGeneration == catalogGeneration,
-              registration.ingressGeneration == ingressGeneration
-        else {
-            return .unavailable(reason: .generationMismatch, retryAfterMilliseconds: nil)
-        }
-
-        let uniqueFileIDs = Array(Set(fileIDs)).sorted { $0.uuidString < $1.uuidString }
-        guard !uniqueFileIDs.isEmpty else {
-            return .unavailable(reason: .generationMismatch, retryAfterMilliseconds: nil)
-        }
-        guard uniqueFileIDs.count <= policy.maximumProjectionDemandFileIDCount else {
-            recordProjectionDemandBusy(rootEpoch: rootEpoch)
-            return .busy(
-                reason: .fileIDLimit(
-                    attempted: uniqueFileIDs.count,
-                    limit: policy.maximumProjectionDemandFileIDCount
-                ),
-                retryAfterMilliseconds: policy.projectionDemandRetryMilliseconds
-            )
-        }
-        let metadataByteCount: UInt64
-        guard let fileIDCount = UInt64(exactly: uniqueFileIDs.count) else {
-            recordProjectionDemandBusy(rootEpoch: rootEpoch)
-            return .busy(
-                reason: .metadataByteLimit(attempted: .max, limit: policy.maximumProjectionDemandMetadataByteCount),
-                retryAfterMilliseconds: policy.projectionDemandRetryMilliseconds
-            )
-        }
-        let (fileIDBytes, fileIDBytesOverflow) = fileIDCount.multipliedReportingOverflow(by: 16)
-        guard !fileIDBytesOverflow, let retainedBytes = addingChecked(fileIDBytes, 192) else {
-            recordProjectionDemandBusy(rootEpoch: rootEpoch)
-            return .busy(
-                reason: .metadataByteLimit(attempted: .max, limit: policy.maximumProjectionDemandMetadataByteCount),
-                retryAfterMilliseconds: policy.projectionDemandRetryMilliseconds
-            )
-        }
-        metadataByteCount = retainedBytes
-        let rootRecords = projectionDemands.values.filter { $0.ticket.rootEpoch == rootEpoch }
-        guard projectionDemands.count < policy.maximumProjectionDemandCount,
-              rootRecords.count < policy.maximumProjectionDemandCountPerRoot
-        else {
-            recordProjectionDemandBusy(rootEpoch: rootEpoch)
-            return .busy(
-                reason: .requestLimit,
-                retryAfterMilliseconds: policy.projectionDemandRetryMilliseconds
-            )
-        }
-        let rootMetadataBytes = rootRecords.reduce(UInt64(0)) {
-            addingSaturating($0, $1.metadataByteCount)
-        }
-        let globalMetadataBytes = projectionDemands.values.reduce(UInt64(0)) {
-            addingSaturating($0, $1.metadataByteCount)
-        }
-        let attemptedRootBytes = addingSaturating(rootMetadataBytes, metadataByteCount)
-        let attemptedGlobalBytes = addingSaturating(globalMetadataBytes, metadataByteCount)
-        guard attemptedRootBytes <= policy.maximumProjectionDemandMetadataByteCountPerRoot,
-              attemptedGlobalBytes <= policy.maximumProjectionDemandMetadataByteCount
-        else {
-            recordProjectionDemandBusy(rootEpoch: rootEpoch)
-            let attempted = max(attemptedRootBytes, attemptedGlobalBytes)
-            let limit = attemptedRootBytes > policy.maximumProjectionDemandMetadataByteCountPerRoot
-                ? policy.maximumProjectionDemandMetadataByteCountPerRoot
-                : policy.maximumProjectionDemandMetadataByteCount
-            return .busy(
-                reason: .metadataByteLimit(attempted: attempted, limit: limit),
-                retryAfterMilliseconds: policy.projectionDemandRetryMilliseconds
-            )
-        }
-        ensureProjectionDemandOrdinalCapacity()
-        let ticket = WorkspaceCodemapProjectionDemandTicket(
-            rootEpoch: rootEpoch,
-            catalogGeneration: catalogGeneration,
-            ingressGeneration: ingressGeneration
-        )
-        let ordinal = nextProjectionDemandOrdinal
-        nextProjectionDemandOrdinal = addingChecked(nextProjectionDemandOrdinal, 1) ?? .max
-        let joinedExistingFlight = projectionJobs[rootEpoch].map { job in
-            guard projectionJobIsCurrent(job) else { return false }
-            return switch job.phase {
-            case .budgetLimited, .complete, .cancelled, .superseded:
-                false
-            default:
-                true
-            }
-        } ?? false
-        projectionDemands[ticket.id] = ProjectionDemandRecord(
-            ticket: ticket,
-            owner: owner,
-            fileIDs: uniqueFileIDs,
-            deadlineUptimeNanoseconds: deadlineUptimeNanoseconds,
-            enqueueOrdinal: ordinal,
-            metadataByteCount: metadataByteCount
-        )
-        incrementCounter(\.projectionDemandsAcquired)
-        if joinedExistingFlight {
-            incrementCounter(\.projectionDemandsJoined)
-        }
-        let status = projectionDemandStatusValue(ticket)
-        scheduleQueuedRequests()
-        scheduleProjectionAdmissions()
-        return .acquired(ticket: ticket, status: status)
-    }
-
-    func projectionDemandStatus(
-        _ ticket: WorkspaceCodemapProjectionDemandTicket
-    ) -> WorkspaceCodemapProjectionDemandStatus {
-        projectionDemandStatusValue(ticket)
-    }
-
-    func releaseProjectionDemand(_ ticket: WorkspaceCodemapProjectionDemandTicket) {
-        guard let record = projectionDemands[ticket.id], record.ticket == ticket else {
-            terminalProjectionDemands.removeValue(forKey: ticket.id)
-            return
-        }
-        projectionDemands.removeValue(forKey: ticket.id)
-        incrementCounter(\.projectionDemandsReleased)
-        pruneAdmissionHistory()
-        scheduleProjectionAdmissions()
+    func cancelGraphIndex(rootEpoch: WorkspaceCodemapRootEpoch) {
+        _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
     }
 
     func demand(_ demand: WorkspaceCodemapBindingDemand) async -> WorkspaceCodemapBindingDemandResult {
@@ -977,7 +991,7 @@ actor WorkspaceCodemapBindingEngine {
 
     /// Resolves an already-published clean Git artifact without demand admission, manifest
     /// adoption, source classification, source-authority capture, or worktree materialization.
-    /// Targeted invalidation removes the path projection or changes its generation, so the
+    /// Targeted invalidation removes the path graphIndex or changes its generation, so the
     /// durable record remains authoritative only while the captured path identity is current.
     func lookupPublishedArtifact(
         _ request: WorkspaceCodemapPublishedArtifactLookupRequest
@@ -1003,7 +1017,7 @@ actor WorkspaceCodemapBindingEngine {
             )) {
             case let .ready(value):
                 resolution = value
-                source = .projectionCAS
+                source = .graphIndexCAS
             case .miss:
                 switch try await runtime.coordinator.resolve(CodeMapArtifactBuildRequest(
                     ownerID: request.ownerID,
@@ -1058,8 +1072,8 @@ actor WorkspaceCodemapBindingEngine {
         }
 
         switch source {
-        case .projectionCAS:
-            incrementCounter(\.publishedArtifactProjectionCASHits)
+        case .graphIndexCAS:
+            incrementCounter(\.publishedArtifactGraphIndexCASHits)
         case .locatorCAS:
             incrementCounter(\.publishedArtifactLocatorCASHits)
         }
@@ -1118,7 +1132,49 @@ actor WorkspaceCodemapBindingEngine {
     func invalidateWatcherGap(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) async -> WorkspaceCodemapBindingInvalidationResult {
-        await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .watcherGap)
+        guard case var .eligible(session)? = roots[rootEpoch],
+              session.invalidationGeneration < UInt64.max,
+              let graph = selectionGraphsByRootEpoch[rootEpoch]
+        else {
+            return await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .watcherGap)
+        }
+        let reconciliation = await graph.beginWatcherGapReconciliation()
+        if case .coalesced = reconciliation {
+            _ = await overlay.beginGraphReconciliation(rootEpoch: rootEpoch)
+            emit(.invalidation, rootEpoch: rootEpoch, invalidationReason: .watcherGap)
+            return WorkspaceCodemapBindingInvalidationResult(
+                revokedOverlayCount: 0,
+                cancelledRequestCount: 0,
+                manifestWriteFailed: false
+            )
+        }
+        if case .revoked = reconciliation {
+            return await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .watcherGap)
+        }
+
+        _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
+        session.invalidationGeneration += 1
+        roots[rootEpoch] = .eligible(session)
+        detachManifestAdoptionOperations(rootEpoch: rootEpoch)
+
+        let requestIDs = activeRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
+        let queuedIDs = queuedRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
+        let cancellationBatch = synchronouslyCancelRequests(requestIDs + queuedIDs)
+        await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
+
+        guard await overlay.beginGraphReconciliation(rootEpoch: rootEpoch),
+              scheduleGraphIndex(rootEpoch: rootEpoch) == .handedOff
+        else {
+            _ = await graph.recordWatcherGapReconciliationFailure()
+            return await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .watcherGap)
+        }
+        recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
+        emit(.invalidation, rootEpoch: rootEpoch, invalidationReason: .watcherGap)
+        return WorkspaceCodemapBindingInvalidationResult(
+            revokedOverlayCount: 0,
+            cancelledRequestCount: cancellationBatch.cancelledRequestCount,
+            manifestWriteFailed: false
+        )
     }
 
     func invalidateCheckout(
@@ -1140,11 +1196,11 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     func unloadRoot(rootEpoch: WorkspaceCodemapRootEpoch) async {
-        revokeProjectionDemands(rootEpoch: rootEpoch, status: .cancelled)
         if case .registering? = roots[rootEpoch] {
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
             await capabilityService.release(rootEpoch: rootEpoch)
+            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             emit(.rootUnload, rootEpoch: rootEpoch)
             return
@@ -1158,25 +1214,26 @@ actor WorkspaceCodemapBindingEngine {
         }
         let requestIDs = queuedRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id) +
             activeRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
-        _ = cancelProjectionJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
-        let projectionTasks = drainingProjectionTasks.compactMap { jobID, task in
-            drainingProjectionRootEpochs[jobID] == rootEpoch ? task : nil
+        _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
+        let graphIndexTasks = drainingGraphIndexTasks.compactMap { jobID, task in
+            drainingGraphIndexRootEpochs[jobID] == rootEpoch ? task : nil
         }
         roots.removeValue(forKey: rootEpoch)
         detachManifestWriters(rootEpoch: rootEpoch)
         detachManifestAdoptionOperations(rootEpoch: rootEpoch)
         let cancellationBatch = synchronouslyCancelRequests(requestIDs)
-        if let manifestWriterSession {
-            await runtime.manifestStore.endManifestWriterSession(manifestWriterSession)
-        }
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
+        await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
         _ = await overlay.unregister(rootEpoch: rootEpoch)
         adoptionReservations = adoptionReservations.filter { $0.key.rootEpoch != rootEpoch }
         retainedAdoptions = retainedAdoptions.filter { $0.key.rootEpoch != rootEpoch }
         pruneAdmissionHistory()
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
-        for task in projectionTasks {
+        for task in graphIndexTasks {
             await task.value
+        }
+        if let manifestWriterSession {
+            await runtime.manifestStore.endManifestWriterSession(manifestWriterSession)
         }
         await capabilityService.release(rootEpoch: rootEpoch)
         emit(.rootUnload, rootEpoch: rootEpoch)
@@ -1193,18 +1250,17 @@ actor WorkspaceCodemapBindingEngine {
 
         isShuttingDown = true
         #if DEBUG
-            for hold in debugProjectionAdmissionHolds.values {
+            for hold in debugGraphIndexAdmissionHolds.values {
                 hold.expiryTask.cancel()
             }
-            debugProjectionAdmissionHolds.removeAll()
-            debugProjectionAdmissionEnqueuedAtNanoseconds.removeAll()
+            debugGraphIndexAdmissionHolds.removeAll()
+            debugGraphIndexAdmissionEnqueuedAtNanoseconds.removeAll()
         #endif
         let rootEpochs = Array(roots.keys)
         for rootEpoch in rootEpochs {
-            revokeProjectionDemands(rootEpoch: rootEpoch, status: .cancelled)
-            _ = cancelProjectionJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
+            _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
         }
-        let projectionTasks = Array(drainingProjectionTasks.values)
+        let graphIndexTasks = Array(drainingGraphIndexTasks.values)
         let manifestWriterSessions = roots.values.compactMap { record -> CodeMapRootManifestWriterSessionToken? in
             guard case let .eligible(session) = record else { return nil }
             return session.manifestWriterSession
@@ -1231,13 +1287,10 @@ actor WorkspaceCodemapBindingEngine {
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
         let requestTasks = Array(drainingRequestTasks.values)
 
-        for writerSession in manifestWriterSessions {
-            await runtime.manifestStore.endManifestWriterSession(writerSession)
-        }
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
         for rootEpoch in rootEpochs {
+            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
-            await capabilityService.release(rootEpoch: rootEpoch)
         }
         for task in requestTasks {
             await task.value
@@ -1248,8 +1301,14 @@ actor WorkspaceCodemapBindingEngine {
         for task in adoptionTasks {
             _ = await task.value
         }
-        for task in projectionTasks {
+        for task in graphIndexTasks {
             await task.value
+        }
+        for writerSession in manifestWriterSessions {
+            await runtime.manifestStore.endManifestWriterSession(writerSession)
+        }
+        for rootEpoch in rootEpochs {
+            await capabilityService.release(rootEpoch: rootEpoch)
         }
         await waitForRegistrationOperationsToDrain()
         await capabilityService.drain()
@@ -1258,27 +1317,13 @@ actor WorkspaceCodemapBindingEngine {
         retainedAdoptions.removeAll()
         drainingManifestAdoptionTasks.removeAll()
         drainingRequestTasks.removeAll()
-        drainingProjectionTasks.removeAll()
-        drainingProjectionResources.removeAll()
-        drainingProjectionRootEpochs.removeAll()
-        projectionAdmissionQueue.removeAll()
-        activeProjectionJobIDs.removeAll()
-        projectionRootLastAdmission.removeAll()
-        projectionDemands.removeAll()
-        terminalProjectionDemands.removeAll()
+        drainingGraphIndexTasks.removeAll()
+        drainingGraphIndexResources.removeAll()
+        drainingGraphIndexRootEpochs.removeAll()
+        graphIndexAdmissionQueue.removeAll()
+        activeGraphIndexJobIDs.removeAll()
+        graphIndexRootLastAdmission.removeAll()
         pruneAdmissionHistory()
-        for continuations in projectionSnapshotContinuations.values {
-            for continuation in continuations.values {
-                continuation.finish()
-            }
-        }
-        projectionSnapshotContinuations.removeAll()
-        lastPublishedProjectionSnapshotsByRootEpoch.removeAll()
-        for schedule in projectionProgressPublicationSchedulesByRootEpoch.values {
-            schedule.task.cancel()
-        }
-        projectionProgressPublicationSchedulesByRootEpoch.removeAll()
-        lastProjectionProgressPublicationUptimeByRootEpoch.removeAll()
         shutdownComplete = true
         let waiters = shutdownWaiters
         shutdownWaiters.removeAll()
@@ -1320,707 +1365,7 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    func prepareCompletedProjectionSuccessor(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        liveSnapshot: WorkspaceCodemapLiveGraphSnapshot
-    ) async -> WorkspaceCodemapProjectionSuccessorSeal? {
-        guard liveSnapshot.rootEpoch == rootEpoch else { return nil }
-        observeOverlayContributionGeneration(
-            liveSnapshot.contributionGeneration,
-            rootEpoch: rootEpoch
-        )
-        guard let job = projectionJobs[rootEpoch],
-              job.phase == .complete,
-              let predecessorProof = job.coverageProof,
-              projectionJobAuthorityIsCurrent(job),
-              predecessorProof.generation == job.generation,
-              liveSnapshot.rootEpoch == rootEpoch,
-              liveSnapshot.catalogGeneration == job.catalogGeneration,
-              liveSnapshot.repositoryAuthority == job.repositoryAuthority,
-              let overlaySnapshot = await overlay.snapshot(rootEpoch: rootEpoch),
-              overlaySnapshot.authorityIsCurrent,
-              overlaySnapshot.catalogGeneration == liveSnapshot.catalogGeneration,
-              overlaySnapshot.repositoryAuthority == liveSnapshot.repositoryAuthority,
-              overlaySnapshot.contributionGeneration == liveSnapshot.contributionGeneration,
-              let currentJob = projectionJobs[rootEpoch],
-              currentJob.id == job.id,
-              currentJob.phase == .complete,
-              currentJob.coverageProof == predecessorProof,
-              projectionJobAuthorityIsCurrent(currentJob),
-              let successorProof = predecessorProof.successor(
-                  contributionGeneration: liveSnapshot.contributionGeneration
-              )
-        else { return nil }
-        return WorkspaceCodemapProjectionSuccessorSeal(
-            predecessorProof: predecessorProof,
-            successorProof: successorProof
-        )
-    }
-
-    func commitCompletedProjectionSuccessor(
-        _ seal: WorkspaceCodemapProjectionSuccessorSeal
-    ) -> Bool {
-        let rootEpoch = seal.predecessorProof.generation.rootEpoch
-        guard var job = projectionJobs[rootEpoch],
-              job.phase == .complete,
-              job.generation == seal.predecessorProof.generation,
-              job.coverageProof == seal.predecessorProof,
-              projectionJobAuthorityIsCurrent(job),
-              latestOverlayContributionGenerationByRootEpoch[rootEpoch] ==
-              seal.successorProof.generation.contributionGeneration,
-              seal.predecessorProof.successor(
-                  contributionGeneration: seal.successorProof.generation.contributionGeneration
-              ) == seal.successorProof
-        else { return false }
-        job.generation = seal.successorProof.generation
-        job.coverageProof = seal.successorProof
-        job.coverageCompletedUptimeNanoseconds = uptimeNanoseconds()
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
-        activateProjectionDemands(rootEpoch: rootEpoch)
-        return true
-    }
-
-    @discardableResult
-    func restartCompletedProjectionForOverlayAdvance(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
-    ) -> Bool {
-        observeOverlayContributionGeneration(contributionGeneration, rootEpoch: rootEpoch)
-        guard let job = projectionJobs[rootEpoch],
-              job.phase == .complete,
-              job.task == nil,
-              let proof = job.coverageProof,
-              proof.generation.contributionGeneration < contributionGeneration,
-              resetProjectionForLatestGeneration(
-                  jobID: job.id,
-                  rootEpoch: rootEpoch,
-                  recordSupersession: true
-              )
-        else { return false }
-        incrementCounter(\.projectionPreloadsScheduled)
-        emit(.projectionPreloadScheduled, rootEpoch: rootEpoch, projectionPhase: .scheduled)
-        let task = Task(priority: .background) {
-            await self.runProjectionPreload(jobID: job.id, rootEpoch: rootEpoch)
-        }
-        guard var current = projectionJobs[rootEpoch], current.id == job.id else {
-            task.cancel()
-            return false
-        }
-        current.task = task
-        projectionJobs[rootEpoch] = current
-        return true
-    }
-
-    func waitForCurrentProjectionCoverage(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) async -> Bool {
-        var remainingTaskBoundaries = 2
-        while !Task.isCancelled, remainingTaskBoundaries > 0 {
-            guard let job = projectionJobs[rootEpoch],
-                  projectionJobAuthorityIsCurrent(job)
-            else { return false }
-            guard let task = job.task else {
-                return job.phase == .complete && projectionJobIsCurrent(job)
-            }
-            remainingTaskBoundaries -= 1
-            await task.value
-        }
-        guard !Task.isCancelled,
-              let job = projectionJobs[rootEpoch],
-              job.task == nil
-        else { return false }
-        return job.phase == .complete && projectionJobIsCurrent(job)
-    }
-
-    func planAutomaticSelectionCandidates(
-        _ request: WorkspaceCodemapBindingAutomaticSelectionPlanRequest
-    ) async -> WorkspaceCodemapBindingAutomaticSelectionPlanDisposition {
-        guard request.maximumMatchedCandidateCount >= 0 else {
-            return .budget(
-                dimension: .catalogEntries,
-                attempted: 0,
-                limit: 0
-            )
-        }
-        guard case let .eligible(initial)? = roots[request.rootEpoch],
-              initial.registration.catalogGeneration > 0,
-              initial.registration.ingressGeneration > 0
-        else { return .unavailable(.rootUnloaded) }
-        guard let preload = projectionJobs[request.rootEpoch] else {
-            return .incomplete(
-                progress: .notStarted,
-                remainingCount: UInt64(request.candidates.count),
-                retry: nil
-            )
-        }
-        guard preload.phase == .complete, let coverageProof = preload.coverageProof else {
-            if let budget = preload.budget {
-                return .budget(
-                    dimension: budget.dimension,
-                    attempted: budget.attempted,
-                    limit: budget.limit
-                )
-            }
-            let processed = preload.progress.counts.processedCandidateCount
-            let supported = preload.progress.counts.supportedCandidateCount
-            let remaining = supported >= processed ? supported - processed : nil
-            if let provisional = await provisionalAutomaticSelectionPlan(
-                request,
-                progress: preload.progress,
-                remainingCount: remaining,
-                retry: preload.retry
-            ) {
-                return provisional
-            }
-            if preload.phase == .suspendedBusy {
-                return .busy(
-                    progress: preload.progress,
-                    retryAfterMilliseconds: preload.retry?.retryAfterMilliseconds
-                )
-            }
-            return .incomplete(
-                progress: preload.progress,
-                remainingCount: remaining,
-                retry: preload.retry
-            )
-        }
-        guard request.sourceTickets.allSatisfy({ ticket in
-            ticket.rootEpoch == request.rootEpoch &&
-                ticket.catalogGeneration == initial.registration.catalogGeneration &&
-                ticket.ingressGeneration == initial.registration.ingressGeneration
-        }), request.candidates.allSatisfy({ candidate in
-            candidate.identity.rootID == request.rootEpoch.rootID &&
-                candidate.identity.rootLifetimeID == request.rootEpoch.rootLifetimeID &&
-                candidate.identity.standardizedRootPath == initial.registration.capabilityRequest.loadedRootURL.path &&
-                candidate.catalogGeneration == initial.registration.catalogGeneration &&
-                candidate.ingressGeneration == initial.registration.ingressGeneration
-        }) else { return .stale }
-        let uniqueCandidateFileIDs = Set(request.candidates.map(\.identity.fileID))
-        guard uniqueCandidateFileIDs.count == request.candidates.count,
-              UInt64(request.candidates.count) == coverageProof.candidateCount
-        else { return .stale }
-
-        var pipelineIdentitiesByLanguage: [LanguageType: CodeMapPipelineIdentity] = [:]
-        do {
-            for language in Set(request.candidates.map(\.language)) {
-                let pipelineIdentity = try ensurePipeline(
-                    rootEpoch: request.rootEpoch,
-                    language: language
-                )
-                pipelineIdentitiesByLanguage[language] = pipelineIdentity
-            }
-        } catch {
-            return .unavailable(.notBuilt)
-        }
-        guard case let .eligible(session)? = roots[request.rootEpoch],
-              session.registration == initial.registration
-        else { return .stale }
-
-        guard let bundle = await overlay.freeze(rootEpoch: request.rootEpoch) else {
-            return .incomplete(
-                progress: preload.progress,
-                remainingCount: nil,
-                retry: preload.retry
-            )
-        }
-        defer { bundle.close() }
-        guard let graphSnapshot = try? bundle.graphSnapshot() else { return .stale }
-        guard coverageProof.generation.contributionGeneration == graphSnapshot.contributionGeneration else {
-            return .incomplete(
-                progress: preload.progress,
-                remainingCount: 0,
-                retry: preload.retry
-            )
-        }
-        var sourceReferences = Set<String>()
-        for ticket in request.sourceTickets {
-            guard let binding = graphSnapshot.bindings.first(where: { binding in
-                guard case let .resolved(completion) = binding.availability else { return false }
-                return completion.token.identity.fileID == ticket.fileID &&
-                    completion.token.requestGeneration == ticket.requestGeneration
-            }), case let .resolved(completion) = binding.availability
-            else {
-                return .incomplete(
-                    progress: preload.progress,
-                    remainingCount: nil,
-                    retry: preload.retry
-                )
-            }
-            switch completion.outcome {
-            case let .ready(artifact):
-                sourceReferences.formUnion(CodeMapSelectionGraphContribution(
-                    artifactKey: completion.artifactKey,
-                    artifact: artifact
-                ).sortedUniqueReferences)
-            case .readyNoSymbols:
-                break
-            case .oversize, .decodeFailed, .parseFailed:
-                return .unavailable(.corrupt)
-            }
-        }
-
-        var necessary: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
-        var necessaryByteCount: UInt64 = 0
-        var indexedCandidateCount = 0
-        var hasMissingOrStaleContribution = false
-        let orderedCandidates = request.candidates.sorted {
-            if $0.identity.standardizedRelativePath != $1.identity.standardizedRelativePath {
-                return $0.identity.standardizedRelativePath < $1.identity.standardizedRelativePath
-            }
-            return $0.identity.fileID.uuidString < $1.identity.fileID.uuidString
-        }
-        for candidate in orderedCandidates {
-            guard let pipelineIdentity = pipelineIdentitiesByLanguage[candidate.language],
-                  let pipeline = session.pipelines[pipelineIdentity]
-            else {
-                hasMissingOrStaleContribution = true
-                continue
-            }
-            let currentPathGeneration = session.pathGenerations[
-                candidate.identity.standardizedRelativePath
-            ] ?? session.registration.ingressGeneration
-            guard candidate.requestGeneration == candidate.pathGeneration,
-                  candidate.pathGeneration == currentPathGeneration
-            else {
-                hasMissingOrStaleContribution = true
-                continue
-            }
-            let repositoryRelativePath = repositoryPath(
-                loadedRootRelativePath: candidate.identity.standardizedRelativePath,
-                prefix: session.capability.repositoryRelativeLoadedRootPrefix
-            )
-            guard let repositoryRelativePath,
-                  let record = pipeline.automaticSelectionCandidateRecords[repositoryRelativePath],
-                  record.bindingGeneration == candidate.requestGeneration,
-                  let envelope = record.contributionEnvelope
-            else {
-                hasMissingOrStaleContribution = true
-                continue
-            }
-            guard envelope.identity.schemaVersion == CodeMapSelectionGraphContribution.currentSchemaVersion,
-                  envelope.identity.policyVersion == CodeMapSelectionGraphContribution.currentPolicyVersion
-            else {
-                hasMissingOrStaleContribution = true
-                continue
-            }
-            guard let nextIndexedCandidateCount = addingChecked(indexedCandidateCount, 1) else {
-                return .budget(dimension: .catalogEntries, attempted: .max, limit: .max - 1)
-            }
-            indexedCandidateCount = nextIndexedCandidateCount
-            if !sourceReferences.isDisjoint(with: envelope.sortedUniqueDefinitions) {
-                guard necessary.count < request.maximumMatchedCandidateCount else {
-                    return .budget(
-                        dimension: .catalogEntries,
-                        attempted: UInt64(necessary.count + 1),
-                        limit: UInt64(request.maximumMatchedCandidateCount)
-                    )
-                }
-                let candidateByteCount = automaticSelectionCandidateByteCount(candidate)
-                let attemptedByteCount = addingSaturating(
-                    necessaryByteCount,
-                    candidateByteCount
-                )
-                guard attemptedByteCount >= necessaryByteCount,
-                      attemptedByteCount <= policy.maximumAutomaticSelectionMatchedCandidateByteCount
-                else {
-                    return .budget(
-                        dimension: .retainedProjectionBytes,
-                        attempted: attemptedByteCount,
-                        limit: policy.maximumAutomaticSelectionMatchedCandidateByteCount
-                    )
-                }
-                necessaryByteCount = attemptedByteCount
-                necessary.append(candidate)
-            }
-        }
-        guard !hasMissingOrStaleContribution,
-              projectionJobs[request.rootEpoch]?.coverageProof == coverageProof,
-              coverageProof.generation.contributionGeneration == graphSnapshot.contributionGeneration
-        else { return .stale }
-        return .ready(WorkspaceCodemapBindingAutomaticSelectionPlan(
-            necessaryCandidates: necessary,
-            indexedCandidateCount: indexedCandidateCount,
-            coverageProof: coverageProof
-        ))
-    }
-
-    private func automaticSelectionCandidateByteCount(
-        _ candidate: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate
-    ) -> UInt64 {
-        var bytes: UInt64 = 160
-        bytes = addingSaturating(bytes, UInt64(candidate.identity.standardizedRootPath.utf8.count))
-        bytes = addingSaturating(bytes, UInt64(candidate.identity.standardizedRelativePath.utf8.count))
-        bytes = addingSaturating(bytes, UInt64(candidate.identity.standardizedFullPath.utf8.count))
-        return bytes
-    }
-
-    private func provisionalAutomaticSelectionPlan(
-        _ request: WorkspaceCodemapBindingAutomaticSelectionPlanRequest,
-        progress: WorkspaceCodemapProjectionProgress,
-        remainingCount: UInt64?,
-        retry: WorkspaceCodemapProjectionRetry?
-    ) async -> WorkspaceCodemapBindingAutomaticSelectionPlanDisposition? {
-        guard case let .eligible(initial)? = roots[request.rootEpoch],
-              request.sourceTickets.allSatisfy({ ticket in
-                  ticket.rootEpoch == request.rootEpoch &&
-                      ticket.catalogGeneration == initial.registration.catalogGeneration &&
-                      ticket.ingressGeneration == initial.registration.ingressGeneration
-              }),
-              request.candidates.allSatisfy({ candidate in
-                  candidate.identity.rootID == request.rootEpoch.rootID &&
-                      candidate.identity.rootLifetimeID == request.rootEpoch.rootLifetimeID &&
-                      candidate.identity.standardizedRootPath ==
-                      initial.registration.capabilityRequest.loadedRootURL.path &&
-                      candidate.catalogGeneration == initial.registration.catalogGeneration &&
-                      candidate.ingressGeneration == initial.registration.ingressGeneration
-              }),
-              Set(request.candidates.map(\.identity.fileID)).count == request.candidates.count
-        else { return nil }
-
-        var pipelineIdentitiesByLanguage: [LanguageType: CodeMapPipelineIdentity] = [:]
-        do {
-            for language in Set(request.candidates.map(\.language)) {
-                pipelineIdentitiesByLanguage[language] = try ensurePipeline(
-                    rootEpoch: request.rootEpoch,
-                    language: language
-                )
-            }
-        } catch {
-            return nil
-        }
-        guard case let .eligible(session)? = roots[request.rootEpoch],
-              session.registration == initial.registration,
-              let bundle = await overlay.freeze(rootEpoch: request.rootEpoch)
-        else { return nil }
-        defer { bundle.close() }
-        guard let graphSnapshot = try? bundle.graphSnapshot() else { return nil }
-        var sourceReferences = Set<String>()
-        for ticket in request.sourceTickets {
-            guard let binding = graphSnapshot.bindings.first(where: { binding in
-                guard case let .resolved(completion) = binding.availability else { return false }
-                return completion.token.identity.fileID == ticket.fileID &&
-                    completion.token.requestGeneration == ticket.requestGeneration
-            }), case let .resolved(completion) = binding.availability
-            else { return nil }
-            switch completion.outcome {
-            case let .ready(artifact):
-                sourceReferences.formUnion(CodeMapSelectionGraphContribution(
-                    artifactKey: completion.artifactKey,
-                    artifact: artifact
-                ).sortedUniqueReferences)
-            case .readyNoSymbols:
-                break
-            case .oversize, .decodeFailed, .parseFailed:
-                return nil
-            }
-        }
-
-        var necessary: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
-        var necessaryByteCount: UInt64 = 0
-        var indexedCandidateCount = 0
-        let orderedCandidates = request.candidates.sorted {
-            if $0.identity.standardizedRelativePath != $1.identity.standardizedRelativePath {
-                return $0.identity.standardizedRelativePath < $1.identity.standardizedRelativePath
-            }
-            return $0.identity.fileID.uuidString < $1.identity.fileID.uuidString
-        }
-        for candidate in orderedCandidates {
-            guard let pipelineIdentity = pipelineIdentitiesByLanguage[candidate.language],
-                  let pipeline = session.pipelines[pipelineIdentity]
-            else { continue }
-            let currentPathGeneration = session.pathGenerations[
-                candidate.identity.standardizedRelativePath
-            ] ?? session.registration.ingressGeneration
-            guard candidate.requestGeneration == candidate.pathGeneration,
-                  candidate.pathGeneration == currentPathGeneration,
-                  let repositoryRelativePath = repositoryPath(
-                      loadedRootRelativePath: candidate.identity.standardizedRelativePath,
-                      prefix: session.capability.repositoryRelativeLoadedRootPrefix
-                  ),
-                  let record = pipeline.automaticSelectionCandidateRecords[repositoryRelativePath],
-                  record.bindingGeneration == candidate.requestGeneration,
-                  let envelope = record.contributionEnvelope,
-                  envelope.identity.schemaVersion == CodeMapSelectionGraphContribution.currentSchemaVersion,
-                  envelope.identity.policyVersion == CodeMapSelectionGraphContribution.currentPolicyVersion
-            else { continue }
-            guard let nextIndexedCandidateCount = addingChecked(indexedCandidateCount, 1) else {
-                return .budget(dimension: .catalogEntries, attempted: .max, limit: .max - 1)
-            }
-            indexedCandidateCount = nextIndexedCandidateCount
-            guard !sourceReferences.isDisjoint(with: envelope.sortedUniqueDefinitions) else { continue }
-            guard necessary.count < request.maximumMatchedCandidateCount else {
-                return .budget(
-                    dimension: .catalogEntries,
-                    attempted: UInt64(necessary.count + 1),
-                    limit: UInt64(request.maximumMatchedCandidateCount)
-                )
-            }
-            let candidateByteCount = automaticSelectionCandidateByteCount(candidate)
-            let attemptedByteCount = addingSaturating(necessaryByteCount, candidateByteCount)
-            guard attemptedByteCount >= necessaryByteCount,
-                  attemptedByteCount <= policy.maximumAutomaticSelectionMatchedCandidateByteCount
-            else {
-                return .budget(
-                    dimension: .retainedProjectionBytes,
-                    attempted: attemptedByteCount,
-                    limit: policy.maximumAutomaticSelectionMatchedCandidateByteCount
-                )
-            }
-            necessaryByteCount = attemptedByteCount
-            necessary.append(candidate)
-        }
-        return .provisional(
-            necessaryCandidates: necessary,
-            indexedCandidateCount: indexedCandidateCount,
-            progress: progress,
-            remainingCount: remainingCount,
-            retry: retry
-        )
-    }
-
-    func currentProjectionSnapshot(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> WorkspaceCodemapCurrentProjectionSnapshot {
-        guard case .eligible? = roots[rootEpoch] else {
-            return .unavailable(reason: .rootNotRegistered)
-        }
-        guard let job = projectionJobs[rootEpoch] else {
-            return .unavailable(reason: .jobNotScheduled)
-        }
-        guard projectionJobAuthorityIsCurrent(job) else {
-            return .nonCurrent
-        }
-        guard job.phase == .complete else {
-            return .pending(
-                phase: job.phase,
-                progress: job.progress,
-                inBatchProgress: job.inBatchProgress,
-                retry: job.retry,
-                budget: job.budget
-            )
-        }
-        guard let proof = job.coverageProof,
-              let completedUptimeNanoseconds = job.coverageCompletedUptimeNanoseconds,
-              let generation = job.generation,
-              generation == proof.generation,
-              proof.generation.rootEpoch == rootEpoch,
-              proof.generation.catalogToken.catalogGeneration == job.catalogGeneration,
-              proof.generation.catalogToken.ingressGeneration == job.ingressGeneration,
-              projectionJobIsCurrent(job)
-        else {
-            return .nonCurrent
-        }
-        return .authoritativeComplete(
-            proof: proof,
-            completedUptimeNanoseconds: completedUptimeNanoseconds
-        )
-    }
-
-    func projectionSnapshotUpdates(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> AsyncStream<WorkspaceCodemapCurrentProjectionSnapshot> {
-        let id = UUID()
-        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let hadSubscribers = projectionSnapshotContinuations[rootEpoch]?.isEmpty == false
-            let snapshot = currentProjectionSnapshot(rootEpoch: rootEpoch)
-            if hadSubscribers {
-                // Bring existing subscribers and the global de-dup baseline to the same
-                // current value before the new subscriber receives its initial snapshot.
-                publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-            }
-            projectionSnapshotContinuations[rootEpoch, default: [:]][id] = continuation
-            continuation.yield(snapshot)
-            if !hadSubscribers {
-                lastPublishedProjectionSnapshotsByRootEpoch[rootEpoch] = snapshot
-            }
-            continuation.onTermination = { _ in
-                Task { await self.removeProjectionSnapshotContinuation(id, rootEpoch: rootEpoch) }
-            }
-        }
-    }
-
-    private func removeProjectionSnapshotContinuation(
-        _ id: UUID,
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) {
-        projectionSnapshotContinuations[rootEpoch]?.removeValue(forKey: id)
-        if projectionSnapshotContinuations[rootEpoch]?.isEmpty == true {
-            projectionSnapshotContinuations.removeValue(forKey: rootEpoch)
-            lastPublishedProjectionSnapshotsByRootEpoch.removeValue(forKey: rootEpoch)
-        }
-    }
-
-    private func publishProjectionSnapshotUpdate(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        finish: Bool = false
-    ) {
-        guard let continuations = projectionSnapshotContinuations[rootEpoch] else { return }
-        let snapshot = currentProjectionSnapshot(rootEpoch: rootEpoch)
-        if lastPublishedProjectionSnapshotsByRootEpoch[rootEpoch] != snapshot {
-            lastPublishedProjectionSnapshotsByRootEpoch[rootEpoch] = snapshot
-            for continuation in continuations.values {
-                continuation.yield(snapshot)
-            }
-        }
-        if finish {
-            for continuation in continuations.values {
-                continuation.finish()
-            }
-            projectionSnapshotContinuations.removeValue(forKey: rootEpoch)
-            lastPublishedProjectionSnapshotsByRootEpoch.removeValue(forKey: rootEpoch)
-        }
-    }
-
-    private func beginProjectionInBatchProgress(
-        jobID: UUID,
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        candidateCount: Int
-    ) -> UUID? {
-        guard candidateCount > 0,
-              let candidateCount = UInt64(exactly: candidateCount),
-              var job = projectionJobs[rootEpoch],
-              job.id == jobID,
-              projectionJobIsCurrent(job)
-        else { return nil }
-        let replacedVisibleProgress = job.inBatchProgress != nil
-        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-        let batchID = UUID()
-        let pageStartProcessedCandidateBaseline = job.pageStartProcessedCandidateBaseline
-            ?? job.checkpoint?.progress.counts.processedCandidateCount
-            ?? job.progress.counts.processedCandidateCount
-        job.pageStartProcessedCandidateBaseline = pageStartProcessedCandidateBaseline
-        job.inBatchProgress = WorkspaceCodemapProjectionInBatchProgress(
-            batchID: batchID,
-            acceptedProcessedCandidateBaseline: pageStartProcessedCandidateBaseline,
-            resolvedCandidateCount: 0,
-            candidateCount: candidateCount
-        )
-        projectionJobs[rootEpoch] = job
-        if replacedVisibleProgress {
-            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-        }
-        return batchID
-    }
-
-    private func recordProjectionCandidateResolved(
-        jobID: UUID,
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        batchID: UUID
-    ) {
-        guard var job = projectionJobs[rootEpoch],
-              job.id == jobID,
-              projectionJobIsCurrent(job),
-              let inBatchProgress = job.inBatchProgress,
-              inBatchProgress.batchID == batchID,
-              let advanced = inBatchProgress.recordingResolvedCandidate()
-        else { return }
-        job.inBatchProgress = advanced
-        projectionJobs[rootEpoch] = job
-        scheduleProjectionProgressPublication(
-            jobID: jobID,
-            rootEpoch: rootEpoch,
-            inBatchProgress: advanced
-        )
-    }
-
-    private func scheduleProjectionProgressPublication(
-        jobID: UUID,
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        inBatchProgress: WorkspaceCodemapProjectionInBatchProgress
-    ) {
-        let now = uptimeNanoseconds()
-        if inBatchProgress.resolvedCandidateCount == 1 ||
-            lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] == nil
-        {
-            cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: false)
-            lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] = now
-            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-            return
-        }
-        guard projectionProgressPublicationSchedulesByRootEpoch[rootEpoch] == nil else { return }
-        let interval = policy.projectionProgressPublicationMinimumIntervalMilliseconds * 1_000_000
-        let last = lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] ?? now
-        let nextEligible = addingSaturating(last, interval)
-        if now >= nextEligible {
-            lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] = now
-            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-            return
-        }
-        let delay = nextEligible - now
-        let token = UUID()
-        let batchID = inBatchProgress.batchID
-        let task = Task { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: delay)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            await self?.publishScheduledProjectionProgress(
-                token: token,
-                jobID: jobID,
-                rootEpoch: rootEpoch,
-                batchID: batchID
-            )
-        }
-        projectionProgressPublicationSchedulesByRootEpoch[rootEpoch] =
-            ProjectionProgressPublicationSchedule(
-                token: token,
-                jobID: jobID,
-                batchID: batchID,
-                task: task
-            )
-    }
-
-    private func publishScheduledProjectionProgress(
-        token: UUID,
-        jobID: UUID,
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        batchID: UUID
-    ) {
-        guard let schedule = projectionProgressPublicationSchedulesByRootEpoch[rootEpoch],
-              schedule.token == token,
-              schedule.jobID == jobID,
-              schedule.batchID == batchID,
-              let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
-              job.inBatchProgress?.batchID == batchID
-        else { return }
-        projectionProgressPublicationSchedulesByRootEpoch.removeValue(forKey: rootEpoch)
-        lastProjectionProgressPublicationUptimeByRootEpoch[rootEpoch] = uptimeNanoseconds()
-        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-    }
-
-    private func clearProjectionInBatchProgress(
-        jobID: UUID,
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        publishReset: Bool
-    ) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else {
-            cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-            return
-        }
-        let hadVisibleProgress = job.inBatchProgress != nil
-        job.inBatchProgress = nil
-        projectionJobs[rootEpoch] = job
-        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-        if publishReset, hadVisibleProgress {
-            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-        }
-    }
-
-    private func cancelProjectionProgressPublication(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        resetLastPublication: Bool
-    ) {
-        projectionProgressPublicationSchedulesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
-        if resetLastPublication {
-            lastProjectionProgressPublicationUptimeByRootEpoch.removeValue(forKey: rootEpoch)
-        }
-    }
-
     func accounting() -> WorkspaceCodemapBindingEngineAccounting {
-        expireProjectionDemands()
         var eligible = 0
         var unavailable = 0
         var active = 0
@@ -2042,26 +1387,25 @@ actor WorkspaceCodemapBindingEngine {
         active = activeRequests.count
         owners.formUnion(activeRequests.values.map(\.publicOwner))
         owners.formUnion(queuedRequests.values.map(\.demand.owner))
-        owners.formUnion(projectionDemands.values.map(\.owner))
         let reservedSourceBytes = activeRequests.values.reduce(UInt64(0)) {
             addingSaturating($0, $1.reservedSourceBytes)
         }
         let adoptionUsage = adoptionLeaseUsage()
-        let projectionRoots: [WorkspaceCodemapBindingEngineProjectionRootAccounting] = projectionJobs.values.sorted {
+        let graphIndexRoots: [WorkspaceCodemapBindingEngineGraphIndexRootAccounting] = graphIndexJobs.values.sorted {
             rootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
-        }.map { job -> WorkspaceCodemapBindingEngineProjectionRootAccounting in
-            let drainingResources = drainingProjectionResources.reduce(
-                WorkspaceCodemapProjectionResourceAccounting.zero
+        }.map { job -> WorkspaceCodemapBindingEngineGraphIndexRootAccounting in
+            let drainingResources = drainingGraphIndexResources.reduce(
+                WorkspaceCodemapGraphIndexResourceAccounting.zero
             ) { partial, element in
-                guard drainingProjectionRootEpochs[element.key] == job.rootEpoch else { return partial }
+                guard drainingGraphIndexRootEpochs[element.key] == job.rootEpoch else { return partial }
                 switch partial.adding(element.value) {
                 case let .success(value):
                     return value
                 case .failure:
-                    return WorkspaceCodemapProjectionResourceAccounting(
+                    return WorkspaceCodemapGraphIndexResourceAccounting(
                         retainedPathBytes: .max,
                         retainedSourceBytes: .max,
-                        retainedProjectionBytes: .max,
+                        retainedGraphIndexBytes: .max,
                         stagedGraphBytes: .max,
                         residentGraphBytes: .max,
                         queuedManifestMutationBytes: .max
@@ -2071,62 +1415,55 @@ actor WorkspaceCodemapBindingEngine {
             let rootResources = switch job.resources.adding(drainingResources) {
             case let .success(value): value
             case .failure:
-                WorkspaceCodemapProjectionResourceAccounting(
+                WorkspaceCodemapGraphIndexResourceAccounting(
                     retainedPathBytes: .max,
                     retainedSourceBytes: .max,
-                    retainedProjectionBytes: .max,
+                    retainedGraphIndexBytes: .max,
                     stagedGraphBytes: .max,
                     residentGraphBytes: .max,
                     queuedManifestMutationBytes: .max
                 )
             }
-            return WorkspaceCodemapBindingEngineProjectionRootAccounting(
+            return WorkspaceCodemapBindingEngineGraphIndexRootAccounting(
                 rootEpoch: job.rootEpoch,
                 phase: job.phase,
                 progress: job.progress,
                 queuedBatchCount: job.isQueuedForAdmission ? 1 : 0,
-                activeBatchCount: activeProjectionBatchCount(rootEpoch: job.rootEpoch),
-                drainingBatchCount: drainingProjectionRootEpochs.values.count(where: {
+                activeBatchCount: activeGraphIndexBatchCount(rootEpoch: job.rootEpoch),
+                drainingBatchCount: drainingGraphIndexRootEpochs.values.count(where: {
                     $0 == job.rootEpoch
                 }),
                 resources: rootResources,
                 retry: job.retry,
-                budget: job.budget,
-                retainedDemandCount: projectionDemands.values.count(where: {
-                    $0.ticket.rootEpoch == job.rootEpoch
-                }),
-                retainedDemandMetadataByteCount: projectionDemands.values.reduce(UInt64(0)) {
-                    guard $1.ticket.rootEpoch == job.rootEpoch else { return $0 }
-                    return addingSaturating($0, $1.metadataByteCount)
-                }
+                budget: job.budget
             )
         }
-        let liveProjectionResources = projectionJobs.values.reduce(
-            WorkspaceCodemapProjectionResourceAccounting.zero
+        let liveGraphIndexResources = graphIndexJobs.values.reduce(
+            WorkspaceCodemapGraphIndexResourceAccounting.zero
         ) { partial, job in
             switch partial.adding(job.resources) {
             case let .success(value): value
             case .failure:
-                WorkspaceCodemapProjectionResourceAccounting(
+                WorkspaceCodemapGraphIndexResourceAccounting(
                     retainedPathBytes: .max,
                     retainedSourceBytes: .max,
-                    retainedProjectionBytes: .max,
+                    retainedGraphIndexBytes: .max,
                     stagedGraphBytes: .max,
                     residentGraphBytes: .max,
                     queuedManifestMutationBytes: .max
                 )
             }
         }
-        let projectionResources = drainingProjectionResources.values.reduce(
-            liveProjectionResources
+        let graphIndexResources = drainingGraphIndexResources.values.reduce(
+            liveGraphIndexResources
         ) { partial, resources in
             switch partial.adding(resources) {
             case let .success(value): value
             case .failure:
-                WorkspaceCodemapProjectionResourceAccounting(
+                WorkspaceCodemapGraphIndexResourceAccounting(
                     retainedPathBytes: .max,
                     retainedSourceBytes: .max,
-                    retainedProjectionBytes: .max,
+                    retainedGraphIndexBytes: .max,
                     stagedGraphBytes: .max,
                     residentGraphBytes: .max,
                     queuedManifestMutationBytes: .max
@@ -2147,25 +1484,20 @@ actor WorkspaceCodemapBindingEngine {
             ownerAdmissionHistoryCount: ownerLastAdmission.count,
             dirtyManifestCount: dirty,
             counters: counters,
-            projectionJobCount: projectionJobs.count,
-            suspendedProjectionJobCount: projectionJobs.values.count(where: {
+            graphIndexJobCount: graphIndexJobs.count,
+            suspendedGraphIndexJobCount: graphIndexJobs.values.count(where: {
                 $0.phase == .suspendedBusy
             }),
-            queuedProjectionBatchCount: projectionAdmissionQueue.count,
-            activeProjectionBatchCount: activeProjectionJobIDs.count,
-            drainingProjectionTaskCount: drainingProjectionTasks.count,
-            retainedProjectionDemandCount: projectionDemands.count,
-            retainedProjectionDemandMetadataByteCount: projectionDemands.values.reduce(UInt64(0)) {
-                addingSaturating($0, $1.metadataByteCount)
-            },
-            terminalProjectionDemandStatusCount: terminalProjectionDemands.count,
-            projectionResources: projectionResources,
-            projectionRoots: projectionRoots
+            queuedGraphIndexBatchCount: graphIndexAdmissionQueue.count,
+            activeGraphIndexBatchCount: activeGraphIndexJobIDs.count,
+            drainingGraphIndexTaskCount: drainingGraphIndexTasks.count,
+            graphIndexResources: graphIndexResources,
+            graphIndexRoots: graphIndexRoots
         )
     }
 
     #if DEBUG
-        func debugAcquireProjectionAdmissionHold(
+        func debugAcquireGraphIndexAdmissionHold(
             rootEpoch: WorkspaceCodemapRootEpoch,
             expiresAfterMilliseconds: UInt64
         ) -> (
@@ -2178,20 +1510,20 @@ actor WorkspaceCodemapBindingEngine {
             let expiryTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: expiresAfterMilliseconds * 1_000_000)
                 guard !Task.isCancelled else { return }
-                _ = await self?.debugReleaseProjectionAdmissionHold(
+                _ = await self?.debugReleaseGraphIndexAdmissionHold(
                     holdID,
                     rootEpoch: rootEpoch
                 )
             }
-            debugProjectionAdmissionHolds[holdID] = DebugProjectionAdmissionHold(
+            debugGraphIndexAdmissionHolds[holdID] = DebugGraphIndexAdmissionHold(
                 rootEpoch: rootEpoch,
                 expiryTask: expiryTask
             )
-            let snapshot = debugProjectionAdmissionSnapshot(rootEpoch: rootEpoch)
+            let snapshot = debugGraphIndexAdmissionSnapshot(rootEpoch: rootEpoch)
             return (holdID, snapshot.metrics, snapshot.queueWaitMilliseconds)
         }
 
-        func debugReleaseProjectionAdmissionHold(
+        func debugReleaseGraphIndexAdmissionHold(
             _ holdID: UUID,
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> (
@@ -2199,35 +1531,35 @@ actor WorkspaceCodemapBindingEngine {
             metrics: [String: UInt64],
             queueWaitMilliseconds: [UInt64]
         ) {
-            let owned = debugProjectionAdmissionHolds[holdID]
+            let owned = debugGraphIndexAdmissionHolds[holdID]
             let released = owned?.rootEpoch == rootEpoch
-            if released, let hold = debugProjectionAdmissionHolds.removeValue(forKey: holdID) {
+            if released, let hold = debugGraphIndexAdmissionHolds.removeValue(forKey: holdID) {
                 hold.expiryTask.cancel()
-                scheduleProjectionAdmissions()
+                scheduleGraphIndexAdmissions()
             }
-            let snapshot = debugProjectionAdmissionSnapshot(rootEpoch: rootEpoch)
+            let snapshot = debugGraphIndexAdmissionSnapshot(rootEpoch: rootEpoch)
             return (released, snapshot.metrics, snapshot.queueWaitMilliseconds)
         }
 
-        func debugProjectionAdmissionSnapshot(
+        func debugGraphIndexAdmissionSnapshot(
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> (
             metrics: [String: UInt64],
             queueWaitMilliseconds: [UInt64]
         ) {
             let current = accounting()
-            let queueWaitMilliseconds = debugProjectionQueueWaitMillisecondsByRootEpoch[
+            let queueWaitMilliseconds = debugGraphIndexQueueWaitMillisecondsByRootEpoch[
                 rootEpoch
             ] ?? []
             return (
                 [
-                    "hold_count": UInt64(debugProjectionAdmissionHolds.values.count(where: {
+                    "hold_count": UInt64(debugGraphIndexAdmissionHolds.values.count(where: {
                         $0.rootEpoch == rootEpoch
                     })),
                     "queue_wait_sample_ordinal":
-                        debugProjectionQueueWaitSampleOrdinalByRootEpoch[rootEpoch] ?? 0,
-                    "queued_projection_batch_count": UInt64(current.queuedProjectionBatchCount),
-                    "active_projection_batch_count": UInt64(current.activeProjectionBatchCount),
+                        debugGraphIndexQueueWaitSampleOrdinalByRootEpoch[rootEpoch] ?? 0,
+                    "queued_graphIndex_batch_count": UInt64(current.queuedGraphIndexBatchCount),
+                    "active_graphIndex_batch_count": UInt64(current.activeGraphIndexBatchCount),
                     "builds": current.counters.builds,
                     "materializations": current.counters.materializations,
                     "manifest_writes": current.counters.manifestWrites,
@@ -2239,281 +1571,60 @@ actor WorkspaceCodemapBindingEngine {
                     "failures": current.counters.failures,
                     "manifest_failures": current.counters.manifestFailures,
                     "busy_rejections": current.counters.busyRejections,
-                    "projection_demand_busy_rejections":
-                        current.counters.projectionDemandBusyRejections,
-                    "projection_batches_started": current.counters.projectionBatchesStarted,
-                    "projection_batches_queued": current.counters.projectionBatchesQueued,
-                    "projection_demands_acquired": current.counters.projectionDemandsAcquired,
-                    "projection_builds_started": current.counters.projectionBuildsStarted,
-                    "projection_segments_published": current.counters.projectionSegmentsPublished,
-                    "projection_catalog_pages": current.counters.projectionCatalogPages,
-                    "projection_catalog_candidates": current.counters.projectionCatalogCandidates,
-                    "projection_budget_rejections": current.counters.projectionBudgetRejections,
-                    "retained_path_bytes": current.projectionResources.retainedPathBytes,
-                    "retained_source_bytes": current.projectionResources.retainedSourceBytes,
-                    "retained_projection_bytes": current.projectionResources.retainedProjectionBytes,
-                    "staged_graph_bytes": current.projectionResources.stagedGraphBytes,
-                    "resident_graph_bytes": current.projectionResources.residentGraphBytes,
-                    "queued_manifest_mutation_bytes": current.projectionResources.queuedManifestMutationBytes,
+                    "graphIndex_batches_started": current.counters.graphIndexBatchesStarted,
+                    "graphIndex_batches_queued": current.counters.graphIndexBatchesQueued,
+                    "graph_index_runs_started": current.counters.graphIndexRunsStarted,
+                    "graphIndex_changes_published": current.counters.graphIndexChangesPublished,
+                    "graphIndex_catalog_pages": current.counters.graphIndexCatalogPages,
+                    "graphIndex_catalog_candidates": current.counters.graphIndexCatalogCandidates,
+                    "graphIndex_budget_rejections": current.counters.graphIndexBudgetRejections,
+                    "retained_path_bytes": current.graphIndexResources.retainedPathBytes,
+                    "retained_source_bytes": current.graphIndexResources.retainedSourceBytes,
+                    "retained_graphIndex_bytes": current.graphIndexResources.retainedGraphIndexBytes,
+                    "staged_graph_bytes": current.graphIndexResources.stagedGraphBytes,
+                    "resident_graph_bytes": current.graphIndexResources.residentGraphBytes,
+                    "queued_manifest_mutation_bytes": current.graphIndexResources.queuedManifestMutationBytes,
                     "limit_retained_path_bytes":
-                        policy.maximumProjectionCatalogPagePathByteCount *
-                        UInt64(policy.maximumActiveProjectionBatchCount),
+                        policy.maximumGraphIndexCatalogPagePathByteCount *
+                        UInt64(policy.maximumActiveGraphIndexBatchCount),
                     "limit_retained_source_bytes": policy.maximumRetainedSourceByteCount,
-                    "limit_retained_projection_bytes": policy.maximumRetainedProjectionByteCount,
-                    "limit_staged_graph_bytes": policy.maximumStagedProjectionGraphByteCount,
+                    "limit_retained_graphIndex_bytes": policy.maximumRetainedGraphIndexByteCount,
+                    "limit_staged_graph_bytes": policy.maximumStagedGraphIndexGraphByteCount,
                     "limit_resident_graph_bytes": WorkspaceCodemapSelectionGraphSizePolicy.initial.maxBytes,
                     "limit_queued_manifest_mutation_bytes":
-                        policy.maximumQueuedProjectionManifestMutationByteCount
+                        policy.maximumQueuedGraphIndexManifestMutationByteCount
                 ],
                 queueWaitMilliseconds
             )
         }
     #endif
 
-    // MARK: - Projection preload
+    // MARK: - GraphIndex build
 
-    private func activateProjectionDemands(rootEpoch: WorkspaceCodemapRootEpoch) {
-        guard projectionDemands.values.contains(where: { $0.ticket.rootEpoch == rootEpoch }),
-              case .eligible? = roots[rootEpoch]
-        else { return }
-        _ = scheduleProjectionPreload(rootEpoch: rootEpoch)
-    }
-
-    private func projectionDemandStatusValue(
-        _ ticket: WorkspaceCodemapProjectionDemandTicket
-    ) -> WorkspaceCodemapProjectionDemandStatus {
-        if let terminal = terminalProjectionDemands[ticket.id], terminal.ticket == ticket {
-            return terminal.status
-        }
-        guard let record = projectionDemands[ticket.id], record.ticket == ticket else {
-            return .cancelled
-        }
-        let retry = policy.projectionDemandRetryMilliseconds
-        switch roots[ticket.rootEpoch] {
-        case let .registering(attempt):
-            guard attempt.registration.catalogGeneration == ticket.catalogGeneration,
-                  attempt.registration.ingressGeneration == ticket.ingressGeneration
-            else { return terminalizeProjectionDemand(ticket.id, status: .stale) }
-            if record.deadlineUptimeNanoseconds <= uptimeNanoseconds() {
-                return terminalizeProjectionDemand(ticket.id, status: .expired)
-            }
-            return .waitingForSetup(retryAfterMilliseconds: retry)
-        case let .eligible(session):
-            guard session.registration.catalogGeneration == ticket.catalogGeneration,
-                  session.registration.ingressGeneration == ticket.ingressGeneration
-            else { return terminalizeProjectionDemand(ticket.id, status: .stale) }
-        case .unavailable:
-            return terminalizeProjectionDemand(
-                ticket.id,
-                status: .unavailable(reason: .capabilityUnavailable, retryAfterMilliseconds: nil)
-            )
-        case nil:
-            return terminalizeProjectionDemand(ticket.id, status: .stale)
-        }
-        guard let job = projectionJobs[ticket.rootEpoch] else {
-            if record.deadlineUptimeNanoseconds <= uptimeNanoseconds() {
-                return terminalizeProjectionDemand(ticket.id, status: .expired)
-            }
-            activateProjectionDemands(rootEpoch: ticket.rootEpoch)
-            return .queued(progress: .notStarted, retryAfterMilliseconds: retry)
-        }
-        if job.phase == .complete,
-           let proof = job.coverageProof,
-           let completedAt = job.coverageCompletedUptimeNanoseconds,
-           projectionJobIsCurrent(job)
-        {
-            if completedAt > record.deadlineUptimeNanoseconds {
-                return terminalizeProjectionDemand(ticket.id, status: .expired)
-            }
-            if record.deadlineUptimeNanoseconds <= uptimeNanoseconds() {
-                return terminalizeProjectionDemand(ticket.id, status: .ready(proof))
-            }
-            return .ready(proof)
-        }
-        if let budget = job.budget {
-            return terminalizeProjectionDemand(
-                ticket.id,
-                status: .unavailable(reason: .projectionBudget(budget), retryAfterMilliseconds: nil)
-            )
-        }
-        if job.phase == .cancelled || job.phase == .superseded || !projectionJobIsCurrent(job) {
-            return terminalizeProjectionDemand(ticket.id, status: .stale)
-        }
-        if record.deadlineUptimeNanoseconds <= uptimeNanoseconds() {
-            return terminalizeProjectionDemand(ticket.id, status: .expired)
-        }
-        if job.phase == .suspendedBusy {
-            let suggestedRetry = job.retry?.retryAfterMilliseconds ?? retry
-            return .suspendedBusy(
-                progress: job.progress,
-                retryAfterMilliseconds: min(1000, max(25, suggestedRetry))
-            )
-        }
-        if job.isActiveBatch {
-            return .activeBatch(progress: job.progress, retryAfterMilliseconds: retry)
-        }
-        if job.isQueuedForAdmission {
-            if !activeProjectionJobIDs.isEmpty {
-                return .waitingForBatchBoundary(progress: job.progress, retryAfterMilliseconds: retry)
-            }
-            return .queued(progress: job.progress, retryAfterMilliseconds: retry)
-        }
-        return .joined(progress: job.progress, retryAfterMilliseconds: retry)
-    }
-
-    @discardableResult
-    private func terminalizeProjectionDemand(
-        _ ticketID: UUID,
-        status: WorkspaceCodemapProjectionDemandStatus
-    ) -> WorkspaceCodemapProjectionDemandStatus {
-        guard let record = projectionDemands.removeValue(forKey: ticketID) else {
-            return terminalProjectionDemands[ticketID]?.status ?? status
-        }
-        ensureTerminalProjectionDemandOrdinalCapacity()
-        let ordinal = nextTerminalProjectionDemandOrdinal
-        nextTerminalProjectionDemandOrdinal = addingChecked(nextTerminalProjectionDemandOrdinal, 1) ?? .max
-        terminalProjectionDemands[ticketID] = TerminalProjectionDemandRecord(
-            ticket: record.ticket,
-            status: status,
-            terminalOrdinal: ordinal
-        )
-        trimTerminalProjectionDemands()
-        switch status {
-        case .expired:
-            incrementCounter(\.projectionDemandsExpired)
-        case .stale:
-            incrementCounter(\.projectionDemandsRevoked)
-        default:
-            break
-        }
-        pruneAdmissionHistory()
-        return status
-    }
-
-    private func expireProjectionDemands() {
-        let now = uptimeNanoseconds()
-        let terminal = projectionDemands.values.compactMap {
-            record -> (UUID, WorkspaceCodemapProjectionDemandStatus)? in
-            guard record.deadlineUptimeNanoseconds <= now else { return nil }
-            if let job = projectionJobs[record.ticket.rootEpoch],
-               job.phase == .complete,
-               let proof = job.coverageProof,
-               let completedAt = job.coverageCompletedUptimeNanoseconds,
-               completedAt <= record.deadlineUptimeNanoseconds,
-               projectionJobIsCurrent(job)
-            {
-                return (record.ticket.id, .ready(proof))
-            }
-            return (record.ticket.id, .expired)
-        }
-        for (ticketID, status) in terminal {
-            terminalizeProjectionDemand(ticketID, status: status)
-        }
-    }
-
-    private func revokeProjectionDemands(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        status: WorkspaceCodemapProjectionDemandStatus
-    ) {
-        let ticketIDs = projectionDemands.values.filter {
-            $0.ticket.rootEpoch == rootEpoch
-        }.map(\.ticket.id)
-        for ticketID in ticketIDs {
-            terminalizeProjectionDemand(ticketID, status: status)
-        }
-    }
-
-    private func projectionDemandPriority(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> (deadline: UInt64, enqueueOrdinal: UInt64)? {
-        projectionDemands.values.filter {
-            $0.ticket.rootEpoch == rootEpoch
-        }.map {
-            ($0.deadlineUptimeNanoseconds, $0.enqueueOrdinal)
-        }.min { lhs, rhs in
-            if lhs.0 != rhs.0 {
-                return lhs.0 < rhs.0
-            }
-            return lhs.1 < rhs.1
-        }
-    }
-
-    private func projectionArtifactPriority(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> CodeMapArtifactBuildPriority {
-        projectionDemandPriority(rootEpoch: rootEpoch) == nil ? .background : .demand
-    }
-
-    private func recordProjectionDemandBusy(rootEpoch: WorkspaceCodemapRootEpoch) {
-        incrementCounter(\.projectionDemandBusyRejections)
-        recordBusy(rootEpoch)
-    }
-
-    private func ensureProjectionDemandOrdinalCapacity() {
-        guard nextProjectionDemandOrdinal == .max else { return }
-        var ordinal: UInt64 = 1
-        for record in projectionDemands.values.sorted(by: {
-            $0.enqueueOrdinal < $1.enqueueOrdinal
-        }) {
-            var updated = record
-            updated.enqueueOrdinal = ordinal
-            projectionDemands[record.ticket.id] = updated
-            ordinal = addingChecked(ordinal, 1) ?? .max
-        }
-        nextProjectionDemandOrdinal = ordinal
-    }
-
-    private func ensureTerminalProjectionDemandOrdinalCapacity() {
-        guard nextTerminalProjectionDemandOrdinal == .max else { return }
-        var ordinal: UInt64 = 1
-        for record in terminalProjectionDemands.values.sorted(by: {
-            $0.terminalOrdinal < $1.terminalOrdinal
-        }) {
-            terminalProjectionDemands[record.ticket.id] = TerminalProjectionDemandRecord(
-                ticket: record.ticket,
-                status: record.status,
-                terminalOrdinal: ordinal
-            )
-            ordinal = addingChecked(ordinal, 1) ?? .max
-        }
-        nextTerminalProjectionDemandOrdinal = ordinal
-    }
-
-    private func trimTerminalProjectionDemands() {
-        let overflow = terminalProjectionDemands.count - policy.maximumProjectionDemandCount
-        guard overflow > 0 else { return }
-        let evicted = terminalProjectionDemands.values.sorted {
-            $0.terminalOrdinal < $1.terminalOrdinal
-        }.prefix(overflow)
-        for record in evicted {
-            terminalProjectionDemands.removeValue(forKey: record.ticket.id)
-        }
-    }
-
-    private func runProjectionPreload(
+    private func runGraphIndex(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) async {
-        defer { finishProjectionWorker(jobID: jobID, rootEpoch: rootEpoch) }
-        guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .waitingForAdmission) else {
+        defer { finishGraphIndexWorker(jobID: jobID, rootEpoch: rootEpoch) }
+        guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .waitingForAdmission) else {
             return
         }
-        incrementCounter(\.projectionPreloadsStarted)
-        emit(.projectionPreloadStarted, rootEpoch: rootEpoch, projectionPhase: .waitingForAdmission)
+        incrementCounter(\.graphIndexRunsStarted)
+        emit(.graphIndexRunStarted, rootEpoch: rootEpoch, graphIndexPhase: .waitingForAdmission)
 
         while !Task.isCancelled {
-            guard await awaitProjectionAdmission(jobID: jobID, rootEpoch: rootEpoch) else { return }
-            let result = await processProjectionBatch(jobID: jobID, rootEpoch: rootEpoch)
-            releaseProjectionAdmission(jobID: jobID, rootEpoch: rootEpoch)
+            guard await awaitGraphIndexAdmission(jobID: jobID, rootEpoch: rootEpoch) else { return }
+            let result = await processGraphIndexBatch(jobID: jobID, rootEpoch: rootEpoch)
+            releaseGraphIndexAdmission(jobID: jobID, rootEpoch: rootEpoch)
             switch result {
             case .checkpointed:
-                guard updateProjectionPhase(
+                guard updateGraphIndexPhase(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     phase: .waitingForAdmission
                 ) else { return }
             case .restartGeneration:
-                guard resetProjectionForLatestGeneration(
+                guard resetGraphIndexForLatestGeneration(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     recordSupersession: true
@@ -2521,12 +1632,12 @@ actor WorkspaceCodemapBindingEngine {
                     return
                 }
             case .restartPage:
-                guard resetProjectionForLatestGeneration(
+                guard resetGraphIndexForLatestGeneration(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     recordSupersession: false
-                ), await waitForProjectionRetry(jobID: jobID, rootEpoch: rootEpoch),
-                updateProjectionPhase(
+                ), await waitForGraphIndexRetry(jobID: jobID, rootEpoch: rootEpoch),
+                updateGraphIndexPhase(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     phase: .waitingForAdmission
@@ -2536,15 +1647,10 @@ actor WorkspaceCodemapBindingEngine {
             case .complete, .budgetLimited, .cancelled, .superseded:
                 return
             case .retry:
-                clearProjectionInBatchProgress(
-                    jobID: jobID,
-                    rootEpoch: rootEpoch,
-                    publishReset: true
-                )
-                guard await waitForProjectionRetry(jobID: jobID, rootEpoch: rootEpoch) else {
+                guard await waitForGraphIndexRetry(jobID: jobID, rootEpoch: rootEpoch) else {
                     return
                 }
-                guard updateProjectionPhase(
+                guard updateGraphIndexPhase(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     phase: .waitingForAdmission
@@ -2553,11 +1659,11 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func awaitProjectionAdmission(
+    private func awaitGraphIndexAdmission(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) async -> Bool {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID, projectionJobIsCurrent(job) else {
+        guard let job = graphIndexJobs[rootEpoch], job.id == jobID, graphIndexJobIsCurrent(job) else {
             return false
         }
         if job.isActiveBatch {
@@ -2566,9 +1672,9 @@ actor WorkspaceCodemapBindingEngine {
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled,
-                      var current = projectionJobs[rootEpoch],
+                      var current = graphIndexJobs[rootEpoch],
                       current.id == jobID,
-                      projectionJobIsCurrent(current)
+                      graphIndexJobIsCurrent(current)
                 else {
                     continuation.resume(returning: false)
                     return
@@ -2577,136 +1683,106 @@ actor WorkspaceCodemapBindingEngine {
                     continuation.resume(returning: false)
                     return
                 }
-                if nextProjectionQueueOrdinal == .max {
-                    renumberProjectionAdmissionQueue()
+                if nextGraphIndexQueueOrdinal == .max {
+                    renumberGraphIndexAdmissionQueue()
                 }
-                let ordinal = nextProjectionQueueOrdinal
-                nextProjectionQueueOrdinal = addingChecked(nextProjectionQueueOrdinal, 1) ?? .max
+                let ordinal = nextGraphIndexQueueOrdinal
+                nextGraphIndexQueueOrdinal = addingChecked(nextGraphIndexQueueOrdinal, 1) ?? .max
                 current.isQueuedForAdmission = true
                 current.phase = .waitingForAdmission
-                projectionJobs[rootEpoch] = current
-                projectionAdmissionQueue.append(ProjectionAdmissionWaiter(
+                graphIndexJobs[rootEpoch] = current
+                graphIndexAdmissionQueue.append(GraphIndexAdmissionWaiter(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     enqueueOrdinal: ordinal,
-                    demandOvertakeRecorded: false,
+                    rootOvertakeRecorded: false,
                     explicitOvertakeRecorded: false,
                     continuation: continuation
                 ))
                 #if DEBUG
-                    debugProjectionAdmissionEnqueuedAtNanoseconds[jobID] = DispatchTime.now().uptimeNanoseconds
+                    debugGraphIndexAdmissionEnqueuedAtNanoseconds[jobID] = DispatchTime.now().uptimeNanoseconds
                 #endif
-                incrementCounter(\.projectionBatchesQueued)
-                emit(.projectionBatchQueued, rootEpoch: rootEpoch, projectionPhase: .waitingForAdmission)
-                scheduleProjectionAdmissions()
+                incrementCounter(\.graphIndexBatchesQueued)
+                emit(.graphIndexBatchQueued, rootEpoch: rootEpoch, graphIndexPhase: .waitingForAdmission)
+                scheduleGraphIndexAdmissions()
             }
         } onCancel: {
-            Task { await self.cancelProjectionAdmission(jobID: jobID) }
+            Task { await self.cancelGraphIndexAdmission(jobID: jobID) }
         }
     }
 
-    private func scheduleProjectionAdmissions() {
-        guard !isShuttingDown, !projectionAdmissionQueue.isEmpty else { return }
-        expireProjectionDemands()
+    private func scheduleGraphIndexAdmissions() {
+        guard !isShuttingDown, !graphIndexAdmissionQueue.isEmpty else { return }
         let demandForeground = activeRequests.values.contains { $0.demand.priority == .demand } ||
             queuedRequests.values.contains { $0.demand.priority == .demand }
         let explicitForeground = activeRequests.values.contains { $0.demand.priority == .explicit } ||
             queuedRequests.values.contains { $0.demand.priority == .explicit }
         if demandForeground || explicitForeground {
-            for index in projectionAdmissionQueue.indices {
-                let rootEpoch = projectionAdmissionQueue[index].rootEpoch
-                if demandForeground, !projectionAdmissionQueue[index].demandOvertakeRecorded {
-                    projectionAdmissionQueue[index].demandOvertakeRecorded = true
-                    incrementCounter(\.projectionDemandOvertakes)
-                    emit(.projectionDemandOvertake, rootEpoch: rootEpoch, projectionPhase: .waitingForAdmission)
+            for index in graphIndexAdmissionQueue.indices {
+                let rootEpoch = graphIndexAdmissionQueue[index].rootEpoch
+                if demandForeground, !graphIndexAdmissionQueue[index].rootOvertakeRecorded {
+                    graphIndexAdmissionQueue[index].rootOvertakeRecorded = true
+                    incrementCounter(\.graphIndexRootOvertakes)
+                    emit(.graphIndexRootOvertake, rootEpoch: rootEpoch, graphIndexPhase: .waitingForAdmission)
                 }
-                if explicitForeground, !projectionAdmissionQueue[index].explicitOvertakeRecorded {
-                    projectionAdmissionQueue[index].explicitOvertakeRecorded = true
-                    incrementCounter(\.projectionExplicitOvertakes)
-                    emit(.projectionExplicitOvertake, rootEpoch: rootEpoch, projectionPhase: .waitingForAdmission)
+                if explicitForeground, !graphIndexAdmissionQueue[index].explicitOvertakeRecorded {
+                    graphIndexAdmissionQueue[index].explicitOvertakeRecorded = true
+                    incrementCounter(\.graphIndexExplicitOvertakes)
+                    emit(.graphIndexExplicitOvertake, rootEpoch: rootEpoch, graphIndexPhase: .waitingForAdmission)
                 }
             }
         }
 
-        while activeProjectionJobIDs.count < policy.maximumActiveProjectionBatchCount,
-              !projectionAdmissionQueue.isEmpty
+        while activeGraphIndexJobIDs.count < policy.maximumActiveGraphIndexBatchCount,
+              !graphIndexAdmissionQueue.isEmpty
         {
-            let eligible = projectionAdmissionQueue.indices.filter { index in
-                let waiter = projectionAdmissionQueue[index]
+            let eligible = graphIndexAdmissionQueue.indices.filter { index in
+                let waiter = graphIndexAdmissionQueue[index]
                 #if DEBUG
-                    if debugProjectionAdmissionHolds.values.contains(where: {
+                    if debugGraphIndexAdmissionHolds.values.contains(where: {
                         $0.rootEpoch == waiter.rootEpoch
                     }) {
                         return false
                     }
                 #endif
-                guard let job = projectionJobs[waiter.rootEpoch],
+                guard let job = graphIndexJobs[waiter.rootEpoch],
                       job.id == waiter.jobID,
-                      projectionJobIsCurrent(job),
+                      graphIndexJobIsCurrent(job),
                       !job.isActiveBatch,
-                      activeProjectionBatchCount(rootEpoch: waiter.rootEpoch) <
-                      policy.maximumActiveProjectionBatchCountPerRoot
+                      activeGraphIndexBatchCount(rootEpoch: waiter.rootEpoch) <
+                      policy.maximumActiveGraphIndexBatchCountPerRoot
                 else { return false }
-                return activeProjectionJobIDs.count < policy.maximumActiveProjectionBatchCount
+                return activeGraphIndexJobIDs.count < policy.maximumActiveGraphIndexBatchCount
             }
             guard !eligible.isEmpty else { return }
-            let demanded = eligible.filter {
-                projectionDemandPriority(rootEpoch: projectionAdmissionQueue[$0].rootEpoch) != nil
-            }
-            let ordinary = eligible.filter { !demanded.contains($0) }
-            let selectedIndex: Int
-            let selectedDemandedProjection: Bool
-            // Projection demand participates in the shared foreground quantum, but the mere
-            // presence of foreground file work must not idle spare projection capacity.
-            if !demanded.isEmpty,
-               consecutiveDemandAdmissions < policy.maximumConsecutiveDemandAdmissions || ordinary.isEmpty
-            {
-                selectedIndex = demanded.min(by: { lhs, rhs in
-                    let left = projectionAdmissionQueue[lhs]
-                    let right = projectionAdmissionQueue[rhs]
-                    let leftDemand = projectionDemandPriority(rootEpoch: left.rootEpoch)!
-                    let rightDemand = projectionDemandPriority(rootEpoch: right.rootEpoch)!
-                    if leftDemand.deadline != rightDemand.deadline {
-                        return leftDemand.deadline < rightDemand.deadline
-                    }
-                    let leftAdmission = projectionRootLastAdmission[left.rootEpoch] ?? 0
-                    let rightAdmission = projectionRootLastAdmission[right.rootEpoch] ?? 0
-                    if leftAdmission != rightAdmission {
-                        return leftAdmission < rightAdmission
-                    }
-                    if leftDemand.enqueueOrdinal != rightDemand.enqueueOrdinal {
-                        return leftDemand.enqueueOrdinal < rightDemand.enqueueOrdinal
-                    }
+            let selectedIndex = eligible.min { lhs, rhs in
+                let left = graphIndexAdmissionQueue[lhs]
+                let right = graphIndexAdmissionQueue[rhs]
+                let leftAdmission = graphIndexRootLastAdmission[left.rootEpoch] ?? 0
+                let rightAdmission = graphIndexRootLastAdmission[right.rootEpoch] ?? 0
+                if leftAdmission != rightAdmission { return leftAdmission < rightAdmission }
+                if left.enqueueOrdinal != right.enqueueOrdinal {
                     return left.enqueueOrdinal < right.enqueueOrdinal
-                })!
-                selectedDemandedProjection = true
-            } else if let oldestOrdinary = ordinary.min(by: { lhs, rhs in
-                let left = projectionAdmissionQueue[lhs].enqueueOrdinal
-                let right = projectionAdmissionQueue[rhs].enqueueOrdinal
-                return left < right
-            }) {
-                selectedIndex = oldestOrdinary
-                selectedDemandedProjection = false
-            } else {
-                return
-            }
-            let waiter = projectionAdmissionQueue.remove(at: selectedIndex)
-            guard var job = projectionJobs[waiter.rootEpoch],
+                }
+                return rootEpochPrecedes(left.rootEpoch, right.rootEpoch)
+            }!
+            let waiter = graphIndexAdmissionQueue.remove(at: selectedIndex)
+            guard var job = graphIndexJobs[waiter.rootEpoch],
                   job.id == waiter.jobID,
-                  projectionJobIsCurrent(job)
+                  graphIndexJobIsCurrent(job)
             else {
                 #if DEBUG
-                    debugProjectionAdmissionEnqueuedAtNanoseconds.removeValue(forKey: waiter.jobID)
+                    debugGraphIndexAdmissionEnqueuedAtNanoseconds.removeValue(forKey: waiter.jobID)
                 #endif
                 waiter.continuation.resume(returning: false)
                 continue
             }
             #if DEBUG
-                if let enqueued = debugProjectionAdmissionEnqueuedAtNanoseconds.removeValue(
+                if let enqueued = debugGraphIndexAdmissionEnqueuedAtNanoseconds.removeValue(
                     forKey: waiter.jobID
                 ) {
                     let elapsed = DispatchTime.now().uptimeNanoseconds &- enqueued
-                    var samples = debugProjectionQueueWaitMillisecondsByRootEpoch[
+                    var samples = debugGraphIndexQueueWaitMillisecondsByRootEpoch[
                         waiter.rootEpoch,
                         default: []
                     ]
@@ -2716,105 +1792,98 @@ actor WorkspaceCodemapBindingEngine {
                             samples.count - 1024
                         )
                     }
-                    debugProjectionQueueWaitMillisecondsByRootEpoch[waiter.rootEpoch] = samples
-                    debugProjectionQueueWaitSampleOrdinalByRootEpoch[waiter.rootEpoch, default: 0] &+= 1
+                    debugGraphIndexQueueWaitMillisecondsByRootEpoch[waiter.rootEpoch] = samples
+                    debugGraphIndexQueueWaitSampleOrdinalByRootEpoch[waiter.rootEpoch, default: 0] &+= 1
                 }
             #endif
             job.isQueuedForAdmission = false
             job.isActiveBatch = true
             job.phase = .readingCatalogPage
             job.retry = nil
-            projectionJobs[waiter.rootEpoch] = job
-            activeProjectionJobIDs.insert(waiter.jobID)
+            graphIndexJobs[waiter.rootEpoch] = job
+            activeGraphIndexJobIDs.insert(waiter.jobID)
             ensureAdmissionOrdinalCapacity()
-            projectionRootLastAdmission[waiter.rootEpoch] = nextAdmissionOrdinal
+            graphIndexRootLastAdmission[waiter.rootEpoch] = nextAdmissionOrdinal
             nextAdmissionOrdinal = addingChecked(nextAdmissionOrdinal, 1) ?? .max
-            if selectedDemandedProjection {
-                consecutiveDemandAdmissions = min(
-                    policy.maximumConsecutiveDemandAdmissions,
-                    consecutiveDemandAdmissions + 1
-                )
-            } else {
-                consecutiveDemandAdmissions = 0
-            }
-            incrementCounter(\.projectionBatchesStarted)
-            emit(.projectionBatchStarted, rootEpoch: waiter.rootEpoch, projectionPhase: .readingCatalogPage)
+            consecutiveDemandAdmissions = 0
+            incrementCounter(\.graphIndexBatchesStarted)
+            emit(.graphIndexBatchStarted, rootEpoch: waiter.rootEpoch, graphIndexPhase: .readingCatalogPage)
             waiter.continuation.resume(returning: true)
         }
     }
 
-    private func activeProjectionBatchCount(rootEpoch: WorkspaceCodemapRootEpoch) -> Int {
-        activeProjectionJobIDs.count { jobID in
-            if drainingProjectionRootEpochs[jobID] == rootEpoch {
+    private func activeGraphIndexBatchCount(rootEpoch: WorkspaceCodemapRootEpoch) -> Int {
+        activeGraphIndexJobIDs.count { jobID in
+            if drainingGraphIndexRootEpochs[jobID] == rootEpoch {
                 return true
             }
-            return projectionJobs[rootEpoch]?.id == jobID
+            return graphIndexJobs[rootEpoch]?.id == jobID
         }
     }
 
-    private func releaseProjectionAdmission(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
-        activeProjectionJobIDs.remove(jobID)
+    private func releaseGraphIndexAdmission(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
+        activeGraphIndexJobIDs.remove(jobID)
         job.isActiveBatch = false
-        projectionJobs[rootEpoch] = job
-        incrementCounter(\.projectionBatchesCompleted)
-        emit(.projectionBatchCompleted, rootEpoch: rootEpoch)
+        graphIndexJobs[rootEpoch] = job
+        incrementCounter(\.graphIndexBatchesCompleted)
+        emit(.graphIndexBatchCompleted, rootEpoch: rootEpoch)
         scheduleQueuedRequests()
-        scheduleProjectionAdmissions()
+        scheduleGraphIndexAdmissions()
     }
 
-    private func cancelProjectionAdmission(jobID: UUID) {
-        let detached = projectionAdmissionQueue.filter { $0.jobID == jobID }
-        projectionAdmissionQueue.removeAll { $0.jobID == jobID }
+    private func cancelGraphIndexAdmission(jobID: UUID) {
+        let detached = graphIndexAdmissionQueue.filter { $0.jobID == jobID }
+        graphIndexAdmissionQueue.removeAll { $0.jobID == jobID }
         #if DEBUG
-            debugProjectionAdmissionEnqueuedAtNanoseconds.removeValue(forKey: jobID)
+            debugGraphIndexAdmissionEnqueuedAtNanoseconds.removeValue(forKey: jobID)
         #endif
         for waiter in detached {
             waiter.continuation.resume(returning: false)
         }
     }
 
-    private func renumberProjectionAdmissionQueue() {
+    private func renumberGraphIndexAdmissionQueue() {
         var ordinal: UInt64 = 1
-        for index in projectionAdmissionQueue.indices {
-            projectionAdmissionQueue[index].enqueueOrdinal = ordinal
+        for index in graphIndexAdmissionQueue.indices {
+            graphIndexAdmissionQueue[index].enqueueOrdinal = ordinal
             ordinal = addingChecked(ordinal, 1) ?? .max
         }
-        nextProjectionQueueOrdinal = ordinal
+        nextGraphIndexQueueOrdinal = ordinal
     }
 
-    private func processProjectionBatch(
+    private func processGraphIndexBatch(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) async -> ProjectionBatchResult {
-        defer { clearProjectionBatchResources(jobID: jobID, rootEpoch: rootEpoch) }
-        guard let initial = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) else {
+    ) async -> GraphIndexBatchResult {
+        defer { clearGraphIndexBatchResources(jobID: jobID, rootEpoch: rootEpoch) }
+        guard let initial = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) else {
             return .cancelled
         }
-        let request = WorkspaceCodemapProjectionCatalogPageRequest(
+        let request = WorkspaceCodemapGraphIndexCatalogPageRequest(
             rootEpoch: rootEpoch,
             token: initial.generation?.catalogToken,
             cursor: initial.cursor,
             maximumEntryCount: min(
-                policy.maximumProjectionCatalogPageEntryCount,
-                policy.maximumProjectionBatchCandidateCount
+                policy.maximumGraphIndexCatalogPageEntryCount,
+                policy.maximumGraphIndexBatchCandidateCount
             ),
-            maximumPathByteCount: policy.maximumProjectionCatalogPagePathByteCount
+            maximumPathByteCount: policy.maximumGraphIndexCatalogPagePathByteCount
         )
-        let pageDisposition = await catalogClient.readProjectionCatalogPage(request)
+        let pageDisposition = await catalogClient.readGraphIndexCatalogPage(request)
         guard !Task.isCancelled,
-              let afterPageRead = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+              let afterPageRead = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
         else { return .cancelled }
-        let page: WorkspaceCodemapProjectionCatalogPage
+        let page: WorkspaceCodemapGraphIndexCatalogPage
         switch pageDisposition {
         case let .page(value):
             page = value
         case .stale:
-            supersedeProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+            supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
             return .superseded
         case let .unavailable(reason):
             if reason == .rootNotCurrent {
-                supersedeProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+                supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
                 return .superseded
             }
             return .retry
@@ -2824,10 +1893,10 @@ actor WorkspaceCodemapBindingEngine {
               page.token.ingressGeneration == afterPageRead.ingressGeneration,
               request.token == nil || request.token == page.token
         else {
-            supersedeProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+            supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
             return .superseded
         }
-        switch reserveProjectionResources(
+        switch reserveGraphIndexResources(
             jobID: jobID,
             rootEpoch: rootEpoch,
             retainedPathBytes: page.pathByteCount
@@ -2837,56 +1906,49 @@ actor WorkspaceCodemapBindingEngine {
         case .retry:
             return .retry
         case let .budget(budget):
-            finishProjectionForBudget(jobID: jobID, rootEpoch: rootEpoch, budget: budget)
+            finishGraphIndexForBudget(jobID: jobID, rootEpoch: rootEpoch, budget: budget)
             return .budgetLimited
         }
 
         if afterPageRead.generation == nil {
             guard let overlaySnapshot = await overlay.snapshot(rootEpoch: rootEpoch),
-                  var job = projectionJobs[rootEpoch],
+                  var job = graphIndexJobs[rootEpoch],
                   job.id == jobID,
-                  projectionJobIsCurrent(job),
+                  graphIndexJobIsCurrent(job),
                   overlaySnapshot.catalogGeneration == job.catalogGeneration,
                   overlaySnapshot.repositoryAuthority == job.repositoryAuthority
             else { return .retry }
-            job.generation = WorkspaceCodemapProjectionGeneration(
+            job.generation = WorkspaceCodemapGraphIndexGeneration(
                 catalogToken: page.token,
                 repositoryAuthority: job.repositoryAuthority,
                 contributionGeneration: overlaySnapshot.contributionGeneration
             )
-            projectionJobs[rootEpoch] = job
+            graphIndexJobs[rootEpoch] = job
         }
-        guard let generation = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch)?.generation,
+        guard let generation = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)?.generation,
               generation.catalogToken == page.token
         else { return .superseded }
-        incrementCounter(\.projectionCatalogPages)
-        addToCounter(\.projectionCatalogCandidates, UInt64(page.entries.count))
-        addToCounter(\.projectionCatalogPathBytes, page.pathByteCount)
-        emit(.projectionCatalogPage, rootEpoch: rootEpoch, numericValue: 1, projectionPhase: .readingCatalogPage)
+        incrementCounter(\.graphIndexCatalogPages)
+        addToCounter(\.graphIndexCatalogCandidates, UInt64(page.entries.count))
+        addToCounter(\.graphIndexCatalogPathBytes, page.pathByteCount)
+        emit(.graphIndexCatalogPage, rootEpoch: rootEpoch, numericValue: 1, graphIndexPhase: .readingCatalogPage)
         emit(
-            .projectionCatalogCandidates,
+            .graphIndexCatalogCandidates,
             rootEpoch: rootEpoch,
             numericValue: UInt64(page.entries.count),
-            projectionPhase: .readingCatalogPage
+            graphIndexPhase: .readingCatalogPage
         )
         emit(
-            .projectionCatalogPathBytes,
+            .graphIndexCatalogPathBytes,
             rootEpoch: rootEpoch,
             numericValue: page.pathByteCount,
-            projectionPhase: .readingCatalogPage
+            graphIndexPhase: .readingCatalogPage
         )
-
-        let inBatchID = beginProjectionInBatchProgress(
-            jobID: jobID,
-            rootEpoch: rootEpoch,
-            candidateCount: page.entries.count
-        )
-        guard page.entries.isEmpty || inBatchID != nil else { return .cancelled }
-        guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .loadingEnvelopes) else {
+        guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .loadingEnvelopes) else {
             return .cancelled
         }
         var pipelineByFileID: [UUID: CodeMapPipelineIdentity] = [:]
-        var candidatesByPipeline: [CodeMapPipelineIdentity: [WorkspaceCodemapProjectionCatalogCandidate]] = [:]
+        var candidatesByPipeline: [CodeMapPipelineIdentity: [WorkspaceCodemapGraphIndexCatalogCandidate]] = [:]
         do {
             for candidate in page.entries {
                 let pipelineIdentity = try ensurePipeline(
@@ -2899,18 +1961,41 @@ actor WorkspaceCodemapBindingEngine {
         } catch {
             return .retry
         }
-        guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
+        guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
             return .cancelled
         }
+        let pendingSlots = page.entries.compactMap { candidate -> WorkspaceCodemapGraphSlot? in
+            guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID] else { return nil }
+            return try? WorkspaceCodemapGraphSlot.validated(
+                rootEpoch: rootEpoch,
+                identity: candidate.identity,
+                requestGeneration: candidate.requestGeneration,
+                pathGeneration: candidate.pathGeneration,
+                pipelineIdentity: pipelineIdentity,
+                state: .pending,
+                diagnostics: WorkspaceCodemapGraphSlotDiagnostics(
+                    contributionDigest: nil,
+                    source: .graphIndex
+                )
+            ).get()
+        }
+        guard pendingSlots.count == page.entries.count,
+              await publishGraphIndexSlots(
+                  rootEpoch: rootEpoch,
+                  catalogToken: page.token,
+                  slots: pendingSlots,
+                  enumerationFinished: page.isEnd && page.entries.isEmpty
+              )
+        else { return .superseded }
 
         var manifestRecordsByPipeline: [CodeMapPipelineIdentity: [String: CodeMapRootManifestRecord]] = [:]
         for (pipelineIdentity, candidates) in candidatesByPipeline {
-            guard let records = await loadProjectionManifestRecords(
+            guard let records = await loadGraphIndexManifestRecords(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 pipelineIdentity: pipelineIdentity,
                 candidatePaths: Set(candidates.compactMap { candidate in
-                    guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+                    guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
                           case let .eligible(session)? = roots[rootEpoch]
                     else { return nil }
                     return repositoryPath(
@@ -2922,8 +2007,8 @@ actor WorkspaceCodemapBindingEngine {
             manifestRecordsByPipeline[pipelineIdentity] = records
         }
 
-        var resolvedByFileID: [UUID: ProjectionCandidateResolution] = [:]
-        var misses: [WorkspaceCodemapProjectionCatalogCandidate] = []
+        var resolvedByFileID: [UUID: GraphIndexCandidateResolution] = [:]
+        var misses: [WorkspaceCodemapGraphIndexCatalogCandidate] = []
         for candidate in page.entries {
             guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
                   case let .eligible(session)? = roots[rootEpoch],
@@ -2935,33 +2020,26 @@ actor WorkspaceCodemapBindingEngine {
             else { return .superseded }
             let record = manifestRecordsByPipeline[pipelineIdentity]?[repositoryRelativePath]
             if let record,
-               let entry = projectionEntry(
+               let entry = graphIndexEntry(
                    candidate: candidate,
                    pipelineIdentity: pipelineIdentity,
                    repositoryRelativePath: repositoryRelativePath,
                    record: record
                )
             {
-                retainProjectionAutomaticSelectionRecord(
+                retainGraphIndexAutomaticSelectionRecord(
                     rootEpoch: rootEpoch,
                     pipelineIdentity: pipelineIdentity,
                     record: record
                 )
                 resolvedByFileID[candidate.identity.fileID] = .entry(entry, manifestRecord: nil)
-                if let inBatchID {
-                    recordProjectionCandidateResolved(
-                        jobID: jobID,
-                        rootEpoch: rootEpoch,
-                        batchID: inBatchID
-                    )
-                }
             } else {
                 misses.append(candidate)
             }
         }
 
         if !misses.isEmpty {
-            guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .classifyingBatch),
+            guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .classifyingBatch),
                   case let .eligible(session)? = roots[rootEpoch]
             else { return .cancelled }
             incrementCounter(\.classifications)
@@ -2970,7 +2048,7 @@ actor WorkspaceCodemapBindingEngine {
                 relativePaths: misses.map(\.identity.standardizedRelativePath)
             )
             guard !Task.isCancelled,
-                  currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil
+                  currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil
             else { return .cancelled }
             guard classifications.failure == nil,
                   classifications.classifications.count == misses.count
@@ -2978,7 +2056,7 @@ actor WorkspaceCodemapBindingEngine {
             let classificationsByPath = Dictionary(
                 uniqueKeysWithValues: classifications.classifications.map { ($0.relativePath, $0) }
             )
-            guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .resolvingArtifacts) else {
+            guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .resolvingArtifacts) else {
                 return .cancelled
             }
             let maximumConcurrentResolutions = min(
@@ -2986,11 +2064,11 @@ actor WorkspaceCodemapBindingEngine {
                 policy.maximumConcurrentMaterializationCountPerOwner
             )
             let indexedResolutions = await withTaskGroup(
-                of: IndexedProjectionCandidateResolution.self,
-                returning: [IndexedProjectionCandidateResolution].self
+                of: IndexedGraphIndexCandidateResolution.self,
+                returning: [IndexedGraphIndexCandidateResolution].self
             ) { group in
                 var nextIndex = 0
-                var completed: [IndexedProjectionCandidateResolution] = []
+                var completed: [IndexedGraphIndexCandidateResolution] = []
                 completed.reserveCapacity(misses.count)
 
                 while nextIndex < maximumConcurrentResolutions {
@@ -3003,20 +2081,20 @@ actor WorkspaceCodemapBindingEngine {
                                   candidate.identity.standardizedRelativePath
                               ]
                         else {
-                            return IndexedProjectionCandidateResolution(
+                            return IndexedGraphIndexCandidateResolution(
                                 index: index,
                                 fileID: candidate.identity.fileID,
                                 resolution: .transient
                             )
                         }
-                        let resolution = await self.resolveProjectionCandidate(
+                        let resolution = await self.resolveGraphIndexCandidate(
                             jobID: jobID,
                             rootEpoch: rootEpoch,
                             candidate: candidate,
                             pipelineIdentity: pipelineIdentity,
                             classification: classification
                         )
-                        return IndexedProjectionCandidateResolution(
+                        return IndexedGraphIndexCandidateResolution(
                             index: index,
                             fileID: candidate.identity.fileID,
                             resolution: resolution
@@ -3025,13 +2103,6 @@ actor WorkspaceCodemapBindingEngine {
                 }
 
                 while let result = await group.next() {
-                    if case .entry = result.resolution, let inBatchID {
-                        recordProjectionCandidateResolved(
-                            jobID: jobID,
-                            rootEpoch: rootEpoch,
-                            batchID: inBatchID
-                        )
-                    }
                     completed.append(result)
                     guard nextIndex < misses.count else { continue }
                     let index = nextIndex
@@ -3043,20 +2114,20 @@ actor WorkspaceCodemapBindingEngine {
                                   candidate.identity.standardizedRelativePath
                               ]
                         else {
-                            return IndexedProjectionCandidateResolution(
+                            return IndexedGraphIndexCandidateResolution(
                                 index: index,
                                 fileID: candidate.identity.fileID,
                                 resolution: .transient
                             )
                         }
-                        let resolution = await self.resolveProjectionCandidate(
+                        let resolution = await self.resolveGraphIndexCandidate(
                             jobID: jobID,
                             rootEpoch: rootEpoch,
                             candidate: candidate,
                             pipelineIdentity: pipelineIdentity,
                             classification: classification
                         )
-                        return IndexedProjectionCandidateResolution(
+                        return IndexedGraphIndexCandidateResolution(
                             index: index,
                             fileID: candidate.identity.fileID,
                             resolution: resolution
@@ -3065,7 +2136,7 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 return completed.sorted { $0.index < $1.index }
             }
-            guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
+            guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
                 return .cancelled
             }
             for result in indexedResolutions {
@@ -3078,7 +2149,7 @@ actor WorkspaceCodemapBindingEngine {
                 case .transient:
                     return .retry
                 case let .budget(budget):
-                    finishProjectionForBudget(jobID: jobID, rootEpoch: rootEpoch, budget: budget)
+                    finishGraphIndexForBudget(jobID: jobID, rootEpoch: rootEpoch, budget: budget)
                     return .budgetLimited
                 }
             }
@@ -3088,25 +2159,25 @@ actor WorkspaceCodemapBindingEngine {
             resolvedByFileID[candidate.identity.fileID]
         }
         guard orderedResolutions.count == page.entries.count else { return .retry }
-        let entries = orderedResolutions.compactMap { resolution -> WorkspaceCodemapProjectionEntry? in
+        let entries = orderedResolutions.compactMap { resolution -> WorkspaceCodemapGraphIndexEntry? in
             guard case let .entry(entry, _) = resolution else { return nil }
             return entry
         }
         guard entries.count == page.entries.count else { return .retry }
 
         if page.isEnd {
-            let tokenDisposition = await catalogClient.revalidateProjectionCatalogToken(
+            let tokenDisposition = await catalogClient.revalidateGraphIndexCatalogToken(
                 rootEpoch,
                 page.token
             )
-            guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
+            guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
                 return .cancelled
             }
             switch tokenDisposition {
             case .current:
                 break
             case .stale:
-                supersedeProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+                supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
                 return .superseded
             case .unavailable:
                 return .retry
@@ -3114,13 +2185,13 @@ actor WorkspaceCodemapBindingEngine {
         }
 
         let pageLastCursor = page.entries.last.map {
-            WorkspaceCodemapProjectionCatalogCursor(
+            WorkspaceCodemapGraphIndexCatalogCursor(
                 standardizedRelativePath: $0.identity.standardizedRelativePath,
                 fileID: $0.identity.fileID
             )
-        } ?? currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch)?.lastProcessedCursor
-        let catalogCompletion: WorkspaceCodemapProjectionCatalogCompletion? = page.isEnd
-            ? WorkspaceCodemapProjectionCatalogCompletion(
+        } ?? currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)?.lastProcessedCursor
+        let catalogCompletion: WorkspaceCodemapGraphIndexCatalogCompletion? = page.isEnd
+            ? WorkspaceCodemapGraphIndexCatalogCompletion(
                 token: page.token,
                 finalCursor: pageLastCursor,
                 supportedCandidateCount: page.supportedCandidateCountThroughPage
@@ -3138,7 +2209,7 @@ actor WorkspaceCodemapBindingEngine {
         })
         var markerReadinessUnavailableFileIDs = Set<UUID>()
         if !manifestRecords.isEmpty {
-            guard updateProjectionPhase(
+            guard updateGraphIndexPhase(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 phase: .writingManifestCheckpoint
@@ -3153,10 +2224,10 @@ actor WorkspaceCodemapBindingEngine {
                         rootEpoch: rootEpoch,
                         pipelineIdentity: pipelineIdentity,
                         mutations: mutations,
-                        proof: .projection(jobID: jobID, generation: generation),
+                        proof: .graphIndex(jobID: jobID, generation: generation),
                         retainRecordsInMemory: true
                     )
-                    guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
+                    guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
                         return .cancelled
                     }
                     switch submission {
@@ -3169,7 +2240,7 @@ actor WorkspaceCodemapBindingEngine {
                     case .retry:
                         return .retry
                     case let .budget(budget):
-                        finishProjectionForBudget(
+                        finishGraphIndexForBudget(
                             jobID: jobID,
                             rootEpoch: rootEpoch,
                             budget: budget
@@ -3180,43 +2251,43 @@ actor WorkspaceCodemapBindingEngine {
             }
         }
 
-        let segmentGroups: [ProjectionSegmentGroup]
-        switch projectionSegmentGroups(entries) {
+        let changeGroups: [GraphIndexChangeGroup]
+        switch graphIndexChangeGroups(entries) {
         case let .groups(groups):
-            segmentGroups = groups
+            changeGroups = groups
         case let .budget(budget):
-            finishProjectionForBudget(
+            finishGraphIndexForBudget(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 budget: budget
             )
             return .budgetLimited
         }
-        let retainedProjectionBytes = segmentGroups.reduce(0) {
+        let retainedGraphIndexBytes = changeGroups.reduce(0) {
             addingSaturating($0, $1.byteCount)
         }
-        switch reserveProjectionResources(
+        switch reserveGraphIndexResources(
             jobID: jobID,
             rootEpoch: rootEpoch,
-            retainedProjectionBytes: retainedProjectionBytes
+            retainedGraphIndexBytes: retainedGraphIndexBytes
         ) {
         case .reserved:
             break
         case .retry:
             return .retry
         case let .budget(budget):
-            finishProjectionForBudget(jobID: jobID, rootEpoch: rootEpoch, budget: budget)
+            finishGraphIndexForBudget(jobID: jobID, rootEpoch: rootEpoch, budget: budget)
             return .budgetLimited
         }
 
-        var progress = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch)?.progress ?? .notStarted
-        if segmentGroups.isEmpty {
-            let delta = WorkspaceCodemapProjectionProgressDelta(
+        var progress = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)?.progress ?? .notStarted
+        if changeGroups.isEmpty {
+            let delta = WorkspaceCodemapGraphIndexProgressDelta(
                 counts: .zero,
                 catalogPageCount: 1,
                 catalogPathByteCount: page.pathByteCount,
-                publishedSegmentCount: 0,
-                publishedSegmentByteCount: 0
+                publishedGraphChangeCount: 0,
+                publishedGraphChangeByteCount: 0
             )
             let advance = progress.advancing(
                 to: .checkpointed,
@@ -3225,10 +2296,10 @@ actor WorkspaceCodemapBindingEngine {
             )
             guard case let .success(advanced) = advance else {
                 let budget = switch advance {
-                case let .failure(error): projectionOverflowBudget(error)
-                case .success: preconditionFailure("Expected projection accounting failure.")
+                case let .failure(error): graphIndexOverflowBudget(error)
+                case .success: preconditionFailure("Expected graphIndex accounting failure.")
                 }
-                finishProjectionForBudget(
+                finishGraphIndexForBudget(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     budget: budget
@@ -3236,17 +2307,17 @@ actor WorkspaceCodemapBindingEngine {
                 return .budgetLimited
             }
             progress = advanced
-            updateProjectionProgress(jobID: jobID, rootEpoch: rootEpoch, progress: progress)
+            updateGraphIndexProgress(jobID: jobID, rootEpoch: rootEpoch, progress: progress)
         } else {
-            var publishedSegmentThisPage = false
-            for (index, group) in segmentGroups.enumerated() {
-                guard var job = projectionJobs[rootEpoch], job.id == jobID,
-                      job.nextSegmentSequence < UInt64.max
+            var publishedChangeThisPage = false
+            for (index, group) in changeGroups.enumerated() {
+                guard var job = graphIndexJobs[rootEpoch], job.id == jobID,
+                      job.nextGraphChangeSequence < UInt64.max
                 else {
-                    finishProjectionForBudget(
+                    finishGraphIndexForBudget(
                         jobID: jobID,
                         rootEpoch: rootEpoch,
-                        budget: WorkspaceCodemapProjectionBudget(
+                        budget: WorkspaceCodemapGraphIndexBudget(
                             dimension: .catalogEntries,
                             attempted: .max,
                             limit: .max - 1
@@ -3254,29 +2325,23 @@ actor WorkspaceCodemapBindingEngine {
                     )
                     return .budgetLimited
                 }
-                let counts = projectionCounts(group.entries)
-                let isLast = index == segmentGroups.count - 1
-                let delta = WorkspaceCodemapProjectionProgressDelta(
+                let counts = graphIndexCounts(group.entries)
+                let isLast = index == changeGroups.count - 1
+                let delta = WorkspaceCodemapGraphIndexProgressDelta(
                     counts: counts,
                     catalogPageCount: isLast ? 1 : 0,
                     catalogPathByteCount: isLast ? page.pathByteCount : 0,
-                    publishedSegmentCount: 1,
-                    publishedSegmentByteCount: group.byteCount
+                    publishedGraphChangeCount: 1,
+                    publishedGraphChangeByteCount: group.byteCount
                 )
                 guard case let .success(advanced) = progress.advancing(
-                    to: .publishingProjectionSegment,
+                    to: .publishingGraphChanges,
                     by: delta,
                     catalogCompletion: isLast ? catalogCompletion : nil
-                ), case let .success(segment) = WorkspaceCodemapProjectionSegment.validated(
-                    generation: generation,
-                    sequence: job.nextSegmentSequence,
-                    entries: group.entries,
-                    progress: advanced,
-                    byteCount: group.byteCount
                 ) else {
-                    return publishedSegmentThisPage ? .restartPage : .retry
+                    return publishedChangeThisPage ? .restartPage : .retry
                 }
-                switch reserveProjectionResources(
+                switch reserveGraphIndexResources(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     stagedGraphBytes: group.byteCount
@@ -3284,78 +2349,75 @@ actor WorkspaceCodemapBindingEngine {
                 case .reserved:
                     break
                 case .retry:
-                    return publishedSegmentThisPage ? .restartPage : .retry
+                    return publishedChangeThisPage ? .restartPage : .retry
                 case let .budget(budget):
-                    finishProjectionForBudget(
+                    finishGraphIndexForBudget(
                         jobID: jobID,
                         rootEpoch: rootEpoch,
                         budget: budget
                     )
                     return .budgetLimited
                 }
-                let disposition = await publishProjectionSnapshot(
-                    .segment(segment),
+                let disposition = await publishGraphIndexEntries(
+                    group.entries,
+                    progress: advanced,
+                    enumerationFinished: false,
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     markerReadinessUnavailableFileIDs: markerReadinessUnavailableFileIDs
                 )
-                releaseStagedProjectionBytes(
+                releaseStagedGraphIndexBytes(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     byteCount: group.byteCount
                 )
-                guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
+                guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
                     return .cancelled
                 }
                 switch disposition {
                 case let .accepted(accepted), let .exactDuplicate(accepted):
                     progress = accepted
-                    publishedSegmentThisPage = true
-                    job = projectionJobs[rootEpoch]!
+                    publishedChangeThisPage = true
+                    job = graphIndexJobs[rootEpoch]!
                     job.progress = accepted
-                    job.nextSegmentSequence += 1
+                    job.nextGraphChangeSequence += 1
                     job.retry = nil
-                    projectionJobs[rootEpoch] = job
-                    cancelProjectionProgressPublication(
-                        rootEpoch: rootEpoch,
-                        resetLastPublication: false
-                    )
-                    publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-                    incrementCounter(\.projectionSegmentsPublished)
-                    addToCounter(\.projectionSegmentBytes, group.byteCount)
-                    if job.nextSegmentSequence == 1 {
-                        incrementCounter(\.projectionFirstSegments)
+                    graphIndexJobs[rootEpoch] = job
+                    incrementCounter(\.graphIndexChangesPublished)
+                    addToCounter(\.graphIndexChangeBytes, group.byteCount)
+                    if job.nextGraphChangeSequence == 1 {
+                        incrementCounter(\.graphIndexFirstChanges)
                         emit(
-                            .projectionFirstSegment,
+                            .graphIndexFirstChange,
                             rootEpoch: rootEpoch,
                             numericValue: group.byteCount,
-                            projectionPhase: .publishingProjectionSegment
+                            graphIndexPhase: .publishingGraphChanges
                         )
                     }
                     emit(
-                        .projectionSegmentPublished,
+                        .graphIndexChangePublished,
                         rootEpoch: rootEpoch,
                         numericValue: group.byteCount,
-                        projectionPhase: .publishingProjectionSegment
+                        graphIndexPhase: .publishingGraphChanges
                     )
                 case .stale, .superseded:
-                    switch await projectionPublicationStalenessResult(
+                    switch await graphIndexPublicationStalenessResult(
                         jobID: jobID,
                         rootEpoch: rootEpoch
                     ) {
                     case .restartGeneration:
                         return .restartGeneration
                     case .retry:
-                        return publishedSegmentThisPage ? .restartPage : .retry
+                        return publishedChangeThisPage ? .restartPage : .retry
                     case .terminal:
-                        supersedeProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+                        supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
                         return .superseded
                     }
                 case let .budget(dimension, attempted, limit):
-                    finishProjectionForBudget(
+                    finishGraphIndexForBudget(
                         jobID: jobID,
                         rootEpoch: rootEpoch,
-                        budget: WorkspaceCodemapProjectionBudget(
+                        budget: WorkspaceCodemapGraphIndexBudget(
                             dimension: dimension,
                             attempted: attempted,
                             limit: limit
@@ -3363,69 +2425,60 @@ actor WorkspaceCodemapBindingEngine {
                     )
                     return .budgetLimited
                 case .unavailable:
-                    return publishedSegmentThisPage ? .restartPage : .retry
+                    return publishedChangeThisPage ? .restartPage : .retry
                 case .busy:
                     return .retry
                 }
             }
         }
 
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return .cancelled }
-        // Segment progress already includes this page. For an empty page it was advanced above.
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return .cancelled }
+        // Change progress already includes this page. For an empty page it was advanced above.
         guard job.progress.counts.supportedCandidateCount == page.supportedCandidateCountThroughPage
         else {
-            supersedeProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+            supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
             return .superseded
         }
         job.cursor = page.nextCursor
         job.lastProcessedCursor = pageLastCursor
-        progress = projectionProgress(progress, phase: .checkpointed)
+        progress = graphIndexProgress(progress, phase: .checkpointed)
         job.phase = .checkpointed
         job.progress = progress
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
         job.retryAttempt = 0
         job.retry = nil
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
-        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
 
         guard page.isEnd else { return .checkpointed }
         guard let completion = catalogCompletion,
-              progress.catalogCompletion == completion,
-              case let .success(proof) = WorkspaceCodemapProjectionCoverageProof.validated(
-                  generation: generation,
-                  catalogCompletion: completion,
-                  counts: progress.counts,
-                  lastSegmentSequence: job.nextSegmentSequence == 0 ? nil : job.nextSegmentSequence - 1
-              ) else { return .retry }
-        let sealDisposition = await publishProjectionSnapshot(
-            .seal(proof),
+              progress.catalogCompletion == completion
+        else { return .retry }
+        let finalDisposition = await publishGraphIndexEntries(
+            [],
+            progress: progress,
+            enumerationFinished: true,
             jobID: jobID,
             rootEpoch: rootEpoch
         )
-        guard var completedJob = projectionJobs[rootEpoch], completedJob.id == jobID else {
+        guard var completedJob = graphIndexJobs[rootEpoch], completedJob.id == jobID else {
             return .cancelled
         }
-        switch sealDisposition {
+        switch finalDisposition {
         case let .accepted(accepted), let .exactDuplicate(accepted):
             completedJob.phase = .complete
             completedJob.progress = accepted
             completedJob.inBatchProgress = nil
             completedJob.pageStartProcessedCandidateBaseline = nil
-            completedJob.coverageProof = proof
-            completedJob.coverageCompletedUptimeNanoseconds = uptimeNanoseconds()
             completedJob.retry = nil
-            completedJob.checkpoint = makeProjectionCheckpoint(completedJob)
-            projectionJobs[rootEpoch] = completedJob
-            cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-            incrementCounter(\.projectionCoveragesCompleted)
-            emit(.projectionCoverageComplete, rootEpoch: rootEpoch, projectionPhase: .complete)
+            completedJob.checkpoint = makeGraphIndexCheckpoint(completedJob)
+            graphIndexJobs[rootEpoch] = completedJob
+            incrementCounter(\.graphIndexCoveragesCompleted)
+            emit(.graphIndexCoverageComplete, rootEpoch: rootEpoch, graphIndexPhase: .complete)
             return .complete
         case .stale, .superseded:
-            switch await projectionPublicationStalenessResult(
+            switch await graphIndexPublicationStalenessResult(
                 jobID: jobID,
                 rootEpoch: rootEpoch
             ) {
@@ -3434,14 +2487,14 @@ actor WorkspaceCodemapBindingEngine {
             case .retry:
                 return .restartPage
             case .terminal:
-                supersedeProjectionJob(jobID: jobID, rootEpoch: rootEpoch)
+                supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
                 return .superseded
             }
         case let .budget(dimension, attempted, limit):
-            finishProjectionForBudget(
+            finishGraphIndexForBudget(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
-                budget: WorkspaceCodemapProjectionBudget(
+                budget: WorkspaceCodemapGraphIndexBudget(
                     dimension: dimension,
                     attempted: attempted,
                     limit: limit
@@ -3455,13 +2508,13 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func loadProjectionManifestRecords(
+    private func loadGraphIndexManifestRecords(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         pipelineIdentity: CodeMapPipelineIdentity,
         candidatePaths: Set<String>
     ) async -> [String: CodeMapRootManifestRecord]? {
-        guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+        guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
               let pipeline = session.pipelines[pipelineIdentity]
         else { return nil }
@@ -3473,18 +2526,18 @@ actor WorkspaceCodemapBindingEngine {
                 currentAuthority: pipeline.authority
             )
         } catch {
-            guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else { return nil }
-            incrementCounter(\.projectionEnvelopeInvalid)
-            emit(.projectionEnvelopeInvalid, rootEpoch: rootEpoch, projectionPhase: .loadingEnvelopes)
+            guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else { return nil }
+            incrementCounter(\.graphIndexEnvelopeInvalid)
+            emit(.graphIndexEnvelopeInvalid, rootEpoch: rootEpoch, graphIndexPhase: .loadingEnvelopes)
             return [:]
         }
-        guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
+        guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
               job.sessionID == session.id
         else { return nil }
         switch load {
         case .miss:
             emit(.manifestLoadMiss, rootEpoch: rootEpoch)
-            updateProjectionPipelineScope(
+            updateGraphIndexPipelineScope(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 pipelineIdentity: pipelineIdentity,
@@ -3492,9 +2545,9 @@ actor WorkspaceCodemapBindingEngine {
             )
             return [:]
         case .stale:
-            incrementCounter(\.projectionEnvelopeStale)
-            emit(.projectionEnvelopeStale, rootEpoch: rootEpoch, projectionPhase: .loadingEnvelopes)
-            updateProjectionPipelineScope(
+            incrementCounter(\.graphIndexEnvelopeStale)
+            emit(.graphIndexEnvelopeStale, rootEpoch: rootEpoch, graphIndexPhase: .loadingEnvelopes)
+            updateGraphIndexPipelineScope(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 pipelineIdentity: pipelineIdentity,
@@ -3505,11 +2558,11 @@ actor WorkspaceCodemapBindingEngine {
             guard snapshot.namespace == pipeline.namespace,
                   snapshot.authority == pipeline.authority
             else {
-                incrementCounter(\.projectionEnvelopeStale)
+                incrementCounter(\.graphIndexEnvelopeStale)
                 return [:]
             }
             emit(.manifestLoadHit, rootEpoch: rootEpoch, numericValue: UInt64(snapshot.records.count))
-            updateProjectionPipelineScope(
+            updateGraphIndexPipelineScope(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 pipelineIdentity: pipelineIdentity,
@@ -3523,30 +2576,30 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func projectionEntry(
-        candidate: WorkspaceCodemapProjectionCatalogCandidate,
+    private func graphIndexEntry(
+        candidate: WorkspaceCodemapGraphIndexCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity,
         repositoryRelativePath: String,
         record: CodeMapRootManifestRecord
-    ) -> WorkspaceCodemapProjectionEntry? {
+    ) -> WorkspaceCodemapGraphIndexEntry? {
         guard record.repositoryRelativePath == repositoryRelativePath,
               record.bindingGeneration == candidate.requestGeneration,
               record.locatorIdentity.pipelineIdentity == pipelineIdentity,
               record.artifactKey.pipelineIdentity == pipelineIdentity
         else {
-            incrementCounter(\.projectionEnvelopeStale)
-            emit(.projectionEnvelopeStale, projectionPhase: .loadingEnvelopes)
+            incrementCounter(\.graphIndexEnvelopeStale)
+            emit(.graphIndexEnvelopeStale, graphIndexPhase: .loadingEnvelopes)
             return nil
         }
-        let outcome: WorkspaceCodemapProjectionEntryOutcome
+        let outcome: WorkspaceCodemapGraphIndexEntryOutcome
         switch record.outcome {
         case .ready, .readyNoSymbols:
             guard let envelope = record.contributionEnvelope,
                   envelope.identity.schemaVersion == CodeMapSelectionGraphContribution.currentSchemaVersion,
                   envelope.identity.policyVersion == CodeMapSelectionGraphContribution.currentPolicyVersion
             else {
-                incrementCounter(\.projectionEnvelopeStale)
-                emit(.projectionEnvelopeStale, projectionPhase: .loadingEnvelopes)
+                incrementCounter(\.graphIndexEnvelopeStale)
+                emit(.graphIndexEnvelopeStale, graphIndexPhase: .loadingEnvelopes)
                 return nil
             }
             let contribution = CodeMapSelectionGraphContribution(
@@ -3555,29 +2608,29 @@ actor WorkspaceCodemapBindingEngine {
                 references: envelope.sortedUniqueReferences
             )
             guard CodeMapRootManifestContributionIdentity(contribution) == envelope.identity else {
-                incrementCounter(\.projectionEnvelopeInvalid)
-                emit(.projectionEnvelopeInvalid, projectionPhase: .loadingEnvelopes)
+                incrementCounter(\.graphIndexEnvelopeInvalid)
+                emit(.graphIndexEnvelopeInvalid, graphIndexPhase: .loadingEnvelopes)
                 return nil
             }
             outcome = envelope.sortedUniqueDefinitions.isEmpty && envelope.sortedUniqueReferences.isEmpty
                 ? .empty(contribution)
                 : .contributed(contribution)
-            incrementCounter(\.projectionEnvelopeHits)
-            emit(.projectionEnvelopeHit, projectionPhase: .loadingEnvelopes)
+            incrementCounter(\.graphIndexEnvelopeHits)
+            emit(.graphIndexEnvelopeHit, graphIndexPhase: .loadingEnvelopes)
         case .terminalOversize:
             outcome = .terminalArtifact(.oversize)
-            incrementCounter(\.projectionTerminalRecordHits)
-            emit(.projectionTerminalRecordHit, projectionPhase: .loadingEnvelopes)
+            incrementCounter(\.graphIndexTerminalRecordHits)
+            emit(.graphIndexTerminalRecordHit, graphIndexPhase: .loadingEnvelopes)
         case .terminalDecodeFailure:
             outcome = .terminalArtifact(.decodeFailed)
-            incrementCounter(\.projectionTerminalRecordHits)
-            emit(.projectionTerminalRecordHit, projectionPhase: .loadingEnvelopes)
+            incrementCounter(\.graphIndexTerminalRecordHits)
+            emit(.graphIndexTerminalRecordHit, graphIndexPhase: .loadingEnvelopes)
         case .terminalParseFailure:
             outcome = .terminalArtifact(.parseFailed)
-            incrementCounter(\.projectionTerminalRecordHits)
-            emit(.projectionTerminalRecordHit, projectionPhase: .loadingEnvelopes)
+            incrementCounter(\.graphIndexTerminalRecordHits)
+            emit(.graphIndexTerminalRecordHit, graphIndexPhase: .loadingEnvelopes)
         }
-        return WorkspaceCodemapProjectionEntry(
+        return WorkspaceCodemapGraphIndexEntry(
             identity: candidate.identity,
             requestGeneration: candidate.requestGeneration,
             pathGeneration: candidate.pathGeneration,
@@ -3586,7 +2639,7 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    private func retainProjectionAutomaticSelectionRecord(
+    private func retainGraphIndexAutomaticSelectionRecord(
         rootEpoch: WorkspaceCodemapRootEpoch,
         pipelineIdentity: CodeMapPipelineIdentity,
         record: CodeMapRootManifestRecord
@@ -3606,14 +2659,14 @@ actor WorkspaceCodemapBindingEngine {
         roots[rootEpoch] = .eligible(session)
     }
 
-    private func resolveProjectionCandidate(
+    private func resolveGraphIndexCandidate(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        candidate: WorkspaceCodemapProjectionCatalogCandidate,
+        candidate: WorkspaceCodemapGraphIndexCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity,
         classification: GitBlobIdentityClassification
-    ) async -> ProjectionCandidateResolution {
-        guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+    ) async -> GraphIndexCandidateResolution {
+        guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
               session.id == job.sessionID,
               let pipeline = session.pipelines[pipelineIdentity],
@@ -3627,7 +2680,7 @@ actor WorkspaceCodemapBindingEngine {
 
         switch classification.outcome {
         case .securityExcluded:
-            return .entry(WorkspaceCodemapProjectionEntry(
+            return .entry(WorkspaceCodemapGraphIndexEntry(
                 identity: candidate.identity,
                 requestGeneration: candidate.requestGeneration,
                 pathGeneration: candidate.pathGeneration,
@@ -3635,14 +2688,14 @@ actor WorkspaceCodemapBindingEngine {
                 outcome: .terminalExcluded(.securityExcluded)
             ), manifestRecord: nil)
         case let .unsupported(reason):
-            let exclusion: WorkspaceCodemapProjectionTerminalExclusionReason
+            let exclusion: WorkspaceCodemapGraphTerminalExclusionReason
             switch reason {
             case .gitlink: exclusion = .gitlink
             case .nonRegularFile: exclusion = .nonRegular
             case .unsupportedGit, .invalidObjectFormat, .invalidPath, .unknownIndexMode:
                 return .transient
             }
-            return .entry(WorkspaceCodemapProjectionEntry(
+            return .entry(WorkspaceCodemapGraphIndexEntry(
                 identity: candidate.identity,
                 requestGeneration: candidate.requestGeneration,
                 pathGeneration: candidate.pathGeneration,
@@ -3667,7 +2720,7 @@ actor WorkspaceCodemapBindingEngine {
         )
         guard !Task.isCancelled,
               let sourceAuthority,
-              projectionCandidateIsCurrent(
+              graphIndexCandidateIsCurrent(
                   jobID: jobID,
                   rootEpoch: rootEpoch,
                   candidate: candidate,
@@ -3686,7 +2739,7 @@ actor WorkspaceCodemapBindingEngine {
             var sourceReservation: UInt64 = 0
             defer {
                 if sourceReservation > 0 {
-                    releaseProjectionSourceBytes(
+                    releaseGraphIndexSourceBytes(
                         jobID: jobID,
                         rootEpoch: rootEpoch,
                         byteCount: sourceReservation
@@ -3700,14 +2753,14 @@ actor WorkspaceCodemapBindingEngine {
                     locator: locator,
                     manifestRecord: nil,
                     ownerID: jobID,
-                    priority: projectionArtifactPriority(rootEpoch: rootEpoch)
+                    priority: .background
                 ) {
                 case let .ready(fastPath):
                     resolved = fastPath
                 case let .miss(miss):
-                    recordProjectionFastPathMiss(miss, rootEpoch: rootEpoch)
+                    recordGraphIndexFastPathMiss(miss, rootEpoch: rootEpoch)
                     let reservation = UInt64(policy.maximumValidatedWorktreeByteCount)
-                    switch reserveProjectionResources(
+                    switch reserveGraphIndexResources(
                         jobID: jobID,
                         rootEpoch: rootEpoch,
                         retainedSourceBytes: reservation,
@@ -3728,12 +2781,12 @@ actor WorkspaceCodemapBindingEngine {
                         language: candidate.language,
                         locator: locator,
                         ownerID: jobID,
-                        priority: projectionArtifactPriority(rootEpoch: rootEpoch)
+                        priority: .background
                     )
                 }
             } catch GitBlobSourceMaterializationError.oversized {
                 guard !Task.isCancelled,
-                      projectionCandidateIsCurrent(
+                      graphIndexCandidateIsCurrent(
                           jobID: jobID,
                           rootEpoch: rootEpoch,
                           candidate: candidate,
@@ -3741,7 +2794,7 @@ actor WorkspaceCodemapBindingEngine {
                       )
                 else { return .transient }
                 return .entry(
-                    terminalOversizeProjectionEntry(
+                    terminalOversizeGraphIndexEntry(
                         candidate: candidate,
                         pipelineIdentity: pipelineIdentity
                     ),
@@ -3751,7 +2804,7 @@ actor WorkspaceCodemapBindingEngine {
                 return .transient
             }
             guard !Task.isCancelled,
-                  projectionCandidateIsCurrent(
+                  graphIndexCandidateIsCurrent(
                       jobID: jobID,
                       rootEpoch: rootEpoch,
                       candidate: candidate,
@@ -3759,12 +2812,12 @@ actor WorkspaceCodemapBindingEngine {
                   ), let association = resolved.association,
                   let mode = gitMode(classification)
             else { return .transient }
-            recordProjectionResolutionTelemetry(
+            recordGraphIndexResolutionTelemetry(
                 resolved,
                 rootEpoch: rootEpoch,
                 locatorMissAlreadyRecorded: sourceReservation > 0
             )
-            guard let entry = projectionEntry(
+            guard let entry = graphIndexEntry(
                 candidate: candidate,
                 pipelineIdentity: pipelineIdentity,
                 artifactKey: resolved.resolution.handle.key,
@@ -3782,7 +2835,7 @@ actor WorkspaceCodemapBindingEngine {
         case let .requiresValidatedWorktreeBytes(reason):
             incrementCounter(\.worktreeClassifications)
             let sourceReservation = UInt64(policy.maximumValidatedWorktreeByteCount)
-            switch reserveProjectionResources(
+            switch reserveGraphIndexResources(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 retainedSourceBytes: sourceReservation,
@@ -3796,7 +2849,7 @@ actor WorkspaceCodemapBindingEngine {
                 return .budget(budget)
             }
             defer {
-                releaseProjectionSourceBytes(
+                releaseGraphIndexSourceBytes(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     byteCount: sourceReservation
@@ -3812,7 +2865,7 @@ actor WorkspaceCodemapBindingEngine {
                 )
             } catch FileSystemError.fileTooLarge {
                 guard !Task.isCancelled,
-                      projectionCandidateIsCurrent(
+                      graphIndexCandidateIsCurrent(
                           jobID: jobID,
                           rootEpoch: rootEpoch,
                           candidate: candidate,
@@ -3820,7 +2873,7 @@ actor WorkspaceCodemapBindingEngine {
                       )
                 else { return .transient }
                 return .entry(
-                    terminalOversizeProjectionEntry(
+                    terminalOversizeGraphIndexEntry(
                         candidate: candidate,
                         pipelineIdentity: pipelineIdentity
                     ),
@@ -3830,7 +2883,7 @@ actor WorkspaceCodemapBindingEngine {
                 return .transient
             }
             guard !Task.isCancelled,
-                  projectionCandidateIsCurrent(
+                  graphIndexCandidateIsCurrent(
                       jobID: jobID,
                       rootEpoch: rootEpoch,
                       candidate: candidate,
@@ -3847,27 +2900,27 @@ actor WorkspaceCodemapBindingEngine {
             do {
                 result = try await runtime.coordinator.resolve(CodeMapArtifactBuildRequest(
                     ownerID: jobID,
-                    priority: projectionArtifactPriority(rootEpoch: rootEpoch),
+                    priority: .background,
                     target: .source(input)
                 ))
             } catch {
                 return .transient
             }
             guard !Task.isCancelled,
-                  projectionCandidateIsCurrent(
+                  graphIndexCandidateIsCurrent(
                       jobID: jobID,
                       rootEpoch: rootEpoch,
                       candidate: candidate,
                       pipelineIdentity: pipelineIdentity
                   ), case let .ready(resolution) = result,
-                  let entry = projectionEntry(
+                  let entry = graphIndexEntry(
                       candidate: candidate,
                       pipelineIdentity: pipelineIdentity,
                       artifactKey: resolution.handle.key,
                       outcome: resolution.handle.outcome
                   )
             else { return .transient }
-            recordProjectionBuildTelemetry(resolution, rootEpoch: rootEpoch)
+            recordGraphIndexBuildTelemetry(resolution, rootEpoch: rootEpoch)
             _ = reason
             return .entry(entry, manifestRecord: nil)
 
@@ -3876,13 +2929,13 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func projectionEntry(
-        candidate: WorkspaceCodemapProjectionCatalogCandidate,
+    private func graphIndexEntry(
+        candidate: WorkspaceCodemapGraphIndexCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity,
         artifactKey: CodeMapArtifactKey,
         outcome: CodeMapSyntaxArtifactOutcome
-    ) -> WorkspaceCodemapProjectionEntry? {
-        let projectionOutcome: WorkspaceCodemapProjectionEntryOutcome = switch outcome {
+    ) -> WorkspaceCodemapGraphIndexEntry? {
+        let graphIndexOutcome: WorkspaceCodemapGraphIndexEntryOutcome = switch outcome {
         case let .ready(artifact):
             {
                 let contribution = CodeMapSelectionGraphContribution(
@@ -3907,20 +2960,20 @@ actor WorkspaceCodemapBindingEngine {
         case .parseFailed:
             .terminalArtifact(.parseFailed)
         }
-        return WorkspaceCodemapProjectionEntry(
+        return WorkspaceCodemapGraphIndexEntry(
             identity: candidate.identity,
             requestGeneration: candidate.requestGeneration,
             pathGeneration: candidate.pathGeneration,
             pipelineIdentity: pipelineIdentity,
-            outcome: projectionOutcome
+            outcome: graphIndexOutcome
         )
     }
 
-    private func terminalOversizeProjectionEntry(
-        candidate: WorkspaceCodemapProjectionCatalogCandidate,
+    private func terminalOversizeGraphIndexEntry(
+        candidate: WorkspaceCodemapGraphIndexCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity
-    ) -> WorkspaceCodemapProjectionEntry {
-        WorkspaceCodemapProjectionEntry(
+    ) -> WorkspaceCodemapGraphIndexEntry {
+        WorkspaceCodemapGraphIndexEntry(
             identity: candidate.identity,
             requestGeneration: candidate.requestGeneration,
             pathGeneration: candidate.pathGeneration,
@@ -3929,29 +2982,29 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    private func recordProjectionFastPathMiss(
+    private func recordGraphIndexFastPathMiss(
         _ miss: CodeMapArtifactCoordinatorMiss,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
         switch miss {
         case .locatorNotFound:
-            incrementCounter(\.projectionLocatorMisses)
-            emit(.projectionLocatorMiss, rootEpoch: rootEpoch)
+            incrementCounter(\.graphIndexLocatorMisses)
+            emit(.graphIndexLocatorMiss, rootEpoch: rootEpoch)
         case .corruptLocator:
-            incrementCounter(\.projectionLocatorCorruptions)
-            emit(.projectionLocatorCorrupt, rootEpoch: rootEpoch)
+            incrementCounter(\.graphIndexLocatorCorruptions)
+            emit(.graphIndexLocatorCorrupt, rootEpoch: rootEpoch)
         case .locatorHitWithMissingArtifact:
-            incrementCounter(\.projectionLocatorMisses)
-            incrementCounter(\.projectionCASMisses)
-            emit(.projectionLocatorMiss, rootEpoch: rootEpoch)
-            emit(.projectionCASMiss, rootEpoch: rootEpoch)
+            incrementCounter(\.graphIndexLocatorMisses)
+            incrementCounter(\.graphIndexCASMisses)
+            emit(.graphIndexLocatorMiss, rootEpoch: rootEpoch)
+            emit(.graphIndexCASMiss, rootEpoch: rootEpoch)
         case .artifactKeyNotFound:
-            incrementCounter(\.projectionCASMisses)
-            emit(.projectionCASMiss, rootEpoch: rootEpoch)
+            incrementCounter(\.graphIndexCASMisses)
+            emit(.graphIndexCASMiss, rootEpoch: rootEpoch)
         }
     }
 
-    private func recordProjectionResolutionTelemetry(
+    private func recordGraphIndexResolutionTelemetry(
         _ resolved: ResolvedArtifact,
         rootEpoch: WorkspaceCodemapRootEpoch,
         locatorMissAlreadyRecorded: Bool = false
@@ -3959,17 +3012,17 @@ actor WorkspaceCodemapBindingEngine {
         if !locatorMissAlreadyRecorded {
             switch resolved.resolution.locatorLookup {
             case .miss, .hitButArtifactMissing:
-                incrementCounter(\.projectionLocatorMisses)
-                emit(.projectionLocatorMiss, rootEpoch: rootEpoch)
+                incrementCounter(\.graphIndexLocatorMisses)
+                emit(.graphIndexLocatorMiss, rootEpoch: rootEpoch)
             case .corrupt:
-                incrementCounter(\.projectionLocatorCorruptions)
-                emit(.projectionLocatorCorrupt, rootEpoch: rootEpoch)
+                incrementCounter(\.graphIndexLocatorCorruptions)
+                emit(.graphIndexLocatorCorrupt, rootEpoch: rootEpoch)
             case .hit, .stale, .notRequested:
                 break
             }
             if resolved.resolution.locatorLookup == .hitButArtifactMissing {
-                incrementCounter(\.projectionCASMisses)
-                emit(.projectionCASMiss, rootEpoch: rootEpoch)
+                incrementCounter(\.graphIndexCASMisses)
+                emit(.graphIndexCASMiss, rootEpoch: rootEpoch)
             }
         }
         if resolved.materializedByteCount > 0 {
@@ -3981,10 +3034,10 @@ actor WorkspaceCodemapBindingEngine {
                 numericValue: resolved.materializedByteCount
             )
         }
-        recordProjectionBuildTelemetry(resolved.resolution, rootEpoch: rootEpoch)
+        recordGraphIndexBuildTelemetry(resolved.resolution, rootEpoch: rootEpoch)
     }
 
-    private func recordProjectionBuildTelemetry(
+    private func recordGraphIndexBuildTelemetry(
         _ resolution: CodeMapArtifactCoordinatorResolution,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
@@ -3992,69 +3045,69 @@ actor WorkspaceCodemapBindingEngine {
         case .notNeeded:
             break
         case .joinedSharedBuild:
-            incrementCounter(\.projectionBuildsJoined)
-            incrementCounter(\.projectionBuildsCompleted)
-            emit(.projectionBuildJoined, rootEpoch: rootEpoch)
-            emit(.projectionBuildCompleted, rootEpoch: rootEpoch)
+            incrementCounter(\.graphIndexArtifactBuildsJoined)
+            incrementCounter(\.graphIndexArtifactBuildsCompleted)
+            emit(.graphIndexArtifactBuildJoined, rootEpoch: rootEpoch)
+            emit(.graphIndexArtifactBuildCompleted, rootEpoch: rootEpoch)
         case .performed:
-            incrementCounter(\.projectionBuildsStarted)
-            incrementCounter(\.projectionBuildsCompleted)
-            emit(.projectionBuildStarted, rootEpoch: rootEpoch)
-            emit(.projectionBuildCompleted, rootEpoch: rootEpoch)
+            incrementCounter(\.graphIndexArtifactBuildsStarted)
+            incrementCounter(\.graphIndexArtifactBuildsCompleted)
+            emit(.graphIndexArtifactBuildStarted, rootEpoch: rootEpoch)
+            emit(.graphIndexArtifactBuildCompleted, rootEpoch: rootEpoch)
         }
     }
 
-    private struct ProjectionSegmentGroup {
-        let entries: [WorkspaceCodemapProjectionEntry]
+    private struct GraphIndexChangeGroup {
+        let entries: [WorkspaceCodemapGraphIndexEntry]
         let byteCount: UInt64
     }
 
-    private enum ProjectionSegmentGroupingResult {
-        case groups([ProjectionSegmentGroup])
-        case budget(WorkspaceCodemapProjectionBudget)
+    private enum GraphIndexChangeGroupingResult {
+        case groups([GraphIndexChangeGroup])
+        case budget(WorkspaceCodemapGraphIndexBudget)
     }
 
-    private func projectionSegmentGroups(
-        _ entries: [WorkspaceCodemapProjectionEntry]
-    ) -> ProjectionSegmentGroupingResult {
-        var groups: [ProjectionSegmentGroup] = []
-        var currentEntries: [WorkspaceCodemapProjectionEntry] = []
+    private func graphIndexChangeGroups(
+        _ entries: [WorkspaceCodemapGraphIndexEntry]
+    ) -> GraphIndexChangeGroupingResult {
+        var groups: [GraphIndexChangeGroup] = []
+        var currentEntries: [WorkspaceCodemapGraphIndexEntry] = []
         var currentBytes: UInt64 = 0
         for entry in entries {
             let proposedEntries = currentEntries + [entry]
             let proposedBytes: UInt64
-            switch WorkspaceCodemapSelectionGraphProjectionByteAccounting.normalizedByteCount(
+            switch WorkspaceCodemapGraphIndexByteAccounting.normalizedByteCount(
                 entries: proposedEntries
             ) {
             case let .success(value): proposedBytes = value
-            case let .failure(error): return .budget(projectionOverflowBudget(error))
+            case let .failure(error): return .budget(graphIndexOverflowBudget(error))
             }
             if !currentEntries.isEmpty,
-               proposedBytes > policy.maximumRetainedProjectionByteCountPerSegment
+               proposedBytes > policy.maximumGraphIndexChangeByteCount
             {
-                groups.append(ProjectionSegmentGroup(entries: currentEntries, byteCount: currentBytes))
+                groups.append(GraphIndexChangeGroup(entries: currentEntries, byteCount: currentBytes))
                 currentEntries = [entry]
                 let singleEntryBytes: UInt64
-                switch WorkspaceCodemapSelectionGraphProjectionByteAccounting.normalizedByteCount(
+                switch WorkspaceCodemapGraphIndexByteAccounting.normalizedByteCount(
                     entries: currentEntries
                 ) {
                 case let .success(value): singleEntryBytes = value
-                case let .failure(error): return .budget(projectionOverflowBudget(error))
+                case let .failure(error): return .budget(graphIndexOverflowBudget(error))
                 }
-                guard singleEntryBytes <= policy.maximumRetainedProjectionByteCountPerSegment else {
-                    return .budget(WorkspaceCodemapProjectionBudget(
-                        dimension: .retainedProjectionBytes,
+                guard singleEntryBytes <= policy.maximumGraphIndexChangeByteCount else {
+                    return .budget(WorkspaceCodemapGraphIndexBudget(
+                        dimension: .retainedGraphIndexBytes,
                         attempted: singleEntryBytes,
-                        limit: policy.maximumRetainedProjectionByteCountPerSegment
+                        limit: policy.maximumGraphIndexChangeByteCount
                     ))
                 }
                 currentBytes = singleEntryBytes
             } else {
-                guard proposedBytes <= policy.maximumRetainedProjectionByteCountPerSegment else {
-                    return .budget(WorkspaceCodemapProjectionBudget(
-                        dimension: .retainedProjectionBytes,
+                guard proposedBytes <= policy.maximumGraphIndexChangeByteCount else {
+                    return .budget(WorkspaceCodemapGraphIndexBudget(
+                        dimension: .retainedGraphIndexBytes,
                         attempted: proposedBytes,
-                        limit: policy.maximumRetainedProjectionByteCountPerSegment
+                        limit: policy.maximumGraphIndexChangeByteCount
                     ))
                 }
                 currentEntries = proposedEntries
@@ -4062,14 +3115,45 @@ actor WorkspaceCodemapBindingEngine {
             }
         }
         if !currentEntries.isEmpty {
-            groups.append(ProjectionSegmentGroup(entries: currentEntries, byteCount: currentBytes))
+            groups.append(GraphIndexChangeGroup(entries: currentEntries, byteCount: currentBytes))
         }
         return .groups(groups)
     }
 
-    private func projectionCounts(
-        _ entries: [WorkspaceCodemapProjectionEntry]
-    ) -> WorkspaceCodemapProjectionCounts {
+    private static func graphSlot(
+        _ entry: WorkspaceCodemapGraphIndexEntry
+    ) -> WorkspaceCodemapGraphSlot? {
+        let state: WorkspaceCodemapGraphSlotState = switch entry.outcome {
+        case let .contributed(contribution): .contributed(contribution)
+        case let .empty(contribution): .empty(contribution)
+        case let .terminalArtifact(reason): .terminalArtifact(reason)
+        case let .terminalExcluded(reason): .terminalExcluded(reason)
+        }
+        let contribution: CodeMapSelectionGraphContribution? = switch entry.outcome {
+        case let .contributed(value), let .empty(value): value
+        case .terminalArtifact, .terminalExcluded: nil
+        }
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: entry.identity.rootID,
+            rootLifetimeID: entry.identity.rootLifetimeID
+        )
+        return try? WorkspaceCodemapGraphSlot.validated(
+            rootEpoch: rootEpoch,
+            identity: entry.identity,
+            requestGeneration: entry.requestGeneration,
+            pathGeneration: entry.pathGeneration,
+            pipelineIdentity: entry.pipelineIdentity,
+            state: state,
+            diagnostics: WorkspaceCodemapGraphSlotDiagnostics(
+                contributionDigest: contribution?.contributionDigest,
+                source: .graphIndex
+            )
+        ).get()
+    }
+
+    private func graphIndexCounts(
+        _ entries: [WorkspaceCodemapGraphIndexEntry]
+    ) -> WorkspaceCodemapGraphIndexCounts {
         var contributed: UInt64 = 0
         var empty: UInt64 = 0
         var terminalArtifact: UInt64 = 0
@@ -4082,7 +3166,7 @@ actor WorkspaceCodemapBindingEngine {
             case .terminalExcluded: terminalExcluded = addingSaturating(terminalExcluded, 1)
             }
         }
-        return WorkspaceCodemapProjectionCounts(
+        return WorkspaceCodemapGraphIndexCounts(
             supportedCandidateCount: UInt64(entries.count),
             processedCandidateCount: UInt64(entries.count),
             contributedCount: contributed,
@@ -4093,88 +3177,118 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    private func publishProjectionSnapshot(
-        _ snapshot: WorkspaceCodemapProjectionSnapshot,
+    private func publishGraphIndexSlots(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
+        slots: [WorkspaceCodemapGraphSlot],
+        enumerationFinished: Bool
+    ) async -> Bool {
+        guard let graph = selectionGraphsByRootEpoch[rootEpoch] else { return false }
+        return await overlay.publishGraphIndexSlots(
+            rootEpoch: rootEpoch,
+            catalogToken: catalogToken,
+            slots: slots,
+            enumerationFinished: enumerationFinished,
+            reconciliationFence: { fileIDs, reason in
+                await graph.fenceFiles(fileIDs: fileIDs, reason: reason)
+            }
+        )
+    }
+
+    private func publishGraphIndexEntries(
+        _ entries: [WorkspaceCodemapGraphIndexEntry],
+        progress: WorkspaceCodemapGraphIndexProgress,
+        enumerationFinished: Bool,
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         markerReadinessUnavailableFileIDs: Set<UUID> = []
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
-        guard updateProjectionPhase(
+    ) async -> GraphIndexPublicationDisposition {
+        guard updateGraphIndexPhase(
             jobID: jobID,
             rootEpoch: rootEpoch,
-            phase: .publishingProjectionSegment
-        ) else { return .superseded }
-        var disposition = await catalogClient.publishProjection(snapshot)
-        while case let .busy(retryAfterMilliseconds) = disposition {
-            guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
-                  await waitForProjectionRetry(
-                      jobID: jobID,
-                      rootEpoch: rootEpoch,
-                      overrideMilliseconds: retryAfterMilliseconds
-                  )
-            else { return .superseded }
-            disposition = await catalogClient.publishProjection(snapshot)
-        }
-        switch disposition {
-        case .accepted, .exactDuplicate:
-            if case let .segment(segment) = snapshot {
-                let changes = segment.entries.map { entry in
-                    let state: WorkspaceCodemapMarkerReadinessState = if markerReadinessUnavailableFileIDs
-                        .contains(entry.identity.fileID)
-                    {
-                        .unavailable
-                    } else {
-                        switch entry.outcome {
-                        case .contributed: .ready
-                        case .empty, .terminalArtifact, .terminalExcluded: .unavailable
-                        }
-                    }
-                    return WorkspaceCodemapMarkerReadinessChange(
-                        fileID: entry.identity.fileID,
-                        standardizedRelativePath: entry.identity.standardizedRelativePath,
-                        requestGeneration: entry.requestGeneration,
-                        pathGeneration: entry.pathGeneration,
-                        state: state
-                    )
-                }
-                if !changes.isEmpty {
-                    _ = await catalogClient.publishMarkerReadiness(
-                        WorkspaceCodemapMarkerReadinessUpdate(
-                            rootEpoch: rootEpoch,
-                            changes: changes
-                        )
-                    )
+            phase: .publishingGraphChanges
+        ), let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+        let generation = job.generation
+        else { return .superseded }
+        let slots = entries.compactMap(Self.graphSlot)
+        guard slots.count == entries.count,
+              await publishGraphIndexSlots(
+                  rootEpoch: rootEpoch,
+                  catalogToken: generation.catalogToken,
+                  slots: slots,
+                  enumerationFinished: enumerationFinished
+              ),
+              let overlaySnapshot = await overlay.snapshot(rootEpoch: rootEpoch),
+              var currentJob = graphIndexJobs[rootEpoch],
+              currentJob.id == jobID,
+              currentJob.generation == generation
+        else { return .superseded }
+        currentJob.generation = WorkspaceCodemapGraphIndexGeneration(
+            catalogToken: generation.catalogToken,
+            repositoryAuthority: generation.repositoryAuthority,
+            contributionGeneration: overlaySnapshot.contributionGeneration,
+            schemaVersion: generation.schemaVersion,
+            policyVersion: generation.policyVersion
+        )
+        graphIndexJobs[rootEpoch] = currentJob
+        observeOverlayContributionGeneration(
+            overlaySnapshot.contributionGeneration,
+            rootEpoch: rootEpoch
+        )
+
+        let changes = entries.map { entry in
+            let state: WorkspaceCodemapMarkerReadinessState = if markerReadinessUnavailableFileIDs
+                .contains(entry.identity.fileID)
+            {
+                .unavailable
+            } else {
+                switch entry.outcome {
+                case .contributed: .ready
+                case .terminalExcluded(.securityExcluded): .securityExcluded
+                case .empty, .terminalArtifact, .terminalExcluded: .unavailable
                 }
             }
-        case .stale, .superseded, .budget, .unavailable, .busy:
-            break
+            return WorkspaceCodemapMarkerReadinessChange(
+                fileID: entry.identity.fileID,
+                standardizedRelativePath: entry.identity.standardizedRelativePath,
+                requestGeneration: entry.requestGeneration,
+                pathGeneration: entry.pathGeneration,
+                state: state
+            )
         }
-        return disposition
+        if !changes.isEmpty {
+            _ = await catalogClient.publishMarkerReadiness(
+                WorkspaceCodemapMarkerReadinessUpdate(rootEpoch: rootEpoch, changes: changes)
+            )
+        }
+        return .accepted(progress)
     }
 
-    private func waitForProjectionRetry(
+    /// Waits for bounded graph-index retry eligibility while preserving the overlay as the
+    /// only graph publication authority.
+    private func waitForGraphIndexRetry(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         overrideMilliseconds: UInt64? = nil
     ) async -> Bool {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID, projectionJobIsCurrent(job) else {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID, graphIndexJobIsCurrent(job) else {
             return false
         }
         let attempt = addingChecked(job.retryAttempt, 1) ?? .max
         let shift = min(attempt - 1, 62)
         let multiplier = UInt64(1) << shift
-        let (scaled, scaledOverflow) = policy.projectionRetryInitialMilliseconds
+        let (scaled, scaledOverflow) = policy.graphIndexRetryInitialMilliseconds
             .multipliedReportingOverflow(by: multiplier)
         let base = overrideMilliseconds ?? min(
-            policy.projectionRetryMaximumMilliseconds,
+            policy.graphIndexRetryMaximumMilliseconds,
             scaledOverflow ? .max : scaled
         )
-        let jitterRange = policy.projectionRetryJitterPercent
+        let jitterRange = policy.graphIndexRetryJitterPercent
         let jitterPercent = jitterRange == 0 ? 0 : attempt % (jitterRange + 1)
         let jitter = base.multipliedReportingOverflow(by: jitterPercent).overflow
             ? 0
             : base * jitterPercent / 100
-        let delay = min(policy.projectionRetryMaximumMilliseconds, addingSaturating(base, jitter))
+        let delay = min(policy.graphIndexRetryMaximumMilliseconds, addingSaturating(base, jitter))
         let nanoseconds = delay.multipliedReportingOverflow(by: 1_000_000).overflow
             ? UInt64.max
             : delay * 1_000_000
@@ -4182,19 +3296,19 @@ actor WorkspaceCodemapBindingEngine {
         let next = addingSaturating(now, nanoseconds)
         job.phase = .suspendedBusy
         job.retryAttempt = attempt
-        job.retry = WorkspaceCodemapProjectionRetry(
+        job.retry = WorkspaceCodemapGraphIndexRetry(
             attempt: attempt,
             retryAfterMilliseconds: delay,
             nextEligibleAdmissionUptimeNanoseconds: next
         )
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
-        incrementCounter(\.projectionRetries)
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
+        incrementCounter(\.graphIndexRetries)
         emit(
-            .projectionRetry,
+            .graphIndexRetry,
             rootEpoch: rootEpoch,
             numericValue: attempt,
-            projectionPhase: .suspendedBusy,
+            graphIndexPhase: .suspendedBusy,
             retryAfterMilliseconds: delay
         )
         do {
@@ -4202,33 +3316,33 @@ actor WorkspaceCodemapBindingEngine {
         } catch {
             return false
         }
-        guard var current = projectionJobs[rootEpoch],
+        guard var current = graphIndexJobs[rootEpoch],
               current.id == jobID,
-              projectionJobIsCurrent(current)
+              graphIndexJobIsCurrent(current)
         else { return false }
         current.retry = nil
-        projectionJobs[rootEpoch] = current
+        graphIndexJobs[rootEpoch] = current
         return true
     }
 
-    private func currentProjectionJob(
+    private func currentGraphIndexJob(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> ProjectionPreloadJob? {
-        guard let job = projectionJobs[rootEpoch], job.id == jobID, projectionJobIsCurrent(job) else {
+    ) -> GraphIndexJob? {
+        guard let job = graphIndexJobs[rootEpoch], job.id == jobID, graphIndexJobIsCurrent(job) else {
             return nil
         }
         return job
     }
 
-    private func projectionPublicationStalenessResult(
+    private func graphIndexPublicationStalenessResult(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) async -> ProjectionPublicationStalenessResult {
-        guard let initial = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+    ) async -> GraphIndexPublicationStalenessResult {
+        guard let initial = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               let generation = initial.generation
         else { return .terminal }
-        let tokenDisposition = await catalogClient.revalidateProjectionCatalogToken(
+        let tokenDisposition = await catalogClient.revalidateGraphIndexCatalogToken(
             rootEpoch,
             generation.catalogToken
         )
@@ -4240,11 +3354,11 @@ actor WorkspaceCodemapBindingEngine {
         case .stale:
             return .terminal
         }
-        guard let afterToken = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+        guard let afterToken = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               afterToken.generation == generation
         else { return .terminal }
         guard let overlaySnapshot = await overlay.snapshot(rootEpoch: rootEpoch) else { return .retry }
-        guard let current = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+        guard let current = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               current.generation == generation,
               overlaySnapshot.catalogGeneration == current.catalogGeneration,
               overlaySnapshot.repositoryAuthority == current.repositoryAuthority
@@ -4254,14 +3368,14 @@ actor WorkspaceCodemapBindingEngine {
             : .terminal
     }
 
-    private func resetProjectionForLatestGeneration(
+    private func resetGraphIndexForLatestGeneration(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         recordSupersession: Bool
     ) -> Bool {
-        guard var job = projectionJobs[rootEpoch],
+        guard var job = graphIndexJobs[rootEpoch],
               job.id == jobID,
-              projectionJobAuthorityIsCurrent(job),
+              graphIndexJobAuthorityIsCurrent(job),
               job.generation != nil
         else { return false }
         job.phase = .waitingForAdmission
@@ -4271,7 +3385,7 @@ actor WorkspaceCodemapBindingEngine {
         job.progress = .notStarted
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
-        job.nextSegmentSequence = 0
+        job.nextGraphChangeSequence = 0
         job.pipelineScopes = [:]
         job.resources = .zero
         job.pendingManifestMutationCount = 0
@@ -4279,21 +3393,17 @@ actor WorkspaceCodemapBindingEngine {
         job.retry = nil
         job.budget = nil
         job.checkpoint = nil
-        job.coverageProof = nil
-        job.coverageCompletedUptimeNanoseconds = nil
         job.isQueuedForAdmission = false
         job.isActiveBatch = false
-        projectionJobs[rootEpoch] = job
-        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+        graphIndexJobs[rootEpoch] = job
         if recordSupersession {
-            incrementCounter(\.projectionCoveragesSuperseded)
-            emit(.projectionCoverageSuperseded, rootEpoch: rootEpoch, projectionPhase: .superseded)
+            incrementCounter(\.graphIndexCoveragesSuperseded)
+            emit(.graphIndexCoverageSuperseded, rootEpoch: rootEpoch, graphIndexPhase: .superseded)
         }
         return true
     }
 
-    private func projectionJobAuthorityIsCurrent(_ job: ProjectionPreloadJob) -> Bool {
+    private func graphIndexJobAuthorityIsCurrent(_ job: GraphIndexJob) -> Bool {
         guard case let .eligible(session)? = roots[job.rootEpoch] else { return false }
         return session.id == job.sessionID &&
             session.generation == job.sessionGeneration &&
@@ -4308,13 +3418,8 @@ actor WorkspaceCodemapBindingEngine {
             } ?? true
     }
 
-    private func projectionJobIsCurrent(_ job: ProjectionPreloadJob) -> Bool {
-        guard projectionJobAuthorityIsCurrent(job) else { return false }
-        guard job.phase == .complete, let proof = job.coverageProof else { return true }
-        let contributionGeneration = proof.generation.contributionGeneration
-        guard job.generation?.contributionGeneration == contributionGeneration else { return false }
-        return latestOverlayContributionGenerationByRootEpoch[job.rootEpoch]
-            .map { $0 == contributionGeneration } ?? true
+    private func graphIndexJobIsCurrent(_ job: GraphIndexJob) -> Bool {
+        graphIndexJobAuthorityIsCurrent(job)
     }
 
     private func observeOverlayContributionGeneration(
@@ -4329,13 +3434,13 @@ actor WorkspaceCodemapBindingEngine {
         latestOverlayContributionGenerationByRootEpoch[rootEpoch] = generation
     }
 
-    private func projectionCandidateIsCurrent(
+    private func graphIndexCandidateIsCurrent(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        candidate: WorkspaceCodemapProjectionCatalogCandidate,
+        candidate: WorkspaceCodemapGraphIndexCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity
     ) -> Bool {
-        guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+        guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
               session.pipelines[pipelineIdentity] != nil,
               candidate.identity.rootID == rootEpoch.rootID,
@@ -4353,69 +3458,68 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     @discardableResult
-    private func updateProjectionPhase(
+    private func updateGraphIndexPhase(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        phase: WorkspaceCodemapProjectionPreloadPhase
+        phase: WorkspaceCodemapGraphIndexPhase
     ) -> Bool {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID, projectionJobIsCurrent(job) else {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID, graphIndexJobIsCurrent(job) else {
             return false
         }
         job.phase = phase
-        job.progress = projectionProgress(job.progress, phase: phase)
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
+        job.progress = graphIndexProgress(job.progress, phase: phase)
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
         return true
     }
 
-    private func projectionProgress(
-        _ progress: WorkspaceCodemapProjectionProgress,
-        phase: WorkspaceCodemapProjectionPreloadPhase
-    ) -> WorkspaceCodemapProjectionProgress {
+    private func graphIndexProgress(
+        _ progress: WorkspaceCodemapGraphIndexProgress,
+        phase: WorkspaceCodemapGraphIndexPhase
+    ) -> WorkspaceCodemapGraphIndexProgress {
         switch progress.advancing(to: phase, by: .zero) {
         case let .success(value): value
         case .failure: progress
         }
     }
 
-    private func updateProjectionProgress(
+    private func updateGraphIndexProgress(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        progress: WorkspaceCodemapProjectionProgress
+        progress: WorkspaceCodemapGraphIndexProgress
     ) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
         job.progress = progress
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
-        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
     }
 
-    private func updateProjectionPipelineScope(
+    private func updateGraphIndexPipelineScope(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         pipelineIdentity: CodeMapPipelineIdentity,
         manifestGeneration: UInt64?
     ) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
-        job.pipelineScopes[pipelineIdentity] = WorkspaceCodemapProjectionPipelineScope(
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
+        job.pipelineScopes[pipelineIdentity] = WorkspaceCodemapGraphIndexPipelineScope(
             pipelineIdentity: pipelineIdentity,
             manifestGeneration: manifestGeneration
         )
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
     }
 
-    private func makeProjectionCheckpoint(
-        _ job: ProjectionPreloadJob
-    ) -> WorkspaceCodemapProjectionPreloadCheckpoint? {
+    private func makeGraphIndexCheckpoint(
+        _ job: GraphIndexJob
+    ) -> WorkspaceCodemapGraphIndexCheckpoint? {
         guard let generation = job.generation else { return nil }
-        return WorkspaceCodemapProjectionPreloadCheckpoint(
+        return WorkspaceCodemapGraphIndexCheckpoint(
             generation: generation,
             engineSessionID: job.sessionID,
             phase: job.phase,
             cursor: job.cursor,
             progress: job.progress,
-            nextSegmentSequence: job.nextSegmentSequence,
+            nextGraphChangeSequence: job.nextGraphChangeSequence,
             pipelineScopes: job.pipelineScopes.values.sorted {
                 $0.pipelineIdentity.canonicalBytes.lexicographicallyPrecedes(
                     $1.pipelineIdentity.canonicalBytes
@@ -4428,72 +3532,72 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    private func reserveProjectionResources(
+    private func reserveGraphIndexResources(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         retainedPathBytes: UInt64 = 0,
         retainedSourceBytes: UInt64 = 0,
-        retainedProjectionBytes: UInt64 = 0,
+        retainedGraphIndexBytes: UInt64 = 0,
         stagedGraphBytes: UInt64 = 0,
         queuedManifestMutationBytes: UInt64 = 0,
         preserveForegroundSourceAllowance: Bool = false
-    ) -> ProjectionResourceReservationResult {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return .retry }
-        let addition = WorkspaceCodemapProjectionResourceAccounting(
+    ) -> GraphIndexResourceReservationResult {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return .retry }
+        let addition = WorkspaceCodemapGraphIndexResourceAccounting(
             retainedPathBytes: retainedPathBytes,
             retainedSourceBytes: retainedSourceBytes,
-            retainedProjectionBytes: retainedProjectionBytes,
+            retainedGraphIndexBytes: retainedGraphIndexBytes,
             stagedGraphBytes: stagedGraphBytes,
             residentGraphBytes: 0,
             queuedManifestMutationBytes: queuedManifestMutationBytes
         )
-        let jobResources: WorkspaceCodemapProjectionResourceAccounting
+        let jobResources: WorkspaceCodemapGraphIndexResourceAccounting
         switch job.resources.adding(addition) {
         case let .success(value):
             jobResources = value
         case let .failure(error):
-            return .budget(projectionOverflowBudget(error))
+            return .budget(graphIndexOverflowBudget(error))
         }
 
-        if let budget = fixedProjectionResourceBudget(jobResources, preserveForegroundSourceAllowance) {
+        if let budget = fixedGraphIndexResourceBudget(jobResources, preserveForegroundSourceAllowance) {
             return .budget(budget)
         }
 
-        var sameRootOthers = WorkspaceCodemapProjectionResourceAccounting.zero
-        var globalOthers = WorkspaceCodemapProjectionResourceAccounting.zero
-        for other in projectionJobs.values where other.id != jobID {
+        var sameRootOthers = WorkspaceCodemapGraphIndexResourceAccounting.zero
+        var globalOthers = WorkspaceCodemapGraphIndexResourceAccounting.zero
+        for other in graphIndexJobs.values where other.id != jobID {
             switch globalOthers.adding(other.resources) {
             case let .success(value): globalOthers = value
-            case let .failure(error): return .budget(projectionOverflowBudget(error))
+            case let .failure(error): return .budget(graphIndexOverflowBudget(error))
             }
             if other.rootEpoch == rootEpoch {
                 switch sameRootOthers.adding(other.resources) {
                 case let .success(value): sameRootOthers = value
-                case let .failure(error): return .budget(projectionOverflowBudget(error))
+                case let .failure(error): return .budget(graphIndexOverflowBudget(error))
                 }
             }
         }
-        for (drainingJobID, resources) in drainingProjectionResources {
+        for (drainingJobID, resources) in drainingGraphIndexResources {
             switch globalOthers.adding(resources) {
             case let .success(value): globalOthers = value
-            case let .failure(error): return .budget(projectionOverflowBudget(error))
+            case let .failure(error): return .budget(graphIndexOverflowBudget(error))
             }
-            if drainingProjectionRootEpochs[drainingJobID] == rootEpoch {
+            if drainingGraphIndexRootEpochs[drainingJobID] == rootEpoch {
                 switch sameRootOthers.adding(resources) {
                 case let .success(value): sameRootOthers = value
-                case let .failure(error): return .budget(projectionOverflowBudget(error))
+                case let .failure(error): return .budget(graphIndexOverflowBudget(error))
                 }
             }
         }
-        let rootResources: WorkspaceCodemapProjectionResourceAccounting
+        let rootResources: WorkspaceCodemapGraphIndexResourceAccounting
         switch sameRootOthers.adding(jobResources) {
         case let .success(value): rootResources = value
-        case let .failure(error): return .budget(projectionOverflowBudget(error))
+        case let .failure(error): return .budget(graphIndexOverflowBudget(error))
         }
-        let globalResources: WorkspaceCodemapProjectionResourceAccounting
+        let globalResources: WorkspaceCodemapGraphIndexResourceAccounting
         switch globalOthers.adding(jobResources) {
         case let .success(value): globalResources = value
-        case let .failure(error): return .budget(projectionOverflowBudget(error))
+        case let .failure(error): return .budget(graphIndexOverflowBudget(error))
         }
         let foregroundAllowance = preserveForegroundSourceAllowance
             ? UInt64(policy.maximumValidatedWorktreeByteCount)
@@ -4507,11 +3611,11 @@ actor WorkspaceCodemapBindingEngine {
                 : partial
         }
         let startsMaterialization = retainedSourceBytes > 0 && job.resources.retainedSourceBytes == 0
-        let projectionUsage = projectionSourceUsage(rootEpoch: rootEpoch)
+        let graphIndexUsage = graphIndexSourceUsage(rootEpoch: rootEpoch)
         if startsMaterialization,
            addingSaturating(
                activeRequests.count,
-               addingSaturating(projectionUsage.globalMaterializationCount, 1)
+               addingSaturating(graphIndexUsage.globalMaterializationCount, 1)
            ) >
            policy.maximumConcurrentMaterializationCount
         {
@@ -4520,19 +3624,19 @@ actor WorkspaceCodemapBindingEngine {
         if startsMaterialization,
            addingSaturating(
                activeRequests.values.count(where: { $0.rootEpoch == rootEpoch }),
-               addingSaturating(projectionUsage.rootMaterializationCount, 1)
+               addingSaturating(graphIndexUsage.rootMaterializationCount, 1)
            ) > policy.maximumConcurrentMaterializationCountPerRoot
         {
             return .retry
         }
-        guard rootResources.retainedProjectionBytes <= policy.maximumRetainedProjectionByteCountPerRoot,
-              globalResources.retainedProjectionBytes <= policy.maximumRetainedProjectionByteCount,
-              rootResources.stagedGraphBytes <= policy.maximumStagedProjectionGraphByteCountPerRoot,
-              globalResources.stagedGraphBytes <= policy.maximumStagedProjectionGraphByteCount,
+        guard rootResources.retainedGraphIndexBytes <= policy.maximumRetainedGraphIndexByteCountPerRoot,
+              globalResources.retainedGraphIndexBytes <= policy.maximumRetainedGraphIndexByteCount,
+              rootResources.stagedGraphBytes <= policy.maximumStagedGraphIndexGraphByteCountPerRoot,
+              globalResources.stagedGraphBytes <= policy.maximumStagedGraphIndexGraphByteCount,
               rootResources.queuedManifestMutationBytes <=
-              policy.maximumQueuedProjectionManifestMutationByteCountPerRoot,
+              policy.maximumQueuedGraphIndexManifestMutationByteCountPerRoot,
               globalResources.queuedManifestMutationBytes <=
-              policy.maximumQueuedProjectionManifestMutationByteCount,
+              policy.maximumQueuedGraphIndexManifestMutationByteCount,
               addingSaturating(rootResources.retainedSourceBytes, rootDemandSourceBytes) <=
               policy.maximumRetainedSourceByteCountPerRoot,
               addingSaturating(
@@ -4541,33 +3645,33 @@ actor WorkspaceCodemapBindingEngine {
               ) <= policy.maximumRetainedSourceByteCount
         else { return .retry }
         job.resources = jobResources
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
         return .reserved
     }
 
-    private func fixedProjectionResourceBudget(
-        _ resources: WorkspaceCodemapProjectionResourceAccounting,
+    private func fixedGraphIndexResourceBudget(
+        _ resources: WorkspaceCodemapGraphIndexResourceAccounting,
         _ preserveForegroundSourceAllowance: Bool
-    ) -> WorkspaceCodemapProjectionBudget? {
-        let checks: [(WorkspaceCodemapProjectionBudgetDimension, UInt64, UInt64)] = [
+    ) -> WorkspaceCodemapGraphIndexBudget? {
+        let checks: [(WorkspaceCodemapGraphIndexBudgetDimension, UInt64, UInt64)] = [
             (
-                .retainedProjectionBytes,
-                resources.retainedProjectionBytes,
-                policy.maximumRetainedProjectionByteCountPerRoot
+                .retainedGraphIndexBytes,
+                resources.retainedGraphIndexBytes,
+                policy.maximumRetainedGraphIndexByteCountPerRoot
             ),
-            (.retainedProjectionBytes, resources.retainedProjectionBytes, policy.maximumRetainedProjectionByteCount),
-            (.stagedGraphBytes, resources.stagedGraphBytes, policy.maximumStagedProjectionGraphByteCountPerRoot),
-            (.stagedGraphBytes, resources.stagedGraphBytes, policy.maximumStagedProjectionGraphByteCount),
+            (.retainedGraphIndexBytes, resources.retainedGraphIndexBytes, policy.maximumRetainedGraphIndexByteCount),
+            (.stagedGraphBytes, resources.stagedGraphBytes, policy.maximumStagedGraphIndexGraphByteCountPerRoot),
+            (.stagedGraphBytes, resources.stagedGraphBytes, policy.maximumStagedGraphIndexGraphByteCount),
             (
                 .queuedManifestMutationBytes,
                 resources.queuedManifestMutationBytes,
-                policy.maximumQueuedProjectionManifestMutationByteCountPerRoot
+                policy.maximumQueuedGraphIndexManifestMutationByteCountPerRoot
             ),
             (
                 .queuedManifestMutationBytes,
                 resources.queuedManifestMutationBytes,
-                policy.maximumQueuedProjectionManifestMutationByteCount
+                policy.maximumQueuedGraphIndexManifestMutationByteCount
             ),
             (.retainedSourceBytes, resources.retainedSourceBytes, policy.maximumRetainedSourceByteCountPerRoot),
             (
@@ -4580,20 +3684,20 @@ actor WorkspaceCodemapBindingEngine {
             )
         ]
         guard let failure = checks.first(where: { $0.1 > $0.2 }) else { return nil }
-        return WorkspaceCodemapProjectionBudget(
+        return WorkspaceCodemapGraphIndexBudget(
             dimension: failure.0,
             attempted: failure.1,
             limit: failure.2
         )
     }
 
-    private func projectionOverflowBudget(
-        _ error: WorkspaceCodemapProjectionAccountingError
-    ) -> WorkspaceCodemapProjectionBudget {
-        let field: WorkspaceCodemapProjectionAccountingField = switch error {
+    private func graphIndexOverflowBudget(
+        _ error: WorkspaceCodemapGraphIndexAccountingError
+    ) -> WorkspaceCodemapGraphIndexBudget {
+        let field: WorkspaceCodemapGraphIndexAccountingField = switch error {
         case let .overflow(value), let .underflow(value): value
         }
-        let dimension: WorkspaceCodemapProjectionBudgetDimension = switch field {
+        let dimension: WorkspaceCodemapGraphIndexBudgetDimension = switch field {
         case .catalogPathBytes, .retainedPathBytes:
             .catalogPathBytes
         case .retainedSourceBytes:
@@ -4604,175 +3708,157 @@ actor WorkspaceCodemapBindingEngine {
             .residentGraph(.bytes)
         case .queuedManifestMutationBytes:
             .queuedManifestMutationBytes
-        case .retainedProjectionBytes, .publishedSegmentBytes, .publishedSegments:
-            .retainedProjectionBytes
+        case .retainedGraphIndexBytes, .publishedGraphChangeBytes, .publishedGraphChanges:
+            .retainedGraphIndexBytes
         case .supportedCandidates, .processedCandidates, .contributed, .empty,
              .terminalArtifacts, .terminalExcluded, .transient, .catalogPages:
             .catalogEntries
         }
-        return WorkspaceCodemapProjectionBudget(dimension: dimension, attempted: .max, limit: .max - 1)
+        return WorkspaceCodemapGraphIndexBudget(dimension: dimension, attempted: .max, limit: .max - 1)
     }
 
-    private func clearProjectionBatchResources(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
-        job.resources = WorkspaceCodemapProjectionResourceAccounting(
+    private func clearGraphIndexBatchResources(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
+        job.resources = WorkspaceCodemapGraphIndexResourceAccounting(
             retainedPathBytes: 0,
             retainedSourceBytes: 0,
-            retainedProjectionBytes: 0,
+            retainedGraphIndexBytes: 0,
             stagedGraphBytes: 0,
             residentGraphBytes: job.resources.residentGraphBytes,
             queuedManifestMutationBytes: job.resources.queuedManifestMutationBytes
         )
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
     }
 
-    private func releaseProjectionSourceBytes(
+    private func releaseGraphIndexSourceBytes(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         byteCount: UInt64
     ) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
         let value = job.resources.retainedSourceBytes >= byteCount
             ? job.resources.retainedSourceBytes - byteCount
             : 0
-        job.resources = WorkspaceCodemapProjectionResourceAccounting(
+        job.resources = WorkspaceCodemapGraphIndexResourceAccounting(
             retainedPathBytes: job.resources.retainedPathBytes,
             retainedSourceBytes: value,
-            retainedProjectionBytes: job.resources.retainedProjectionBytes,
+            retainedGraphIndexBytes: job.resources.retainedGraphIndexBytes,
             stagedGraphBytes: job.resources.stagedGraphBytes,
             residentGraphBytes: job.resources.residentGraphBytes,
             queuedManifestMutationBytes: job.resources.queuedManifestMutationBytes
         )
-        projectionJobs[rootEpoch] = job
+        graphIndexJobs[rootEpoch] = job
     }
 
-    private func releaseStagedProjectionBytes(
+    private func releaseStagedGraphIndexBytes(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         byteCount: UInt64
     ) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
-        job.resources = WorkspaceCodemapProjectionResourceAccounting(
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
+        job.resources = WorkspaceCodemapGraphIndexResourceAccounting(
             retainedPathBytes: job.resources.retainedPathBytes,
             retainedSourceBytes: job.resources.retainedSourceBytes,
-            retainedProjectionBytes: job.resources.retainedProjectionBytes,
+            retainedGraphIndexBytes: job.resources.retainedGraphIndexBytes,
             stagedGraphBytes: job.resources.stagedGraphBytes >= byteCount
                 ? job.resources.stagedGraphBytes - byteCount
                 : 0,
             residentGraphBytes: job.resources.residentGraphBytes,
             queuedManifestMutationBytes: job.resources.queuedManifestMutationBytes
         )
-        projectionJobs[rootEpoch] = job
+        graphIndexJobs[rootEpoch] = job
     }
 
-    private func finishProjectionForBudget(
+    private func finishGraphIndexForBudget(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        budget: WorkspaceCodemapProjectionBudget
+        budget: WorkspaceCodemapGraphIndexBudget
     ) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
-        incrementCounter(\.projectionBudgetRejections)
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
+        incrementCounter(\.graphIndexBudgetRejections)
         job.phase = .budgetLimited
-        job.progress = projectionProgress(job.progress, phase: .budgetLimited)
+        job.progress = graphIndexProgress(job.progress, phase: .budgetLimited)
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
         job.retry = nil
         job.budget = budget
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
-        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
         emit(
-            .projectionBudget,
+            .graphIndexBudget,
             rootEpoch: rootEpoch,
             numericValue: budget.attempted,
-            projectionPhase: .budgetLimited
+            graphIndexPhase: .budgetLimited
         )
     }
 
-    private func supersedeProjectionJob(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
-        guard var job = projectionJobs[rootEpoch], job.id == jobID else { return }
+    private func supersedeGraphIndexJob(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
         job.phase = .superseded
-        job.progress = projectionProgress(job.progress, phase: .superseded)
+        job.progress = graphIndexProgress(job.progress, phase: .superseded)
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
-        job.checkpoint = makeProjectionCheckpoint(job)
-        projectionJobs[rootEpoch] = job
-        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
-        incrementCounter(\.projectionCoveragesSuperseded)
-        emit(.projectionCoverageSuperseded, rootEpoch: rootEpoch, projectionPhase: .superseded)
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
+        incrementCounter(\.graphIndexCoveragesSuperseded)
+        emit(.graphIndexCoverageSuperseded, rootEpoch: rootEpoch, graphIndexPhase: .superseded)
     }
 
-    private func finishProjectionWorker(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
-        activeProjectionJobIDs.remove(jobID)
-        cancelProjectionAdmission(jobID: jobID)
-        drainingProjectionTasks.removeValue(forKey: jobID)
-        drainingProjectionResources.removeValue(forKey: jobID)
-        drainingProjectionRootEpochs.removeValue(forKey: jobID)
-        if var job = projectionJobs[rootEpoch], job.id == jobID {
+    private func finishGraphIndexWorker(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
+        activeGraphIndexJobIDs.remove(jobID)
+        cancelGraphIndexAdmission(jobID: jobID)
+        drainingGraphIndexTasks.removeValue(forKey: jobID)
+        drainingGraphIndexResources.removeValue(forKey: jobID)
+        drainingGraphIndexRootEpochs.removeValue(forKey: jobID)
+        if var job = graphIndexJobs[rootEpoch], job.id == jobID {
             job.task = nil
             job.isQueuedForAdmission = false
             job.isActiveBatch = false
             job.resources = .zero
-            job.checkpoint = makeProjectionCheckpoint(job)
-            projectionJobs[rootEpoch] = job
-        }
-        if let job = projectionJobs[rootEpoch],
-           job.id == jobID,
-           job.phase == .complete,
-           let proofGeneration = job.coverageProof?.generation.contributionGeneration,
-           let latestGeneration = latestOverlayContributionGenerationByRootEpoch[rootEpoch],
-           proofGeneration < latestGeneration
-        {
-            _ = restartCompletedProjectionForOverlayAdvance(
-                rootEpoch: rootEpoch,
-                contributionGeneration: latestGeneration
-            )
+            job.checkpoint = makeGraphIndexCheckpoint(job)
+            graphIndexJobs[rootEpoch] = job
         }
         scheduleQueuedRequests()
-        scheduleProjectionAdmissions()
+        scheduleGraphIndexAdmissions()
     }
 
     @discardableResult
-    private func cancelProjectionJob(
+    private func cancelGraphIndexJob(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        terminalPhase: WorkspaceCodemapProjectionPreloadPhase
+        terminalPhase: WorkspaceCodemapGraphIndexPhase
     ) -> Task<Void, Never>? {
-        guard var job = projectionJobs.removeValue(forKey: rootEpoch) else { return nil }
-        cancelProjectionProgressPublication(rootEpoch: rootEpoch, resetLastPublication: true)
-        publishProjectionSnapshotUpdate(rootEpoch: rootEpoch)
+        guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return nil }
         let wasComplete = job.phase == .complete
-        let wasActive = activeProjectionJobIDs.contains(job.id)
+        let wasActive = activeGraphIndexJobIDs.contains(job.id)
         job.phase = terminalPhase
-        // An admitted projection transaction is non-preemptive. Revocation removes publication
+        // An admitted graphIndex transaction is non-preemptive. Revocation removes publication
         // authority immediately, but the worker reaches its existing currentness boundary without
         // task cancellation. A queued worker owns no admitted transaction and may be cancelled.
         if !wasActive, job.resources.retainedSourceBytes == 0 {
             job.task?.cancel()
         }
-        let detached = projectionAdmissionQueue.filter { $0.jobID == job.id }
-        projectionAdmissionQueue.removeAll { $0.jobID == job.id }
+        let detached = graphIndexAdmissionQueue.filter { $0.jobID == job.id }
+        graphIndexAdmissionQueue.removeAll { $0.jobID == job.id }
         for waiter in detached {
             waiter.continuation.resume(returning: false)
         }
         if wasActive {
-            incrementCounter(\.projectionCancelledBatches)
-            emit(.projectionBatchCancelled, rootEpoch: rootEpoch, projectionPhase: terminalPhase)
+            incrementCounter(\.graphIndexCancelledBatches)
+            emit(.graphIndexBatchCancelled, rootEpoch: rootEpoch, graphIndexPhase: terminalPhase)
         }
-        projectionRootLastAdmission.removeValue(forKey: rootEpoch)
+        graphIndexRootLastAdmission.removeValue(forKey: rootEpoch)
         if terminalPhase == .cancelled, !wasComplete {
-            incrementCounter(\.projectionCoveragesCancelled)
-            emit(.projectionCoverageCancelled, rootEpoch: rootEpoch, projectionPhase: .cancelled)
+            incrementCounter(\.graphIndexCoveragesCancelled)
+            emit(.graphIndexCoverageCancelled, rootEpoch: rootEpoch, graphIndexPhase: .cancelled)
         }
         if let task = job.task, wasActive {
-            drainingProjectionTasks[job.id] = task
-            drainingProjectionResources[job.id] = job.resources
-            drainingProjectionRootEpochs[job.id] = rootEpoch
+            drainingGraphIndexTasks[job.id] = task
+            drainingGraphIndexResources[job.id] = job.resources
+            drainingGraphIndexRootEpochs[job.id] = rootEpoch
         }
         if !wasActive {
-            scheduleProjectionAdmissions()
+            scheduleGraphIndexAdmissions()
         }
         return job.task
     }
@@ -5733,7 +4819,7 @@ actor WorkspaceCodemapBindingEngine {
               ),
               let record = pipeline.manifestRecords[repositoryRelativePath]
         else {
-            return .failure(.projectionMissing)
+            return .failure(.graphIndexMissing)
         }
         guard record.bindingGeneration == request.pathGeneration,
               record.locatorIdentity.repositoryNamespace == session.capability.repositoryNamespace,
@@ -5859,14 +4945,14 @@ actor WorkspaceCodemapBindingEngine {
         let ownerRequests = rootRequests.filter { $0.publicOwner == demand.owner }
         let owners = Set(rootRequests.map(\.publicOwner))
         let sourceBytes = UInt64(policy.maximumValidatedWorktreeByteCount)
-        let projectionUsage = projectionSourceUsage(rootEpoch: rootEpoch)
-        let rootSourceBytes = rootRequests.reduce(projectionUsage.rootBytes) {
+        let graphIndexUsage = graphIndexSourceUsage(rootEpoch: rootEpoch)
+        let rootSourceBytes = rootRequests.reduce(graphIndexUsage.rootBytes) {
             addingSaturating($0, $1.reservedSourceBytes)
         }
         let ownerSourceBytes = ownerRequests.reduce(UInt64(0)) {
             addingSaturating($0, $1.reservedSourceBytes)
         }
-        let globalSourceBytes = activeRequests.values.reduce(projectionUsage.globalBytes) {
+        let globalSourceBytes = activeRequests.values.reduce(graphIndexUsage.globalBytes) {
             addingSaturating($0, $1.reservedSourceBytes)
         }
         return activeRequests.count < policy.maximumActiveRequestCount &&
@@ -5875,9 +4961,9 @@ actor WorkspaceCodemapBindingEngine {
             activeRequests.count < policy.maximumActiveTaskCount &&
             rootRequests.count < policy.maximumActiveTaskCountPerRoot &&
             ownerRequests.count < policy.maximumActiveTaskCountPerOwner &&
-            addingSaturating(activeRequests.count, projectionUsage.globalMaterializationCount) <
+            addingSaturating(activeRequests.count, graphIndexUsage.globalMaterializationCount) <
             policy.maximumConcurrentMaterializationCount &&
-            addingSaturating(rootRequests.count, projectionUsage.rootMaterializationCount) <
+            addingSaturating(rootRequests.count, graphIndexUsage.rootMaterializationCount) <
             policy.maximumConcurrentMaterializationCountPerRoot &&
             ownerRequests.count < policy.maximumConcurrentMaterializationCountPerOwner &&
             (owners.contains(demand.owner) || owners.count < policy.maximumOwnerCountPerRoot) &&
@@ -5886,7 +4972,7 @@ actor WorkspaceCodemapBindingEngine {
             addingSaturating(ownerSourceBytes, sourceBytes) <= policy.maximumRetainedSourceByteCountPerOwner
     }
 
-    private func projectionSourceUsage(
+    private func graphIndexSourceUsage(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> (
         rootBytes: UInt64,
@@ -5898,7 +4984,7 @@ actor WorkspaceCodemapBindingEngine {
         var globalBytes: UInt64 = 0
         var rootMaterializationCount = 0
         var globalMaterializationCount = 0
-        for job in projectionJobs.values where job.resources.retainedSourceBytes > 0 {
+        for job in graphIndexJobs.values where job.resources.retainedSourceBytes > 0 {
             globalBytes = addingSaturating(globalBytes, job.resources.retainedSourceBytes)
             globalMaterializationCount = addingSaturating(globalMaterializationCount, 1)
             if job.rootEpoch == rootEpoch {
@@ -5906,10 +4992,10 @@ actor WorkspaceCodemapBindingEngine {
                 rootMaterializationCount = addingSaturating(rootMaterializationCount, 1)
             }
         }
-        for (jobID, resources) in drainingProjectionResources where resources.retainedSourceBytes > 0 {
+        for (jobID, resources) in drainingGraphIndexResources where resources.retainedSourceBytes > 0 {
             globalBytes = addingSaturating(globalBytes, resources.retainedSourceBytes)
             globalMaterializationCount = addingSaturating(globalMaterializationCount, 1)
-            if drainingProjectionRootEpochs[jobID] == rootEpoch {
+            if drainingGraphIndexRootEpochs[jobID] == rootEpoch {
                 rootBytes = addingSaturating(rootBytes, resources.retainedSourceBytes)
                 rootMaterializationCount = addingSaturating(rootMaterializationCount, 1)
             }
@@ -6104,8 +5190,8 @@ actor WorkspaceCodemapBindingEngine {
             guard let next = addingChecked(ownerOrdinal, 1) else { return }
             ownerOrdinal = next
         }
-        var projectionOrdinal: UInt64 = 1
-        for (key, _) in projectionRootLastAdmission.sorted(by: { lhs, rhs in
+        var graphIndexOrdinal: UInt64 = 1
+        for (key, _) in graphIndexRootLastAdmission.sorted(by: { lhs, rhs in
             if lhs.value != rhs.value {
                 return lhs.value < rhs.value
             }
@@ -6113,10 +5199,10 @@ actor WorkspaceCodemapBindingEngine {
             let right = rhs.key.rootID.uuidString + rhs.key.rootLifetimeID.uuidString
             return left < right
         }) {
-            projectionRootLastAdmission[key] = projectionOrdinal
-            projectionOrdinal = addingChecked(projectionOrdinal, 1) ?? .max
+            graphIndexRootLastAdmission[key] = graphIndexOrdinal
+            graphIndexOrdinal = addingChecked(graphIndexOrdinal, 1) ?? .max
         }
-        nextAdmissionOrdinal = max(rootOrdinal, max(ownerOrdinal, projectionOrdinal))
+        nextAdmissionOrdinal = max(rootOrdinal, max(ownerOrdinal, graphIndexOrdinal))
     }
 
     private func pruneAdmissionHistory() {
@@ -6124,7 +5210,6 @@ actor WorkspaceCodemapBindingEngine {
         retainedRoots.formUnion(queuedRequests.values.map(\.rootEpoch))
         retainedRoots.formUnion(adoptionReservations.keys.map(\.rootEpoch))
         retainedRoots.formUnion(retainedAdoptions.keys.map(\.rootEpoch))
-        retainedRoots.formUnion(projectionDemands.values.map(\.ticket.rootEpoch))
         rootLastAdmission = rootLastAdmission.filter { retainedRoots.contains($0.key) }
 
         var retainedOwners = Set(activeRequests.values.map {
@@ -6134,7 +5219,7 @@ actor WorkspaceCodemapBindingEngine {
             OwnerKey(rootEpoch: $0.rootEpoch, owner: $0.demand.owner)
         })
         ownerLastAdmission = ownerLastAdmission.filter { retainedOwners.contains($0.key) }
-        if activeRequests.isEmpty, queuedRequests.isEmpty, projectionDemands.isEmpty {
+        if activeRequests.isEmpty, queuedRequests.isEmpty {
             consecutiveDemandAdmissions = 0
         }
     }
@@ -6676,7 +5761,7 @@ actor WorkspaceCodemapBindingEngine {
         }
         request.continuation?.resume(returning: request.cancelled ? .cancelled : result)
         scheduleQueuedRequests()
-        scheduleProjectionAdmissions()
+        scheduleGraphIndexAdmissions()
     }
 
     private static func resolveClean(
@@ -6880,7 +5965,7 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         pipelineIdentity: CodeMapPipelineIdentity,
         mutations: [ManifestMutation],
-        proof: ManifestMutationProof,
+        proof: ManifestMutationAuthority,
         retainRecordsInMemory: Bool
     ) async -> ManifestMutationSubmissionResult {
         guard !mutations.isEmpty,
@@ -6899,19 +5984,19 @@ actor WorkspaceCodemapBindingEngine {
         let byteCount = mutations.reduce(UInt64(0)) {
             addingSaturating($0, manifestMutationByteCount($1))
         }
-        if case let .projection(jobID, _) = proof {
-            guard let nextPendingCount = projectionJobs[rootEpoch].flatMap({ job in
+        if case let .graphIndex(jobID, _) = proof {
+            guard let nextPendingCount = graphIndexJobs[rootEpoch].flatMap({ job in
                 job.id == jobID
                     ? addingChecked(job.pendingManifestMutationCount, UInt64(mutations.count))
                     : nil
             }) else {
-                return .budget(WorkspaceCodemapProjectionBudget(
+                return .budget(WorkspaceCodemapGraphIndexBudget(
                     dimension: .queuedManifestMutationBytes,
                     attempted: .max,
                     limit: .max - 1
                 ))
             }
-            switch reserveProjectionResources(
+            switch reserveGraphIndexResources(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
                 queuedManifestMutationBytes: byteCount
@@ -6923,10 +6008,10 @@ actor WorkspaceCodemapBindingEngine {
             case let .budget(budget):
                 return .budget(budget)
             }
-            guard var job = projectionJobs[rootEpoch], job.id == jobID else { return .retry }
+            guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return .retry }
             job.pendingManifestMutationCount = nextPendingCount
-            job.checkpoint = makeProjectionCheckpoint(job)
-            projectionJobs[rootEpoch] = job
+            job.checkpoint = makeGraphIndexCheckpoint(job)
+            graphIndexJobs[rootEpoch] = job
         }
 
         if retainRecordsInMemory {
@@ -7002,13 +6087,13 @@ actor WorkspaceCodemapBindingEngine {
             workKey: workKey,
             namespace: pipeline.namespace
         )
-        if case let .projection(jobID, _) = proof,
-           var job = projectionJobs[rootEpoch], job.id == jobID
+        if case let .graphIndex(jobID, _) = proof,
+           var job = graphIndexJobs[rootEpoch], job.id == jobID
         {
-            job.resources = WorkspaceCodemapProjectionResourceAccounting(
+            job.resources = WorkspaceCodemapGraphIndexResourceAccounting(
                 retainedPathBytes: job.resources.retainedPathBytes,
                 retainedSourceBytes: job.resources.retainedSourceBytes,
-                retainedProjectionBytes: job.resources.retainedProjectionBytes,
+                retainedGraphIndexBytes: job.resources.retainedGraphIndexBytes,
                 stagedGraphBytes: job.resources.stagedGraphBytes,
                 residentGraphBytes: job.resources.residentGraphBytes,
                 queuedManifestMutationBytes: job.resources.queuedManifestMutationBytes >= byteCount
@@ -7018,8 +6103,8 @@ actor WorkspaceCodemapBindingEngine {
             job.pendingManifestMutationCount = job.pendingManifestMutationCount >= UInt64(mutations.count)
                 ? job.pendingManifestMutationCount - UInt64(mutations.count)
                 : 0
-            job.checkpoint = makeProjectionCheckpoint(job)
-            projectionJobs[rootEpoch] = job
+            job.checkpoint = makeGraphIndexCheckpoint(job)
+            graphIndexJobs[rootEpoch] = job
         }
         return succeeded ? .persisted : .durabilityFailure
     }
@@ -7030,7 +6115,7 @@ actor WorkspaceCodemapBindingEngine {
     ) {
         var state = manifestWriters[namespace] ?? ManifestWriterState()
         // Admission order is the priority policy: a later session mutation must not overtake
-        // an earlier projection mutation. Batch compatibility may only group adjacent work.
+        // an earlier graphIndex mutation. Batch compatibility may only group adjacent work.
         state.queuedWork.append(item)
         recordManifestWriterPeakQueuedItems(in: state)
         guard state.writerID == nil else {
@@ -7088,7 +6173,7 @@ actor WorkspaceCodemapBindingEngine {
         if let deferredHeadBatch = writer.deferredHeadBatch {
             return deferredHeadBatch
         }
-        let maximumByteCount = policy.maximumQueuedProjectionManifestMutationByteCountPerRoot
+        let maximumByteCount = policy.maximumQueuedGraphIndexManifestMutationByteCountPerRoot
         let items = writer.queuedWork.popBatch(
             maximumItemCount: Self.maximumManifestWriterBatchItemCount,
             maximumByteCount: maximumByteCount,
@@ -7197,8 +6282,8 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 continue
             }
-            if case let .projection(_, generation) = batch.proof {
-                let tokenDisposition = await catalogClient.revalidateProjectionCatalogToken(
+            if case let .graphIndex(_, generation) = batch.proof {
+                let tokenDisposition = await catalogClient.revalidateGraphIndexCatalogToken(
                     scope.rootEpoch,
                     generation.catalogToken
                 )
@@ -7383,7 +6468,7 @@ actor WorkspaceCodemapBindingEngine {
             guard !Task.isCancelled else { return }
         }
         guard !Task.isCancelled else { return }
-        await resumeDeferredManifestWriter(namespace: namespace, retryID: retryID)
+        resumeDeferredManifestWriter(namespace: namespace, retryID: retryID)
     }
 
     private func resumeDeferredManifestWriter(
@@ -7623,7 +6708,7 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     private func manifestMutationProofIsCurrent(
-        _ proof: ManifestMutationProof,
+        _ proof: ManifestMutationAuthority,
         rootEpoch: WorkspaceCodemapRootEpoch,
         session: Session,
         pipeline: PipelineSession
@@ -7632,10 +6717,10 @@ actor WorkspaceCodemapBindingEngine {
         case let .session(invalidationGeneration):
             return session.capability.rootEpoch == rootEpoch &&
                 session.invalidationGeneration == invalidationGeneration
-        case let .projection(jobID, generation):
-            guard let job = projectionJobs[rootEpoch],
+        case let .graphIndex(jobID, generation):
+            guard let job = graphIndexJobs[rootEpoch],
                   job.id == jobID,
-                  projectionJobIsCurrent(job),
+                  graphIndexJobIsCurrent(job),
                   job.generation == generation,
                   pipeline.pipelineIdentity == pipeline.namespace.pipelineIdentity
             else { return false }
@@ -7669,7 +6754,7 @@ actor WorkspaceCodemapBindingEngine {
         var batches: [[ManifestMutation]] = []
         var batch: [ManifestMutation] = []
         var batchBytes: UInt64 = 0
-        let limit = policy.maximumQueuedProjectionManifestMutationByteCountPerRoot
+        let limit = policy.maximumQueuedGraphIndexManifestMutationByteCountPerRoot
         for mutation in mutations {
             let bytes = manifestMutationByteCount(mutation)
             if !batch.isEmpty, addingSaturating(batchBytes, bytes) > limit {
@@ -7996,12 +7081,12 @@ actor WorkspaceCodemapBindingEngine {
                 manifestWriteFailed: false
             )
         }
-        revokeProjectionDemands(rootEpoch: rootEpoch, status: .stale)
         if case let .registering(attempt)? = roots[rootEpoch] {
             replacementCancelledRegistrationAttemptIDs.insert(attempt.id)
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
             await capabilityService.invalidateForAuthorityReplacement(rootEpoch: rootEpoch)
+            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             emit(.invalidation, rootEpoch: rootEpoch, invalidationReason: reason)
             return WorkspaceCodemapBindingInvalidationResult(
@@ -8024,7 +7109,7 @@ actor WorkspaceCodemapBindingEngine {
             return await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .authorityChanged)
         }
 
-        _ = cancelProjectionJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
+        _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
 
         session.invalidationGeneration += 1
         for path in safePaths {
@@ -8098,12 +7183,12 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapLiveOverlayInvalidationReason
     ) async -> WorkspaceCodemapBindingInvalidationResult {
-        revokeProjectionDemands(rootEpoch: rootEpoch, status: .stale)
         if case let .registering(attempt)? = roots[rootEpoch] {
             replacementCancelledRegistrationAttemptIDs.insert(attempt.id)
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
             await capabilityService.invalidateForAuthorityReplacement(rootEpoch: rootEpoch)
+            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             emit(.invalidation, rootEpoch: rootEpoch, invalidationReason: reason)
             return WorkspaceCodemapBindingInvalidationResult(
@@ -8119,7 +7204,7 @@ actor WorkspaceCodemapBindingEngine {
                 manifestWriteFailed: false
             )
         }
-        _ = cancelProjectionJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
+        _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
         let requestIDs = activeRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
         let queuedIDs = queuedRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
         roots[rootEpoch] = .unavailable(UnavailableRoot(
@@ -8136,6 +7221,7 @@ actor WorkspaceCodemapBindingEngine {
             expectedAuthority: session.capability.repositoryAuthority,
             reason: reason
         )
+        await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .repositoryAuthorityChanged)
         adoptionReservations = adoptionReservations.filter { $0.key.rootEpoch != rootEpoch }
         retainedAdoptions = retainedAdoptions.filter { $0.key.rootEpoch != rootEpoch }
         pruneAdmissionHistory()
@@ -8181,7 +7267,7 @@ actor WorkspaceCodemapBindingEngine {
             cancelledRequestCount += 1
         }
         scheduleQueuedRequests()
-        scheduleProjectionAdmissions()
+        scheduleGraphIndexAdmissions()
         return SynchronousCancellationBatch(
             overlayCancellations: overlayCancellations,
             cancelledRequestCount: cancelledRequestCount
@@ -8388,7 +7474,7 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch? = nil,
         artifact: CodeMapArtifactKey? = nil,
         numericValue: UInt64 = 0,
-        projectionPhase: WorkspaceCodemapProjectionPreloadPhase? = nil,
+        graphIndexPhase: WorkspaceCodemapGraphIndexPhase? = nil,
         retryAfterMilliseconds: UInt64? = nil,
         publishedArtifactLookupSource: WorkspaceCodemapPublishedArtifactLookupSource? = nil,
         publishedArtifactLookupMissReason: WorkspaceCodemapPublishedArtifactLookupMissReason? = nil,
@@ -8399,29 +7485,11 @@ actor WorkspaceCodemapBindingEngine {
             rootEpoch: rootEpoch,
             artifactStorageDigest: artifact?.storageDigestHex,
             numericValue: numericValue,
-            projectionPhase: projectionPhase,
+            graphIndexPhase: graphIndexPhase,
             retryAfterMilliseconds: retryAfterMilliseconds,
             publishedArtifactLookupSource: publishedArtifactLookupSource,
             publishedArtifactLookupMissReason: publishedArtifactLookupMissReason,
             invalidationReason: invalidationReason
         ))
-        if let rootEpoch, projectionStatusChanged(for: kind) {
-            let finish = if case .rootUnload = kind { true } else { false }
-            publishProjectionSnapshotUpdate(rootEpoch: rootEpoch, finish: finish)
-        }
-    }
-
-    private func projectionStatusChanged(for kind: WorkspaceCodemapBindingEngineHookKind) -> Bool {
-        switch kind {
-        case .capabilityEligible, .capabilityTerminalUnavailable, .rootUnload,
-             .projectionPreloadScheduled, .projectionPreloadStarted,
-             .projectionBatchStarted, .projectionBatchCompleted,
-             .projectionSegmentPublished, .projectionCoverageComplete,
-             .projectionCoverageCancelled, .projectionCoverageSuperseded,
-             .projectionRetry, .projectionBudget:
-            true
-        default:
-            false
-        }
     }
 }
