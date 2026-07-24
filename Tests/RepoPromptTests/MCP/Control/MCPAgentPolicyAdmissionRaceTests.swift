@@ -2192,6 +2192,58 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
     }
 
     @MainActor
+    func testPendingPolicyRollbackRestoresContextPromotedDuringRouteMapping() throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let connectionID = UUID()
+            let windowID = window.windowID
+
+            window.mcpServer.installTabContext(
+                clientID: nil,
+                clientName: clientName,
+                windowID: windowID,
+                workspaceID: nil,
+                snapshot: ComposeTabState(),
+                runID: runID,
+                signalRouting: false
+            )
+            XCTAssertEqual(
+                window.mcpServer.pendingContextQueueLength(clientName: clientName, windowID: windowID),
+                1
+            )
+
+            let token = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+                connectionID: connectionID,
+                runID: runID,
+                windowID: windowID,
+                clientName: clientName
+            ))
+            XCTAssertEqual(
+                window.mcpServer.pendingContextQueueLength(clientName: clientName, windowID: windowID),
+                0
+            )
+
+            let rollbackResult = window.mcpServer.rollbackPendingPolicyRunIDMapping(
+                token,
+                clientName: clientName,
+                windowID: windowID,
+                signalRoutingFailure: false
+            )
+
+            XCTAssertEqual(rollbackResult, .restored)
+            XCTAssertEqual(
+                window.mcpServer.pendingContextQueueLength(clientName: clientName, windowID: windowID),
+                1
+            )
+            XCTAssertNil(window.mcpServer.tabContextByConnectionID[connectionID])
+        #else
+            throw XCTSkip("Pending policy rollback diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
     func testPendingPolicyRollbackDoesNotRestorePreviousRunAfterPrimaryGenerationChanges() throws {
         #if DEBUG
             let window = makeWindow()
