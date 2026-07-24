@@ -822,9 +822,8 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             resolveRequestedTabID: { _ in targetTabID },
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
-            bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
+            startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Smoke start target did not resolve a session ID.")
                 }
