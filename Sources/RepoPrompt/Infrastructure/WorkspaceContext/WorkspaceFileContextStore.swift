@@ -357,6 +357,13 @@ actor WorkspaceFileContextStore {
         let task: Task<Void, Never>
     }
 
+    /// UI-status lower bound for coverage that remains valid while a path-level
+    /// invalidation replaces the current projection job.
+    private struct CodemapRootStatusCoverageBaseline {
+        var retainedCandidateCount: UInt64
+        var invalidatedCandidateFileIDs: Set<UUID>
+    }
+
     private enum CodemapSetupDisposition {
         case ready
         case unavailable(WorkspaceCodemapArtifactDemandUnavailableReason)
@@ -612,6 +619,7 @@ actor WorkspaceFileContextStore {
         ] = [:]
         var graphPublicationFlight: CodemapGraphPublicationFlight?
         var projectionRecoveryObserver: CodemapProjectionRecoveryObserver?
+        var projectionStatusTask: Task<Void, Never>?
         var selectionGraph: CodemapSelectionGraphState?
         var graphSnapshotDirtyDuringPathInvalidation = false
     }
@@ -627,6 +635,7 @@ actor WorkspaceFileContextStore {
         let projectionDemands: [CodemapProjectionDemandRecord]
         let graphPublicationTask: Task<Void, Never>?
         let projectionRecoveryObserverTask: Task<Void, Never>?
+        let projectionStatusTask: Task<Void, Never>?
         let selectionGraph: WorkspaceCodemapSelectionGraph?
         let graphWorkerTask: Task<Void, Never>?
         let preloadLaunchTask: Task<Void, Never>?
@@ -1375,6 +1384,22 @@ actor WorkspaceFileContextStore {
             codemapProjectionCatalogBuildHandler = handler
         }
 
+        func setCodemapProjectionPhaseForTesting(
+            rootID: UUID,
+            phase: WorkspaceCodemapProjectionPreloadPhase
+        ) {
+            guard let state = rootStatesByID[rootID] else { return }
+            let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+            codemapProjectionSnapshotsByRootEpoch[rootEpoch] = .pending(
+                phase: phase,
+                progress: .notStarted,
+                inBatchProgress: nil,
+                retry: nil,
+                budget: nil
+            )
+            publishCodemapRootStatusesIfChanged()
+        }
+
         func codemapProjectionPreloadStoreEventsForTesting(
             rootID: UUID? = nil
         ) -> [CodemapProjectionPreloadStoreEvent] {
@@ -1682,7 +1707,7 @@ actor WorkspaceFileContextStore {
                     terminalCount = proof.terminalCount
                     lastSegmentSequence = proof.lastSegmentSequence
                     coverageCompletedUptimeNanoseconds = completed
-                case let .pending(phase, progress, _, budget):
+                case let .pending(phase, progress, _, _, budget):
                     projectionPhase = CodemapFullLoadDebugSupport.projectionPhaseName(phase)
                     supportedCandidateCount = progress.counts.supportedCandidateCount
                     processedCandidateCount = progress.counts.processedCandidateCount
@@ -2725,6 +2750,19 @@ actor WorkspaceFileContextStore {
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
     private var codemapProjectionPreloadReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var codemapSuspendedRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var codemapResumeTransitionIDsByRootEpoch: [WorkspaceCodemapRootEpoch: UUID] = [:]
+    private var codemapProjectionSnapshotsByRootEpoch: [
+        WorkspaceCodemapRootEpoch: WorkspaceCodemapCurrentProjectionSnapshot
+    ] = [:]
+    private var codemapRootStatusCoverageBaselinesByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapRootStatusCoverageBaseline
+    ] = [:]
+    private var codemapRootStatusContinuations: [
+        UUID: AsyncStream<WorkspaceCodemapRootStatusUpdate>.Continuation
+    ] = [:]
+    private var codemapRootStatusRevision: UInt64 = 0
+    private var lastPublishedCodemapRootStatuses: [WorkspaceCodemapRootStatusSnapshot] = []
     private var codemapPathLocalCatalogMutationDepthByRootID: [UUID: Int] = [:]
     private var codemapAuthorityGenerationsByRootEpoch: [WorkspaceCodemapRootEpoch: UInt64] = [:]
     private var codemapProjectionInvalidationGenerationsByRootEpoch: [
@@ -2944,6 +2982,7 @@ actor WorkspaceFileContextStore {
             }
             session.graphPublicationFlight?.task?.cancel()
             session.projectionRecoveryObserver?.task?.cancel()
+            session.projectionStatusTask?.cancel()
             session.selectionGraph?.workerTask?.cancel()
             for bundle in session.bundlesByRequestID.values {
                 bundle.close()
@@ -2968,6 +3007,9 @@ actor WorkspaceFileContextStore {
             continuation.finish()
         }
         for continuation in codemapMarkerReadinessContinuations.values {
+            continuation.finish()
+        }
+        for continuation in codemapRootStatusContinuations.values {
             continuation.finish()
         }
         for continuation in fileSystemDeltaContinuations.values {
@@ -5319,6 +5361,7 @@ actor WorkspaceFileContextStore {
                 rootLifetimeID: pending.state.lifetimeID
             )
             recordCodemapRootReadyForProjectionPreload(rootEpoch: rootEpoch)
+            publishCodemapRootStatusesIfChanged()
             scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch)
         }
         scheduleOrphanedSessionWorktreeResourceCleanup(previousResources)
@@ -9753,6 +9796,204 @@ actor WorkspaceFileContextStore {
         codemapMarkerReadinessContinuations.removeValue(forKey: id)
     }
 
+    func codemapRootStatusUpdates() -> AsyncStream<WorkspaceCodemapRootStatusUpdate> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            codemapRootStatusContinuations[id] = continuation
+            continuation.yield(currentCodemapRootStatusUpdate())
+            continuation.onTermination = { _ in
+                Task { await self.removeCodemapRootStatusContinuation(id) }
+            }
+        }
+    }
+
+    func codemapRootStatusSnapshot(rootID: UUID) -> WorkspaceCodemapRootStatusSnapshot? {
+        guard let state = rootStatesByID[rootID] else { return nil }
+        return makeCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+        )
+    }
+
+    func setCodemapGenerationSuspended(
+        rootID: UUID,
+        suspended: Bool
+    ) async -> WorkspaceCodemapRootSuspensionUpdateResult {
+        guard let state = rootStatesByID[rootID] else { return .rootUnavailable }
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+
+        if suspended {
+            let cancelledResume = codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch) != nil
+            let inserted = codemapSuspendedRootEpochs.insert(rootEpoch).inserted
+            guard inserted || cancelledResume else { return .unchanged }
+            codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
+            publishCodemapRootStatusesIfChanged()
+            if inserted {
+                let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine
+                _ = detachCodemapSession(rootEpoch: rootEpoch)
+                if let engine {
+                    await engine.cancelProjectionPreload(rootEpoch: rootEpoch)
+                }
+            }
+            return .changed
+        }
+
+        guard codemapSuspendedRootEpochs.contains(rootEpoch),
+              codemapResumeTransitionIDsByRootEpoch[rootEpoch] == nil
+        else { return .unchanged }
+        let resumeID = UUID()
+        codemapResumeTransitionIDsByRootEpoch[rootEpoch] = resumeID
+        if let cleanup = codemapCleanupFlightsByRootID[rootID] {
+            await cleanup.task.value
+        }
+        guard rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID else {
+            if codemapResumeTransitionIDsByRootEpoch[rootEpoch] == resumeID {
+                codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+            }
+            return .rootUnavailable
+        }
+        guard codemapResumeTransitionIDsByRootEpoch[rootEpoch] == resumeID,
+              codemapSuspendedRootEpochs.remove(rootEpoch) != nil
+        else { return .unchanged }
+        codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+        scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch)
+        publishCodemapRootStatusesIfChanged()
+        return .changed
+    }
+
+    private func removeCodemapRootStatusContinuation(_ id: UUID) {
+        codemapRootStatusContinuations.removeValue(forKey: id)
+    }
+
+    private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+        codemapSuspendedRootEpochs.contains(rootEpoch)
+    }
+
+    func currentCodemapRootStatusUpdate() -> WorkspaceCodemapRootStatusUpdate {
+        WorkspaceCodemapRootStatusUpdate(
+            revision: codemapRootStatusRevision,
+            roots: currentCodemapRootStatusSnapshots()
+        )
+    }
+
+    private func currentCodemapRootStatusSnapshots() -> [WorkspaceCodemapRootStatusSnapshot] {
+        rootLoadOrder.compactMap { rootID in
+            guard let state = rootStatesByID[rootID] else { return nil }
+            return makeCodemapRootStatusSnapshot(
+                rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+            )
+        }
+    }
+
+    private func makeCodemapRootStatusSnapshot(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapRootStatusSnapshot {
+        if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
+            return WorkspaceCodemapRootStatusSnapshot(
+                rootEpoch: rootEpoch,
+                state: .paused,
+                processedCandidateCount: 0,
+                totalCandidateCount: nil
+            )
+        }
+
+        let knownTotalCandidateCount = codemapKnownTotalCandidateCount(rootEpoch: rootEpoch)
+        if let projection = codemapProjectionSnapshotsByRootEpoch[rootEpoch] {
+            switch projection {
+            case let .authoritativeComplete(proof, _):
+                return WorkspaceCodemapRootStatusSnapshot(
+                    rootEpoch: rootEpoch,
+                    state: .ready,
+                    processedCandidateCount: proof.counts.processedCandidateCount,
+                    totalCandidateCount: proof.catalogCompletion.supportedCandidateCount
+                )
+            case let .pending(phase, progress, inBatchProgress, _, _):
+                let state: WorkspaceCodemapRootStatusState = switch phase {
+                case .suspendedBusy:
+                    .generating
+                case .budgetLimited:
+                    .waiting
+                case .complete:
+                    .ready
+                case .cancelled, .superseded:
+                    .idle
+                default:
+                    .generating
+                }
+                let totalCandidateCount = progress.catalogCompletion?.supportedCandidateCount
+                    ?? knownTotalCandidateCount
+                let processedCandidateCount = normalizedCodemapRootStatusCandidateCount(
+                    max(
+                        progress.counts.processedCandidateCount,
+                        codemapRootStatusCoverageBaselinesByRootEpoch[rootEpoch]?
+                            .retainedCandidateCount ?? 0
+                    ),
+                    totalCandidateCount: totalCandidateCount
+                )
+                return WorkspaceCodemapRootStatusSnapshot(
+                    rootEpoch: rootEpoch,
+                    state: state,
+                    processedCandidateCount: processedCandidateCount,
+                    locallyResolvedCandidateCountThroughRoot: inBatchProgress?
+                        .locallyResolvedCandidateCountThroughRoot,
+                    totalCandidateCount: totalCandidateCount
+                )
+            case .unavailable, .nonCurrent:
+                break
+            }
+        }
+
+        let state: WorkspaceCodemapRootStatusState = switch codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch]?.phase {
+        case .eligibilityQueued, .setupJoining, .engineScheduling:
+            .preparing
+        case .handedOff:
+            .generating
+        case .transientRetry:
+            .waiting
+        case .terminalNonGit:
+            .unavailable
+        case .notScheduled, .cancelled, .superseded, nil:
+            .idle
+        }
+        let processedCandidateCount = normalizedCodemapRootStatusCandidateCount(
+            codemapRootStatusCoverageBaselinesByRootEpoch[rootEpoch]?.retainedCandidateCount ?? 0,
+            totalCandidateCount: knownTotalCandidateCount
+        )
+        return WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: rootEpoch,
+            state: state,
+            processedCandidateCount: processedCandidateCount,
+            totalCandidateCount: knownTotalCandidateCount
+        )
+    }
+
+    private func normalizedCodemapRootStatusCandidateCount(
+        _ candidateCount: UInt64,
+        totalCandidateCount: UInt64?
+    ) -> UInt64 {
+        guard let totalCandidateCount else { return candidateCount }
+        return min(candidateCount, totalCandidateCount)
+    }
+
+    private func codemapKnownTotalCandidateCount(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> UInt64? {
+        guard let authority = currentCodemapAuthority(rootEpoch: rootEpoch),
+              let shard = codemapProjectionCatalogShardAndToken(authority: authority)?.shard
+        else { return nil }
+        return UInt64(exactly: shard.projectionFiles.count)
+    }
+
+    private func publishCodemapRootStatusesIfChanged() {
+        let roots = currentCodemapRootStatusSnapshots()
+        guard roots != lastPublishedCodemapRootStatuses else { return }
+        lastPublishedCodemapRootStatuses = roots
+        codemapRootStatusRevision &+= 1
+        let update = WorkspaceCodemapRootStatusUpdate(revision: codemapRootStatusRevision, roots: roots)
+        for continuation in codemapRootStatusContinuations.values {
+            continuation.yield(update)
+        }
+    }
+
     @discardableResult
     func loadRoot(
         path: String,
@@ -10173,6 +10414,7 @@ actor WorkspaceFileContextStore {
             rootLifetimeID: state.lifetimeID
         )
         recordCodemapRootReadyForProjectionPreload(rootEpoch: rootEpoch)
+        publishCodemapRootStatusesIfChanged()
         scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch)
         #if DEBUG
             WorkspaceRestorePerfLog.event(
@@ -10407,6 +10649,11 @@ actor WorkspaceFileContextStore {
                 continuation.resume()
             }
             codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
+            codemapSuspendedRootEpochs.remove(rootEpoch)
+            codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+            codemapProjectionSnapshotsByRootEpoch.removeValue(forKey: rootEpoch)
+            codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
+            publishCodemapRootStatusesIfChanged()
             if let cleanup = detachCodemapSession(
                 rootEpoch: rootEpoch,
                 invalidationCommands: [.unload],
@@ -13354,7 +13601,8 @@ actor WorkspaceFileContextStore {
     private func currentCodemapAuthority(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> CodemapRootAuthority? {
-        guard let state = rootStatesByID[rootEpoch.rootID],
+        guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch),
+              let state = rootStatesByID[rootEpoch.rootID],
               state.lifetimeID == rootEpoch.rootLifetimeID
         else { return nil }
         if let session = codemapSessionsByRootEpoch[rootEpoch],
@@ -13434,7 +13682,8 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             guard codemapProjectionPreloadLaunchPolicyForTesting == .enabled else { return }
         #endif
-        guard codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
+        guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch),
+              codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
               codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
               let authority = currentCodemapAuthority(rootEpoch: rootEpoch),
               codemapPreflightAuthorityIsCurrent(authority)
@@ -13477,6 +13726,7 @@ actor WorkspaceFileContextStore {
         }
         launch.task = task
         codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch] = launch
+        publishCodemapRootStatusesIfChanged()
     }
 
     private func runCodemapProjectionPreloadLaunch(
@@ -13810,7 +14060,9 @@ actor WorkspaceFileContextStore {
     private func ensureCodemapSetupTask(
         authority: CodemapRootAuthority
     ) -> Task<CodemapSetupDisposition, Never>? {
-        guard codemapPreflightAuthorityIsCurrent(authority) else { return nil }
+        guard !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
+              codemapPreflightAuthorityIsCurrent(authority)
+        else { return nil }
         codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
         if let existing = codemapSessionsByRootEpoch[authority.rootEpoch] {
             guard existing.authority == authority else { return nil }
@@ -13843,6 +14095,7 @@ actor WorkspaceFileContextStore {
         guard let launch = codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
               launch.authority == authority,
+              !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
               codemapPreflightAuthorityIsCurrent(authority)
         else { return false }
         return true
@@ -13859,6 +14112,7 @@ actor WorkspaceFileContextStore {
         else { return }
         launch.phase = phase
         codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch] = launch
+        publishCodemapRootStatusesIfChanged()
     }
 
     private func finishCodemapProjectionPreloadLaunch(
@@ -13872,6 +14126,7 @@ actor WorkspaceFileContextStore {
         else { return }
         launch.phase = phase
         codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch] = launch
+        publishCodemapRootStatusesIfChanged()
         if phase == .cancelled || phase == .superseded {
             recordCodemapProjectionPreloadStoreEvent(
                 phase == .cancelled ? .cancelled : .superseded,
@@ -13892,7 +14147,8 @@ actor WorkspaceFileContextStore {
         launchID: UUID,
         authority: CodemapRootAuthority
     ) {
-        guard let launch = codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch],
+        guard !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
+              let launch = codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
               launch.authority == authority,
               launch.phase == .transientRetry,
@@ -13949,6 +14205,7 @@ actor WorkspaceFileContextStore {
         else { return }
         codemapProjectionPreloadRetriesByRootEpoch.removeValue(forKey: authority.rootEpoch)
         guard !Task.isCancelled,
+              !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
               codemapProjectionPreloadRetryPolicy.nowNanoseconds() >= deadlineNanoseconds,
               codemapPreflightAuthorityIsCurrent(authority)
         else { return }
@@ -14444,6 +14701,9 @@ actor WorkspaceFileContextStore {
             rootID: file.rootID,
             rootLifetimeID: state.lifetimeID
         )
+        if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
+            return .init(result: .unavailable(.cancelled), ownership: .notAcquired)
+        }
         if codemapCleanupFlightsByRootID[file.rootID] != nil ||
             codemapRootMutationFenceTokensByRootEpoch[rootEpoch] != nil ||
             codemapPathIsFenced(rootEpoch: rootEpoch, relativePath: file.standardizedRelativePath)
@@ -14663,6 +14923,9 @@ actor WorkspaceFileContextStore {
             return .unavailable(reason: .generationMismatch, retryAfterMilliseconds: nil)
         }
         let rootEpoch = first.rootEpoch
+        guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch) else {
+            return .unavailable(reason: .capabilityUnavailable, retryAfterMilliseconds: nil)
+        }
         var uniqueFileIDs: [UUID] = []
         var seenFileIDs = Set<UUID>()
         for ticket in sourceTickets {
@@ -16457,7 +16720,60 @@ actor WorkspaceFileContextStore {
             .unavailable(.registrationFailed)
         }
         publishCodemapSetupDisposition(disposition, authority: authority)
+        if case .ready = disposition {
+            startCodemapProjectionStatusObserver(authority: authority, engine: engine)
+        }
         return disposition
+    }
+
+    private func startCodemapProjectionStatusObserver(
+        authority: CodemapRootAuthority,
+        engine: WorkspaceCodemapBindingEngine
+    ) {
+        guard var session = codemapSessionsByRootEpoch[authority.rootEpoch],
+              session.authority == authority,
+              session.engine === engine
+        else { return }
+        session.projectionStatusTask?.cancel()
+        let task = Task { [weak self] in
+            let stream = await engine.projectionSnapshotUpdates(rootEpoch: authority.rootEpoch)
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await self?.acceptCodemapProjectionStatusSnapshot(
+                    snapshot,
+                    authority: authority,
+                    engine: engine
+                )
+            }
+        }
+        session.projectionStatusTask = task
+        codemapSessionsByRootEpoch[authority.rootEpoch] = session
+    }
+
+    private func acceptCodemapProjectionStatusSnapshot(
+        _ snapshot: WorkspaceCodemapCurrentProjectionSnapshot,
+        authority: CodemapRootAuthority,
+        engine: WorkspaceCodemapBindingEngine
+    ) {
+        guard let session = codemapSessionsByRootEpoch[authority.rootEpoch],
+              session.authority == authority,
+              session.engine === engine,
+              codemapAuthorityIsCurrent(authority)
+        else { return }
+        if case let .authoritativeComplete(proof, _) = snapshot,
+           let current = codemapProjectionCatalogShardAndToken(authority: authority),
+           let candidateCount = UInt64(exactly: current.shard.projectionFiles.count),
+           proof.counts.processedCandidateCount == candidateCount,
+           proof.catalogCompletion.supportedCandidateCount == candidateCount
+        {
+            codemapRootStatusCoverageBaselinesByRootEpoch[authority.rootEpoch] =
+                CodemapRootStatusCoverageBaseline(
+                    retainedCandidateCount: candidateCount,
+                    invalidatedCandidateFileIDs: []
+                )
+        }
+        codemapProjectionSnapshotsByRootEpoch[authority.rootEpoch] = snapshot
+        publishCodemapRootStatusesIfChanged()
     }
 
     private func performCodemapDemand(
@@ -17750,6 +18066,7 @@ actor WorkspaceFileContextStore {
             capability: .recordsOnly
         )
         registerPublishedRootCatalogShard(shard, kind: .authoritative)
+        publishCodemapRootStatusesIfChanged()
         return .ready
     }
 
@@ -18441,6 +18758,10 @@ actor WorkspaceFileContextStore {
         guard !paths.isEmpty, let state = rootStatesByID[rootID] else { return (nil, nil) }
         let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
 
+        retainCodemapRootStatusCoverageAcrossPathInvalidation(
+            rootEpoch: rootEpoch,
+            standardizedRelativePaths: paths
+        )
         advanceCodemapProjectionInvalidationGeneration(rootEpoch: rootEpoch)
         _ = cancelCodemapProjectionPreloadLaunchForInvalidation(rootEpoch: rootEpoch)
 
@@ -18625,6 +18946,29 @@ actor WorkspaceFileContextStore {
             task: task
         )
         return (token, task)
+    }
+
+    private func retainCodemapRootStatusCoverageAcrossPathInvalidation(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        standardizedRelativePaths: Set<String>
+    ) {
+        guard var baseline = codemapRootStatusCoverageBaselinesByRootEpoch[rootEpoch],
+              let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID,
+              let authority = currentCodemapAuthority(rootEpoch: rootEpoch),
+              let shard = codemapProjectionCatalogShardAndToken(authority: authority)?.shard
+        else { return }
+
+        for path in standardizedRelativePaths {
+            guard let fileID = state.fileIDsByRelativePath[path],
+                  shard.projectionFileIndexByID[fileID] != nil,
+                  baseline.invalidatedCandidateFileIDs.insert(fileID).inserted
+            else { continue }
+            baseline.retainedCandidateCount = baseline.retainedCandidateCount > 0
+                ? baseline.retainedCandidateCount - 1
+                : 0
+        }
+        codemapRootStatusCoverageBaselinesByRootEpoch[rootEpoch] = baseline
     }
 
     private func performCodemapPathInvalidation(
@@ -18862,6 +19206,9 @@ actor WorkspaceFileContextStore {
             forKey: rootEpoch
         )
         let session = codemapSessionsByRootEpoch.removeValue(forKey: rootEpoch)
+        codemapProjectionSnapshotsByRootEpoch.removeValue(forKey: rootEpoch)
+        codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
+        publishCodemapRootStatusesIfChanged()
         if let session, !session.markerReadinessByFileID.isEmpty {
             let changes = session.markerReadinessByFileID.values.map {
                 WorkspaceCodemapMarkerReadinessChange(
@@ -18911,6 +19258,7 @@ actor WorkspaceFileContextStore {
         session?.setupTask?.cancel()
         session?.graphPublicationFlight?.task?.cancel()
         session?.projectionRecoveryObserver?.task?.cancel()
+        session?.projectionStatusTask?.cancel()
         session?.selectionGraph?.workerTask?.cancel()
         let demandRecords = session.map { Array($0.demandsByFileID.values) } ?? []
         for record in demandRecords {
@@ -18932,6 +19280,7 @@ actor WorkspaceFileContextStore {
             projectionDemands: projectionDemands,
             graphPublicationTask: session?.graphPublicationFlight?.task,
             projectionRecoveryObserverTask: session?.projectionRecoveryObserver?.task,
+            projectionStatusTask: session?.projectionStatusTask,
             selectionGraph: session?.selectionGraph?.graph,
             graphWorkerTask: session?.selectionGraph?.workerTask,
             preloadLaunchTask: launch?.task,
@@ -18962,6 +19311,9 @@ actor WorkspaceFileContextStore {
             }
             if let projectionRecoveryObserverTask = detached.projectionRecoveryObserverTask {
                 await projectionRecoveryObserverTask.value
+            }
+            if let projectionStatusTask = detached.projectionStatusTask {
+                await projectionStatusTask.value
             }
             if let selectionGraph = detached.selectionGraph {
                 _ = await selectionGraph.invalidateCurrentness(
@@ -19181,6 +19533,10 @@ actor WorkspaceFileContextStore {
     private func schedulePendingCodemapProjectionPreloadIfFullyUnfenced(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
+        if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
+            codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
+            return
+        }
         guard codemapProjectionPreloadReschedulePendingRootEpochs.contains(rootEpoch),
               codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
               codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil,

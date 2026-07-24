@@ -43,6 +43,7 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
     let maximumProjectionCatalogPageEntryCount: Int
     let maximumProjectionCatalogPagePathByteCount: UInt64
     let maximumProjectionBatchCandidateCount: Int
+    let projectionProgressPublicationMinimumIntervalMilliseconds: UInt64
     let maximumRetainedProjectionByteCountPerSegment: UInt64
     let maximumRetainedProjectionByteCountPerRoot: UInt64
     let maximumRetainedProjectionByteCount: UInt64
@@ -96,6 +97,7 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         maximumProjectionCatalogPageEntryCount: Int = 64,
         maximumProjectionCatalogPagePathByteCount: UInt64 = 256 * 1024,
         maximumProjectionBatchCandidateCount: Int = 64,
+        projectionProgressPublicationMinimumIntervalMilliseconds: UInt64 = 100,
         maximumRetainedProjectionByteCountPerSegment: UInt64 = 8 * 1024 * 1024,
         maximumRetainedProjectionByteCountPerRoot: UInt64 = 32 * 1024 * 1024,
         maximumRetainedProjectionByteCount: UInt64 = 128 * 1024 * 1024,
@@ -151,6 +153,7 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         precondition(maximumProjectionCatalogPagePathByteCount > 0)
         precondition(maximumProjectionBatchCandidateCount > 0)
         precondition(maximumProjectionBatchCandidateCount <= maximumProjectionCatalogPageEntryCount)
+        precondition((25 ... 1000).contains(projectionProgressPublicationMinimumIntervalMilliseconds))
         precondition(maximumRetainedProjectionByteCountPerSegment > 0)
         precondition(maximumRetainedProjectionByteCountPerRoot > 0)
         precondition(maximumRetainedProjectionByteCount > 0)
@@ -209,6 +212,8 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         self.maximumProjectionCatalogPageEntryCount = maximumProjectionCatalogPageEntryCount
         self.maximumProjectionCatalogPagePathByteCount = maximumProjectionCatalogPagePathByteCount
         self.maximumProjectionBatchCandidateCount = maximumProjectionBatchCandidateCount
+        self.projectionProgressPublicationMinimumIntervalMilliseconds =
+            projectionProgressPublicationMinimumIntervalMilliseconds
         self.maximumRetainedProjectionByteCountPerSegment = maximumRetainedProjectionByteCountPerSegment
         self.maximumRetainedProjectionByteCountPerRoot = maximumRetainedProjectionByteCountPerRoot
         self.maximumRetainedProjectionByteCount = maximumRetainedProjectionByteCount
@@ -805,6 +810,7 @@ enum WorkspaceCodemapCurrentProjectionSnapshot: Hashable {
     case pending(
         phase: WorkspaceCodemapProjectionPreloadPhase,
         progress: WorkspaceCodemapProjectionProgress,
+        inBatchProgress: WorkspaceCodemapProjectionInBatchProgress?,
         retry: WorkspaceCodemapProjectionRetry?,
         budget: WorkspaceCodemapProjectionBudget?
     )

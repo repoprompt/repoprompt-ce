@@ -946,6 +946,8 @@ final class CodemapStoreFixture: @unchecked Sendable {
         projectionAuthority: ProjectionAuthority = .engine,
         resolutionGate: CodemapResolutionGate? = nil,
         syntheticGraphArtifacts: Bool = false,
+        artifactBuilder: CodeMapArtifactBuilderClient? = nil,
+        artifactCoordinatorPolicy: CodeMapArtifactBuildCoordinatorPolicy = .default,
         bindingEnginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
         manifestStoreFaultAction: @escaping @Sendable (
             CodeMapRootManifestStoreFaultPoint
@@ -959,7 +961,7 @@ final class CodemapStoreFixture: @unchecked Sendable {
         let manifestReadCount = manifestReadCount
         let buildCount = buildCount
         let buildPriorities = buildPriorities
-        let defaultBuilder = CodeMapArtifactBuilderClient()
+        let defaultBuilder = artifactBuilder ?? CodeMapArtifactBuilderClient()
         let runtimeTracker = CodemapRuntimeTracker()
         let freshRuntimeFactory: @Sendable () throws -> CodeMapArtifactRuntime = {
             runtimeFactoryCount.increment()
@@ -985,6 +987,7 @@ final class CodemapStoreFixture: @unchecked Sendable {
                     }
                     return try await defaultBuilder.execute(input, ownerID, priority)
                 }),
+                coordinatorPolicy: artifactCoordinatorPolicy,
                 bindingIntegrationRegistry: registry,
                 bindingEngineFactory: { runtime in
                     engineFactoryCount.increment()

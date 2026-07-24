@@ -265,6 +265,97 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         await store.unloadRoot(id: loaded.id)
     }
 
+    func testSingleFileEditRetainsUnchangedCoverageWhileProjectionReschedules() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let paths = [
+            "Sources/First.swift",
+            "Sources/Second.swift",
+            "Sources/Third.swift"
+        ]
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: Dictionary(uniqueKeysWithValues: paths.map { path in
+                (
+                    path,
+                    SwiftFixtureSource.emptyStruct(
+                        URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                    )
+                )
+            })
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let rescheduleGate = CodemapRootSuspensionGate()
+        addTeardownBlock {
+            rescheduleGate.release()
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+
+        try await AsyncTestWait.waitUntil("initial Code Map coverage", timeout: 5) {
+            let status = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+            return status?.state == .ready && status?.processedCandidateCount == UInt64(paths.count)
+        }
+        let initialSnapshot = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        let initial = try XCTUnwrap(initialSnapshot)
+        XCTAssertEqual(initial.processedCandidateCount, UInt64(paths.count))
+        XCTAssertEqual(initial.totalCandidateCount, UInt64(paths.count))
+
+        await store.setCodemapProjectionPreloadStartHandlerForTesting { rootEpoch in
+            await rescheduleGate.enterAndWait(rootEpoch)
+        }
+        let statusStream = await store.codemapRootStatusUpdates()
+        let postEditStatusObserved = expectation(
+            description: "The first post-edit status preserves unchanged coverage"
+        )
+        let postEditStatusTask = Task { () -> WorkspaceCodemapRootStatusSnapshot? in
+            var observedInitialReady = false
+            for await update in statusStream {
+                guard let status = update.roots.first(where: { $0.rootEpoch.rootID == loaded.id }) else {
+                    continue
+                }
+                if status.state == .ready {
+                    observedInitialReady = true
+                    continue
+                }
+                if observedInitialReady {
+                    postEditStatusObserved.fulfill()
+                    return status
+                }
+            }
+            return nil
+        }
+        defer { postEditStatusTask.cancel() }
+
+        try Self.write(
+            "struct Second { let changed = true }\n",
+            to: root.appendingPathComponent("Sources/Second.swift")
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [.fileModified("Sources/Second.swift", nil)]
+        )
+        let enteredEpoch = await rescheduleGate.waitUntilEntered()
+        let blockedEpoch = try XCTUnwrap(enteredEpoch)
+        XCTAssertEqual(blockedEpoch.rootID, loaded.id)
+        await fulfillment(of: [postEditStatusObserved], timeout: 2)
+
+        let observedPostEditStatus = await postEditStatusTask.value
+        let postEdit = try XCTUnwrap(observedPostEditStatus)
+        XCTAssertNotEqual(postEdit.state, .ready)
+        XCTAssertEqual(postEdit.processedCandidateCount, UInt64(paths.count - 1))
+        XCTAssertEqual(postEdit.displayProcessedCandidateCount, UInt64(paths.count - 1))
+        XCTAssertEqual(postEdit.totalCandidateCount, UInt64(paths.count))
+
+        rescheduleGate.release()
+        try await AsyncTestWait.waitUntil("replacement Code Map coverage", timeout: 5) {
+            let status = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+            return status?.state == .ready && status?.processedCandidateCount == UInt64(paths.count)
+        }
+        await store.unloadRoot(id: loaded.id)
+    }
+
     func testUnloadCancelsAndDrainsBlockedProjectionPreloadLaunch() async throws {
         let fixture = try CodemapStoreFixture(name: #function)
         let startGate = CodemapRootSuspensionGate()
@@ -297,6 +388,191 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         await startGate.release()
         await unloadTask.value
         XCTAssertEqual(fixture.providerAccessCount.value, 0)
+    }
+
+    func testPauseCancelsBlockedPreloadRejectsDemandAndResumeReschedules() async throws {
+        let fixture = try CodemapStoreFixture(name: #function)
+        let startGate = EngineBuildGate()
+        addTeardownBlock {
+            startGate.release()
+            await fixture.shutdown()
+        }
+        let root = try fixture.makePlainRoot(files: [
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
+        ])
+        let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .enabled)
+        await store.setCodemapProjectionPreloadStartHandlerForTesting { _ in
+            await startGate.enterIgnoringCancellationUntilRelease()
+        }
+        let loaded = try await store.loadRoot(path: root.path)
+        let didEnter = await startGate.waitUntilEntered()
+        XCTAssertTrue(didEnter)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+
+        let pauseResult = await store.setCodemapGenerationSuspended(
+            rootID: loaded.id,
+            suspended: true
+        )
+        XCTAssertEqual(pauseResult, .changed)
+        let pausedStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertEqual(pausedStatus?.state, .paused)
+        let demand = await store.requestCodemapArtifact(forFileID: file.id)
+        guard case .unavailable(.cancelled) = demand else {
+            return XCTFail("Expected paused root demand to be cancelled.")
+        }
+        XCTAssertEqual(fixture.providerAccessCount.value, 0)
+
+        let resumeFinished = EngineLockedFlag()
+        let resumeTask = Task {
+            let result = await store.setCodemapGenerationSuspended(rootID: loaded.id, suspended: false)
+            resumeFinished.set(true)
+            return result
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+        XCTAssertFalse(resumeFinished.value)
+        let repauseResult = await store.setCodemapGenerationSuspended(
+            rootID: loaded.id,
+            suspended: true
+        )
+        XCTAssertEqual(repauseResult, .changed)
+        startGate.release()
+        let cancelledResumeResult = await resumeTask.value
+        XCTAssertEqual(cancelledResumeResult, .unchanged)
+        let eventsAfterCancelledResume = await store.codemapProjectionPreloadStoreEventsForTesting(rootID: loaded.id)
+        XCTAssertEqual(eventsAfterCancelledResume.count { $0.kind == .scheduled }, 1)
+
+        let resumeResult = await store.setCodemapGenerationSuspended(
+            rootID: loaded.id,
+            suspended: false
+        )
+        XCTAssertEqual(resumeResult, .changed)
+        let didReschedule = await waitForCodemapPreloadEventCount(
+            store: store,
+            rootID: loaded.id,
+            kind: .scheduled,
+            count: 2
+        )
+        XCTAssertTrue(didReschedule)
+        let resumedStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertNotEqual(resumedStatus?.state, .paused)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testRootStatusNormalizesSuspendedBusyAsGeneratingAndBudgetLimitedAsWaiting() async throws {
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .manual)
+        addTeardownBlock { await fixture.shutdown() }
+        let root = try fixture.makePlainRoot(files: [
+            "Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")
+        ])
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+
+        await store.setCodemapProjectionPhaseForTesting(
+            rootID: loaded.id,
+            phase: .suspendedBusy
+        )
+        let suspendedBusyStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertEqual(suspendedBusyStatus?.state, .generating)
+
+        await store.setCodemapProjectionPhaseForTesting(
+            rootID: loaded.id,
+            phase: .budgetLimited
+        )
+        let budgetLimitedStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertEqual(budgetLimitedStatus?.state, .waiting)
+
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testRootStatusStreamBridgesLocalCandidateResolutionUntilDurableCompletion() async throws {
+        let candidateCount = 5
+        let paths = (0 ..< candidateCount).map { "Sources/Progress\($0).swift" }
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: Dictionary(uniqueKeysWithValues: paths.map { path in
+                (
+                    path,
+                    SwiftFixtureSource.emptyStruct(
+                        URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                    )
+                )
+            })
+        )
+        let candidateGate = EngineMultiEntryGate()
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            artifactBuilder: CodeMapArtifactBuilderClient(build: { _, _, _ in
+                await candidateGate.enter()
+                return .readyNoSymbols
+            }),
+            artifactCoordinatorPolicy: CodeMapArtifactBuildCoordinatorPolicy(
+                maximumConcurrentBuildCount: candidateCount
+            ),
+            bindingEnginePolicy: WorkspaceCodemapBindingEnginePolicy(
+                maximumConcurrentMaterializationCountPerOwner: candidateCount
+            )
+        )
+        addTeardownBlock {
+            await candidateGate.releaseAll()
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let statusStream = await store.codemapRootStatusUpdates()
+        let intermediateObserved = expectation(
+            description: "Root status exposes locally resolved progress"
+        )
+        let completionObserved = expectation(description: "Root status reaches durable completion")
+        let observedStatusTask = Task { () -> [WorkspaceCodemapRootStatusSnapshot] in
+            var snapshots: [WorkspaceCodemapRootStatusSnapshot] = []
+            var fulfilledIntermediate = false
+            var fulfilledCompletion = false
+            for await update in statusStream {
+                guard let snapshot = update.roots.first(where: { $0.rootEpoch.rootID == loaded.id }) else {
+                    continue
+                }
+                snapshots.append(snapshot)
+                if snapshot.processedCandidateCount == 0,
+                   snapshot.locallyResolvedCandidateCountThroughRoot == 1,
+                   !fulfilledIntermediate
+                {
+                    fulfilledIntermediate = true
+                    intermediateObserved.fulfill()
+                }
+                if snapshot.state == .ready, !fulfilledCompletion {
+                    fulfilledCompletion = true
+                    completionObserved.fulfill()
+                    return snapshots
+                }
+            }
+            return snapshots
+        }
+        defer { observedStatusTask.cancel() }
+
+        let allCandidatesEntered = await candidateGate.waitUntilEntered(candidateCount)
+        XCTAssertTrue(allCandidatesEntered)
+        await candidateGate.releaseOne()
+        await fulfillment(of: [intermediateObserved], timeout: 2)
+
+        let currentStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        let intermediate = try XCTUnwrap(currentStatus)
+        XCTAssertEqual(intermediate.processedCandidateCount, 0)
+        XCTAssertEqual(intermediate.locallyResolvedCandidateCountThroughRoot, 1)
+        XCTAssertEqual(intermediate.displayProcessedCandidateCount, 1)
+        XCTAssertEqual(intermediate.totalCandidateCount, UInt64(candidateCount))
+
+        await candidateGate.releaseAll()
+        await fulfillment(of: [completionObserved], timeout: 5)
+        let observedStatuses = await observedStatusTask.value
+        let completed = try XCTUnwrap(observedStatuses.last)
+        XCTAssertEqual(completed.state, .ready)
+        XCTAssertEqual(completed.processedCandidateCount, UInt64(candidateCount))
+        XCTAssertNil(completed.locallyResolvedCandidateCountThroughRoot)
+        XCTAssertEqual(completed.displayProcessedCandidateCount, UInt64(candidateCount))
+        await store.unloadRoot(id: loaded.id)
     }
 
     func testFirstProjectionPageLazilyPublishesRecordsOnlyShardAfterRootReady() async throws {
@@ -338,6 +614,8 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
                 ))
         )
         XCTAssertEqual(page.entries.map(\.identity.fileID), [file.id])
+        let mappingStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertEqual(mappingStatus?.totalCandidateCount, 1)
         let after = await store.storeWorkDiagnosticsSnapshot()
         let shard = try XCTUnwrap(after.rootCatalogShards.roots.first { $0.rootID == loaded.id })
         XCTAssertEqual(after.rootCatalogShards.publishedShardCount, 1)

@@ -63,6 +63,94 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         }
     }
 
+    func testRowsMapCompactCodemapProgressAndUnavailableState() {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+        let snapshots = [
+            rootA.id: WorkspaceCodemapRootStatusSnapshot(
+                rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
+                state: .generating,
+                processedCandidateCount: 7,
+                totalCandidateCount: 12
+            ),
+            rootB.id: WorkspaceCodemapRootStatusSnapshot(
+                rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootB.id, rootLifetimeID: UUID()),
+                state: .unavailable,
+                processedCandidateCount: 0,
+                totalCandidateCount: nil
+            )
+        ]
+
+        let rows = AgentWorkspaceRootsSidebarStore.rows(
+            from: [rootA, rootB],
+            codemapStatusLookup: { snapshots[$0] }
+        )
+
+        XCTAssertEqual(rows[0].codemap.state, .mapping)
+        XCTAssertEqual(rows[0].codemap.percentageText, "58%")
+        XCTAssertTrue(rows[0].codemap.canToggle)
+        XCTAssertEqual(rows[1].codemap.state, .unavailable)
+        XCTAssertNil(rows[1].codemap.progressFraction)
+        XCTAssertFalse(rows[1].codemap.canToggle)
+
+        let localOnly = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
+            state: .generating,
+            processedCandidateCount: 0,
+            locallyResolvedCandidateCountThroughRoot: 17,
+            totalCandidateCount: 64
+        ))
+        XCTAssertEqual(localOnly.processedCandidateCount, 0)
+        XCTAssertEqual(localOnly.displayProcessedCandidateCount, 17)
+        XCTAssertEqual(localOnly.percentageText, "26%")
+        XCTAssertEqual(localOnly.progressFraction ?? 0, 17.0 / 64.0, accuracy: 0.000_001)
+        XCTAssertTrue(localOnly.tooltip.contains("processed for mapping"))
+
+        let belowOnePercent = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
+            state: .generating,
+            processedCandidateCount: 1,
+            totalCandidateCount: 1000
+        ))
+        XCTAssertEqual(belowOnePercent.progressFraction ?? 0, 0.001, accuracy: 0.000_001)
+        XCTAssertEqual(belowOnePercent.percentageText, "<1%")
+        XCTAssertEqual(belowOnePercent.statusText, "Mapping <1%")
+
+        let acceptedAndLocal = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
+            state: .generating,
+            processedCandidateCount: 12,
+            locallyResolvedCandidateCountThroughRoot: 17,
+            totalCandidateCount: 64
+        ))
+        XCTAssertEqual(acceptedAndLocal.displayProcessedCandidateCount, 17)
+
+        let locallyResolvedAll = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
+            state: .generating,
+            processedCandidateCount: 0,
+            locallyResolvedCandidateCountThroughRoot: 64,
+            totalCandidateCount: 64
+        ))
+        XCTAssertEqual(locallyResolvedAll.progressFraction, 0.99)
+        XCTAssertEqual(locallyResolvedAll.percentageText, "99%")
+
+        let nearlyComplete = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
+            state: .generating,
+            processedCandidateCount: 199,
+            totalCandidateCount: 200
+        ))
+        XCTAssertEqual(nearlyComplete.percentageText, "99%")
+        let complete = AgentWorkspaceCodemapPresentation.make(WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootA.id, rootLifetimeID: UUID()),
+            state: .ready,
+            processedCandidateCount: 200,
+            totalCandidateCount: 200
+        ))
+        XCTAssertEqual(complete.percentageText, "100%")
+    }
+
     func testRowsAttachGitContextByStandardizedRootPathWithoutChangingOrder() {
         let rootA = makeProjection(name: "A", path: "/tmp/A")
         let rootB = makeProjection(name: "B", path: "/tmp/B")
@@ -106,6 +194,77 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         await waitUntil { store.rootRows.map(\.id) == [rootB.id] }
 
         XCTAssertEqual(store.rootRows.map(\.id), [rootB.id])
+    }
+
+    func testCodemapStatusNotificationsCoalesceRootRowResnapshots() async {
+        let root = makeProjection(name: "A", path: "/tmp/A")
+        let manager = makeWorkspaceManager()
+        let codemapChanges = PassthroughSubject<Void, Never>()
+        var lookupCount = 0
+        let snapshot = WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: root.id, rootLifetimeID: UUID()),
+            state: .generating,
+            processedCandidateCount: 1,
+            totalCandidateCount: 2
+        )
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { [root] },
+            rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+            codemapStatusLookup: { _ in
+                lookupCount += 1
+                return snapshot
+            },
+            codemapStatusChanges: codemapChanges.eraseToAnyPublisher(),
+            workspaceManager: manager,
+            windowID: -1
+        )
+        XCTAssertEqual(lookupCount, 1)
+
+        codemapChanges.send(())
+        codemapChanges.send(())
+        await waitUntil { lookupCount >= 2 }
+
+        XCTAssertEqual(lookupCount, 2)
+        XCTAssertEqual(store.rootRows.first?.codemap.displayProcessedCandidateCount, 1)
+    }
+
+    func testCodemapToggleResnapshotsAuthoritativeStateBeforeClearingPending() async {
+        let root = makeProjection(name: "A", path: "/tmp/A")
+        let manager = makeWorkspaceManager()
+        var snapshot = WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: root.id, rootLifetimeID: UUID()),
+            state: .paused,
+            processedCandidateCount: 0,
+            totalCandidateCount: nil
+        )
+        var actions: [(UUID, Bool)] = []
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { [root] },
+            rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+            codemapStatusLookup: { _ in snapshot },
+            setCodemapSuspended: { rootID, suspended in
+                actions.append((rootID, suspended))
+                snapshot = WorkspaceCodemapRootStatusSnapshot(
+                    rootEpoch: snapshot.rootEpoch,
+                    state: suspended ? .paused : .generating,
+                    processedCandidateCount: 0,
+                    totalCandidateCount: nil
+                )
+            },
+            workspaceManager: manager,
+            windowID: -1
+        )
+
+        await store.toggleCodemapGeneration(rowID: root.id)
+        XCTAssertEqual(actions.map(\.0), [root.id])
+        XCTAssertEqual(actions.map(\.1), [false])
+        XCTAssertFalse(store.rootRows[0].codemap.isPaused)
+
+        await store.toggleCodemapGeneration(rowID: root.id)
+
+        XCTAssertEqual(actions.map(\.1), [false, true])
+        XCTAssertTrue(store.rootRows[0].codemap.isPaused)
+        XCTAssertTrue(store.codemapActionRootIDs.isEmpty)
     }
 
     // MARK: - Root context actions
@@ -213,6 +372,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(enriched.canMoveUp, base.canMoveUp)
         XCTAssertEqual(enriched.canMoveDown, base.canMoveDown)
         XCTAssertEqual(enriched.gitContext, base.gitContext)
+        XCTAssertEqual(enriched.codemap, base.codemap)
     }
 
     func testWithWorktreePreservesGitContext() {
