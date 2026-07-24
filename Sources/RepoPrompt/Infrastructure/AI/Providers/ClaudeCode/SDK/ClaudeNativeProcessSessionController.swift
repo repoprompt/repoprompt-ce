@@ -126,12 +126,16 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private struct LaunchEnvironmentSignature: Equatable {
+        private static let liveMutableEnvironmentKeys: Set<String> = ["ANTHROPIC_MODEL"]
+
         let environmentOverrides: [String: String]
         let removedEnvironmentKeys: Set<String>
         let backend: ClaudeCodeLaunchEnvironment.Backend
 
         init(_ launchEnvironment: ClaudeCodeLaunchEnvironment) {
-            environmentOverrides = launchEnvironment.environmentOverrides
+            environmentOverrides = launchEnvironment.environmentOverrides.filter {
+                !Self.liveMutableEnvironmentKeys.contains($0.key)
+            }
             removedEnvironmentKeys = launchEnvironment.removedEnvironmentKeys
             backend = launchEnvironment.backend
         }
@@ -579,7 +583,9 @@ final actor ClaudeNativeProcessSessionController {
         let launchEnvironment = resolvedFlags.launchEnvironment
         let environment = await resolvedLaunchEnvironment(
             resolverOverrides: launchEnvironment.environmentOverrides,
-            resolverRemovedKeys: launchEnvironment.removedEnvironmentKeys
+            resolverRemovedKeys: launchEnvironment.removedEnvironmentKeys,
+            effortLevel: resolvedFlags.environmentEffortLevel,
+            suppressesEffortSettings: launchEnvironment.suppressesEffortSettings
         )
         let resolvedCommand = CommandPathResolver.resolve(
             config.commandName,
@@ -592,7 +598,7 @@ final actor ClaudeNativeProcessSessionController {
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         let arguments = buildArguments(
             existingSessionID: existingSessionID,
-            model: nil
+            model: launchEnvironment.effectiveModel
         )
 
         let workingDirectory = resolvedWorkingDirectory()
@@ -645,7 +651,10 @@ final actor ClaudeNativeProcessSessionController {
 
         let request = Self.buildInitializeRequest(systemPromptOverride: systemPromptOverride)
 
-        let initializeResult = try await sendControlRequest(request: request)
+        let initializeResult = try await sendControlRequest(
+            request: request,
+            timeoutSeconds: config.sdkConnectTimeoutSeconds
+        )
         if let returnedSessionID = (initializeResult["session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !returnedSessionID.isEmpty
         {
@@ -672,7 +681,7 @@ final actor ClaudeNativeProcessSessionController {
     private func resolveLaunchFlagSettings(
         model: String?,
         effortLevel suppliedEffortLevel: ClaudeCodeEffortLevel?
-    ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?) {
+    ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?, environmentEffortLevel: ClaudeCodeEffortLevel?) {
         let modelSpecifier = model.map { ClaudeModelSpecifier(raw: $0) }
         let requestedModel = modelSpecifier != nil
             ? model
@@ -682,7 +691,8 @@ final actor ClaudeNativeProcessSessionController {
             ?? config.effortLevel
         let launchEnvironment = try await environmentResolver.resolve(
             variant: config.runtimeVariant,
-            requestedModel: requestedModel
+            requestedModel: requestedModel,
+            requestedEffort: effectiveEffortLevel?.rawValue
         )
         let requestEffortLevel = Self.shouldSuppressEffortSettings(for: launchEnvironment)
             ? nil
@@ -691,7 +701,7 @@ final actor ClaudeNativeProcessSessionController {
             model: launchEnvironment.effectiveModel,
             effortLevel: requestEffortLevel
         )
-        return (launchEnvironment, request)
+        return (launchEnvironment, request, requestEffortLevel)
     }
 
     private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
@@ -1291,6 +1301,12 @@ final actor ClaudeNativeProcessSessionController {
             publishRuntimeInitIfChanged()
         }
 
+        if let retryProgress = Self.parseAPIRetryProgressResult(from: payload) {
+            let logPayload = streamResultLogPayload(retryProgress)
+            writeRawEventLogRecord(kind: "translator.streamResult", payload: logPayload)
+            emit(.stream(retryProgress))
+        }
+
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
             return
         }
@@ -1487,6 +1503,66 @@ final actor ClaudeNativeProcessSessionController {
         return ClaudeAbortArtifactFilter.shouldSuppressUserFacingError(text)
     }
 
+    /// Converts Claude Code `system/api_retry` events into status text so provider throttling
+    /// does not leave Agent Mode stuck on an opaque generic "Thinking…" state.
+    private static func parseAPIRetryProgressResult(from payload: [String: Any]) -> AIStreamResult? {
+        guard (payload["type"] as? String) == "system",
+              ((payload["subtype"] as? String)?.lowercased() == "api_retry")
+        else {
+            return nil
+        }
+
+        func trimmedString(_ key: String) -> String? {
+            guard let value = payload[key] else { return nil }
+            let text: String = if let stringValue = value as? String {
+                stringValue
+            } else {
+                String(describing: value)
+            }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        func intValue(_ key: String) -> Int? {
+            if let value = payload[key] as? Int { return value }
+            if let value = payload[key] as? Double { return Int(value) }
+            if let value = payload[key] as? String { return Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            return nil
+        }
+
+        let attemptText: String? = if let attempt = intValue("attempt") {
+            if let maxRetries = intValue("max_retries"), maxRetries > 0 {
+                "\(attempt)/\(maxRetries)"
+            } else {
+                "\(attempt)"
+            }
+        } else {
+            nil
+        }
+
+        var detailParts: [String] = []
+        if let status = trimmedString("error_status") {
+            detailParts.append(status)
+        }
+        if let error = trimmedString("error") {
+            detailParts.append(error)
+        }
+
+        var message = "Provider API retry"
+        if let attemptText {
+            message += " \(attemptText)"
+        }
+        if !detailParts.isEmpty {
+            message += ": " + detailParts.joined(separator: " ")
+        }
+        if let retryDelayMS = intValue("retry_delay_ms"), retryDelayMS > 0 {
+            let retryDelaySeconds = max(1, Int((Double(retryDelayMS) / 1000.0).rounded(.up)))
+            message += ". Retrying in \(retryDelaySeconds)s."
+        }
+
+        return AIStreamResult(type: "task_progress", text: message)
+    }
+
     /// Extracts tools and MCP server statuses from a `system/init` stream payload.
     /// Returns `nil` if the payload is not a `system/init` event.
     private static func parseSystemInitFields(from payload: [String: Any]) -> (tools: [String], mcpStatuses: [String: String])? {
@@ -1653,6 +1729,11 @@ final actor ClaudeNativeProcessSessionController {
             isRawEventFileLoggingEnabled()
         }
 
+        /// Test seam for `system/api_retry` → `task_progress` mapping.
+        static func test_parseAPIRetryProgressResult(from payload: [String: Any]) -> AIStreamResult? {
+            parseAPIRetryProgressResult(from: payload)
+        }
+
         func test_determineTurnStatus(payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
             determineTurnStatus(from: payload, stopReasonHint: stopReasonHint)
         }
@@ -1664,12 +1745,16 @@ final actor ClaudeNativeProcessSessionController {
         func test_effectiveLaunchEnvironment(
             base: [String: String],
             resolverOverrides: [String: String] = [:],
-            resolverRemovedKeys: Set<String> = []
+            resolverRemovedKeys: Set<String> = [],
+            effortLevel: ClaudeCodeEffortLevel? = nil,
+            suppressesEffortSettings: Bool = false
         ) -> [String: String] {
             effectiveLaunchEnvironment(
                 base: base,
                 resolverOverrides: resolverOverrides,
-                resolverRemovedKeys: resolverRemovedKeys
+                resolverRemovedKeys: resolverRemovedKeys,
+                effortLevel: effortLevel,
+                suppressesEffortSettings: suppressesEffortSettings
             )
         }
 
@@ -1981,6 +2066,15 @@ final actor ClaudeNativeProcessSessionController {
 
         args.append(contentsOf: ["--permission-prompt-tool", "stdio"])
 
+        // Claude-compatible backends must not inherit ~/.claude/settings.json env such as
+        // ANTHROPIC_BASE_URL or ANTHROPIC_MODEL from another provider. `--bare` alone still
+        // permits user settings env; restrict settings sources while keeping explicit project/local
+        // configuration and RepoPrompt's --mcp-config available.
+        if config.runtimeVariant != .standard {
+            args.append("--bare")
+            args.append(contentsOf: ["--setting-sources", "project,local"])
+        }
+
         // GLM/z.ai sheds requests carrying the Agent SDK identity preamble under load (see #295).
         // Any non-empty --append-system-prompt flips the CLI onto the never-shed "Claude Code" preamble.
         if config.runtimeVariant == .glm {
@@ -1991,6 +2085,10 @@ final actor ClaudeNativeProcessSessionController {
             args.append(contentsOf: ["--resume", existingSessionID])
             // RepoPrompt instructions are delivered in provider-bound user messages,
             // so CLI prompt flags remain unused on both fresh starts and resumes.
+        }
+
+        if let model = Self.normalizedFlagSettingsModel(model) {
+            args.append(contentsOf: ["--model", model])
         }
 
         if config.permissionMode.caseInsensitiveCompare("bypassPermissions") == .orderedSame {
@@ -2211,7 +2309,9 @@ final actor ClaudeNativeProcessSessionController {
 
     private func resolvedLaunchEnvironment(
         resolverOverrides: [String: String],
-        resolverRemovedKeys: Set<String>
+        resolverRemovedKeys: Set<String>,
+        effortLevel: ClaudeCodeEffortLevel?,
+        suppressesEffortSettings: Bool
     ) async -> [String: String] {
         let result = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(
@@ -2223,14 +2323,18 @@ final actor ClaudeNativeProcessSessionController {
         return effectiveLaunchEnvironment(
             base: result.environment,
             resolverOverrides: resolverOverrides,
-            resolverRemovedKeys: resolverRemovedKeys
+            resolverRemovedKeys: resolverRemovedKeys,
+            effortLevel: effortLevel,
+            suppressesEffortSettings: suppressesEffortSettings
         )
     }
 
     private func effectiveLaunchEnvironment(
         base: [String: String],
         resolverOverrides: [String: String],
-        resolverRemovedKeys: Set<String> = []
+        resolverRemovedKeys: Set<String> = [],
+        effortLevel: ClaudeCodeEffortLevel? = nil,
+        suppressesEffortSettings: Bool = false
     ) -> [String: String] {
         var env = base
         if env["CLAUDE_CODE_ENTRYPOINT"].map({ !$0.isEmpty }) != true {
@@ -2247,6 +2351,13 @@ final actor ClaudeNativeProcessSessionController {
         }
         for (key, value) in resolverOverrides {
             env[key] = value
+        }
+        if suppressesEffortSettings {
+            env.removeValue(forKey: "CLAUDE_CODE_EFFORT_LEVEL")
+        } else if let effortLevel {
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = effortLevel.envValue
+        } else {
+            env.removeValue(forKey: "CLAUDE_CODE_EFFORT_LEVEL")
         }
         return ProcessEnvironmentSanitizer.sanitizedForChildLaunch(
             env,

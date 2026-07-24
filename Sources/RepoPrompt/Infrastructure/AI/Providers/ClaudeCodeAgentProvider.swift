@@ -78,7 +78,8 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             }
             let launchEnvironment = try await environmentResolver.resolve(
                 variant: config.runtimeVariant,
-                requestedModel: config.modelString
+                requestedModel: config.modelString,
+                requestedEffort: config.effortLevel?.rawValue
             )
             return HeadlessAgentContext(
                 runID: actualRunID,

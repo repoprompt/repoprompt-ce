@@ -246,7 +246,8 @@ final class ClaudeCodeProvider: AIProvider {
             let resolver = ClaudeCodeLaunchEnvironmentResolver()
             let launchEnvironment = try await resolver.resolve(
                 variant: Self.runtimeVariant(for: descriptor.backendID),
-                requestedModel: descriptor.requestedModelRaw
+                requestedModel: descriptor.requestedModelRaw,
+                requestedEffort: nil
             )
             options.model = launchEnvironment.effectiveModel
             options.environmentOverrides = launchEnvironment.environmentOverrides
@@ -424,7 +425,8 @@ final class ClaudeCodeProvider: AIProvider {
         let resolver = ClaudeCodeLaunchEnvironmentResolver()
         let launchEnvironment = try await resolver.resolve(
             variant: Self.runtimeVariant(for: backendID),
-            requestedModel: Self.compatibleBackendTestRequestedModel(for: backendID)
+            requestedModel: Self.compatibleBackendTestRequestedModel(for: backendID),
+            requestedEffort: nil
         )
         let emptyConfigLease = try await configService.prepareEmptyLaunchConfig()
         defer { emptyConfigLease.release() }
