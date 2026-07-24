@@ -161,7 +161,13 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
                 await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
             }
 
-            // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
+            // 3) Flush already-captured workspace saves before window teardown can release them.
+            let workspaceSavesFlushed = await WindowStatesManager.shared.flushAllWorkspaceSavesBeforeTermination()
+            if !workspaceSavesFlushed {
+                print("💾 App termination exhausted the bounded workspace-save retry.")
+            }
+
+            // 4) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
             // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()

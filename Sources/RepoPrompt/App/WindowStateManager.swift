@@ -911,6 +911,20 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - MCP Server Coordination
 
+    /// Establishes a durability barrier for saves already captured by each window.
+    /// Windows are flushed serially so two views of the same workspace do not prepare
+    /// competing termination snapshots concurrently.
+    func flushAllWorkspaceSavesBeforeTermination() async -> Bool {
+        var allSucceeded = true
+        for window in allWindows {
+            let outcome = await window.workspaceManager.flushPendingWorkspaceSavesBeforeClose()
+            if outcome == .failed || outcome == .cancelled {
+                allSucceeded = false
+            }
+        }
+        return allSucceeded
+    }
+
     /// Stops MCP servers in **all** windows (unconditionally).
     /// During teardown, "running" state can be stale; we just want tools off.
     func stopAllServers() async {

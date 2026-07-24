@@ -52,6 +52,53 @@ struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, Cus
     static let directUnknown = WorkspaceSaveSource("directUnknown")
 }
 
+enum WorkspaceSaveUrgency: Equatable {
+    case deferred
+    case flushBeforeBoundary
+}
+
+enum WorkspaceSaveCompletion: Equatable {
+    case committed(version: Int)
+    case superseded(version: Int)
+    case skippedIneligible
+    case failed
+    case cancelled
+}
+
+#if DEBUG
+    struct WorkspaceSavePerformanceSummary: Equatable {
+        let source: WorkspaceSaveSource
+        let payloadByteCount: Int
+        let composeTabCount: Int
+        let selectedPathCount: Int
+        let sliceFileCount: Int
+        let sliceRangeCount: Int
+        let preparationDurationMS: Double
+        let diskDecodeDurationMS: Double
+        let encodeDurationMS: Double
+        let staleVersionRetryCount: Int
+        let coalescedRequestCount: Int
+        let atomicWriteCount: Int
+
+        var traceFields: [String: String] {
+            [
+                "source": source.rawValue,
+                "payloadByteCount": "\(payloadByteCount)",
+                "composeTabCount": "\(composeTabCount)",
+                "selectedPathCount": "\(selectedPathCount)",
+                "sliceFileCount": "\(sliceFileCount)",
+                "sliceRangeCount": "\(sliceRangeCount)",
+                "preparationDurationMS": String(format: "%.3f", preparationDurationMS),
+                "diskDecodeDurationMS": String(format: "%.3f", diskDecodeDurationMS),
+                "encodeDurationMS": String(format: "%.3f", encodeDurationMS),
+                "staleVersionRetryCount": "\(staleVersionRetryCount)",
+                "coalescedRequestCount": "\(coalescedRequestCount)",
+                "atomicWriteCount": "\(atomicWriteCount)"
+            ]
+        }
+    }
+#endif
+
 struct WorkspaceSaveOwner: Equatable, Hashable {
     let windowID: Int?
     let managerID: UUID?
@@ -189,7 +236,6 @@ enum WorkspaceSaveTracer {
                 "windowID": metadata.owner.windowID.map(String.init) ?? "<none>",
                 "managerID": metadata.owner.managerID.map { WorkspaceRestorePerfLog.shortID($0) } ?? "<none>",
                 "workspaceID": WorkspaceRestorePerfLog.shortID(metadata.workspaceID),
-                "workspaceName": metadata.workspaceName,
                 "workspaceDateModified": String(format: "%.6f", metadata.workspaceDateModified.timeIntervalSince1970),
                 "activeTabID": metadata.activeTabID.map { WorkspaceRestorePerfLog.shortID($0) } ?? "<none>",
                 "activeSelectionRevision": "\(metadata.activeSelectionRevision)",

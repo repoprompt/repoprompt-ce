@@ -1551,6 +1551,10 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        let workspaceSaveOutcome = await workspaceManager.flushPendingWorkspaceSavesBeforeClose()
+        if workspaceSaveOutcome == .failed || workspaceSaveOutcome == .cancelled {
+            print("💾 Window close could not flush all workspace saves: \(workspaceSaveOutcome)")
+        }
         await promptManager.gitViewModel.shutdownForWindowClose()
 
         let isAppTermination = WindowStatesManager.shared.isTerminating
