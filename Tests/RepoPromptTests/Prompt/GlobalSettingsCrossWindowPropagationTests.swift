@@ -75,6 +75,47 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         XCTAssertEqual(persisted.modelRaw, AgentModel.gpt55CodexLow.rawValue)
     }
 
+    func testGlobalContextBuilderSelectionUpdatesPopoverProjectionAndLaunchAuthority() async throws {
+        let previousCodexConnected = UserDefaults.standard.object(forKey: "CodexCLIConnected")
+        defer {
+            if let previousCodexConnected {
+                UserDefaults.standard.set(previousCodexConnected, forKey: "CodexCLIConnected")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "CodexCLIConnected")
+            }
+        }
+        UserDefaults.standard.set(true, forKey: "CodexCLIConnected")
+
+        let store = try makeIsolatedStore()
+        let prompt = makePromptViewModel(windowID: 1, store: store)
+        let profile = AgentModelsSettingsProfile(
+            contextBuilderAgentRaw: AgentProviderKind.codexExec.rawValue,
+            contextBuilderModelsByAgent: [
+                AgentProviderKind.codexExec.rawValue: AgentModel.gpt55CodexLow.rawValue
+            ]
+        )
+
+        store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .userInitiated)
+        await drainMainQueue()
+
+        XCTAssertEqual(prompt.contextBuilderAgent, .codexExec)
+        XCTAssertEqual(prompt.contextBuilderAgentModelRaw, AgentModel.gpt55CodexLow.rawValue)
+
+        let persisted = store.persistedGlobalContextBuilderAgentSelection()
+        let resolved = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: persisted.agentRaw,
+            persistedModelRaw: persisted.modelRaw,
+            availability: .init(
+                claudeCodeAvailable: true,
+                codexAvailable: true,
+                openCodeAvailable: false,
+                cursorAvailable: false
+            )
+        ))
+        XCTAssertEqual(resolved.agent, prompt.contextBuilderAgent)
+        XCTAssertEqual(resolved.modelRaw, prompt.contextBuilderAgentModelRaw)
+    }
+
     // NOTE: Context Builder agent propagation is exercised compositionally — the store-side
     // publish is covered by SettingsJSONOnlyPersistenceTests.testGlobalDefaultsSettersPublishObjectWillChange
     // and the VM-side subscription + re-seed is covered by testOracleModelChangePropagatesAcrossWindows

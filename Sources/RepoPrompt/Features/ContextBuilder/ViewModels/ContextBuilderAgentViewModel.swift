@@ -537,7 +537,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 selectedModel = AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel
                 isRestoringState = false
             }
-            updateDynamicModelPolling()
+            updateDynamicModelPolling(allowUnvalidatedDynamicPolling: true)
             persistAgentModelToEffectiveProfile()
             if let session = activeSession {
                 persistSessionConfig(session)
@@ -1011,7 +1011,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard let self else { return }
             await handleComposeTabsWillClose(tabIDs)
         }
-        updateDynamicModelPolling(startCursorPolling: false)
+        updateDynamicModelPolling(
+            startCursorPolling: false,
+            allowUnvalidatedDynamicPolling: false
+        )
     }
 
     func prepareForWindowClose() {
@@ -1048,18 +1051,25 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func resolvedPersistedContextBuilderSelection(workspaceID: UUID? = nil) -> AgentModelCatalog.NormalizedAgentSelection? {
-        guard let apiSettingsViewModel = promptManager.apiSettingsViewModel,
-              apiSettingsViewModel.isContextBuilderProviderValidationComplete
-        else {
+        guard let apiSettingsViewModel = promptManager.apiSettingsViewModel else {
             return nil
         }
         let profile = settingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID ?? currentWorkspaceID)
         let agentRaw = profile.contextBuilderAgentRaw
         let modelRaw = agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
+        let availability = apiSettingsViewModel.contextBuilderRestorationAvailabilityContext
+        guard apiSettingsViewModel.isContextBuilderProviderValidationComplete else {
+            return AgentModelCatalog.normalizePersistedSelection(
+                agentRaw: agentRaw,
+                modelRaw: modelRaw,
+                availability: availability,
+                codexDynamicModels: codexDynamicModels
+            )
+        }
         return AutoRecommendationEngine.resolveContextBuilderSelection(
             persistedAgentRaw: agentRaw,
             persistedModelRaw: modelRaw,
-            availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
+            availability: availability,
             enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
     }
@@ -1091,21 +1101,34 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func handleAgentProviderAvailabilityChanged() {
         refreshAvailableAgents()
         guard let normalized = resolvedPersistedContextBuilderSelection() else { return }
-        guard normalized.agent != selectedAgent || normalized.modelRaw.caseInsensitiveCompare(selectedModelRaw) != .orderedSame else {
-            return
+        let selectionChanged = normalized.agent != selectedAgent ||
+            normalized.modelRaw.caseInsensitiveCompare(selectedModelRaw) != .orderedSame
+        if selectionChanged {
+            isRestoringState = true
+            selectedAgent = normalized.agent
+            selectedModelRaw = normalized.modelRaw
+            selectedModel = AgentModel.resolvedModel(forRaw: normalized.modelRaw, agentKind: normalized.agent) ?? .defaultModel
+            isRestoringState = false
         }
-        isRestoringState = true
-        selectedAgent = normalized.agent
-        selectedModelRaw = normalized.modelRaw
-        selectedModel = AgentModel.resolvedModel(forRaw: normalized.modelRaw, agentKind: normalized.agent) ?? .defaultModel
-        isRestoringState = false
-        updateDynamicModelPolling()
+        updateDynamicModelPolling(
+            startCursorPolling: false,
+            allowUnvalidatedDynamicPolling: false
+        )
     }
 
-    private func updateDynamicModelPolling(startCursorPolling: Bool = true) {
-        updateCodexModelPolling()
-        updateOpenCodeModelPolling()
-        updateCursorModelPolling(startPolling: startCursorPolling)
+    private func updateDynamicModelPolling(
+        startCursorPolling: Bool = true,
+        allowUnvalidatedDynamicPolling: Bool = false
+    ) {
+        if allowUnvalidatedDynamicPolling || promptManager.apiSettingsViewModel?.isContextBuilderProviderValidationComplete == true {
+            updateCodexModelPolling()
+            updateOpenCodeModelPolling()
+            updateCursorModelPolling(startPolling: startCursorPolling)
+        } else {
+            stopCodexModelsSubscription()
+            stopOpenCodeModelsSubscription()
+            stopCursorModelsSubscription()
+        }
     }
 
     private func updateCodexModelPolling() {
@@ -1144,6 +1167,26 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         var test_hasCodexModelsSubscriptionTask: Bool {
             codexModelsSubscriptionTask != nil
+        }
+
+        var test_hasCursorModelsSubscriptionTask: Bool {
+            cursorModelsSubscriptionTask != nil
+        }
+
+        var test_hasOpenCodeModelsSubscriptionTask: Bool {
+            openCodeModelsSubscriptionTask != nil
+        }
+
+        func test_applyEffectiveAgentModelForLifecycle() {
+            applyEffectiveAgentModel()
+        }
+
+        func test_handleAgentProviderAvailabilityChangedForLifecycle() {
+            handleAgentProviderAvailabilityChanged()
+        }
+
+        func test_updateDynamicModelPollingForLifecycle() {
+            updateDynamicModelPolling()
         }
 
         func test_cancelAndDrainCodexModelsSubscription() async {
@@ -1360,7 +1403,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         isRestoringState = false
-        updateDynamicModelPolling(startCursorPolling: false)
+        updateDynamicModelPolling(
+            startCursorPolling: false,
+            allowUnvalidatedDynamicPolling: false
+        )
     }
 
     private func applySessionToBindings(_ session: TabSession) {
@@ -1389,7 +1435,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         contextBuilderInstructions = session.contextBuilderInstructions
         selectedContextBuilderPromptIDs = session.selectedContextBuilderPromptIDs
         isRestoringState = false
-        updateDynamicModelPolling(startCursorPolling: false)
+        updateDynamicModelPolling(
+            startCursorPolling: false,
+            allowUnvalidatedDynamicPolling: false
+        )
     }
 
     private func clearBindings() {
@@ -1429,7 +1478,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         questionTimeoutSeconds = ContextBuilderDefaults.questionTimeoutSeconds
         planTokenBudget = ContextBuilderDefaults.planTokenBudget
         isRestoringState = false
-        updateDynamicModelPolling(startCursorPolling: false)
+        updateDynamicModelPolling(
+            startCursorPolling: false,
+            allowUnvalidatedDynamicPolling: false
+        )
     }
 
     private func updateRuntimeBindings(from session: TabSession) {
@@ -1456,7 +1508,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // Per-tab selected follow-up type
         selectedFollowUpType = session.selectedFollowUpType
         isRestoringState = false
-        updateDynamicModelPolling()
+        updateDynamicModelPolling(allowUnvalidatedDynamicPolling: false)
     }
 
     /// Lightweight binding update for streaming hot path - only updates agentLog and toolCallCount.
@@ -1593,7 +1645,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         selectedModel = AgentModel.resolvedModel(forRaw: normalized.modelRaw, agentKind: normalized.agent) ?? .defaultModel
         isRestoringState = false
         refreshAvailableAgents()
-        updateDynamicModelPolling(startCursorPolling: false)
+        updateDynamicModelPolling(
+            startCursorPolling: false,
+            allowUnvalidatedDynamicPolling: false
+        )
     }
 
     /// Load workspace-scoped discovery defaults (token budget, enhancement mode, clarifying questions, plan budget).
