@@ -26,7 +26,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             codemapGitEligibilityProbe: .init { _ in
                 .transientUnavailable(.repositoryChanging)
             },
-            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+            codemapGraphIndexBuildLaunchPolicyForTesting: .disabled
         )
         _ = try await store.loadRoot(path: root.path)
         let prompt = makePrompt(store: store, windowID: -9801)
@@ -185,7 +185,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             codemapGitEligibilityProbe: .init { _ in
                 .transientUnavailable(.repositoryChanging)
             },
-            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+            codemapGraphIndexBuildLaunchPolicyForTesting: .disabled
         )
         let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
         let worktreeRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
@@ -269,7 +269,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
                 codemapGitEligibilityProbe: .init { _ in
                     .transientUnavailable(.repositoryChanging)
                 },
-                codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+                codemapGraphIndexBuildLaunchPolicyForTesting: .disabled
             )
         )
         WindowStatesManager.shared.registerWindowState(window)

@@ -4,19 +4,19 @@ import XCTest
 
 final class CodemapFullLoadDebugHarnessTests: XCTestCase {
     func testAggregateReadyRequiresEveryRootTerminal() {
-        let proof = makeRoot(state: .proofComplete)
+        let readyRoot = makeRoot(state: .ready)
         let ineligible = makeRoot(state: .terminalIneligible)
 
         XCTAssertEqual(
-            CodemapFullLoadDebugSupport.aggregateState(for: [proof, ineligible]),
+            CodemapFullLoadDebugSupport.aggregateState(for: [readyRoot, ineligible]),
             .ready
         )
         XCTAssertEqual(
-            CodemapFullLoadDebugSupport.aggregateState(for: [proof, makeRoot(state: .pending)]),
+            CodemapFullLoadDebugSupport.aggregateState(for: [readyRoot, makeRoot(state: .pending)]),
             .pending
         )
         XCTAssertEqual(
-            CodemapFullLoadDebugSupport.aggregateState(for: [proof, makeRoot(state: .failed)]),
+            CodemapFullLoadDebugSupport.aggregateState(for: [readyRoot, makeRoot(state: .failed)]),
             .failed
         )
         XCTAssertEqual(
@@ -102,7 +102,7 @@ final class CodemapFullLoadDebugHarnessTests: XCTestCase {
 
     func testPrivacySafePayloadOmitsPathsAndSourceText() throws {
         let payload = CodemapFullLoadDebugSupport.privacySafeRootPayload(
-            makeRoot(state: .proofComplete)
+            makeRoot(state: .ready)
         )
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -127,12 +127,12 @@ final class CodemapFullLoadDebugHarnessTests: XCTestCase {
             state: state,
             reason: nil,
             launchPhase: "handed_off",
-            projectionPhase: state == .proofComplete ? "complete" : nil,
-            supportedCandidateCount: state == .proofComplete ? 1 : nil,
-            processedCandidateCount: state == .proofComplete ? 1 : nil,
-            terminalCount: state == .proofComplete ? 1 : nil,
-            lastSegmentSequence: state == .proofComplete ? 0 : nil,
-            coverageCompletedUptimeNanoseconds: state == .proofComplete ? 100 : nil,
+            graphIndexPhase: state == .ready ? "complete" : nil,
+            supportedCandidateCount: state == .ready ? 1 : nil,
+            processedCandidateCount: state == .ready ? 1 : nil,
+            terminalCount: state == .ready ? 1 : nil,
+            lastGraphChangeSequence: state == .ready ? 0 : nil,
+            readyUptimeNanoseconds: state == .ready ? 100 : nil,
             metrics: [:],
             resources: [:],
             queueWaitMilliseconds: [],

@@ -92,6 +92,25 @@ actor WorkspaceCodemapLiveOverlay {
         var liveFileIDByRelativePath: [String: UUID]
         var shadows: [ShadowKey: Shadow]
         var contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+
+        // Root-local graph authority. Slots retain lightweight contributions independently
+        // of artifact leases; the changed set is a wakeup-coalescing pull surface, not a journal.
+        var graphSlotsByFileID: [UUID: WorkspaceCodemapGraphSlot]
+        var graphFileIDByRelativePath: [String: UUID]
+        var graphIndexSlotsByFileID: [UUID: WorkspaceCodemapGraphSlot]
+        var retainedGraphSlotsByFileID: [UUID: WorkspaceCodemapGraphSlot]
+        var manifestGraphSlotsByRelativePath: [String: WorkspaceCodemapGraphSlot]
+        var graphCatalogToken: WorkspaceCodemapGraphIndexCatalogToken?
+        var graphEnumerationFinished: Bool
+        var graphReconciliationPriorIndexSlotsByFileID: [UUID: WorkspaceCodemapGraphSlot]?
+        var graphReconciliationSeenIndexFileIDs: Set<UUID>
+        var graphReconciliationSuppressedFileIDs: Set<UUID>
+        var graphCoverage: WorkspaceCodemapGraphCatalogCoverage
+        var changedFileIDsSinceFloor: Set<UUID>
+        var graphRemovalsByFileID: [UUID: WorkspaceCodemapGraphRemoval]
+        var floorGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+        var graphNotificationContinuations: [UUID: AsyncStream<WorkspaceCodemapGraphChangeNotification>.Continuation]
+        var graphRevocationReason: WorkspaceCodemapGraphRevocationReason?
     }
 
     private enum AccessLocation {
@@ -118,6 +137,7 @@ actor WorkspaceCodemapLiveOverlay {
     }
 
     private let policy: WorkspaceCodemapLiveOverlayPolicy
+    private let graphPolicy: WorkspaceCodemapGraphPolicy
     private let manifestRecordEqualityTraversal: @Sendable () -> Void
     private let manifestAdoptionCommitHook: @Sendable () async -> Void
     private let initialManifestInvalidationGeneration: UInt64
@@ -133,6 +153,7 @@ actor WorkspaceCodemapLiveOverlay {
 
     init(
         policy: WorkspaceCodemapLiveOverlayPolicy = .default,
+        graphPolicy: WorkspaceCodemapGraphPolicy = .initial,
         initialAccessOrdinal: UInt64 = 1,
         initialCounterValue: UInt64 = 0,
         initialManifestInvalidationGeneration: UInt64 = 1,
@@ -141,6 +162,7 @@ actor WorkspaceCodemapLiveOverlay {
         manifestAdoptionCommitHook: @escaping @Sendable () async -> Void = {}
     ) {
         self.policy = policy
+        self.graphPolicy = graphPolicy
         self.manifestRecordEqualityTraversal = manifestRecordEqualityTraversal
         self.manifestAdoptionCommitHook = manifestAdoptionCommitHook
         self.initialManifestInvalidationGeneration = initialManifestInvalidationGeneration
@@ -177,6 +199,23 @@ actor WorkspaceCodemapLiveOverlay {
             return .busy(.rootLimit)
         }
 
+        let initialGeneration = WorkspaceCodemapSelectionGraphContributionGeneration(
+            rawValue: initialContributionGeneration
+        )
+        guard case let .success(initialCoverage) = WorkspaceCodemapGraphCatalogCoverage.validated(
+            rootEpoch: capability.rootEpoch,
+            catalogWatermark: nil,
+            enumerationState: .notStarted,
+            supportedCount: 0,
+            classifiedCount: 0,
+            pendingCount: 0,
+            contributedCount: 0,
+            emptyCount: 0,
+            terminalArtifactCount: 0,
+            terminalExcludedCount: 0
+        ) else {
+            return .rejected(.rootEpochMismatch)
+        }
         roots[capability.rootEpoch] = RootState(
             registration: registration,
             authorityIsCurrent: true,
@@ -186,16 +225,34 @@ actor WorkspaceCodemapLiveOverlay {
             liveByFileID: [:],
             liveFileIDByRelativePath: [:],
             shadows: [:],
-            contributionGeneration: .init(rawValue: initialContributionGeneration)
+            contributionGeneration: initialGeneration,
+            graphSlotsByFileID: [:],
+            graphFileIDByRelativePath: [:],
+            graphIndexSlotsByFileID: [:],
+            retainedGraphSlotsByFileID: [:],
+            manifestGraphSlotsByRelativePath: [:],
+            graphCatalogToken: nil,
+            graphEnumerationFinished: false,
+            graphReconciliationPriorIndexSlotsByFileID: nil,
+            graphReconciliationSeenIndexFileIDs: [],
+            graphReconciliationSuppressedFileIDs: [],
+            graphCoverage: initialCoverage,
+            changedFileIDsSinceFloor: [],
+            graphRemovalsByFileID: [:],
+            floorGeneration: initialGeneration,
+            graphNotificationContinuations: [:],
+            graphRevocationReason: nil
         )
         return .registered
     }
 
     @discardableResult
     func unregister(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
-        let removed = roots.removeValue(forKey: rootEpoch) != nil
-        if removed { removeAdmissionReservations(rootEpoch: rootEpoch) }
-        return removed
+        guard var root = roots.removeValue(forKey: rootEpoch) else { return false }
+        root.graphRevocationReason = .rootUnloaded
+        finishGraphNotifications(&root, reason: .rootUnloaded)
+        removeAdmissionReservations(rootEpoch: rootEpoch)
+        return true
     }
 
     func beginManifestAdoption(
@@ -427,6 +484,7 @@ actor WorkspaceCodemapLiveOverlay {
         }
         root.pipelines[ticket.pipelineIdentity] = pipeline
         root.shadows = root.shadows.filter { $0.key.pipelineIdentity != ticket.pipelineIdentity }
+        refreshManifestGraphSlots(&root, pipelineIdentity: ticket.pipelineIdentity, rootEpoch: rootEpoch)
         advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         await manifestAdoptionCommitHook()
@@ -462,6 +520,7 @@ actor WorkspaceCodemapLiveOverlay {
             rootEpoch: ticket.rootEpoch
         ) else { return false }
         root.pipelines[ticket.pipelineIdentity] = pipeline
+        refreshManifestGraphSlots(&root, pipelineIdentity: ticket.pipelineIdentity, rootEpoch: ticket.rootEpoch)
         if root.authorityIsCurrent {
             advanceContributionGeneration(&root, rootEpoch: ticket.rootEpoch)
         }
@@ -745,10 +804,14 @@ actor WorkspaceCodemapLiveOverlay {
             removeLiveEntry(fileID: fileID, from: &root)
         }
         root.shadows.removeValue(forKey: shadowKey)
-        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
+        let ticketGeneration = WorkspaceCodemapSelectionGraphContributionGeneration(
+            rawValue: root.contributionGeneration.rawValue == .max
+                ? .max
+                : root.contributionGeneration.rawValue + 1
+        )
         let ticket = WorkspaceCodemapLiveDemandTicket(
             token: token,
-            contributionGeneration: root.contributionGeneration,
+            contributionGeneration: ticketGeneration,
             requestID: UUID()
         )
         root.liveByFileID[token.identity.fileID] = .pending(Pending(
@@ -757,6 +820,7 @@ actor WorkspaceCodemapLiveOverlay {
             owners: [owner]
         ))
         root.liveFileIDByRelativePath[relativePath] = token.identity.fileID
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         return .started(ticket)
     }
@@ -1093,6 +1157,42 @@ actor WorkspaceCodemapLiveOverlay {
             guard let relativePath = validatedRelativePath(path) else { continue }
             observedValidPath = true
             var affectedPipelines: Set<CodeMapPipelineIdentity> = []
+            var removedGraphSlots: [WorkspaceCodemapGraphSlot] = []
+            let graphIndexFileIDs = root.graphIndexSlotsByFileID.values
+                .filter { $0.standardizedRelativePath == relativePath }
+                .map(\.fileID)
+            let retainedFileIDs = root.retainedGraphSlotsByFileID.values
+                .filter { $0.standardizedRelativePath == relativePath }
+                .map(\.fileID)
+            for fileID in Set(graphIndexFileIDs).union(retainedFileIDs) {
+                if let slot = root.graphIndexSlotsByFileID.removeValue(forKey: fileID) ??
+                    root.retainedGraphSlotsByFileID.removeValue(forKey: fileID)
+                {
+                    affectedPipelines.insert(slot.pipelineIdentity)
+                    removedGraphSlots.append(slot)
+                }
+                root.retainedGraphSlotsByFileID.removeValue(forKey: fileID)
+            }
+            if reason == .modified {
+                for slot in removedGraphSlots {
+                    if let pending = graphSlot(
+                        rootEpoch: rootEpoch,
+                        identity: slot.identity,
+                        requestGeneration: slot.requestGeneration,
+                        pathGeneration: slot.pathGeneration,
+                        pipelineIdentity: slot.pipelineIdentity,
+                        state: .pending,
+                        source: .graphIndex
+                    ) {
+                        root.graphIndexSlotsByFileID[pending.fileID] = pending
+                        root.graphReconciliationSuppressedFileIDs.remove(pending.fileID)
+                    }
+                }
+            }
+            if let manifestSlot = root.manifestGraphSlotsByRelativePath.removeValue(forKey: relativePath) {
+                affectedPipelines.insert(manifestSlot.pipelineIdentity)
+            }
+            let removedGraphSlot = !graphIndexFileIDs.isEmpty || !retainedFileIDs.isEmpty
             let removedClean = root.cleanByRelativePath.removeValue(forKey: relativePath) != nil
             if let pipelineIdentity = root.cleanPipelineByRelativePath.removeValue(forKey: relativePath),
                var pipeline = root.pipelines[pipelineIdentity]
@@ -1114,7 +1214,7 @@ actor WorkspaceCodemapLiveOverlay {
             }) == true {
                 affectedPipelines.insert(pipelineIdentity)
             }
-            if removedClean || liveFileID != nil || !affectedPipelines.isEmpty {
+            if removedGraphSlot || removedClean || liveFileID != nil || !affectedPipelines.isEmpty {
                 invalidated = addingSaturating(invalidated, 1)
                 for pipelineIdentity in affectedPipelines {
                     root.shadows[ShadowKey(
@@ -1126,7 +1226,16 @@ actor WorkspaceCodemapLiveOverlay {
         }
         if observedValidPath {
             advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
-            advanceContributionGeneration(&root, rootEpoch: rootEpoch)
+            let removalReason: WorkspaceCodemapGraphRemovalReason = switch reason {
+            case .deleted: .deleted
+            case .renamed: .renamed
+            default: .replaced
+            }
+            advanceContributionGeneration(
+                &root,
+                rootEpoch: rootEpoch,
+                removalReason: removalReason
+            )
         }
         roots[rootEpoch] = root
         return invalidated
@@ -1141,8 +1250,6 @@ actor WorkspaceCodemapLiveOverlay {
         guard var root = roots[rootEpoch],
               root.registration.capability.repositoryAuthority == expectedAuthority
         else { return false }
-        root.authorityIsCurrent = false
-        removeAdmissionReservations(rootEpoch: rootEpoch)
         advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
         root.pipelines.removeAll()
         root.cleanByRelativePath.removeAll()
@@ -1150,7 +1257,282 @@ actor WorkspaceCodemapLiveOverlay {
         root.liveByFileID.removeAll()
         root.liveFileIDByRelativePath.removeAll()
         root.shadows.removeAll()
-        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
+        root.graphIndexSlotsByFileID.removeAll()
+        root.retainedGraphSlotsByFileID.removeAll()
+        root.graphReconciliationSuppressedFileIDs.removeAll()
+        root.manifestGraphSlotsByRelativePath.removeAll()
+        root.graphSlotsByFileID.removeAll()
+        root.graphFileIDByRelativePath.removeAll()
+        revokeGraph(&root, rootEpoch: rootEpoch, reason: .repositoryAuthorityChanged)
+        roots[rootEpoch] = root
+        return true
+    }
+
+    func graphChanges(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        since generation: WorkspaceCodemapSelectionGraphContributionGeneration
+    ) -> WorkspaceCodemapGraphChangesDisposition {
+        guard let root = roots[rootEpoch] else { return .revoked(.rootUnloaded) }
+        if let reason = root.graphRevocationReason {
+            return .revoked(reason)
+        }
+        guard root.authorityIsCurrent else { return .revoked(.repositoryAuthorityChanged) }
+        if root.graphCoverage.enumerationState == .notStarted,
+           root.graphSlotsByFileID.isEmpty
+        {
+            return .unchanged(generation: root.contributionGeneration)
+        }
+        if generation == root.contributionGeneration {
+            return .unchanged(generation: root.contributionGeneration)
+        }
+        if generation < root.floorGeneration || generation > root.contributionGeneration {
+            return checkpointDisposition(for: rootEpoch, root: root)
+        }
+        let changedSlots = root.changedFileIDsSinceFloor.compactMap { root.graphSlotsByFileID[$0] }
+            .sorted(by: workspaceCodemapGraphSlotPrecedesForOverlay)
+        let removals = root.changedFileIDsSinceFloor.compactMap { root.graphRemovalsByFileID[$0] }
+            .sorted(by: workspaceCodemapGraphRemovalPrecedesForOverlay)
+        return .diff(
+            changedSlots: changedSlots,
+            removed: removals,
+            coverage: root.graphCoverage,
+            generation: root.contributionGeneration
+        )
+    }
+
+    func graphCheckpoint(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapGraphCheckpointDisposition {
+        guard let root = roots[rootEpoch] else { return .revoked(.rootUnloaded) }
+        if let reason = root.graphRevocationReason { return .revoked(reason) }
+        guard root.authorityIsCurrent else { return .revoked(.repositoryAuthorityChanged) }
+        return switch checkpointDisposition(for: rootEpoch, root: root) {
+        case let .resync(checkpoint, _): .checkpoint(checkpoint)
+        case let .revoked(reason): .revoked(reason)
+        case .unchanged, .diff:
+            preconditionFailure("Checkpoint construction must produce resync or revocation.")
+        }
+    }
+
+    func graphChangeNotifications(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> AsyncStream<WorkspaceCodemapGraphChangeNotification> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            guard var root = roots[rootEpoch] else {
+                continuation.yield(.revoked(.rootUnloaded))
+                continuation.finish()
+                return
+            }
+            if let reason = root.graphRevocationReason {
+                continuation.yield(.revoked(reason))
+                continuation.finish()
+                return
+            }
+            guard root.authorityIsCurrent else {
+                continuation.yield(.revoked(.repositoryAuthorityChanged))
+                continuation.finish()
+                return
+            }
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeGraphNotificationContinuation(id, rootEpoch: rootEpoch) }
+            }
+            root.graphNotificationContinuations[id] = continuation
+            roots[rootEpoch] = root
+        }
+    }
+
+    /// Publishes current graph-index classifications into the root-local ledger. Repeated
+    /// publication is idempotent; a captured enumeration is complete only after every
+    /// supported slot is classified.
+    @discardableResult
+    func publishGraphIndexSlots(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
+        slots: [WorkspaceCodemapGraphSlot],
+        enumerationFinished: Bool = false,
+        reconciliationFence: (@Sendable (
+            Set<UUID>,
+            WorkspaceCodemapGraphFenceReason
+        ) async -> WorkspaceCodemapGraphFenceDisposition)? = nil
+    ) async -> Bool {
+        guard var root = roots[rootEpoch], root.authorityIsCurrent,
+              catalogToken.rootEpoch == rootEpoch,
+              catalogToken.catalogGeneration == root.registration.catalogGeneration,
+              slots.allSatisfy({ $0.rootEpoch == rootEpoch })
+        else { return false }
+        let visibleSlotsBeforePublication = root.graphSlotsByFileID
+        if let current = root.graphCatalogToken, current != catalogToken {
+            let isSyntheticBootstrap = current.catalogGeneration == catalogToken.catalogGeneration &&
+                current.topologyGeneration == 0 &&
+                current.appliedIndexGeneration == 0 &&
+                current.ingressGeneration == 0 &&
+                current.graphIndexInvalidationGeneration == 0
+            let isMonotonicReplacement = current.rootEpoch == catalogToken.rootEpoch &&
+                current.catalogGeneration == catalogToken.catalogGeneration &&
+                catalogToken.topologyGeneration >= current.topologyGeneration &&
+                catalogToken.appliedIndexGeneration >= current.appliedIndexGeneration &&
+                catalogToken.ingressGeneration >= current.ingressGeneration &&
+                catalogToken.graphIndexInvalidationGeneration > current.graphIndexInvalidationGeneration
+            guard isSyntheticBootstrap || isMonotonicReplacement else { return false }
+            root.graphEnumerationFinished = false
+        }
+        root.graphCatalogToken = catalogToken
+        // Enumeration completion is published only after any destructive safety fences derived
+        // from this authoritative pass have completed.
+        if !enumerationFinished {
+            root.graphEnumerationFinished = false
+        }
+        for slot in slots {
+            root.graphReconciliationSuppressedFileIDs.remove(slot.fileID)
+            if root.graphReconciliationPriorIndexSlotsByFileID != nil {
+                root.graphReconciliationSeenIndexFileIDs.insert(slot.fileID)
+            }
+            if let otherFileID = root.graphFileIDByRelativePath[slot.standardizedRelativePath],
+               otherFileID != slot.fileID
+            {
+                let removedPath = root.graphSlotsByFileID[otherFileID]?.standardizedRelativePath
+                    ?? slot.standardizedRelativePath
+                root.graphSlotsByFileID.removeValue(forKey: otherFileID)
+                root.graphRemovalsByFileID[otherFileID] = WorkspaceCodemapGraphRemoval(
+                    rootEpoch: rootEpoch,
+                    fileID: otherFileID,
+                    standardizedRelativePath: removedPath,
+                    reason: root.graphReconciliationPriorIndexSlotsByFileID == nil ? .replaced : .deleted
+                )
+                root.changedFileIDsSinceFloor.insert(otherFileID)
+            }
+            if let old = root.graphSlotsByFileID[slot.fileID],
+               old.standardizedRelativePath != slot.standardizedRelativePath
+            {
+                root.graphFileIDByRelativePath.removeValue(forKey: old.standardizedRelativePath)
+            }
+            root.graphIndexSlotsByFileID[slot.fileID] = slot
+        }
+        let completedReconciliation = enumerationFinished && root.graphReconciliationPriorIndexSlotsByFileID != nil
+        if enumerationFinished, let priorSlots = root.graphReconciliationPriorIndexSlotsByFileID {
+            for fileID in Set(priorSlots.keys).subtracting(root.graphReconciliationSeenIndexFileIDs) {
+                root.graphIndexSlotsByFileID.removeValue(forKey: fileID)
+                root.retainedGraphSlotsByFileID.removeValue(forKey: fileID)
+                root.manifestGraphSlotsByRelativePath = root.manifestGraphSlotsByRelativePath.filter {
+                    $0.value.fileID != fileID
+                }
+                // Reconciliation changes lightweight graph membership only. Artifact leases and
+                // cache residency remain owned by their existing demand/manifest lifetimes.
+                root.graphReconciliationSuppressedFileIDs.insert(fileID)
+            }
+        }
+        advanceContributionGeneration(
+            &root,
+            rootEpoch: rootEpoch,
+            removalReason: completedReconciliation ? .deleted : .replaced
+        )
+        if completedReconciliation,
+           let priorSlots = root.graphReconciliationPriorIndexSlotsByFileID
+        {
+            for (fileID, priorSlot) in priorSlots {
+                guard let currentSlot = root.graphSlotsByFileID[fileID],
+                      priorSlot.standardizedRelativePath != currentSlot.standardizedRelativePath
+                else { continue }
+                root.graphRemovalsByFileID[fileID] = WorkspaceCodemapGraphRemoval(
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    standardizedRelativePath: priorSlot.standardizedRelativePath,
+                    reason: .renamed
+                )
+                root.changedFileIDsSinceFloor.insert(fileID)
+            }
+        }
+        roots[rootEpoch] = root
+
+        let requiredFences = destructiveGraphFences(
+            before: visibleSlotsBeforePublication,
+            after: root.graphSlotsByFileID,
+            reconciliationCompleted: completedReconciliation
+        )
+        if !requiredFences.isEmpty {
+            guard let reconciliationFence else {
+                revokeGraph(&root, rootEpoch: rootEpoch, reason: .reconciliationFailed)
+                roots[rootEpoch] = root
+                return false
+            }
+            for reason in [
+                WorkspaceCodemapGraphFenceReason.deleted,
+                .renamed,
+                .securityExcluded
+            ] {
+                guard let fileIDs = requiredFences[reason], !fileIDs.isEmpty else { continue }
+                guard case .fenced = await reconciliationFence(fileIDs, reason) else {
+                    if var current = roots[rootEpoch] {
+                        revokeGraph(&current, rootEpoch: rootEpoch, reason: .reconciliationFailed)
+                        roots[rootEpoch] = current
+                    }
+                    return false
+                }
+            }
+            guard let resumed = roots[rootEpoch], resumed.authorityIsCurrent,
+                  resumed.graphCatalogToken == catalogToken,
+                  resumed.contributionGeneration == root.contributionGeneration
+            else {
+                if var current = roots[rootEpoch] {
+                    revokeGraph(&current, rootEpoch: rootEpoch, reason: .reconciliationFailed)
+                    roots[rootEpoch] = current
+                }
+                return false
+            }
+            root = resumed
+        }
+
+        if enumerationFinished {
+            root.graphEnumerationFinished = true
+            if completedReconciliation {
+                root.graphReconciliationPriorIndexSlotsByFileID = nil
+                root.graphReconciliationSeenIndexFileIDs.removeAll(keepingCapacity: true)
+            }
+            advanceContributionGeneration(&root, rootEpoch: rootEpoch)
+        }
+        if completedReconciliation {
+            root.floorGeneration = root.contributionGeneration
+            root.changedFileIDsSinceFloor.removeAll(keepingCapacity: true)
+            root.graphRemovalsByFileID.removeAll(keepingCapacity: true)
+            yieldGraphChange(&root)
+        }
+        roots[rootEpoch] = root
+        return root.authorityIsCurrent
+    }
+
+    /// Begins a root-local watcher-gap pass without revoking the last committed graph. Existing
+    /// index slots remain visible until the replacement enumeration seals, at which point entries
+    /// absent from the authoritative pass are removed atomically.
+    @discardableResult
+    func beginGraphReconciliation(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+        guard var root = roots[rootEpoch], root.authorityIsCurrent,
+              root.graphRevocationReason == nil
+        else { return false }
+        if root.graphReconciliationPriorIndexSlotsByFileID == nil {
+            root.graphReconciliationPriorIndexSlotsByFileID = root.graphIndexSlotsByFileID
+            root.graphReconciliationSeenIndexFileIDs.removeAll(keepingCapacity: true)
+        }
+        root.graphEnumerationFinished = false
+        root.floorGeneration = root.contributionGeneration
+        root.changedFileIDsSinceFloor.removeAll(keepingCapacity: true)
+        root.graphRemovalsByFileID.removeAll(keepingCapacity: true)
+        yieldGraphChange(&root)
+        roots[rootEpoch] = root
+        return true
+    }
+
+    /// Forces future lagging pullers through the full checkpoint path. Used after a root-local
+    /// authoritative watcher-gap rescan; the current committed graph remains queryable meanwhile.
+    @discardableResult
+    func advanceGraphResyncFloor(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+        guard var root = roots[rootEpoch], root.authorityIsCurrent,
+              root.graphRevocationReason == nil
+        else { return false }
+        root.floorGeneration = root.contributionGeneration
+        root.changedFileIDsSinceFloor.removeAll(keepingCapacity: true)
+        root.graphRemovalsByFileID.removeAll(keepingCapacity: true)
+        yieldGraphChange(&root)
         roots[rootEpoch] = root
         return true
     }
@@ -1225,39 +1607,6 @@ actor WorkspaceCodemapLiveOverlay {
             bindings: [ready.binding],
             leaseOwners: [ready.leaseOwner]
         )
-    }
-
-    func graphContributions(rootEpoch: WorkspaceCodemapRootEpoch) -> WorkspaceCodemapLiveGraphSnapshot? {
-        ensureAccessOrdinalCapacity(requiredCount: roots[rootEpoch].map { visibleReadyEntries($0).count } ?? 0)
-        guard var root = roots[rootEpoch], root.authorityIsCurrent else { return nil }
-        touchVisibleReadyEntries(&root)
-        roots[rootEpoch] = root
-        return WorkspaceCodemapLiveGraphSnapshot(
-            rootEpoch: rootEpoch,
-            catalogGeneration: root.registration.catalogGeneration,
-            repositoryAuthority: root.registration.capability.repositoryAuthority,
-            contributionGeneration: root.contributionGeneration,
-            bindings: visibleReadyEntries(root).map(\.binding)
-        )
-    }
-
-    func consumeGraphSnapshot(
-        _ snapshot: WorkspaceCodemapLiveGraphSnapshot
-    ) -> [WorkspaceCodemapArtifactBinding]? {
-        ensureAccessOrdinalCapacity(
-            requiredCount: roots[snapshot.rootEpoch].map { visibleReadyEntries($0).count } ?? 0
-        )
-        guard let root = roots[snapshot.rootEpoch], root.authorityIsCurrent else { return nil }
-        let current = WorkspaceCodemapLiveGraphSnapshot(
-            rootEpoch: snapshot.rootEpoch,
-            catalogGeneration: root.registration.catalogGeneration,
-            repositoryAuthority: root.registration.capability.repositoryAuthority,
-            contributionGeneration: root.contributionGeneration,
-            bindings: visibleReadyEntries(root).map(\.binding)
-        )
-        guard current == snapshot else { return nil }
-        touchVisibleReadyEntries(rootEpoch: snapshot.rootEpoch)
-        return snapshot.bindings
     }
 
     func accounting() -> WorkspaceCodemapLiveOverlayAccounting {
@@ -1660,6 +2009,18 @@ actor WorkspaceCodemapLiveOverlay {
         }), var root = roots[candidate.rootEpoch]
         else { return false }
 
+        if !candidate.isNegative {
+            for slot in root.graphSlotsByFileID.values where
+                slot.standardizedRelativePath == candidate.relativePath
+            {
+                switch slot.state {
+                case .contributed, .empty:
+                    root.retainedGraphSlotsByFileID[slot.fileID] = slot
+                case .pending, .terminalArtifact, .terminalExcluded:
+                    break
+                }
+            }
+        }
         if let shadowKey = candidate.shadowKey {
             root.shadows.removeValue(forKey: shadowKey)
             if root.cleanPipelineByRelativePath[shadowKey.relativePath] == shadowKey.pipelineIdentity {
@@ -1682,14 +2043,396 @@ actor WorkspaceCodemapLiveOverlay {
 
     private func advanceContributionGeneration(
         _ root: inout RootState,
-        rootEpoch: WorkspaceCodemapRootEpoch
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        removalReason: WorkspaceCodemapGraphRemovalReason = .replaced
     ) {
+        let oldSlots = root.graphSlotsByFileID
+        let oldCoverage = root.graphCoverage
+        reconcileGraphSlots(&root, rootEpoch: rootEpoch)
+        guard updateGraphCoverage(&root, rootEpoch: rootEpoch) else {
+            revokeGraph(&root, rootEpoch: rootEpoch, reason: .accountingOverflow)
+            return
+        }
+
+        let changedFileIDs = Set(oldSlots.keys).union(root.graphSlotsByFileID.keys).filter {
+            oldSlots[$0] != root.graphSlotsByFileID[$0]
+        }
+        let coverageChanged = root.graphCoverage != oldCoverage
+        guard !changedFileIDs.isEmpty || coverageChanged else { return }
+
         let (next, overflow) = root.contributionGeneration.rawValue.addingReportingOverflow(1)
         guard !overflow else {
             failClosedGenerationExhaustion(&root, rootEpoch: rootEpoch)
             return
         }
         root.contributionGeneration = .init(rawValue: next)
+        for fileID in changedFileIDs {
+            root.changedFileIDsSinceFloor.insert(fileID)
+            if let removed = oldSlots[fileID], root.graphSlotsByFileID[fileID] == nil {
+                root.graphRemovalsByFileID[fileID] = WorkspaceCodemapGraphRemoval(
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    standardizedRelativePath: removed.standardizedRelativePath,
+                    reason: removalReason
+                )
+            } else {
+                root.graphRemovalsByFileID.removeValue(forKey: fileID)
+            }
+        }
+        if root.changedFileIDsSinceFloor.count > graphPolicy.maximumChangedSetFileIDCount {
+            root.floorGeneration = root.contributionGeneration
+            root.changedFileIDsSinceFloor.removeAll(keepingCapacity: true)
+            root.graphRemovalsByFileID.removeAll(keepingCapacity: true)
+        }
+        yieldGraphChange(&root)
+    }
+
+    private func reconcileGraphSlots(
+        _ root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        var slotsByPath: [String: WorkspaceCodemapGraphSlot] = [:]
+        func mergeLayer(_ candidates: some Sequence<WorkspaceCodemapGraphSlot>) {
+            for slot in candidates.sorted(by: workspaceCodemapGraphSlotPrecedesForOverlay) {
+                let path = slot.standardizedRelativePath
+                guard let current = slotsByPath[path] else {
+                    slotsByPath[path] = slot
+                    continue
+                }
+                if slot.requestGeneration > current.requestGeneration ||
+                    (
+                        slot.requestGeneration == current.requestGeneration &&
+                            slot.pathGeneration >= current.pathGeneration
+                    )
+                {
+                    slotsByPath[path] = slot
+                }
+            }
+        }
+
+        // Precedence is path-based and explicit. UUID ordering must never decide whether a stale
+        // index entry hides newer live state for the same logical file.
+        mergeLayer(root.graphIndexSlotsByFileID.values)
+        mergeLayer(root.retainedGraphSlotsByFileID.values)
+        mergeLayer(root.manifestGraphSlotsByRelativePath.values)
+        mergeLayer(root.cleanByRelativePath.values.compactMap { graphSlot(rootEpoch: rootEpoch, ready: $0) })
+
+        var liveSlots: [WorkspaceCodemapGraphSlot] = []
+        for entry in root.liveByFileID.values {
+            switch entry {
+            case let .pending(pending):
+                if let slot = graphSlot(
+                    rootEpoch: rootEpoch,
+                    identity: pending.binding.identity,
+                    requestGeneration: pending.ticket.token.requestGeneration,
+                    pathGeneration: pending.ticket.token.sourceExpectation.sourceAuthority.pathGeneration,
+                    pipelineIdentity: pending.ticket.token.pipelineIdentity,
+                    state: .pending,
+                    source: .live
+                ) {
+                    liveSlots.append(slot)
+                }
+            case let .ready(ready):
+                if let slot = graphSlot(rootEpoch: rootEpoch, ready: ready) {
+                    liveSlots.append(slot)
+                }
+            case let .unavailable(ticket, reason, _):
+                if let state = graphSlotState(for: reason),
+                   let slot = graphSlot(
+                       rootEpoch: rootEpoch,
+                       identity: ticket.token.identity,
+                       requestGeneration: ticket.token.requestGeneration,
+                       pathGeneration: ticket.token.sourceExpectation.sourceAuthority.pathGeneration,
+                       pipelineIdentity: ticket.token.pipelineIdentity,
+                       state: state,
+                       source: .live
+                   )
+                {
+                    liveSlots.append(slot)
+                }
+            }
+        }
+        // Live state is the highest-precedence layer.
+        for slot in liveSlots {
+            slotsByPath[slot.standardizedRelativePath] = slot
+        }
+
+        for (key, shadow) in root.shadows {
+            guard let slot = slotsByPath[key.relativePath],
+                  slot.pipelineIdentity == key.pipelineIdentity
+            else { continue }
+            switch shadow.reason {
+            case .modified, .watcherGap, .evicted:
+                slotsByPath[key.relativePath] = graphSlot(
+                    rootEpoch: rootEpoch,
+                    identity: slot.identity,
+                    requestGeneration: slot.requestGeneration,
+                    pathGeneration: slot.pathGeneration,
+                    pipelineIdentity: slot.pipelineIdentity,
+                    state: .pending,
+                    source: .graphIndex
+                )
+            case .deleted, .renamed, .checkoutChanged, .authorityChanged, .catalogChanged:
+                slotsByPath.removeValue(forKey: key.relativePath)
+            }
+        }
+
+        var slots: [UUID: WorkspaceCodemapGraphSlot] = [:]
+        var fileIDByPath: [String: UUID] = [:]
+        for slot in slotsByPath.values
+            where root.liveByFileID[slot.fileID] != nil ||
+            !root.graphReconciliationSuppressedFileIDs.contains(slot.fileID)
+        {
+            slots[slot.fileID] = slot
+            fileIDByPath[slot.standardizedRelativePath] = slot.fileID
+        }
+        root.graphSlotsByFileID = slots
+        root.graphFileIDByRelativePath = fileIDByPath
+    }
+
+    private func refreshManifestGraphSlots(
+        _ root: inout RootState,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        root.manifestGraphSlotsByRelativePath = root.manifestGraphSlotsByRelativePath.filter {
+            $0.value.pipelineIdentity != pipelineIdentity
+        }
+        guard let pipeline = root.pipelines[pipelineIdentity] else { return }
+        for path in pipeline.cleanRelativePaths {
+            guard let ready = root.cleanByRelativePath[path],
+                  let slot = graphSlot(rootEpoch: rootEpoch, ready: ready)
+            else { continue }
+            root.manifestGraphSlotsByRelativePath[path] = slot
+        }
+    }
+
+    private func graphSlot(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        ready: StoredReady
+    ) -> WorkspaceCodemapGraphSlot? {
+        let completion = ready.completion
+        let state: WorkspaceCodemapGraphSlotState
+        switch completion.outcome {
+        case .ready, .readyNoSymbols:
+            guard let contribution = graphContribution(completion) else { return nil }
+            state = contribution.sortedUniqueDefinitions.isEmpty && contribution.sortedUniqueReferences.isEmpty
+                ? .empty(contribution)
+                : .contributed(contribution)
+        case .oversize:
+            state = .terminalArtifact(.oversize)
+        case .decodeFailed:
+            state = .terminalArtifact(.decodeFailed)
+        case .parseFailed:
+            state = .terminalArtifact(.parseFailed)
+        }
+        return graphSlot(
+            rootEpoch: rootEpoch,
+            identity: ready.binding.identity,
+            requestGeneration: completion.token.requestGeneration,
+            pathGeneration: completion.token.sourceExpectation.sourceAuthority.pathGeneration,
+            pipelineIdentity: completion.token.pipelineIdentity,
+            state: state,
+            source: ready.source == .cleanManifest ? .cleanManifest : .live
+        )
+    }
+
+    private func graphSlot(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        identity: WorkspaceCodemapArtifactBindingIdentity,
+        requestGeneration: UInt64,
+        pathGeneration: UInt64,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        state: WorkspaceCodemapGraphSlotState,
+        source: WorkspaceCodemapGraphSlotSource
+    ) -> WorkspaceCodemapGraphSlot? {
+        let contribution: CodeMapSelectionGraphContribution? = switch state {
+        case let .contributed(value), let .empty(value): value
+        case .pending, .terminalArtifact, .terminalExcluded: nil
+        }
+        return try? WorkspaceCodemapGraphSlot.validated(
+            rootEpoch: rootEpoch,
+            identity: identity,
+            requestGeneration: requestGeneration,
+            pathGeneration: pathGeneration,
+            pipelineIdentity: pipelineIdentity,
+            state: state,
+            diagnostics: WorkspaceCodemapGraphSlotDiagnostics(
+                contributionDigest: contribution?.contributionDigest,
+                source: source
+            )
+        ).get()
+    }
+
+    private func graphSlotState(
+        for reason: WorkspaceCodemapLiveOverlayUnavailableReason
+    ) -> WorkspaceCodemapGraphSlotState? {
+        switch reason {
+        case .unsupportedFileType:
+            .terminalExcluded(.nonRegular)
+        case .transient:
+            .pending
+        case .securityExcluded:
+            .terminalExcluded(.securityExcluded)
+        case let .terminalArtifact(outcome):
+            switch outcome {
+            case .oversize: .terminalArtifact(.oversize)
+            case .decodeFailed: .terminalArtifact(.decodeFailed)
+            case .parseFailed: .terminalArtifact(.parseFailed)
+            case .ready, .readyNoSymbols: nil
+            }
+        case .invalidated:
+            nil
+        }
+    }
+
+    private func updateGraphCoverage(
+        _ root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> Bool {
+        if root.graphCatalogToken == nil, !root.graphSlotsByFileID.isEmpty {
+            root.graphCatalogToken = WorkspaceCodemapGraphIndexCatalogToken(
+                rootEpoch: rootEpoch,
+                topologyGeneration: 0,
+                appliedIndexGeneration: 0,
+                catalogGeneration: root.registration.catalogGeneration,
+                ingressGeneration: 0,
+                graphIndexInvalidationGeneration: 0
+            )
+        }
+        guard let coverage = coverageForSlots(
+            root.graphSlotsByFileID,
+            rootEpoch: rootEpoch,
+            token: root.graphCatalogToken,
+            enumerationFinished: root.graphEnumerationFinished
+        ) else { return false }
+        root.graphCoverage = coverage
+        return true
+    }
+
+    private func coverageForSlots(
+        _ slots: [UUID: WorkspaceCodemapGraphSlot],
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        token: WorkspaceCodemapGraphIndexCatalogToken?,
+        enumerationFinished: Bool
+    ) -> WorkspaceCodemapGraphCatalogCoverage? {
+        var pending: UInt64 = 0
+        var contributed: UInt64 = 0
+        var empty: UInt64 = 0
+        var terminalArtifact: UInt64 = 0
+        var terminalExcluded: UInt64 = 0
+        for slot in slots.values {
+            switch slot.state {
+            case .pending: pending += 1
+            case .contributed: contributed += 1
+            case .empty: empty += 1
+            case .terminalArtifact: terminalArtifact += 1
+            case .terminalExcluded: terminalExcluded += 1
+            }
+        }
+        let classified = contributed + empty + terminalArtifact + terminalExcluded
+        let supported = classified + pending
+        let enumerationState: WorkspaceCodemapGraphCatalogEnumerationState = if token == nil {
+            .notStarted
+        } else if enumerationFinished, pending == 0 {
+            .complete
+        } else {
+            .partial
+        }
+        return try? WorkspaceCodemapGraphCatalogCoverage.validated(
+            rootEpoch: rootEpoch,
+            catalogWatermark: token,
+            enumerationState: enumerationState,
+            supportedCount: supported,
+            classifiedCount: classified,
+            pendingCount: pending,
+            contributedCount: contributed,
+            emptyCount: empty,
+            terminalArtifactCount: terminalArtifact,
+            terminalExcludedCount: terminalExcluded
+        ).get()
+    }
+
+    private func destructiveGraphFences(
+        before: [UUID: WorkspaceCodemapGraphSlot],
+        after: [UUID: WorkspaceCodemapGraphSlot],
+        reconciliationCompleted: Bool
+    ) -> [WorkspaceCodemapGraphFenceReason: Set<UUID>] {
+        var result: [WorkspaceCodemapGraphFenceReason: Set<UUID>] = [:]
+        for (fileID, oldSlot) in before {
+            guard let newSlot = after[fileID] else {
+                if reconciliationCompleted {
+                    result[.deleted, default: []].insert(fileID)
+                }
+                continue
+            }
+            if oldSlot.standardizedRelativePath != newSlot.standardizedRelativePath {
+                result[.renamed, default: []].insert(fileID)
+            }
+            if case .terminalExcluded(.securityExcluded) = newSlot.state {
+                switch oldSlot.state {
+                case .contributed, .empty:
+                    result[.securityExcluded, default: []].insert(fileID)
+                case .pending, .terminalArtifact, .terminalExcluded:
+                    break
+                }
+            }
+        }
+        return result
+    }
+
+    private func checkpointDisposition(
+        for rootEpoch: WorkspaceCodemapRootEpoch,
+        root: RootState
+    ) -> WorkspaceCodemapGraphChangesDisposition {
+        guard root.authorityIsCurrent else { return .revoked(.repositoryAuthorityChanged) }
+        guard case let .success(checkpoint) = WorkspaceCodemapGraphCheckpoint.validated(
+            rootEpoch: rootEpoch,
+            repositoryAuthority: root.registration.capability.repositoryAuthority,
+            generation: root.contributionGeneration,
+            schemaVersion: CodeMapSelectionGraphContribution.currentSchemaVersion,
+            policyVersion: CodeMapSelectionGraphContribution.currentPolicyVersion,
+            slots: Array(root.graphSlotsByFileID.values),
+            coverage: root.graphCoverage
+        ) else { return .revoked(.accountingOverflow) }
+        return .resync(checkpoint: checkpoint, generation: root.contributionGeneration)
+    }
+
+    private func yieldGraphChange(_ root: inout RootState) {
+        for continuation in root.graphNotificationContinuations.values {
+            continuation.yield(.changed)
+        }
+    }
+
+    private func finishGraphNotifications(
+        _ root: inout RootState,
+        reason: WorkspaceCodemapGraphRevocationReason
+    ) {
+        for continuation in root.graphNotificationContinuations.values {
+            continuation.yield(.revoked(reason))
+            continuation.finish()
+        }
+        root.graphNotificationContinuations.removeAll()
+    }
+
+    private func removeGraphNotificationContinuation(
+        _ id: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard var root = roots[rootEpoch] else { return }
+        root.graphNotificationContinuations.removeValue(forKey: id)
+        roots[rootEpoch] = root
+    }
+
+    private func revokeGraph(
+        _ root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        reason: WorkspaceCodemapGraphRevocationReason
+    ) {
+        root.graphRevocationReason = reason
+        root.authorityIsCurrent = false
+        finishGraphNotifications(&root, reason: reason)
+        removeAdmissionReservations(rootEpoch: rootEpoch)
     }
 
     @discardableResult
@@ -1737,7 +2480,7 @@ actor WorkspaceCodemapLiveOverlay {
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
         root.authorityIsCurrent = false
-        removeAdmissionReservations(rootEpoch: rootEpoch)
+        revokeGraph(&root, rootEpoch: rootEpoch, reason: .contributionGenerationExhausted)
     }
 
     private func rootEpochPrecedes(
@@ -2066,4 +2809,24 @@ actor WorkspaceCodemapLiveOverlay {
     private func subtractingFloor(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
         lhs >= rhs ? lhs - rhs : 0
     }
+}
+
+private func workspaceCodemapGraphSlotPrecedesForOverlay(
+    _ lhs: WorkspaceCodemapGraphSlot,
+    _ rhs: WorkspaceCodemapGraphSlot
+) -> Bool {
+    if lhs.standardizedRelativePath != rhs.standardizedRelativePath {
+        return lhs.standardizedRelativePath.utf8.lexicographicallyPrecedes(rhs.standardizedRelativePath.utf8)
+    }
+    return lhs.fileID.uuidString.utf8.lexicographicallyPrecedes(rhs.fileID.uuidString.utf8)
+}
+
+private func workspaceCodemapGraphRemovalPrecedesForOverlay(
+    _ lhs: WorkspaceCodemapGraphRemoval,
+    _ rhs: WorkspaceCodemapGraphRemoval
+) -> Bool {
+    if lhs.standardizedRelativePath != rhs.standardizedRelativePath {
+        return lhs.standardizedRelativePath.utf8.lexicographicallyPrecedes(rhs.standardizedRelativePath.utf8)
+    }
+    return lhs.fileID.uuidString.utf8.lexicographicallyPrecedes(rhs.fileID.uuidString.utf8)
 }

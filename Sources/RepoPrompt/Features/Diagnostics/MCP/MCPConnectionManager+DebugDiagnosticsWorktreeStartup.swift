@@ -251,8 +251,8 @@ import MCP
                         "correlation_id": correlationID.uuidString,
                         "mark": phase.rawValue
                     ])
-                case "codemap_projection_snapshot":
-                    guard let snapshot = await resolved.store.debugCodemapProjectionAdmissionSnapshot(
+                case "codemap_graph_index_snapshot":
+                    guard let snapshot = await resolved.store.debugCodemapGraphIndexAdmissionSnapshot(
                         rootID: scope.rootID
                     ) else {
                         return debugDiagnosticsError(
@@ -265,7 +265,7 @@ import MCP
                         "ok": true,
                         "op": op,
                         "action": action,
-                        "codemap_projection": debugCodemapProjectionPayload(snapshot)
+                        "codemap_graph_index": debugCodemapGraphIndexPayload(snapshot)
                     ])
                 case "codemap_root_snapshot":
                     let targetRootID = try debugRequiredUUID(arguments, key: "target_root_id")
@@ -282,7 +282,7 @@ import MCP
                     let enginePresent = await resolved.store.debugCodemapEnginePresent(
                         rootID: targetRootID
                     )
-                    let snapshot = await resolved.store.debugCodemapProjectionAdmissionSnapshot(
+                    let snapshot = await resolved.store.debugCodemapGraphIndexAdmissionSnapshot(
                         rootID: targetRootID
                     )
                     return debugDiagnosticsResult([
@@ -291,24 +291,24 @@ import MCP
                         "action": action,
                         "target_root_id": targetRootID.uuidString,
                         "engine_present": enginePresent,
-                        "codemap_projection": snapshot.map { debugCodemapProjectionPayload($0) } ?? [
+                        "codemap_graph_index": snapshot.map { debugCodemapGraphIndexPayload($0) } ?? [
                             "hold_count": 0,
-                            "queued_projection_batch_count": 0,
-                            "active_projection_batch_count": 0,
+                            "queued_graph_index_batch_count": 0,
+                            "active_graph_index_batch_count": 0,
                             "builds": 0,
-                            "projection_batches_started": 0,
-                            "projection_catalog_candidates": 0,
-                            "projection_budget_rejections": 0,
+                            "graph_index_batches_started": 0,
+                            "graph_index_catalog_candidates": 0,
+                            "graph_index_budget_rejections": 0,
                             "retained_path_bytes": 0,
                             "retained_source_bytes": 0,
-                            "retained_projection_bytes": 0,
+                            "retained_graph_index_bytes": 0,
                             "staged_graph_bytes": 0,
                             "resident_graph_bytes": 0,
                             "queued_manifest_mutation_bytes": 0,
                             "queue_wait_ms": []
                         ]
                     ])
-                case "codemap_projection_hold_acquire":
+                case "codemap_graph_index_hold_acquire":
                     let targetRootID: UUID
                     if debugString(arguments, "target_root_id") != nil {
                         targetRootID = try debugRequiredUUID(arguments, key: "target_root_id")
@@ -330,7 +330,7 @@ import MCP
                         key: "expires_ms",
                         range: 10501 ... 60000
                     )
-                    guard let acquired = await resolved.store.debugAcquireCodemapProjectionAdmissionHold(
+                    guard let acquired = await resolved.store.debugAcquireCodemapGraphIndexAdmissionHold(
                         rootID: targetRootID,
                         expiresAfterMilliseconds: UInt64(expiresMilliseconds)
                     ) else {
@@ -347,19 +347,19 @@ import MCP
                         "target_root_id": targetRootID.uuidString,
                         "hold_id": acquired.holdID.uuidString,
                         "expires_ms": expiresMilliseconds,
-                        "codemap_projection": debugCodemapProjectionPayload((
+                        "codemap_graph_index": debugCodemapGraphIndexPayload((
                             metrics: acquired.metrics,
                             queueWaitMilliseconds: acquired.queueWaitMilliseconds
                         ))
                     ])
-                case "codemap_projection_hold_release":
+                case "codemap_graph_index_hold_release":
                     let targetRootID: UUID = if debugString(arguments, "target_root_id") != nil {
                         try debugRequiredUUID(arguments, key: "target_root_id")
                     } else {
                         scope.rootID
                     }
                     let holdID = try debugRequiredUUID(arguments, key: "hold_id")
-                    guard let released = await resolved.store.debugReleaseCodemapProjectionAdmissionHold(
+                    guard let released = await resolved.store.debugReleaseCodemapGraphIndexAdmissionHold(
                         rootID: targetRootID,
                         holdID: holdID
                     ) else {
@@ -376,7 +376,7 @@ import MCP
                         "target_root_id": targetRootID.uuidString,
                         "hold_id": holdID.uuidString,
                         "released": released.released,
-                        "codemap_projection": debugCodemapProjectionPayload((
+                        "codemap_graph_index": debugCodemapGraphIndexPayload((
                             metrics: released.metrics,
                             queueWaitMilliseconds: released.queueWaitMilliseconds
                         ))
@@ -627,7 +627,7 @@ import MCP
             ]
         }
 
-        private nonisolated func debugCodemapProjectionPayload(
+        private nonisolated func debugCodemapGraphIndexPayload(
             _ snapshot: (metrics: [String: UInt64], queueWaitMilliseconds: [UInt64])
         ) -> [String: Any] {
             var payload = snapshot.metrics.reduce(into: [String: Any]()) { result, item in

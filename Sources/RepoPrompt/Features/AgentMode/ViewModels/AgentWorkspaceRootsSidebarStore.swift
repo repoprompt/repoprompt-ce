@@ -3,12 +3,14 @@ import Foundation
 
 struct AgentWorkspaceCodemapPresentation: Equatable {
     enum State: Equatable {
-        case pending
-        case mapping
-        case waiting
+        case notInitialized
+        case indexing
         case ready
+        case updating
+        case reconciling
         case paused
         case unavailable
+        case revoked
     }
 
     enum Tone: Equatable {
@@ -19,25 +21,27 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
     }
 
     let state: State
-    /// Durable candidate coverage accepted by the projection catalog.
-    let processedCandidateCount: UInt64
-    /// Ephemeral candidates resolved locally in the active batch, expressed through the root.
-    let locallyResolvedCandidateCountThroughRoot: UInt64?
-    let totalCandidateCount: UInt64?
+    let classifiedCount: UInt64
+    let supportedCount: UInt64?
+    let pendingCount: UInt64
+    let updatesPending: Bool
+    let graphRevision: UInt64?
 
     static let pending = Self(
-        state: .pending,
-        processedCandidateCount: 0,
-        locallyResolvedCandidateCountThroughRoot: nil,
-        totalCandidateCount: nil
+        state: .notInitialized,
+        classifiedCount: 0,
+        supportedCount: nil,
+        pendingCount: 0,
+        updatesPending: false,
+        graphRevision: nil
     )
 
     var tone: Tone {
         switch state {
-        case .pending, .mapping: .accent
-        case .waiting: .warning
+        case .notInitialized, .indexing, .updating: .accent
+        case .reconciling: .warning
         case .ready: .success
-        case .paused, .unavailable: .secondary
+        case .paused, .unavailable, .revoked: .secondary
         }
     }
 
@@ -46,36 +50,27 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
     }
 
     var canToggle: Bool {
-        state != .unavailable
+        state != .unavailable && state != .revoked
     }
 
     var isActivelyMapping: Bool {
         switch state {
-        case .pending, .mapping: true
-        case .waiting, .ready, .paused, .unavailable: false
+        case .notInitialized, .indexing, .updating, .reconciling: true
+        case .ready, .paused, .unavailable, .revoked: false
         }
     }
 
     var showsProgress: Bool {
         switch state {
-        case .pending, .mapping, .waiting: true
-        case .ready, .paused, .unavailable: false
+        case .notInitialized, .indexing, .updating, .reconciling: true
+        case .ready, .paused, .unavailable, .revoked: false
         }
     }
 
-    var displayProcessedCandidateCount: UInt64 {
-        let displayed = max(
-            processedCandidateCount,
-            locallyResolvedCandidateCountThroughRoot ?? 0
-        )
-        guard let totalCandidateCount else { return displayed }
-        return min(displayed, totalCandidateCount)
-    }
-
     var progressFraction: Double? {
-        if state == .ready, totalCandidateCount == 0 { return 1 }
-        guard let totalCandidateCount, totalCandidateCount > 0 else { return nil }
-        let fraction = min(1, Double(displayProcessedCandidateCount) / Double(totalCandidateCount))
+        if state == .ready, supportedCount == 0 { return 1 }
+        guard let supportedCount, supportedCount > 0 else { return nil }
+        let fraction = min(1, Double(min(classifiedCount, supportedCount)) / Double(supportedCount))
         return state == .ready ? fraction : min(0.99, fraction)
     }
 
@@ -89,51 +84,64 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
 
     var statusText: String {
         switch state {
-        case .pending: "Preparing…"
-        case .mapping: percentageText.map { "Mapping \($0)" } ?? "Mapping…"
-        case .waiting: percentageText.map { "Waiting at \($0)" } ?? "Waiting…"
+        case .notInitialized: "Preparing…"
+        case .indexing: percentageText.map { "Indexing \($0)" } ?? "Indexing…"
         case .ready: "Mapped"
+        case .updating: percentageText.map { "Updating \($0)" } ?? "Updating…"
+        case .reconciling: "Reconciling…"
         case .paused: "Paused"
         case .unavailable: "Unavailable"
+        case .revoked: "Revoked"
         }
     }
 
     var tooltip: String {
         switch state {
-        case .pending:
-            "Code Map generation is preparing."
-        case .mapping:
-            if let totalCandidateCount {
-                "Code Map generation: \(displayProcessedCandidateCount) of \(totalCandidateCount) files processed for mapping (\(percentageText ?? "0%"))."
+        case .notInitialized:
+            "Code Map indexing is preparing."
+        case .indexing:
+            if let supportedCount {
+                "Code Map graph coverage: \(classifiedCount) of \(supportedCount) files indexed (\(percentageText ?? "0%"))."
             } else {
-                "Code Map generation is in progress."
+                "Code Map indexing is in progress."
             }
-        case .waiting:
-            "Code Map generation is waiting to continue."
         case .ready:
-            "Code Map generation is complete: \(displayProcessedCandidateCount) files mapped."
+            "Code Map graph is ready with \(classifiedCount) indexed files."
+        case .updating:
+            "Code Map graph is usable and applying pending updates."
+        case .reconciling:
+            "Code Map graph is usable while watcher changes are reconciled."
         case .paused:
-            "Paused for this loaded root. Resume to allow Code Map generation."
+            "Paused for this loaded root. Resume to allow Code Map indexing."
         case .unavailable:
-            "Code Maps are unavailable because this root is not a Git repository."
+            "Code Maps are unavailable for this root."
+        case .revoked:
+            "Code Map graph authority was revoked and must be re-established."
         }
     }
 
     static func make(_ snapshot: WorkspaceCodemapRootStatusSnapshot?) -> Self {
         guard let snapshot else { return .pending }
-        let state: State = switch snapshot.state {
-        case .idle, .preparing: .pending
-        case .generating: .mapping
-        case .waiting: .waiting
-        case .ready: .ready
-        case .paused: .paused
-        case .unavailable: .unavailable
+        let state: State = if snapshot.isGenerationSuspended {
+            .paused
+        } else {
+            switch snapshot.availability {
+            case .notInitialized: .notInitialized
+            case .indexing: .indexing
+            case .ready: .ready
+            case .updating: .updating
+            case .reconciling: .reconciling
+            case .unavailable: .unavailable
+            case .revoked: .revoked
+            }
         }
         return Self(
             state: state,
-            processedCandidateCount: snapshot.processedCandidateCount,
-            locallyResolvedCandidateCountThroughRoot: snapshot.locallyResolvedCandidateCountThroughRoot,
-            totalCandidateCount: snapshot.totalCandidateCount
+            classifiedCount: snapshot.coverage?.classifiedCount ?? 0,
+            supportedCount: snapshot.coverage?.supportedCount,
+            pendingCount: snapshot.coverage?.pendingCount ?? 0,
+            updatesPending: snapshot.updatesPending,
+            graphRevision: snapshot.graphRevision
         )
     }
 }

@@ -892,7 +892,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 params: [
                     "name": MCPWindowToolName.getCodeStructure,
                     "arguments": [
-                        "scope": "paths",
                         "paths": [nonGitFile.path]
                     ]
                 ]
@@ -904,11 +903,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(work.count, 1)
             XCTAssertEqual(work.first?.operation, MCPWindowToolName.getCodeStructure)
             let gitCommands = work.first?.commands ?? []
-            XCTAssertEqual(work.first?.commandCount, 3, gitCommands.joined(separator: "\n"))
-            XCTAssertTrue(
-                gitCommands.contains { $0.contains("rev-parse --show-toplevel") },
-                gitCommands.joined(separator: "\n")
-            )
+            XCTAssertEqual(work.first?.commandCount, 0, gitCommands.joined(separator: "\n"))
+            XCTAssertTrue(gitCommands.isEmpty)
             XCTAssertEqual(work.first?.outcome, "success")
         }
 

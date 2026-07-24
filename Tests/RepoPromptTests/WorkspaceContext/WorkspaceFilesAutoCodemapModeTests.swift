@@ -67,21 +67,6 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.snapshotSelection().manualCodemapPaths.isEmpty)
     }
 
-    func testGraphReadinessDoesNotMutateManualMode() {
-        let fixture = makeFixture(fileName: "Manual.swift")
-        fixture.viewModel.enterManualCodemapMode()
-
-        fixture.viewModel.handleAutomaticCodemapReadinessForTesting(
-            rootEpoch: WorkspaceCodemapRootEpoch(
-                rootID: fixture.file.rootIdentifier,
-                rootLifetimeID: UUID()
-            )
-        )
-
-        XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
-        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
-    }
-
     func testNewSourceGenerationClearsExistingInferredMarkersSynchronously() {
         let fixture = makeFixture(fileName: "Generation.swift")
         fixture.viewModel.setAutoCodemapFilesForTesting([fixture.file])
@@ -205,23 +190,24 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         }
     }
 
-    func testPublicationRevalidationIsFinalAwaitBeforeSynchronousCommit() throws {
+    func testValueReceiptRevalidationIsFinalAwaitBeforeSynchronousCommit() throws {
         let repoRoot = try RepoRoot.url()
         let sourceURL = repoRoot.appendingPathComponent(
             "Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift"
         )
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        let revalidation = try XCTUnwrap(try source.range(
+        let revalidationCall = try XCTUnwrap(source.range(
+            of: "let revalidation = await workspaceFileContextStore.revalidateAutomaticCodemapSelection("
+        ))
+        let postRevalidationGuard = try XCTUnwrap(source.range(
             of: "guard automaticCodemapSelectionIsCurrent(",
-            range: XCTUnwrap(source.range(
-                of: "revalidateAutomaticCodemapSelectionForPublication("
-            )).upperBound ..< source.endIndex
+            range: revalidationCall.upperBound ..< source.endIndex
         ))
         let commit = try XCTUnwrap(source.range(
             of: "resetAutoCodemapFiles(resolvedTargets)",
-            range: revalidation.lowerBound ..< source.endIndex
+            range: postRevalidationGuard.lowerBound ..< source.endIndex
         ))
-        let synchronousCommitRegion = source[revalidation.lowerBound ..< commit.upperBound]
+        let synchronousCommitRegion = source[postRevalidationGuard.lowerBound ..< commit.upperBound]
         XCTAssertFalse(synchronousCommitRegion.contains("await"))
     }
 

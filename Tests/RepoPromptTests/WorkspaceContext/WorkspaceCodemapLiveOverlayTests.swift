@@ -19,7 +19,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         requireSendable(WorkspaceCodemapLiveEntrySnapshot.self)
         requireSendable(WorkspaceCodemapLiveRootSnapshot.self)
         requireSendable(WorkspaceCodemapLiveReadySnapshot.self)
-        requireSendable(WorkspaceCodemapLiveGraphSnapshot.self)
         requireSendable(WorkspaceCodemapLiveFrozenArtifactHandle.self)
         requireSendable(WorkspaceCodemapLiveOverlayRootAccounting.self)
         requireSendable(WorkspaceCodemapLiveOverlayAccounting.self)
@@ -199,8 +198,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         assertTrueValue(snapshot.entries.allSatisfy {
             if case .shadowed(.renamed) = $0.state { true } else { false }
         })
-        let graphValue = await fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
-        try assertTrueValue(unwrapValue(graphValue).bindings.isEmpty)
     }
 
     func testCheckoutAndAuthorityInvalidationFencePendingCompletionAndPermitExplicitRebind() async throws {
@@ -406,7 +403,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let frozenHandle = try XCTUnwrap(try bundle.handle(for: ready.token.identity.fileID))
         XCTAssertEqual(try frozenHandle.artifactKey(), ready.completion.artifactKey)
         XCTAssertEqual(try bundle.snapshot().count, 1)
-        XCTAssertEqual(try bundle.graphSnapshot().bindings.count, 1)
         XCTAssertNotNil(try bundle.renderedCodemap(
             for: ready.token.identity.fileID,
             displayPath: "Logical/Lease.swift"
@@ -417,9 +413,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         XCTAssertTrue(bundle.isClosed)
         XCTAssertTrue(bundle.entries.isEmpty)
         XCTAssertThrowsError(try bundle.snapshot()) {
-            XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
-        }
-        XCTAssertThrowsError(try bundle.graphSnapshot()) {
             XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
         }
         XCTAssertThrowsError(try bundle.handle(for: ready.token.identity.fileID)) {
@@ -550,65 +543,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         ))
     }
 
-    func testGraphSnapshotEmitsOnlyCurrentReadyBindings() async throws {
-        let fixture = try await makeRootFixture(
-            name: #function,
-            files: [
-                "Ready.swift": SwiftFixtureSource.emptyStruct("Ready", trailingNewline: false),
-                "Pending.swift": SwiftFixtureSource.emptyStruct("Pending", trailingNewline: false),
-                "Unavailable.swift": SwiftFixtureSource.emptyStruct("Unavailable", trailingNewline: false)
-            ]
-        )
-        defer { fixture.cleanup() }
-        let ready = try await makeWorktreeReady(
-            fixture: fixture,
-            path: "Ready.swift",
-            requestGeneration: 1,
-            artifactName: "Ready"
-        )
-        let pending = try await makeWorktreeReady(
-            fixture: fixture,
-            path: "Pending.swift",
-            requestGeneration: 1,
-            artifactName: "Pending"
-        )
-        let readyTicket = try await startedTicket(fixture.overlay.beginDemand(owner: .init(), token: ready.token))
-        _ = try await startedTicket(fixture.overlay.beginDemand(owner: .init(), token: pending.token))
-        _ = try await acceptedReady(fixture.overlay.acceptCompletion(
-            ticket: readyTicket,
-            completion: ready.completion,
-            lease: ready.lease
-        ))
-        let unavailable = try await makeWorktreeReady(
-            fixture: fixture,
-            path: "Unavailable.swift",
-            requestGeneration: 1,
-            artifactName: "Unavailable"
-        )
-        let unavailableTicket = try await startedTicket(fixture.overlay.beginDemand(
-            owner: .init(),
-            token: unavailable.token
-        ))
-        let unavailableSet = await fixture.overlay.setUnavailable(
-            ticket: unavailableTicket,
-            reason: .transient
-        )
-        assertEqualValue(unavailableSet, .accepted)
-        await unavailable.lease.close()
-
-        let graphValue = await fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
-        let graph = try unwrapValue(graphValue)
-        assertEqualValue(graph.bindings.count, 1)
-        assertEqualValue(graph.bindings[0].identity.fileID, ready.token.identity.fileID)
-        let store = try unwrapValue(WorkspaceCodemapSelectionGraphModelStore.authorized(
-            by: graph.bindings[0],
-            contributionGeneration: graph.contributionGeneration
-        ))
-        guard case .accepted = store.accept(graph.bindings[0]) else {
-            return XCTFail("Emitted graph binding must be directly consumable by the graph model.")
-        }
-    }
-
     func testBoundsApplyBusyWaiterPolicyAndEvictActorOwnershipWithoutBreakingFrozenHandle() async throws {
         let policy = WorkspaceCodemapLiveOverlayPolicy(
             maximumRootCount: 1,
@@ -673,6 +607,14 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         assertEqualValue(accounting.evictionCount, 1)
         assertEqualValue(accounting.admissionReservationCount, 0)
         assertEqualValue(frozen.entries[0].artifactKey, first.completion.artifactKey)
+
+        let graphCheckpoint = await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch)
+        guard case let .checkpoint(checkpoint) = graphCheckpoint,
+              let retained = checkpoint.slots.first(where: { $0.fileID == first.token.identity.fileID })
+        else { return XCTFail("Artifact eviction must retain the lightweight graph contribution.") }
+        guard case .contributed = retained.state else {
+            return XCTFail("Evicted ready artifact must retain its contributed graph slot.")
+        }
     }
 
     func testAdmissionReservationsAreBoundedFIFOAndReclaimedByCancellationAndUnload() async throws {
@@ -803,7 +745,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         }
     }
 
-    func testTerminalCompletionBecomesUnavailableAndNeverEmitsGraphContribution() async throws {
+    func testTerminalCompletionBecomesUnavailableAndNeverFreezesArtifact() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
             files: ["Terminal.swift": SwiftFixtureSource.emptyStruct("Terminal", trailingNewline: false)]
@@ -829,8 +771,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         }
         let bundleValue = await fixture.overlay.freeze(rootEpoch: fixture.rootEpoch)
         try assertTrueValue(unwrapValue(bundleValue).entries.isEmpty)
-        let graphValue = await fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
-        try assertTrueValue(unwrapValue(graphValue).bindings.isEmpty)
     }
 
     func testCompletionValidationAndBusyAdmissionRemainRetryable() async throws {
@@ -1429,7 +1369,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         assertFalseValue(snapshot.authorityIsCurrent)
     }
 
-    func testContributionGenerationExhaustionRevokesOldGraphSnapshotWithoutABA() async throws {
+    func testContributionGenerationExhaustionRevokesGraphChangesWithoutABA() async throws {
         let overlay = WorkspaceCodemapLiveOverlay(initialContributionGeneration: .max)
         let fixture = try await makeRootFixture(
             name: #function,
@@ -1438,7 +1378,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         defer { fixture.cleanup() }
 
-        let oldGraph = try await unwrapValue(overlay.graphContributions(rootEpoch: fixture.rootEpoch))
         let ready = try await makeWorktreeReady(
             fixture: fixture,
             path: "Fence.swift",
@@ -1447,8 +1386,10 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         _ = try await startedTicket(overlay.beginDemand(owner: .init(), token: ready.token))
 
-        await assertNilValue(overlay.consumeGraphSnapshot(oldGraph))
-        await assertNilValue(overlay.graphContributions(rootEpoch: fixture.rootEpoch))
+        guard case .revoked = await overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: .init(rawValue: 0)
+        ) else { return XCTFail("Contribution generation exhaustion must revoke graph pulls.") }
         await assertNilValue(overlay.freeze(rootEpoch: fixture.rootEpoch))
         await ready.lease.close()
     }
@@ -2272,88 +2213,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         await third.lease.close()
     }
 
-    func testGraphSnapshotsRequireConsumeTimeCurrentness() async throws {
-        let fixture = try await makeRootFixture(
-            name: #function,
-            files: ["Graph.swift": SwiftFixtureSource.emptyStruct("Graph", trailingNewline: false)]
-        )
-        defer { fixture.cleanup() }
-        let fileID = uuid("B5000000-0000-0000-0000-000000000001")
-        let first = try await makeWorktreeReady(
-            fixture: fixture,
-            path: "Graph.swift",
-            fileID: fileID,
-            requestGeneration: 1,
-            artifactName: "Graph"
-        )
-        let firstTicket = try await startedTicket(
-            fixture.overlay.beginDemand(owner: .init(), token: first.token)
-        )
-        _ = try await acceptedReady(fixture.overlay.acceptCompletion(
-            ticket: firstTicket,
-            completion: first.completion,
-            lease: first.lease
-        ))
-        let firstGraph = try await unwrapValue(
-            fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
-        )
-        await assertEqualValue(fixture.overlay.consumeGraphSnapshot(firstGraph)?.count, 1)
-
-        let foreignCatalogGraph = WorkspaceCodemapLiveGraphSnapshot(
-            rootEpoch: firstGraph.rootEpoch,
-            catalogGeneration: firstGraph.catalogGeneration + 1,
-            repositoryAuthority: firstGraph.repositoryAuthority,
-            contributionGeneration: firstGraph.contributionGeneration,
-            bindings: firstGraph.bindings
-        )
-        await assertNilValue(fixture.overlay.consumeGraphSnapshot(foreignCatalogGraph))
-        let foreignRepositoryGraph = WorkspaceCodemapLiveGraphSnapshot(
-            rootEpoch: firstGraph.rootEpoch,
-            catalogGeneration: firstGraph.catalogGeneration,
-            repositoryAuthority: repositoryAuthority(
-                like: firstGraph.repositoryAuthority,
-                authorityGeneration: firstGraph.repositoryAuthority.authorityGeneration + 1
-            ),
-            contributionGeneration: firstGraph.contributionGeneration,
-            bindings: firstGraph.bindings
-        )
-        await assertNilValue(fixture.overlay.consumeGraphSnapshot(foreignRepositoryGraph))
-
-        _ = await fixture.overlay.invalidatePaths(
-            rootEpoch: fixture.rootEpoch,
-            standardizedRelativePaths: ["Graph.swift"],
-            reason: .modified
-        )
-        await assertNilValue(fixture.overlay.consumeGraphSnapshot(firstGraph))
-        let invalidatedGraph = try await unwrapValue(
-            fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
-        )
-        await assertEqualValue(fixture.overlay.consumeGraphSnapshot(invalidatedGraph)?.count, 0)
-
-        let replacement = try await makeWorktreeReady(
-            fixture: fixture,
-            path: "Graph.swift",
-            fileID: fileID,
-            requestGeneration: 2,
-            artifactName: "Graph"
-        )
-        let replacementTicket = try await startedTicket(
-            fixture.overlay.beginDemand(owner: .init(), token: replacement.token)
-        )
-        _ = try await acceptedReady(fixture.overlay.acceptCompletion(
-            ticket: replacementTicket,
-            completion: replacement.completion,
-            lease: replacement.lease
-        ))
-        await assertNilValue(fixture.overlay.consumeGraphSnapshot(invalidatedGraph))
-        let replacementGraph = try await unwrapValue(
-            fixture.overlay.graphContributions(rootEpoch: fixture.rootEpoch)
-        )
-        await assertEqualValue(fixture.overlay.consumeGraphSnapshot(replacementGraph)?.count, 1)
-        await assertTrueValue(fixture.overlay.unregister(rootEpoch: fixture.rootEpoch))
-        await assertNilValue(fixture.overlay.consumeGraphSnapshot(replacementGraph))
-    }
-
     func testCompletionStaleFencesIdentifyEveryAuthorityDimension() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
@@ -2732,6 +2591,594 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
             ),
             1
         )
+    }
+
+    func testGraphLedgerPullSemanticsAccumulateFloorAndEmitDestructiveRemoval() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Sources/Graph.swift": SwiftFixtureSource.emptyStruct("Graph", trailingNewline: false)]
+        )
+        defer { fixture.cleanup() }
+        let ready = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Sources/Graph.swift",
+            fileID: uuid("8A000000-0000-0000-0000-000000000001"),
+            requestGeneration: 1,
+            artifactName: "Graph"
+        )
+        let slot = try XCTUnwrap(try? WorkspaceCodemapGraphSlot.validated(
+            rootEpoch: fixture.rootEpoch,
+            identity: ready.token.identity,
+            requestGeneration: 1,
+            pathGeneration: 1,
+            pipelineIdentity: ready.token.pipelineIdentity,
+            state: .pending,
+            diagnostics: .init(contributionDigest: nil, source: .graphIndex)
+        ).get())
+        let catalogToken = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+
+        let published = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: catalogToken,
+            slots: [slot]
+        )
+        XCTAssertTrue(published)
+        let first: WorkspaceCodemapSelectionGraphContributionGeneration
+        switch await fixture.overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: .init(rawValue: 1)
+        ) {
+        case let .diff(changed, removed, coverage, generation):
+            XCTAssertEqual(changed, [slot])
+            XCTAssertTrue(removed.isEmpty)
+            XCTAssertEqual(coverage.enumerationState, .partial)
+            first = generation
+        default:
+            return XCTFail("Expected the first graph pull to be a diff.")
+        }
+        let unchanged = await fixture.overlay.graphChanges(rootEpoch: fixture.rootEpoch, since: first)
+        XCTAssertEqual(unchanged, .unchanged(generation: first))
+
+        let advancedFloor = await fixture.overlay.advanceGraphResyncFloor(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(advancedFloor)
+        guard case let .resync(checkpoint, generation) = await fixture.overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: .init(rawValue: 0)
+        ) else { return XCTFail("A pull below the floor must receive a checkpoint.") }
+        XCTAssertEqual(checkpoint.slots, [slot])
+        XCTAssertEqual(generation, first)
+
+        let invalidatedCount = await fixture.overlay.invalidatePaths(
+            rootEpoch: fixture.rootEpoch,
+            standardizedRelativePaths: ["Sources/Graph.swift"],
+            reason: .deleted
+        )
+        XCTAssertEqual(invalidatedCount, 1)
+        guard case let .diff(changed, removed, _, removalGeneration) = await fixture.overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: first
+        ) else { return XCTFail("Expected a destructive removal diff.") }
+        XCTAssertTrue(changed.isEmpty)
+        XCTAssertEqual(removed.map(\.fileID), [slot.fileID])
+        XCTAssertEqual(removed.map(\.reason), [.deleted])
+        XCTAssertGreaterThan(removalGeneration, first)
+
+        let unregistered = await fixture.overlay.unregister(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(unregistered)
+        let revoked = await fixture.overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: removalGeneration
+        )
+        XCTAssertEqual(revoked, .revoked(.rootUnloaded))
+    }
+
+    func testGraphSlotsPreservePathGenerationForExactFenceMatching() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)]
+        )
+        defer { fixture.cleanup() }
+        let ready = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Fence.swift",
+            fileID: uuid("8A000000-0000-0000-0000-000000000002"),
+            requestGeneration: 1,
+            artifactName: "Fence",
+            pathGeneration: 2,
+            ingressGeneration: 1
+        )
+        let indexedSlot = try WorkspaceCodemapGraphSlot.validated(
+            rootEpoch: fixture.rootEpoch,
+            identity: ready.token.identity,
+            requestGeneration: 1,
+            pathGeneration: 2,
+            pipelineIdentity: ready.token.pipelineIdentity,
+            state: .pending,
+            diagnostics: .init(contributionDigest: nil, source: .graphIndex)
+        ).get()
+        let catalogToken = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let published = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: catalogToken,
+            slots: [indexedSlot],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(published)
+        let fence = WorkspaceCodemapGraphFenceIdentity(fileID: indexedSlot.fileID, slot: indexedSlot)
+
+        let ticket = try await startedTicket(
+            fixture.overlay.beginDemand(owner: .init(), token: ready.token)
+        )
+        guard case let .checkpoint(pendingCheckpoint) = await fixture.overlay.graphCheckpoint(
+            rootEpoch: fixture.rootEpoch
+        ), let pendingSlot = pendingCheckpoint.slots.first
+        else { return XCTFail("Expected a live pending graph slot.") }
+        XCTAssertEqual(pendingSlot.requestGeneration, 1)
+        XCTAssertEqual(pendingSlot.pathGeneration, 2)
+        XCTAssertTrue(fence.matches(pendingSlot))
+
+        guard case .accepted = await fixture.overlay.acceptCompletion(
+            ticket: ticket,
+            completion: ready.completion,
+            lease: ready.lease
+        ) else { return XCTFail("Expected the live completion to publish.") }
+        guard case let .checkpoint(readyCheckpoint) = await fixture.overlay.graphCheckpoint(
+            rootEpoch: fixture.rootEpoch
+        ), let readySlot = readyCheckpoint.slots.first
+        else { return XCTFail("Expected a live ready graph slot.") }
+        XCTAssertEqual(readySlot.pathGeneration, 2)
+        XCTAssertTrue(fence.matches(readySlot))
+
+        let invalidated = await fixture.overlay.invalidatePaths(
+            rootEpoch: fixture.rootEpoch,
+            standardizedRelativePaths: ["Fence.swift"],
+            reason: .modified
+        )
+        XCTAssertEqual(invalidated, 1)
+        guard case let .checkpoint(invalidatedCheckpoint) = await fixture.overlay.graphCheckpoint(
+            rootEpoch: fixture.rootEpoch
+        ), let invalidatedSlot = invalidatedCheckpoint.slots.first
+        else { return XCTFail("Expected the invalidated graph-index slot to remain pending.") }
+        XCTAssertEqual(invalidatedSlot.pathGeneration, 2)
+        XCTAssertTrue(fence.matches(invalidatedSlot))
+    }
+
+    func testGraphLivePathPrecedenceAndReconciliationPreserveArtifactResidency() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Shared.swift": SwiftFixtureSource.emptyStruct("Live", trailingNewline: false)]
+        )
+        defer { fixture.cleanup() }
+        let live = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Shared.swift",
+            fileID: uuid("8C000000-0000-0000-0000-000000000001"),
+            requestGeneration: 2,
+            artifactName: "Live"
+        )
+        let liveTicket = try await startedTicket(
+            fixture.overlay.beginDemand(owner: .init(), token: live.token)
+        )
+        guard case .accepted = await fixture.overlay.acceptCompletion(
+            ticket: liveTicket,
+            completion: live.completion,
+            lease: live.lease
+        ) else { return XCTFail("Expected the live contribution to publish.") }
+
+        let stale = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Shared.swift",
+            fileID: uuid("8C000000-0000-0000-0000-000000000002"),
+            requestGeneration: 1,
+            artifactName: "Live"
+        )
+        let staleSlot = try WorkspaceCodemapGraphSlot.validated(
+            rootEpoch: fixture.rootEpoch,
+            identity: stale.token.identity,
+            requestGeneration: 1,
+            pathGeneration: 1,
+            pipelineIdentity: stale.token.pipelineIdentity,
+            state: .pending,
+            diagnostics: .init(contributionDigest: nil, source: .graphIndex)
+        ).get()
+        let token = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let initialPublish = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [staleSlot],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(initialPublish)
+        guard case let .checkpoint(initial) = await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected a graph checkpoint.")
+        }
+        XCTAssertEqual(initial.slots.map(\.fileID), [live.token.identity.fileID])
+
+        let beganReconciliation = await fixture.overlay.beginGraphReconciliation(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(beganReconciliation)
+        let reconciliationPublish = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(reconciliationPublish)
+        guard case let .checkpoint(reconciled) = await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected a reconciled graph checkpoint.")
+        }
+        XCTAssertEqual(reconciled.slots.map(\.fileID), [live.token.identity.fileID])
+        let frozenValue = await fixture.overlay.freeze(rootEpoch: fixture.rootEpoch)
+        let frozen = try XCTUnwrap(frozenValue)
+        XCTAssertEqual(frozen.entries.map(\.fileID), [live.token.identity.fileID])
+        await stale.lease.close()
+    }
+
+    func testGraphWatcherReconciliationCoalescesAndForcesCheckpointRemovingMissingSlots() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: [
+                "A.swift": SwiftFixtureSource.emptyStruct("A", trailingNewline: false),
+                "B.swift": SwiftFixtureSource.emptyStruct("B", trailingNewline: false)
+            ]
+        )
+        defer { fixture.cleanup() }
+        let a = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "A.swift",
+            fileID: uuid("8B000000-0000-0000-0000-000000000001"),
+            requestGeneration: 1,
+            artifactName: "A"
+        )
+        let b = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "B.swift",
+            fileID: uuid("8B000000-0000-0000-0000-000000000002"),
+            requestGeneration: 1,
+            artifactName: "B"
+        )
+        func classified(_ ready: ReadyFixture) throws -> WorkspaceCodemapGraphSlot {
+            try WorkspaceCodemapGraphSlot.validated(
+                rootEpoch: fixture.rootEpoch,
+                identity: ready.token.identity,
+                requestGeneration: 1,
+                pathGeneration: 1,
+                pipelineIdentity: ready.token.pipelineIdentity,
+                state: .empty(CodeMapSelectionGraphContribution(
+                    artifactKey: ready.completion.artifactKey,
+                    definitions: [],
+                    references: []
+                ))
+            ).get()
+        }
+        let slots = try [classified(a), classified(b)]
+        let token = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let initialPublish = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: slots,
+            enumerationFinished: true
+        )
+        XCTAssertTrue(initialPublish)
+        let baseline: WorkspaceCodemapSelectionGraphContributionGeneration
+        switch await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) {
+        case let .checkpoint(checkpoint): baseline = checkpoint.generation
+        case .revoked: return XCTFail("Expected an initial graph checkpoint.")
+        }
+
+        let began = await fixture.overlay.beginGraphReconciliation(rootEpoch: fixture.rootEpoch)
+        let coalesced = await fixture.overlay.beginGraphReconciliation(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(began)
+        XCTAssertTrue(coalesced)
+        let reconciliationPublish = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [slots[0]],
+            enumerationFinished: true,
+            reconciliationFence: { _, _ in .fenced(safetyCounter: 1) }
+        )
+        XCTAssertTrue(reconciliationPublish)
+        guard case let .resync(checkpoint, generation) = await fixture.overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: baseline
+        ) else { return XCTFail("A sealed reconciliation must force a resync checkpoint.") }
+        XCTAssertGreaterThan(generation, baseline)
+        XCTAssertEqual(checkpoint.slots.map(\.fileID), [a.token.identity.fileID])
+        XCTAssertTrue(checkpoint.coverage.isComplete)
+
+        let beganMissingFenceReconciliation = await fixture.overlay.beginGraphReconciliation(
+            rootEpoch: fixture.rootEpoch
+        )
+        XCTAssertTrue(beganMissingFenceReconciliation)
+        let missingFencePublication = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [],
+            enumerationFinished: true
+        )
+        XCTAssertFalse(missingFencePublication)
+        let missingFenceCheckpoint = await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(missingFenceCheckpoint, .revoked(.reconciliationFailed))
+    }
+
+    func testReconciliationRemovalsCarryDestructiveReasonsAndAwaitFencesBeforeCompleteCheckpoint() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: [
+                "Retained.swift": SwiftFixtureSource.emptyStruct("Retained", trailingNewline: false),
+                "Removed.swift": SwiftFixtureSource.emptyStruct("Removed", trailingNewline: false),
+                "Original.swift": SwiftFixtureSource.emptyStruct("Original", trailingNewline: false)
+            ]
+        )
+        defer { fixture.cleanup() }
+        let retained = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Retained.swift",
+            fileID: uuid("8D000000-0000-0000-0000-000000000001"),
+            requestGeneration: 1,
+            artifactName: "Retained"
+        )
+        let removed = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Removed.swift",
+            fileID: uuid("8D000000-0000-0000-0000-000000000002"),
+            requestGeneration: 1,
+            artifactName: "Removed"
+        )
+        let renamed = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Original.swift",
+            fileID: uuid("8D000000-0000-0000-0000-000000000003"),
+            requestGeneration: 1,
+            artifactName: "Original"
+        )
+        func classified(_ ready: ReadyFixture) throws -> WorkspaceCodemapGraphSlot {
+            try WorkspaceCodemapGraphSlot.validated(
+                rootEpoch: fixture.rootEpoch,
+                identity: ready.token.identity,
+                requestGeneration: 1,
+                pathGeneration: 1,
+                pipelineIdentity: ready.token.pipelineIdentity,
+                state: .empty(CodeMapSelectionGraphContribution(
+                    artifactKey: ready.completion.artifactKey,
+                    definitions: [],
+                    references: []
+                ))
+            ).get()
+        }
+        let retainedSlot = try classified(retained)
+        let removedSlot = try classified(removed)
+        let originalSlot = try classified(renamed)
+        let renamedIdentity = try XCTUnwrap(WorkspaceCodemapArtifactBindingIdentity(
+            rootID: fixture.rootEpoch.rootID,
+            rootLifetimeID: fixture.rootEpoch.rootLifetimeID,
+            fileID: originalSlot.fileID,
+            standardizedRootPath: renamed.token.identity.standardizedRootPath,
+            standardizedRelativePath: "Renamed.swift",
+            standardizedFullPath: URL(fileURLWithPath: renamed.token.identity.standardizedRootPath)
+                .appendingPathComponent("Renamed.swift").path
+        ))
+        let renamedSlot = try WorkspaceCodemapGraphSlot.validated(
+            rootEpoch: fixture.rootEpoch,
+            identity: renamedIdentity,
+            requestGeneration: 2,
+            pathGeneration: 2,
+            pipelineIdentity: originalSlot.pipelineIdentity,
+            state: originalSlot.state
+        ).get()
+        let token = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let initialPublished = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [retainedSlot, removedSlot, originalSlot],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(initialPublished)
+        guard case let .checkpoint(initial) = await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected the initial complete checkpoint.")
+        }
+
+        let gate = OverlayReconciliationFenceGate()
+        defer { gate.release() }
+        let beganReconciliation = await fixture.overlay.beginGraphReconciliation(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(beganReconciliation)
+        let publication = Task {
+            await fixture.overlay.publishGraphIndexSlots(
+                rootEpoch: fixture.rootEpoch,
+                catalogToken: token,
+                slots: [retainedSlot, renamedSlot],
+                enumerationFinished: true,
+                reconciliationFence: { fileIDs, reason in
+                    await gate.enter(fileIDs: fileIDs, reason: reason)
+                }
+            )
+        }
+        let enteredFence = await gate.waitUntilEntered()
+        XCTAssertTrue(enteredFence)
+        XCTAssertEqual(gate.fileIDs, Set([removedSlot.fileID]))
+        XCTAssertEqual(gate.reason, .deleted)
+
+        guard case let .diff(changed, removals, coverage, generation) = await fixture.overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: initial.generation
+        ) else { return XCTFail("Overlay removal must publish before the fence boundary.") }
+        XCTAssertEqual(changed.map(\.fileID), [renamedSlot.fileID])
+        XCTAssertEqual(Set(removals.map(\.fileID)), Set([removedSlot.fileID, renamedSlot.fileID]))
+        XCTAssertEqual(Set(removals.map(\.reason)), Set([.deleted, .renamed]))
+        XCTAssertEqual(coverage.enumerationState, .partial)
+        XCTAssertGreaterThan(generation, initial.generation)
+        guard case let .checkpoint(whileFencing) = await fixture.overlay.graphCheckpoint(
+            rootEpoch: fixture.rootEpoch
+        ) else { return XCTFail("Expected a checkpoint while the safety fence is pending.") }
+        XCTAssertEqual(whileFencing.coverage.enumerationState, .partial)
+
+        gate.release()
+        let published = await publication.value
+        XCTAssertTrue(published)
+        guard case let .resync(checkpoint, _) = await fixture.overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: initial.generation
+        ) else { return XCTFail("Fence completion must publish the authoritative checkpoint.") }
+        XCTAssertTrue(checkpoint.coverage.isComplete)
+        XCTAssertEqual(Set(checkpoint.slots.map(\.fileID)), Set([retainedSlot.fileID, renamedSlot.fileID]))
+        XCTAssertEqual(gate.fileIDs, Set([renamedSlot.fileID]))
+        XCTAssertEqual(gate.reason, .renamed)
+
+        let beganRejectedFenceReconciliation = await fixture.overlay.beginGraphReconciliation(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(beganRejectedFenceReconciliation)
+        let rejectedFencePublication = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [retainedSlot],
+            enumerationFinished: true,
+            reconciliationFence: { _, _ in .rejected(.repositoryAuthorityMismatch) }
+        )
+        XCTAssertFalse(rejectedFencePublication)
+        let rejectedFenceCheckpoint = await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(
+            rejectedFenceCheckpoint,
+            .revoked(.reconciliationFailed),
+            "A rejected post-mutation fence must revoke rather than leave a partial publication usable."
+        )
+    }
+
+    func testChangedSetOverflowForcesSuccessiveAuthoritativeResyncs() async throws {
+        let graphPolicy = try XCTUnwrap(WorkspaceCodemapGraphPolicy(
+            maximumChangedSetFileIDCount: 1
+        ))
+        let overlay = WorkspaceCodemapLiveOverlay(graphPolicy: graphPolicy)
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["A.swift": "struct A {}", "B.swift": "struct B {}"],
+            overlay: overlay
+        )
+        defer { fixture.cleanup() }
+        let aID = UUID()
+        let bID = UUID()
+
+        func slot(_ ready: ReadyFixture) throws -> WorkspaceCodemapGraphSlot {
+            try WorkspaceCodemapGraphSlot.validated(
+                rootEpoch: fixture.rootEpoch,
+                identity: ready.token.identity,
+                requestGeneration: ready.token.requestGeneration,
+                pathGeneration: ready.token.requestGeneration,
+                pipelineIdentity: ready.token.pipelineIdentity,
+                state: .empty(CodeMapSelectionGraphContribution(
+                    artifactKey: ready.completion.artifactKey,
+                    definitions: [],
+                    references: []
+                ))
+            ).get()
+        }
+        func ready(_ path: String, fileID: UUID, generation: UInt64) async throws -> WorkspaceCodemapGraphSlot {
+            try await slot(makeWorktreeReady(
+                fixture: fixture,
+                path: path,
+                fileID: fileID,
+                requestGeneration: generation,
+                artifactName: path
+            ))
+        }
+
+        let a1 = try await ready("A.swift", fileID: aID, generation: 1)
+        let b1 = try await ready("B.swift", fileID: bID, generation: 1)
+        let token = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let initialPublication = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [a1, b1],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(initialPublication)
+        guard case let .checkpoint(initial) = await overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected initial checkpoint.")
+        }
+
+        let a2 = try await ready("A.swift", fileID: aID, generation: 2)
+        let b2 = try await ready("B.swift", fileID: bID, generation: 2)
+        let firstA = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [a2],
+            enumerationFinished: false
+        )
+        let firstB = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [b2],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(firstA)
+        XCTAssertTrue(firstB)
+        guard case let .resync(firstOverflow, firstGeneration) = await overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: initial.generation
+        ) else { return XCTFail("The first changed-set overflow must force a resync.") }
+        XCTAssertEqual(Set(firstOverflow.slots.map(\.requestGeneration)), [2])
+
+        let a3 = try await ready("A.swift", fileID: aID, generation: 3)
+        let b3 = try await ready("B.swift", fileID: bID, generation: 3)
+        let secondA = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [a3],
+            enumerationFinished: false
+        )
+        let secondB = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [b3],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(secondA)
+        XCTAssertTrue(secondB)
+        guard case let .resync(secondOverflow, secondGeneration) = await overlay.graphChanges(
+            rootEpoch: fixture.rootEpoch,
+            since: firstGeneration
+        ) else { return XCTFail("A later changed-set overflow must force another resync.") }
+        XCTAssertGreaterThan(secondGeneration, firstGeneration)
+        XCTAssertEqual(Set(secondOverflow.slots.map(\.requestGeneration)), [3])
     }
 
     private func makeRootFixture(
@@ -3113,6 +3560,41 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
 
     private func uuid(_ value: String) -> UUID {
         UUID(uuidString: value)!
+    }
+}
+
+private final class OverlayReconciliationFenceGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "overlay reconciliation fence gate")
+    private let lock = NSLock()
+    private var capturedFileIDs = Set<UUID>()
+    private var capturedReason: WorkspaceCodemapGraphFenceReason?
+
+    var fileIDs: Set<UUID> {
+        lock.withLock { capturedFileIDs }
+    }
+
+    var reason: WorkspaceCodemapGraphFenceReason? {
+        lock.withLock { capturedReason }
+    }
+
+    func enter(
+        fileIDs: Set<UUID>,
+        reason: WorkspaceCodemapGraphFenceReason
+    ) async -> WorkspaceCodemapGraphFenceDisposition {
+        lock.withLock {
+            capturedFileIDs = fileIDs
+            capturedReason = reason
+        }
+        await fence.enterAndWait()
+        return .fenced(safetyCounter: 1)
+    }
+
+    func waitUntilEntered() async -> Bool {
+        await fence.waitUntilEntered()
+    }
+
+    func release() {
+        fence.release()
     }
 }
 

@@ -171,7 +171,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             path: root.path
         )
 
-        let issue = WorkspaceCodemapOperationIssue.automatic(.unavailable(.noReadySources))
+        let issue = WorkspaceCodemapOperationIssue.automatic(.unavailable([.emptySources]))
         let presentation = WorkspaceCodemapOperationPresentation(
             orderedEntries: [],
             coverage: .pending([issue]),
@@ -220,11 +220,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let targetRecord = try XCTUnwrap(maybeTargetRecord)
         let rootEpoch = makeRootEpoch(rootID: targetRecord.rootID)
         let issue = WorkspaceCodemapOperationIssue.automatic(.pending([
-            .candidateDemand(
-                rootEpoch: rootEpoch,
-                fileID: targetRecord.id,
-                ticket: makeCodemapTicket(fileID: targetRecord.id, rootID: targetRecord.rootID)
-            )
+            .targetDemandPending(rootEpoch: rootEpoch, fileID: targetRecord.id)
         ]))
         let presentation = WorkspaceCodemapOperationPresentation(
             orderedEntries: [],
@@ -1053,11 +1049,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let targetRecord = try XCTUnwrap(targetRecordCandidate)
             let rootEpoch = makeRootEpoch(rootID: targetRecord.rootID)
             let issue = WorkspaceCodemapOperationIssue.automatic(.pending([
-                .candidateDemand(
-                    rootEpoch: rootEpoch,
-                    fileID: targetRecord.id,
-                    ticket: makeCodemapTicket(fileID: targetRecord.id, rootID: targetRecord.rootID)
-                )
+                .targetDemandPending(rootEpoch: rootEpoch, fileID: targetRecord.id)
             ]))
             let presentation = WorkspaceCodemapOperationPresentation(
                 orderedEntries: [],
