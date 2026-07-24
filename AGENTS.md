@@ -233,6 +233,15 @@ See `docs/architecture/source-layout.md` for the full ownership map and document
 - Do not put directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Keep `MCPControlMessages.swift` single-sourced in `Sources/RepoPromptShared/MCP`.
 
+## Apple SwiftUI skills (vendored)
+
+For SwiftUI implementation or review work, read
+`.agents/skills/swiftui-specialist/SKILL.md` and the topic-relevant files in
+its `references/` directory before writing or reviewing SwiftUI code. This is
+an Apple-authored contributor reference (provenance and license boundary:
+`.agents/skills/README.md`); it does not override AGENTS.md, docs/testing.md,
+or the generated-workspace rules.
+
 ## Swift style workflow
 
 For Swift edits, run the formatter before handoff. Prefer the coordinated daemon alias so the mutating job is serialized with other daemon work:

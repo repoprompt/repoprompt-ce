@@ -1,2 +1,5 @@
 # Preserve upstream Sparkle distribution bytes, including upstream header whitespace.
 Vendor/Sparkle/** -whitespace
+
+# Preserve Apple's exported Xcode agent skill bytes verbatim.
+.agents/skills/swiftui-specialist/** -whitespace
