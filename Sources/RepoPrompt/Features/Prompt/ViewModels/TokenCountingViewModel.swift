@@ -74,6 +74,8 @@ class TokenCountingViewModel: ObservableObject {
     // MARK: - Private Properties
 
     private static let tokenUpdateDebounceNanoseconds: UInt64 = 500_000_000
+    private static let maxSelectionConsistencyRetryCount = 5
+    private static let maxSelectionConsistencyRetryDelayNanoseconds: UInt64 = 5_000_000_000
 
     private let tokenCalculationService = TokenCalculationService()
     private let promptContextAccountingService = PromptContextAccountingService()
@@ -87,6 +89,8 @@ class TokenCountingViewModel: ObservableObject {
     private var lastObservedSelectionObservationRevision: UInt64 = 0
     private var lastPredominantLanguage: String = "Swift"
     private var automaticRecountSuspendDepth: Int = 0
+    private var selectionConsistencyRetryCount = 0
+    private var shouldUseSelectionConsistencyRetryBackoffForNextSelectionRecount = false
     private var lastPublishedSelection: StoredSelection?
     #if DEBUG
         private var debugBeforeTokenCalculationForTesting: (@MainActor @Sendable () async -> Void)?
@@ -278,10 +282,16 @@ class TokenCountingViewModel: ObservableObject {
         }
 
         let generation = tokenCountSchedulerGeneration
+        let usesSelectionConsistencyRetryBackoff = shouldUseSelectionConsistencyRetryBackoffForNextSelectionRecount
+            && pendingDirty.contains(.selection)
+        shouldUseSelectionConsistencyRetryBackoffForNextSelectionRecount = false
+        let debounceNanoseconds = tokenCountUpdateDebounceNanoseconds(
+            useSelectionConsistencyRetryBackoff: usesSelectionConsistencyRetryBackoff
+        )
         tokenUpdateDebounceTask?.cancel()
         tokenUpdateDebounceTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: Self.tokenUpdateDebounceNanoseconds)
+                try await Task.sleep(nanoseconds: debounceNanoseconds)
             } catch {
                 return
             }
@@ -294,6 +304,29 @@ class TokenCountingViewModel: ObservableObject {
             tokenUpdateDebounceTask = nil
             startPendingTokenCountUpdate(generation: generation)
         }
+    }
+
+    private func tokenCountUpdateDebounceNanoseconds(useSelectionConsistencyRetryBackoff: Bool) -> UInt64 {
+        guard useSelectionConsistencyRetryBackoff,
+              selectionConsistencyRetryCount > 0
+        else {
+            return Self.tokenUpdateDebounceNanoseconds
+        }
+        let retryDelay = UInt64(selectionConsistencyRetryCount) * Self.tokenUpdateDebounceNanoseconds * 2
+        return min(retryDelay, Self.maxSelectionConsistencyRetryDelayNanoseconds)
+    }
+
+    private func recordSelectionConsistencyRetry() {
+        selectionConsistencyRetryCount = min(
+            selectionConsistencyRetryCount + 1,
+            Self.maxSelectionConsistencyRetryCount
+        )
+        shouldUseSelectionConsistencyRetryBackoffForNextSelectionRecount = true
+    }
+
+    private func resetSelectionConsistencyRetry() {
+        selectionConsistencyRetryCount = 0
+        shouldUseSelectionConsistencyRetryBackoffForNextSelectionRecount = false
     }
 
     private func startPendingTokenCountUpdate(generation: UInt64) {
@@ -349,6 +382,7 @@ class TokenCountingViewModel: ObservableObject {
 
     private func recordSelectionProjectionChanged() {
         selectionObservationRevision &+= 1
+        resetSelectionConsistencyRetry()
         markDirty(.selection)
     }
 
@@ -423,6 +457,30 @@ class TokenCountingViewModel: ObservableObject {
 
         func tokenCalculationStartCountForTesting() -> Int {
             debugTokenCalculationStartCount
+        }
+
+        func selectionConsistencyRetryCountForTesting() -> Int {
+            selectionConsistencyRetryCount
+        }
+
+        func selectionConsistencyRetryBackoffPendingForTesting() -> Bool {
+            shouldUseSelectionConsistencyRetryBackoffForNextSelectionRecount
+        }
+
+        func recordSelectionConsistencyRetryForTesting() {
+            recordSelectionConsistencyRetry()
+        }
+
+        func recordSelectionProjectionChangedForTesting() {
+            recordSelectionProjectionChanged()
+        }
+
+        func tokenCountUpdateDebounceNanosecondsForTesting(
+            useSelectionConsistencyRetryBackoff: Bool = true
+        ) -> UInt64 {
+            tokenCountUpdateDebounceNanoseconds(
+                useSelectionConsistencyRetryBackoff: useSelectionConsistencyRetryBackoff
+            )
         }
 
         func debugTokenRecountStateFields() -> [String: String] {
@@ -773,9 +831,11 @@ class TokenCountingViewModel: ObservableObject {
                     fields: ["duration": consistencyStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"]
                 )
             #endif
+            recordSelectionConsistencyRetry()
             markDirty(.selection)
             return
         }
+        resetSelectionConsistencyRetry()
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.calculate.selectionConsistent",
