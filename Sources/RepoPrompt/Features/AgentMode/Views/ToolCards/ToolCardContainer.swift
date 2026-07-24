@@ -8,17 +8,55 @@ func performAgentToolCardExpansionStateUpdateWithoutAnimation(_ update: () -> Vo
     }
 }
 
-extension EnvironmentValues {
-    @Entry var agentToolCardAutoExpandEnabled: Bool = true
-
-    @Entry var agentLiveBashExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState] = [:]
-
-    @Entry var agentRecentAssistantItemIDs: Set<UUID> = []
-
-    @Entry var agentMessageRuntimeFooterByItemID: [UUID: AgentMessageRuntimeFooter] = [:]
-
-    @Entry var agentApprovalVisible: Bool = false
+// swiftformat:disable environmentEntry
+private struct AgentToolCardAutoExpandEnabledKey: EnvironmentKey {
+    static let defaultValue = true
 }
+
+private struct AgentLiveBashExecutionByItemIDKey: EnvironmentKey {
+    static let defaultValue: [UUID: AgentModeViewModel.BashLiveExecutionState] = [:]
+}
+
+private struct AgentRecentAssistantItemIDsKey: EnvironmentKey {
+    static let defaultValue: Set<UUID> = []
+}
+
+private struct AgentMessageRuntimeFooterByItemIDKey: EnvironmentKey {
+    static let defaultValue: [UUID: AgentMessageRuntimeFooter] = [:]
+}
+
+private struct AgentApprovalVisibleKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var agentToolCardAutoExpandEnabled: Bool {
+        get { self[AgentToolCardAutoExpandEnabledKey.self] }
+        set { self[AgentToolCardAutoExpandEnabledKey.self] = newValue }
+    }
+
+    var agentLiveBashExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState] {
+        get { self[AgentLiveBashExecutionByItemIDKey.self] }
+        set { self[AgentLiveBashExecutionByItemIDKey.self] = newValue }
+    }
+
+    var agentRecentAssistantItemIDs: Set<UUID> {
+        get { self[AgentRecentAssistantItemIDsKey.self] }
+        set { self[AgentRecentAssistantItemIDsKey.self] = newValue }
+    }
+
+    var agentMessageRuntimeFooterByItemID: [UUID: AgentMessageRuntimeFooter] {
+        get { self[AgentMessageRuntimeFooterByItemIDKey.self] }
+        set { self[AgentMessageRuntimeFooterByItemIDKey.self] = newValue }
+    }
+
+    var agentApprovalVisible: Bool {
+        get { self[AgentApprovalVisibleKey.self] }
+        set { self[AgentApprovalVisibleKey.self] = newValue }
+    }
+}
+
+// swiftformat:enable environmentEntry
 
 enum AgentToolCardRenderedBashPhase: String, Equatable {
     case live

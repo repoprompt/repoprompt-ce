@@ -3618,6 +3618,8 @@ SIGNING_TEAM_ID=648A27MST5
         utilities = root / ".build" / "checkouts" / "KeyboardShortcuts" / "Sources" / "KeyboardShortcuts" / "Utilities.swift"
         utilities.parent.mkdir(parents=True)
         utilities.write_text(source if source is not None else self.keyboard_shortcuts_upstream_utilities(), encoding="utf-8")
+        recorder = utilities.parent / "Recorder.swift"
+        recorder.write_text(self.keyboard_shortcuts_upstream_recorder(), encoding="utf-8")
         self.write_package_resolved(root, "2.3.0")
         return root, utilities
 
@@ -3643,6 +3645,29 @@ extension String {
 extension Data {
 \tvar toString: String? { String(data: self, encoding: .utf8) }
 }
+"""
+
+    @staticmethod
+    def keyboard_shortcuts_upstream_recorder() -> str:
+        # The preview-removal patch expects #Preview blocks at line 172.
+        # Pad with 171 lines so the hunk header @@ -172,14 +171,0 @@ applies.
+        padding = "\n".join(f"// recorder line {i + 1}" for i in range(171))
+        return f"""\
+{padding}
+#Preview {{
+\tKeyboardShortcuts.Recorder("record_shortcut", name: .init("xcodePreview"))
+\t\t.environment(\\.locale, .init(identifier: "en"))
+}}
+
+#Preview {{
+\tKeyboardShortcuts.Recorder("record_shortcut", name: .init("xcodePreview"))
+\t\t.environment(\\.locale, .init(identifier: "zh-Hans"))
+}}
+
+#Preview {{
+\tKeyboardShortcuts.Recorder("record_shortcut", name: .init("xcodePreview"))
+\t\t.environment(\\.locale, .init(identifier: "ru"))
+}}
 """
 
     @staticmethod
