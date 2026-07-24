@@ -351,7 +351,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let resumeParams = try recordedParams(for: "thread/resume", at: recordURL)
         XCTAssertEqual(resumeParams["cwd"] as? String, worktreeRoot.path)
         XCTAssertEqual(resumeParams["threadId"] as? String, "existing-thread")
-        XCTAssertNil(resumeParams["path"])
+        XCTAssertEqual(resumeParams["path"] as? String, "/tmp/existing-thread.jsonl")
 
         let turnParams = try recordedRequests(for: "turn/start", at: recordURL)
             .map { try XCTUnwrap($0["params"] as? [String: Any]) }
@@ -778,7 +778,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let (resumeController, resumeRecordURL) = try await makeController(options: makeOptions())
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "  existing-thread  ",
-            rolloutPath: "/tmp/existing-thread.jsonl",
+            rolloutPath: "  \n/tmp/existing-thread.jsonl\t ",
             model: nil,
             reasoningEffort: "high"
         )
@@ -794,7 +794,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let params = try recordedParams(for: "thread/resume", at: resumeRecordURL)
         XCTAssertEqual(params["threadId"] as? String, "existing-thread")
         XCTAssertEqual(params["model"] as? String, "gpt-test")
-        XCTAssertNil(params["path"])
+        XCTAssertEqual(params["path"] as? String, "/tmp/existing-thread.jsonl")
         XCTAssertNil(params["effort"])
     }
 
@@ -803,6 +803,23 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "existing-thread",
             rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil
+        )
+
+        _ = try await controller.startOrResume(existing: existing, baseInstructions: "Agent")
+        await controller.shutdown()
+
+        let params = try recordedParams(for: "thread/resume", at: recordURL)
+        XCTAssertEqual(params["threadId"] as? String, "existing-thread")
+        XCTAssertNil(params["path"])
+    }
+
+    func testResumeWithBlankPathOmitsPathAndSendsRequiredThreadID() async throws {
+        let (controller, recordURL) = try await makeController(options: makeOptions())
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: "existing-thread",
+            rolloutPath: " \n\t ",
             model: nil,
             reasoningEffort: nil
         )

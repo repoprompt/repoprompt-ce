@@ -3139,7 +3139,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private static func isMissingRolloutErrorMessage(_ message: String) -> Bool {
-        let normalized = message.lowercased()
+        let normalized = message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let noRolloutFoundPrefix = "no rollout found for thread id "
+        if normalized.hasPrefix(noRolloutFoundPrefix) {
+            let threadID = normalized.dropFirst(noRolloutFoundPrefix.count)
+            if !threadID.isEmpty, !threadID.contains(where: \.isWhitespace) {
+                return true
+            }
+        }
+
         guard normalized.contains("rollout") else { return false }
         let hasLoadFailure = normalized.contains("failed to load rollout")
             || normalized.contains("failed loading rollout")

@@ -1214,6 +1214,11 @@ final class CodexNativeSessionController {
             do {
                 if let resumeThreadID {
                     var params: [String: Any] = ["threadId": resumeThreadID]
+                    if let rolloutPath = existing?.rolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !rolloutPath.isEmpty
+                    {
+                        params["path"] = rolloutPath
+                    }
                     if let model {
                         params["model"] = model
                     }

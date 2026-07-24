@@ -189,6 +189,14 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                 session.items.contains { $0.kind == .error && $0.text.hasPrefix("Codex native resume failed:") },
                 "a successful fresh fallback must not be labeled as a resume failure"
             )
+            XCTAssertEqual(
+                session.items.count(where: {
+                    $0.kind == .system
+                        && $0.text == "Codex couldn't resume the previous thread because its rollout file was missing. Started a fresh thread."
+                }),
+                1,
+                "the fallback must disclose that native model context was not resumed"
+            )
             #if DEBUG
                 XCTAssertTrue(
                     CodexAgentModeCoordinator.debugIsCodexNativeSessionFailureText(
@@ -198,6 +206,45 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                     "a stale resumed disposition must still deduplicate a later fresh-start failure"
                 )
             #endif
+        }
+    }
+
+    func testMissingRolloutFallbackClassifierMatchesOnlyKnownMissingForms() {
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: "019f775c-4070-7200-b41c-933196989588",
+            rolloutPath: "/missing/rollout.jsonl",
+            model: nil,
+            reasoningEffort: nil
+        )
+
+        for message in [
+            "no rollout found for thread id 019f775c-4070-7200-b41c-933196989588",
+            "  NO ROLLOUT FOUND FOR THREAD ID 019f775c-4070-7200-b41c-933196989588\n",
+            "failed to load rollout: no such file"
+        ] {
+            XCTAssertTrue(
+                CodexAgentModeCoordinator.test_shouldRetryCodexStartWithoutResume(
+                    existingRef: existing,
+                    errorDescription: message
+                ),
+                message
+            )
+        }
+
+        for message in [
+            "no rollout found for thread id",
+            "no rollout found for thread id thread extra",
+            "rollout not found for thread id thread",
+            "failed to load rollout: permission denied",
+            "rollout is corrupt"
+        ] {
+            XCTAssertFalse(
+                CodexAgentModeCoordinator.test_shouldRetryCodexStartWithoutResume(
+                    existingRef: existing,
+                    errorDescription: message
+                ),
+                message
+            )
         }
     }
 
@@ -707,7 +754,7 @@ private final class RoutingReadinessFakeCodexController: CodexSessionControllerT
             throw NSError(
                 domain: "CodexMCPRoutingReadinessTests",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "failed to load rollout: no such file"]
+                userInfo: [NSLocalizedDescriptionKey: "no rollout found for thread id missing-rollout-thread"]
             )
         }
         markStarted()
