@@ -2,6 +2,23 @@ import CryptoKit
 import Foundation
 
 actor GitDiffEngine {
+    struct CacheLimits: Equatable {
+        static let production = CacheLimits(
+            maximumEntryCount: 32,
+            maximumRetainedUTF8Bytes: 64 * 1024 * 1024
+        )
+
+        let maximumEntryCount: Int
+        let maximumRetainedUTF8Bytes: Int
+
+        init(maximumEntryCount: Int, maximumRetainedUTF8Bytes: Int) {
+            precondition(maximumEntryCount > 0)
+            precondition(maximumRetainedUTF8Bytes > 0)
+            self.maximumEntryCount = maximumEntryCount
+            self.maximumRetainedUTF8Bytes = maximumRetainedUTF8Bytes
+        }
+    }
+
     struct DiffTextResult {
         let fingerprint: GitDiffFingerprint
         let text: String
@@ -23,9 +40,9 @@ actor GitDiffEngine {
 
     private let vcsService: VCSService
     private let gitService: GitService // Kept for diff text generation (specific formats)
-    private var cache: [CacheKey: DiffTextResult] = [:]
+    private var cache: DiffTextCache
 
-    private struct CacheKey: Hashable {
+    struct CacheKey: Hashable {
         let repoPath: String
         let targetKey: String
         let scope: GitDiffScope
@@ -34,10 +51,175 @@ actor GitDiffEngine {
         let backendKind: VCSBackendKind
     }
 
-    init(vcsService: VCSService = .shared, gitService: GitService = GitService()) {
+    struct DiffTextCache {
+        private struct Entry {
+            let result: DiffTextResult
+            let retainedUTF8Bytes: Int
+        }
+
+        #if DEBUG
+            struct HealthSnapshot: Equatable {
+                let entryCount: Int
+                let retainedUTF8Bytes: Int
+                let hitCount: Int
+                let missCount: Int
+                let bypassCount: Int
+                let admissionCount: Int
+                let replacementCount: Int
+                let evictionCount: Int
+                let oversizedRejectionCount: Int
+            }
+        #endif
+
+        private let limits: CacheLimits
+        private var entries: LRUCache<CacheKey, Entry>
+        private(set) var retainedUTF8Bytes = 0
+
+        #if DEBUG
+            private var hitCount = 0
+            private var missCount = 0
+            private var bypassCount = 0
+            private var admissionCount = 0
+            private var replacementCount = 0
+            private var evictionCount = 0
+            private var oversizedRejectionCount = 0
+        #endif
+
+        init(limits: CacheLimits) {
+            self.limits = limits
+            entries = LRUCache(capacity: limits.maximumEntryCount)
+        }
+
+        var count: Int {
+            entries.count
+        }
+
+        mutating func value(for key: CacheKey) -> DiffTextResult? {
+            guard let entry = entries[key] else {
+                #if DEBUG
+                    missCount &+= 1
+                #endif
+                return nil
+            }
+            #if DEBUG
+                hitCount &+= 1
+            #endif
+            return entry.result
+        }
+
+        mutating func recordBypass() {
+            #if DEBUG
+                bypassCount &+= 1
+            #endif
+        }
+
+        @discardableResult
+        mutating func admit(_ result: DiffTextResult, for key: CacheKey) -> Bool {
+            if let replaced = entries.removeValue(forKey: key) {
+                retainedUTF8Bytes = max(0, retainedUTF8Bytes - replaced.retainedUTF8Bytes)
+                #if DEBUG
+                    replacementCount &+= 1
+                #endif
+            }
+
+            let byteCount = Self.retainedUTF8ByteCount(for: key, result: result)
+            guard byteCount <= limits.maximumRetainedUTF8Bytes else {
+                #if DEBUG
+                    oversizedRejectionCount &+= 1
+                #endif
+                return false
+            }
+
+            while true {
+                let (proposedBytes, overflow) = retainedUTF8Bytes.addingReportingOverflow(byteCount)
+                if !overflow, proposedBytes <= limits.maximumRetainedUTF8Bytes {
+                    retainedUTF8Bytes = proposedBytes
+                    break
+                }
+                guard let evicted = entries.removeLeastRecentlyUsed() else { return false }
+                removeFromAccounting(evicted.value)
+                #if DEBUG
+                    evictionCount &+= 1
+                #endif
+            }
+
+            let entry = Entry(result: result, retainedUTF8Bytes: byteCount)
+            if let evicted = entries.setReturningEvictedEntry(entry, forKey: key) {
+                removeFromAccounting(evicted.value)
+                #if DEBUG
+                    evictionCount &+= 1
+                #endif
+            }
+            #if DEBUG
+                admissionCount &+= 1
+            #endif
+            return true
+        }
+
+        static func retainedUTF8ByteCount(for key: CacheKey, result: DiffTextResult) -> Int {
+            var count = 0
+            for string in [
+                key.repoPath,
+                key.targetKey,
+                key.selectedPathsKey,
+                key.statusHash,
+                result.fingerprint.headSHA,
+                result.fingerprint.baseRef,
+                result.fingerprint.statusHash,
+                result.text
+            ] {
+                count = saturatingAdd(count, string.utf8.count)
+            }
+            if let perFile = result.perFile {
+                for (path, text) in perFile {
+                    count = saturatingAdd(count, path.utf8.count)
+                    count = saturatingAdd(count, text.utf8.count)
+                }
+            }
+            return count
+        }
+
+        #if DEBUG
+            var healthSnapshot: HealthSnapshot {
+                HealthSnapshot(
+                    entryCount: count,
+                    retainedUTF8Bytes: retainedUTF8Bytes,
+                    hitCount: hitCount,
+                    missCount: missCount,
+                    bypassCount: bypassCount,
+                    admissionCount: admissionCount,
+                    replacementCount: replacementCount,
+                    evictionCount: evictionCount,
+                    oversizedRejectionCount: oversizedRejectionCount
+                )
+            }
+        #endif
+
+        private mutating func removeFromAccounting(_ entry: Entry) {
+            retainedUTF8Bytes = max(0, retainedUTF8Bytes - entry.retainedUTF8Bytes)
+        }
+
+        static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
+    }
+
+    init(
+        vcsService: VCSService = .shared,
+        gitService: GitService = GitService(),
+        cacheLimits: CacheLimits = .production
+    ) {
         self.vcsService = vcsService
         self.gitService = gitService
+        cache = DiffTextCache(limits: cacheLimits)
     }
+
+    #if DEBUG
+        func cacheHealthSnapshot() -> DiffTextCache.HealthSnapshot {
+            cache.healthSnapshot
+        }
+    #endif
 
     func statusFingerprint(baseRef: String, repoURL: URL) async throws -> GitDiffFingerprint {
         try await vcsService.getStatusFingerprint(at: repoURL, baseRef: baseRef)
@@ -299,6 +481,9 @@ actor GitDiffEngine {
     ) async throws -> DiffTextResult {
         let normalizedSelected = normalizedAbsolutePaths(selectedAbsolutePaths)
         let selectedPathsKey = normalizedSelected.sorted().joined(separator: "|")
+        if !useCache {
+            cache.recordBypass()
+        }
 
         switch target {
         case let .uncommitted(base):
@@ -316,7 +501,7 @@ actor GitDiffEngine {
                 statusHash: fingerprint.statusHash,
                 backendKind: backend.kind
             )
-            if useCache, let cached = cache[cacheKey] {
+            if useCache, let cached = cache.value(for: cacheKey) {
                 return cached
             }
 
@@ -335,7 +520,9 @@ actor GitDiffEngine {
             )
             guard !filtered.isEmpty else {
                 let result = DiffTextResult(fingerprint: fingerprint, text: "", perFile: nil)
-                cache[cacheKey] = result
+                // Always admit recomputed results so useCache:false only bypasses
+                // lookup (force refresh), never leaves a stale resident entry.
+                cache.admit(result, for: cacheKey)
                 return result
             }
 
@@ -366,7 +553,7 @@ actor GitDiffEngine {
                 .joined(separator: "\n")
             let perFile = combined.isEmpty ? nil : GitService.splitUnifiedDiffByFile(combined)
             let result = DiffTextResult(fingerprint: fingerprint, text: combined, perFile: perFile)
-            cache[cacheKey] = result
+            cache.admit(result, for: cacheKey)
             return result
 
         case let .uncommittedMergeBase(base):
@@ -384,7 +571,7 @@ actor GitDiffEngine {
                 statusHash: fingerprint.statusHash,
                 backendKind: backend.kind
             )
-            if useCache, let cached = cache[cacheKey] {
+            if useCache, let cached = cache.value(for: cacheKey) {
                 return cached
             }
 
@@ -403,7 +590,7 @@ actor GitDiffEngine {
             )
             guard !filtered.isEmpty else {
                 let result = DiffTextResult(fingerprint: fingerprint, text: "", perFile: nil)
-                cache[cacheKey] = result
+                cache.admit(result, for: cacheKey)
                 return result
             }
 
@@ -433,7 +620,7 @@ actor GitDiffEngine {
                 .joined(separator: "\n")
             let perFile = combined.isEmpty ? nil : GitService.splitUnifiedDiffByFile(combined)
             let result = DiffTextResult(fingerprint: fingerprint, text: combined, perFile: perFile)
-            cache[cacheKey] = result
+            cache.admit(result, for: cacheKey)
             return result
 
         case let .commit(sha):
@@ -493,7 +680,7 @@ actor GitDiffEngine {
             statusHash: statusHash,
             backendKind: backend.kind
         )
-        if useCache, let cached = cache[cacheKey] {
+        if useCache, let cached = cache.value(for: cacheKey) {
             return cached
         }
 
@@ -511,7 +698,7 @@ actor GitDiffEngine {
             let gitPaths = gitRelativePaths(from: selectedAbsolutePaths, repoRootPath: repoURL.path)
             guard !gitPaths.isEmpty else {
                 let result = DiffTextResult(fingerprint: fingerprint, text: "", perFile: nil)
-                cache[cacheKey] = result
+                cache.admit(result, for: cacheKey)
                 return result
             }
             diffText = try await backend.getDiffText(
@@ -525,7 +712,7 @@ actor GitDiffEngine {
 
         let perFile = diffText.isEmpty ? nil : GitService.splitUnifiedDiffByFile(diffText)
         let result = DiffTextResult(fingerprint: fingerprint, text: diffText, perFile: perFile)
-        cache[cacheKey] = result
+        cache.admit(result, for: cacheKey)
         return result
     }
 
