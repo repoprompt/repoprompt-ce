@@ -2679,6 +2679,84 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         XCTAssertEqual(revoked, .revoked(.rootUnloaded))
     }
 
+    func testGraphSlotsPreservePathGenerationForExactFenceMatching() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)]
+        )
+        defer { fixture.cleanup() }
+        let ready = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Fence.swift",
+            fileID: uuid("8A000000-0000-0000-0000-000000000002"),
+            requestGeneration: 1,
+            artifactName: "Fence",
+            pathGeneration: 2,
+            ingressGeneration: 1
+        )
+        let indexedSlot = try WorkspaceCodemapGraphSlot.validated(
+            rootEpoch: fixture.rootEpoch,
+            identity: ready.token.identity,
+            requestGeneration: 1,
+            pathGeneration: 2,
+            pipelineIdentity: ready.token.pipelineIdentity,
+            state: .pending,
+            diagnostics: .init(contributionDigest: nil, source: .graphIndex)
+        ).get()
+        let catalogToken = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let published = await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: catalogToken,
+            slots: [indexedSlot],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(published)
+        let fence = WorkspaceCodemapGraphFenceIdentity(fileID: indexedSlot.fileID, slot: indexedSlot)
+
+        let ticket = try await startedTicket(
+            fixture.overlay.beginDemand(owner: .init(), token: ready.token)
+        )
+        guard case let .checkpoint(pendingCheckpoint) = await fixture.overlay.graphCheckpoint(
+            rootEpoch: fixture.rootEpoch
+        ), let pendingSlot = pendingCheckpoint.slots.first
+        else { return XCTFail("Expected a live pending graph slot.") }
+        XCTAssertEqual(pendingSlot.requestGeneration, 1)
+        XCTAssertEqual(pendingSlot.pathGeneration, 2)
+        XCTAssertTrue(fence.matches(pendingSlot))
+
+        guard case .accepted = await fixture.overlay.acceptCompletion(
+            ticket: ticket,
+            completion: ready.completion,
+            lease: ready.lease
+        ) else { return XCTFail("Expected the live completion to publish.") }
+        guard case let .checkpoint(readyCheckpoint) = await fixture.overlay.graphCheckpoint(
+            rootEpoch: fixture.rootEpoch
+        ), let readySlot = readyCheckpoint.slots.first
+        else { return XCTFail("Expected a live ready graph slot.") }
+        XCTAssertEqual(readySlot.pathGeneration, 2)
+        XCTAssertTrue(fence.matches(readySlot))
+
+        let invalidated = await fixture.overlay.invalidatePaths(
+            rootEpoch: fixture.rootEpoch,
+            standardizedRelativePaths: ["Fence.swift"],
+            reason: .modified
+        )
+        XCTAssertEqual(invalidated, 1)
+        guard case let .checkpoint(invalidatedCheckpoint) = await fixture.overlay.graphCheckpoint(
+            rootEpoch: fixture.rootEpoch
+        ), let invalidatedSlot = invalidatedCheckpoint.slots.first
+        else { return XCTFail("Expected the invalidated graph-index slot to remain pending.") }
+        XCTAssertEqual(invalidatedSlot.pathGeneration, 2)
+        XCTAssertTrue(fence.matches(invalidatedSlot))
+    }
+
     func testGraphLivePathPrecedenceAndReconciliationPreserveArtifactResidency() async throws {
         let fixture = try await makeRootFixture(
             name: #function,

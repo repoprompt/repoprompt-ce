@@ -1179,6 +1179,7 @@ actor WorkspaceCodemapLiveOverlay {
                         rootEpoch: rootEpoch,
                         identity: slot.identity,
                         requestGeneration: slot.requestGeneration,
+                        pathGeneration: slot.pathGeneration,
                         pipelineIdentity: slot.pipelineIdentity,
                         state: .pending,
                         source: .graphIndex
@@ -2124,6 +2125,7 @@ actor WorkspaceCodemapLiveOverlay {
                     rootEpoch: rootEpoch,
                     identity: pending.binding.identity,
                     requestGeneration: pending.ticket.token.requestGeneration,
+                    pathGeneration: pending.ticket.token.sourceExpectation.sourceAuthority.pathGeneration,
                     pipelineIdentity: pending.ticket.token.pipelineIdentity,
                     state: .pending,
                     source: .live
@@ -2140,6 +2142,7 @@ actor WorkspaceCodemapLiveOverlay {
                        rootEpoch: rootEpoch,
                        identity: ticket.token.identity,
                        requestGeneration: ticket.token.requestGeneration,
+                       pathGeneration: ticket.token.sourceExpectation.sourceAuthority.pathGeneration,
                        pipelineIdentity: ticket.token.pipelineIdentity,
                        state: state,
                        source: .live
@@ -2164,6 +2167,7 @@ actor WorkspaceCodemapLiveOverlay {
                     rootEpoch: rootEpoch,
                     identity: slot.identity,
                     requestGeneration: slot.requestGeneration,
+                    pathGeneration: slot.pathGeneration,
                     pipelineIdentity: slot.pipelineIdentity,
                     state: .pending,
                     source: .graphIndex
@@ -2226,6 +2230,7 @@ actor WorkspaceCodemapLiveOverlay {
             rootEpoch: rootEpoch,
             identity: ready.binding.identity,
             requestGeneration: completion.token.requestGeneration,
+            pathGeneration: completion.token.sourceExpectation.sourceAuthority.pathGeneration,
             pipelineIdentity: completion.token.pipelineIdentity,
             state: state,
             source: ready.source == .cleanManifest ? .cleanManifest : .live
@@ -2236,6 +2241,7 @@ actor WorkspaceCodemapLiveOverlay {
         rootEpoch: WorkspaceCodemapRootEpoch,
         identity: WorkspaceCodemapArtifactBindingIdentity,
         requestGeneration: UInt64,
+        pathGeneration: UInt64,
         pipelineIdentity: CodeMapPipelineIdentity,
         state: WorkspaceCodemapGraphSlotState,
         source: WorkspaceCodemapGraphSlotSource
@@ -2248,7 +2254,7 @@ actor WorkspaceCodemapLiveOverlay {
             rootEpoch: rootEpoch,
             identity: identity,
             requestGeneration: requestGeneration,
-            pathGeneration: requestGeneration,
+            pathGeneration: pathGeneration,
             pipelineIdentity: pipelineIdentity,
             state: state,
             diagnostics: WorkspaceCodemapGraphSlotDiagnostics(
