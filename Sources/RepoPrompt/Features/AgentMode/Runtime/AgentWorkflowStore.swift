@@ -163,6 +163,28 @@ final class AgentWorkflowStore: ObservableObject {
         refresh()
     }
 
+    func reloadPreferencesFromDefaults(acceptImportedFeaturedIDs: Bool = false) {
+        if let saved = UserDefaults.standard.stringArray(forKey: Self.hiddenBuiltInKey) {
+            hiddenBuiltInIDs = Set(saved)
+        } else {
+            hiddenBuiltInIDs = Self.defaultHiddenBuiltInIDs
+        }
+        let savedFeaturedWorkflowIDs = UserDefaults.standard.stringArray(forKey: Self.featuredWorkflowIDsKey)
+        featuredWorkflowIDs = savedFeaturedWorkflowIDs
+            ?? Self.defaultFeaturedWorkflowIDs
+
+        let persistedVersion = UserDefaults.standard.integer(forKey: Self.featuredDefaultsVersionKey)
+        if persistedVersion < Self.featuredDefaultsVersion {
+            if acceptImportedFeaturedIDs, savedFeaturedWorkflowIDs != nil {
+                UserDefaults.standard.set(Self.featuredDefaultsVersion, forKey: Self.featuredDefaultsVersionKey)
+                return
+            }
+            featuredWorkflowIDs = Self.defaultFeaturedWorkflowIDs
+            persistFeaturedWorkflowIDs()
+            UserDefaults.standard.set(Self.featuredDefaultsVersion, forKey: Self.featuredDefaultsVersionKey)
+        }
+    }
+
     // MARK: Loading
 
     func refresh() {
