@@ -55,18 +55,18 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(ServerNetworkManager.admissionClass(forCanonicalToolName: alias), .exclusive)
     }
 
-    func testGateBCapacitiesRecordConservativeWI3BaselineChoices() {
+    func testCapacitiesRecordModernMultiAgentDefaults() {
         XCTAssertEqual(MCPToolAdmissionPolicy.exclusiveConnectionLimit, 1)
-        XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 8)
-        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, 2)
-        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, 2)
-        XCTAssertEqual(MCPToolAdmissionPolicy.gitReadConnectionLimit, 2)
+        XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 16)
+        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, 6)
+        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, 8)
+        XCTAssertEqual(MCPToolAdmissionPolicy.gitReadConnectionLimit, 4)
         XCTAssertEqual(MCPToolAdmissionPolicy.gitReadPerRepositoryLimit, 1)
-        XCTAssertEqual(MCPToolAdmissionPolicy.fileSearchConnectionLimit, 4)
-        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 2)
-        XCTAssertEqual(ServerNetworkManager.controlCallLaneLimit, 8)
-        XCTAssertEqual(ServerNetworkManager.gitReadCallLaneLimit, 2)
-        XCTAssertEqual(ServerNetworkManager.fileSearchCallLaneLimit, 4)
+        XCTAssertEqual(MCPToolAdmissionPolicy.fileSearchConnectionLimit, 6)
+        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 6)
+        XCTAssertEqual(ServerNetworkManager.controlCallLaneLimit, 16)
+        XCTAssertEqual(ServerNetworkManager.gitReadCallLaneLimit, 4)
+        XCTAssertEqual(ServerNetworkManager.fileSearchCallLaneLimit, 6)
     }
 
     func testSameConnectionSmallReadsOverlapAtBoundedCapacity() async throws {
@@ -226,31 +226,32 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
     }
 
     func testSmallReadResourceAdmissionBoundsOneWindowAndOverlapsDistinctWindows() async throws {
-        let controller = MCPToolResourceAdmissionController(
-            limit: MCPToolAdmissionPolicy.smallReadPerWindowLimit
-        )
+        let limit = MCPToolAdmissionPolicy.smallReadPerWindowLimit
+        let controller = MCPToolResourceAdmissionController(limit: limit)
         let gate = AdmissionTestGate()
 
-        let first = mutationTask(controller: controller, resource: .window(30), gate: gate)
-        let second = mutationTask(controller: controller, resource: .window(30), gate: gate)
-        let didFillWindowCapacity = await waitUntil { await gate.startedCount() == 2 }
+        let sameWindowTasks = (0 ..< limit).map { _ in
+            mutationTask(controller: controller, resource: .window(30), gate: gate)
+        }
+        let didFillWindowCapacity = await waitUntil { await gate.startedCount() == limit }
         XCTAssertTrue(didFillWindowCapacity)
 
         let queuedSameWindow = mutationTask(controller: controller, resource: .window(30), gate: gate)
         let distinctWindow = mutationTask(controller: controller, resource: .window(40), gate: gate)
-        let didOverlapDistinctWindow = await waitUntil { await gate.startedCount() == 3 }
+        let didOverlapDistinctWindow = await waitUntil { await gate.startedCount() == limit + 1 }
         XCTAssertTrue(didOverlapDistinctWindow)
-        XCTAssertEqual(controller.activeCount(for: .window(30)), 2)
+        XCTAssertEqual(controller.activeCount(for: .window(30)), limit)
         XCTAssertEqual(controller.activeCount(for: .window(40)), 1)
         XCTAssertEqual(controller.waiterCount(for: .window(30)), 1)
 
         await gate.release()
-        try await first.value
-        try await second.value
+        for task in sameWindowTasks {
+            try await task.value
+        }
         try await queuedSameWindow.value
         try await distinctWindow.value
         let finalReadCount = await gate.startedCount()
-        XCTAssertEqual(finalReadCount, 4)
+        XCTAssertEqual(finalReadCount, limit + 2)
         XCTAssertEqual(controller.activeCount(for: .window(30)), 0)
         XCTAssertEqual(controller.activeCount(for: .window(40)), 0)
     }
