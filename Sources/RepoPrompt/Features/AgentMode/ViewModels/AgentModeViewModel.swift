@@ -3138,11 +3138,10 @@ final class AgentModeViewModel: ObservableObject {
         }
         if let restartedElapsedTimerAt = rollback.restartedElapsedTimerAt {
             if session.activeAgentRunStartedAt == restartedElapsedTimerAt {
-                let restoredStartedAt: Date?
-                if let deferredRollback = session.deferredActiveAgentRunTimerRollback {
-                    restoredStartedAt = deferredRollback.originalStartedAt
+                let restoredStartedAt: Date? = if let deferredRollback = session.deferredActiveAgentRunTimerRollback {
+                    deferredRollback.originalStartedAt
                 } else {
-                    restoredStartedAt = rollback.previousActiveAgentRunStartedAt
+                    rollback.previousActiveAgentRunStartedAt
                 }
                 session.deferredActiveAgentRunTimerRollback = nil
                 session.activeAgentRunStartedAt = restoredStartedAt
@@ -12115,19 +12114,19 @@ final class AgentModeViewModel: ObservableObject {
             effectiveUserText = """
             <interview_first>
             Before starting this task, interview me to make sure you fully understand what I need. Follow these rules exactly:
-
+            \("")
             1. Ask ONE question at a time using the `ask_user` tool. Always include an `options` array with 2–4 concrete multiple-choice answers so I can respond quickly. Add a final option like "Other (I'll explain)" when my answer might not be listed.
             2. After each answer, adapt your next question based on what I told you. Narrow in on specifics — don't repeat what you already know.
             3. Ask 1–3 questions total. Stop early if the task is already clear enough.
             4. After the interview, briefly summarize what you learned and how it shapes your approach, then proceed with the task.
-
+            \("")
             Example flow:
             - Q1: "What's the main goal?" → options: ["Add new feature", "Fix a bug", "Refactor existing code", "Other (I'll explain)"]
             - User picks "Add new feature"
             - Q2 (adapted): "Where should this feature live?" → options: ["Extend FooView", "New standalone view", "Backend service layer", "Other (I'll explain)"]
             - ...and so on, each question building on previous answers.
             </interview_first>
-
+            \("")
             \(effectiveUserText)
             """
             interviewFirst = false
@@ -13716,7 +13715,7 @@ final class AgentModeViewModel: ObservableObject {
                 <previous_conversation>
                 \(conversationHistory)
                 </previous_conversation>
-
+                \("")
                 <current_instruction>
                 \(initialMessageForRun)
                 </current_instruction>
