@@ -1061,9 +1061,12 @@ class PromptViewModel: ObservableObject {
         detectRenames: Bool = true
     ) async throws -> GitDiffSnapshotManifest {
         // Validate prerequisites
-        guard let workspace = workspaceManager?.activeWorkspace else {
+        guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
             throw GitArtifactPublishError.noActiveWorkspace
         }
+        let workspaceDirectory = try workspaceManager
+            .featureArtifactStorage(for: workspace)
+            .workspaceDirectory
         guard let gitRootPath = gitViewModel.gitRootPath else {
             throw GitArtifactPublishError.noGitRepository
         }
@@ -1095,11 +1098,6 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Get workspace directory for storing artifacts
-        guard let workspaceManager else {
-            throw GitArtifactPublishError.noActiveWorkspace
-        }
-        let workspaceDirectory = workspaceManager.workspaceDirectory(for: workspace)
         let compareDisplay = compareSpec.displayString
 
         // Publish the artifacts
@@ -5745,9 +5743,16 @@ extension PromptViewModel {
                 bindings: bindings
             )
         }
+        guard let artifactWorkspaceDirectory = try? manager.featureArtifactStorage(for: workspace).workspaceDirectory else {
+            return .automaticOnly(
+                base: effectiveBase,
+                workspaceRootPaths: workspace.repoPaths,
+                bindings: bindings
+            )
+        }
         return await FrozenPromptGitReviewContext.make(
             workspaceID: workspace.id,
-            workspaceDirectoryPath: manager.workspaceDirectory(for: workspace).path,
+            workspaceDirectoryPath: artifactWorkspaceDirectory.path,
             workspaceRootPaths: workspace.repoPaths,
             tabID: creatorTabID,
             sessionID: sessionID,

@@ -481,6 +481,25 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         }
     }
 
+    private static func persistentArtifactDirectory(
+        workspaceManager: WorkspaceManagerViewModel,
+        workspace: WorkspaceModel
+    ) throws -> URL {
+        try workspaceManager.featureArtifactStorage(for: workspace).workspaceDirectory
+    }
+
+    #if DEBUG
+        static func test_persistentArtifactDirectory(
+            workspaceManager: WorkspaceManagerViewModel,
+            workspace: WorkspaceModel
+        ) throws -> URL {
+            try persistentArtifactDirectory(
+                workspaceManager: workspaceManager,
+                workspace: workspace
+            )
+        }
+    #endif
+
     private func executeGitToolBody(
         args: [String: Value],
         connectionID: UUID?,
@@ -503,7 +522,14 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         guard let workspace = workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
         }
-        let workspaceDirectory = workspaceManager.workspaceDirectory(for: workspace)
+        // Reads, publication, selection ingress, and later artifact lookup must share
+        // one storage authority. Ephemeral workspaces use their lifecycle-managed
+        // temporary root here; mixing it with the durable workspace directory makes
+        // freshly published artifacts appear unmapped to Context Builder.
+        let workspaceDirectory = try Self.persistentArtifactDirectory(
+            workspaceManager: workspaceManager,
+            workspace: workspace
+        )
         let store = GitDiffSnapshotStore()
         let vcsService = VCSService.shared
 

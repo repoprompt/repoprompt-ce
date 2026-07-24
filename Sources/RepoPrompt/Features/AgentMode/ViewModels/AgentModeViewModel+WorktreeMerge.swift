@@ -353,11 +353,42 @@ enum AgentWorktreeMergeCoordinator {
 
 @MainActor
 extension AgentModeViewModel {
+    private static func worktreePreviewDirectory(
+        publishArtifacts: Bool,
+        workspaceManager: WorkspaceManagerViewModel?
+    ) throws -> URL {
+        if publishArtifacts {
+            guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
+                throw MCPError.invalidParams(
+                    "Worktree artifact publication requires an active workspace."
+                )
+            }
+            return try workspaceManager
+                .featureArtifactStorage(for: workspace)
+                .workspaceDirectory
+        }
+        if let workspaceManager, let workspace = workspaceManager.activeWorkspace {
+            return workspaceManager.workspaceDirectory(for: workspace)
+        }
+        return FileManager.default.temporaryDirectory
+    }
+
+    #if DEBUG
+        static func test_worktreePreviewDirectory(
+            publishArtifacts: Bool,
+            workspaceManager: WorkspaceManagerViewModel?
+        ) throws -> URL {
+            try worktreePreviewDirectory(
+                publishArtifacts: publishArtifacts,
+                workspaceManager: workspaceManager
+            )
+        }
+    #endif
+
     func previewWorktreeMerge(
         sessionID: UUID,
         repoRoot: String? = nil,
         target: String? = "@main",
-        workspaceDirectory: URL? = nil,
         contextLines: Int = 3,
         detectRenames: Bool = false,
         publishArtifacts: Bool = true,
@@ -373,9 +404,10 @@ extension AgentModeViewModel {
             selector: target,
             source: source
         )
-        let directory = workspaceDirectory
-            ?? workspaceManager?.activeWorkspace?.customStoragePath
-            ?? FileManager.default.temporaryDirectory
+        let directory = try Self.worktreePreviewDirectory(
+            publishArtifacts: publishArtifacts,
+            workspaceManager: workspaceManager
+        )
         let preview = try await VCSService.shared.previewGitWorktreeMerge(.init(
             source: source,
             target: targetEndpoint,

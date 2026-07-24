@@ -339,12 +339,12 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let loaded = try await store.loadRoot(path: root.path)
         let files = await store.files(inRoot: loaded.id)
         let file = try XCTUnwrap(files.first)
-        let ticket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: file.id)
+        let demand = try await readyArtifactDemand(
+            store: store,
+            forFileID: file.id
         )
-        let ready = try await readyResult(
-            settledResult(store: store, ticket: ticket)
-        )
+        let ticket = demand.ticket
+        let ready = demand.ready
 
         let released = await store.releaseReadyCodemapArtifactDemandRetain(ticket)
         XCTAssertTrue(released)

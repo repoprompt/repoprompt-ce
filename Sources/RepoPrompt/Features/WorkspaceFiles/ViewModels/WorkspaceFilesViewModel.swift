@@ -3275,7 +3275,18 @@ class WorkspaceFilesViewModel: ObservableObject {
             throw GitDataRootLoadError.systemWorkspace(workspaceID: workspace.id)
         }
 
-        let gitDataURL = workspaceManager.gitDataDirectory(for: workspace)
+        // Ephemeral workspaces must never touch persistent workspace storage on
+        // disk. Their Git artifacts are published to the memory-only feature
+        // artifact directory (a temporary, auto-cleaned location) via
+        // `featureArtifactStorage`, so the Git-data root is resolved from that
+        // same directory to stay consistent with where artifacts are written.
+        // Persistent workspaces continue to use their on-disk `_git_data` folder.
+        let gitDataURL = if workspace.persistenceDisposition == .skipEphemeral {
+            try workspaceManager.featureArtifactStorage(for: workspace).workspaceDirectory
+                .appendingPathComponent("_git_data", isDirectory: true)
+        } else {
+            workspaceManager.gitDataDirectory(for: workspace)
+        }
         if !isFolderAlreadyLoaded(gitDataURL) {
             try await loadSupplementalRoot(
                 at: gitDataURL,

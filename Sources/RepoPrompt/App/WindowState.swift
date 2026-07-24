@@ -1443,9 +1443,7 @@ class WindowState: ObservableObject {
             }) {
                 // If ephemeral == true, mark existing workspace ephemeral (edge case)
                 if shouldBeEphemeral {
-                    if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existingWorkspace.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
-                    }
+                    await workspaceManager.setWorkspaceEphemeral(existingWorkspace.id, true)
                 }
 
                 // If focus == true, attempt to bring up an existing window
@@ -1483,9 +1481,7 @@ class WindowState: ObservableObject {
             if let existing = workspaceManager.workspaces.first(where: { $0.name == workspaceName }) {
                 // If ephemeral == true, mark that workspace ephemeral
                 if shouldBeEphemeral {
-                    if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existing.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
-                    }
+                    await workspaceManager.setWorkspaceEphemeral(existing.id, true)
                 }
 
                 // If focus == true, attempt to bring up existing window

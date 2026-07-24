@@ -282,6 +282,7 @@ actor ChatDataService {
 
     /// Returns a list of "ChatSession-xxx.json" files in the workspace’s Chats folder, sorted by mod date desc.
     func listChatSessions(for workspace: WorkspaceModel) async throws -> [URL] {
+        guard workspace.persistenceDisposition == .persistent else { return [] }
         let chatsFolder = try ensureChatsFolder(for: workspace)
 
         let contents = try FileManager.default.contentsOfDirectory(
@@ -440,6 +441,10 @@ actor ChatDataService {
     /// Creates (if needed) and returns the "Chats" subfolder for the given workspace.
     /// Uses workspace.customStoragePath if set, else the default ~Library location.
     private func ensureChatsFolder(for workspace: WorkspaceModel) throws -> URL {
+        guard workspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+
         let baseFolder = try workspaceFolderURL(for: workspace)
         let chatsFolder = baseFolder.appendingPathComponent("Chats")
 

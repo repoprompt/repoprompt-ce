@@ -3517,10 +3517,20 @@ final class MCPServerViewModel: ObservableObject {
                     throw MCPError.invalidParams("context_builder could not resolve the invoking Agent Mode workspace.")
                 }
                 do {
+                    if workspace.persistenceDisposition == .skipEphemeral {
+                        _ = try await targetWindow.workspaceFilesViewModel.ensureGitDataRootLoaded(
+                            workspace: workspace,
+                            workspaceManager: targetWindow.workspaceManager,
+                            refreshRootFolderStateAfterLoad: false
+                        )
+                    }
+                    let artifactWorkspaceDirectory = try targetWindow.workspaceManager
+                        .featureArtifactStorage(for: workspace)
+                        .workspaceDirectory
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
-                        workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
+                        workspaceDirectoryPath: artifactWorkspaceDirectory.path,
                         store: targetWindow.promptManager.workspaceFileContextStore
                     )
                 } catch {

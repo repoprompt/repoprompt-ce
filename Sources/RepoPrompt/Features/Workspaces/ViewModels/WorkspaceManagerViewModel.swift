@@ -233,9 +233,48 @@ enum WorkspaceOpenError: LocalizedError {
 
 /// The main WorkspaceManager, refactored to store each WorkspaceModel
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
+/// Authorized workspace-owned persistent storage. Construction is restricted to this file,
+/// where workspace storage paths are resolved.
+private final class WorkspaceStorageAuthorization: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    func invalidate() {
+        lock.withLock { valid = false }
+    }
+
+    func validate() throws {
+        guard lock.withLock({ valid }) else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+    }
+}
+
+struct WorkspacePersistentStorage: Equatable {
+    let workspaceDirectory: URL
+    private let authorization: WorkspaceStorageAuthorization
+
+    fileprivate init(
+        authorizedWorkspaceDirectory: URL,
+        authorization: WorkspaceStorageAuthorization = WorkspaceStorageAuthorization()
+    ) {
+        workspaceDirectory = authorizedWorkspaceDirectory.standardizedFileURL
+        self.authorization = authorization
+    }
+
+    func validateAuthorization() throws {
+        try authorization.validate()
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspaceDirectory == rhs.workspaceDirectory
+    }
+}
+
 @MainActor
 class WorkspaceManagerViewModel: ObservableObject {
     private static let logger = Logger(subsystem: "com.repoprompt.workspace", category: "WorkspaceSwitch")
+    private var persistentStorageAuthorizations: [UUID: WorkspaceStorageAuthorization] = [:]
 
     @Published var workspaces: [WorkspaceModel] = [] {
         didSet {
@@ -1502,6 +1541,49 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // ➋ Fall back to global custom storage set by the user or the default location
         return baseRoot.appendingPathComponent(directoryName(for: workspace))
+    }
+
+    func persistentStorage(for workspace: WorkspaceModel) throws -> WorkspacePersistentStorage {
+        let authoritativeWorkspace = workspaces.first(where: { $0.id == workspace.id }) ?? workspace
+        guard authoritativeWorkspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+        let authorization = persistentStorageAuthorizations[authoritativeWorkspace.id]
+            ?? WorkspaceStorageAuthorization()
+        persistentStorageAuthorizations[authoritativeWorkspace.id] = authorization
+        return WorkspacePersistentStorage(
+            authorizedWorkspaceDirectory: workspaceDirectory(for: authoritativeWorkspace),
+            authorization: authorization
+        )
+    }
+
+    func featureArtifactStorage(for workspace: WorkspaceModel) throws -> WorkspacePersistentStorage {
+        let authoritativeWorkspace = workspaces.first(where: { $0.id == workspace.id }) ?? workspace
+        if authoritativeWorkspace.persistenceDisposition == .skipEphemeral {
+            return WorkspacePersistentStorage(
+                authorizedWorkspaceDirectory: Self.ephemeralArtifactDirectory(for: authoritativeWorkspace.id)
+            )
+        }
+        return try persistentStorage(for: authoritativeWorkspace)
+    }
+
+    private nonisolated static func ephemeralArtifactDirectory(for workspaceID: UUID) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptCE-EphemeralArtifacts", isDirectory: true)
+            .appendingPathComponent(workspaceID.uuidString, isDirectory: true)
+    }
+
+    private func removeEphemeralArtifacts(for workspaceID: UUID) {
+        try? FileManager.default.removeItem(at: Self.ephemeralArtifactDirectory(for: workspaceID))
+    }
+
+    nonisolated func persistentStorage(for workspace: WorkspaceModel, baseRoot: URL) throws -> WorkspacePersistentStorage {
+        guard workspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+        return WorkspacePersistentStorage(
+            authorizedWorkspaceDirectory: workspaceDirectory(for: workspace, baseRoot: baseRoot)
+        )
     }
 
     func workspaceFileURL(for workspace: WorkspaceModel) -> URL {
@@ -3020,6 +3102,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                    let switchedWorkspace = activeWorkspace,
                    switchedWorkspace.id == newWorkspace.id,
                    !switchedWorkspace.isSystemWorkspace,
+                   switchedWorkspace.persistenceDisposition == .persistent,
                    !shouldReturnToSystem
                 {
                     schedulePostSwitchGitDataLoad(for: switchedWorkspace, reason: "postSwitch")
@@ -3107,7 +3190,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             let diskURL = workspaceFileURL(for: newWorkspace)
             if FileManager.default.fileExists(atPath: diskURL.path) {
                 do {
-                    let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL)
+                    var upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL)
+                    if workspaces[wsIndex].isEphemeral || newWorkspace.isEphemeral {
+                        upgraded.isEphemeral = true
+                    }
                     workspaces[wsIndex] = upgraded
                     recordRepoPathBaseline(for: upgraded)
                 } catch {
@@ -3436,7 +3522,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Runs git data maintenance when a workspace is opened.
     /// This handles version upgrades, legacy purge, and retention enforcement (max 25 snapshots, 7 day expiry).
     private func runGitDataMaintenanceOnWorkspaceOpen(_ workspace: WorkspaceModel) {
-        let workspaceDir = workspaceDirectory(for: workspace)
+        guard let workspaceDir = try? persistentStorage(for: workspace).workspaceDirectory else {
+            return
+        }
         let workspaceName = workspace.name
         Task.detached(priority: .utility) {
             let result = await GitDiffDataMaintenance.shared.runOnWorkspaceOpen(workspaceDirectory: workspaceDir)
@@ -3533,6 +3621,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         #endif
         guard workspace.isSystemWorkspace == false else {
             outcome = "systemWorkspace"
+            return
+        }
+        guard workspace.persistenceDisposition == .persistent else {
+            outcome = "ephemeralWorkspace"
             return
         }
         if let expectedWorkspaceID, workspace.id != expectedWorkspaceID {
@@ -4931,6 +5023,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     func pollAndSaveStateAsync(source: WorkspaceSaveSource = .pollAndSaveStateAsync) async {
         guard let active = activeWorkspace else { return }
 
+        guard active.persistenceDisposition == .persistent else { return }
+
         let wsID = active.id
         let cur = stateVersionByWorkspaceID[wsID, default: 0]
         let last = lastSavedVersionByWorkspaceID[wsID, default: -1]
@@ -5961,6 +6055,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
+        removeEphemeralArtifacts(for: workspace.id)
 
         let workspaceDir = workspaceDirectory(for: workspace)
 
@@ -6921,6 +7016,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var waitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var latestSelectionByWorkspaceTab: [WorkspaceTabSelectionKey: LatestSelectionRecord] = [:]
         private var lastWrittenSelectionRevisionByWorkspaceTab: [WorkspaceTabSelectionKey: UInt64] = [:]
+        private var persistenceBlockedWorkspaceIDs: Set<UUID> = []
         #if DEBUG
             private var atomicWriteGateForTesting: (@Sendable () async -> Void)?
         #endif
@@ -6938,6 +7034,15 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         private func enqueue(data: Data, url: URL, metadata: WorkspaceSavePayloadMetadata?) {
+            let workspace = Self.decodedWorkspacePayload(data)
+            let workspaceID = metadata?.workspaceID ?? workspace?.id
+            guard workspace?.persistenceDisposition != .skipEphemeral,
+                  workspaceID.map({ !persistenceBlockedWorkspaceIDs.contains($0) }) ?? true
+            else {
+                WorkspaceSaveTracer.event("workspaceSave.enqueue.blockedEphemeral", metadata: metadata, url: url)
+                return
+            }
+
             let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
             WorkspaceSaveTracer.event("workspaceSave.enqueue", metadata: metadata, url: url)
             recordLatestSelectionIfNeeded(metadata)
@@ -6981,6 +7086,27 @@ class WorkspaceManagerViewModel: ObservableObject {
             await flush(url: url)
         }
 
+        func setPersistenceBlocked(_ blocked: Bool, workspaceID: UUID) {
+            if blocked {
+                persistenceBlockedWorkspaceIDs.insert(workspaceID)
+                for (url, var pending) in pendingByURL {
+                    let pendingWorkspaceID = pending.newestMetadata?.workspaceID
+                        ?? Self.decodedWorkspacePayload(pending.newestData)?.id
+                    guard pendingWorkspaceID == workspaceID else { continue }
+                    pending.newestData = Data()
+                    pending.newestMetadata = nil
+                    pending.newestLifecycleCorrelation = nil
+                    pendingByURL[url] = pending
+                }
+            } else {
+                persistenceBlockedWorkspaceIDs.remove(workspaceID)
+            }
+        }
+
+        private func isPersistenceBlocked(_ workspaceID: UUID) -> Bool {
+            persistenceBlockedWorkspaceIDs.contains(workspaceID)
+        }
+
         func writeNormalizationIfUnchanged(
             data: Data,
             url: URL,
@@ -6989,6 +7115,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             metadata: WorkspaceSavePayloadMetadata? = nil
         ) -> Bool {
             guard pendingByURL[url] == nil else { return false }
+            if let workspace = Self.decodedWorkspacePayload(data) {
+                guard workspace.persistenceDisposition == .persistent,
+                      !persistenceBlockedWorkspaceIDs.contains(workspace.id)
+                else { return false }
+            }
             do {
                 let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
                 guard Int64(values.fileSize ?? -1) == expectedFileSize,
@@ -7044,6 +7175,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 pendingByURL.removeAll()
                 latestSelectionByWorkspaceTab.removeAll()
                 lastWrittenSelectionRevisionByWorkspaceTab.removeAll()
+                persistenceBlockedWorkspaceIDs.removeAll()
                 atomicWriteGateForTesting = nil
                 let allWaiters = waitersByURL.values.flatMap(\.self)
                 waitersByURL.removeAll()
@@ -7224,6 +7356,26 @@ class WorkspaceManagerViewModel: ObservableObject {
                         #if DEBUG
                             await atomicWriteGateForTesting?()
                         #endif
+                        let workspaceID = effective.metadata?.workspaceID
+                            ?? Self.decodedWorkspacePayload(effective.data)?.id
+                        let persistenceBlocked = if let workspaceID {
+                            await self?.isPersistenceBlocked(workspaceID) ?? false
+                        } else {
+                            false
+                        }
+                        guard !persistenceBlocked else {
+                            WorkspaceSaveTracer.event(
+                                "workspaceSave.write.blockedEphemeral",
+                                metadata: effective.metadata,
+                                url: url
+                            )
+                            await self?.writerFinished(
+                                for: url,
+                                effective: effective,
+                                writeSucceeded: false
+                            )
+                            return
+                        }
                         let writeState = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.atomicWrite)
                         EditFlowPerf.lifecycleEvent(
                             EditFlowPerf.Lifecycle.WorkspaceDurability.writeBegan,
@@ -7300,6 +7452,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         else { return nil }
 
         let current = workspaces[currentIndex]
+        guard current.persistenceDisposition == .persistent else { return nil }
+
         let capturedStateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
         let lastSyncedRepoPaths = lastSyncedRepoPathsByWorkspaceID[workspaceID]
         #if DEBUG
@@ -7381,6 +7535,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
             }
 
+            guard workspaces.indices.contains(latestIndex),
+                  workspaces[latestIndex].id == workspaceID,
+                  workspaces[latestIndex].persistenceDisposition == .persistent
+            else { return nil }
+
             var publishedWorkspace = workspaces[latestIndex]
             if indexFieldsChanged {
                 publishedWorkspace.name = merged.name
@@ -7432,7 +7591,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         preserveDiskRepoPathsIfUnchangedSinceBaseline: Bool = true,
         source: WorkspaceSaveSource = .directUnknown
     ) async throws -> URL {
-        let targetURL = workspaceFileURL(for: workspace)
+        let storage = try persistentStorage(for: workspace)
+        let targetURL = storage.workspaceDirectory.appendingPathComponent("workspace.json")
         let capturedStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
         await WorkspaceDiskWriter.shared.flush(url: targetURL)
 
@@ -7475,17 +7635,31 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let metadata = workspaceSaveMetadata(for: workspaceToSave, source: source)
         WorkspaceSaveTracer.event("workspaceSave.direct.enqueue", metadata: metadata, url: targetURL)
-        let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, baseRoot: currentBaseRoot, metadata: metadata)
+        let finalURL = try await saveWorkspaceToFileAsync(
+            workspaceToSave,
+            storage: storage,
+            metadata: metadata
+        )
         recordRepoPathBaseline(for: workspaceToSave)
         return finalURL
     }
 
-    nonisolated func saveWorkspaceToFileAsync(_ workspace: WorkspaceModel, baseRoot: URL, metadata: WorkspaceSavePayloadMetadata? = nil) async throws -> URL {
-        // Encode JSON
-        let encoded = try JSONEncoder().encode(workspace)
+    nonisolated func saveWorkspaceToFileAsync(
+        _ workspace: WorkspaceModel,
+        baseRoot: URL,
+        metadata: WorkspaceSavePayloadMetadata? = nil
+    ) async throws -> URL {
+        let storage = try persistentStorage(for: workspace, baseRoot: baseRoot)
+        return try await saveWorkspaceToFileAsync(workspace, storage: storage, metadata: metadata)
+    }
 
-        // Prepare file path
-        let folder = try ensureWorkspaceDirectoryExists(for: workspace, baseRoot: baseRoot)
+    private nonisolated func saveWorkspaceToFileAsync(
+        _ workspace: WorkspaceModel,
+        storage: WorkspacePersistentStorage,
+        metadata: WorkspaceSavePayloadMetadata?
+    ) async throws -> URL {
+        let encoded = try JSONEncoder().encode(workspace)
+        let folder = try ensureWorkspaceDirectoryExists(storage: storage)
         let finalURL = folder.appendingPathComponent("workspace.json")
 
         // Enqueue write to shared disk writer for serialization
@@ -7501,9 +7675,11 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Synchronous workspace write used by focused tests and direct save paths.
     func saveWorkspaceToFile(_ workspace: WorkspaceModel, source: WorkspaceSaveSource = .directUnknown) throws -> URL {
+        let storage = try persistentStorage(for: workspace)
+
         // Encode JSON and prepare file path
         let encoded = try JSONEncoder().encode(workspace)
-        let folder = try ensureWorkspaceDirectoryExists(for: workspace)
+        let folder = try ensureWorkspaceDirectoryExists(storage: storage)
         let finalURL = folder.appendingPathComponent("workspace.json")
         let metadata = workspaceSaveMetadata(for: workspace, source: source)
 
@@ -7524,7 +7700,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     nonisolated static func loadWorkspaceFromFileResult(at fileURL: URL) throws -> WorkspaceFileLoadResult {
         let cachedResult = try WorkspaceFileDecodeCache.shared.loadWorkspace(at: fileURL)
         let normalizationSaveTask: Task<Void, Never>?
-        if cachedResult.normalizationRequiresSave,
+        if cachedResult.workspace.persistenceDisposition == .persistent,
+           cachedResult.normalizationRequiresSave,
            WorkspaceFileDecodeCache.shared.claimNormalizationSave(for: cachedResult.cacheKey)
         {
             let workspaceToSave = cachedResult.workspace
@@ -7577,12 +7754,20 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Async version for directory creation with race condition handling
     func ensureWorkspaceDirectoryExists(for workspace: WorkspaceModel) throws -> URL {
-        try ensureWorkspaceDirectoryExists(for: workspace, baseRoot: currentBaseRoot)
+        try ensureWorkspaceDirectoryExists(storage: persistentStorage(for: workspace))
     }
 
     nonisolated func ensureWorkspaceDirectoryExists(for workspace: WorkspaceModel, baseRoot: URL) throws -> URL {
-        let dir = workspaceDirectory(for: workspace, baseRoot: baseRoot)
-        let chats = chatsFolder(for: workspace, baseRoot: baseRoot)
+        try ensureWorkspaceDirectoryExists(
+            storage: persistentStorage(for: workspace, baseRoot: baseRoot)
+        )
+    }
+
+    private nonisolated func ensureWorkspaceDirectoryExists(
+        storage: WorkspacePersistentStorage
+    ) throws -> URL {
+        let dir = storage.workspaceDirectory
+        let chats = dir.appendingPathComponent("Chats", isDirectory: true)
         let fm = FileManager.default
 
         // Create the main directory if missing
@@ -7926,19 +8111,21 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaces[index].repoPaths.append(path)
             workspaces[index].dateModified = Date()
 
-            // Save asynchronously and flush for cross-window consistency
-            do {
-                let workspaceToSave = workspaces[index]
-                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, preserveDiskRepoPathsIfUnchangedSinceBaseline: false, source: .rootAdd)
-                await WorkspaceDiskWriter.shared.flush(url: finalURL)
-                recordRepoPathBaseline(for: workspaceToSave)
-                await rebuildAndSaveIndexAsync()
-                await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
-                postWorkspaceRepoPathsDidChange(for: workspaceToSave.id)
-            } catch {
-                print("Error saving workspace after adding folder: \(error)")
-                throw error
+            let workspaceToSave = workspaces[index]
+            if workspaceToSave.persistenceDisposition == .persistent {
+                // Save asynchronously and flush for cross-window consistency.
+                do {
+                    let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, preserveDiskRepoPathsIfUnchangedSinceBaseline: false, source: .rootAdd)
+                    await WorkspaceDiskWriter.shared.flush(url: finalURL)
+                    recordRepoPathBaseline(for: workspaceToSave)
+                    await rebuildAndSaveIndexAsync()
+                    await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
+                } catch {
+                    print("Error saving workspace after adding folder: \(error)")
+                    throw error
+                }
             }
+            postWorkspaceRepoPathsDidChange(for: workspaceToSave.id)
         }
 
         if workspace.id == activeWorkspace?.id {
@@ -8308,10 +8495,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
-    /// Sets a workspace's ephemeral property by ID
-    func setWorkspaceEphemeral(_ workspaceID: UUID, _ value: Bool) {
-        if let idx = workspaces.firstIndex(where: { $0.id == workspaceID }) {
-            workspaces[idx].isEphemeral = value
+    /// Sets a workspace's ephemeral property by ID and establishes the disk-writer barrier.
+    func setWorkspaceEphemeral(_ workspaceID: UUID, _ value: Bool) async {
+        guard let idx = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+
+        if value {
+            workspaces[idx].isEphemeral = true
+            persistentStorageAuthorizations.removeValue(forKey: workspaceID)?.invalidate()
+            await WorkspaceDiskWriter.shared.setPersistenceBlocked(true, workspaceID: workspaceID)
+            guard workspaces.indices.contains(idx), workspaces[idx].id == workspaceID else { return }
+            removeEphemeralArtifacts(for: workspaceID)
+        } else {
+            removeEphemeralArtifacts(for: workspaceID)
+            await WorkspaceDiskWriter.shared.setPersistenceBlocked(false, workspaceID: workspaceID)
+            guard workspaces.indices.contains(idx), workspaces[idx].id == workspaceID else { return }
+            workspaces[idx].isEphemeral = false
         }
     }
 
@@ -8392,12 +8590,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Creates an ephemeral workspace (non-persisted)
     func createEphemeralWorkspace(name: String, repoPaths: [String]) -> WorkspaceModel {
-        var ws = createWorkspace(name: name, repoPaths: repoPaths)
-        if let idx = workspaces.firstIndex(where: { $0.id == ws.id }) {
-            workspaces[idx].isEphemeral = true
-            ws = workspaces[idx] // re-fetch the mutated copy
-        }
-        return ws
+        createWorkspace(name: name, repoPaths: repoPaths, ephemeral: true)
     }
 
     @MainActor
