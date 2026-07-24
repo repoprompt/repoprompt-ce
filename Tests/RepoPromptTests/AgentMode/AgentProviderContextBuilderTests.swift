@@ -135,6 +135,17 @@ final class AgentProviderContextBuilderTests: XCTestCase {
 
     @MainActor
     func testAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await assertAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze()
+            }
+        #else
+            throw XCTSkip("Shared MCP server integration fixtures require DEBUG")
+        #endif
+    }
+
+    @MainActor
+    private func assertAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositories.makeRepository(
             named: "repository",
@@ -150,12 +161,17 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        addTeardownBlock { @MainActor in
-            window.beginClose()
-            await window.tearDown()
-            WindowStatesManager.shared.unregisterWindowState(window)
+        do {
+            try await assertAgentModeOverCapHandoff(in: window, root: root)
+        } catch {
+            await cleanUp(window)
+            throw error
         }
+        await cleanUp(window)
+    }
 
+    @MainActor
+    private func assertAgentModeOverCapHandoff(in window: WindowState, root: URL) async throws {
         let tabID = UUID()
         let selection = StoredSelection(
             selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
@@ -201,6 +217,13 @@ final class AgentProviderContextBuilderTests: XCTestCase {
                 0
             )
         #endif
+    }
+
+    @MainActor
+    private func cleanUp(_ window: WindowState) async {
+        window.beginClose()
+        await window.tearDown()
+        WindowStatesManager.shared.unregisterWindowState(window)
     }
 
     private func makePresentation(
