@@ -2273,7 +2273,7 @@ actor MCPService: Service {
     private func runPPIDWatchdog(initialPPID: pid_t) async throws {
         // Check every 5 seconds - balance between responsiveness and CPU usage
         while !Task.isCancelled {
-            try await Task.sleep(for: .seconds(5))
+            try await MCPCompatibilitySleep.sleep(.seconds(5))
 
             let currentPPID = getppid()
             if currentPPID != initialPPID {
@@ -2389,7 +2389,7 @@ actor MCPService: Service {
                 log.warning("Bootstrap connection lost (\(err)). Retrying in \(String(format: "%.1f", delay))s (attempt \(attempt), elapsed \(String(format: "%.0f", elapsedSinceFirstFailure))s)")
 
                 do {
-                    try await Task.sleep(for: .seconds(delay))
+                    try await MCPCompatibilitySleep.sleep(.seconds(delay))
                 } catch is CancellationError {
                     // Cancelled by kill signal or PPID watchdog
                     throw CLIRuntimeError.hostDisconnected(.taskCancelled)

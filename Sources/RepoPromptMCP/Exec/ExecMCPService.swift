@@ -237,13 +237,13 @@ actor ExecMCPService: Service {
                         if options.verbose {
                             fputs("Waiting for RepoPrompt app (attempt \(attempt))...\n", stderr)
                         }
-                        try await Task.sleep(for: .milliseconds(500))
+                        try await MCPCompatibilitySleep.sleep(.milliseconds(500))
                         continue
                     case .bootstrapResponseTimeout where Date() < deadline:
                         if options.verbose {
                             fputs("Retrying stalled RepoPrompt bootstrap handshake (attempt \(attempt))...\n", stderr)
                         }
-                        try await Task.sleep(for: .milliseconds(500))
+                        try await MCPCompatibilitySleep.sleep(.milliseconds(500))
                         continue
                     default:
                         break
@@ -252,7 +252,7 @@ actor ExecMCPService: Service {
 
                 // For other errors, retry if we have time
                 if Date() < deadline {
-                    try await Task.sleep(for: .milliseconds(500))
+                    try await MCPCompatibilitySleep.sleep(.milliseconds(500))
                     continue
                 }
 
