@@ -387,6 +387,15 @@ private struct HiddenSessionSliceRebaseTarget {
     let physicalRootPaths: Set<String>
 }
 
+private struct HiddenSessionSliceRebaseTabContext {
+    let identity: WorkspaceSelectionIdentity
+    let agentSessionID: UUID
+    let binding: AgentSessionWorktreeBinding
+    let bindingFingerprint: String
+    let physicalRootPaths: Set<String>
+    let slicesByLogicalPath: [String: [LineRange]]
+}
+
 private struct HiddenSessionSliceRebaseRequest {
     let rootID: UUID
     let rootLifetimeID: UUID
@@ -1591,9 +1600,13 @@ class WorkspaceFilesViewModel: ObservableObject {
             hiddenSessionHandledGenerationByRootLifetime.removeValue(forKey: lifetimeKey)
             return true
         }
-        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
-              snapshot.root.kind == .sessionWorktree,
-              snapshot.root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
+        guard let lookup = await workspaceFileContextStore.appliedIndexRecordLookup(
+            rootID: event.rootID,
+            fileIDs: event.modifiedFileIDs,
+            folderIDs: []
+        ),
+            lookup.root.kind == .sessionWorktree,
+            lookup.root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
         else { return false }
 
         let handled = hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] ?? 0
@@ -1604,16 +1617,26 @@ class WorkspaceFilesViewModel: ObservableObject {
             hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] = event.generation
             return true
         }
+        guard !event.modifiedFileIDs.isEmpty else {
+            hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] = event.generation
+            return true
+        }
+
+        let tabContexts = await hiddenSessionSliceRebaseTabContexts(
+            physicalRootPath: lookup.root.standardizedFullPath
+        ) ?? []
+        guard !tabContexts.isEmpty else {
+            hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] = event.generation
+            return true
+        }
 
         for fileID in event.modifiedFileIDs {
-            guard let file = snapshot.files.first(where: { $0.id == fileID }),
-                  file.rootID == event.rootID,
-                  let targets = await hiddenSessionSliceRebaseTargets(
-                      physicalRootPath: snapshot.root.standardizedFullPath,
-                      physicalFullPath: file.standardizedFullPath
-                  ),
-                  !targets.isEmpty
-            else { continue }
+            guard let file = lookup.filesByID[fileID], file.rootID == event.rootID else { continue }
+            let targets = hiddenSessionSliceRebaseTargets(
+                tabContexts: tabContexts,
+                physicalFullPath: file.standardizedFullPath
+            )
+            guard !targets.isEmpty else { continue }
             let eventSource = event.modifiedFileSourceSnapshotsByID[fileID]
             let sourceSnapshot: SliceRebaseSourceSnapshot? = eventSource.flatMap { source in
                 guard source.rootID == event.rootID,
@@ -1631,7 +1654,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 rootID: event.rootID,
                 rootLifetimeID: rootLifetimeID,
                 fileID: fileID,
-                physicalRootPath: snapshot.root.standardizedFullPath,
+                physicalRootPath: lookup.root.standardizedFullPath,
                 physicalFullPath: file.standardizedFullPath,
                 relativePath: file.standardizedRelativePath,
                 sourceSnapshot: sourceSnapshot,
@@ -1643,16 +1666,16 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     @MainActor
-    private func hiddenSessionSliceRebaseTargets(
-        physicalRootPath: String,
-        physicalFullPath: String
-    ) async -> [HiddenSessionSliceRebaseTarget]? {
+    private func hiddenSessionSliceRebaseTabContexts(
+        physicalRootPath: String
+    ) async -> [HiddenSessionSliceRebaseTabContext]? {
         guard let provider = sessionWorktreeBindingsProvider,
               let workspace = workspaceManager?.activeWorkspace
         else { return nil }
-        var targets: [HiddenSessionSliceRebaseTarget] = []
+        var contexts: [HiddenSessionSliceRebaseTabContext] = []
         for tab in workspace.composeTabs {
-            guard let sessionID = tab.activeAgentSessionID else { continue }
+            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
+            guard !slices.isEmpty, let sessionID = tab.activeAgentSessionID else { continue }
             let bindings = provider(sessionID)
             let matchingBindings = bindings.filter {
                 StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath) == physicalRootPath
@@ -1666,21 +1689,37 @@ class WorkspaceFilesViewModel: ObservableObject {
                 ownerID: sessionID,
                 bindingFingerprint: fingerprint,
                 physicalRootPaths: physicalRootPaths
-            ), let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
-                forPhysicalPath: physicalFullPath,
-                binding: binding
             ) else { continue }
-            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
-            guard slices[logicalFullPath]?.isEmpty == false else { continue }
-            targets.append(HiddenSessionSliceRebaseTarget(
+            contexts.append(HiddenSessionSliceRebaseTabContext(
                 identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
-                logicalFullPath: logicalFullPath,
                 agentSessionID: sessionID,
+                binding: binding,
                 bindingFingerprint: fingerprint,
-                physicalRootPaths: physicalRootPaths
+                physicalRootPaths: physicalRootPaths,
+                slicesByLogicalPath: slices
             ))
         }
-        return targets
+        return contexts
+    }
+
+    private func hiddenSessionSliceRebaseTargets(
+        tabContexts: [HiddenSessionSliceRebaseTabContext],
+        physicalFullPath: String
+    ) -> [HiddenSessionSliceRebaseTarget] {
+        tabContexts.compactMap { context in
+            guard let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
+                forPhysicalPath: physicalFullPath,
+                binding: context.binding
+            ), context.slicesByLogicalPath[logicalFullPath]?.isEmpty == false
+            else { return nil }
+            return HiddenSessionSliceRebaseTarget(
+                identity: context.identity,
+                logicalFullPath: logicalFullPath,
+                agentSessionID: context.agentSessionID,
+                bindingFingerprint: context.bindingFingerprint,
+                physicalRootPaths: context.physicalRootPaths
+            )
+        }
     }
 
     @MainActor

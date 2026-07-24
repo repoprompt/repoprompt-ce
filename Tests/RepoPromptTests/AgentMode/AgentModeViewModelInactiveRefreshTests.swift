@@ -733,6 +733,21 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         }
         XCTAssertEqual(Set(tabIDs), Set([first.tabID, second.tabID]))
 
+        viewModel.test_resetPersistentBindingResolutionCallCount()
+        XCTAssertEqual(
+            viewModel.worktreeBindingState(forAgentSessionID: sessionID, tabID: first.tabID),
+            .unavailable
+        )
+        XCTAssertEqual(viewModel.test_persistentBindingResolutionCallCount, 1)
+
+        let missingSessionID = UUID()
+        viewModel.test_resetPersistentBindingResolutionCallCount()
+        XCTAssertEqual(
+            viewModel.worktreeBindingState(forAgentSessionID: missingSessionID),
+            .unavailable
+        )
+        XCTAssertEqual(viewModel.test_persistentBindingResolutionCallCount, 1)
+
         do {
             _ = try await viewModel.mcpResolveOrCreateSessionTarget(
                 tabID: nil,

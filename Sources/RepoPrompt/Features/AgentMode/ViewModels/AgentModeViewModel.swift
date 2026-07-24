@@ -772,6 +772,14 @@ final class AgentModeViewModel: ObservableObject {
             persistentBindingResolution(for: sessionID)
         }
 
+        func test_resetPersistentBindingResolutionCallCount() {
+            persistentBindingResolutionCallCountForTesting = 0
+        }
+
+        var test_persistentBindingResolutionCallCount: Int {
+            persistentBindingResolutionCallCountForTesting
+        }
+
         func test_bindingTransitionToken(for session: TabSession) -> PersistentBindingTransitionToken {
             session.persistentBindingTransitionToken()
         }
@@ -3462,7 +3470,14 @@ final class AgentModeViewModel: ObservableObject {
         )?.sessionID
     }
 
+    #if DEBUG
+        private var persistentBindingResolutionCallCountForTesting = 0
+    #endif
+
     private func persistentBindingResolution(for sessionID: UUID) -> PersistentBindingResolution {
+        #if DEBUG
+            persistentBindingResolutionCallCountForTesting += 1
+        #endif
         var authoritativeCandidates = Set<UUID>()
         var conflictingTabIDs = Set<UUID>()
         let liveClaims = Dictionary(uniqueKeysWithValues: sessions.values.compactMap { session in
@@ -5503,20 +5518,21 @@ final class AgentModeViewModel: ObservableObject {
         forAgentSessionID sessionID: UUID,
         tabID: UUID? = nil
     ) -> AgentSessionWorktreeBindingState {
-        do {
-            if let live = try authoritativeLiveSession(for: sessionID) {
+        switch persistentBindingResolution(for: sessionID) {
+        case let .unique(resolvedTabID):
+            if let live = sessions[resolvedTabID], live.activeAgentSessionID == sessionID {
                 return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
             }
-        } catch {
-            return .unavailable
-        }
-        if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
-            return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
-        }
-        switch persistentBindingResolution(for: sessionID) {
-        case .unique:
+            if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
+                return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
+            }
             return .unhydrated
-        case .notFound, .ambiguous:
+        case .notFound:
+            if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
+                return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
+            }
+            return .unavailable
+        case .ambiguous:
             return .unavailable
         }
     }
