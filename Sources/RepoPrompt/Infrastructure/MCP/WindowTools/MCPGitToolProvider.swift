@@ -597,13 +597,6 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             try await dependencies.validateContextBuilderGitArtifactSelection(metadata, publicationFence.target)
         }
 
-        // Tool-level admission is keyed by every repository touched by this request. WI-9's
-        // lower-level global/per-repository subprocess controller remains independently active.
-        let gitAdmissionLease = try await MCPGitToolAdmissionController.shared.acquire(
-            repositoryRoots: repos.map(\.rootURL)
-        )
-        defer { MCPGitToolAdmissionController.shared.release(gitAdmissionLease) }
-
         // For now, use primary repo for single-repo operations
         // Multi-root execution will be implemented for operations that benefit from it (status, diff)
         MCPToolWorkCountDiagnostics.setGitRepositories(repos.map(\.repoKey))
@@ -1097,6 +1090,16 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
             // If artifacts requested, use the publisher
             if artifacts {
+                // Tool-level admission is only needed for artifact publication paths,
+                // which write Git snapshot files and can commit primary artifacts to the
+                // current tab selection. Plain read-only Git operations are protected by
+                // the lower-level GitProcessAdmissionController and must not queue behind
+                // a stuck artifact export.
+                let gitAdmissionLease = try await MCPGitToolAdmissionController.shared.acquire(
+                    repositoryRoots: repos.map(\.rootURL)
+                )
+                defer { MCPGitToolAdmissionController.shared.release(gitAdmissionLease) }
+
                 let modeRaw = args["mode"]?.stringValue?.lowercased() ?? "standard"
                 guard let mode = GitDiffPublishMode(rawValue: modeRaw) else {
                     throw MCPError.invalidParams("Invalid mode: \(modeRaw)")
