@@ -10,6 +10,38 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
         return WorkspaceCodemapBindingEnginePolicy(maximumManifestAdoptionRecordCount: recordLimit)
     }
 
+    func awaitCodemapGraphsReady(
+        store: WorkspaceFileContextStore,
+        rootIDs: Set<UUID>,
+        timeout: Duration = .seconds(60)
+    ) async throws -> [WorkspaceCodemapRootStatusSnapshot] {
+        precondition(!rootIDs.isEmpty)
+        let updates = await store.codemapRootStatusUpdates()
+        return try await withThrowingTaskGroup(of: [WorkspaceCodemapRootStatusSnapshot].self) { group in
+            group.addTask {
+                for await update in updates {
+                    try Task.checkCancellation()
+                    let roots = update.roots.filter { rootIDs.contains($0.rootEpoch.rootID) }
+                    if roots.count == rootIDs.count, roots.allSatisfy({ $0.availability == .ready }) {
+                        return roots.sorted {
+                            workspaceCodemapRootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
+                        }
+                    }
+                }
+                throw CodemapStoreTestError.timedOut
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw CodemapStoreTestError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw CodemapStoreTestError.timedOut
+            }
+            return result
+        }
+    }
+
     func waitForCompletionBeforeExternalDeadline(
         _ completion: CodemapBoundedCompletionState,
         clock: ContinuousClock,

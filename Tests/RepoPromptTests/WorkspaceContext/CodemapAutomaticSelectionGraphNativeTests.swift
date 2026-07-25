@@ -173,28 +173,16 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         }
         let automaticDemandTicketOffset = fixture.demandedTickets.values.count
 
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(60))
-        var resolved: WorkspaceCodemapAutomaticSelectionResult?
-        while clock.now < deadline {
-            let identities = await store.codemapAutomaticSelectionSourceIdentities(
-                forFileIDs: [source.id],
-                rootScope: .visibleWorkspace
-            )
-            if let identity = identities.first {
-                let result = try await store.resolveAutomaticCodemapSelection(
-                    sources: [identity],
-                    rootScope: .visibleWorkspace
-                )
-                if result.targets.contains(where: { $0.fileID == target.id }), result.receipt != nil {
-                    resolved = result
-                    break
-                }
-            }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-
-        let result = try XCTUnwrap(resolved)
+        _ = try await awaitCodemapGraphsReady(store: store, rootIDs: [loaded.id])
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: [source.id],
+            rootScope: .visibleWorkspace
+        )
+        let identity = try XCTUnwrap(identities.first)
+        let result = try await store.resolveAutomaticCodemapSelection(
+            sources: [identity],
+            rootScope: .visibleWorkspace
+        )
         XCTAssertEqual(result.targets.map(\.fileID), [target.id])
         XCTAssertFalse(result.targets.contains { $0.fileID == source.id || $0.fileID == unrelated.id })
         let buildCountBeforeRepeatQuery = fixture.buildCount.value
@@ -291,47 +279,26 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let secondSource = try XCTUnwrap(secondFiles.first { $0.standardizedRelativePath == "Sources/Source.swift" })
         let secondTarget = try XCTUnwrap(secondFiles.first { $0.standardizedRelativePath == "Sources/Target.swift" })
 
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(60))
-        var isolated: WorkspaceCodemapAutomaticSelectionResult?
-        var merged: WorkspaceCodemapAutomaticSelectionResult?
-        while clock.now < deadline {
-            let identities = await store.codemapAutomaticSelectionSourceIdentities(
-                forFileIDs: [firstSource.id, secondSource.id],
-                rootScope: .visibleWorkspace
-            )
-            if identities.count == 2 {
-                let orderedIdentities = identities.sorted {
-                    workspaceCodemapRootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
-                }
-                let expectedOrderedRootIDs = orderedIdentities.map(\.rootEpoch.rootID)
-                let targetByRoot = [firstRoot.id: firstTarget.id, secondRoot.id: secondTarget.id]
-                let expectedOrderedTargetIDs = expectedOrderedRootIDs.compactMap { targetByRoot[$0] }
-                let firstIdentity = try XCTUnwrap(identities.first { $0.fileID == firstSource.id })
-                let firstResult = try await store.resolveAutomaticCodemapSelection(
-                    sources: [firstIdentity],
-                    rootScope: .visibleWorkspace
-                )
-                let mergedResult = try await store.resolveAutomaticCodemapSelection(
-                    sources: Array(identities.reversed()),
-                    rootScope: .visibleWorkspace
-                )
-                if firstResult.targets.map(\.fileID) == [firstTarget.id],
-                   mergedResult.roots.map(\.rootEpoch.rootID) == expectedOrderedRootIDs,
-                   mergedResult.targets.map(\.fileID) == expectedOrderedTargetIDs
-                {
-                    isolated = firstResult
-                    merged = mergedResult
-                    break
-                }
-            }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-
-        let isolatedResult = try XCTUnwrap(isolated)
+        _ = try await awaitCodemapGraphsReady(
+            store: store,
+            rootIDs: [firstRoot.id, secondRoot.id]
+        )
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: [firstSource.id, secondSource.id],
+            rootScope: .visibleWorkspace
+        )
+        XCTAssertEqual(identities.count, 2)
+        let firstIdentity = try XCTUnwrap(identities.first { $0.fileID == firstSource.id })
+        let isolatedResult = try await store.resolveAutomaticCodemapSelection(
+            sources: [firstIdentity],
+            rootScope: .visibleWorkspace
+        )
         XCTAssertEqual(isolatedResult.targets.map(\.fileID), [firstTarget.id])
         XCTAssertFalse(isolatedResult.targets.contains { $0.fileID == secondTarget.id })
-        let mergedResult = try XCTUnwrap(merged)
+        let mergedResult = try await store.resolveAutomaticCodemapSelection(
+            sources: Array(identities.reversed()),
+            rootScope: .visibleWorkspace
+        )
         let expectedRootIDs = mergedResult.roots.map(\.rootEpoch).sorted(
             by: workspaceCodemapRootEpochPrecedes
         ).map(\.rootID)
@@ -388,6 +355,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         for source in sources {
             _ = try await waitForAutomaticSelection(
                 store: store,
+                rootIDs: [source.rootID],
                 sourceFileIDs: [source.id],
                 expectedTargetFileIDs: [XCTUnwrap(targetsByRoot[source.rootID])]
             )
@@ -466,36 +434,18 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             $0.standardizedRelativePath == "Sources/Target.swift"
         })
 
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(60))
-        var resolved: WorkspaceCodemapAutomaticSelectionResult?
-        var lastCandidate: WorkspaceCodemapAutomaticSelectionResult?
-        while clock.now < deadline {
-            let identities = await store.codemapAutomaticSelectionSourceIdentities(
-                forFileIDs: [budgetSource.id, healthySource.id],
-                rootScope: .visibleWorkspace
-            )
-            if identities.count == 2 {
-                let candidate = try await store.resolveAutomaticCodemapSelection(
-                    sources: Array(identities.reversed()),
-                    rootScope: .visibleWorkspace
-                )
-                lastCandidate = candidate
-                let budgetResult = candidate.roots.first { $0.rootEpoch.rootID == budgetRoot.id }
-                let healthyResult = candidate.roots.first { $0.rootEpoch.rootID == healthyRoot.id }
-                if budgetResult?.issues.contains(.budget(.referenceFailureLimit(attempted: 1, limit: 0))) == true,
-                   healthyResult?.targets.map(\.fileID) == [healthyTarget.id]
-                {
-                    resolved = candidate
-                    break
-                }
-            }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-
-        let result = try XCTUnwrap(
-            resolved,
-            "Timed out waiting for independent budget/healthy root results; last candidate: \(String(describing: lastCandidate))"
+        _ = try await awaitCodemapGraphsReady(
+            store: store,
+            rootIDs: [budgetRoot.id, healthyRoot.id]
+        )
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: [budgetSource.id, healthySource.id],
+            rootScope: .visibleWorkspace
+        )
+        XCTAssertEqual(identities.count, 2)
+        let result = try await store.resolveAutomaticCodemapSelection(
+            sources: Array(identities.reversed()),
+            rootScope: .visibleWorkspace
         )
         let budgetResult = try XCTUnwrap(result.roots.first { $0.rootEpoch.rootID == budgetRoot.id })
         let healthyResult = try XCTUnwrap(result.roots.first { $0.rootEpoch.rootID == healthyRoot.id })
@@ -548,6 +498,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         _ = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [root.id],
             sourceFileIDs: [source.id],
             expectedTargetFileIDs: [target.id]
         )
@@ -603,6 +554,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         _ = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [root.id],
             sourceFileIDs: [source.id],
             expectedTargetFileIDs: [target.id]
         )
@@ -662,6 +614,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         _ = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [root.id],
             sourceFileIDs: [source.id],
             expectedTargetFileIDs: [target.id]
         )
@@ -734,6 +687,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         _ = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [root.id],
             sourceFileIDs: [source.id],
             expectedTargetFileIDs: [target.id]
         )
@@ -808,6 +762,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let second = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Second.swift" })
         _ = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [root.id],
             sourceFileIDs: [source.id],
             expectedTargetFileIDs: [first.id, second.id]
         )
@@ -852,6 +807,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let second = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Second.swift" })
         _ = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [root.id],
             sourceFileIDs: [source.id],
             expectedTargetFileIDs: [first.id, second.id]
         )
@@ -910,6 +866,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         })
         let first = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [firstRoot.id],
             sourceFileIDs: [firstSource.id],
             expectedTargetFileIDs: [firstTarget.id]
         )
@@ -933,6 +890,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         })
         let reloaded = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [reloadedRoot.id],
             sourceFileIDs: [reloadedSource.id],
             expectedTargetFileIDs: [reloadedTarget.id]
         )
@@ -968,27 +926,18 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let first = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/First.swift" })
         let second = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Second.swift" })
 
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(60))
-        var resolved: WorkspaceCodemapAutomaticSelectionResult?
-        while clock.now < deadline {
-            let identities = await store.codemapAutomaticSelectionSourceIdentities(
-                forFileIDs: [source.id],
-                rootScope: .visibleWorkspace
-            )
-            if let identity = identities.first {
-                let candidate = try await store.resolveAutomaticCodemapSelection(
-                    sources: [identity],
-                    rootScope: .visibleWorkspace
-                )
-                if Set(candidate.targets.map(\.fileID)) == Set([first.id, second.id]), candidate.receipt != nil {
-                    resolved = candidate
-                    break
-                }
-            }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        let receipt = try XCTUnwrap(resolved?.receipt)
+        _ = try await awaitCodemapGraphsReady(store: store, rootIDs: [loaded.id])
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: [source.id],
+            rootScope: .visibleWorkspace
+        )
+        let identity = try XCTUnwrap(identities.first)
+        let resolved = try await store.resolveAutomaticCodemapSelection(
+            sources: [identity],
+            rootScope: .visibleWorkspace
+        )
+        XCTAssertEqual(Set(resolved.targets.map(\.fileID)), Set([first.id, second.id]))
+        let receipt = try XCTUnwrap(resolved.receipt)
 
         try "struct FirstTarget { let changed: Bool }\n".write(
             to: rootURL.appendingPathComponent("Sources/First.swift"),
@@ -1000,18 +949,10 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             deltas: [.fileModified("Sources/First.swift", Date())]
         )
 
-        var revalidation = await store.revalidateAutomaticCodemapSelection(
+        let revalidation = await store.revalidateAutomaticCodemapSelection(
             receipt,
             rootScope: .visibleWorkspace
         )
-        let mutationDeadline = clock.now.advanced(by: .seconds(10))
-        while revalidation.validTargets.contains(where: { $0.fileID == first.id }), clock.now < mutationDeadline {
-            try await Task.sleep(for: .milliseconds(25))
-            revalidation = await store.revalidateAutomaticCodemapSelection(
-                receipt,
-                rootScope: .visibleWorkspace
-            )
-        }
         XCTAssertEqual(revalidation.validTargets.map(\.fileID), [second.id])
         XCTAssertTrue(revalidation.issues.contains(.targetGenerationChanged(
             rootEpoch: receipt.roots[0].rootEpoch,
@@ -1049,6 +990,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         _ = try await waitForAutomaticSelection(
             store: store,
+            rootIDs: [root.id],
             sourceFileIDs: [source.id],
             expectedTargetFileIDs: [target.id]
         )
@@ -1152,27 +1094,22 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
 
     private func waitForAutomaticSelection(
         store: WorkspaceFileContextStore,
+        rootIDs: Set<UUID>,
         sourceFileIDs: [UUID],
         expectedTargetFileIDs: [UUID]
     ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(60))
-        while clock.now < deadline {
-            let identities = await store.codemapAutomaticSelectionSourceIdentities(
-                forFileIDs: sourceFileIDs,
-                rootScope: .visibleWorkspace
-            )
-            if identities.count == sourceFileIDs.count {
-                let result = try await store.resolveAutomaticCodemapSelection(
-                    sources: identities,
-                    rootScope: .visibleWorkspace
-                )
-                if result.targets.map(\.fileID) == expectedTargetFileIDs, result.receipt != nil {
-                    return result
-                }
-            }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        throw CodemapStoreTestError.timedOut
+        _ = try await awaitCodemapGraphsReady(store: store, rootIDs: rootIDs)
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: sourceFileIDs,
+            rootScope: .visibleWorkspace
+        )
+        XCTAssertEqual(identities.count, sourceFileIDs.count)
+        let result = try await store.resolveAutomaticCodemapSelection(
+            sources: identities,
+            rootScope: .visibleWorkspace
+        )
+        XCTAssertEqual(result.targets.map(\.fileID), expectedTargetFileIDs)
+        XCTAssertNotNil(result.receipt)
+        return result
     }
 }
