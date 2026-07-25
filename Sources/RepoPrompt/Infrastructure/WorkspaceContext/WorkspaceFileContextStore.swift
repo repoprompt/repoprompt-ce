@@ -12190,13 +12190,19 @@ actor WorkspaceFileContextStore {
     private func resolveCodemapEligibility(
         authority: CodemapRootAuthority
     ) async -> CodemapEligibilityResolution {
+        var requiresGitPreflight = false
         if let completed = codemapCompletedEligibilityByRootEpoch[authority.rootEpoch],
            completed.authority == authority,
            codemapPreflightAuthorityIsCurrent(authority)
         {
             if case let .terminal(.nonGit, proof?) = completed.result {
-                if codemapLocalGitClassificationProbe.validate(proof) {
+                switch codemapLocalGitClassificationProbe.validate(proof) {
+                case .current:
                     return completed.result
+                case .requiresLocalReclassification:
+                    break
+                case .requiresGitPreflight:
+                    requiresGitPreflight = true
                 }
                 codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
                 terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
@@ -12211,8 +12217,13 @@ actor WorkspaceFileContextStore {
                 terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
                 return .stale
             }
-            if codemapLocalGitClassificationProbe.validate(cached.proof) {
+            switch codemapLocalGitClassificationProbe.validate(cached.proof) {
+            case .current:
                 return .terminal(.nonGit, cached.proof)
+            case .requiresLocalReclassification:
+                break
+            case .requiresGitPreflight:
+                requiresGitPreflight = true
             }
             terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
         }
@@ -12226,7 +12237,10 @@ actor WorkspaceFileContextStore {
             let id = UUID()
             let task = Task { [weak self] in
                 guard let self else { return CodemapEligibilityResolution.cancelled }
-                return await performCodemapEligibility(authority: authority)
+                return await performCodemapEligibility(
+                    authority: authority,
+                    requiresGitPreflight: requiresGitPreflight
+                )
             }
             flight = CodemapEligibilityFlight(id: id, authority: authority, task: task)
             codemapEligibilityFlightsByRootEpoch[authority.rootEpoch] = flight
@@ -12249,7 +12263,7 @@ actor WorkspaceFileContextStore {
         }
         if case let .terminal(.nonGit, proof?) = result,
            codemapPreflightAuthorityIsCurrent(authority),
-           codemapLocalGitClassificationProbe.validate(proof)
+           codemapLocalGitClassificationProbe.validate(proof) == .current
         {
             terminalNonGitCodemapCacheByEpoch[authority.rootEpoch] = .init(
                 standardizedRootPath: authority.standardizedRootPath,
@@ -12282,17 +12296,22 @@ actor WorkspaceFileContextStore {
     }
 
     private func performCodemapEligibility(
-        authority: CodemapRootAuthority
+        authority: CodemapRootAuthority,
+        requiresGitPreflight: Bool
     ) async -> CodemapEligibilityResolution {
         let rootURL = URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true)
-        let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
+        if !requiresGitPreflight {
+            let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
+            guard !Task.isCancelled else { return .cancelled }
+            guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
+            if case let .definitelyNonGit(proof) = local,
+               codemapLocalGitClassificationProbe.validate(proof) == .current
+            {
+                return .terminal(.nonGit, proof)
+            }
+        }
         guard !Task.isCancelled else { return .cancelled }
         guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
-        if case let .definitelyNonGit(proof) = local,
-           codemapLocalGitClassificationProbe.validate(proof)
-        {
-            return .terminal(.nonGit, proof)
-        }
         let result = await codemapGitEligibilityProbe.resolve(rootURL)
         guard !Task.isCancelled else { return .cancelled }
         guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
@@ -12593,7 +12612,7 @@ actor WorkspaceFileContextStore {
                let cached = terminalNonGitCodemapCacheByEpoch[rootEpoch]
             {
                 if cached.standardizedRootPath == authority.standardizedRootPath,
-                   codemapLocalGitClassificationProbe.validate(cached.proof)
+                   codemapLocalGitClassificationProbe.validate(cached.proof) == .current
                 {
                     shouldReturnStableUnavailable = true
                 } else {

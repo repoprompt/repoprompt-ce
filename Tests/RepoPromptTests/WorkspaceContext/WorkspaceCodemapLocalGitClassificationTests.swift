@@ -18,7 +18,10 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         guard case let .definitelyNonGit(proof) = result else {
             return XCTFail("Expected a terminal non-Git proof, got \(result)")
         }
-        XCTAssertTrue(WorkspaceCodemapLocalGitClassificationProbe.production.validate(proof))
+        XCTAssertEqual(
+            WorkspaceCodemapLocalGitClassificationProbe.production.validate(proof),
+            .current
+        )
     }
 
     func testWorktreeSubdirectoryRequiresGitPreflight() async throws {
@@ -269,7 +272,10 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
                 validationGate.didResolve()
                 return result
             } validate: { proof in
-                validationGate.permitsValidation() && productionLocalClassification.validate(proof)
+                guard validationGate.permitsValidation() else {
+                    return .requiresLocalReclassification
+                }
+                return productionLocalClassification.validate(proof)
             },
             codemapGitEligibilityProbe: .init { rootURL in
                 await gitPreflightCount.increment()
