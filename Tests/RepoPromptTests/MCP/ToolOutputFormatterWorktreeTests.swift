@@ -493,6 +493,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         let sessionID = "11111111-1111-1111-1111-111111111111"
         let interactionID = "22222222-2222-2222-2222-222222222222"
         let cases: [([Value], Bool)] = [
+            ([], true),
             (
                 [
                     .object(["label": .string("accept")]),

@@ -5411,12 +5411,13 @@ extension ToolOutputFormatter {
                 case "approval":
                     let options = interaction?["options"]?.arrayValue ?? []
                     let labels = options.compactMap { $0.objectValue?["label"]?.stringValue }
-                    if !labels.isEmpty {
-                        lines.append("- Allowed response values: \(labels.map { "`\($0)`" }.joined(separator: ", "))")
-                    } else {
-                        lines.append("- Allowed response values: `accept`, `accept_for_session`, `accept_with_amendment`, `decline`, `cancel`")
-                    }
-                    if labels.contains("accept_with_amendment") {
+                    let effectiveLabels = labels.isEmpty
+                        ? ["accept", "accept_for_session", "accept_with_amendment", "decline", "cancel"]
+                        : labels
+                    lines.append(
+                        "- Allowed response values: \(effectiveLabels.map { "`\($0)`" }.joined(separator: ", "))"
+                    )
+                    if effectiveLabels.contains("accept_with_amendment") {
                         lines.append(
                             "- For `response=\"accept_with_amendment\"`, also provide `amendment=\"<text>\"`."
                         )
