@@ -5,6 +5,9 @@ import XCTest
     @MainActor
     final class WorkspaceSavePreparationTests: XCTestCase {
         private var originalMCPAutoStart = false
+        private var savePreparationGates: [WorkspaceSavePreparationGate] = []
+        private var saveTasks: [Task<Void, Never>] = []
+        private var managersWithSavePreparationHooks: [WorkspaceManagerViewModel] = []
 
         override func setUp() async throws {
             try await super.setUp()
@@ -14,6 +17,17 @@ import XCTest
         }
 
         override func tearDown() async throws {
+            for managersWithSavePreparationHook in managersWithSavePreparationHooks {
+                managersWithSavePreparationHook.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            }
+            savePreparationGates.forEach { $0.cancel() }
+            saveTasks.forEach { $0.cancel() }
+            for saveTask in saveTasks {
+                await saveTask.value
+            }
+            managersWithSavePreparationHooks.removeAll()
+            savePreparationGates.removeAll()
+            saveTasks.removeAll()
             await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
             GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
             try await super.tearDown()
@@ -33,20 +47,23 @@ import XCTest
             manager.markWorkspaceDirty()
 
             let gate = WorkspaceSavePreparationGate()
+            savePreparationGates.append(gate)
+            managersWithSavePreparationHooks.append(manager)
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, fileURL, _ in
                 await gate.arriveAndWait(workspaceID: workspaceID, fileURL: fileURL)
             }
             let saveTask = Task { @MainActor in
                 await manager.pollAndSaveStateAsync()
             }
-            let arrival = await gate.waitUntilArrived()
+            saveTasks.append(saveTask)
+            let arrival = try await gate.waitUntilArrivedAndBlocked()
             XCTAssertEqual(arrival.workspaceID, workspaceA.id)
             XCTAssertEqual(arrival.fileURL, manager.workspaceFileURL(for: workspaceA))
             try manager.workspaces.swapAt(
                 XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceA.id }),
                 XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceB.id })
             )
-            await gate.release()
+            gate.release()
             await saveTask.value
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
 
@@ -69,15 +86,18 @@ import XCTest
             let expectedURL = manager.workspaceFileURL(for: workspace)
 
             let gate = WorkspaceSavePreparationGate()
+            savePreparationGates.append(gate)
+            managersWithSavePreparationHooks.append(manager)
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, fileURL, _ in
                 await gate.arriveAndWait(workspaceID: workspaceID, fileURL: fileURL)
             }
             let saveTask = Task { @MainActor in
                 await manager.pollAndSaveStateAsync()
             }
-            _ = await gate.waitUntilArrived()
+            saveTasks.append(saveTask)
+            _ = try await gate.waitUntilArrivedAndBlocked()
             manager.workspaces.removeAll { $0.id == workspace.id }
-            await gate.release()
+            gate.release()
             await saveTask.value
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
 
@@ -189,36 +209,102 @@ import XCTest
         }
     }
 
-    private actor WorkspaceSavePreparationGate {
+    private final class WorkspaceSavePreparationGate: @unchecked Sendable {
         struct Arrival {
             let workspaceID: UUID
             let fileURL: URL
         }
 
+        private let condition = NSCondition()
+        private let releaseFence = TestReleaseFence(name: "workspace save preparation gate")
         private var arrival: Arrival?
-        private var arrivalWaiters: [CheckedContinuation<Arrival, Never>] = []
-        private var releaseContinuation: CheckedContinuation<Void, Never>?
+        private var arrivalWaiters: [UUID: CheckedContinuation<Arrival?, Never>] = [:]
+        private var cancelledArrivalWaiters = Set<UUID>()
+        private var isCancelled = false
 
         func arriveAndWait(workspaceID: UUID, fileURL: URL) async {
-            let value = Arrival(workspaceID: workspaceID, fileURL: fileURL)
-            arrival = value
-            arrivalWaiters.forEach { $0.resume(returning: value) }
-            arrivalWaiters.removeAll()
-            await withCheckedContinuation { continuation in
-                releaseContinuation = continuation
-            }
+            recordArrival(Arrival(workspaceID: workspaceID, fileURL: fileURL))
+            await releaseFence.enterAndWait()
         }
 
-        func waitUntilArrived() async -> Arrival {
-            if let arrival { return arrival }
-            return await withCheckedContinuation { continuation in
-                arrivalWaiters.append(continuation)
+        func waitUntilArrivedAndBlocked() async throws -> Arrival {
+            guard let arrival = await waitUntilArrived() else {
+                throw CancellationError()
             }
+            guard await releaseFence.waitUntilEntered() else {
+                throw CancellationError()
+            }
+            return arrival
         }
 
         func release() {
-            releaseContinuation?.resume()
-            releaseContinuation = nil
+            releaseFence.release()
+        }
+
+        func cancel() {
+            condition.lock()
+            isCancelled = true
+            let pending = Array(arrivalWaiters.values)
+            arrivalWaiters.removeAll()
+            cancelledArrivalWaiters.removeAll()
+            condition.broadcast()
+            condition.unlock()
+            pending.forEach { $0.resume(returning: nil) }
+            releaseFence.release()
+        }
+
+        private func waitUntilArrived() async -> Arrival? {
+            let waiterID = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    registerArrivalWaiter(continuation, waiterID: waiterID)
+                }
+            } onCancel: {
+                cancelArrivalWaiter(waiterID)
+            }
+        }
+
+        private func recordArrival(_ value: Arrival) {
+            condition.lock()
+            guard !isCancelled else {
+                condition.unlock()
+                return
+            }
+            arrival = value
+            let pending = Array(arrivalWaiters.values)
+            arrivalWaiters.removeAll()
+            cancelledArrivalWaiters.removeAll()
+            condition.broadcast()
+            condition.unlock()
+            pending.forEach { $0.resume(returning: value) }
+        }
+
+        private func registerArrivalWaiter(
+            _ continuation: CheckedContinuation<Arrival?, Never>,
+            waiterID: UUID
+        ) {
+            condition.lock()
+            if let arrival {
+                condition.unlock()
+                continuation.resume(returning: arrival)
+            } else if isCancelled || Task.isCancelled || cancelledArrivalWaiters.remove(waiterID) != nil {
+                condition.unlock()
+                continuation.resume(returning: nil)
+            } else {
+                arrivalWaiters[waiterID] = continuation
+                condition.unlock()
+            }
+        }
+
+        private func cancelArrivalWaiter(_ waiterID: UUID) {
+            condition.lock()
+            let continuation = arrivalWaiters.removeValue(forKey: waiterID)
+            if continuation == nil {
+                cancelledArrivalWaiters.insert(waiterID)
+            }
+            condition.broadcast()
+            condition.unlock()
+            continuation?.resume(returning: nil)
         }
     }
 
