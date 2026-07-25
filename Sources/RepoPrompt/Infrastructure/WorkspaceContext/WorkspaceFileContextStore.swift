@@ -12190,7 +12190,6 @@ actor WorkspaceFileContextStore {
     private func resolveCodemapEligibility(
         authority: CodemapRootAuthority
     ) async -> CodemapEligibilityResolution {
-        var skipLocalClassification = false
         if let completed = codemapCompletedEligibilityByRootEpoch[authority.rootEpoch],
            completed.authority == authority,
            codemapPreflightAuthorityIsCurrent(authority)
@@ -12201,7 +12200,6 @@ actor WorkspaceFileContextStore {
                 }
                 codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
                 terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
-                skipLocalClassification = true
             } else {
                 return completed.result
             }
@@ -12217,7 +12215,6 @@ actor WorkspaceFileContextStore {
                 return .terminal(.nonGit, cached.proof)
             }
             terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
-            skipLocalClassification = true
         }
 
         let flight: CodemapEligibilityFlight
@@ -12229,10 +12226,7 @@ actor WorkspaceFileContextStore {
             let id = UUID()
             let task = Task { [weak self] in
                 guard let self else { return CodemapEligibilityResolution.cancelled }
-                return await performCodemapEligibility(
-                    authority: authority,
-                    skipLocalClassification: skipLocalClassification
-                )
+                return await performCodemapEligibility(authority: authority)
             }
             flight = CodemapEligibilityFlight(id: id, authority: authority, task: task)
             codemapEligibilityFlightsByRootEpoch[authority.rootEpoch] = flight
@@ -12288,19 +12282,16 @@ actor WorkspaceFileContextStore {
     }
 
     private func performCodemapEligibility(
-        authority: CodemapRootAuthority,
-        skipLocalClassification: Bool
+        authority: CodemapRootAuthority
     ) async -> CodemapEligibilityResolution {
         let rootURL = URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true)
-        if !skipLocalClassification {
-            let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
-            guard !Task.isCancelled else { return .cancelled }
-            guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
-            if case let .definitelyNonGit(proof) = local,
-               codemapLocalGitClassificationProbe.validate(proof)
-            {
-                return .terminal(.nonGit, proof)
-            }
+        let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
+        guard !Task.isCancelled else { return .cancelled }
+        guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
+        if case let .definitelyNonGit(proof) = local,
+           codemapLocalGitClassificationProbe.validate(proof)
+        {
+            return .terminal(.nonGit, proof)
         }
         let result = await codemapGitEligibilityProbe.resolve(rootURL)
         guard !Task.isCancelled else { return .cancelled }
