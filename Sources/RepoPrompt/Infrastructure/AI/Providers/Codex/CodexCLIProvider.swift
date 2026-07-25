@@ -763,12 +763,10 @@ final class CodexCLIProvider: AIProvider {
             preconditionFailure("CodexCLIProvider requires an app-server client when no custom session controller factory is provided.")
         }
 
+        let interactiveConfigOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
         let options = CodexNativeSessionController.Options(
             requestTimeout: requestTimeout,
-            configOverridesProvider: { [weak self] in
-                guard let self else { return [:] }
-                return interactiveConfigOverrides(excludeServers: excludeServers)
-            },
+            configOverridesProvider: { interactiveConfigOverrides },
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },

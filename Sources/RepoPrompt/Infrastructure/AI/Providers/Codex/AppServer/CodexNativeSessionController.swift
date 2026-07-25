@@ -1289,9 +1289,6 @@ final class CodexNativeSessionController {
                 throw error
             }
 
-            let pendingSessionRef = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort).sessionRef
-            try await disableThreadMemoryMode(threadID: pendingSessionRef.conversationID)
-
             let sessionRef = try await eventHandlingMutex.withLock {
                 try ensureBindingCanComplete()
                 let sessionRef = applyThreadResponse(result, fallbackEffort: reasoningEffort)
@@ -1310,84 +1307,6 @@ final class CodexNativeSessionController {
             }
             throw error
         }
-    }
-
-    private func disableThreadMemoryMode(threadID rawThreadID: String) async throws {
-        let threadID = rawThreadID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !threadID.isEmpty else { throw CodexAppServerClient.ClientError.invalidResponse }
-        do {
-            try await disableThreadMemoryModeForeground(threadID: threadID)
-        } catch {
-            // Memory mode is an optional app-server capability. It should never keep
-            // Agent Mode stuck in the startup/"Initializing…" phase after the thread
-            // itself has already started or resumed successfully. Make one final
-            // background attempt so transient app-server stalls can still clear the
-            // persisted thread eligibility without blocking startup readiness.
-            scheduleBackgroundThreadMemoryModeDisable(threadID: threadID)
-        }
-    }
-
-    private func disableThreadMemoryModeForeground(threadID: String) async throws {
-        var lastError: Error?
-        for _ in 1 ... optionalMemoryModeForegroundAttemptCount {
-            do {
-                try await sendThreadMemoryModeDisableRequest(threadID: threadID)
-                return
-            } catch {
-                lastError = error
-            }
-        }
-        throw lastError ?? CodexAppServerClient.ClientError.invalidResponse
-    }
-
-    private func scheduleBackgroundThreadMemoryModeDisable(threadID: String) {
-        Task.detached(priority: .utility) { [client] in
-            do {
-                try await Self.sendThreadMemoryModeDisableRequest(
-                    client: client,
-                    threadID: threadID,
-                    timeout: nil,
-                    useDefaultTimeout: false
-                )
-            } catch {
-                // Best-effort optional setting; startup must not depend on this background retry.
-            }
-        }
-    }
-
-    private func sendThreadMemoryModeDisableRequest(threadID: String) async throws {
-        try await Self.sendThreadMemoryModeDisableRequest(
-            client: client,
-            threadID: threadID,
-            timeout: optionalMemoryModeRequestTimeout,
-            useDefaultTimeout: true
-        )
-    }
-
-    private static func sendThreadMemoryModeDisableRequest(
-        client: CodexAppServerClient,
-        threadID: String,
-        timeout: TimeInterval?,
-        useDefaultTimeout: Bool
-    ) async throws {
-        _ = try await client.request(
-            method: "thread/memoryMode/set",
-            params: [
-                "threadId": threadID,
-                "mode": "disabled"
-            ],
-            timeout: timeout,
-            useDefaultTimeout: useDefaultTimeout
-        )
-    }
-
-    private var optionalMemoryModeForegroundAttemptCount: Int {
-        2
-    }
-
-    private var optionalMemoryModeRequestTimeout: TimeInterval? {
-        guard let requestTimeout = options.requestTimeout else { return 1 }
-        return min(requestTimeout, 1)
     }
 
     func readThreadSnapshot(
