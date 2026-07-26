@@ -52,7 +52,7 @@ The versioned contract is fail-closed: missing or unknown keys are errors. Metho
 local `$ref`, `allOf`, `oneOf`, and `anyOf` composition and accepts both single-value `enum`
 and `const` discriminators, so upstream organizational refactors do not create false removals.
 
-The hardened 0.144.6 baseline checks 39 methods, 177 parameter paths, and 64 response paths. A failure names
+The hardened 0.144.6 baseline checks 38 methods, 175 parameter paths, and 64 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
@@ -69,12 +69,15 @@ differences:
    declares it; `threadId` is the current resume authority.
 4. `ThreadGoalGetResponse.goal` is optional, while RPCE treated an omitted key as an invalid
    response instead of “no goal.”
-5. `thread/memoryMode/set` is absent from the default generated bundle and appears only with
-   `--experimental`. RPCE uses it as an optional best-effort capability, so the authoritative
-   comparison must include experimental schemas.
+5. **Updated 2026-07-24:** The bundled Codex 0.144.6 source initializes `memory_mode` to `Disabled` for both fresh and
+   resumed threads when `memories.generate_memories=false`, making RPCE's start/resume config
+   initialization the authority. RPCE therefore does not call `thread/memoryMode/set`; recheck this
+   initialization behavior before each bundled Codex runtime bump.
 6. The generated `goal.status` enum includes `blocked` and `usageLimited`, while RPCE previously
    rejected both as invalid responses. The same six-value enum is also declared for
    `thread/goal/set`, so accepting those cases does not create an outbound schema violation.
+
+The contract still generates experimental schemas because RPCE validates `initialize.capabilities.experimentalApi`.
 
 Items 1–4 and 6 were reconciled in the same change: thread-level requests no longer send undeclared
 `effort` or `path`, turn-level `effort` remains authoritative, an omitted goal is treated as

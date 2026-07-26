@@ -128,11 +128,14 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         }
     }
 
-    func testEditRenameDeleteWatcherAndCheckoutInvalidationsFenceVisibilityWithoutScheduling() async throws {
+    func testEditRenameDeleteFenceVisibilityWatcherReconcilesAndCheckoutRevokes() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Fenced.swift": SwiftFixtureSource.emptyStruct("Fenced")]
+            files: [
+                "Sources/Fenced.swift": SwiftFixtureSource.emptyStruct("Fenced"),
+                "Sources/Survivor.swift": SwiftFixtureSource.emptyStruct("Survivor")
+            ]
         )
         let fixture = try await makeEngineFixture(
             root: root,
@@ -141,16 +144,25 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
             )
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
-        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Fenced.swift")) else {
-            return XCTFail("Expected initial ready result.")
+        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Fenced.swift")),
+              case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Survivor.swift"))
+        else {
+            return XCTFail("Expected initial ready results.")
         }
+        let graph = await fixture.engine.selectionGraph(rootEpoch: fixture.rootEpoch)
+        let graphReady = await waitForEngineCondition {
+            guard case let .ready(pinned) = await graph?.latestSnapshot() else { return false }
+            let indexedPaths = Set(pinned.snapshot.nodesByFileID.values.map(\.standardizedRelativePath))
+            return indexedPaths.isSuperset(of: ["Sources/Fenced.swift", "Sources/Survivor.swift"])
+        }
+        XCTAssertTrue(graphReady)
         let modified = await fixture.engine.invalidateModified(
             rootEpoch: fixture.rootEpoch,
             standardizedRelativePaths: ["Sources/Fenced.swift"]
         )
         XCTAssertEqual(modified.revokedOverlayCount, 1)
         let modifiedBundleValue = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
-        XCTAssertTrue(try XCTUnwrap(modifiedBundleValue).entries.isEmpty)
+        XCTAssertEqual(try XCTUnwrap(modifiedBundleValue).entries.count, 1)
 
         let renamed = await fixture.engine.invalidateRenamed(
             rootEpoch: fixture.rootEpoch,
@@ -164,15 +176,126 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         )
         XCTAssertFalse(deleted.manifestWriteFailed)
         let watcher = await fixture.engine.invalidateWatcherGap(rootEpoch: fixture.rootEpoch)
-        XCTAssertEqual(watcher.revokedOverlayCount, 1)
-        guard case .rejected(.capabilityUnavailable) = await fixture.engine.demand(
-            fixture.demand(path: "Sources/Fenced.swift")
-        ) else { return XCTFail("Expected watcher authority fence.") }
-        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
-            return XCTFail("Expected explicit re-registration after watcher gap.")
+        XCTAssertEqual(watcher.revokedOverlayCount, 0)
+        guard case let .ready(pinned)? = await graph?.latestSnapshot() else {
+            return XCTFail("Expected the last committed graph to remain queryable during reconciliation.")
+        }
+        XCTAssertTrue(pinned.reconciling)
+        let survivorID = try XCTUnwrap(pinned.snapshot.nodesByFileID.first {
+            $0.value.standardizedRelativePath == "Sources/Survivor.swift"
+        }?.key)
+        let reconciliationResult = try await graph?.traverseLatest(.init(
+            seedFileIDs: [survivorID],
+            direction: nil,
+            maximumDepth: 0,
+            budget: WorkspaceCodemapGraphPolicy.initial.queryBudget(
+                maximumTokenCount: 6000,
+                includesSignatures: false
+            )
+        ))
+        XCTAssertEqual(reconciliationResult?.status, .partial)
+        XCTAssertEqual(reconciliationResult?.nodes.map(\.fileID), [survivorID])
+        XCTAssertTrue(reconciliationResult?.reconciling == true)
+        XCTAssertTrue(reconciliationResult?.issues.contains(.watcherGapReconciling) == true)
+        let postWatcherDemand = await fixture.engine.demand(fixture.demand(path: "Sources/Fenced.swift"))
+        if case .rejected(.capabilityUnavailable) = postWatcherDemand {
+            return XCTFail("Expected watcher reconciliation to preserve root authority.")
         }
         let checkout = await fixture.engine.invalidateCheckout(rootEpoch: fixture.rootEpoch)
         XCTAssertEqual(checkout.revokedOverlayCount, 1)
+    }
+
+    func testRejectedReconciliationFenceRevokesBindingOwnedGraphAndDrainsPullWork() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Retained.swift": SwiftFixtureSource.emptyStruct("Retained"),
+                "Sources/Removed.swift": SwiftFixtureSource.emptyStruct("Removed")
+            ]
+        )
+        let overlay = WorkspaceCodemapLiveOverlay()
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+            ),
+            overlay: overlay
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Retained.swift")),
+              case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Removed.swift")),
+              let graph = await fixture.engine.selectionGraph(rootEpoch: fixture.rootEpoch)
+        else { return XCTFail("Expected a binding-owned graph with two ready targets.") }
+        let graphReady = await waitForEngineCondition {
+            guard case let .ready(pinned) = await graph.latestSnapshot() else { return false }
+            return pinned.snapshot.nodesByFileID.count == 2
+        }
+        XCTAssertTrue(graphReady)
+        guard case let .ready(before) = await graph.latestSnapshot(),
+              case let .checkpoint(checkpoint) = await overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch),
+              let catalogToken = checkpoint.coverage.catalogWatermark,
+              let template = checkpoint.slots.first,
+              let indexOnlyIdentity = WorkspaceCodemapArtifactBindingIdentity(
+                  rootID: fixture.rootEpoch.rootID,
+                  rootLifetimeID: fixture.rootEpoch.rootLifetimeID,
+                  fileID: UUID(),
+                  standardizedRootPath: template.identity.standardizedRootPath,
+                  standardizedRelativePath: "Sources/IndexOnly.swift",
+                  standardizedFullPath: URL(fileURLWithPath: template.identity.standardizedRootPath)
+                      .appendingPathComponent("Sources/IndexOnly.swift").path
+              ),
+              case let .success(indexOnlySlot) = WorkspaceCodemapGraphSlot.validated(
+                  rootEpoch: fixture.rootEpoch,
+                  identity: indexOnlyIdentity,
+                  requestGeneration: 1,
+                  pathGeneration: 1,
+                  pipelineIdentity: template.pipelineIdentity,
+                  state: template.state
+              )
+        else { return XCTFail("Expected committed graph and overlay checkpoints.") }
+        let injected = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: catalogToken,
+            slots: checkpoint.slots + [indexOnlySlot],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(injected)
+        let indexOnlyCommitted = await waitForEngineCondition {
+            guard case let .ready(pinned) = await graph.latestSnapshot() else { return false }
+            return pinned.snapshot.nodesByFileID[indexOnlySlot.fileID] != nil
+        }
+        XCTAssertTrue(indexOnlyCommitted)
+
+        let beganReconciliation = await overlay.beginGraphReconciliation(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(beganReconciliation)
+        let published = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: catalogToken,
+            slots: checkpoint.slots,
+            enumerationFinished: true,
+            reconciliationFence: { _, _ in .rejected(.repositoryAuthorityMismatch) }
+        )
+        XCTAssertFalse(published)
+
+        let revoked = await waitForEngineCondition {
+            await graph.latestSnapshot() == .revoked(.reconciliationFailed)
+        }
+        XCTAssertTrue(revoked)
+        let receiptDisposition = await graph.revalidate(
+            before.receipt,
+            affectedFileIDs: Set(before.snapshot.nodesByFileID.keys)
+        )
+        XCTAssertEqual(receiptDisposition, .revoked(.reconciliationFailed))
+        let drained = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return await fixture.engine.graphPullTaskCountForTesting() == 0 &&
+                accounting.graphIndexJobCount == 0 &&
+                accounting.activeGraphIndexBatchCount == 0 &&
+                accounting.drainingGraphIndexTaskCount == 0
+        }
+        XCTAssertTrue(drained)
+        await fixture.engine.shutdown()
     }
 
     func testCatalogInvalidationFencesVisibilityWithoutScheduling() async throws {

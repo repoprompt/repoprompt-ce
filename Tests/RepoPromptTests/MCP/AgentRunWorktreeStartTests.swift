@@ -2505,17 +2505,25 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(repeatedDiagnostics.first { $0.rootID == physicalRoot.id }?.crawlCount, 1)
         XCTAssertEqual(repeatedDiagnostics.first { $0.rootID == physicalRoot.id }?.sessionWorktreeOwnerCount, 1)
 
+        let rootRemovalAcknowledged = expectation(description: "session worktree root removal completed")
+        await window.workspaceFileContextStore.setRootUnloadTerminationDidCompleteHandler { diagnostics in
+            guard diagnostics.watcherStopReports.contains(where: { $0.rootID == physicalRoot.id }) else { return }
+            rootRemovalAcknowledged.fulfill()
+        }
         _ = try await viewModel.transitionWorktreeBindings(
             [],
             forSessionID: sessionID,
             intent: .externalManagement
         )
         XCTAssertTrue(session.worktreeBindings.isEmpty)
-        let rootsAfterUnbind = await window.workspaceFileContextStore.roots()
-        XCTAssertFalse(rootsAfterUnbind.contains { $0.id == physicalRoot.id })
         let releasedOwnership = await window.workspaceFileContextStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
         XCTAssertEqual(releasedOwnership.installedOwnerCount, 0)
         XCTAssertEqual(releasedOwnership.rootClaimCount, 0)
+
+        await fulfillment(of: [rootRemovalAcknowledged], timeout: TestFenceDefaults.enterWait)
+        await window.workspaceFileContextStore.setRootUnloadTerminationDidCompleteHandler(nil)
+        let rootsAfterUnbind = await window.workspaceFileContextStore.roots()
+        XCTAssertFalse(rootsAfterUnbind.contains { $0.id == physicalRoot.id })
     }
 
     func testBindingTransitionValidatesAndMaterializesChangedSecondaryBindingWithoutRestartingPrimaryIdentity() async throws {

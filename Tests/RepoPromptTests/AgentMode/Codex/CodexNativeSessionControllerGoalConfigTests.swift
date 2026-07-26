@@ -711,40 +711,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         }
     }
 
-    func testOptionalMemoryModeRetriesDoNotFailStartup() async throws {
-        let options = CodexNativeSessionController.Options(
-            requestTimeout: 0.2,
-            configOverridesProvider: { [:] },
-            approvalPolicyProvider: { .never },
-            sandboxModeProvider: { .readOnly },
-            authTokensRefreshHandler: nil
-        )
-        let (controller, recordURL) = try await makeController(
-            options: options,
-            ignoreMemoryModeRequests: true
-        )
-
-        let startedAt = Date()
-        let ref = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
-        let elapsed = Date().timeIntervalSince(startedAt)
-
-        XCTAssertEqual(ref.conversationID, "fresh-thread")
-        XCTAssertLessThan(elapsed, 30.0)
-        let memoryModeRequests = try recordedRequests(for: "thread/memoryMode/set", at: recordURL)
-        XCTAssertGreaterThanOrEqual(memoryModeRequests.count, 2)
-        let memoryModeParams = try XCTUnwrap(memoryModeRequests.first?["params"] as? [String: Any])
-        XCTAssertEqual(memoryModeParams["threadId"] as? String, "fresh-thread")
-        XCTAssertEqual(memoryModeParams["mode"] as? String, "disabled")
-
-        let requestCountAfterBackgroundRetry = try await waitForRecordedRequestCount(
-            for: "thread/memoryMode/set",
-            at: recordURL,
-            minimumCount: 3
-        )
-        await controller.shutdown()
-        XCTAssertGreaterThanOrEqual(requestCountAfterBackgroundRetry, 3)
-    }
-
     func testSchemaAlignedThreadRequestsOmitUndeclaredFieldsAndAcceptMissingGoal() async throws {
         let (startController, startRecordURL) = try await makeController(options: makeOptions())
         _ = try await startController.startOrResume(
@@ -939,6 +905,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
         try assertProcessLaunchOmitsReasoningSummaryOverride(at: startRecordURL, label: "thread/start process")
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: startRecordURL, label: "thread/start process")
+        XCTAssertEqual(try recordedRequests(for: "thread/memoryMode/set", at: startRecordURL).count, 0)
 
         let (resumeController, resumeRecordURL) = try await makeController(options: options)
         let existing = CodexNativeSessionController.SessionRef(
@@ -959,6 +926,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
         try assertProcessLaunchOmitsReasoningSummaryOverride(at: resumeRecordURL, label: "thread/resume process")
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: resumeRecordURL, label: "thread/resume process")
+        XCTAssertEqual(try recordedRequests(for: "thread/memoryMode/set", at: resumeRecordURL).count, 0)
     }
 
     private func makeOptions() -> CodexNativeSessionController.Options {
@@ -971,7 +939,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
     private func makeController(
         options: CodexNativeSessionController.Options,
-        ignoreMemoryModeRequests: Bool = false,
         goalStatus: String? = nil
     ) async throws -> (CodexNativeSessionController, URL) {
         let directory = FileManager.default.temporaryDirectory
@@ -983,7 +950,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let executableURL = try makeFakeCodexAppServer(
             in: directory,
             recordURL: recordURL,
-            ignoreMemoryModeRequests: ignoreMemoryModeRequests,
             goalStatus: goalStatus
         )
         let client = CodexAppServerClient()
@@ -1011,7 +977,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     private func makeFakeCodexAppServer(
         in directory: URL,
         recordURL: URL,
-        ignoreMemoryModeRequests: Bool = false,
         ignoreInitializeRequests: Bool = false,
         ignoreTurnStartRequests: Bool = false,
         goalStatus: String? = nil
@@ -1028,7 +993,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             raise SystemExit(0)
 
         record_path = \(String(reflecting: recordURL.path))
-        ignore_memory_mode_requests = \(ignoreMemoryModeRequests ? "True" : "False")
         ignore_initialize_requests = \(ignoreInitializeRequests ? "True" : "False")
         ignore_turn_start_requests = \(ignoreTurnStartRequests ? "True" : "False")
         goal_status = \(goalStatus.map { String(reflecting: $0) } ?? "None")
@@ -1052,8 +1016,6 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             if "id" not in request:
                 continue
             if method == "initialize" and ignore_initialize_requests:
-                continue
-            if method == "thread/memoryMode/set" and ignore_memory_mode_requests:
                 continue
             if method == "turn/start" and ignore_turn_start_requests:
                 continue
@@ -1188,6 +1150,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertEqual(params["approvalsReviewer"] as? String, expectedApprovalReviewer, label)
         let config = try XCTUnwrap(params["config"] as? [String: Any], label)
         XCTAssertEqual(config["features.goals"] as? Bool, expectedGoalSupportEnabled, label)
+        XCTAssertEqual(config["features.memories"] as? Bool, false, label)
+        XCTAssertEqual(config["memories.generate_memories"] as? Bool, false, label)
+        XCTAssertEqual(config["memories.use_memories"] as? Bool, false, label)
         XCTAssertEqual(config["features.computer_use"] as? Bool, false, label)
         XCTAssertEqual(
             config["features.code_mode.direct_only_tool_namespaces"] as? [String],

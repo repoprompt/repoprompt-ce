@@ -193,19 +193,6 @@
     },
     {
       "union": "ClientRequest.json",
-      "method": "thread/memoryMode/set",
-      "alwaysSent": [
-        "threadId",
-        "mode"
-      ],
-      "enumValues": {
-        "mode": [
-          "disabled"
-        ]
-      }
-    },
-    {
-      "union": "ClientRequest.json",
       "method": "thread/read",
       "alwaysSent": [
         "threadId",

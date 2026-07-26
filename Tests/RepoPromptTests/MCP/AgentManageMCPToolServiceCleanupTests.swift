@@ -5,6 +5,117 @@ import XCTest
 
 @MainActor
 final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
+    func testCleanupSessionsIncludesPersistedProviderCleanupOutcome() async throws {
+        let previousAction = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        GlobalSettingsStore.shared.setProviderConversationCleanupAction(.archive, commit: false)
+        defer { GlobalSettingsStore.shared.setProviderConversationCleanupAction(previousAction, commit: false) }
+
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let recorder = AgentManageCleanupRecorder(outcome: .succeeded(message: "archived from MCP cleanup"))
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { handle, action in
+            recorder.record(handle: handle, action: action)
+            return recorder.outcome
+        }
+
+        let sessionID = UUID()
+        let session = AgentSession(
+            id: sessionID,
+            workspaceID: workspace.id,
+            name: "Cleanup Session",
+            savedAt: Date(timeIntervalSinceReferenceDate: 298),
+            itemCount: 0,
+            agentKind: AgentProviderKind.codexExec.rawValue,
+            lastRunState: AgentSessionRunState.completed.rawValue,
+            autoEditEnabled: true,
+            codexConversationID: "mcp-cleanup-thread",
+            codexRolloutPath: "/tmp/mcp-cleanup-rollout.jsonl",
+            isMCPOriginated: true
+        )
+        try await AgentSessionDataService.shared.saveAgentSession(
+            session,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+
+        let service = makeService(window: window, cleanupDependencies: .live)
+        let result = try await service.execute(args: [
+            "op": .string("cleanup_sessions"),
+            "session_ids": .array([.string(sessionID.uuidString)])
+        ])
+
+        let object = try XCTUnwrap(result.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, "completed")
+        XCTAssertEqual(object["deleted_count"]?.intValue, 1)
+        let deletedSessions = try XCTUnwrap(object["deleted_sessions"]?.arrayValue)
+        let deleted = try XCTUnwrap(deletedSessions.first?.objectValue)
+        let cleanup = try XCTUnwrap(deleted["provider_cleanup"]?.objectValue)
+        XCTAssertEqual(cleanup["status"]?.stringValue, "succeeded")
+        XCTAssertEqual(cleanup["message"]?.stringValue, "archived from MCP cleanup")
+
+        let calls = recorder.calls()
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.handle.conversationID, "mcp-cleanup-thread")
+        XCTAssertEqual(calls.first?.handle.rolloutPath, "/tmp/mcp-cleanup-rollout.jsonl")
+        XCTAssertEqual(calls.first?.action, .archive)
+    }
+
+    func testCleanupSessionsReportsUnsupportedProviderCleanupForNonCodexPersistedSession() async throws {
+        let previousAction = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        GlobalSettingsStore.shared.setProviderConversationCleanupAction(.archive, commit: false)
+        defer { GlobalSettingsStore.shared.setProviderConversationCleanupAction(previousAction, commit: false) }
+
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let recorder = AgentManageCleanupRecorder(outcome: .succeeded(message: "should not run"))
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { handle, action in
+            recorder.record(handle: handle, action: action)
+            return recorder.outcome
+        }
+
+        let sessionID = UUID()
+        let session = AgentSession(
+            id: sessionID,
+            workspaceID: workspace.id,
+            name: "Unsupported Cleanup Session",
+            savedAt: Date(timeIntervalSinceReferenceDate: 299),
+            itemCount: 0,
+            agentKind: AgentProviderKind.openCode.rawValue,
+            lastRunState: AgentSessionRunState.completed.rawValue,
+            providerSessionID: "open-code-session",
+            autoEditEnabled: true,
+            isMCPOriginated: true
+        )
+        try await AgentSessionDataService.shared.saveAgentSession(
+            session,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+
+        let service = makeService(window: window, cleanupDependencies: .live)
+        let result = try await service.execute(args: [
+            "op": .string("cleanup_sessions"),
+            "session_ids": .array([.string(sessionID.uuidString)])
+        ])
+
+        let object = try XCTUnwrap(result.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, "completed")
+        XCTAssertEqual(object["deleted_count"]?.intValue, 1)
+        let deletedSessions = try XCTUnwrap(object["deleted_sessions"]?.arrayValue)
+        let deleted = try XCTUnwrap(deletedSessions.first?.objectValue)
+        let cleanup = try XCTUnwrap(deleted["provider_cleanup"]?.objectValue)
+        XCTAssertEqual(cleanup["status"]?.stringValue, "unsupported")
+        XCTAssertEqual(
+            cleanup["message"]?.stringValue,
+            "ACP provider openCode has session metadata but no verified conversation cleanup API."
+        )
+        XCTAssertTrue(recorder.calls().isEmpty)
+    }
+
     func testLargeMixedBatchIsBoundedAndReportsEveryEligibleOutcome() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -127,7 +238,7 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
             recorder: recorder,
             checkCancellation: {
                 cancellationChecks += 1
-                if cancellationChecks == 3 {
+                if cancellationChecks == 4 {
                     throw CancellationError()
                 }
             }
@@ -185,6 +296,214 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
             reply["unprocessed_sessions"]?.arrayValue?.compactMap { $0.objectValue?["reason"]?.stringValue },
             ["cancelled_before_mutation", "cancelled_before_mutation"]
         )
+    }
+
+    func testPersistedSessionLoadFailurePreventsDeletionAndProviderCleanup() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let sessionID = UUID()
+        let recorder = CleanupRecorder(metadataByID: [sessionID: makeMetadata(id: sessionID)])
+        let cleanupRecorder = AgentManageCleanupRecorder(outcome: .succeeded())
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { handle, action in
+            cleanupRecorder.record(handle: handle, action: action)
+            return cleanupRecorder.outcome
+        }
+        let service = makeService(
+            window: window,
+            recorder: recorder,
+            loadPersistedSession: { _, _ in
+                throw CleanupResolutionTestError.lookupFailed
+            }
+        )
+
+        let reply = try await responseObject(service.execute(args: cleanupArgs([sessionID])))
+
+        XCTAssertEqual(reply["status"]?.stringValue, "partial")
+        XCTAssertEqual(reply["deleted_count"]?.intValue, 0)
+        XCTAssertEqual(recorder.persistedDeleteIDs, [])
+        XCTAssertEqual(recorder.persistedFinalizeIDs, [])
+        XCTAssertTrue(cleanupRecorder.calls().isEmpty)
+        let failure = try XCTUnwrap(reply["skipped_sessions"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(failure["reason"]?.stringValue, "resolution_failed")
+        XCTAssertTrue(failure["message"]?.stringValue?.contains("lookup failed") == true)
+    }
+
+    func testPersistedSessionLoadCancellationStopsBeforeMutation() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let sessionID = UUID()
+        let recorder = CleanupRecorder(metadataByID: [sessionID: makeMetadata(id: sessionID)])
+        let cleanupRecorder = AgentManageCleanupRecorder(outcome: .succeeded())
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { handle, action in
+            cleanupRecorder.record(handle: handle, action: action)
+            return cleanupRecorder.outcome
+        }
+        let service = makeService(
+            window: window,
+            recorder: recorder,
+            loadPersistedSession: { _, _ in
+                throw CancellationError()
+            }
+        )
+
+        let reply = try await responseObject(service.execute(args: cleanupArgs([sessionID])))
+
+        XCTAssertEqual(reply["status"]?.stringValue, "cancelled")
+        XCTAssertEqual(reply["processed_count"]?.intValue, 0)
+        XCTAssertEqual(reply["unprocessed_count"]?.intValue, 1)
+        XCTAssertEqual(recorder.persistedDeleteIDs, [])
+        XCTAssertEqual(recorder.persistedFinalizeIDs, [])
+        XCTAssertTrue(cleanupRecorder.calls().isEmpty)
+        XCTAssertEqual(
+            reply["unprocessed_sessions"]?.arrayValue?.first?.objectValue?["reason"]?.stringValue,
+            "cancelled_before_mutation"
+        )
+    }
+
+    func testPersistedCleanupDeletesDurablyBeforeProviderCleanup() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let sessionID = UUID()
+        let recorder = CleanupRecorder(metadataByID: [sessionID: makeMetadata(id: sessionID)])
+        let events = CleanupEventRecorder()
+        let persistedSession = makePersistedCleanupSession(id: sessionID, workspaceID: workspace.id)
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { _, _ in
+            events.record("cleanup")
+            return .succeeded(message: "provider cleanup after delete")
+        }
+        let service = makeService(
+            window: window,
+            recorder: recorder,
+            loadPersistedSession: { _, _ in
+                events.record("load")
+                return persistedSession
+            },
+            deletePersistedSession: { id, workspace in
+                events.record("delete")
+                recorder.persistedDeleteIDs.append(id)
+                recorder.persistedDeleteWorkspaceIDs.append(workspace.id)
+            }
+        )
+
+        let reply = try await responseObject(service.execute(args: cleanupArgs([sessionID])))
+
+        XCTAssertEqual(events.values(), ["load", "delete", "cleanup"])
+        XCTAssertEqual(reply["deleted_count"]?.intValue, 1)
+        let cleanup = reply["deleted_sessions"]?.arrayValue?.first?.objectValue?["provider_cleanup"]?.objectValue
+        XCTAssertEqual(cleanup?["status"]?.stringValue, "succeeded")
+        XCTAssertEqual(cleanup?["message"]?.stringValue, "provider cleanup after delete")
+    }
+
+    func testFinalProviderCleanupCancellationKeepsCommittedDeletionOutOfRetryLedger() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let sessionID = UUID()
+        let recorder = CleanupRecorder(metadataByID: [sessionID: makeMetadata(id: sessionID)])
+        let cleanupRecorder = AgentManageCleanupRecorder(
+            outcome: .cancelled(message: "provider cleanup cancelled")
+        )
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { handle, action in
+            cleanupRecorder.record(handle: handle, action: action)
+            return cleanupRecorder.outcome
+        }
+        let persistedSession = makePersistedCleanupSession(id: sessionID, workspaceID: workspace.id)
+        let service = makeService(
+            window: window,
+            recorder: recorder,
+            loadPersistedSession: { _, _ in persistedSession }
+        )
+
+        let reply = try await responseObject(service.execute(args: cleanupArgs([sessionID])))
+
+        XCTAssertEqual(reply["status"]?.stringValue, "cancelled")
+        XCTAssertEqual(reply["cancelled"]?.boolValue, true)
+        XCTAssertEqual(reply["processed_count"]?.intValue, 1)
+        XCTAssertEqual(reply["deleted_count"]?.intValue, 1)
+        XCTAssertEqual(reply["skipped_count"]?.intValue, 0)
+        XCTAssertEqual(reply["unprocessed_count"]?.intValue, 0)
+        XCTAssertEqual(stringArray(reply["retry_session_ids"]), [])
+        XCTAssertEqual(recorder.persistedDeleteIDs, [sessionID])
+        let deleted = try XCTUnwrap(reply["deleted_sessions"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(deleted["durable"]?.boolValue, true)
+        XCTAssertEqual(deleted["provider_cleanup"]?.objectValue?["status"]?.stringValue, "cancelled")
+        XCTAssertEqual(deleted["provider_cleanup"]?.objectValue?["message"]?.stringValue, "provider cleanup cancelled")
+    }
+
+    func testProviderCleanupCancellationStopsLargerBatchAfterCommittedDeletion() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let sessionIDs = [UUID(), UUID(), UUID()]
+        let recorder = CleanupRecorder(metadataByID: Dictionary(
+            uniqueKeysWithValues: sessionIDs.map { ($0, makeMetadata(id: $0)) }
+        ))
+        let cleanupRecorder = AgentManageCleanupRecorder(outcome: .cancelled())
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { handle, action in
+            cleanupRecorder.record(handle: handle, action: action)
+            return cleanupRecorder.outcome
+        }
+        let persistedSessions = Dictionary(
+            uniqueKeysWithValues: sessionIDs.map {
+                ($0, makePersistedCleanupSession(id: $0, workspaceID: workspace.id))
+            }
+        )
+        let service = makeService(
+            window: window,
+            recorder: recorder,
+            loadPersistedSession: { sessionID, _ in persistedSessions[sessionID] }
+        )
+
+        let reply = try await responseObject(service.execute(args: cleanupArgs(sessionIDs)))
+
+        XCTAssertEqual(reply["status"]?.stringValue, "cancelled")
+        XCTAssertEqual(reply["processed_count"]?.intValue, 1)
+        XCTAssertEqual(reply["deleted_count"]?.intValue, 1)
+        XCTAssertEqual(reply["skipped_count"]?.intValue, 0)
+        XCTAssertEqual(reply["unprocessed_count"]?.intValue, 2)
+        XCTAssertEqual(recorder.persistedDeleteIDs, [sessionIDs[0]])
+        XCTAssertEqual(recorder.persistedFinalizeIDs, [sessionIDs[0]])
+        XCTAssertEqual(stringArray(reply["retry_session_ids"]), Array(sessionIDs.dropFirst()).map(\.uuidString))
+        XCTAssertEqual(cleanupRecorder.calls().count, 1)
+        XCTAssertEqual(
+            reply["unprocessed_sessions"]?.arrayValue?.compactMap { $0.objectValue?["reason"]?.stringValue },
+            ["cancelled_after_committed_deletion", "cancelled_after_committed_deletion"]
+        )
+    }
+
+    func testPersistedDeleteFailureDoesNotRunProviderCleanup() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let sessionID = UUID()
+        let recorder = CleanupRecorder(metadataByID: [sessionID: makeMetadata(id: sessionID)])
+        let events = CleanupEventRecorder()
+        let persistedSession = makePersistedCleanupSession(id: sessionID, workspaceID: workspace.id)
+        window.agentModeViewModel.test_setPersistedProviderConversationCleaner { _, _ in
+            events.record("cleanup")
+            return .succeeded()
+        }
+        let service = makeService(
+            window: window,
+            recorder: recorder,
+            loadPersistedSession: { _, _ in
+                events.record("load")
+                return persistedSession
+            },
+            deletePersistedSession: { _, _ in
+                events.record("delete")
+                throw CleanupResolutionTestError.persistedDeleteFailed
+            }
+        )
+
+        let reply = try await responseObject(service.execute(args: cleanupArgs([sessionID])))
+
+        XCTAssertEqual(events.values(), ["load", "delete"])
+        XCTAssertEqual(reply["deleted_count"]?.intValue, 0)
+        XCTAssertEqual(recorder.persistedFinalizeIDs, [])
+        let failure = try XCTUnwrap(reply["skipped_sessions"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(failure["reason"]?.stringValue, "delete_failed")
     }
 
     func testLastIDMutationCancellationIsProcessedRetryableAndCancelled() async throws {
@@ -328,7 +647,7 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
         XCTAssertFalse(workspace.stashedTabs.contains { $0.tab.activeAgentSessionID == sessionID })
     }
 
-    func testOpenDeleteFailureReportsPartialMutationAndRetryConverges() async throws {
+    func testOpenDeleteFailurePreservesLocalStateAndRetryConverges() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
@@ -363,9 +682,9 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
         XCTAssertEqual(first["status"]?.stringValue, "partial")
         XCTAssertEqual(stringArray(first["retry_session_ids"]), [sessionID.uuidString])
         let partial = try XCTUnwrap(first["skipped_sessions"]?.arrayValue?.first?.objectValue)
-        XCTAssertEqual(partial["reason"]?.stringValue, "delete_partially_completed")
+        XCTAssertEqual(partial["reason"]?.stringValue, "delete_failed")
         XCTAssertEqual(partial["durable"]?.boolValue, false)
-        XCTAssertEqual(partial["local_cleanup_completed"]?.boolValue, true)
+        XCTAssertEqual(partial["local_cleanup_completed"]?.boolValue, false)
         XCTAssertTrue(partial["message"]?.stringValue?.contains("persisted delete failed") == true)
         XCTAssertEqual(retry["status"]?.stringValue, "completed")
         XCTAssertEqual(retry["deleted_count"]?.intValue, 1)
@@ -445,6 +764,7 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
         window: WindowState,
         recorder: CleanupRecorder,
         loadPersistedMetadata: (@MainActor (UUID, WorkspaceModel) async throws -> AgentSessionMeta?)? = nil,
+        loadPersistedSession: (@MainActor (UUID, WorkspaceModel) async throws -> AgentSession?)? = nil,
         deleteOpenSession: (@MainActor (AgentModeViewModel, UUID, WorkspaceModel) async throws -> Void)? = nil,
         deletePersistedSession: (@MainActor (UUID, WorkspaceModel) async throws -> Void)? = nil,
         checkCancellation: @escaping @MainActor () throws -> Void = {}
@@ -459,6 +779,12 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
                     recorder.metadataLookupIDs.append(sessionID)
                     return recorder.metadataByID[sessionID]
                 },
+                loadPersistedSession: { sessionID, workspace in
+                    if let loadPersistedSession {
+                        return try await loadPersistedSession(sessionID, workspace)
+                    }
+                    return nil
+                },
                 deleteOpenSession: { viewModel, tabID, workspace in
                     if let deleteOpenSession {
                         try await deleteOpenSession(viewModel, tabID, workspace)
@@ -466,6 +792,7 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
                         recorder.openDeleteTabIDs.append(tabID)
                         recorder.openDeleteWorkspaceIDs.append(workspace.id)
                     }
+                    return nil
                 },
                 deletePersistedSession: { sessionID, workspace in
                     if let deletePersistedSession {
@@ -512,6 +839,24 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
             "op": .string("cleanup_sessions"),
             "session_ids": .array(sessionIDs.map { .string($0.uuidString) })
         ]
+    }
+
+    private func makePersistedCleanupSession(id: UUID, workspaceID: UUID) -> AgentSession {
+        AgentSession(
+            id: id,
+            workspaceID: workspaceID,
+            name: "Persisted cleanup",
+            savedAt: Date(timeIntervalSinceReferenceDate: 2),
+            itemCount: 0,
+            agentKind: AgentProviderKind.codexExec.rawValue,
+            lastRunState: AgentSessionRunState.completed.rawValue,
+            providerCleanupHandle: ProviderConversationCleanupHandle(
+                provider: AgentProviderKind.codexExec.rawValue,
+                conversationID: "persisted-cleanup-thread"
+            ),
+            autoEditEnabled: true,
+            isMCPOriginated: true
+        )
     }
 
     private func makeMetadata(
@@ -570,5 +915,51 @@ private final class CleanupRecorder {
 
     init(metadataByID: [UUID: AgentSessionMeta] = [:]) {
         self.metadataByID = metadataByID
+    }
+}
+
+private final class CleanupEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func record(_ event: String) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func values() -> [String] {
+        lock.lock()
+        let values = events
+        lock.unlock()
+        return values
+    }
+}
+
+private final class AgentManageCleanupRecorder: @unchecked Sendable {
+    struct Call {
+        let handle: ProviderConversationCleanupHandle
+        let action: ProviderConversationCleanupAction
+    }
+
+    let outcome: ProviderConversationCleanupOutcome
+    private let lock = NSLock()
+    private var recordedCalls: [Call] = []
+
+    init(outcome: ProviderConversationCleanupOutcome) {
+        self.outcome = outcome
+    }
+
+    func record(handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) {
+        lock.lock()
+        recordedCalls.append(.init(handle: handle, action: action))
+        lock.unlock()
+    }
+
+    func calls() -> [Call] {
+        lock.lock()
+        let calls = recordedCalls
+        lock.unlock()
+        return calls
     }
 }

@@ -297,6 +297,7 @@ class CodemapBindingEngineTestCase: XCTestCase {
         hooks: WorkspaceCodemapBindingEngineHooks = .none,
         manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter = .init { _ in },
         overlay: WorkspaceCodemapLiveOverlay? = nil,
+        selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
         initialQueueOrdinal: UInt64 = 1,
         initialAdmissionOrdinal: UInt64 = 1,
         initialCounterValue: UInt64 = 0,
@@ -375,6 +376,7 @@ class CodemapBindingEngineTestCase: XCTestCase {
             sourceReader: sourceReaderOverride ?? reader,
             catalogClient: catalog,
             overlay: overlay ?? WorkspaceCodemapLiveOverlay(),
+            selectionGraphFactory: selectionGraphFactory,
             policy: policy,
             hooks: hooks,
             manifestWriterRetryWaiter: manifestWriterRetryWaiter,
@@ -1387,172 +1389,6 @@ final class EngineHookEvents: @unchecked Sendable {
             guard condition.wait(until: deadline) else { return false }
         }
         return true
-    }
-}
-
-actor EngineProjectionRecorder {
-    private(set) var snapshots: [WorkspaceCodemapProjectionSnapshot] = []
-    private var progress = WorkspaceCodemapProjectionProgress.notStarted
-
-    func publish(
-        _ snapshot: WorkspaceCodemapProjectionSnapshot
-    ) -> WorkspaceCodemapProjectionSnapshotDisposition {
-        snapshots.append(snapshot)
-        switch snapshot {
-        case let .segment(segment):
-            progress = segment.progress
-        case let .seal(proof):
-            if case let .success(completed) = progress.advancing(
-                to: .complete,
-                by: .zero,
-                catalogCompletion: proof.catalogCompletion
-            ) {
-                progress = completed
-            }
-        }
-        return .accepted(progress)
-    }
-}
-
-actor EngineProjectionPartialPageRetryPublisher {
-    private let rereadGate: EngineAsyncGate
-    private var acceptedProgress = WorkspaceCodemapProjectionProgress.notStarted
-    private var segmentPublicationCount = 0
-    private(set) var snapshots: [WorkspaceCodemapProjectionSnapshot] = []
-
-    init(rereadGate: EngineAsyncGate) {
-        self.rereadGate = rereadGate
-    }
-
-    func publish(
-        _ snapshot: WorkspaceCodemapProjectionSnapshot
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
-        snapshots.append(snapshot)
-        switch snapshot {
-        case let .segment(segment):
-            segmentPublicationCount += 1
-            switch segmentPublicationCount {
-            case 1:
-                acceptedProgress = segment.progress
-                return .accepted(acceptedProgress)
-            case 2:
-                return .busy(retryAfterMilliseconds: nil)
-            case 3:
-                await rereadGate.enterAndWait()
-                return .exactDuplicate(acceptedProgress)
-            default:
-                acceptedProgress = segment.progress
-                return .accepted(acceptedProgress)
-            }
-        case let .seal(proof):
-            guard case let .success(completed) = acceptedProgress.advancing(
-                to: .complete,
-                by: .zero,
-                catalogCompletion: proof.catalogCompletion
-            ) else { return .unavailable(.invalidCompletenessProof) }
-            acceptedProgress = completed
-            return .accepted(completed)
-        }
-    }
-}
-
-actor EngineProjectionGenerationRacePublisher {
-    private let gate: EngineAsyncGate
-    private let recorder: EngineProjectionRecorder
-    private var rejectedFirstSnapshot = false
-    private(set) var snapshots: [WorkspaceCodemapProjectionSnapshot] = []
-
-    init(gate: EngineAsyncGate, recorder: EngineProjectionRecorder) {
-        self.gate = gate
-        self.recorder = recorder
-    }
-
-    func publish(
-        _ snapshot: WorkspaceCodemapProjectionSnapshot
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
-        snapshots.append(snapshot)
-        if !rejectedFirstSnapshot {
-            rejectedFirstSnapshot = true
-            await gate.enterAndWait()
-            return .stale
-        }
-        return await recorder.publish(snapshot)
-    }
-}
-
-final class EngineProjectionCatalogStub: @unchecked Sendable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let entries: [WorkspaceCodemapProjectionCatalogCandidate]
-    let recorder: EngineProjectionRecorder
-    let pageGate: EngineAsyncGate?
-    let publishProjectionOverride: (@Sendable (
-        WorkspaceCodemapProjectionSnapshot
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition)?
-
-    init(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        entries: [WorkspaceCodemapProjectionCatalogCandidate],
-        recorder: EngineProjectionRecorder,
-        pageGate: EngineAsyncGate? = nil,
-        publishProjectionOverride: (@Sendable (
-            WorkspaceCodemapProjectionSnapshot
-        ) async -> WorkspaceCodemapProjectionSnapshotDisposition)? = nil
-    ) {
-        self.rootEpoch = rootEpoch
-        self.entries = entries.sorted { lhs, rhs in
-            if lhs.identity.standardizedRelativePath != rhs.identity.standardizedRelativePath {
-                return lhs.identity.standardizedRelativePath.utf8.lexicographicallyPrecedes(
-                    rhs.identity.standardizedRelativePath.utf8
-                )
-            }
-            return lhs.identity.fileID.uuidString.utf8.lexicographicallyPrecedes(
-                rhs.identity.fileID.uuidString.utf8
-            )
-        }
-        self.recorder = recorder
-        self.pageGate = pageGate
-        self.publishProjectionOverride = publishProjectionOverride
-    }
-
-    var client: WorkspaceCodemapBindingCatalogClient {
-        WorkspaceCodemapBindingCatalogClient {
-            _, _ in nil
-        } readProjectionCatalogPage: { [self] request in
-            if let pageGate {
-                await pageGate.enterAndWait()
-            }
-            guard request.rootEpoch == rootEpoch, request.cursor == nil else { return .stale }
-            let token = projectionToken
-            switch WorkspaceCodemapProjectionCatalogPage.validated(
-                request: request,
-                token: token,
-                entries: entries,
-                nextCursor: nil,
-                isEnd: true,
-                supportedCandidateCountThroughPage: UInt64(entries.count)
-            ) {
-            case let .success(page): return .page(page)
-            case .failure: return .unavailable(.catalogUnavailable)
-            }
-        } revalidateProjectionCatalogToken: { [self] epoch, token in
-            epoch == rootEpoch && token == projectionToken ? .current : .stale
-        } publishProjection: { [recorder, publishProjectionOverride] snapshot in
-            if let publishProjectionOverride {
-                return await publishProjectionOverride(snapshot)
-            }
-            return await recorder.publish(snapshot)
-        }
-    }
-
-    private var projectionToken: WorkspaceCodemapProjectionCatalogToken {
-        WorkspaceCodemapProjectionCatalogToken(
-            rootEpoch: rootEpoch,
-            topologyGeneration: 1,
-            appliedIndexGeneration: 1,
-            catalogGeneration: 1,
-            ingressGeneration: 1,
-            projectionInvalidationGeneration: 1
-        )
     }
 }
 

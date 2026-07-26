@@ -14,6 +14,14 @@ fail() {
 
 python3 Scripts/codex_runtime_artifact.py validate-manifest
 
+python3 Scripts/validate_codex_update_workflow.py
+grep -F 'python3 Scripts/test_codex_update_candidate.py' Makefile >/dev/null ||
+    fail "release-selftest must cover guarded Codex update candidates"
+grep -F 'python3 Scripts/test_codex_update_workflow.py' Makefile >/dev/null ||
+    fail "release-selftest must cover the structured Codex candidate workflow contract"
+grep -F 'Scripts/codex_update_candidate.py' docs/releasing.md >/dev/null ||
+    fail "docs/releasing.md is missing the guarded Codex update flow"
+
 for path in \
     ThirdPartyLicenses/codex/LICENSE \
     ThirdPartyLicenses/codex/NOTICE \
