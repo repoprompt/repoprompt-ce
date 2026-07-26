@@ -125,7 +125,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    static let currentSerializationVersion = 6
+    static let currentSerializationVersion = 7
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -167,6 +167,10 @@ struct AgentSession: Codable, Identifiable {
     /// Provider-specific resumable session identifier (e.g., Claude CLI session_id)
     /// Used to resume conversations with --resume instead of replaying history
     var providerSessionID: String?
+
+    /// Provider-neutral cleanup metadata. This is distinct from resumability:
+    /// a session ID may route cleanup, but does not imply remote deletion support.
+    var providerCleanupHandle: ProviderConversationCleanupHandle?
     var autoEditEnabled: Bool
 
     /// Persisted per-turn token usage for non-Codex providers.
@@ -225,6 +229,7 @@ struct AgentSession: Codable, Identifiable {
         agentReasoningEffort: String? = nil,
         lastRunState: String? = nil,
         providerSessionID: String? = nil,
+        providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
         autoEditEnabled: Bool = true,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
@@ -261,6 +266,7 @@ struct AgentSession: Codable, Identifiable {
         self.agentReasoningEffort = agentReasoningEffort
         self.lastRunState = lastRunState
         self.providerSessionID = providerSessionID
+        self.providerCleanupHandle = providerCleanupHandle
         self.autoEditEnabled = autoEditEnabled
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
@@ -299,6 +305,7 @@ struct AgentSession: Codable, Identifiable {
         case agentReasoningEffort
         case lastRunState
         case providerSessionID
+        case providerCleanupHandle
         case autoEditEnabled
         case providerTokenUsageByTurn
         case codexConversationID
@@ -340,6 +347,7 @@ struct AgentSession: Codable, Identifiable {
         agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
+        providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
@@ -405,6 +413,16 @@ extension AgentSession {
 
     func visibleItemCount(showCompressedHistory: Bool) -> Int {
         showCompressedHistory ? effectiveCanonicalItemCount : effectiveDefaultPresentedItemCount
+    }
+
+    var resolvedProviderCleanupHandle: ProviderConversationCleanupHandle? {
+        ProviderConversationCleanupHandle.resolved(
+            provider: agentKind ?? AgentProviderKind.claudeCode.rawValue,
+            explicit: providerCleanupHandle,
+            providerSessionID: providerSessionID,
+            codexConversationID: codexConversationID,
+            codexRolloutPath: codexRolloutPath
+        )
     }
 
     var hasItems: Bool {

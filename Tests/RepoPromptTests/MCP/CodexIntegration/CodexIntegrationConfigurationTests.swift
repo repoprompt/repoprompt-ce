@@ -580,7 +580,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
 
         XCTAssertFalse(result.changed)
         XCTAssertEqual(result.content, input)
-        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.144.6") == true)
+        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.145.0") == true)
         XCTAssertFalse(result.content.contains("direct_only_tool_namespaces"))
     }
 

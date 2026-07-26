@@ -190,6 +190,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     enum NativeSendOutcome: Equatable {
         case sent
         case queuedFallback(queueID: UUID, reason: CodexTurnFallbackDecision)
+        case preDispatchRejected(message: String)
         case stale(reason: String)
         case cancelled
         case failed(message: String)
@@ -198,7 +199,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             switch self {
             case .sent, .queuedFallback:
                 true
-            case .stale, .cancelled, .failed:
+            case .preDispatchRejected, .stale, .cancelled, .failed:
                 false
             }
         }
@@ -1471,6 +1472,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         session.codexConversationID = agentSession.codexConversationID
         session.codexRolloutPath = agentSession.codexRolloutPath
+        session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.codexModel = agentSession.codexModel
         session.codexReasoningEffort = agentSession.codexReasoningEffort
         session.codexContextUsage = AgentContextUsage(
@@ -1491,6 +1493,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         agentSession.codexConversationID = session.codexConversationID
         agentSession.codexRolloutPath = session.codexRolloutPath
+        agentSession.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+            provider: session.selectedAgent.rawValue,
+            explicit: session.providerCleanupHandle,
+            providerSessionID: session.providerSessionID,
+            codexConversationID: session.codexConversationID,
+            codexRolloutPath: session.codexRolloutPath
+        )
         agentSession.codexModel = session.codexModel
         agentSession.codexReasoningEffort = session.codexReasoningEffort
         agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
@@ -2878,6 +2887,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         if isHeadlessAgent(oldAgent) || isHeadlessAgent(newAgent) {
             session.providerSessionID = nil
+            session.providerCleanupHandle = nil
         }
         if oldAgent == .codexExec, newAgent != .codexExec {
             cancelCodexThreadNameSync(for: session.tabID)
@@ -2903,6 +2913,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             resetCodexResumeTimeoutState(for: session)
             session.codexConversationID = nil
             session.codexRolloutPath = nil
+            session.providerCleanupHandle = nil
             session.codexContextUsage = nil
             viewModel?.clearContextUsageSnapshot(for: session)
             session.codexModel = nil
@@ -3414,6 +3425,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             cancelCodexTransportClosedFallback(for: session.tabID)
             session.codexConversationID = ref.conversationID
             session.codexRolloutPath = ref.rolloutPath
+            session.providerCleanupHandle = ProviderConversationCleanupHandle(
+                provider: AgentProviderKind.codexExec.rawValue,
+                conversationID: ref.conversationID,
+                rolloutPath: ref.rolloutPath
+            )
             session.codexModel = ref.model
             session.codexReasoningEffort = ref.reasoningEffort
             // Thread-level config is captured by thread/start or thread/resume. turn/start
@@ -5247,18 +5263,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 viewModel?.scheduleSave(for: session.tabID)
-                return .failed(message: message)
+                return .preDispatchRejected(message: message)
             }
             guard session.runID == activeSendRunID,
                   session.runState.isActive,
                   session.selectedAgent == .codexExec
             else {
+                let message = "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain."
                 viewModel?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
                 )
-                return .stale(reason: "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain.")
+                return .preDispatchRejected(message: message)
             }
         }
         let hadResumeEligibleCodexHistoryBeforeSend = Self.hasResumeEligibleCodexHistory(session.items)
@@ -9152,6 +9169,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         resetCodexResumeTimeoutState(for: session)
         session.codexConversationID = nil
         session.codexRolloutPath = nil
+        session.providerCleanupHandle = nil
         session.codexContextUsage = nil
         viewModel?.clearContextUsageSnapshot(for: session)
         session.activeReasoningItemID = nil

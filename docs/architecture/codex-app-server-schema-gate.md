@@ -21,9 +21,9 @@ consumes at its current integration boundary.
 
 ## Version contract
 
-- The contract floor is **Codex CLI 0.144.6**.
-- Local validation accepts 0.144.6 or newer so a developer can detect drift before CI moves.
-- CI installs exactly `@openai/codex@0.144.6`, making the required check deterministic.
+- The contract floor is **Codex CLI 0.145.0**.
+- Local validation accepts 0.145.0 or newer so a developer can detect drift before CI moves.
+- CI installs exactly `@openai/codex@0.145.0`, making the required check deterministic.
 - The gate fails before generation when the installed CLI is older than the floor.
 
 When advancing Codex, install the intended version, run the gate, reconcile RPCE with the generated
@@ -52,7 +52,7 @@ The versioned contract is fail-closed: missing or unknown keys are errors. Metho
 local `$ref`, `allOf`, `oneOf`, and `anyOf` composition and accepts both single-value `enum`
 and `const` discriminators, so upstream organizational refactors do not create false removals.
 
-The hardened 0.144.6 baseline checks 38 methods, 175 parameter paths, and 64 response paths. A failure names
+The hardened 0.145.0 baseline checks 38 methods, 179 parameter paths, and 64 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
@@ -69,13 +69,25 @@ differences:
    declares it; `threadId` is the current resume authority.
 4. `ThreadGoalGetResponse.goal` is optional, while RPCE treated an omitted key as an invalid
    response instead of “no goal.”
-5. **Updated 2026-07-24:** The bundled Codex 0.144.6 source initializes `memory_mode` to `Disabled` for both fresh and
-   resumed threads when `memories.generate_memories=false`, making RPCE's start/resume config
-   initialization the authority. RPCE therefore does not call `thread/memoryMode/set`; recheck this
-   initialization behavior before each bundled Codex runtime bump.
+5. **Revalidated 2026-07-26 for Codex 0.145.0:** The bundled source initializes `memory_mode` to
+   `Disabled` for both fresh and resumed threads when `memories.generate_memories=false`, making
+   RPCE's start/resume config initialization the authority. RPCE therefore does not call
+   `thread/memoryMode/set`; recheck this initialization behavior before each bundled Codex runtime
+   bump.
 6. The generated `goal.status` enum includes `blocked` and `usageLimited`, while RPCE previously
    rejected both as invalid responses. The same six-value enum is also declared for
    `thread/goal/set`, so accepting those cases does not create an outbound schema violation.
+
+## 0.145.0 rotation findings (2026-07-26)
+
+The verified bundled 0.145.0 CLI passes the existing bounded projection without code or contract-path
+changes. A full generated-bundle comparison with verified 0.144.6 schemas showed additive upstream
+evolution, including optional `runtimeWorkspaceRoots` on `thread/start` and `turn/start`, backwards
+pagination cursors on `thread/resume`, audio input/tool-output variants, and new app, environment, and
+thread-search methods. None removes or changes a field RPCE sends or consumes. The exact tagged source
+also retains `[features.code_mode].direct_only_tool_namespaces` as direct model exposure and initializes
+new and resumed thread persistence to `Disabled` when `memories.generate_memories=false`; no routing,
+reconnect, memory-mode, or per-version compatibility change is required.
 
 The contract still generates experimental schemas because RPCE validates `initialize.capabilities.experimentalApi`.
 

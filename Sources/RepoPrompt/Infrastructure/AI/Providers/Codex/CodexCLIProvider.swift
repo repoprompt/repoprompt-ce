@@ -393,7 +393,7 @@ final class CodexCLIProvider: AIProvider {
                     appServerClient: appServerClient,
                     requestTimeout: requestTimeout
                 )
-                _ = try await controller.startOrResume(
+                let sessionRef = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
                     model: selection.model,
@@ -455,7 +455,7 @@ final class CodexCLIProvider: AIProvider {
                         switch status {
                         case .completed:
                             sawCompletion = true
-                            continuation.yield(Self.messageStopEvent())
+                            continuation.yield(Self.messageStopEvent(sessionRef: sessionRef))
                             break eventLoop
                         case .interrupted:
                             throw CancellationError()
@@ -1008,14 +1008,24 @@ final class CodexCLIProvider: AIProvider {
         return String(describing: error)
     }
 
-    private static func messageStopEvent() -> AIStreamResult {
-        AIStreamResult(
+    private static func messageStopEvent(
+        sessionRef: CodexNativeSessionController.SessionRef? = nil
+    ) -> AIStreamResult {
+        let cleanupHandle = sessionRef.map {
+            ProviderConversationCleanupHandle(
+                provider: String(describing: AIProviderType.codex),
+                conversationID: $0.conversationID,
+                rolloutPath: $0.rolloutPath
+            )
+        }
+        return AIStreamResult(
             type: "message_stop",
             text: nil,
             reasoning: nil,
             promptTokens: nil,
             completionTokens: nil,
-            cost: nil
+            cost: nil,
+            cleanupHandle: cleanupHandle
         )
     }
 

@@ -68,6 +68,8 @@ final class AgentModeViewModel: ObservableObject {
     typealias MCPServerEnabler = () async -> Void
     typealias MCPRunRoutingCleaner = (_ runID: UUID, _ windowID: Int, _ reason: String) async -> Void
     typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
+    typealias ProviderConversationCleaner = ProviderConversationCleanupRegistry.Cleaner
+    typealias PersistedProviderConversationCleaner = ProviderConversationCleaner
     typealias CodexActiveToolQuery = (_ runID: UUID) -> Bool
     typealias CodexAgentRunWaitQuery = (_ runID: UUID) -> Bool
     typealias CodexAgentRunWaitDrain = @MainActor (_ runID: UUID, _ source: String) async -> Bool
@@ -570,6 +572,7 @@ final class AgentModeViewModel: ObservableObject {
     private let mcpServerEnabler: MCPServerEnabler
     private let mcpRunRoutingCleaner: MCPRunRoutingCleaner
     private let mcpRunToolCanceller: MCPRunToolCanceller
+    private var providerConversationCleanupRegistry: ProviderConversationCleanupRegistry
     let codexCoordinator: CodexAgentModeCoordinator
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
@@ -689,6 +692,12 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setWorkspaceSwitchInFlight(_ isInFlight: Bool) {
             workspaceSwitchInFlight = isInFlight
+        }
+
+        func test_setPersistedProviderConversationCleaner(
+            _ cleaner: @escaping PersistedProviderConversationCleaner
+        ) {
+            providerConversationCleanupRegistry = ProviderConversationCleanupRegistry(codexCleaner: cleaner)
         }
 
         func test_setSidebarAutoArchiveDependencies(
@@ -1107,6 +1116,7 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             tabsWithActiveAgentRun.remove(tabID)
             session?.activeAgentRunStartedAt = nil
+            session?.deferredActiveAgentRunTimerRollback = nil
             // Intentionally do NOT clear/mark attention here. Provider paths
             // sometimes call setAgentRunActive(false) before session.runState
             // has been mutated to its terminal/waiting value — detection must
@@ -1483,6 +1493,7 @@ final class AgentModeViewModel: ObservableObject {
         mcpRunToolCanceller = { [weak mcpServer] runID, reason in
             mcpServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
         }
+        providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
         usesProductionAgentDefaultsAndModelPolling = true
         codexCoordinator = CodexAgentModeCoordinator(
@@ -1607,6 +1618,7 @@ final class AgentModeViewModel: ObservableObject {
                 )
             },
             mcpRunToolCanceller: MCPRunToolCanceller? = nil,
+            providerConversationCleanupRegistry: ProviderConversationCleanupRegistry = ProviderConversationCleanupRegistry(),
             mcpServerEnabler: @escaping MCPServerEnabler = {},
             testMCPServer: MCPServerViewModel? = nil,
             testWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
@@ -1653,6 +1665,7 @@ final class AgentModeViewModel: ObservableObject {
                 ?? { [weak testMCPServer] runID, reason in
                     testMCPServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
                 }
+            self.providerConversationCleanupRegistry = providerConversationCleanupRegistry
             self.shouldManageCodexTooling = shouldManageCodexTooling
             usesProductionAgentDefaultsAndModelPolling = testUsesProductionAgentDefaultsAndModelPolling
             let legacyWatchdogThreshold = testCodexStallWatchdogInactivityThreshold
@@ -3035,17 +3048,50 @@ final class AgentModeViewModel: ObservableObject {
         return session.agentMessageRuntimeFootersByItemID
     }
 
-    private func recordAgentTurnUserAnchor(for session: TabSession, userItem: AgentChatItem) {
+    /// Reversal record for `recordAgentTurnUserAnchor`, so an optimistic user
+    /// bubble that is later removed before provider dispatch can also roll back
+    /// the turn-runtime bookkeeping recorded for it. Every restore is guarded
+    /// against interleaved mutations: state is only reverted when it still
+    /// matches what `recordAgentTurnUserAnchor` wrote.
+    struct AgentTurnUserAnchorRollbackState {
+        struct CompletedFooter {
+            let anchor: TabSession.AgentTurnRuntimeAnchor
+            let footerItemID: UUID?
+            let previousFooter: AgentMessageRuntimeFooter?
+            let writtenFooter: AgentMessageRuntimeFooter?
+        }
+
+        let userItemID: UUID
+        let previousActiveAgentRunStartedAt: Date?
+        var completedFooters: [CompletedFooter] = []
+        var restartedElapsedTimerAt: Date?
+    }
+
+    @discardableResult
+    private func recordAgentTurnUserAnchor(
+        for session: TabSession,
+        userItem: AgentChatItem
+    ) -> AgentTurnUserAnchorRollbackState {
+        var rollback = AgentTurnUserAnchorRollbackState(
+            userItemID: userItem.id,
+            previousActiveAgentRunStartedAt: session.activeAgentRunStartedAt
+        )
         if session.runState == .running {
-            completeNextAgentTurnRuntimeFooterIfNeeded(
+            if let completedFooter = completeNextAgentTurnRuntimeFooterIfNeeded(
                 for: session,
                 endedAt: userItem.timestamp,
                 maxSequenceIndexExclusive: userItem.sequenceIndex
-            )
+            ) {
+                rollback.completedFooters.append(completedFooter)
+            }
         }
 
         if shouldRestartActiveAgentRunElapsedTimer(for: session) {
+            let startedAtBeforeRestart = session.activeAgentRunStartedAt
             restartActiveAgentRunElapsedTimer(for: session, startedAt: userItem.timestamp)
+            if session.activeAgentRunStartedAt != startedAtBeforeRestart {
+                rollback.restartedElapsedTimerAt = session.activeAgentRunStartedAt
+            }
         }
 
         let anchor = TabSession.AgentTurnRuntimeAnchor(
@@ -3056,13 +3102,77 @@ final class AgentModeViewModel: ObservableObject {
         if session.runState == .waitingForUser,
            !session.pendingTurnRuntimeAnchors.isEmpty
         {
-            completeNextAgentTurnRuntimeFooterIfNeeded(
+            if let completedFooter = completeNextAgentTurnRuntimeFooterIfNeeded(
                 for: session,
                 endedAt: userItem.timestamp,
                 maxSequenceIndexExclusive: userItem.sequenceIndex
-            )
+            ) {
+                rollback.completedFooters.append(completedFooter)
+            }
         }
         session.pendingTurnRuntimeAnchors.append(anchor)
+        return rollback
+    }
+
+    /// Rolls back the turn-runtime bookkeeping recorded for an optimistic user
+    /// bubble whose turn was never delivered to the provider. Restores are
+    /// conditional so state mutated by other runtime activity in the meantime
+    /// is never overwritten.
+    private func rollbackAgentTurnUserAnchor(
+        _ rollback: AgentTurnUserAnchorRollbackState,
+        session: TabSession
+    ) {
+        session.pendingTurnRuntimeAnchors.removeAll { $0.userItemID == rollback.userItemID }
+        for completedFooter in rollback.completedFooters.reversed() {
+            if let footerItemID = completedFooter.footerItemID {
+                guard let writtenFooter = completedFooter.writtenFooter,
+                      session.agentMessageRuntimeFootersByItemID[footerItemID] == writtenFooter
+                else {
+                    // A newer runtime mutation won this footer. Keep the
+                    // consumed anchor consumed as part of the same atomic
+                    // decision so it cannot be attributed a second time.
+                    continue
+                }
+                session.agentMessageRuntimeFootersByItemID[footerItemID] = completedFooter.previousFooter
+            }
+            // Reinsert the consumed anchor only while its user item and active
+            // turn still exist. A back-to-back rejected submission may have
+            // already removed that optimistic bubble, while a terminal runtime
+            // transition may have made the anchor no longer pending work.
+            if session.runState.isActive,
+               session.items.contains(where: { $0.id == completedFooter.anchor.userItemID }),
+               !session.pendingTurnRuntimeAnchors.contains(where: {
+                   $0.userItemID == completedFooter.anchor.userItemID
+               })
+            {
+                session.pendingTurnRuntimeAnchors.insert(completedFooter.anchor, at: 0)
+            }
+        }
+        if let restartedElapsedTimerAt = rollback.restartedElapsedTimerAt {
+            if session.activeAgentRunStartedAt == restartedElapsedTimerAt {
+                let restoredStartedAt: Date? = if let deferredRollback = session.deferredActiveAgentRunTimerRollback {
+                    deferredRollback.originalStartedAt
+                } else {
+                    rollback.previousActiveAgentRunStartedAt
+                }
+                session.deferredActiveAgentRunTimerRollback = nil
+                session.activeAgentRunStartedAt = restoredStartedAt
+                publishActiveAgentRunStartedAt(for: session.tabID, session: session)
+            } else if session.deferredActiveAgentRunTimerRollback == nil,
+                      let activeAgentRunStartedAt = session.activeAgentRunStartedAt,
+                      session.pendingTurnRuntimeAnchors.contains(where: {
+                          $0.startedAt == activeAgentRunStartedAt
+                      })
+            {
+                // A later optimistic submission owns the visible timer. Carry
+                // this rejection's original baseline forward so rejection of
+                // that later submission skips this already-rejected timestamp.
+                session.deferredActiveAgentRunTimerRollback = .init(
+                    originalStartedAt: rollback.previousActiveAgentRunStartedAt
+                )
+            }
+        }
+        requestUIRefresh(tabID: session.tabID, urgent: true)
     }
 
     private func shouldRestartActiveAgentRunElapsedTimer(for session: TabSession) -> Bool {
@@ -3076,12 +3186,13 @@ final class AgentModeViewModel: ObservableObject {
         requestUIRefresh(tabID: session.tabID, urgent: true)
     }
 
+    @discardableResult
     private func completeNextAgentTurnRuntimeFooterIfNeeded(
         for session: TabSession,
         endedAt: Date,
         maxSequenceIndexExclusive explicitMaxSequenceIndexExclusive: Int? = nil
-    ) {
-        guard !session.pendingTurnRuntimeAnchors.isEmpty else { return }
+    ) -> AgentTurnUserAnchorRollbackState.CompletedFooter? {
+        guard !session.pendingTurnRuntimeAnchors.isEmpty else { return nil }
         let anchor = session.pendingTurnRuntimeAnchors.removeFirst()
         let nextAnchorUpperBound = session.pendingTurnRuntimeAnchors.first?.userSequenceIndex
         let upperBound = explicitMaxSequenceIndexExclusive ?? nextAnchorUpperBound
@@ -3090,15 +3201,28 @@ final class AgentModeViewModel: ObservableObject {
             if let upperBound, item.sequenceIndex >= upperBound { return false }
             return item.hasDisplayableAssistantBody
         }) else {
-            return
+            return AgentTurnUserAnchorRollbackState.CompletedFooter(
+                anchor: anchor,
+                footerItemID: nil,
+                previousFooter: nil,
+                writtenFooter: nil
+            )
         }
-        session.agentMessageRuntimeFootersByItemID[target.id] = AgentMessageRuntimeFooter(
+        let previousFooter = session.agentMessageRuntimeFootersByItemID[target.id]
+        let writtenFooter = AgentMessageRuntimeFooter(
             itemID: target.id,
             anchorDate: anchor.startedAt,
             completedDate: max(endedAt, anchor.startedAt),
             statusText: "Worked for"
         )
+        session.agentMessageRuntimeFootersByItemID[target.id] = writtenFooter
         requestUIRefresh(tabID: session.tabID, urgent: true)
+        return AgentTurnUserAnchorRollbackState.CompletedFooter(
+            anchor: anchor,
+            footerItemID: target.id,
+            previousFooter: previousFooter,
+            writtenFooter: writtenFooter
+        )
     }
 
     private func prepareSessionForRunStart(tabID: UUID, session: TabSession) async {
@@ -4031,6 +4155,7 @@ final class AgentModeViewModel: ObservableObject {
 
         session.runState = payload.normalizedRunState
         session.providerSessionID = agentSession.providerSessionID
+        session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
         session.pendingHandoff = PendingHandoffState(
             payload: agentSession.pendingHandoffPayload,
@@ -4262,6 +4387,7 @@ final class AgentModeViewModel: ObservableObject {
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
         session.activeAgentRunStartedAt = nil
+        session.deferredActiveAgentRunTimerRollback = nil
         session.waitingPrompt = nil
         session.pendingAskUser = nil
         session.pendingUserInputRequest = nil
@@ -4278,6 +4404,7 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
         session.providerSessionID = nil
+        session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
         session.lastUserMessageAt = nil
         session.isDirty = false
@@ -5977,6 +6104,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         await claudeCoordinator.shutdownClaudeSessionIfNeeded(session)
         session.providerSessionID = nil
+        session.providerCleanupHandle = nil
         session.contextUsageSnapshot = nil
         session.activeNonCodexTurnTokenAccumulator = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
@@ -8406,6 +8534,7 @@ final class AgentModeViewModel: ObservableObject {
     func selectWorkflow(_ workflow: AgentWorkflowDefinition?) {
         guard let tabID = currentTabID else { return }
         let session = session(for: tabID)
+        session.userWorkflowSelectionMutationGeneration &+= 1
         session.selectedWorkflow = workflow
         selectedWorkflow = workflow
         syncComposerUIState(tabID: tabID)
@@ -11047,6 +11176,13 @@ final class AgentModeViewModel: ObservableObject {
             agentReasoningEffort: session.selectedReasoningEffortRaw,
             lastRunState: session.runState.rawValue,
             providerSessionID: session.providerSessionID,
+            providerCleanupHandle: providerCleanupHandle(
+                provider: session.selectedAgent.rawValue,
+                explicit: session.providerCleanupHandle,
+                providerSessionID: session.providerSessionID,
+                codexConversationID: session.codexConversationID,
+                codexRolloutPath: session.codexRolloutPath
+            ),
             autoEditEnabled: session.autoEditEnabled,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             parentSessionID: session.parentSessionID,
@@ -11260,7 +11396,11 @@ final class AgentModeViewModel: ObservableObject {
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                let result = submitUserTurn(text: text, tabID: target.tabID)
+                let result = submitUserTurn(
+                    text: text,
+                    tabID: target.tabID,
+                    rawDraftText: claim.attempt.rawDraftSnapshot
+                )
                 if result == .submitted {
                     clearComposerDraftIfUnchanged(for: claim)
                 }
@@ -11323,7 +11463,11 @@ final class AgentModeViewModel: ObservableObject {
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            let result = submitUserTurn(text: text, tabID: target.tabID)
+            let result = submitUserTurn(
+                text: text,
+                tabID: target.tabID,
+                rawDraftText: claim.attempt.rawDraftSnapshot
+            )
             if result == .submitted {
                 clearComposerDraftIfUnchanged(for: claim)
             }
@@ -11452,7 +11596,11 @@ final class AgentModeViewModel: ObservableObject {
             if destinationTabID == currentTabID {
                 applySessionToBindings(destinationSession)
             }
-            let result = submitUserTurn(text: text, tabID: destinationTabID)
+            let result = submitUserTurn(
+                text: text,
+                tabID: destinationTabID,
+                rawDraftText: claim.attempt.rawDraftSnapshot
+            )
             guard result == .submitted else {
                 clearPendingUserTurnState(on: destinationSession)
                 return result
@@ -11764,7 +11912,8 @@ final class AgentModeViewModel: ObservableObject {
     func submitUserTurn(
         text: String,
         tabID: UUID,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID? = nil,
+        rawDraftText: String? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -11780,6 +11929,7 @@ final class AgentModeViewModel: ObservableObject {
         scheduleSkillCatalogRefresh()
 
         let activeWorkflow = session.selectedWorkflow
+        let restorationSelectedWorkflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
         let nativePreparedTurn: NativeSlashPreparedUserTurn?
         if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session) {
             if let validationFailure = validateNativeSlashCommandUsage(
@@ -11871,7 +12021,10 @@ final class AgentModeViewModel: ObservableObject {
                     taggedFilesToSend: taggedFilesToSend,
                     activeWorkflow: bubbleWorkflow,
                     nativePreparedTurn: nativePreparedTurn,
-                    codexAttemptID: codexAttemptID
+                    codexAttemptID: codexAttemptID,
+                    rawDraftText: rawDraftText,
+                    restorationSelectedWorkflow: activeWorkflow,
+                    restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
                 )
             }
             return .submitted
@@ -11885,7 +12038,10 @@ final class AgentModeViewModel: ObservableObject {
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: bubbleWorkflow,
             nativePreparedTurn: nativePreparedTurn,
-            codexAttemptID: codexAttemptID
+            codexAttemptID: codexAttemptID,
+            rawDraftText: rawDraftText,
+            restorationSelectedWorkflow: activeWorkflow,
+            restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
         )
     }
 
@@ -11896,7 +12052,10 @@ final class AgentModeViewModel: ObservableObject {
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID? = nil,
+        rawDraftText: String? = nil,
+        restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
+        restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) async {
         guard let session = sessions[tabID] else { return }
         await prepareSessionForRunStart(tabID: tabID, session: session)
@@ -11909,7 +12068,10 @@ final class AgentModeViewModel: ObservableObject {
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: activeWorkflow,
             nativePreparedTurn: nativePreparedTurn,
-            codexAttemptID: codexAttemptID
+            codexAttemptID: codexAttemptID,
+            rawDraftText: rawDraftText,
+            restorationSelectedWorkflow: restorationSelectedWorkflow,
+            restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
         )
     }
 
@@ -11932,7 +12094,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     #endif
 
-    private func removeUnconfirmedMCPOptimisticCodexUserItem(
+    private func removeUnconfirmedOptimisticCodexUserItem(
         session: TabSession,
         tabID: UUID,
         itemID: UUID?,
@@ -11943,7 +12105,7 @@ final class AgentModeViewModel: ObservableObject {
         else { return }
         guard session.removeItem(at: index) != nil else { return }
         Self.steeringDebugLog(
-            "[AgentRunSteeringWake] removed unconfirmed MCP Codex optimistic item tab=\(tabID) itemID=\(itemID) reason=\(reason)"
+            "[AgentRunSteeringWake] removed unconfirmed Codex optimistic item tab=\(tabID) itemID=\(itemID) reason=\(reason)"
         )
         requestUIRefresh(tabID: tabID, urgent: true)
         scheduleSave(for: tabID)
@@ -11958,9 +12120,14 @@ final class AgentModeViewModel: ObservableObject {
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID? = nil,
+        rawDraftText: String? = nil,
+        restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
+        restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) -> UserTurnSubmissionResult {
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
+        // Composer claims preserve the exact raw snapshot separately from provider-normalized text.
+        let restorationDraftText = rawDraftText ?? trimmedText
 
         let bubbleText: String
         if !trimmedText.isEmpty {
@@ -11998,19 +12165,19 @@ final class AgentModeViewModel: ObservableObject {
             effectiveUserText = """
             <interview_first>
             Before starting this task, interview me to make sure you fully understand what I need. Follow these rules exactly:
-
+            \("")
             1. Ask ONE question at a time using the `ask_user` tool. Always include an `options` array with 2–4 concrete multiple-choice answers so I can respond quickly. Add a final option like "Other (I'll explain)" when my answer might not be listed.
             2. After each answer, adapt your next question based on what I told you. Narrow in on specifics — don't repeat what you already know.
             3. Ask 1–3 questions total. Stop early if the task is already clear enough.
             4. After the interview, briefly summarize what you learned and how it shapes your approach, then proceed with the task.
-
+            \("")
             Example flow:
             - Q1: "What's the main goal?" → options: ["Add new feature", "Fix a bug", "Refactor existing code", "Other (I'll explain)"]
             - User picks "Add new feature"
             - Q2 (adapted): "Where should this feature live?" → options: ["Extend FooView", "New standalone view", "Backend service layer", "Other (I'll explain)"]
             - ...and so on, each question building on previous answers.
             </interview_first>
-
+            \("")
             \(effectiveUserText)
             """
             interviewFirst = false
@@ -12044,7 +12211,7 @@ final class AgentModeViewModel: ObservableObject {
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow
         )
-        recordAgentTurnUserAnchor(for: session, userItem: userItem)
+        let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
         updateBindingsFromSession(session)
         scheduleSave(for: tabID)
@@ -12086,7 +12253,7 @@ final class AgentModeViewModel: ObservableObject {
                 providerText: wrappedText,
                 images: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
-                draftText: trimmedText,
+                draftText: restorationDraftText,
                 optimisticUserItemID: userItem.id,
                 origin: codexAttemptID.map(TabSession.CodexFallbackOrigin.mcp) ?? .manual,
                 dispatchTicket: dispatchTicket
@@ -12102,7 +12269,7 @@ final class AgentModeViewModel: ObservableObject {
                     guard await session.codexSteerAckTracker.awaitDispatchAuthorization(
                         attemptID: codexAttemptID
                     ) else {
-                        self.removeUnconfirmedMCPOptimisticCodexUserItem(
+                        self.removeUnconfirmedOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
                             itemID: userItem.id,
@@ -12112,20 +12279,32 @@ final class AgentModeViewModel: ObservableObject {
                     }
                 }
                 handedOffToSerialDispatch = true
-                let sendOutcome = await self.startAgentRun(
-                    tabID: tabID,
-                    initialMessage: wrappedText,
-                    attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend,
-                    codexFallbackContext: fallbackContext
-                )
+                guard await session.codexDispatchSerialGate.awaitTurn(dispatchTicket) else {
+                    return
+                }
+                defer {
+                    session.codexDispatchSerialGate.finish(dispatchTicket)
+                }
+                let sendOutcome: CodexAgentModeCoordinator.NativeSendOutcome? = if self.sessions[tabID] === session {
+                    await self.startAgentRun(
+                        tabID: tabID,
+                        initialMessage: wrappedText,
+                        attachments: attachmentsToSend,
+                        taggedFileAttachments: taggedFilesToSend,
+                        codexFallbackContext: fallbackContext
+                    )
+                } else {
+                    .preDispatchRejected(
+                        message: "Codex did not send because the tab session changed before provider dispatch."
+                    )
+                }
                 if sendOutcome?.didSend != true {
                     self.clearPendingCodexComputerUseActivationIfMatched(
                         session: session,
                         activationID: stagedCodexComputerUseActivationID
                     )
                     if codexAttemptID != nil {
-                        self.removeUnconfirmedMCPOptimisticCodexUserItem(
+                        self.removeUnconfirmedOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
                             itemID: userItem.id,
@@ -12133,12 +12312,44 @@ final class AgentModeViewModel: ObservableObject {
                         )
                     }
                 }
+                if case let .preDispatchRejected(message)? = sendOutcome,
+                   codexAttemptID == nil
+                {
+                    // The dispatch ticket remains held through this synchronous
+                    // rollback/restore, so the next queued send cannot observe
+                    // partially restored state.
+                    self.removeUnconfirmedOptimisticCodexUserItem(
+                        session: session,
+                        tabID: tabID,
+                        itemID: userItem.id,
+                        reason: "manual send was rejected before provider dispatch"
+                    )
+                    self.rollbackAgentTurnUserAnchor(turnRuntimeAnchorRollback, session: session)
+                    if let authoritativeSession = self.sessions[tabID] {
+                        self.restoreRejectedManualSubmissionComposerState(
+                            tabID: tabID,
+                            session: authoritativeSession,
+                            draftText: fallbackContext.draftText,
+                            images: attachmentsToSend,
+                            taggedFiles: taggedFilesToSend,
+                            selectedWorkflow: restorationSelectedWorkflow,
+                            selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                            message: message
+                        )
+                    }
+                } else {
+                    // Any retained or durably accepted optimistic submission is
+                    // the new timer baseline for later rollback.
+                    session.deferredActiveAgentRunTimerRollback = nil
+                }
                 guard let codexAttemptID else { return }
                 let terminalState: CodexSteerAckTracker.TerminalState = switch sendOutcome {
                 case .sent:
                     .steerAccepted
                 case let .queuedFallback(queueID, _):
                     .durablyQueued(queueID: queueID)
+                case let .preDispatchRejected(message):
+                    .failed(message: message)
                 case let .stale(reason):
                     .stale(reason: reason)
                 case .cancelled:
@@ -13478,17 +13689,6 @@ final class AgentModeViewModel: ObservableObject {
         codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         let session = session(for: tabID)
-        let codexDispatchTicket = codexFallbackContext?.dispatchTicket
-        if let codexDispatchTicket {
-            guard await session.codexDispatchSerialGate.awaitTurn(codexDispatchTicket) else {
-                return .cancelled
-            }
-        }
-        defer {
-            if let codexDispatchTicket {
-                session.codexDispatchSerialGate.finish(codexDispatchTicket)
-            }
-        }
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             if session.mcpFollowUpRunPending {
                 session.mcpFollowUpRunPending = false
@@ -13574,7 +13774,7 @@ final class AgentModeViewModel: ObservableObject {
                 <previous_conversation>
                 \(conversationHistory)
                 </previous_conversation>
-
+                \("")
                 <current_instruction>
                 \(initialMessageForRun)
                 </current_instruction>
@@ -14110,6 +14310,13 @@ final class AgentModeViewModel: ObservableObject {
                    session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
                 {
                     session.providerSessionID = sessionID
+                    session.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+                        provider: session.selectedAgent.rawValue,
+                        explicit: nil,
+                        providerSessionID: sessionID,
+                        codexConversationID: session.codexConversationID,
+                        codexRolloutPath: session.codexRolloutPath
+                    )
                     session.isDirty = true
                     self.scheduleSave(for: session.tabID)
                 }
@@ -15518,6 +15725,7 @@ final class AgentModeViewModel: ObservableObject {
         // restore the old conversation or affect a replacement controller.
         claudeCoordinator.prepareForConversationResetSync(session)
         session.providerSessionID = nil
+        session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
         session.pendingNonCodexUserInputTokenQueue.removeAll()
         session.activeNonCodexTurnTokenAccumulator = nil
@@ -15530,6 +15738,7 @@ final class AgentModeViewModel: ObservableObject {
         session.codexReasoningSegmentsByKey.removeAll()
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
+        session.deferredActiveAgentRunTimerRollback = nil
 
         // Clear Codex-native identifiers and usage
         codexCoordinator.clearCodexSessionState(session)
@@ -15603,6 +15812,67 @@ final class AgentModeViewModel: ObservableObject {
         let affectedTabIDs: Set<UUID>
         let clearedComposeTabIDs: Set<UUID>
         let clearedStashedTabIDs: Set<UUID>
+    }
+
+    @discardableResult
+    func cleanupProviderConversationForDeletedAgentSession(_ session: TabSession) async -> ProviderConversationCleanupOutcome? {
+        let action = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        let handle = providerCleanupHandle(
+            provider: session.selectedAgent.rawValue,
+            explicit: session.providerCleanupHandle,
+            providerSessionID: session.providerSessionID,
+            codexConversationID: session.codexConversationID,
+            codexRolloutPath: session.codexRolloutPath
+        )
+        guard let handle else { return nil }
+
+        let outcome: ProviderConversationCleanupOutcome = if let controller = session.codexController {
+            await controller.cleanupConversation(handle, action: action)
+        } else if let controller = session.claudeController {
+            await controller.cleanupConversation(handle, action: action)
+        } else if let provider = session.provider {
+            await provider.cleanupConversation(handle, action: action)
+        } else {
+            await providerConversationCleanupRegistry.cleanup(handle, action: action)
+        }
+        logProviderConversationCleanupOutcome(outcome, action: action, handle: handle)
+        return outcome
+    }
+
+    @discardableResult
+    func cleanupProviderConversationForPersistedAgentSession(_ agentSession: AgentSession) async -> ProviderConversationCleanupOutcome? {
+        let action = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        let handle = agentSession.resolvedProviderCleanupHandle
+        guard let handle else { return nil }
+        let outcome = await providerConversationCleanupRegistry.cleanup(handle, action: action)
+        logProviderConversationCleanupOutcome(outcome, action: action, handle: handle)
+        return outcome
+    }
+
+    private func providerCleanupHandle(
+        provider: String,
+        explicit: ProviderConversationCleanupHandle?,
+        providerSessionID: String?,
+        codexConversationID: String?,
+        codexRolloutPath: String?
+    ) -> ProviderConversationCleanupHandle? {
+        ProviderConversationCleanupHandle.resolved(
+            provider: provider,
+            explicit: explicit,
+            providerSessionID: providerSessionID,
+            codexConversationID: codexConversationID,
+            codexRolloutPath: codexRolloutPath
+        )
+    }
+
+    private func logProviderConversationCleanupOutcome(
+        _ outcome: ProviderConversationCleanupOutcome,
+        action: ProviderConversationCleanupAction,
+        handle: ProviderConversationCleanupHandle
+    ) {
+        #if DEBUG
+            print("[AgentModeVM] provider conversation cleanup action=\(action.rawValue) provider=\(handle.provider) status=\(outcome.status) message=\(outcome.message ?? "")")
+        #endif
     }
 
     @discardableResult
@@ -15693,6 +15963,7 @@ final class AgentModeViewModel: ObservableObject {
             cancelPendingInstruction(for: session)
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
+            await cleanupProviderConversationForDeletedAgentSession(session)
             await session.disposeProviderIfPresent()
             await codexCoordinator.shutdownCodexSession(session)
             await claudeCoordinator.shutdownClaudeSession(session)
@@ -15749,7 +16020,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Delete a session completely (clear chat and close tab)
-    func deleteSession(tabID: UUID, workspace: WorkspaceModel) async throws {
+    @discardableResult
+    func deleteSession(
+        tabID: UUID,
+        workspace: WorkspaceModel
+    ) async throws -> ProviderConversationCleanupOutcome? {
         #if DEBUG
             let deleteSessionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
@@ -15759,6 +16034,23 @@ final class AgentModeViewModel: ObservableObject {
         if wasCurrentTab {
             lastProcessedTabID = nil
         }
+        if let sessionID {
+            liveSession?.saveDebounceTask?.cancel()
+            liveSession?.saveDebounceTask = nil
+            liveSession?.saveRequestGeneration &+= 1
+            saveRequestedWhileInFlightSessionIDs.remove(sessionID)
+            do {
+                try await dataService.deleteAgentSession(id: sessionID, for: workspace)
+            } catch {
+                if let liveSession {
+                    liveSession.isDirty = true
+                    scheduleSave(for: tabID)
+                }
+                throw error
+            }
+        }
+
+        var providerCleanupOutcome: ProviderConversationCleanupOutcome?
         if let session = liveSession {
             removePendingUIRefresh(for: tabID)
             cancelPersistedLoad(for: session)
@@ -15770,6 +16062,7 @@ final class AgentModeViewModel: ObservableObject {
             cancelPendingInstruction(for: session)
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
+            providerCleanupOutcome = await cleanupProviderConversationForDeletedAgentSession(session)
             await session.disposeProviderIfPresent()
             await codexCoordinator.shutdownCodexSession(session)
             await claudeCoordinator.shutdownClaudeSession(session)
@@ -15780,13 +16073,7 @@ final class AgentModeViewModel: ObservableObject {
             reason: "session_delete"
         )
         let workspaceID = workspace.id
-        var persistedDeletionError: Error?
         if let sessionID {
-            do {
-                try await dataService.deleteAgentSession(id: sessionID, for: workspace)
-            } catch {
-                persistedDeletionError = error
-            }
             removeSessionIndex(sessionID: sessionID)
         } else {
             removeSessionIndex(forTabID: tabID)
@@ -15819,9 +16106,7 @@ final class AgentModeViewModel: ObservableObject {
                 ]
             )
         #endif
-        if let persistedDeletionError {
-            throw persistedDeletionError
-        }
+        return providerCleanupOutcome
     }
 
     /// Last activity timestamp for sorting tabs in the UI

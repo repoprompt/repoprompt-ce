@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -1565,7 +1566,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         }
     }
 
-    func testActiveCodexNativeSendFailsWithoutSendingWhenAgentRunDrainFails() async {
+    func testActiveCodexNativeSendRejectsBeforeDispatchWhenAgentRunDrainFails() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller) { _, _ in false }
         let session = preparedCodexSession(in: viewModel, controller: controller)
@@ -1576,10 +1577,482 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             attachments: []
         )
 
-        guard case let .failed(message) = outcome else {
-            return XCTFail("Expected failed outcome, got \(outcome)")
+        guard case let .preDispatchRejected(message) = outcome else {
+            return XCTFail("Expected pre-dispatch rejection, got \(outcome)")
         }
         XCTAssertTrue(message.contains("agent_run.wait"))
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text == message })
+        XCTAssertEqual(session.runState, .running)
+    }
+
+    func testActiveCodexNativeSendRejectsBeforeDispatchWhenActiveRunChangesDuringDrain() async {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _ in
+            await drainGate.wait()
+            return true
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let capturedRunID = session.runID
+
+        let sendTask = Task {
+            await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+                session: session,
+                text: "hello",
+                attachments: []
+            )
+        }
+        await drainGate.waitUntilWaiting()
+        session.runID = UUID()
+        drainGate.release()
+
+        let outcome = await sendTask.value
+        guard case let .preDispatchRejected(message) = outcome else {
+            return XCTFail("Expected pre-dispatch rejection, got \(outcome)")
+        }
+        XCTAssertTrue(message.contains("active run changed"))
+        XCTAssertNotEqual(session.runID, capturedRunID)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+    }
+
+    func testComposerActiveSendDrainRejectionRemovesOnlyOptimisticBubbleAndRestoresFullComposerState() async throws {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _ in
+            await drainGate.wait()
+            return false
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        defer {
+            drainGate.release()
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let existingUserItem = AgentChatItem.user(
+            "existing confirmed user item",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(existingUserItem)
+        let inFlightAssistantItem = AgentChatItem.assistant(
+            "in-flight assistant progress",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(inFlightAssistantItem)
+        let inFlightAnchor = AgentModeViewModel.TabSession.AgentTurnRuntimeAnchor(
+            userItemID: existingUserItem.id,
+            userSequenceIndex: existingUserItem.sequenceIndex,
+            startedAt: Date(timeIntervalSinceNow: -240)
+        )
+        session.pendingTurnRuntimeAnchors = [inFlightAnchor]
+        let runStartedAtBeforeSubmit = Date(timeIntervalSinceNow: -120)
+        session.activeAgentRunStartedAt = runStartedAtBeforeSubmit
+
+        let image = AgentImageAttachment(
+            source: .localFile(path: "/tmp/rejected-composer-image.png"),
+            title: "rejected-composer-image.png"
+        )
+        session.pendingImageAttachments = [image]
+        let taggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/File.swift",
+            displayName: "File.swift"
+        )
+        session.pendingTaggedFileAttachments = [taggedFile]
+        let workflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Test Workflow",
+            template: "Wrapped: $ARGUMENTS"
+        )
+        session.selectedWorkflow = workflow
+
+        let rawDraft = "\n  restore this draft  \n"
+        let providerText = rawDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        viewModel.storeDraftText(for: session.tabID, rawDraft)
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: rawDraft
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch viewModel.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected composer submit claim, got \(rejection)")
+        }
+
+        let result = await viewModel.executeComposerSubmitAttempt(text: providerText, claim: claim)
+
+        XCTAssertEqual(result, .submitted)
+        try await waitUntil {
+            drainGate.isWaitingSync()
+        }
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "")
+        XCTAssertTrue(session.pendingImageAttachments.isEmpty)
+        XCTAssertTrue(session.pendingTaggedFileAttachments.isEmpty)
+        XCTAssertNil(session.selectedWorkflow)
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.text),
+            [existingUserItem.text, providerText]
+        )
+        // While the send is in flight, the optimistic submission has staged its
+        // turn-runtime bookkeeping: prior in-flight anchor consumed into a
+        // footer, new anchor pending, elapsed timer restarted.
+        XCTAssertEqual(session.pendingTurnRuntimeAnchors.count, 1)
+        XCTAssertNotEqual(session.pendingTurnRuntimeAnchors.first?.userItemID, existingUserItem.id)
+        XCTAssertNotNil(session.agentMessageRuntimeFootersByItemID[inFlightAssistantItem.id])
+        XCTAssertNotEqual(session.activeAgentRunStartedAt, runStartedAtBeforeSubmit)
+
+        // Simulate newer runtime activity winning the same footer while the
+        // pre-dispatch drain remains suspended.
+        let newerFooter = AgentMessageRuntimeFooter(
+            itemID: inFlightAssistantItem.id,
+            anchorDate: inFlightAnchor.startedAt,
+            completedDate: Date(),
+            statusText: "Newer runtime footer"
+        )
+        session.agentMessageRuntimeFootersByItemID[inFlightAssistantItem.id] = newerFooter
+
+        drainGate.release()
+        try await waitUntil {
+            viewModel.draftRestorationEvent?.text == rawDraft
+                && session.items.contains { $0.kind == .error && $0.text.contains("agent_run.wait") }
+        }
+
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.id),
+            [existingUserItem.id]
+        )
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), rawDraft)
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .replaceAlways)
+        XCTAssertEqual(session.pendingImageAttachments, [image])
+        XCTAssertEqual(session.pendingTaggedFileAttachments, [taggedFile])
+        XCTAssertEqual(session.selectedWorkflow, workflow)
+        XCTAssertEqual(viewModel.selectedWorkflow, workflow)
+        // The newer footer remains authoritative, and its already-accounted
+        // anchor is not reinserted for a second attribution.
+        XCTAssertTrue(session.pendingTurnRuntimeAnchors.isEmpty)
+        XCTAssertEqual(
+            session.agentMessageRuntimeFootersByItemID[inFlightAssistantItem.id],
+            newerFooter
+        )
+        XCTAssertEqual(session.activeAgentRunStartedAt, runStartedAtBeforeSubmit)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+    }
+
+    func testComposerActiveSendDrainRejectionDoesNotOverwriteNewerComposerChoices() async throws {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _ in
+            await drainGate.wait()
+            return false
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        defer {
+            drainGate.release()
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let rejectedTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/File.swift",
+            displayName: "File.swift"
+        )
+        session.pendingTaggedFileAttachments = [rejectedTaggedFile]
+        let rejectedWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Rejected Workflow"
+        )
+        session.selectedWorkflow = rejectedWorkflow
+
+        let rawDraft = "rejected draft"
+        viewModel.storeDraftText(for: session.tabID, rawDraft)
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: rawDraft
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch viewModel.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected composer submit claim, got \(rejection)")
+        }
+        let result = await viewModel.executeComposerSubmitAttempt(text: rawDraft, claim: claim)
+        XCTAssertEqual(result, .submitted)
+        try await waitUntil {
+            drainGate.isWaitingSync()
+        }
+
+        // While the rejected submission is still in flight, the user makes
+        // newer composer choices; the restoration must not displace them.
+        let newerWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Newer Workflow"
+        )
+        viewModel.selectWorkflow(newerWorkflow)
+        viewModel.selectWorkflow(nil)
+        let newerTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/Other.swift",
+            displayName: "Other.swift"
+        )
+        session.pendingTaggedFileAttachments = [newerTaggedFile]
+        viewModel.storeDraftText(for: session.tabID, "newer typing")
+
+        drainGate.release()
+        try await waitUntil {
+            viewModel.draftRestorationEvent != nil
+                && session.items.contains { $0.kind == .error && $0.text.contains("agent_run.wait") }
+        }
+
+        XCTAssertNil(session.selectedWorkflow)
+        XCTAssertNil(viewModel.selectedWorkflow)
+        XCTAssertEqual(
+            session.pendingTaggedFileAttachments,
+            [rejectedTaggedFile, newerTaggedFile]
+        )
+        XCTAssertEqual(
+            viewModel.retrieveDraftText(for: session.tabID),
+            "rejected draft\nnewer typing"
+        )
+        let restorationEvent = try XCTUnwrap(viewModel.draftRestorationEvent)
+        XCTAssertEqual(restorationEvent.strategy, .replaceAlways)
+        let restorationOperation = try XCTUnwrap(restorationEvent.operation)
+        XCTAssertEqual(
+            AgentComposerDraftRestorationReducer.apply(
+                restorationOperation,
+                to: "newer typing after model composition",
+                lastAppliedRestorationEventID: restorationOperation.previousRestorationEventID
+            ),
+            "rejected draft\nnewer typing after model composition"
+        )
+
+        let unappliedEarlierEventID = UUID()
+        let coalescedOperation = AgentComposerDraftRestorationOperation(
+            rejectedDraftText: "second rejected draft",
+            draftTextBeforeRestoration: "first rejected draft",
+            composedDraftText: "second rejected draft\nfirst rejected draft",
+            previousRestorationEventID: unappliedEarlierEventID
+        )
+        XCTAssertEqual(
+            AgentComposerDraftRestorationReducer.apply(
+                coalescedOperation,
+                to: "typing before either event rendered",
+                lastAppliedRestorationEventID: nil
+            ),
+            "second rejected draft\nfirst rejected draft\ntyping before either event rendered"
+        )
+    }
+
+    func testComposerTabSessionReplacementBeforeDispatchRestoresIntoAuthoritativeSession() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let sourceSession = preparedCodexSession(in: viewModel, controller: controller)
+        sourceSession.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(sourceSession.tabID)
+        defer {
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let blockingTicket = sourceSession.codexDispatchSerialGate.issueTicket()
+        let rejectedImage = AgentImageAttachment(
+            source: .localFile(path: "/tmp/rejected-session-image.png"),
+            title: "rejected-session-image.png"
+        )
+        let rejectedTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/Rejected.swift",
+            displayName: "Rejected.swift"
+        )
+        let rejectedWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Rejected Workflow"
+        )
+        sourceSession.pendingImageAttachments = [rejectedImage]
+        sourceSession.pendingTaggedFileAttachments = [rejectedTaggedFile]
+        sourceSession.selectedWorkflow = rejectedWorkflow
+        sourceSession.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+
+        let rejectedDraft = "rejected draft"
+        viewModel.storeDraftText(for: sourceSession.tabID, rejectedDraft)
+        let target = try XCTUnwrap(
+            viewModel.makeComposerSubmitTarget(tabID: sourceSession.tabID, session: sourceSession)
+        )
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: rejectedDraft
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch viewModel.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected composer submit claim, got \(rejection)")
+        }
+
+        let result = await viewModel.executeComposerSubmitAttempt(text: rejectedDraft, claim: claim)
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(sourceSession.items.count(where: { $0.kind == .user }), 1)
+        XCTAssertEqual(sourceSession.pendingTurnRuntimeAnchors.count, 1)
+        XCTAssertNotNil(sourceSession.pendingCodexComputerUseActivation)
+
+        let replacementSession = AgentModeViewModel.TabSession(tabID: sourceSession.tabID)
+        replacementSession.selectedAgent = .codexExec
+        viewModel.test_installLiveSession(replacementSession)
+        let newerImage = AgentImageAttachment(
+            source: .localFile(path: "/tmp/newer-session-image.png"),
+            title: "newer-session-image.png"
+        )
+        let newerTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/Newer.swift",
+            displayName: "Newer.swift"
+        )
+        let newerWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Newer Workflow"
+        )
+        replacementSession.pendingImageAttachments = [newerImage]
+        replacementSession.pendingTaggedFileAttachments = [newerTaggedFile]
+        viewModel.storeDraftText(for: replacementSession.tabID, "newer typing")
+        viewModel.selectWorkflow(newerWorkflow)
+
+        let restoration = expectation(description: "composer restored into replacement session")
+        var cancellable: AnyCancellable?
+        cancellable = viewModel.$draftRestorationEvent
+            .compactMap(\.self)
+            .filter { $0.tabID == replacementSession.tabID }
+            .sink { _ in restoration.fulfill() }
+        sourceSession.codexDispatchSerialGate.finish(blockingTicket)
+        await fulfillment(of: [restoration], timeout: 2)
+        withExtendedLifetime(cancellable) {}
+
+        XCTAssertTrue(sourceSession.items.filter { $0.kind == .user }.isEmpty)
+        XCTAssertTrue(sourceSession.pendingTurnRuntimeAnchors.isEmpty)
+        XCTAssertNil(sourceSession.pendingCodexComputerUseActivation)
+        XCTAssertTrue(replacementSession.items.filter { $0.kind == .user }.isEmpty)
+        XCTAssertEqual(
+            replacementSession.pendingImageAttachments,
+            [rejectedImage, newerImage]
+        )
+        XCTAssertEqual(
+            replacementSession.pendingTaggedFileAttachments,
+            [rejectedTaggedFile, newerTaggedFile]
+        )
+        XCTAssertEqual(replacementSession.selectedWorkflow, newerWorkflow)
+        XCTAssertEqual(viewModel.selectedWorkflow, newerWorkflow)
+        XCTAssertEqual(
+            viewModel.retrieveDraftText(for: replacementSession.tabID),
+            "rejected draft\nnewer typing"
+        )
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .replaceAlways)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(sourceSession.codexFallbackQueue.isEmpty)
+        XCTAssertTrue(replacementSession.codexFallbackQueue.isEmpty)
+    }
+
+    func testBackToBackComposerActiveSendDrainRejectionsRestoreEachDraftExactlyOnce() async throws {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _ in
+            await drainGate.wait()
+            return false
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        defer {
+            drainGate.release()
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let existingUserItem = AgentChatItem.user(
+            "existing confirmed user item",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(existingUserItem)
+        let existingAssistantItem = AgentChatItem.assistant(
+            "existing assistant progress",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(existingAssistantItem)
+        let originalAnchor = AgentModeViewModel.TabSession.AgentTurnRuntimeAnchor(
+            userItemID: existingUserItem.id,
+            userSequenceIndex: existingUserItem.sequenceIndex,
+            startedAt: Date(timeIntervalSinceNow: -240)
+        )
+        session.pendingTurnRuntimeAnchors = [originalAnchor]
+        let originalRunStartedAt = Date(timeIntervalSinceNow: -120)
+        session.activeAgentRunStartedAt = originalRunStartedAt
+
+        func submitDraft(_ draft: String) async throws {
+            viewModel.storeDraftText(for: session.tabID, draft)
+            let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+            let attempt = AgentComposerSubmitAttempt(
+                id: UUID(),
+                target: target,
+                inputRevision: 1,
+                noticeRevision: 0,
+                rawDraftSnapshot: draft
+            )
+            let claim: AgentModeViewModel.AgentComposerSubmitClaim
+            switch viewModel.claimComposerSubmitAttempt(attempt) {
+            case let .claimed(acceptedClaim):
+                claim = acceptedClaim
+            case let .rejected(rejection):
+                return XCTFail("Expected composer submit claim, got \(rejection)")
+            }
+            let result = await viewModel.executeComposerSubmitAttempt(text: draft, claim: claim)
+            XCTAssertEqual(result, .submitted)
+        }
+
+        try await submitDraft("repeated rejected draft")
+        try await submitDraft("repeated rejected draft")
+        try await waitUntil {
+            drainGate.isWaitingSync()
+        }
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "")
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.text),
+            [existingUserItem.text, "repeated rejected draft", "repeated rejected draft"]
+        )
+
+        let expectedComposedDraft = "repeated rejected draft\nrepeated rejected draft"
+        drainGate.release()
+        try await waitUntil {
+            session.items.count(where: { $0.kind == .error && $0.text.contains("agent_run.wait") }) == 2
+                && viewModel.retrieveDraftText(for: session.tabID) == expectedComposedDraft
+        }
+
+        // Each rejected draft is restored exactly once, both optimistic
+        // bubbles are removed, and no undelivered-turn anchors remain.
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), expectedComposedDraft)
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.id),
+            [existingUserItem.id]
+        )
+        XCTAssertEqual(session.pendingTurnRuntimeAnchors, [originalAnchor])
+        XCTAssertTrue(session.agentMessageRuntimeFootersByItemID.isEmpty)
+        XCTAssertEqual(session.activeAgentRunStartedAt, originalRunStartedAt)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
         XCTAssertEqual(controller.startUserTurnCountSync(), 0)
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
         XCTAssertEqual(session.runState, .running)
@@ -1840,24 +2313,54 @@ private enum LivenessSnapshotError: Error {
 private final class LivenessSnapshotReadGate: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
+    private var waitingObservers: [CheckedContinuation<Void, Never>] = []
     private var started = false
     private var released = false
 
     func wait() async {
         await withCheckedContinuation { continuation in
             let shouldResumeImmediately: Bool
+            let observersToResume: [CheckedContinuation<Void, Never>]
             lock.lock()
             started = true
             if released {
                 shouldResumeImmediately = true
+                observersToResume = []
             } else {
                 shouldResumeImmediately = false
                 self.continuation = continuation
+                observersToResume = waitingObservers
+                waitingObservers.removeAll()
             }
             lock.unlock()
 
+            observersToResume.forEach { $0.resume() }
             if shouldResumeImmediately {
                 continuation.resume()
+            }
+        }
+    }
+
+    func waitUntilWaiting() async {
+        let shouldReturnImmediately: Bool = lock.withLock {
+            if started, !released, continuation != nil {
+                true
+            } else {
+                false
+            }
+        }
+        if shouldReturnImmediately { return }
+        await withCheckedContinuation { observer in
+            let shouldResumeImmediately: Bool = lock.withLock {
+                if started, !released, continuation != nil {
+                    return true
+                } else {
+                    waitingObservers.append(observer)
+                    return false
+                }
+            }
+            if shouldResumeImmediately {
+                observer.resume()
             }
         }
     }
