@@ -119,6 +119,48 @@ updating every archive and exact-tree hash in the manifest, capturing the new
 license/notice files, and rerunning the offline artifact tests plus a protected
 release candidate. Never derive a new pin from an unverified local installation.
 
+### Guarded Codex update candidates
+
+`Scripts/codex_update_candidate.py` prepares evidence for a possible rotation; it
+does not edit or replace `Vendor/Codex/manifest.json`. Select exactly one explicit
+stable version/tag, or opt in explicitly to GitHub's latest stable release:
+
+```bash
+make codex-update-candidate CODEX_CANDIDATE_VERSION=0.145.0
+make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.145.0
+make codex-update-candidate CODEX_CANDIDATE_LATEST=1
+```
+
+Official mode accepts no baseline or verification-tool override: it uses the
+repository manifest, `/usr/bin/lipo`, `/usr/bin/codesign`, and live official
+`openai/codex` metadata/assets. `--release-json`, `--asset-dir`, or any non-default
+baseline/tool requires `--fixture-mode`; that mode rejects `--latest-stable` and
+marks the report, manifest filename, metadata, marker file, and provenance as a
+**NON-PROMOTABLE TEST FIXTURE**. Fixture provenance records the baseline path and
+digest, explicit selection mode, input sources, and effective tools so fixture
+evidence cannot make an official-online claim.
+
+The tool rejects draft and prerelease releases, requires exactly one checksum
+asset and both exact macOS package assets, bounds downloads to the release-declared
+size, bounds archive members and total expansion, and verifies the archives
+against the upstream checksums. It then
+uses the same artifact verifier as packaging to reject extracted-layout, Mach-O
+inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
+The official output directory contains a proposed `candidate-manifest.json`,
+`candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
+checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
+0.144.6 pin remains authoritative
+until a maintainer reviews and deliberately applies a complete rotation change.
+
+The manual **Codex Runtime Update Candidate** workflow runs only from `main`, has
+`contents: read`, uploads those evidence files, and cannot commit, open a pull
+request, promote Tip, or publish a release. Local and workflow runs share the same
+repository-owned tool. A report is not approval: it leaves the external override
+floor as an explicit policy decision and requires schema-gate review (including
+`memory_mode`, MCP direct-only behavior, and `thread/start`/`thread/resume`),
+license/NOTICE review, focused validation, rollback confirmation, maintainer
+approval, and soak before any stable rotation.
+
 ## Release ownership
 
 Ordinary contributors prepare release candidates. They do not need Apple

@@ -67,6 +67,7 @@ TARGET_PAGE_SIZES = {
     CPU_TYPE_X86_64: 0x1000,
     CPU_TYPE_ARM64: 0x4000,
 }
+STABLE_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 
 
 class ContractError(RuntimeError):
@@ -81,17 +82,28 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_manifest(path: Path, *, require_normalized_digests: bool = True) -> dict[str, Any]:
+def load_manifest(
+    path: Path,
+    *,
+    require_normalized_digests: bool = True,
+    expected_version: str | None = None,
+) -> dict[str, Any]:
+    effective_version = expected_version or SUPPORTED_VERSION
+    if STABLE_VERSION_PATTERN.fullmatch(effective_version) is None:
+        raise ContractError(f"expected Codex version must be a stable numeric triplet: {effective_version!r}")
+    effective_tag = f"rust-v{effective_version}"
+    effective_release_url = f"{OFFICIAL_REPOSITORY_URL}/releases/tag/{effective_tag}"
+    effective_download_url = f"{OFFICIAL_REPOSITORY_URL}/releases/download/{effective_tag}"
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ContractError(f"could not read pinned manifest {path}: {exc}") from exc
     if manifest.get("schemaVersion") != 1:
         raise ContractError("unsupported Codex manifest schema")
-    if manifest.get("version") != SUPPORTED_VERSION or manifest.get("tag") != SUPPORTED_TAG:
-        raise ContractError(f"pinned manifest must describe Codex {SUPPORTED_VERSION} / {SUPPORTED_TAG}")
-    if manifest.get("releaseURL") != OFFICIAL_RELEASE_URL:
-        raise ContractError(f"pinned manifest releaseURL must be {OFFICIAL_RELEASE_URL}")
+    if manifest.get("version") != effective_version or manifest.get("tag") != effective_tag:
+        raise ContractError(f"pinned manifest must describe Codex {effective_version} / {effective_tag}")
+    if manifest.get("releaseURL") != effective_release_url:
+        raise ContractError(f"pinned manifest releaseURL must be {effective_release_url}")
     packages = manifest.get("packages")
     if not isinstance(packages, dict) or set(packages) != set(BUNDLE_TARGETS):
         raise ContractError("pinned manifest must contain exactly both macOS package targets")
@@ -101,7 +113,7 @@ def load_manifest(path: Path, *, require_normalized_digests: bool = True) -> dic
     if not isinstance(checksums, dict) or checksums.get("asset") != "codex-package_SHA256SUMS":
         raise ContractError("pinned manifest has an invalid official checksum asset")
     validate_digest(checksums.get("sha256"), "official checksum asset")
-    expected_checksums_url = f"{OFFICIAL_DOWNLOAD_URL}/{checksums['asset']}"
+    expected_checksums_url = f"{effective_download_url}/{checksums['asset']}"
     if checksums.get("url") != expected_checksums_url:
         raise ContractError(f"official checksum asset URL must be {expected_checksums_url}")
     for target, package in packages.items():
@@ -113,7 +125,7 @@ def load_manifest(path: Path, *, require_normalized_digests: bool = True) -> dic
         if package.get("architecture") != TARGET_ARCHITECTURES[target]:
             raise ContractError(f"{target}: architecture policy mismatch")
         validate_digest(package.get("sha256"), f"{target} archive")
-        expected_package_url = f"{OFFICIAL_DOWNLOAD_URL}/{expected_archive}"
+        expected_package_url = f"{effective_download_url}/{expected_archive}"
         if package.get("url") != expected_package_url:
             raise ContractError(f"{target}: official archive URL must be {expected_package_url}")
         entries = package.get("tree")

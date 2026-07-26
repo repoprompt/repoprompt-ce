@@ -1,0 +1,80 @@
+name: Codex Runtime Update Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable Codex version (for example 0.145.0)
+        required: false
+        type: string
+      tag:
+        description: Stable Codex tag (for example rust-v0.145.0)
+        required: false
+        type: string
+      latest_stable:
+        description: Explicitly resolve GitHub's latest stable openai/codex release
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    name: Prepare Review-Only Evidence
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    steps:
+      - name: Check out trusted main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Validate candidate selector
+        id: selector
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_LATEST: ${{ inputs.latest_stable }}
+        run: |
+          set -euo pipefail
+          count=0
+          args=()
+          if [[ -n "$INPUT_VERSION" ]]; then
+            count=$((count + 1))
+            args+=(--version "$INPUT_VERSION")
+          fi
+          if [[ -n "$INPUT_TAG" ]]; then
+            count=$((count + 1))
+            args+=(--tag "$INPUT_TAG")
+          fi
+          if [[ "$INPUT_LATEST" == "true" ]]; then
+            count=$((count + 1))
+            args+=(--latest-stable)
+          fi
+          if [[ "$count" -ne 1 ]]; then
+            echo "Set exactly one of version, tag, or latest_stable." >&2
+            exit 1
+          fi
+          printf '%s\0' "${args[@]}" > "$RUNNER_TEMP/codex-candidate-selector"
+
+      - name: Prepare guarded candidate evidence
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r -d '' value; do args+=("$value"); done < "$RUNNER_TEMP/codex-candidate-selector"
+          python3 Scripts/codex_update_candidate.py \
+            "${args[@]}" \
+            --output-dir .build/codex-update-candidate/evidence
+
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-Codex-runtime-update-candidate
+          path: .build/codex-update-candidate/evidence
+          if-no-files-found: error
