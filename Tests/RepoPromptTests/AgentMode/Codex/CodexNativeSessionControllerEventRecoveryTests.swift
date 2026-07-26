@@ -5,6 +5,57 @@ import XCTest
 final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
     private static let webSearchAliases = ["search", "web_search", "web_search_request", "google_web_search", "search_web"]
 
+    func testRawExecCallIDAndSnapshotItemIDShareOnlyOpaqueProcessHandle() async throws {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "codex/event/exec_command_begin",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "msg": .object([
+                    "call_id": .string("raw-call-1"),
+                    "command": .string("sleep 420"),
+                    "process_id": .string("97027")
+                ])
+            ]
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        let rawInvocationID = try XCTUnwrap(events.compactMap { event -> UUID? in
+            guard case let .toolCall("bash", invocationID, _) = event else { return nil }
+            return invocationID
+        }.first)
+        let runningUpdate = try XCTUnwrap(events.compactMap { event -> CodexNativeSessionController.CommandExecutionRunningUpdate? in
+            guard case let .commandExecutionRunning(update) = event else { return nil }
+            return update
+        }.first)
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread-active",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [[
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "itemsView": "full",
+                        "items": [[
+                            "id": "snapshot-item-1",
+                            "type": "commandExecution",
+                            "status": "inProgress",
+                            "processId": "97027"
+                        ]]
+                    ]]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+        let snapshotItem = try XCTUnwrap(snapshot.activeToolItems.first)
+
+        XCTAssertEqual(runningUpdate.invocationID, rawInvocationID)
+        XCTAssertNotEqual(snapshotItem.invocationID, rawInvocationID)
+        XCTAssertEqual(runningUpdate.processID, snapshotItem.processID)
+    }
+
     func testLegacyAssistantCompleteWithoutPriorDeltaEmitsFullText() async {
         let controller = makeControllerWithThread(turnID: "turn-1")
 

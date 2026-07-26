@@ -224,8 +224,66 @@
           "path": "thread.turns",
           "presence": "required",
           "nullable": false
+        },
+        {
+          "path": "thread.turns[].id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].status",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].itemsView",
+          "presence": "optional",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].items",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].items[].type",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].items[].id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].items[].status",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].items[].tool",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "thread.turns[].items[].processId",
+          "presence": "optional",
+          "nullable": true
         }
-      ]
+      ],
+      "consumedEnumValues": {
+        "thread.turns[].itemsView": [
+          "full",
+          "notLoaded",
+          "summary"
+        ],
+        "thread.turns[].items[].status": [
+          "completed",
+          "declined",
+          "failed",
+          "inProgress"
+        ]
+      }
     },
     {
       "union": "ClientRequest.json",

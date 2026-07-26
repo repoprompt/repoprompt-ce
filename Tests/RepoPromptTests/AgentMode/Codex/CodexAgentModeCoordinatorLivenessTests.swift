@@ -4,6 +4,116 @@ import XCTest
 
 @MainActor
 final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
+    func testThreadSnapshotParsesAuthoritativeActiveCommandItem() throws {
+        let itemID = UUID().uuidString
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [[
+                        "id": "turn",
+                        "status": "inProgress",
+                        "itemsView": "full",
+                        "items": [[
+                            "id": itemID,
+                            "type": "commandExecution",
+                            "status": "inProgress",
+                            "processId": "97027"
+                        ]]
+                    ]]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+
+        XCTAssertTrue(snapshot.hasAuthoritativeActiveTurnItems)
+        let item = try XCTUnwrap(snapshot.activeToolItems.first)
+        XCTAssertEqual(item.turnID, "turn")
+        XCTAssertEqual(item.itemID, itemID)
+        XCTAssertEqual(item.invocationID, UUID(uuidString: itemID))
+        XCTAssertEqual(item.kind, .commandExecution)
+        XCTAssertEqual(item.processID, "97027")
+        XCTAssertEqual(item.status, .inProgress)
+    }
+
+    func testThreadSnapshotPreservesToolIdentityAcrossMultipleActiveTurns() {
+        let firstItemID = UUID().uuidString
+        let secondItemID = UUID().uuidString
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [
+                        [
+                            "id": "turn-a",
+                            "status": "inProgress",
+                            "itemsView": "full",
+                            "items": [[
+                                "id": firstItemID,
+                                "type": "commandExecution",
+                                "status": "inProgress",
+                                "processId": "process-a"
+                            ]]
+                        ],
+                        [
+                            "id": "turn-b",
+                            "status": "inProgress",
+                            "itemsView": "full",
+                            "items": [[
+                                "id": secondItemID,
+                                "type": "commandExecution",
+                                "status": "inProgress",
+                                "processId": "process-b"
+                            ]]
+                        ]
+                    ]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+
+        XCTAssertTrue(snapshot.hasAuthoritativeActiveTurnItems)
+        XCTAssertEqual(snapshot.activeTurnIDs, ["turn-a", "turn-b"])
+        XCTAssertEqual(snapshot.activeToolItems.map(\.turnID), ["turn-a", "turn-b"])
+        XCTAssertEqual(snapshot.activeToolItems.map(\.processID), ["process-a", "process-b"])
+    }
+
+    func testThreadSnapshotWithIncompleteActiveTurnItemsFailsClosed() {
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [
+                        [
+                            "id": "turn-a",
+                            "status": "inProgress",
+                            "itemsView": "full",
+                            "items": []
+                        ],
+                        [
+                            "id": "turn-b",
+                            "status": "inProgress",
+                            "itemsView": "summary",
+                            "items": [[
+                                "id": UUID().uuidString,
+                                "type": "commandExecution",
+                                "status": "inProgress",
+                                "processId": "process-b"
+                            ]]
+                        ]
+                    ]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+
+        XCTAssertFalse(snapshot.hasAuthoritativeActiveTurnItems)
+        XCTAssertEqual(snapshot.activeTurnIDs, ["turn-a", "turn-b"])
+    }
+
     func testActiveThreadSnapshotCountsAsWatchdogLivenessAndReconcilesWaitingFlags() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: ["waiting_for_user_input"]))
         let viewModel = makeViewModel(controller: controller)
@@ -39,6 +149,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             )
         }
 
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
         XCTAssertEqual(controller.shutdownCountSync(), 1)
         XCTAssertEqual(controller.startOrResumeCountSync(), 1)
         XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().contains(true))
@@ -445,30 +556,357 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
     }
 
-    func testActiveRunWithoutRunIDSettlesInsteadOfRearmingWatchdog() async throws {
-        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+    func testSilentCommandWithoutRunIDSurvivesRecoveryWindowAndLaterCompletes() async throws {
+        let invocationID = UUID()
+        let toolItem = makeCommandToolItem(
+            itemID: UUID(),
+            processID: "97027",
+            status: .inProgress
+        )
+        let unrelatedToolItem = makeCommandToolItem(
+            itemID: UUID(),
+            processID: "unrelated-process",
+            status: .inProgress
+        )
+        XCTAssertNotEqual(invocationID, toolItem.invocationID)
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [toolItem, unrelatedToolItem],
+            hasAuthoritativeActiveTurnItems: true
+        )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
-        session.runID = nil
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
-            .assistantDelta("partial answer"),
+            .toolCall(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: #"{"command":"sleep 420"}"#
+            ),
             session: session
         )
-        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .commandExecutionRunning(.init(
+                invocationID: invocationID,
+                processID: "97027",
+                appendedOutput: nil
+            )),
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
+
+        try await waitUntil {
+            controller.readSnapshotCountSync() >= 5
+        }
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().allSatisfy(\.self))
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: #"{"command":"sleep 420"}"#,
+                resultJSON: #"{"status":"completed","processId":"97027","exitCode":0}"#,
+                isError: false
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+    }
+
+    func testTerminalCommandSnapshotWithoutRunIDClearsStaleSpanAndFailsBoundedly() async throws {
+        let invocationID = UUID()
+        let toolItem = makeCommandToolItem(
+            itemID: UUID(),
+            processID: "97027",
+            status: .terminal
+        )
+        XCTAssertNotEqual(invocationID, toolItem.invocationID)
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [toolItem],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: #"{"command":"sleep 420"}"#
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .commandExecutionRunning(.init(
+                invocationID: invocationID,
+                processID: "97027",
+                appendedOutput: nil
+            )),
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
 
         try await waitUntil {
             session.runState == .failed
         }
-        try await waitUntil {
-            controller.shutdownCountSync() == 1
-        }
 
-        XCTAssertEqual(controller.readSnapshotCountSync(), 0)
-        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
-        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["partial answer"])
+        XCTAssertGreaterThan(controller.readSnapshotCountSync(), 0)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
         XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
         XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testUnrelatedInProgressCommandDoesNotCorroborateLocalSpan() async {
+        let localInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [makeCommandToolItem(
+                itemID: UUID(),
+                processID: "snapshot-process",
+                status: .inProgress
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: localInvocationID,
+            processID: "local-process",
+            viewModel: viewModel,
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(session.bashLiveExecutionByKey.values.filter(\.isRunning).count, 1)
+    }
+
+    func testUnrelatedTerminalCommandDoesNotFinalizeOrClearLocalSpan() async {
+        let localInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [makeCommandToolItem(
+                itemID: UUID(),
+                processID: "snapshot-process",
+                status: .terminal
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: localInvocationID,
+            processID: "local-process",
+            viewModel: viewModel,
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        let liveState = session.bashLiveExecutionByKey.values.first
+        XCTAssertEqual(liveState?.invocationID, localInvocationID)
+        XCTAssertEqual(liveState?.isRunning, true)
+    }
+
+    func testTerminalSnapshotAmongMultipleCommandsOnlyClearsExactIdentity() async {
+        let completedInvocationID = UUID()
+        let runningInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [
+                makeCommandToolItem(
+                    itemID: completedInvocationID,
+                    processID: "completed-process",
+                    status: .terminal
+                ),
+                makeCommandToolItem(
+                    itemID: UUID(),
+                    processID: "unrelated-process",
+                    status: .terminal
+                )
+            ],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: completedInvocationID,
+            processID: "completed-process",
+            command: "sleep 1",
+            viewModel: viewModel,
+            session: session
+        )
+        await openRunningCommand(
+            invocationID: runningInvocationID,
+            processID: "running-process",
+            command: "sleep 420",
+            viewModel: viewModel,
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.keys.first?.invocationID, runningInvocationID)
+        let runningStates = session.bashLiveExecutionByKey.values.filter(\.isRunning)
+        XCTAssertEqual(runningStates.count, 1)
+        XCTAssertEqual(runningStates.first?.invocationID, runningInvocationID)
+    }
+
+    func testSnapshotItemFromAnotherActiveTurnCannotAffectCurrentTurnSpan() async {
+        let invocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeTurnIDs: ["turn", "other-turn"],
+            activeToolItems: [makeCommandToolItem(
+                turnID: "other-turn",
+                itemID: invocationID,
+                processID: "97027",
+                status: .terminal
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: invocationID,
+            processID: "97027",
+            viewModel: viewModel,
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(session.bashLiveExecutionByKey.values.first?.isRunning, true)
+    }
+
+    func testDuplicateSnapshotProcessHandlesFailClosed() async {
+        let localInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [
+                makeCommandToolItem(
+                    itemID: UUID(),
+                    processID: "shared-process",
+                    status: .inProgress
+                ),
+                makeCommandToolItem(
+                    itemID: UUID(),
+                    processID: "shared-process",
+                    status: .inProgress
+                )
+            ],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: localInvocationID,
+            processID: "shared-process",
+            viewModel: viewModel,
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+    }
+
+    func testDuplicateLocalProcessHandlesFailClosed() async {
+        let firstInvocationID = UUID()
+        let secondInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [makeCommandToolItem(
+                itemID: UUID(),
+                processID: "shared-process",
+                status: .inProgress
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: firstInvocationID,
+            processID: "shared-process",
+            command: "sleep 1",
+            viewModel: viewModel,
+            session: session
+        )
+        await openRunningCommand(
+            invocationID: secondInvocationID,
+            processID: "shared-process",
+            viewModel: viewModel,
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 2)
+        XCTAssertEqual(session.bashLiveExecutionByKey.values.filter(\.isRunning).count, 2)
     }
 
     func testTurnStartSilenceRemainsRunningWithoutSpeculativeRedispatch() async throws {
@@ -1711,6 +2149,45 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    private func makeCommandToolItem(
+        turnID: String = "turn",
+        itemID: UUID,
+        processID: String?,
+        status: CodexNativeSessionController.ThreadSnapshot.ToolItemObservation.Status
+    ) -> CodexNativeSessionController.ThreadSnapshot.ToolItemObservation {
+        .init(
+            turnID: turnID,
+            itemID: itemID.uuidString,
+            invocationID: itemID,
+            kind: .commandExecution,
+            toolName: nil,
+            processID: processID,
+            status: status
+        )
+    }
+
+    private func openRunningCommand(
+        invocationID: UUID,
+        processID: String,
+        command: String = "sleep 420",
+        viewModel: AgentModeViewModel,
+        session: AgentModeViewModel.TabSession
+    ) async {
+        let argsJSON = #"{"command":"\#(command)"}"#
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "bash", invocationID: invocationID, argsJSON: argsJSON),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .commandExecutionRunning(.init(
+                invocationID: invocationID,
+                processID: processID,
+                appendedOutput: nil
+            )),
+            session: session
+        )
+    }
+
     private func makeViewModel(
         controller: LivenessFakeCodexController,
         drain: AgentModeViewModel.CodexAgentRunWaitDrain? = nil,
@@ -1731,7 +2208,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     private func preparedCodexSession(
         in viewModel: AgentModeViewModel,
         controller: LivenessFakeCodexController,
-        runID: UUID = UUID()
+        runID: UUID? = UUID()
     ) -> AgentModeViewModel.TabSession {
         let session = viewModel.session(for: UUID())
         session.selectedAgent = .codexExec
@@ -1894,6 +2371,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     private let snapshotStatuses: [CodexNativeSessionController.ThreadSnapshot.RuntimeStatus]
     private let snapshotActiveTurnIDs: [String]
     private let snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus?
+    private let activeToolItems: [CodexNativeSessionController.ThreadSnapshot.ToolItemObservation]
+    private let hasAuthoritativeActiveTurnItems: Bool
     private let onSendUserTurn: (() -> Void)?
     private let steerError: Error?
     private let steerDelayNanos: UInt64
@@ -1912,6 +2391,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         activeTurnIDs: [String] = ["turn"],
         snapshotSequence: [CodexNativeSessionController.ThreadSnapshot.RuntimeStatus]? = nil,
         latestTurnStatus: CodexNativeSessionController.TurnStatus? = nil,
+        activeToolItems: [CodexNativeSessionController.ThreadSnapshot.ToolItemObservation] = [],
+        hasAuthoritativeActiveTurnItems: Bool = false,
         onSendUserTurn: (() -> Void)? = nil,
         steerError: Error? = nil,
         steerDelayNanos: UInt64 = 0,
@@ -1932,6 +2413,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         }
         snapshotActiveTurnIDs = activeTurnIDs
         snapshotLatestTurnStatus = latestTurnStatus
+        self.activeToolItems = activeToolItems
+        self.hasAuthoritativeActiveTurnItems = hasAuthoritativeActiveTurnItems
         self.onSendUserTurn = onSendUserTurn
         self.steerError = steerError
         self.steerDelayNanos = steerDelayNanos
@@ -2014,23 +2497,24 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         let snapshotIndex = readSnapshotCount % snapshotStatuses.count
         readSnapshotCount += 1
         readSnapshotIncludeTurnsValues.append(includeTurns)
-        if includeTurns, let postReattachSnapshotReadGate {
+        let isPostReattachSnapshot = includeTurns && startOrResumeCount > 0
+        if isPostReattachSnapshot, let postReattachSnapshotReadGate {
             await postReattachSnapshotReadGate.wait()
         } else if let snapshotReadGate {
             await snapshotReadGate.wait()
         }
         if alwaysFailsSnapshotRead
             || (failsEveryEvenSnapshotRead && readSnapshotCount.isMultiple(of: 2))
-            || (failsPostReattachSnapshotRead && includeTurns)
+            || (failsPostReattachSnapshotRead && isPostReattachSnapshot)
         {
             throw LivenessSnapshotError.probeFailed
         }
-        let runtimeStatus = if includeTurns {
+        let runtimeStatus = if isPostReattachSnapshot {
             postReattachSnapshotStatus ?? snapshotStatuses[snapshotIndex]
         } else {
             snapshotStatuses[snapshotIndex]
         }
-        let activeTurnIDs = if includeTurns {
+        let activeTurnIDs = if isPostReattachSnapshot {
             postReattachActiveTurnIDs ?? snapshotActiveTurnIDs
         } else {
             snapshotActiveTurnIDs
@@ -2043,7 +2527,9 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
             runtimeStatus: runtimeStatus,
             currentTurnID: activeTurnIDs.first,
             activeTurnIDs: activeTurnIDs,
-            latestTurnStatus: includeTurns ? snapshotLatestTurnStatus : nil
+            latestTurnStatus: includeTurns ? snapshotLatestTurnStatus : nil,
+            activeToolItems: includeTurns ? activeToolItems : [],
+            hasAuthoritativeActiveTurnItems: includeTurns && hasAuthoritativeActiveTurnItems
         )
     }
 

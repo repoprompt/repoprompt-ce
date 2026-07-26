@@ -490,6 +490,7 @@ extension AgentModeViewModel {
 
         struct Execution: Equatable {
             let toolName: String
+            let turnID: String?
             let startedAt: Date
             var lastSignalAt: Date
             var processID: String?
