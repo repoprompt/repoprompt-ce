@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 CODEX_ARCH ?= all
@@ -49,6 +49,7 @@ help:
 	@printf '  %-30s %s\n' 'debug-cli-status' 'Show CE debug CLI status'
 	@printf '  %-30s %s\n' 'codex-acquire' 'Acquire and verify pinned Codex package(s); override with CODEX_ARCH=host|arm64|x86_64'
 	@printf '  %-30s %s\n' 'codex-status' 'Verify cached pinned Codex packages without network access'
+	@printf '  %-30s %s\n' 'codex-update-candidate' 'Prepare review-only stable Codex update evidence; set one CODEX_CANDIDATE selector'
 	@printf '\n%s\n' 'Xcode workspace targets:'
 	@printf '  %-30s %s\n' 'xcode' 'Generate and open the disposable Xcode workspace'
 	@printf '  %-30s %s\n' 'xcode-generate' 'Generate the disposable Xcode workspace'
@@ -108,6 +109,17 @@ codex-acquire:
 codex-status:
 	python3 Scripts/codex_runtime_artifact.py status --cache-root "$${REPOPROMPT_CODEX_CACHE_ROOT:-.build/codex-runtime}"
 
+codex-update-candidate:
+	@set --; count=0; \
+	if [ -n "$(CODEX_CANDIDATE_VERSION)" ]; then count=$$((count + 1)); set -- "$$@" --version "$(CODEX_CANDIDATE_VERSION)"; fi; \
+	if [ -n "$(CODEX_CANDIDATE_TAG)" ]; then count=$$((count + 1)); set -- "$$@" --tag "$(CODEX_CANDIDATE_TAG)"; fi; \
+	if [ "$(CODEX_CANDIDATE_LATEST)" = "1" ]; then count=$$((count + 1)); set -- "$$@" --latest-stable; fi; \
+	if [ "$$count" -ne 1 ]; then \
+		echo "Set exactly one of CODEX_CANDIDATE_VERSION=X.Y.Z, CODEX_CANDIDATE_TAG=rust-vX.Y.Z, or CODEX_CANDIDATE_LATEST=1" >&2; \
+		exit 1; \
+	fi; \
+	python3 Scripts/codex_update_candidate.py "$$@"
+
 resolve:
 	swift package resolve
 
@@ -145,6 +157,8 @@ release-selftest:
 	python3 Scripts/test_release_promotion.py
 	python3 Scripts/test_release_tooling.py
 	python3 Scripts/test_codex_runtime_artifact.py
+	python3 Scripts/test_codex_update_candidate.py
+	python3 Scripts/test_codex_update_workflow.py
 
 release-sync-cli-version:
 	./Scripts/release.sh sync-cli-version

@@ -2273,7 +2273,7 @@ actor MCPService: Service {
     private func runPPIDWatchdog(initialPPID: pid_t) async throws {
         // Check every 5 seconds - balance between responsiveness and CPU usage
         while !Task.isCancelled {
-            try await Task.sleep(for: .seconds(5))
+            try await MCPCompatibilitySleep.sleep(.seconds(5))
 
             let currentPPID = getppid()
             if currentPPID != initialPPID {
@@ -2389,7 +2389,7 @@ actor MCPService: Service {
                 log.warning("Bootstrap connection lost (\(err)). Retrying in \(String(format: "%.1f", delay))s (attempt \(attempt), elapsed \(String(format: "%.0f", elapsedSinceFirstFailure))s)")
 
                 do {
-                    try await Task.sleep(for: .seconds(delay))
+                    try await MCPCompatibilitySleep.sleep(.seconds(delay))
                 } catch is CancellationError {
                     // Cancelled by kill signal or PPID watchdog
                     throw CLIRuntimeError.hostDisconnected(.taskCancelled)
@@ -2985,10 +2985,10 @@ func printUsage() {
           tree src/                                    Tree from specific path
           get_file_tree type=files mode=selected       Show only selected files
 
-        get_code_structure (structure, map) - Get function/type signatures
-          structure src/auth/                          Codemaps for directory (default considers up to 10 files)
-          structure --scope selected                   Codemaps for selection (~6k token cap still applies)
-          get_code_structure paths=["src/"] max_results=50   Opt in to consider more files (response still capped)
+        get_code_structure (structure, map) - Traverse root-local code graphs
+          structure                                   Current selection, seed nodes only
+          structure src/auth/ --expand uses --depth 2  Traverse referenced definitions
+          get_code_structure paths=["src/"] signatures=false size=large
 
         workspace_context (context) - Get workspace snapshot
           context                                      Default snapshot

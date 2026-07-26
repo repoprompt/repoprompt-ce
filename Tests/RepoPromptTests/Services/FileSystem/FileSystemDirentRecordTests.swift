@@ -37,7 +37,7 @@ final class FileSystemDirentRecordTests: XCTestCase {
         }
 
         let mapping = mmap(nil, mappingSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
-        guard mapping != MAP_FAILED else {
+        guard let mapping, mapping != MAP_FAILED else {
             XCTFail("mmap failed with errno \(errno)")
             return
         }
@@ -45,12 +45,12 @@ final class FileSystemDirentRecordTests: XCTestCase {
             XCTAssertEqual(munmap(mapping, mappingSize), 0)
         }
 
-        let recordAddress = mapping!.advanced(by: pageSize - record.count)
+        let recordAddress = mapping.advanced(by: pageSize - record.count)
         XCTAssertEqual(Int(bitPattern: recordAddress) % MemoryLayout<dirent>.alignment, 0)
         record.withUnsafeBytes { bytes in
             recordAddress.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
         }
-        guard mprotect(mapping!.advanced(by: pageSize), pageSize, PROT_NONE) == 0 else {
+        guard mprotect(mapping.advanced(by: pageSize), pageSize, PROT_NONE) == 0 else {
             XCTFail("mprotect failed with errno \(errno)")
             return
         }

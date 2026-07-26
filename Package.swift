@@ -19,7 +19,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/swiftlang/swift-markdown", exact: "0.6.0"),
     .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.8.0"),
     .package(url: "https://github.com/apple/swift-system.git", exact: "1.6.4"),
-    .package(url: "https://github.com/provencher/swift-sdk.git", revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"),
+    .package(url: "https://github.com/repoprompt/swift-sdk.git", revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"),
     // RepoPromptApp and RepoPromptCodeMapCore share this customized wrapper/runtime graph.
     .package(
         url: "https://github.com/repoprompt/swift-tree-sitter.git",
@@ -38,7 +38,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/tree-sitter/tree-sitter-cpp", exact: "0.23.4"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-php.git", exact: "0.24.2"),
     .package(url: "https://github.com/jamesrochabrun/SwiftAnthropic", revision: "b7d030cd7453f314c780f5492385f73d704cbd5d"),
-    .package(url: "https://github.com/provencher/SwiftOpenAI", revision: "1211782eb337e7968124448a20d9260df1952012"),
+    .package(url: "https://github.com/repoprompt/SwiftOpenAI", revision: "1211782eb337e7968124448a20d9260df1952012"),
     .package(path: "Vendor/UniversalCharsetDetection"),
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),

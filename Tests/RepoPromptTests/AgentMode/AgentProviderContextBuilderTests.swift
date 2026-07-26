@@ -134,7 +134,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
     }
 
     @MainActor
-    func testAgentModeOverCapHandoffUsesBorrowedPresentationWithoutSecondDemandOrFreeze() async throws {
+    func testAgentModeOverCapHandoffUsesBorrowedPresentationWithZeroSourceDemandOrSecondFreeze() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositories.makeRepository(
             named: "repository",
@@ -192,8 +192,8 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let afterSummary = await window.workspaceFileContextStore.codemapPresentationOperationCountsForTesting()
 
         XCTAssertTrue(block.contains("<selection_summary>"), block)
-        XCTAssertGreaterThan(beforeSummary.artifactDemandRequests, 0)
-        XCTAssertEqual(afterSummary.artifactDemandRequests - beforeSummary.artifactDemandRequests, 0)
+        XCTAssertEqual(beforeSummary.artifactDemandRequests, 0)
+        XCTAssertEqual(afterSummary.artifactDemandRequests, 0)
         XCTAssertEqual(afterSummary.presentationFreezeRequests - beforeSummary.presentationFreezeRequests, 0)
         #if DEBUG
             XCTAssertEqual(

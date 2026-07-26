@@ -107,8 +107,15 @@ protocol CodexSessionControlling: AnyObject {
         failure: CodexNativeSessionController.TurnFailure
     ) async
     func cancelCurrentTurn() async
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
+}
+
+extension CodexSessionControlling {
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+        .unsupported(message: "Codex runtime has no local API for \(action.rawValue) cleanup of conversations.")
+    }
 }
 
 final class CodexNativeSessionController {
@@ -456,6 +463,29 @@ final class CodexNativeSessionController {
             }
         }
 
+        struct ToolItemObservation: Equatable {
+            enum Kind: Equatable {
+                case commandExecution
+                case mcpToolCall
+                case dynamicToolCall
+                case fileChange
+            }
+
+            enum Status: Equatable {
+                case inProgress
+                case terminal
+                case unknown
+            }
+
+            let turnID: String
+            let itemID: String
+            let invocationID: UUID?
+            let kind: Kind
+            let toolName: String?
+            let processID: String?
+            let status: Status
+        }
+
         let conversationID: String
         let rolloutPath: String?
         let model: String?
@@ -464,6 +494,32 @@ final class CodexNativeSessionController {
         let currentTurnID: String?
         let activeTurnIDs: [String]
         let latestTurnStatus: TurnStatus?
+        let activeToolItems: [ToolItemObservation]
+        let hasAuthoritativeActiveTurnItems: Bool
+
+        init(
+            conversationID: String,
+            rolloutPath: String?,
+            model: String?,
+            reasoningEffort: String?,
+            runtimeStatus: RuntimeStatus,
+            currentTurnID: String?,
+            activeTurnIDs: [String],
+            latestTurnStatus: TurnStatus?,
+            activeToolItems: [ToolItemObservation] = [],
+            hasAuthoritativeActiveTurnItems: Bool = false
+        ) {
+            self.conversationID = conversationID
+            self.rolloutPath = rolloutPath
+            self.model = model
+            self.reasoningEffort = reasoningEffort
+            self.runtimeStatus = runtimeStatus
+            self.currentTurnID = currentTurnID
+            self.activeTurnIDs = activeTurnIDs
+            self.latestTurnStatus = latestTurnStatus
+            self.activeToolItems = activeToolItems
+            self.hasAuthoritativeActiveTurnItems = hasAuthoritativeActiveTurnItems
+        }
 
         var sessionRef: SessionRef {
             SessionRef(
@@ -776,6 +832,20 @@ final class CodexNativeSessionController {
             timeout: timeout,
             useDefaultTimeout: useDefaultTimeout
         )
+    }
+
+    func cleanupConversation(
+        _ handle: ProviderConversationCleanupHandle,
+        action: ProviderConversationCleanupAction
+    ) async -> ProviderConversationCleanupOutcome {
+        let cleanup = CodexConversationCleanupService(
+            requestExecutor: { [weak self] method, params, timeout in
+                guard let self else { throw CodexAppServerClient.ClientError.invalidResponse }
+                return try await performRequest(method: method, params: params, timeout: timeout)
+            },
+            timeout: options.requestTimeout
+        )
+        return await cleanup.cleanup(handle, action: action)
     }
 
     init(
@@ -1289,9 +1359,6 @@ final class CodexNativeSessionController {
                 throw error
             }
 
-            let pendingSessionRef = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort).sessionRef
-            try await disableThreadMemoryMode(threadID: pendingSessionRef.conversationID)
-
             let sessionRef = try await eventHandlingMutex.withLock {
                 try ensureBindingCanComplete()
                 let sessionRef = applyThreadResponse(result, fallbackEffort: reasoningEffort)
@@ -1310,84 +1377,6 @@ final class CodexNativeSessionController {
             }
             throw error
         }
-    }
-
-    private func disableThreadMemoryMode(threadID rawThreadID: String) async throws {
-        let threadID = rawThreadID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !threadID.isEmpty else { throw CodexAppServerClient.ClientError.invalidResponse }
-        do {
-            try await disableThreadMemoryModeForeground(threadID: threadID)
-        } catch {
-            // Memory mode is an optional app-server capability. It should never keep
-            // Agent Mode stuck in the startup/"Initializing…" phase after the thread
-            // itself has already started or resumed successfully. Make one final
-            // background attempt so transient app-server stalls can still clear the
-            // persisted thread eligibility without blocking startup readiness.
-            scheduleBackgroundThreadMemoryModeDisable(threadID: threadID)
-        }
-    }
-
-    private func disableThreadMemoryModeForeground(threadID: String) async throws {
-        var lastError: Error?
-        for _ in 1 ... optionalMemoryModeForegroundAttemptCount {
-            do {
-                try await sendThreadMemoryModeDisableRequest(threadID: threadID)
-                return
-            } catch {
-                lastError = error
-            }
-        }
-        throw lastError ?? CodexAppServerClient.ClientError.invalidResponse
-    }
-
-    private func scheduleBackgroundThreadMemoryModeDisable(threadID: String) {
-        Task.detached(priority: .utility) { [client] in
-            do {
-                try await Self.sendThreadMemoryModeDisableRequest(
-                    client: client,
-                    threadID: threadID,
-                    timeout: nil,
-                    useDefaultTimeout: false
-                )
-            } catch {
-                // Best-effort optional setting; startup must not depend on this background retry.
-            }
-        }
-    }
-
-    private func sendThreadMemoryModeDisableRequest(threadID: String) async throws {
-        try await Self.sendThreadMemoryModeDisableRequest(
-            client: client,
-            threadID: threadID,
-            timeout: optionalMemoryModeRequestTimeout,
-            useDefaultTimeout: true
-        )
-    }
-
-    private static func sendThreadMemoryModeDisableRequest(
-        client: CodexAppServerClient,
-        threadID: String,
-        timeout: TimeInterval?,
-        useDefaultTimeout: Bool
-    ) async throws {
-        _ = try await client.request(
-            method: "thread/memoryMode/set",
-            params: [
-                "threadId": threadID,
-                "mode": "disabled"
-            ],
-            timeout: timeout,
-            useDefaultTimeout: useDefaultTimeout
-        )
-    }
-
-    private var optionalMemoryModeForegroundAttemptCount: Int {
-        2
-    }
-
-    private var optionalMemoryModeRequestTimeout: TimeInterval? {
-        guard let requestTimeout = options.requestTimeout else { return 1 }
-        return min(requestTimeout, 1)
     }
 
     func readThreadSnapshot(
@@ -2022,19 +2011,33 @@ final class CodexNativeSessionController {
         let turns = thread["turns"] as? [[String: Any]] ?? []
         var activeTurnIDs: [String] = []
         var latestTurnStatus: TurnStatus?
+        var activeToolItems: [ThreadSnapshot.ToolItemObservation] = []
+        var authoritativeActiveTurnIDs: Set<String> = []
         for turn in turns {
             let statusRaw = firstString(in: turn, keys: ["status"])
-            if isThreadSnapshotTurnActive(statusRaw) {
-                if let turnID = firstString(in: turn, keys: ["id", "turnId", "turn_id", "turnID"]),
-                   !activeTurnIDs.contains(turnID)
-                {
+            let turnID = firstString(in: turn, keys: ["id", "turnId", "turn_id", "turnID"])
+            if isThreadSnapshotTurnActive(statusRaw), let turnID {
+                if !activeTurnIDs.contains(turnID) {
                     activeTurnIDs.append(turnID)
+                }
+                let itemsView = firstString(in: turn, keys: ["itemsView", "items_view"])?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                if turn["items"] is [[String: Any]], itemsView == nil || itemsView == "full" {
+                    authoritativeActiveTurnIDs.insert(turnID)
+                }
+                if let items = turn["items"] as? [[String: Any]] {
+                    activeToolItems.append(contentsOf: items.compactMap {
+                        parseThreadSnapshotToolItem($0, turnID: turnID)
+                    })
                 }
             }
             if let parsedStatus = parseTerminalTurnStatus(from: statusRaw) {
                 latestTurnStatus = parsedStatus
             }
         }
+        let hasAuthoritativeActiveTurnItems = !activeTurnIDs.isEmpty
+            && activeTurnIDs.allSatisfy(authoritativeActiveTurnIDs.contains)
         return ThreadSnapshot(
             conversationID: conversationID,
             rolloutPath: rolloutPath,
@@ -2043,7 +2046,60 @@ final class CodexNativeSessionController {
             runtimeStatus: runtimeStatus,
             currentTurnID: activeTurnIDs.last,
             activeTurnIDs: activeTurnIDs,
-            latestTurnStatus: latestTurnStatus
+            latestTurnStatus: latestTurnStatus,
+            activeToolItems: activeToolItems,
+            hasAuthoritativeActiveTurnItems: hasAuthoritativeActiveTurnItems
+        )
+    }
+
+    private static func parseThreadSnapshotToolItem(
+        _ item: [String: Any],
+        turnID: String
+    ) -> ThreadSnapshot.ToolItemObservation? {
+        let normalizedType = firstString(in: item, keys: ["type"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        let kind: ThreadSnapshot.ToolItemObservation.Kind
+        switch normalizedType {
+        case "commandexecution":
+            kind = .commandExecution
+        case "mcptoolcall":
+            kind = .mcpToolCall
+        case "dynamictoolcall":
+            kind = .dynamicToolCall
+        case "filechange":
+            kind = .fileChange
+        default:
+            return nil
+        }
+        guard let itemID = firstString(in: item, keys: ["id", "itemId", "item_id"]),
+              !itemID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return nil
+        }
+        let normalizedStatus = firstString(in: item, keys: ["status"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        let status: ThreadSnapshot.ToolItemObservation.Status = switch normalizedStatus {
+        case "inprogress", "running", "pending":
+            .inProgress
+        case "completed", "failed", "declined", "interrupted", "cancelled", "canceled":
+            .terminal
+        default:
+            .unknown
+        }
+        return .init(
+            turnID: turnID,
+            itemID: itemID,
+            invocationID: stableInvocationID(from: itemID),
+            kind: kind,
+            toolName: firstString(in: item, keys: ["tool", "name"]),
+            processID: firstString(in: item, keys: ["processId", "process_id"]),
+            status: status
         )
     }
 
@@ -7422,6 +7478,10 @@ final class CodexNativeSessionController {
     }
 
     private func invocationID(from rawItemID: String?) -> UUID? {
+        Self.stableInvocationID(from: rawItemID)
+    }
+
+    private static func stableInvocationID(from rawItemID: String?) -> UUID? {
         guard let raw = rawItemID?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return nil
         }

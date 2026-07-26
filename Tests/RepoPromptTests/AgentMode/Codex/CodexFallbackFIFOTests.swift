@@ -841,6 +841,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             fallbackContext: context
         )
         XCTAssertEqual(session.codexFallbackQueue.count, 1)
+        session.deferredActiveAgentRunTimerRollback = .init(
+            originalStartedAt: Date(timeIntervalSinceNow: -60)
+        )
 
         viewModel.clearChat(tabID: session.tabID)
 
@@ -852,6 +855,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
         XCTAssertNil(session.codexFallbackDispatchInFlight)
         XCTAssertTrue(session.items.isEmpty)
+        XCTAssertNil(session.deferredActiveAgentRunTimerRollback)
         XCTAssertNil(viewModel.draftRestorationEvent)
     }
 

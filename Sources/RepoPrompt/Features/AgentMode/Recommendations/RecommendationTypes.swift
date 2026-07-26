@@ -397,8 +397,10 @@ enum BestPracticeProfiles {
 
     // MARK: Model Strength Summary
 
+    static let claudeCodeOpusRecommendationLabel = "Claude Opus via Claude Code's stable Opus alias (Opus 5 on the Anthropic API)"
+
     static let claudeStrengths = """
-    Claude Opus 4.6 remains great for editing-heavy work and careful file modifications. \
+    \(claudeCodeOpusRecommendationLabel) remains great for editing-heavy work and careful file modifications. \
     GPT-5.6 Sol Low via Codex CLI is now our default recommendation for explore, discovery, and lightweight agentic work.
     """
 

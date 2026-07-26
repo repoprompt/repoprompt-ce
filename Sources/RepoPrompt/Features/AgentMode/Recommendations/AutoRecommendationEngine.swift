@@ -169,7 +169,7 @@ final class AutoRecommendationEngine {
                 kind: .claudeCode,
                 displayName: "Claude Code",
                 modelString: AIModel.claudeCodeOpus.rawValue, // Opus for chat
-                description: "Claude Opus 4.6 – great for editing and context management",
+                description: "\(BestPracticeProfiles.claudeCodeOpusRecommendationLabel) – great for editing and context management",
                 tradeoffs: [
                     "• Excellent at file editing and code modifications",
                     "• Superior context window management",

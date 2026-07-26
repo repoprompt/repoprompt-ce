@@ -16,7 +16,7 @@ the downloaded asset checksum and provenance are recorded under
 
 ## OpenAI Codex
 
-RepoPrompt CE bundles the complete official OpenAI Codex 0.144.6 standalone
+RepoPrompt CE bundles the complete official OpenAI Codex 0.145.0 standalone
 package for the selected macOS architecture. Codex is licensed under the
 Apache License, Version 2.0. Its copied license and notice are included under
 [`ThirdPartyLicenses/codex/`](ThirdPartyLicenses/codex/), and the exact release

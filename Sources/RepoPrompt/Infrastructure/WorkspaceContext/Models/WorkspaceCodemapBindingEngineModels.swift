@@ -32,30 +32,24 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
     let maximumConcurrentMaterializationCount: Int
     let maximumConsecutiveDemandAdmissions: Int
     let maximumAutomaticSelectionMatchedCandidateByteCount: UInt64
-    let maximumProjectionDemandCountPerRoot: Int
-    let maximumProjectionDemandCount: Int
-    let maximumProjectionDemandFileIDCount: Int
-    let maximumProjectionDemandMetadataByteCountPerRoot: UInt64
-    let maximumProjectionDemandMetadataByteCount: UInt64
-    let projectionDemandRetryMilliseconds: UInt64
-    let maximumActiveProjectionBatchCountPerRoot: Int
-    let maximumActiveProjectionBatchCount: Int
-    let maximumProjectionCatalogPageEntryCount: Int
-    let maximumProjectionCatalogPagePathByteCount: UInt64
-    let maximumProjectionBatchCandidateCount: Int
-    let projectionProgressPublicationMinimumIntervalMilliseconds: UInt64
-    let maximumRetainedProjectionByteCountPerSegment: UInt64
-    let maximumRetainedProjectionByteCountPerRoot: UInt64
-    let maximumRetainedProjectionByteCount: UInt64
-    let maximumStagedProjectionGraphByteCountPerRoot: UInt64
-    let maximumStagedProjectionGraphByteCount: UInt64
-    let maximumQueuedProjectionManifestMutationByteCountPerRoot: UInt64
-    let maximumQueuedProjectionManifestMutationByteCount: UInt64
+    let maximumActiveGraphIndexBatchCountPerRoot: Int
+    let maximumActiveGraphIndexBatchCount: Int
+    let maximumGraphIndexCatalogPageEntryCount: Int
+    let maximumGraphIndexCatalogPagePathByteCount: UInt64
+    let maximumGraphIndexBatchCandidateCount: Int
+    let graphIndexProgressPublicationMinimumIntervalMilliseconds: UInt64
+    let maximumGraphIndexChangeByteCount: UInt64
+    let maximumRetainedGraphIndexByteCountPerRoot: UInt64
+    let maximumRetainedGraphIndexByteCount: UInt64
+    let maximumStagedGraphIndexGraphByteCountPerRoot: UInt64
+    let maximumStagedGraphIndexGraphByteCount: UInt64
+    let maximumQueuedGraphIndexManifestMutationByteCountPerRoot: UInt64
+    let maximumQueuedGraphIndexManifestMutationByteCount: UInt64
     let maximumManifestWriterDeferredItemCount: Int
     let manifestWriterDeferredRetryMilliseconds: UInt64
-    let projectionRetryInitialMilliseconds: UInt64
-    let projectionRetryMaximumMilliseconds: UInt64
-    let projectionRetryJitterPercent: UInt64
+    let graphIndexRetryInitialMilliseconds: UInt64
+    let graphIndexRetryMaximumMilliseconds: UInt64
+    let graphIndexRetryJitterPercent: UInt64
 
     init(
         maximumRootCount: Int = 64,
@@ -86,30 +80,24 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         maximumConcurrentMaterializationCount: Int = 64,
         maximumConsecutiveDemandAdmissions: Int = 8,
         maximumAutomaticSelectionMatchedCandidateByteCount: UInt64 = 8 * 1024 * 1024,
-        maximumProjectionDemandCountPerRoot: Int = 64,
-        maximumProjectionDemandCount: Int = 256,
-        maximumProjectionDemandFileIDCount: Int = 1024,
-        maximumProjectionDemandMetadataByteCountPerRoot: UInt64 = 512 * 1024,
-        maximumProjectionDemandMetadataByteCount: UInt64 = 4 * 1024 * 1024,
-        projectionDemandRetryMilliseconds: UInt64 = 100,
-        maximumActiveProjectionBatchCountPerRoot: Int = 1,
-        maximumActiveProjectionBatchCount: Int = 2,
-        maximumProjectionCatalogPageEntryCount: Int = 64,
-        maximumProjectionCatalogPagePathByteCount: UInt64 = 256 * 1024,
-        maximumProjectionBatchCandidateCount: Int = 64,
-        projectionProgressPublicationMinimumIntervalMilliseconds: UInt64 = 100,
-        maximumRetainedProjectionByteCountPerSegment: UInt64 = 8 * 1024 * 1024,
-        maximumRetainedProjectionByteCountPerRoot: UInt64 = 32 * 1024 * 1024,
-        maximumRetainedProjectionByteCount: UInt64 = 128 * 1024 * 1024,
-        maximumStagedProjectionGraphByteCountPerRoot: UInt64 = 192 * 1024 * 1024,
-        maximumStagedProjectionGraphByteCount: UInt64 = 512 * 1024 * 1024,
-        maximumQueuedProjectionManifestMutationByteCountPerRoot: UInt64 = 8 * 1024 * 1024,
-        maximumQueuedProjectionManifestMutationByteCount: UInt64 = 32 * 1024 * 1024,
+        maximumActiveGraphIndexBatchCountPerRoot: Int = 1,
+        maximumActiveGraphIndexBatchCount: Int = 2,
+        maximumGraphIndexCatalogPageEntryCount: Int = 64,
+        maximumGraphIndexCatalogPagePathByteCount: UInt64 = 256 * 1024,
+        maximumGraphIndexBatchCandidateCount: Int = 64,
+        graphIndexProgressPublicationMinimumIntervalMilliseconds: UInt64 = 100,
+        maximumGraphIndexChangeByteCount: UInt64 = 8 * 1024 * 1024,
+        maximumRetainedGraphIndexByteCountPerRoot: UInt64 = 32 * 1024 * 1024,
+        maximumRetainedGraphIndexByteCount: UInt64 = 128 * 1024 * 1024,
+        maximumStagedGraphIndexGraphByteCountPerRoot: UInt64 = 192 * 1024 * 1024,
+        maximumStagedGraphIndexGraphByteCount: UInt64 = 512 * 1024 * 1024,
+        maximumQueuedGraphIndexManifestMutationByteCountPerRoot: UInt64 = 8 * 1024 * 1024,
+        maximumQueuedGraphIndexManifestMutationByteCount: UInt64 = 32 * 1024 * 1024,
         maximumManifestWriterDeferredItemCount: Int = 256,
         manifestWriterDeferredRetryMilliseconds: UInt64 = 100,
-        projectionRetryInitialMilliseconds: UInt64 = 250,
-        projectionRetryMaximumMilliseconds: UInt64 = 30000,
-        projectionRetryJitterPercent: UInt64 = 20
+        graphIndexRetryInitialMilliseconds: UInt64 = 250,
+        graphIndexRetryMaximumMilliseconds: UInt64 = 30000,
+        graphIndexRetryJitterPercent: UInt64 = 20
     ) {
         precondition(maximumRootCount > 0)
         precondition(maximumActiveRequestCountPerRoot > 0)
@@ -139,39 +127,32 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         precondition(maximumConcurrentMaterializationCount > 0)
         precondition(maximumConsecutiveDemandAdmissions > 0)
         precondition(maximumAutomaticSelectionMatchedCandidateByteCount > 0)
-        precondition(maximumProjectionDemandCountPerRoot > 0)
-        precondition(maximumProjectionDemandCount >= maximumProjectionDemandCountPerRoot)
-        precondition(maximumProjectionDemandFileIDCount > 0)
-        precondition(maximumProjectionDemandMetadataByteCountPerRoot > 0)
+        precondition(maximumActiveGraphIndexBatchCountPerRoot > 0)
+        precondition(maximumActiveGraphIndexBatchCount > 0)
+        precondition(maximumActiveGraphIndexBatchCount >= maximumActiveGraphIndexBatchCountPerRoot)
+        precondition(maximumGraphIndexCatalogPageEntryCount > 0)
+        precondition(maximumGraphIndexCatalogPagePathByteCount > 0)
+        precondition(maximumGraphIndexBatchCandidateCount > 0)
+        precondition(maximumGraphIndexBatchCandidateCount <= maximumGraphIndexCatalogPageEntryCount)
+        precondition((25 ... 1000).contains(graphIndexProgressPublicationMinimumIntervalMilliseconds))
+        precondition(maximumGraphIndexChangeByteCount > 0)
+        precondition(maximumRetainedGraphIndexByteCountPerRoot > 0)
+        precondition(maximumRetainedGraphIndexByteCount > 0)
+        precondition(maximumRetainedGraphIndexByteCount >= maximumRetainedGraphIndexByteCountPerRoot)
+        precondition(maximumStagedGraphIndexGraphByteCountPerRoot > 0)
+        precondition(maximumStagedGraphIndexGraphByteCount > 0)
+        precondition(maximumStagedGraphIndexGraphByteCount >= maximumStagedGraphIndexGraphByteCountPerRoot)
+        precondition(maximumQueuedGraphIndexManifestMutationByteCountPerRoot > 0)
+        precondition(maximumQueuedGraphIndexManifestMutationByteCount > 0)
         precondition(
-            maximumProjectionDemandMetadataByteCount >= maximumProjectionDemandMetadataByteCountPerRoot
-        )
-        precondition(maximumActiveProjectionBatchCountPerRoot > 0)
-        precondition(maximumActiveProjectionBatchCount > 0)
-        precondition(maximumActiveProjectionBatchCount >= maximumActiveProjectionBatchCountPerRoot)
-        precondition(maximumProjectionCatalogPageEntryCount > 0)
-        precondition(maximumProjectionCatalogPagePathByteCount > 0)
-        precondition(maximumProjectionBatchCandidateCount > 0)
-        precondition(maximumProjectionBatchCandidateCount <= maximumProjectionCatalogPageEntryCount)
-        precondition((25 ... 1000).contains(projectionProgressPublicationMinimumIntervalMilliseconds))
-        precondition(maximumRetainedProjectionByteCountPerSegment > 0)
-        precondition(maximumRetainedProjectionByteCountPerRoot > 0)
-        precondition(maximumRetainedProjectionByteCount > 0)
-        precondition(maximumRetainedProjectionByteCount >= maximumRetainedProjectionByteCountPerRoot)
-        precondition(maximumStagedProjectionGraphByteCountPerRoot > 0)
-        precondition(maximumStagedProjectionGraphByteCount > 0)
-        precondition(maximumStagedProjectionGraphByteCount >= maximumStagedProjectionGraphByteCountPerRoot)
-        precondition(maximumQueuedProjectionManifestMutationByteCountPerRoot > 0)
-        precondition(maximumQueuedProjectionManifestMutationByteCount > 0)
-        precondition(
-            maximumQueuedProjectionManifestMutationByteCount >=
-                maximumQueuedProjectionManifestMutationByteCountPerRoot
+            maximumQueuedGraphIndexManifestMutationByteCount >=
+                maximumQueuedGraphIndexManifestMutationByteCountPerRoot
         )
         precondition(maximumManifestWriterDeferredItemCount > 0)
         precondition(manifestWriterDeferredRetryMilliseconds > 0)
-        precondition(projectionRetryInitialMilliseconds > 0)
-        precondition(projectionRetryMaximumMilliseconds >= projectionRetryInitialMilliseconds)
-        precondition(projectionRetryJitterPercent <= 100)
+        precondition(graphIndexRetryInitialMilliseconds > 0)
+        precondition(graphIndexRetryMaximumMilliseconds >= graphIndexRetryInitialMilliseconds)
+        precondition(graphIndexRetryJitterPercent <= 100)
         self.maximumRootCount = maximumRootCount
         self.maximumActiveRequestCountPerRoot = maximumActiveRequestCountPerRoot
         self.maximumActiveRequestCount = maximumActiveRequestCount
@@ -201,33 +182,27 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         self.maximumConsecutiveDemandAdmissions = maximumConsecutiveDemandAdmissions
         self.maximumAutomaticSelectionMatchedCandidateByteCount =
             maximumAutomaticSelectionMatchedCandidateByteCount
-        self.maximumProjectionDemandCountPerRoot = maximumProjectionDemandCountPerRoot
-        self.maximumProjectionDemandCount = maximumProjectionDemandCount
-        self.maximumProjectionDemandFileIDCount = maximumProjectionDemandFileIDCount
-        self.maximumProjectionDemandMetadataByteCountPerRoot = maximumProjectionDemandMetadataByteCountPerRoot
-        self.maximumProjectionDemandMetadataByteCount = maximumProjectionDemandMetadataByteCount
-        self.projectionDemandRetryMilliseconds = min(1000, max(25, projectionDemandRetryMilliseconds))
-        self.maximumActiveProjectionBatchCountPerRoot = maximumActiveProjectionBatchCountPerRoot
-        self.maximumActiveProjectionBatchCount = maximumActiveProjectionBatchCount
-        self.maximumProjectionCatalogPageEntryCount = maximumProjectionCatalogPageEntryCount
-        self.maximumProjectionCatalogPagePathByteCount = maximumProjectionCatalogPagePathByteCount
-        self.maximumProjectionBatchCandidateCount = maximumProjectionBatchCandidateCount
-        self.projectionProgressPublicationMinimumIntervalMilliseconds =
-            projectionProgressPublicationMinimumIntervalMilliseconds
-        self.maximumRetainedProjectionByteCountPerSegment = maximumRetainedProjectionByteCountPerSegment
-        self.maximumRetainedProjectionByteCountPerRoot = maximumRetainedProjectionByteCountPerRoot
-        self.maximumRetainedProjectionByteCount = maximumRetainedProjectionByteCount
-        self.maximumStagedProjectionGraphByteCountPerRoot = maximumStagedProjectionGraphByteCountPerRoot
-        self.maximumStagedProjectionGraphByteCount = maximumStagedProjectionGraphByteCount
-        self.maximumQueuedProjectionManifestMutationByteCountPerRoot =
-            maximumQueuedProjectionManifestMutationByteCountPerRoot
-        self.maximumQueuedProjectionManifestMutationByteCount =
-            maximumQueuedProjectionManifestMutationByteCount
+        self.maximumActiveGraphIndexBatchCountPerRoot = maximumActiveGraphIndexBatchCountPerRoot
+        self.maximumActiveGraphIndexBatchCount = maximumActiveGraphIndexBatchCount
+        self.maximumGraphIndexCatalogPageEntryCount = maximumGraphIndexCatalogPageEntryCount
+        self.maximumGraphIndexCatalogPagePathByteCount = maximumGraphIndexCatalogPagePathByteCount
+        self.maximumGraphIndexBatchCandidateCount = maximumGraphIndexBatchCandidateCount
+        self.graphIndexProgressPublicationMinimumIntervalMilliseconds =
+            graphIndexProgressPublicationMinimumIntervalMilliseconds
+        self.maximumGraphIndexChangeByteCount = maximumGraphIndexChangeByteCount
+        self.maximumRetainedGraphIndexByteCountPerRoot = maximumRetainedGraphIndexByteCountPerRoot
+        self.maximumRetainedGraphIndexByteCount = maximumRetainedGraphIndexByteCount
+        self.maximumStagedGraphIndexGraphByteCountPerRoot = maximumStagedGraphIndexGraphByteCountPerRoot
+        self.maximumStagedGraphIndexGraphByteCount = maximumStagedGraphIndexGraphByteCount
+        self.maximumQueuedGraphIndexManifestMutationByteCountPerRoot =
+            maximumQueuedGraphIndexManifestMutationByteCountPerRoot
+        self.maximumQueuedGraphIndexManifestMutationByteCount =
+            maximumQueuedGraphIndexManifestMutationByteCount
         self.maximumManifestWriterDeferredItemCount = maximumManifestWriterDeferredItemCount
         self.manifestWriterDeferredRetryMilliseconds = manifestWriterDeferredRetryMilliseconds
-        self.projectionRetryInitialMilliseconds = projectionRetryInitialMilliseconds
-        self.projectionRetryMaximumMilliseconds = projectionRetryMaximumMilliseconds
-        self.projectionRetryJitterPercent = projectionRetryJitterPercent
+        self.graphIndexRetryInitialMilliseconds = graphIndexRetryInitialMilliseconds
+        self.graphIndexRetryMaximumMilliseconds = graphIndexRetryMaximumMilliseconds
+        self.graphIndexRetryJitterPercent = graphIndexRetryJitterPercent
     }
 }
 
@@ -273,16 +248,13 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
         WorkspaceCodemapRootEpoch,
         String
     ) async -> WorkspaceCodemapManifestBindingCandidate?
-    let readProjectionCatalogPage: @Sendable (
-        WorkspaceCodemapProjectionCatalogPageRequest
-    ) async -> WorkspaceCodemapProjectionCatalogPageDisposition
-    let revalidateProjectionCatalogToken: @Sendable (
+    let readGraphIndexCatalogPage: @Sendable (
+        WorkspaceCodemapGraphIndexCatalogPageRequest
+    ) async -> WorkspaceCodemapGraphIndexCatalogPageDisposition
+    let revalidateGraphIndexCatalogToken: @Sendable (
         WorkspaceCodemapRootEpoch,
-        WorkspaceCodemapProjectionCatalogToken
-    ) async -> WorkspaceCodemapProjectionCatalogTokenDisposition
-    let publishProjection: @Sendable (
-        WorkspaceCodemapProjectionSnapshot
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition
+        WorkspaceCodemapGraphIndexCatalogToken
+    ) async -> WorkspaceCodemapGraphIndexCatalogTokenDisposition
     let publishMarkerReadiness: @Sendable (
         WorkspaceCodemapMarkerReadinessUpdate
     ) async -> Bool
@@ -295,9 +267,8 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
     ) {
         self.init(
             resolveManifestBinding,
-            readProjectionCatalogPage: { _ in .unavailable(.catalogUnavailable) },
-            revalidateProjectionCatalogToken: { _, _ in .unavailable(.catalogUnavailable) },
-            publishProjection: { _ in .superseded },
+            readGraphIndexCatalogPage: { _ in .unavailable(.catalogUnavailable) },
+            revalidateGraphIndexCatalogToken: { _, _ in .unavailable(.catalogUnavailable) },
             publishMarkerReadiness: { _ in false }
         )
     }
@@ -307,84 +278,24 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
             WorkspaceCodemapRootEpoch,
             String
         ) async -> WorkspaceCodemapManifestBindingCandidate?,
-        readProjectionCatalogPage: @escaping @Sendable (
-            WorkspaceCodemapProjectionCatalogPageRequest
-        ) async -> WorkspaceCodemapProjectionCatalogPageDisposition,
-        revalidateProjectionCatalogToken: @escaping @Sendable (
+        readGraphIndexCatalogPage: @escaping @Sendable (
+            WorkspaceCodemapGraphIndexCatalogPageRequest
+        ) async -> WorkspaceCodemapGraphIndexCatalogPageDisposition,
+        revalidateGraphIndexCatalogToken: @escaping @Sendable (
             WorkspaceCodemapRootEpoch,
-            WorkspaceCodemapProjectionCatalogToken
-        ) async -> WorkspaceCodemapProjectionCatalogTokenDisposition,
-        publishProjection: @escaping @Sendable (
-            WorkspaceCodemapProjectionSnapshot
-        ) async -> WorkspaceCodemapProjectionSnapshotDisposition = { _ in .superseded },
+            WorkspaceCodemapGraphIndexCatalogToken
+        ) async -> WorkspaceCodemapGraphIndexCatalogTokenDisposition,
         publishMarkerReadiness: @escaping @Sendable (
             WorkspaceCodemapMarkerReadinessUpdate
         ) async -> Bool = { _ in false }
     ) {
         self.resolveManifestBinding = resolveManifestBinding
-        self.readProjectionCatalogPage = readProjectionCatalogPage
-        self.revalidateProjectionCatalogToken = revalidateProjectionCatalogToken
-        self.publishProjection = publishProjection
+        self.readGraphIndexCatalogPage = readGraphIndexCatalogPage
+        self.revalidateGraphIndexCatalogToken = revalidateGraphIndexCatalogToken
         self.publishMarkerReadiness = publishMarkerReadiness
     }
 
     static let unavailable = WorkspaceCodemapBindingCatalogClient { _, _ in nil }
-}
-
-struct WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate: Hashable {
-    let identity: WorkspaceCodemapArtifactBindingIdentity
-    let language: LanguageType
-    let requestGeneration: UInt64
-    let catalogGeneration: UInt64
-    let pathGeneration: UInt64
-    let ingressGeneration: UInt64
-
-    var rootEpoch: WorkspaceCodemapRootEpoch {
-        WorkspaceCodemapRootEpoch(
-            rootID: identity.rootID,
-            rootLifetimeID: identity.rootLifetimeID
-        )
-    }
-}
-
-struct WorkspaceCodemapBindingAutomaticSelectionPlanRequest: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let sourceTickets: [WorkspaceCodemapArtifactDemandTicket]
-    let candidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate]
-    let maximumMatchedCandidateCount: Int
-}
-
-struct WorkspaceCodemapBindingAutomaticSelectionPlan: Hashable {
-    let necessaryCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate]
-    let indexedCandidateCount: Int
-    let coverageProof: WorkspaceCodemapProjectionCoverageProof
-}
-
-enum WorkspaceCodemapBindingAutomaticSelectionPlanDisposition: Hashable {
-    case ready(WorkspaceCodemapBindingAutomaticSelectionPlan)
-    case provisional(
-        necessaryCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate],
-        indexedCandidateCount: Int,
-        progress: WorkspaceCodemapProjectionProgress,
-        remainingCount: UInt64?,
-        retry: WorkspaceCodemapProjectionRetry?
-    )
-    case incomplete(
-        progress: WorkspaceCodemapProjectionProgress,
-        remainingCount: UInt64?,
-        retry: WorkspaceCodemapProjectionRetry?
-    )
-    case busy(
-        progress: WorkspaceCodemapProjectionProgress,
-        retryAfterMilliseconds: UInt64?
-    )
-    case stale
-    case unavailable(WorkspaceCodemapSelectionGraphUnavailableReason)
-    case budget(
-        dimension: WorkspaceCodemapProjectionBudgetDimension,
-        attempted: UInt64,
-        limit: UInt64
-    )
 }
 
 struct WorkspaceCodemapValidatedSourceReaderClient: @unchecked Sendable {
@@ -452,7 +363,7 @@ enum WorkspaceCodemapBindingDemandResult {
 }
 
 enum WorkspaceCodemapPublishedArtifactLookupSource: String, Equatable {
-    case projectionCAS
+    case graphIndexCAS
     case locatorCAS
 }
 
@@ -460,7 +371,7 @@ enum WorkspaceCodemapPublishedArtifactLookupMissReason: String, Error, Equatable
     case rootUnavailable
     case currentnessMismatch
     case unsupportedFileType
-    case projectionMissing
+    case graphIndexMissing
     case artifactMissing
 }
 
@@ -530,34 +441,34 @@ enum WorkspaceCodemapBindingEngineHookKind: String {
         case publishedArtifactPostLookupCurrentnessRejection
     #endif
     case rootUnload
-    case projectionPreloadScheduled
-    case projectionPreloadStarted
-    case projectionFirstSegment
-    case projectionSegmentPublished
-    case projectionCoverageComplete
-    case projectionCoverageCancelled
-    case projectionCoverageSuperseded
-    case projectionEnvelopeHit
-    case projectionEnvelopeStale
-    case projectionEnvelopeInvalid
-    case projectionTerminalRecordHit
-    case projectionLocatorMiss
-    case projectionLocatorCorrupt
-    case projectionCASMiss
-    case projectionBuildJoined
-    case projectionBuildStarted
-    case projectionBuildCompleted
-    case projectionCatalogPage
-    case projectionCatalogCandidates
-    case projectionCatalogPathBytes
-    case projectionBatchQueued
-    case projectionBatchStarted
-    case projectionBatchCompleted
-    case projectionBatchCancelled
-    case projectionRetry
-    case projectionDemandOvertake
-    case projectionExplicitOvertake
-    case projectionBudget
+    case graphIndexRunScheduled
+    case graphIndexRunStarted
+    case graphIndexFirstChange
+    case graphIndexChangePublished
+    case graphIndexCoverageComplete
+    case graphIndexCoverageCancelled
+    case graphIndexCoverageSuperseded
+    case graphIndexEnvelopeHit
+    case graphIndexEnvelopeStale
+    case graphIndexEnvelopeInvalid
+    case graphIndexTerminalRecordHit
+    case graphIndexLocatorMiss
+    case graphIndexLocatorCorrupt
+    case graphIndexCASMiss
+    case graphIndexArtifactBuildJoined
+    case graphIndexArtifactBuildStarted
+    case graphIndexArtifactBuildCompleted
+    case graphIndexCatalogPage
+    case graphIndexCatalogCandidates
+    case graphIndexCatalogPathBytes
+    case graphIndexBatchQueued
+    case graphIndexBatchStarted
+    case graphIndexBatchCompleted
+    case graphIndexBatchCancelled
+    case graphIndexRetry
+    case graphIndexRootOvertake
+    case graphIndexExplicitOvertake
+    case graphIndexBudget
 }
 
 /// Hook payloads deliberately contain no physical or logical path.
@@ -566,7 +477,7 @@ struct WorkspaceCodemapBindingEngineHookEvent {
     let rootEpoch: WorkspaceCodemapRootEpoch?
     let artifactStorageDigest: String?
     let numericValue: UInt64
-    let projectionPhase: WorkspaceCodemapProjectionPreloadPhase?
+    let graphIndexPhase: WorkspaceCodemapGraphIndexPhase?
     let retryAfterMilliseconds: UInt64?
     let publishedArtifactLookupSource: WorkspaceCodemapPublishedArtifactLookupSource?
     let publishedArtifactLookupMissReason: WorkspaceCodemapPublishedArtifactLookupMissReason?
@@ -577,7 +488,7 @@ struct WorkspaceCodemapBindingEngineHookEvent {
         rootEpoch: WorkspaceCodemapRootEpoch?,
         artifactStorageDigest: String?,
         numericValue: UInt64,
-        projectionPhase: WorkspaceCodemapProjectionPreloadPhase? = nil,
+        graphIndexPhase: WorkspaceCodemapGraphIndexPhase? = nil,
         retryAfterMilliseconds: UInt64? = nil,
         publishedArtifactLookupSource: WorkspaceCodemapPublishedArtifactLookupSource? = nil,
         publishedArtifactLookupMissReason: WorkspaceCodemapPublishedArtifactLookupMissReason? = nil,
@@ -587,7 +498,7 @@ struct WorkspaceCodemapBindingEngineHookEvent {
         self.rootEpoch = rootEpoch
         self.artifactStorageDigest = artifactStorageDigest
         self.numericValue = numericValue
-        self.projectionPhase = projectionPhase
+        self.graphIndexPhase = graphIndexPhase
         self.retryAfterMilliseconds = retryAfterMilliseconds
         self.publishedArtifactLookupSource = publishedArtifactLookupSource
         self.publishedArtifactLookupMissReason = publishedArtifactLookupMissReason
@@ -683,47 +594,41 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var cancellations: UInt64 = 0
     var busyRejections: UInt64 = 0
     var failures: UInt64 = 0
-    var publishedArtifactProjectionCASHits: UInt64 = 0
+    var publishedArtifactGraphIndexCASHits: UInt64 = 0
     var publishedArtifactLocatorCASHits: UInt64 = 0
     var publishedArtifactLookupMisses: UInt64 = 0
     #if DEBUG
         var publishedArtifactPostLookupCurrentnessRejections: UInt64 = 0
     #endif
-    var projectionPreloadsScheduled: UInt64 = 0
-    var projectionPreloadsStarted: UInt64 = 0
-    var projectionFirstSegments: UInt64 = 0
-    var projectionSegmentsPublished: UInt64 = 0
-    var projectionSegmentBytes: UInt64 = 0
-    var projectionCoveragesCompleted: UInt64 = 0
-    var projectionCoveragesCancelled: UInt64 = 0
-    var projectionCoveragesSuperseded: UInt64 = 0
-    var projectionEnvelopeHits: UInt64 = 0
-    var projectionEnvelopeStale: UInt64 = 0
-    var projectionEnvelopeInvalid: UInt64 = 0
-    var projectionTerminalRecordHits: UInt64 = 0
-    var projectionLocatorMisses: UInt64 = 0
-    var projectionLocatorCorruptions: UInt64 = 0
-    var projectionCASMisses: UInt64 = 0
-    var projectionBuildsJoined: UInt64 = 0
-    var projectionBuildsStarted: UInt64 = 0
-    var projectionBuildsCompleted: UInt64 = 0
-    var projectionCatalogPages: UInt64 = 0
-    var projectionCatalogCandidates: UInt64 = 0
-    var projectionCatalogPathBytes: UInt64 = 0
-    var projectionBatchesQueued: UInt64 = 0
-    var projectionBatchesStarted: UInt64 = 0
-    var projectionBatchesCompleted: UInt64 = 0
-    var projectionRetries: UInt64 = 0
-    var projectionDemandOvertakes: UInt64 = 0
-    var projectionExplicitOvertakes: UInt64 = 0
-    var projectionBudgetRejections: UInt64 = 0
-    var projectionCancelledBatches: UInt64 = 0
-    var projectionDemandsAcquired: UInt64 = 0
-    var projectionDemandsJoined: UInt64 = 0
-    var projectionDemandsReleased: UInt64 = 0
-    var projectionDemandsExpired: UInt64 = 0
-    var projectionDemandsRevoked: UInt64 = 0
-    var projectionDemandBusyRejections: UInt64 = 0
+    var graphIndexRunsScheduled: UInt64 = 0
+    var graphIndexRunsStarted: UInt64 = 0
+    var graphIndexFirstChanges: UInt64 = 0
+    var graphIndexChangesPublished: UInt64 = 0
+    var graphIndexChangeBytes: UInt64 = 0
+    var graphIndexCoveragesCompleted: UInt64 = 0
+    var graphIndexCoveragesCancelled: UInt64 = 0
+    var graphIndexCoveragesSuperseded: UInt64 = 0
+    var graphIndexEnvelopeHits: UInt64 = 0
+    var graphIndexEnvelopeStale: UInt64 = 0
+    var graphIndexEnvelopeInvalid: UInt64 = 0
+    var graphIndexTerminalRecordHits: UInt64 = 0
+    var graphIndexLocatorMisses: UInt64 = 0
+    var graphIndexLocatorCorruptions: UInt64 = 0
+    var graphIndexCASMisses: UInt64 = 0
+    var graphIndexArtifactBuildsJoined: UInt64 = 0
+    var graphIndexArtifactBuildsStarted: UInt64 = 0
+    var graphIndexArtifactBuildsCompleted: UInt64 = 0
+    var graphIndexCatalogPages: UInt64 = 0
+    var graphIndexCatalogCandidates: UInt64 = 0
+    var graphIndexCatalogPathBytes: UInt64 = 0
+    var graphIndexBatchesQueued: UInt64 = 0
+    var graphIndexBatchesStarted: UInt64 = 0
+    var graphIndexBatchesCompleted: UInt64 = 0
+    var graphIndexRetries: UInt64 = 0
+    var graphIndexRootOvertakes: UInt64 = 0
+    var graphIndexExplicitOvertakes: UInt64 = 0
+    var graphIndexBudgetRejections: UInt64 = 0
+    var graphIndexCancelledBatches: UInt64 = 0
 
     init(initialValue: UInt64 = 0) {
         capabilityResolutions = initialValue
@@ -756,85 +661,54 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         cancellations = initialValue
         busyRejections = initialValue
         failures = initialValue
-        publishedArtifactProjectionCASHits = initialValue
+        publishedArtifactGraphIndexCASHits = initialValue
         publishedArtifactLocatorCASHits = initialValue
         publishedArtifactLookupMisses = initialValue
         #if DEBUG
             publishedArtifactPostLookupCurrentnessRejections = initialValue
         #endif
-        projectionPreloadsScheduled = initialValue
-        projectionPreloadsStarted = initialValue
-        projectionFirstSegments = initialValue
-        projectionSegmentsPublished = initialValue
-        projectionSegmentBytes = initialValue
-        projectionCoveragesCompleted = initialValue
-        projectionCoveragesCancelled = initialValue
-        projectionCoveragesSuperseded = initialValue
-        projectionEnvelopeHits = initialValue
-        projectionEnvelopeStale = initialValue
-        projectionEnvelopeInvalid = initialValue
-        projectionTerminalRecordHits = initialValue
-        projectionLocatorMisses = initialValue
-        projectionLocatorCorruptions = initialValue
-        projectionCASMisses = initialValue
-        projectionBuildsJoined = initialValue
-        projectionBuildsStarted = initialValue
-        projectionBuildsCompleted = initialValue
-        projectionCatalogPages = initialValue
-        projectionCatalogCandidates = initialValue
-        projectionCatalogPathBytes = initialValue
-        projectionBatchesQueued = initialValue
-        projectionBatchesStarted = initialValue
-        projectionBatchesCompleted = initialValue
-        projectionRetries = initialValue
-        projectionDemandOvertakes = initialValue
-        projectionExplicitOvertakes = initialValue
-        projectionBudgetRejections = initialValue
-        projectionCancelledBatches = initialValue
-        projectionDemandsAcquired = initialValue
-        projectionDemandsJoined = initialValue
-        projectionDemandsReleased = initialValue
-        projectionDemandsExpired = initialValue
-        projectionDemandsRevoked = initialValue
-        projectionDemandBusyRejections = initialValue
+        graphIndexRunsScheduled = initialValue
+        graphIndexRunsStarted = initialValue
+        graphIndexFirstChanges = initialValue
+        graphIndexChangesPublished = initialValue
+        graphIndexChangeBytes = initialValue
+        graphIndexCoveragesCompleted = initialValue
+        graphIndexCoveragesCancelled = initialValue
+        graphIndexCoveragesSuperseded = initialValue
+        graphIndexEnvelopeHits = initialValue
+        graphIndexEnvelopeStale = initialValue
+        graphIndexEnvelopeInvalid = initialValue
+        graphIndexTerminalRecordHits = initialValue
+        graphIndexLocatorMisses = initialValue
+        graphIndexLocatorCorruptions = initialValue
+        graphIndexCASMisses = initialValue
+        graphIndexArtifactBuildsJoined = initialValue
+        graphIndexArtifactBuildsStarted = initialValue
+        graphIndexArtifactBuildsCompleted = initialValue
+        graphIndexCatalogPages = initialValue
+        graphIndexCatalogCandidates = initialValue
+        graphIndexCatalogPathBytes = initialValue
+        graphIndexBatchesQueued = initialValue
+        graphIndexBatchesStarted = initialValue
+        graphIndexBatchesCompleted = initialValue
+        graphIndexRetries = initialValue
+        graphIndexRootOvertakes = initialValue
+        graphIndexExplicitOvertakes = initialValue
+        graphIndexBudgetRejections = initialValue
+        graphIndexCancelledBatches = initialValue
     }
 }
 
-enum WorkspaceCodemapCurrentProjectionUnavailableReason: String, Hashable {
-    case rootNotRegistered
-    case jobNotScheduled
-}
-
-enum WorkspaceCodemapCurrentProjectionSnapshot: Hashable {
-    case unavailable(reason: WorkspaceCodemapCurrentProjectionUnavailableReason)
-    case pending(
-        phase: WorkspaceCodemapProjectionPreloadPhase,
-        progress: WorkspaceCodemapProjectionProgress,
-        inBatchProgress: WorkspaceCodemapProjectionInBatchProgress?,
-        retry: WorkspaceCodemapProjectionRetry?,
-        budget: WorkspaceCodemapProjectionBudget?
-    )
-    /// A proof-bearing completion. Coverage proofs and completion uptime are assigned only
-    /// after an accepted or exact-duplicate projection seal.
-    case authoritativeComplete(
-        proof: WorkspaceCodemapProjectionCoverageProof,
-        completedUptimeNanoseconds: UInt64
-    )
-    case nonCurrent
-}
-
-struct WorkspaceCodemapBindingEngineProjectionRootAccounting: Equatable {
+struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let phase: WorkspaceCodemapProjectionPreloadPhase
-    let progress: WorkspaceCodemapProjectionProgress
+    let phase: WorkspaceCodemapGraphIndexPhase
+    let progress: WorkspaceCodemapGraphIndexProgress
     let queuedBatchCount: Int
     let activeBatchCount: Int
     let drainingBatchCount: Int
-    let resources: WorkspaceCodemapProjectionResourceAccounting
-    let retry: WorkspaceCodemapProjectionRetry?
-    let budget: WorkspaceCodemapProjectionBudget?
-    let retainedDemandCount: Int
-    let retainedDemandMetadataByteCount: UInt64
+    let resources: WorkspaceCodemapGraphIndexResourceAccounting
+    let retry: WorkspaceCodemapGraphIndexRetry?
+    let budget: WorkspaceCodemapGraphIndexBudget?
 }
 
 struct WorkspaceCodemapBindingEngineAccounting: Equatable {
@@ -851,16 +725,13 @@ struct WorkspaceCodemapBindingEngineAccounting: Equatable {
     let ownerAdmissionHistoryCount: Int
     let dirtyManifestCount: Int
     let counters: WorkspaceCodemapBindingEngineCounters
-    let projectionJobCount: Int
-    let suspendedProjectionJobCount: Int
-    let queuedProjectionBatchCount: Int
-    let activeProjectionBatchCount: Int
-    let drainingProjectionTaskCount: Int
-    let retainedProjectionDemandCount: Int
-    let retainedProjectionDemandMetadataByteCount: UInt64
-    let terminalProjectionDemandStatusCount: Int
-    let projectionResources: WorkspaceCodemapProjectionResourceAccounting
-    let projectionRoots: [WorkspaceCodemapBindingEngineProjectionRootAccounting]
+    let graphIndexJobCount: Int
+    let suspendedGraphIndexJobCount: Int
+    let queuedGraphIndexBatchCount: Int
+    let activeGraphIndexBatchCount: Int
+    let drainingGraphIndexTaskCount: Int
+    let graphIndexResources: WorkspaceCodemapGraphIndexResourceAccounting
+    let graphIndexRoots: [WorkspaceCodemapBindingEngineGraphIndexRootAccounting]
 
     init(
         rootCount: Int,
@@ -876,16 +747,13 @@ struct WorkspaceCodemapBindingEngineAccounting: Equatable {
         ownerAdmissionHistoryCount: Int,
         dirtyManifestCount: Int,
         counters: WorkspaceCodemapBindingEngineCounters,
-        projectionJobCount: Int = 0,
-        suspendedProjectionJobCount: Int = 0,
-        queuedProjectionBatchCount: Int = 0,
-        activeProjectionBatchCount: Int = 0,
-        drainingProjectionTaskCount: Int = 0,
-        retainedProjectionDemandCount: Int = 0,
-        retainedProjectionDemandMetadataByteCount: UInt64 = 0,
-        terminalProjectionDemandStatusCount: Int = 0,
-        projectionResources: WorkspaceCodemapProjectionResourceAccounting = .zero,
-        projectionRoots: [WorkspaceCodemapBindingEngineProjectionRootAccounting] = []
+        graphIndexJobCount: Int = 0,
+        suspendedGraphIndexJobCount: Int = 0,
+        queuedGraphIndexBatchCount: Int = 0,
+        activeGraphIndexBatchCount: Int = 0,
+        drainingGraphIndexTaskCount: Int = 0,
+        graphIndexResources: WorkspaceCodemapGraphIndexResourceAccounting = .zero,
+        graphIndexRoots: [WorkspaceCodemapBindingEngineGraphIndexRootAccounting] = []
     ) {
         self.rootCount = rootCount
         self.eligibleRootCount = eligibleRootCount
@@ -900,15 +768,12 @@ struct WorkspaceCodemapBindingEngineAccounting: Equatable {
         self.ownerAdmissionHistoryCount = ownerAdmissionHistoryCount
         self.dirtyManifestCount = dirtyManifestCount
         self.counters = counters
-        self.projectionJobCount = projectionJobCount
-        self.suspendedProjectionJobCount = suspendedProjectionJobCount
-        self.queuedProjectionBatchCount = queuedProjectionBatchCount
-        self.activeProjectionBatchCount = activeProjectionBatchCount
-        self.drainingProjectionTaskCount = drainingProjectionTaskCount
-        self.retainedProjectionDemandCount = retainedProjectionDemandCount
-        self.retainedProjectionDemandMetadataByteCount = retainedProjectionDemandMetadataByteCount
-        self.terminalProjectionDemandStatusCount = terminalProjectionDemandStatusCount
-        self.projectionResources = projectionResources
-        self.projectionRoots = projectionRoots
+        self.graphIndexJobCount = graphIndexJobCount
+        self.suspendedGraphIndexJobCount = suspendedGraphIndexJobCount
+        self.queuedGraphIndexBatchCount = queuedGraphIndexBatchCount
+        self.activeGraphIndexBatchCount = activeGraphIndexBatchCount
+        self.drainingGraphIndexTaskCount = drainingGraphIndexTaskCount
+        self.graphIndexResources = graphIndexResources
+        self.graphIndexRoots = graphIndexRoots
     }
 }
