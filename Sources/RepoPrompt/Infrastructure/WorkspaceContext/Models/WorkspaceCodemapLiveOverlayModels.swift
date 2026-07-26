@@ -328,13 +328,6 @@ private final class WorkspaceCodemapLiveOverlayBundleState: @unchecked Sendable 
         }
     }
 
-    func bindings() throws -> [WorkspaceCodemapArtifactBinding] {
-        try lock.withLock {
-            guard let entries else { throw WorkspaceCodemapLiveOverlayBundleAccessError.closed }
-            return entries.map(\.binding)
-        }
-    }
-
     func contains(fileID: UUID) throws -> Bool {
         try lock.withLock {
             guard let entries else { throw WorkspaceCodemapLiveOverlayBundleAccessError.closed }
@@ -477,16 +470,6 @@ final class WorkspaceCodemapLiveOverlayBundle: @unchecked Sendable {
         try state.snapshots()
     }
 
-    func graphSnapshot() throws -> WorkspaceCodemapLiveGraphSnapshot {
-        try WorkspaceCodemapLiveGraphSnapshot(
-            rootEpoch: rootEpoch,
-            catalogGeneration: catalogGeneration,
-            repositoryAuthority: repositoryAuthority,
-            contributionGeneration: contributionGeneration,
-            bindings: state.bindings()
-        )
-    }
-
     func handle(for fileID: UUID) throws -> WorkspaceCodemapLiveFrozenArtifactHandle? {
         guard try state.contains(fileID: fileID) else { return nil }
         return WorkspaceCodemapLiveFrozenArtifactHandle(fileID: fileID, state: state)
@@ -509,12 +492,9 @@ final class WorkspaceCodemapLiveOverlayBundle: @unchecked Sendable {
     }
 }
 
-struct WorkspaceCodemapLiveGraphSnapshot: Equatable, Sendable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let catalogGeneration: UInt64
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
-    let contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
-    let bindings: [WorkspaceCodemapArtifactBinding]
+enum WorkspaceCodemapGraphChangeNotification: Hashable, Sendable {
+    case changed
+    case revoked(WorkspaceCodemapGraphRevocationReason)
 }
 
 struct WorkspaceCodemapLiveOverlayRootAccounting: Equatable, Sendable {

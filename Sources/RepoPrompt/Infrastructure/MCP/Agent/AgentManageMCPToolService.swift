@@ -9,11 +9,12 @@ struct AgentManageMCPToolService {
 
     struct CleanupDependencies {
         let loadPersistedMetadata: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> AgentSessionMeta?
+        let loadPersistedSession: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> AgentSession?
         let deleteOpenSession: @MainActor (
             _ viewModel: AgentModeViewModel,
             _ tabID: UUID,
             _ workspace: WorkspaceModel
-        ) async throws -> Void
+        ) async throws -> ProviderConversationCleanupOutcome?
         let deletePersistedSession: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> Void
         let finalizePersistedReferences: @MainActor (
             _ viewModel: AgentModeViewModel,
@@ -27,6 +28,9 @@ struct AgentManageMCPToolService {
                 try await AgentSessionDataService.shared
                     .metadataRecordForSessionID(sessionID, for: workspace)?
                     .agentSessionMeta()
+            },
+            loadPersistedSession: { sessionID, workspace in
+                try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
             },
             deleteOpenSession: { viewModel, tabID, workspace in
                 try await viewModel.deleteSession(tabID: tabID, workspace: workspace)
@@ -834,6 +838,9 @@ struct AgentManageMCPToolService {
             }
 
             var usedOpenTabAuthority = false
+            var mutationStarted = false
+            var durableDeletionCommitted = false
+            var providerCleanupOutcome: ProviderConversationCleanupOutcome?
             do {
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
                     guard targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
@@ -853,7 +860,13 @@ struct AgentManageMCPToolService {
                     #if DEBUG
                         let deleteOpenStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
+                    mutationStarted = true
+                    providerCleanupOutcome = try await cleanupDependencies.deleteOpenSession(
+                        agentModeVM,
+                        openTabID,
+                        workspace
+                    )
+                    durableDeletionCommitted = true
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deleteOpen",
@@ -869,10 +882,14 @@ struct AgentManageMCPToolService {
                         debugOpenDeletedCount += 1
                     #endif
                 } else {
+                    let persistedSession = try await cleanupDependencies.loadPersistedSession(sessionID, workspace)
+                    try cleanupDependencies.checkCancellation()
                     #if DEBUG
                         let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
+                    mutationStarted = true
                     try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                    durableDeletionCommitted = true
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deletePersisted",
@@ -900,28 +917,94 @@ struct AgentManageMCPToolService {
                             ]
                         )
                     #endif
+                    if let persistedSession {
+                        providerCleanupOutcome = await agentModeVM.cleanupProviderConversationForPersistedAgentSession(persistedSession)
+                    }
                 }
-                deletedSessions.append([
+                var cancelledAfterCommittedDeletion = providerCleanupOutcome?.isCancelled == true
+                if !cancelledAfterCommittedDeletion {
+                    do {
+                        try cleanupDependencies.checkCancellation()
+                    } catch is CancellationError {
+                        cancelledAfterCommittedDeletion = true
+                    }
+                }
+                var deletedSession: [String: Value] = [
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
                     "durable": .bool(true)
-                ])
+                ]
+                if let providerCleanupOutcome {
+                    var cleanupObject: [String: Value] = [
+                        "status": .string(providerCleanupOutcome.status)
+                    ]
+                    if let message = providerCleanupOutcome.message {
+                        cleanupObject["message"] = .string(message)
+                    }
+                    deletedSession["provider_cleanup"] = .object(cleanupObject)
+                }
+                deletedSessions.append(deletedSession)
+                if cancelledAfterCommittedDeletion {
+                    wasCancelled = true
+                    let remainingIDs = requestedIDs.dropFirst(index + 1)
+                    unprocessedSessions = remainingIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_after_committed_deletion")
+                        ]
+                    }
+                    retrySessionIDs.append(contentsOf: remainingIDs)
+                    break
+                }
             } catch is CancellationError {
                 wasCancelled = true
-                skippedSessions.append([
-                    "session_id": .string(sessionID.uuidString),
-                    "name": .string(candidate.name),
-                    "reason": .string("mutation_cancelled"),
-                    "durable": .bool(false),
-                    "mutation_started": .bool(true)
-                ])
-                retrySessionIDs.append(sessionID)
                 let remainingIDs = requestedIDs.dropFirst(index + 1)
-                unprocessedSessions = remainingIDs.map { remainingID in
-                    [
-                        "session_id": .string(remainingID.uuidString),
-                        "reason": .string("cancelled_after_mutation_started")
+                if durableDeletionCommitted {
+                    var deletedSession: [String: Value] = [
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "durable": .bool(true)
                     ]
+                    if let providerCleanupOutcome {
+                        var cleanupObject: [String: Value] = [
+                            "status": .string(providerCleanupOutcome.status)
+                        ]
+                        if let message = providerCleanupOutcome.message {
+                            cleanupObject["message"] = .string(message)
+                        }
+                        deletedSession["provider_cleanup"] = .object(cleanupObject)
+                    }
+                    deletedSessions.append(deletedSession)
+                    unprocessedSessions = remainingIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_after_committed_deletion")
+                        ]
+                    }
+                } else if mutationStarted {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("mutation_cancelled"),
+                        "durable": .bool(false),
+                        "mutation_started": .bool(true)
+                    ])
+                    retrySessionIDs.append(sessionID)
+                    unprocessedSessions = remainingIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_after_mutation_started")
+                        ]
+                    }
+                } else {
+                    let unprocessedIDs = [sessionID] + remainingIDs
+                    unprocessedSessions = unprocessedIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_before_mutation")
+                        ]
+                    }
+                    retrySessionIDs.append(sessionID)
                 }
                 retrySessionIDs.append(contentsOf: remainingIDs)
                 break
@@ -930,16 +1013,23 @@ struct AgentManageMCPToolService {
                     skippedSessions.append([
                         "session_id": .string(sessionID.uuidString),
                         "name": .string(candidate.name),
-                        "reason": .string("delete_partially_completed"),
+                        "reason": .string("delete_failed"),
                         "message": .string(error.localizedDescription),
                         "durable": .bool(false),
-                        "local_cleanup_completed": .bool(true)
+                        "local_cleanup_completed": .bool(false)
+                    ])
+                } else if mutationStarted {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("delete_failed"),
+                        "message": .string(error.localizedDescription)
                     ])
                 } else {
                     skippedSessions.append([
                         "session_id": .string(sessionID.uuidString),
                         "name": .string(candidate.name),
-                        "reason": .string("delete_failed"),
+                        "reason": .string("resolution_failed"),
                         "message": .string(error.localizedDescription)
                     ])
                 }

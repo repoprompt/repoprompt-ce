@@ -139,6 +139,8 @@ import MCP
                 #endif
             case "mcp_tool_duration_inventory":
                 return debugMCPToolDurationInventoryPayload(op: op)
+            case "mcp_tool_concurrency_evidence_snapshot":
+                return debugMCPToolConcurrencyEvidencePayload(op: op, arguments: arguments)
             case "mcp_read_search_admission_snapshot":
                 #if DEBUG
                     return await debugMCPReadSearchAdmissionSnapshotPayload(op: op, arguments: arguments)

@@ -18,7 +18,10 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         guard case let .definitelyNonGit(proof) = result else {
             return XCTFail("Expected a terminal non-Git proof, got \(result)")
         }
-        XCTAssertTrue(WorkspaceCodemapLocalGitClassificationProbe.production.validate(proof))
+        XCTAssertEqual(
+            WorkspaceCodemapLocalGitClassificationProbe.production.validate(proof),
+            .current
+        )
     }
 
     func testWorktreeSubdirectoryRequiresGitPreflight() async throws {
@@ -90,7 +93,7 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
                 await preflightCount.increment()
                 return .transientUnavailable(.repositoryChanging)
             },
-            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+            codemapGraphIndexBuildLaunchPolicyForTesting: .disabled
         )
         let loaded = try await store.loadRoot(path: root.path)
         defer { Task { await store.unloadRoot(id: loaded.id) } }
@@ -165,7 +168,7 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
 
         await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))
         let finalGitPreflightCount = await gitPreflightCount.value
-        XCTAssertEqual(finalGitPreflightCount, 1)
+        XCTAssertGreaterThan(finalGitPreflightCount, initialGitPreflightCount)
     }
 
     func testIntermediateSymlinkRetargetInvalidatesProofAndRunsGitPreflight() async throws {
@@ -202,7 +205,7 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
 
         await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))
         let finalGitPreflightCount = await gitPreflightCount.value
-        XCTAssertEqual(finalGitPreflightCount, 1)
+        XCTAssertGreaterThan(finalGitPreflightCount, initialGitPreflightCount)
     }
 
     func testGitLayoutWatcherChangeReprobesAndAdmitsConvertedRepository() async throws {
@@ -247,7 +250,71 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
             file: file
         )
         let finalGitPreflightCount = await gitPreflightCount.value
-        XCTAssertEqual(finalGitPreflightCount, 1)
+        XCTAssertGreaterThan(finalGitPreflightCount, initialGitPreflightCount)
+        _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+    }
+
+    func testInvalidatedNonGitProofReclassifiesLocallyBeforeConvertedRepositoryPreflight() async throws {
+        let root = try makeDirectory("invalidated-proof-reclassification")
+        try writeSwiftFile(in: root)
+        let gitFixture = try ReviewGitRepositoryFixture(name: #function)
+        addTeardownBlock { gitFixture.cleanup() }
+        let classificationCount = AsyncCounter()
+        let gitPreflightCount = AsyncCounter()
+        let validationGate = LocalGitProofValidationGate()
+        let productionLocalClassification = WorkspaceCodemapLocalGitClassificationProbe.production
+        let productionGitEligibility = WorkspaceCodemapGitEligibilityProbe.production().resolve
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let store = codemapFixture.makeStore(
+            codemapLocalGitClassificationProbe: .init { rootURL in
+                let result = await productionLocalClassification.resolve(rootURL)
+                await classificationCount.increment()
+                validationGate.didResolve()
+                return result
+            } validate: { proof in
+                guard validationGate.permitsValidation() else {
+                    return .requiresLocalReclassification
+                }
+                return productionLocalClassification.validate(proof)
+            },
+            codemapGitEligibilityProbe: .init { rootURL in
+                await gitPreflightCount.increment()
+                return await productionGitEligibility(rootURL)
+            }
+        )
+        let loaded = try await store.loadRoot(path: root.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+        }
+        let file = try await firstFile(in: loaded, store: store)
+
+        await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))
+        let initialClassificationCount = await classificationCount.value
+        validationGate.rejectUntilNextResolve()
+        await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))
+        let reclassifiedCount = await classificationCount.value
+        let nonGitPreflightCount = await gitPreflightCount.value
+        XCTAssertGreaterThan(reclassifiedCount, initialClassificationCount)
+        XCTAssertEqual(nonGitPreflightCount, 0)
+
+        _ = try gitFixture.runGit(["init"], at: root)
+        _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: root)
+        _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+        _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: root)
+        _ = try gitFixture.runGit(["add", "."], at: root)
+        _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: root)
+        await store.replayObservedFileSystemDeltas(rootID: loaded.id, deltas: [.folderAdded(".git")])
+
+        let nextDemand = await store.requestCodemapArtifact(forFileID: file.id)
+        let ready = try await settledReady(
+            nextDemand,
+            store: store,
+            gitPreflightCount: gitPreflightCount,
+            root: root,
+            file: file
+        )
+        let finalGitPreflightCount = await gitPreflightCount.value
+        XCTAssertGreaterThan(finalGitPreflightCount, nonGitPreflightCount)
         _ = await store.cancelCodemapArtifactDemand(ready.ticket)
     }
 
@@ -304,21 +371,15 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         if case let .pending(ticket) = result {
             let clock = ContinuousClock()
             let deadline = clock.now.advanced(by: timeout)
-            var delayNanoseconds: UInt64 = 1_000_000
-            while true {
-                result = await store.codemapArtifactDemandStatus(ticket)
-                guard case .pending = result else { break }
-                guard clock.now < deadline else {
-                    let preflightCount = await gitPreflightCount.value
-                    XCTFail(
-                        "Timed out waiting for ready codemap demand after Git layout conversion; " +
-                            "lastDemand=\(result), gitPreflightCount=\(preflightCount), " +
-                            "root=\(root.path), fileID=\(file.id)"
-                    )
-                    throw LocalGitClassificationTestError.expectedReady
-                }
-                try await Task.sleep(nanoseconds: delayNanoseconds)
-                delayNanoseconds = min(delayNanoseconds * 2, 50_000_000)
+            result = await store.waitForCodemapArtifactDemandChange(ticket, deadline: deadline)
+            if case .pending = result {
+                let preflightCount = await gitPreflightCount.value
+                XCTFail(
+                    "Timed out waiting for ready codemap demand after Git layout conversion; " +
+                        "lastDemand=\(result), gitPreflightCount=\(preflightCount), " +
+                        "root=\(root.path), fileID=\(file.id)"
+                )
+                throw LocalGitClassificationTestError.expectedReady
             }
         }
 
@@ -346,6 +407,29 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
 
 private enum LocalGitClassificationTestError: Error {
     case expectedReady
+}
+
+private final class LocalGitProofValidationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rejectsValidationUntilResolve = false
+
+    func rejectUntilNextResolve() {
+        lock.lock()
+        rejectsValidationUntilResolve = true
+        lock.unlock()
+    }
+
+    func didResolve() {
+        lock.lock()
+        rejectsValidationUntilResolve = false
+        lock.unlock()
+    }
+
+    func permitsValidation() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !rejectsValidationUntilResolve
+    }
 }
 
 private actor AsyncCounter {

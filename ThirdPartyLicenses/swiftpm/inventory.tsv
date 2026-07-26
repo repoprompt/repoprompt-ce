@@ -25,13 +25,13 @@ swift-nio-http2	1.43.0	https://github.com/apple/swift-nio-http2.git	swift-nio-ht
 swift-nio-ssl	2.37.0	https://github.com/apple/swift-nio-ssl.git	swift-nio-ssl/
 swift-nio-transport-services	1.28.0	https://github.com/apple/swift-nio-transport-services.git	swift-nio-transport-services/
 swift-numerics	1.1.1	https://github.com/apple/swift-numerics.git	swift-numerics/
-swift-sdk	85dec2fc7a27252bc33dc7728be6af6b3bd398c0	https://github.com/provencher/swift-sdk.git	swift-sdk/
+swift-sdk	85dec2fc7a27252bc33dc7728be6af6b3bd398c0	https://github.com/repoprompt/swift-sdk.git	swift-sdk/
 swift-service-context	1.3.0	https://github.com/apple/swift-service-context.git	swift-service-context/
 swift-service-lifecycle	2.8.0	https://github.com/swift-server/swift-service-lifecycle.git	swift-service-lifecycle/
 swift-system	1.6.4	https://github.com/apple/swift-system.git	swift-system/
 swift-tree-sitter	a778ef4fb7f0d3ad00185f42ce83c688373c4361	https://github.com/repoprompt/swift-tree-sitter.git	../tree-sitter/README.md
 swiftanthropic	b7d030cd7453f314c780f5492385f73d704cbd5d	https://github.com/jamesrochabrun/SwiftAnthropic	swiftanthropic/
-swiftopenai	1211782eb337e7968124448a20d9260df1952012	https://github.com/provencher/SwiftOpenAI	swiftopenai/
+swiftopenai	1211782eb337e7968124448a20d9260df1952012	https://github.com/repoprompt/SwiftOpenAI	swiftopenai/
 tree-sitter	0.25.10	https://github.com/tree-sitter/tree-sitter	../tree-sitter/README.md
 tree-sitter-c	0.24.2	https://github.com/tree-sitter/tree-sitter-c	../tree-sitter/README.md
 tree-sitter-c-sharp	0.23.5	https://github.com/tree-sitter/tree-sitter-c-sharp.git	../tree-sitter/README.md
