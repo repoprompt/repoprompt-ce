@@ -68,7 +68,7 @@ private struct MeasuredPlainTextView: View {
 
 // MARK: - Collapsible User Message
 
-struct CollapsibleUserMessagePreview: Equatable {
+struct CollapsibleUserMessagePreview {
     let text: String
     let needsCollapse: Bool
 
