@@ -235,6 +235,17 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertEqual(observerState.activeRequest, newerRequest)
     }
 
+    func testSparklePositiveResultTargetsOnlyMatchingActiveRequestForSettlement() throws {
+        var observerState = SparkleUserInitiatedObserverState()
+        let requestID = try XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333"))
+
+        XCTAssertNil(observerState.requestToSettle(afterPositiveResultFor: .tip))
+        let tipRequest = observerState.begin(channel: .tip, requestID: requestID)
+        XCTAssertEqual(observerState.requestToSettle(afterPositiveResultFor: .tip), tipRequest)
+        XCTAssertNil(observerState.requestToSettle(afterPositiveResultFor: .stable))
+        XCTAssertEqual(observerState.activeRequest, tipRequest)
+    }
+
     func testSparklePositiveResultsCannotDowngradeKnownBuilds() {
         XCTAssertTrue(SparkleUpdaterManager.sparkleResultIsNotOlderThanKnownUpdate(
             candidateBuildNumber: "29.8.52",

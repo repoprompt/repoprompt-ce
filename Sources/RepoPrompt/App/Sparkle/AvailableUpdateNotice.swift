@@ -42,6 +42,11 @@ struct SparkleUserInitiatedObserverState: Equatable {
     func receiveUncorrelatedNoUpdate() -> UncorrelatedNoUpdateDisposition {
         .preserveNoticeAndRequest
     }
+
+    func requestToSettle(afterPositiveResultFor channel: UpdateChannel) -> Request? {
+        guard let activeRequest, activeRequest.channel == channel else { return nil }
+        return activeRequest
+    }
 }
 
 /// Immutable identity and presentation for a detected app update.

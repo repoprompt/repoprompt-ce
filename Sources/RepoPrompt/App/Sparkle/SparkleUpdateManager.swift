@@ -482,6 +482,11 @@ final class SparkleUpdaterManager: ObservableObject {
                         date: appcastItem.date,
                         description: appcastItem.releaseNotesURL?.absoluteString ?? appcastItem.itemDescription
                     )
+                    if let request = self.userInitiatedObserverState.requestToSettle(
+                        afterPositiveResultFor: resultChannel
+                    ) {
+                        self.scheduleUserInitiatedSparkleCheckReset(for: request, after: 0)
+                    }
                 }
             }
             .store(in: &cancellables)

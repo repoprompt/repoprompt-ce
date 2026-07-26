@@ -2226,7 +2226,7 @@ sys.stdout.write(str(status))
         self.assertNotIn("updaterController.startUpdater()", manager_init)
         self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
         self.assertIn(
-            "guard updaterStarted, sparkleConfigurationValid, activeUserInitiatedChannel == nil else {",
+            "guard updaterStarted, sparkleConfigurationValid, userInitiatedObserverState.activeRequest == nil else {",
             sparkle_manager,
         )
 
