@@ -5269,12 +5269,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   session.runState.isActive,
                   session.selectedAgent == .codexExec
             else {
+                let message = "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain."
                 viewModel?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
                 )
-                return .stale(reason: "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain.")
+                return .preDispatchRejected(message: message)
             }
         }
         let hadResumeEligibleCodexHistoryBeforeSend = Self.hasResumeEligibleCodexHistory(session.items)

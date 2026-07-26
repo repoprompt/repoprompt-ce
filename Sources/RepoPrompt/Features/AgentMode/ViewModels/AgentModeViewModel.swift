@@ -12285,13 +12285,19 @@ final class AgentModeViewModel: ObservableObject {
                 defer {
                     session.codexDispatchSerialGate.finish(dispatchTicket)
                 }
-                let sendOutcome = await self.startAgentRun(
-                    tabID: tabID,
-                    initialMessage: wrappedText,
-                    attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend,
-                    codexFallbackContext: fallbackContext
-                )
+                let sendOutcome: CodexAgentModeCoordinator.NativeSendOutcome? = if self.sessions[tabID] === session {
+                    await self.startAgentRun(
+                        tabID: tabID,
+                        initialMessage: wrappedText,
+                        attachments: attachmentsToSend,
+                        taggedFileAttachments: taggedFilesToSend,
+                        codexFallbackContext: fallbackContext
+                    )
+                } else {
+                    .preDispatchRejected(
+                        message: "Codex did not send because the tab session changed before provider dispatch."
+                    )
+                }
                 if sendOutcome?.didSend != true {
                     self.clearPendingCodexComputerUseActivationIfMatched(
                         session: session,
@@ -12319,16 +12325,18 @@ final class AgentModeViewModel: ObservableObject {
                         reason: "manual send was rejected before provider dispatch"
                     )
                     self.rollbackAgentTurnUserAnchor(turnRuntimeAnchorRollback, session: session)
-                    self.restoreRejectedManualSubmissionComposerState(
-                        tabID: tabID,
-                        session: session,
-                        draftText: fallbackContext.draftText,
-                        images: attachmentsToSend,
-                        taggedFiles: taggedFilesToSend,
-                        selectedWorkflow: restorationSelectedWorkflow,
-                        selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                        message: message
-                    )
+                    if let authoritativeSession = self.sessions[tabID] {
+                        self.restoreRejectedManualSubmissionComposerState(
+                            tabID: tabID,
+                            session: authoritativeSession,
+                            draftText: fallbackContext.draftText,
+                            images: attachmentsToSend,
+                            taggedFiles: taggedFilesToSend,
+                            selectedWorkflow: restorationSelectedWorkflow,
+                            selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                            message: message
+                        )
+                    }
                 } else {
                     // Any retained or durably accepted optimistic submission is
                     // the new timer baseline for later rollback.
