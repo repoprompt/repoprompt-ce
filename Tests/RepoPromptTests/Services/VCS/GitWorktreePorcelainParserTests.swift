@@ -136,12 +136,21 @@ final class GitWorktreePorcelainParserTests: XCTestCase {
         let records = try GitWorktreePorcelainParser.parse(output, format: .nulTerminated)
         let commonDirectory = URL(fileURLWithPath: "/tmp/repo/.git")
 
-        func layout(root: URL, commonDirectory: URL) -> GitRepositoryLayout {
-            GitRepositoryLayout(
-                workTreeRoot: root,
-                dotGitPath: root.appendingPathComponent(".git"),
-                gitDir: commonDirectory.appendingPathComponent("worktrees/repo"),
-                commonDir: commonDirectory,
+        func layout(
+            root: URL,
+            commonDirectory: URL,
+            marksDirectories: Bool = false
+        ) -> GitRepositoryLayout {
+            let markedRoot = URL(fileURLWithPath: root.path, isDirectory: marksDirectories)
+            let markedCommonDirectory = URL(
+                fileURLWithPath: commonDirectory.path,
+                isDirectory: marksDirectories
+            )
+            return GitRepositoryLayout(
+                workTreeRoot: markedRoot,
+                dotGitPath: markedRoot.appendingPathComponent(".git", isDirectory: marksDirectories),
+                gitDir: markedCommonDirectory.appendingPathComponent("worktrees/repo", isDirectory: marksDirectories),
+                commonDir: markedCommonDirectory,
                 isWorktree: true
             )
         }
@@ -155,6 +164,37 @@ final class GitWorktreePorcelainParserTests: XCTestCase {
         XCTAssertEqual(resolution.records[0].record.path, canonicalPath)
         XCTAssertEqual(resolution.records[0].pathURL.path, canonicalPath)
         XCTAssertEqual(resolution.records[0].layout?.workTreeRoot.path, canonicalPath)
+
+        var directoryMarkerIndex = 0
+        let directoryMarkerResolution = try GitService.collapseEquivalentWorktreeAliases(records) { root in
+            defer { directoryMarkerIndex += 1 }
+            return layout(
+                root: root,
+                commonDirectory: commonDirectory,
+                marksDirectories: directoryMarkerIndex == 0
+            )
+        }
+        XCTAssertEqual(directoryMarkerResolution.records.count, 1)
+        XCTAssertEqual(directoryMarkerResolution.collapsedAliasCount, 1)
+        XCTAssertEqual(directoryMarkerResolution.records[0].layout?.workTreeRoot.hasDirectoryPath, true)
+
+        XCTAssertThrowsError(
+            try GitService.collapseEquivalentWorktreeAliases(records) { _ in nil }
+        ) { error in
+            XCTAssertEqual(error as? GitService.WorktreeAliasConflict, .repositoryLayout)
+        }
+
+        var partialLayoutIndex = 0
+        XCTAssertThrowsError(
+            try GitService.collapseEquivalentWorktreeAliases(records) { root in
+                defer { partialLayoutIndex += 1 }
+                return partialLayoutIndex == 0
+                    ? layout(root: root, commonDirectory: commonDirectory)
+                    : nil
+            }
+        ) { error in
+            XCTAssertEqual(error as? GitService.WorktreeAliasConflict, .repositoryLayout)
+        }
 
         var layoutIndex = 0
         XCTAssertThrowsError(

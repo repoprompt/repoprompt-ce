@@ -7846,18 +7846,12 @@ actor GitService {
         _ lhs: GitRepositoryLayout?,
         _ rhs: GitRepositoryLayout?
     ) -> Bool {
-        switch (lhs, rhs) {
-        case (nil, nil):
-            true
-        case let (lhs?, rhs?):
-            lhs.workTreeRoot.path == rhs.workTreeRoot.path
-                && lhs.dotGitPath.path == rhs.dotGitPath.path
-                && lhs.gitDir.path == rhs.gitDir.path
-                && lhs.commonDir.path == rhs.commonDir.path
-                && lhs.isWorktree == rhs.isWorktree
-        default:
-            false
-        }
+        guard let lhs, let rhs else { return false }
+        return lhs.workTreeRoot.path == rhs.workTreeRoot.path
+            && lhs.dotGitPath.path == rhs.dotGitPath.path
+            && lhs.gitDir.path == rhs.gitDir.path
+            && lhs.commonDir.path == rhs.commonDir.path
+            && lhs.isWorktree == rhs.isWorktree
     }
 
     private static func standardizedRepositoryLayout(_ layout: GitRepositoryLayout) -> GitRepositoryLayout {
