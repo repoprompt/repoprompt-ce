@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import OSLog
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -90,6 +91,7 @@ actor GitService {
     private static let gitCheckAttrOutputByteLimit = 4 * 1024 * 1024
     private static let gitBlobSizeOutputByteLimit = 64
     private static let gitBlobDiagnosticOutputByteLimit = 64 * 1024
+    private static let worktreeListLogger = Logger(subsystem: "com.repoprompt.git", category: "worktree-list")
     /// Root/search startup snapshots and receipts are process-local. A process-local salt
     /// provides one path-free repository namespace shared by all GitService instances while
     /// intentionally making restart/receipt loss fall back to the full crawler.
@@ -104,6 +106,22 @@ actor GitService {
         var errorDescription: String? {
             GitService.friendlyErrorDescription(for: message)
         }
+    }
+
+    struct ResolvedWorktreeRecord: Equatable {
+        let record: GitWorktreePorcelainRecord
+        let pathURL: URL
+        let layout: GitRepositoryLayout?
+    }
+
+    struct WorktreeAliasResolution: Equatable {
+        let records: [ResolvedWorktreeRecord]
+        let collapsedAliasCount: Int
+    }
+
+    enum WorktreeAliasConflict: String, Error, Equatable {
+        case recordMetadata = "record_metadata"
+        case repositoryLayout = "repository_layout"
     }
 
     enum GitProcessCaptureError: Error, Equatable {
@@ -7784,6 +7802,56 @@ actor GitService {
         }
     }
 
+    static func collapseEquivalentWorktreeAliases(
+        _ records: [GitWorktreePorcelainRecord],
+        resolveLayout: (URL) -> GitRepositoryLayout? = {
+            GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: $0)
+        }
+    ) throws -> WorktreeAliasResolution {
+        var resolvedRecords: [ResolvedWorktreeRecord] = []
+        var indexByPath: [String: Int] = [:]
+        var collapsedAliasCount = 0
+
+        for sourceRecord in records {
+            let sourceURL = URL(fileURLWithPath: sourceRecord.path)
+            let pathURL = sourceURL.standardizedFileURL
+            var record = sourceRecord
+            record.path = pathURL.path
+            let layout = resolveLayout(sourceURL).map(standardizedRepositoryLayout)
+            let candidate = ResolvedWorktreeRecord(record: record, pathURL: pathURL, layout: layout)
+
+            if let existingIndex = indexByPath[pathURL.path] {
+                let existing = resolvedRecords[existingIndex]
+                guard existing.layout == candidate.layout else {
+                    throw WorktreeAliasConflict.repositoryLayout
+                }
+                guard existing.record == candidate.record else {
+                    throw WorktreeAliasConflict.recordMetadata
+                }
+                collapsedAliasCount += 1
+                continue
+            }
+
+            indexByPath[pathURL.path] = resolvedRecords.count
+            resolvedRecords.append(candidate)
+        }
+
+        return WorktreeAliasResolution(
+            records: resolvedRecords,
+            collapsedAliasCount: collapsedAliasCount
+        )
+    }
+
+    private static func standardizedRepositoryLayout(_ layout: GitRepositoryLayout) -> GitRepositoryLayout {
+        GitRepositoryLayout(
+            workTreeRoot: layout.workTreeRoot.standardizedFileURL,
+            dotGitPath: layout.dotGitPath.standardizedFileURL,
+            gitDir: layout.gitDir.standardizedFileURL,
+            commonDir: layout.commonDir.standardizedFileURL,
+            isWorktree: layout.isWorktree
+        )
+    }
+
     private func makeWorktreeDescriptors(
         from records: [GitWorktreePorcelainRecord],
         currentRepoURL: URL
@@ -7794,20 +7862,35 @@ actor GitService {
         } else {
             nil
         }
-        let worktreeRecords = normalizedWorktreeRecords(
+        let normalizedRecords = normalizedWorktreeRecords(
             records.filter { !$0.isBare },
             currentLayout: currentLayout,
             resolvedMainRoot: resolvedMainRoot
         )
-        guard !worktreeRecords.isEmpty else { return [] }
+        guard !normalizedRecords.isEmpty else { return [] }
 
+        let aliasResolution: WorktreeAliasResolution
+        do {
+            aliasResolution = try Self.collapseEquivalentWorktreeAliases(normalizedRecords)
+        } catch let conflict as WorktreeAliasConflict {
+            Self.worktreeListLogger.error(
+                "git worktree standardized-path alias conflict kind=\(conflict.rawValue, privacy: .public) record_count=\(normalizedRecords.count, privacy: .public)"
+            )
+            throw GitError(
+                message: "git worktree list returned conflicting \(conflict.rawValue) for one standardized checkout path"
+            )
+        }
+
+        if aliasResolution.collapsedAliasCount > 0 {
+            Self.worktreeListLogger.notice(
+                "git worktree standardized-path aliases collapsed record_count=\(normalizedRecords.count, privacy: .public) unique_count=\(aliasResolution.records.count, privacy: .public) collapsed_count=\(aliasResolution.collapsedAliasCount, privacy: .public)"
+            )
+        }
+
+        let worktreeRecords = aliasResolution.records.map(\.record)
         let layoutsByPath: [String: GitRepositoryLayout] = Dictionary(
-            uniqueKeysWithValues: worktreeRecords.compactMap { record -> (String, GitRepositoryLayout)? in
-                let pathURL = URL(fileURLWithPath: record.path)
-                guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: pathURL) else {
-                    return nil
-                }
-                return (pathURL.standardizedFileURL.path, layout)
+            uniqueKeysWithValues: aliasResolution.records.compactMap { resolvedRecord in
+                resolvedRecord.layout.map { (resolvedRecord.pathURL.path, $0) }
             }
         )
 
