@@ -45,7 +45,7 @@ def object_schema(*, required: list[str], properties: dict[str, object]) -> dict
     return {"type": "object", "required": required, "properties": properties}
 
 
-def contract(checks: list[dict], *, floor: str = "0.144.6") -> dict:
+def contract(checks: list[dict], *, floor: str = "0.145.0") -> dict:
     return {
         "schemaVersion": 1,
         "minimumCodexVersion": floor,
@@ -61,8 +61,8 @@ def response_path(path: str, presence: str, nullable: bool) -> dict:
 class CodexAppServerSchemaGateTests(unittest.TestCase):
     def test_version_parser_accepts_cli_output_and_orders_prereleases(self) -> None:
         self.assertEqual(
-            gate.parse_version("codex-cli 0.144.6\n", label="test"),
-            gate.SemanticVersion(0, 144, 6),
+            gate.parse_version("codex-cli 0.145.0\n", label="test"),
+            gate.SemanticVersion(0, 145, 0),
         )
         self.assertEqual(
             gate.parse_version("0.145.0-rc.2+build.7", label="test"),
@@ -662,7 +662,7 @@ out.mkdir(parents=True, exist_ok=True)
 }), encoding="utf-8")
 """
             fake_codex.write_text(
-                script_template % (repr(str(marker)), repr("codex-cli 0.144.6")),
+                script_template % (repr(str(marker)), repr("codex-cli 0.145.0")),
                 encoding="utf-8",
             )
             fake_codex.chmod(0o755)
@@ -684,7 +684,7 @@ out.mkdir(parents=True, exist_ok=True)
                 )
 
             self.assertEqual(result, 0, stderr.getvalue())
-            self.assertIn("Codex CLI: 0.144.6", stdout.getvalue())
+            self.assertIn("Codex CLI: 0.145.0", stdout.getvalue())
             generated_args = json.loads(marker.read_text(encoding="utf-8"))
             self.assertEqual(
                 generated_args[:3],

@@ -789,7 +789,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
     private func writeExecutable(_ script: String, to url: URL) throws -> URL {
         let versionAwareScript = script.replacingOccurrences(
             of: "#!/usr/bin/env python3\n",
-            with: "#!/usr/bin/env python3\nimport sys\n\nif sys.argv[1:] == [\"--version\"]:\n    print(\"codex 0.144.6\")\n    raise SystemExit(0)\n\n",
+            with: "#!/usr/bin/env python3\nimport sys\n\nif sys.argv[1:] == [\"--version\"]:\n    print(\"codex 0.145.0\")\n    raise SystemExit(0)\n\n",
             options: .anchored
         )
         try versionAwareScript.write(to: url, atomically: true, encoding: .utf8)
