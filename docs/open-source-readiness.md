@@ -48,10 +48,10 @@ The root [`Package.swift`](../Package.swift) uses exact versions or fixed revisi
 
 | Dependency | Current manifest form | Current `Package.resolved` state | Readiness note |
 | --- | --- | --- | --- |
-| `https://github.com/provencher/swift-sdk.git` | `revision` | `cb6a62f7c266ed535792b3e9e6e05dc3f0dac8e4` | Pinned. |
+| `https://github.com/repoprompt/swift-sdk.git` | `revision` | `85dec2fc7a27252bc33dc7728be6af6b3bd398c0` | Pinned. |
 | `https://github.com/repoprompt/swift-tree-sitter.git` | `revision` | `a778ef4fb7f0d3ad00185f42ce83c688373c4361` | Customized wrapper fork pinned to one remote authority. |
 | `https://github.com/jamesrochabrun/SwiftAnthropic` | `revision` | `b7d030cd7453f314c780f5492385f73d704cbd5d` | Pinned. |
-| `https://github.com/provencher/SwiftOpenAI` | `revision` | `1211782eb337e7968124448a20d9260df1952012` | Pinned. |
+| `https://github.com/repoprompt/SwiftOpenAI` | `revision` | `1211782eb337e7968124448a20d9260df1952012` | Pinned. |
 
 Released, buildable Tree-sitter grammar packages use source-preserving exact semantic-version requirements, while committed `Package.resolved` revisions continue to define the precise resolved snapshots and CodeMap cache identity. The customized `SwiftTreeSitter` wrapper is pinned directly to the RepoPrompt fork revision `a778ef4fb7f0d3ad00185f42ce83c688373c4361`. The curated [`ThirdPartyLicenses/tree-sitter/`](../ThirdPartyLicenses/tree-sitter/) bundle maps that wrapper revision, the grammar requirements and revisions, its resolved Tree-sitter 0.25.10 runtime, and the runtime's ICU subset notice. `Package.resolved` should stay committed so local and CI resolutions match unless maintainers intentionally update dependency versions.
 
