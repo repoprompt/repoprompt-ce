@@ -478,18 +478,22 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
+        let demandResultGate = TestReleaseFence(name: "automatic target demand result")
+        let demandGateEnabled = CodemapLockedCounter()
         let demandAttempts = CodemapLockedCounter()
         let cleaned = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
         addTeardownBlock {
+            demandResultGate.release()
             await fixture.shutdown()
             repository.cleanup()
         }
         let store = fixture.makeStore(
             cancellationCleanupHook: { cleaned.append($0) },
             demandResultHook: { _, result in
-                demandAttempts.incrementAndGet() == 1
-                    ? .busy(retryAfterMilliseconds: 0)
-                    : result
+                guard demandGateEnabled.value > 0 else { return result }
+                demandAttempts.increment()
+                await demandResultGate.enterAndWait()
+                return .busy(retryAfterMilliseconds: 0)
             }
         )
         let root = try await store.loadRoot(path: rootURL.path)
@@ -503,19 +507,23 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             expectedTargetFileIDs: [target.id]
         )
         let ticketOffset = fixture.demandedTickets.values.count
+        demandGateEnabled.increment()
         let service = WorkspaceSelectionMutationService(
             store: store,
             automaticSelectionPolicy: .init(
-                maximumReadinessRounds: 10,
+                maximumReadinessRounds: 2,
                 initialBackoffMilliseconds: 1,
-                maximumBackoffMilliseconds: 10,
-                maximumTotalWait: .seconds(1)
-            ),
-            automaticSelectionWaiter: .init(sleep: { _ in
-                try await Task.sleep(for: .milliseconds(10))
-            })
+                maximumBackoffMilliseconds: 1,
+                maximumTotalWait: .zero
+            )
         )
-        let result = try await service.resolveAutomaticCodemapSelection(sourceFileIDs: [source.id])
+        let resolution = Task {
+            try await service.resolveAutomaticCodemapSelection(sourceFileIDs: [source.id])
+        }
+        let demandResultEntered = await demandResultGate.waitUntilEntered(timeout: TestFenceDefaults.enterWait)
+        XCTAssertTrue(demandResultEntered)
+        demandResultGate.release()
+        let result = try await resolution.value
         XCTAssertEqual(result.targets, [])
         XCTAssertFalse(result.issues.isEmpty)
         let demanded = Array(fixture.demandedTickets.values.dropFirst(ticketOffset))
