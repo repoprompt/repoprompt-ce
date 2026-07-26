@@ -85,6 +85,15 @@ struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
 
 struct WorkspaceCodemapAutomaticSelectionWaiter {
     let sleep: @Sendable (Duration) async throws -> Void
+    let now: @Sendable () -> ContinuousClock.Instant
+
+    init(
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock().now }
+    ) {
+        self.sleep = sleep
+        self.now = now
+    }
 
     static let production = Self { duration in
         try await Task.sleep(for: duration)
@@ -861,8 +870,9 @@ struct WorkspaceSelectionMutationService {
                 resultsByTarget[target] = owned.result
             }
 
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: automaticSelectionPolicy.maximumTotalWait)
+            let deadline = automaticSelectionWaiter.now().advanced(
+                by: automaticSelectionPolicy.maximumTotalWait
+            )
             for round in 0 ..< automaticSelectionPolicy.maximumReadinessRounds {
                 try Task.checkCancellation()
                 var waiting = false
@@ -887,12 +897,11 @@ struct WorkspaceSelectionMutationService {
                 }
                 guard waiting,
                       round + 1 < automaticSelectionPolicy.maximumReadinessRounds,
-                      clock.now < deadline
+                      automaticSelectionWaiter.now() < deadline
                 else { break }
                 try await waitForAutomaticSelectionReadiness(
                     round: round,
                     suggestedMilliseconds: retryAfter,
-                    clock: clock,
                     deadline: deadline
                 )
                 for (target, current) in resultsByTarget {
@@ -1028,7 +1037,6 @@ struct WorkspaceSelectionMutationService {
     private func waitForAutomaticSelectionReadiness(
         round: Int,
         suggestedMilliseconds: [Int],
-        clock: ContinuousClock,
         deadline: ContinuousClock.Instant
     ) async throws {
         let shift = min(round, 20)
@@ -1037,7 +1045,7 @@ struct WorkspaceSelectionMutationService {
         let suggested = suggestedMilliseconds.max() ?? 0
         let milliseconds = max(bounded, suggested)
         let proposed = Duration.milliseconds(milliseconds)
-        let remaining = clock.now.duration(to: deadline)
+        let remaining = automaticSelectionWaiter.now().duration(to: deadline)
         guard remaining > .zero else { return }
         try await automaticSelectionWaiter.sleep(min(proposed, remaining))
     }

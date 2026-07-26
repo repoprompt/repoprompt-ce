@@ -480,6 +480,8 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
         let demandResultGate = TestReleaseFence(name: "automatic target demand result")
         let demandGateEnabled = CodemapLockedCounter()
+        let deadlineClockReads = CodemapLockedCounter()
+        let deadlineStart = ContinuousClock().now
         let demandAttempts = CodemapLockedCounter()
         let cleaned = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
         addTeardownBlock {
@@ -514,16 +516,23 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
                 maximumReadinessRounds: 2,
                 initialBackoffMilliseconds: 1,
                 maximumBackoffMilliseconds: 1,
-                maximumTotalWait: .zero
+                maximumTotalWait: .seconds(1)
+            ),
+            automaticSelectionWaiter: .init(
+                sleep: { _ in
+                    XCTFail("Deadline should expire before automatic target readiness sleeps")
+                },
+                now: {
+                    guard deadlineClockReads.incrementAndGet() > 1 else { return deadlineStart }
+                    guard demandResultGate.waitUntilEnteredBlocking(
+                        timeout: TestFenceDefaults.enterWait
+                    ) else { return deadlineStart.advanced(by: .seconds(1)) }
+                    return deadlineStart.advanced(by: .seconds(1))
+                }
             )
         )
-        let resolution = Task {
-            try await service.resolveAutomaticCodemapSelection(sourceFileIDs: [source.id])
-        }
-        let demandResultEntered = await demandResultGate.waitUntilEntered(timeout: TestFenceDefaults.enterWait)
-        XCTAssertTrue(demandResultEntered)
+        let result = try await service.resolveAutomaticCodemapSelection(sourceFileIDs: [source.id])
         demandResultGate.release()
-        let result = try await resolution.value
         XCTAssertEqual(result.targets, [])
         XCTAssertFalse(result.issues.isEmpty)
         let demanded = Array(fixture.demandedTickets.values.dropFirst(ticketOffset))
