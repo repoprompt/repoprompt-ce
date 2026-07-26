@@ -709,6 +709,42 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.bashLiveExecutionByKey.values.filter(\.isRunning).count, 1)
     }
 
+    func testNamelessMCPItemDoesNotCorroborateNamedLocalSpan() async {
+        let invocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [.init(
+                turnID: "turn",
+                itemID: invocationID.uuidString,
+                invocationID: invocationID,
+                kind: .mcpToolCall,
+                toolName: nil,
+                processID: nil,
+                status: .inProgress
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "lookup", invocationID: invocationID, argsJSON: "{}"),
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+    }
+
     func testUnrelatedTerminalCommandDoesNotFinalizeOrClearLocalSpan() async {
         let localInvocationID = UUID()
         let controller = LivenessFakeCodexController(

@@ -851,7 +851,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             normalizedToolName == "bash"
         case .mcpToolCall, .dynamicToolCall:
             normalizedToolName != "bash"
-                && Self.normalizedExternalToolName(item.toolName).map { $0 == normalizedToolName } != false
+                && Self.normalizedExternalToolName(item.toolName).map { $0 == normalizedToolName } == true
         case .fileChange:
             normalizedToolName == "apply_patch"
         }
