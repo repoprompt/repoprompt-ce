@@ -2226,7 +2226,7 @@ sys.stdout.write(str(status))
         self.assertNotIn("updaterController.startUpdater()", manager_init)
         self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
         self.assertIn(
-            "guard updaterStarted, sparkleConfigurationValid, activeUserInitiatedChannel == nil else {",
+            "guard updaterStarted, sparkleConfigurationValid, userInitiatedObserverState.activeRequest == nil else {",
             sparkle_manager,
         )
 
@@ -2849,11 +2849,15 @@ sys.stdout.write(str(status))
             ]
         ).stdout.strip()
 
+        expected_title = "Tip build 1.2.3 · v9.8.7 · commit 0123456789ab"
+        expected_release_notes_link = "https://example.invalid/tip/details"
+
         def write_appcast(
             enclosure_signature: str,
             *,
-            title: str = "Tip build v9.8.7",
-            display_version: str = "Tip build v9.8.7",
+            marketing_version: str = "9.8.7",
+            title: str = expected_title,
+            release_notes_link: str = expected_release_notes_link,
         ) -> None:
             appcast.write_text(
                 f"""<?xml version="1.0" encoding="utf-8"?>
@@ -2862,7 +2866,8 @@ sys.stdout.write(str(status))
     <item>
       <title>{title}</title>
       <sparkle:version>1.2.3</sparkle:version>
-      <sparkle:shortVersionString>{display_version}</sparkle:shortVersionString>
+      <sparkle:shortVersionString>{marketing_version}</sparkle:shortVersionString>
+      <sparkle:releaseNotesLink>{release_notes_link}</sparkle:releaseNotesLink>
       <enclosure url="https://example.invalid/tip/{archive.name}"
                  length="{archive.stat().st_size}"
                  sparkle:edSignature="{enclosure_signature}" />
@@ -2878,8 +2883,10 @@ sys.stdout.write(str(status))
             {
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
                 "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(SCRIPT_DIR),
-                "TIP_COMMIT": "0" * 40,
+                "TIP_COMMIT": "0123456789abcdef" * 2 + "01234567",
+                "TIP_SHORT_SHA": "0123456789ab",
                 "TIP_BUILD_NUMBER": "1.2.3",
+                "TIP_RELEASE_URL": expected_release_notes_link,
                 "TIP_DOWNLOAD_URL_PREFIX": "https://example.invalid/tip/",
                 "SPARKLE_PRIVATE_KEY": private_key,
                 "VALIDATOR_APP_BUNDLE": str(app_bundle),
@@ -2923,15 +2930,26 @@ validate_generated_tip_appcast""",
             rejected_duplicate_version.stderr,
         )
 
-        write_appcast(signature, title="Version 9.8.7")
-        rejected_title = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected_title.returncode, 0)
-        self.assertIn("Tip appcast title mismatch", rejected_title.stderr)
+        write_appcast(signature, marketing_version="9.8.8")
+        wrong_marketing = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(wrong_marketing.returncode, 0)
+        self.assertIn(
+            "Tip appcast marketing version mismatch: expected 9.8.7, got 9.8.8",
+            wrong_marketing.stderr,
+        )
 
-        write_appcast(signature, display_version="9.8.7")
-        rejected_display_version = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected_display_version.returncode, 0)
-        self.assertIn("Tip appcast display version mismatch", rejected_display_version.stderr)
+        write_appcast(signature, title="Wrong tip title")
+        wrong_title = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(wrong_title.returncode, 0)
+        self.assertIn("Tip appcast presentation title mismatch: Wrong tip title", wrong_title.stderr)
+
+        write_appcast(signature, release_notes_link="https://example.invalid/tip/wrong-details")
+        wrong_release_notes_link = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(wrong_release_notes_link.returncode, 0)
+        self.assertIn(
+            "Tip appcast release notes link mismatch: https://example.invalid/tip/wrong-details",
+            wrong_release_notes_link.stderr,
+        )
 
         write_appcast("")
         rejected_signature = subprocess.run(command, env=env, text=True, capture_output=True)
@@ -2959,6 +2977,9 @@ validate_generated_tip_appcast""",
             """source "$1"
 APPCAST="$2"
 MARKETING_VERSION="9.8.7"
+TIP_BUILD_NUMBER="29.8.52"
+TIP_SHORT_SHA="abc1234def56"
+TIP_RELEASE_URL="https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/tag/tip-abc1234def56"
 label_generated_tip_appcast""",
             "tip-appcast-label",
             str(SCRIPT_DIR / "main_tip_release.sh"),
@@ -2972,8 +2993,12 @@ label_generated_tip_appcast""",
         assert item is not None
         sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
         self.assertEqual(item.findtext(f"{{{sparkle}}}version"), "29.8.52")
-        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "Tip build v9.8.7")
-        self.assertEqual(item.findtext("title"), "Tip build v9.8.7")
+        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "9.8.7")
+        self.assertEqual(item.findtext("title"), "Tip build 29.8.52 · v9.8.7 · commit abc1234def56")
+        self.assertEqual(
+            item.findtext(f"{{{sparkle}}}releaseNotesLink"),
+            "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/tag/tip-abc1234def56",
+        )
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent

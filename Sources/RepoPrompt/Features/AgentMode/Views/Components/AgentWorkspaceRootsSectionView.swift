@@ -41,8 +41,8 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private struct CodemapSummary {
         enum State: Equatable {
-            case mapping
-            case waiting
+            case indexing
+            case reconciling
             case ready
             case paused
             case mixed
@@ -51,20 +51,20 @@ struct AgentWorkspaceRootsSectionView: View {
 
         let state: State
         let progressFraction: Double?
-        let processedCandidateCount: UInt64
-        let totalCandidateCount: UInt64?
-        let mappedRootCount: Int
-        let waitingRootCount: Int
+        let classifiedCount: UInt64
+        let supportedCount: UInt64?
+        let readyRootCount: Int
+        let reconcilingRootCount: Int
         let pausedRootCount: Int
 
         var progressPercentage: Int? {
-            guard state == .mapping || state == .waiting, let progressFraction else { return nil }
+            guard state == .indexing || state == .reconciling, let progressFraction else { return nil }
             return min(99, max(0, Int((progressFraction * 100).rounded(.down))))
         }
 
         var label: String {
             switch state {
-            case .mapping, .waiting, .ready, .unavailable: "Code Map"
+            case .indexing, .reconciling, .ready, .unavailable: "Code Map"
             case .paused: "Paused"
             case .mixed: "Partial"
             }
@@ -72,28 +72,27 @@ struct AgentWorkspaceRootsSectionView: View {
 
         var detailText: String {
             switch state {
-            case .mapping:
-                var details = [progressPercentage.map { "Mapping \($0)%" } ?? "Preparing mapping…"]
-                if waitingRootCount > 0 { details.append("\(waitingRootCount) waiting") }
+            case .indexing:
+                var details = [progressPercentage.map { "Indexing \($0)%" } ?? "Preparing index…"]
+                if reconcilingRootCount > 0 { details.append("\(reconcilingRootCount) reconciling") }
                 if pausedRootCount > 0 { details.append("\(pausedRootCount) paused") }
                 return details.joined(separator: " • ")
-            case .waiting:
-                let waitingDetail = progressPercentage.map { "Waiting at \($0)%" } ?? "Waiting to continue"
-                if pausedRootCount > 0 { return "\(waitingDetail) • \(pausedRootCount) paused" }
-                return waitingDetail
+            case .reconciling:
+                let detail = "Reconciling watcher changes"
+                return pausedRootCount > 0 ? "\(detail) • \(pausedRootCount) paused" : detail
             case .ready:
                 return "All available roots mapped"
             case .paused:
-                return "Mapping paused"
+                return "Indexing paused"
             case .mixed:
-                return "\(mappedRootCount) mapped • \(pausedRootCount) paused"
+                return "\(readyRootCount) mapped • \(pausedRootCount) paused"
             case .unavailable:
                 return "Code Maps unavailable"
             }
         }
 
         var tooltip: String {
-            "\(detailText). Click for progress and per-root controls."
+            "\(detailText). Click for graph coverage and per-root controls."
         }
     }
 
@@ -246,47 +245,50 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private var codemapSummary: CodemapSummary {
         let availableRoots = roots.filter(\.codemap.canToggle)
-        let mappingRoots = availableRoots.filter(\.codemap.isActivelyMapping)
-        let waitingRoots = availableRoots.filter { $0.codemap.state == .waiting }
+        let activeRoots = availableRoots.filter {
+            switch $0.codemap.state {
+            case .notInitialized, .indexing, .updating: true
+            case .reconciling, .ready, .paused, .unavailable, .revoked: false
+            }
+        }
+        let reconcilingRoots = availableRoots.filter { $0.codemap.state == .reconciling }
         let pausedRoots = availableRoots.filter(\.codemap.isPaused)
-        let mappedRoots = availableRoots.filter { $0.codemap.state == .ready }
+        let readyRoots = availableRoots.filter { $0.codemap.state == .ready }
         let progressRoots = availableRoots.filter { !$0.codemap.isPaused }
         let totalsAreKnown = !progressRoots.isEmpty && progressRoots.allSatisfy {
-            $0.codemap.totalCandidateCount != nil
+            $0.codemap.supportedCount != nil
         }
-        let processed = progressRoots.reduce(UInt64(0)) {
-            $0 + $1.codemap.displayProcessedCandidateCount
-        }
-        let total = totalsAreKnown
-            ? progressRoots.reduce(UInt64(0)) { $0 + ($1.codemap.totalCandidateCount ?? 0) }
+        let classified = progressRoots.reduce(UInt64(0)) { $0 + $1.codemap.classifiedCount }
+        let supported = totalsAreKnown
+            ? progressRoots.reduce(UInt64(0)) { $0 + ($1.codemap.supportedCount ?? 0) }
             : nil
-        let rawProgress = total.flatMap { total -> Double? in
-            guard total > 0 else { return mappingRoots.isEmpty ? 1 : nil }
-            return min(1, Double(processed) / Double(total))
+        let rawProgress = supported.flatMap { supported -> Double? in
+            guard supported > 0 else { return activeRoots.isEmpty ? 1 : nil }
+            return min(1, Double(classified) / Double(supported))
         }
-        let state: CodemapSummary.State = if !mappingRoots.isEmpty {
-            .mapping
-        } else if !waitingRoots.isEmpty {
-            .waiting
+        let state: CodemapSummary.State = if !activeRoots.isEmpty {
+            .indexing
+        } else if !reconcilingRoots.isEmpty {
+            .reconciling
         } else if availableRoots.isEmpty {
             .unavailable
         } else if pausedRoots.count == availableRoots.count {
             .paused
-        } else if mappedRoots.count == availableRoots.count {
+        } else if readyRoots.count == availableRoots.count {
             .ready
         } else {
             .mixed
         }
         let progress = rawProgress.map {
-            state == .mapping || state == .waiting ? min(0.99, $0) : $0
+            state == .indexing || state == .reconciling ? min(0.99, $0) : $0
         }
         return CodemapSummary(
             state: state,
             progressFraction: progress,
-            processedCandidateCount: processed,
-            totalCandidateCount: total,
-            mappedRootCount: mappedRoots.count,
-            waitingRootCount: waitingRoots.count,
+            classifiedCount: classified,
+            supportedCount: supported,
+            readyRootCount: readyRoots.count,
+            reconcilingRootCount: reconcilingRoots.count,
             pausedRootCount: pausedRoots.count
         )
     }
@@ -446,7 +448,7 @@ struct AgentWorkspaceRootsSectionView: View {
         let tint = codemapSummaryTint(summary)
         ZStack {
             switch summary.state {
-            case .mapping, .waiting:
+            case .indexing, .reconciling:
                 if let progress = summary.progressFraction {
                     Circle()
                         .stroke(tint.opacity(0.25), lineWidth: 2)
@@ -484,8 +486,8 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private func codemapSummaryTint(_ summary: CodemapSummary) -> Color {
         switch summary.state {
-        case .mapping: .blue
-        case .waiting: .orange
+        case .indexing: .blue
+        case .reconciling: .orange
         case .ready: .secondary
         case .mixed: .orange
         case .paused, .unavailable: .secondary
@@ -507,12 +509,12 @@ struct AgentWorkspaceRootsSectionView: View {
                 Spacer(minLength: 0)
             }
 
-            if summary.state == .mapping || summary.state == .waiting {
+            if summary.state == .indexing || summary.state == .reconciling {
                 if let progress = summary.progressFraction {
                     ProgressView(value: progress)
                         .tint(.accentColor)
-                    if let total = summary.totalCandidateCount {
-                        Text("\(summary.processedCandidateCount) of \(total) files processed for mapping")
+                    if let total = summary.supportedCount {
+                        Text("\(summary.classifiedCount) of \(total) files indexed")
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                             .foregroundStyle(.secondary)
                     }

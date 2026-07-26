@@ -409,20 +409,54 @@ extension AgentModeViewModel {
 
     func collapsibleSidebarThreadKeys(
         for tabs: [ComposeTabState],
-        currentTabID: UUID?,
+        currentTabID _: UUID?,
         searchText: String,
-        diagnosticSource: String? = nil
+        diagnosticSource _: String? = nil
     ) -> [AgentSidebarThreadKey] {
+        guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let rows = sidebarSessions(for: tabs)
+        guard !rows.isEmpty else { return [] }
+        return rows.indices.compactMap { index in
+            let nextIndex = rows.index(after: index)
+            guard nextIndex < rows.endIndex,
+                  rows[nextIndex].depth > rows[index].depth
+            else { return nil }
+            return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
+        }
+    }
+
+    func displaySidebarSessions(
+        for tabs: [ComposeTabState],
+        currentTabID: UUID?,
+        searchText: String? = nil,
+        diagnosticSource: String? = nil
+    ) -> [SidebarSession] {
         filteredSidebarSessions(
             for: tabs,
             currentTabID: currentTabID,
-            searchText: searchText,
+            searchText: searchText ?? sessionSidebarSearchText,
             diagnosticSource: diagnosticSource
         )
-        .compactMap { row in
-            guard row.depth == 0, row.hasThreadChildren, let key = row.threadKey else { return nil }
-            return key
+    }
+
+    func defaultCollapsedSidebarThreadKeys(
+        for tabs: [ComposeTabState],
+        searchText: String
+    ) -> [AgentSidebarThreadKey] {
+        guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let rows = sidebarSessions(for: tabs)
+        return rows.indices.compactMap { index -> AgentSidebarThreadKey? in
+            let nextIndex = rows.index(after: index)
+            guard rows[index].depth > 0,
+                  nextIndex < rows.endIndex,
+                  rows[nextIndex].depth > rows[index].depth
+            else { return nil }
+            return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
         }
+    }
+
+    func seedDefaultCollapsedSidebarThreads(_ eligibleKeys: [AgentSidebarThreadKey]) {
+        ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: eligibleKeys)
     }
 
     func filteredSidebarSessions(

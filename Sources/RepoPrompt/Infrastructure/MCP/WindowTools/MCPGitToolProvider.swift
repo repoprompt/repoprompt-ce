@@ -599,9 +599,24 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
         // Tool-level admission is keyed by every repository touched by this request. WI-9's
         // lower-level global/per-repository subprocess controller remains independently active.
-        let gitAdmissionLease = try await MCPGitToolAdmissionController.shared.acquire(
-            repositoryRoots: repos.map(\.rootURL)
-        )
+        let gitLeaseWaitClock = ContinuousClock()
+        let gitLeaseWaitStart = gitLeaseWaitClock.now
+        let gitAdmissionLease: MCPGitToolAdmissionController.Lease
+        do {
+            gitAdmissionLease = try await MCPGitToolAdmissionController.shared.acquire(
+                repositoryRoots: repos.map(\.rootURL)
+            )
+            MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
+                classKey: .gitRead,
+                milliseconds: gitLeaseWaitStart.duration(to: gitLeaseWaitClock.now).mcpMilliseconds
+            )
+        } catch {
+            MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                classKey: .gitRead,
+                reason: .leaseWaitTermination(for: error)
+            )
+            throw error
+        }
         defer { MCPGitToolAdmissionController.shared.release(gitAdmissionLease) }
 
         // For now, use primary repo for single-repo operations

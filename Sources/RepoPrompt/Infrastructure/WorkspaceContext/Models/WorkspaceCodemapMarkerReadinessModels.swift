@@ -3,6 +3,7 @@ import Foundation
 enum WorkspaceCodemapMarkerReadinessState: Hashable {
     case ready
     case unavailable
+    case securityExcluded
 }
 
 struct WorkspaceCodemapMarkerReadinessChange: Hashable {

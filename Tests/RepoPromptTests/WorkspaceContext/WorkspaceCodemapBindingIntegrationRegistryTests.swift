@@ -26,8 +26,8 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
         let missingCandidate = await catalog.resolveManifestBinding(missingEpoch, "Sources/Value.swift")
         XCTAssertNil(missingCandidate)
 
-        let firstPage = try await projectionPage(catalog.readProjectionCatalogPage(
-            WorkspaceCodemapProjectionCatalogPageRequest(
+        let firstPage = try await graphIndexPage(catalog.readGraphIndexCatalogPage(
+            WorkspaceCodemapGraphIndexCatalogPageRequest(
                 rootEpoch: firstEpoch,
                 token: nil,
                 cursor: nil,
@@ -35,8 +35,8 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
                 maximumPathByteCount: 64
             )
         ))
-        let secondPage = try await projectionPage(catalog.readProjectionCatalogPage(
-            WorkspaceCodemapProjectionCatalogPageRequest(
+        let secondPage = try await graphIndexPage(catalog.readGraphIndexCatalogPage(
+            WorkspaceCodemapGraphIndexCatalogPageRequest(
                 rootEpoch: secondEpoch,
                 token: nil,
                 cursor: nil,
@@ -46,12 +46,12 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
         ))
         XCTAssertEqual(firstPage.token.rootEpoch, firstEpoch)
         XCTAssertEqual(secondPage.token.rootEpoch, secondEpoch)
-        let currentToken = await catalog.revalidateProjectionCatalogToken(firstEpoch, firstPage.token)
+        let currentToken = await catalog.revalidateGraphIndexCatalogToken(firstEpoch, firstPage.token)
         XCTAssertEqual(currentToken, .current)
-        let foreignToken = await catalog.revalidateProjectionCatalogToken(firstEpoch, secondPage.token)
+        let foreignToken = await catalog.revalidateGraphIndexCatalogToken(firstEpoch, secondPage.token)
         XCTAssertEqual(foreignToken, .stale)
-        let missingPage = await catalog.readProjectionCatalogPage(
-            WorkspaceCodemapProjectionCatalogPageRequest(
+        let missingPage = await catalog.readGraphIndexCatalogPage(
+            WorkspaceCodemapGraphIndexCatalogPageRequest(
                 rootEpoch: missingEpoch,
                 token: nil,
                 cursor: nil,
@@ -261,11 +261,11 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
             catalogClient: WorkspaceCodemapBindingCatalogClient { epoch, relativePath in
                 guard epoch == rootEpoch else { return nil }
                 return candidate(rootEpoch: epoch, fileID: fileID, relativePath: relativePath)
-            } readProjectionCatalogPage: { request in
+            } readGraphIndexCatalogPage: { request in
                 guard request.rootEpoch == rootEpoch else { return .stale }
                 let token = projectionToken(rootEpoch: rootEpoch)
                 guard request.token == nil || request.token == token else { return .stale }
-                switch WorkspaceCodemapProjectionCatalogPage.validated(
+                switch WorkspaceCodemapGraphIndexCatalogPage.validated(
                     request: request,
                     token: token,
                     entries: [],
@@ -278,16 +278,16 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
                 case .failure:
                     return .unavailable(.catalogUnavailable)
                 }
-            } revalidateProjectionCatalogToken: { epoch, token in
+            } revalidateGraphIndexCatalogToken: { epoch, token in
                 guard epoch == rootEpoch, token.rootEpoch == rootEpoch else { return .stale }
                 return token == projectionToken(rootEpoch: rootEpoch) ? .current : .stale
             }
         )
     }
 
-    private func projectionPage(
-        _ disposition: WorkspaceCodemapProjectionCatalogPageDisposition
-    ) throws -> WorkspaceCodemapProjectionCatalogPage {
+    private func graphIndexPage(
+        _ disposition: WorkspaceCodemapGraphIndexCatalogPageDisposition
+    ) throws -> WorkspaceCodemapGraphIndexCatalogPage {
         guard case let .page(page) = disposition else {
             throw RegistryTestError.expectedProjectionPage
         }
@@ -296,14 +296,14 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
 
     private static func projectionToken(
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> WorkspaceCodemapProjectionCatalogToken {
-        WorkspaceCodemapProjectionCatalogToken(
+    ) -> WorkspaceCodemapGraphIndexCatalogToken {
+        WorkspaceCodemapGraphIndexCatalogToken(
             rootEpoch: rootEpoch,
             topologyGeneration: 1,
             appliedIndexGeneration: 1,
             catalogGeneration: 1,
             ingressGeneration: 1,
-            projectionInvalidationGeneration: 1
+            graphIndexInvalidationGeneration: 1
         )
     }
 

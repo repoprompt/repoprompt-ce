@@ -107,6 +107,8 @@ struct AgentModeGeneralSettingsView: View {
 
             providersLinkRow
 
+            providerCleanupActionCard
+
             agentPermissionsCard
 
             linkRow(
@@ -118,6 +120,42 @@ struct AgentModeGeneralSettingsView: View {
 
             agentWorkflowsLinkRow
         }
+    }
+
+    // MARK: - Provider cleanup
+
+    private var providerCleanupActionCard: some View {
+        VStack(alignment: .leading, spacing: fontPreset.scaledClamped(8, max: 12)) {
+            HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+                Image(systemName: "archivebox")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                    .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                    .foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                    Text("Provider Conversation Cleanup")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+                    Text("When deleting Agent Mode sessions, RepoPrompt asks supported providers to archive or delete their remote conversation. Local cleanup still continues if a provider does not support cleanup.")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Picker("Cleanup action", selection: providerCleanupActionBinding) {
+                        Text("Archive").tag(ProviderConversationCleanupAction.archive)
+                        Text("Delete").tag(ProviderConversationCleanupAction.delete)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 220)
+                }
+                Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+            }
+            .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+        }
+    }
+
+    private var providerCleanupActionBinding: Binding<ProviderConversationCleanupAction> {
+        Binding(
+            get: { globalSettings.providerConversationCleanupAction() },
+            set: { globalSettings.setProviderConversationCleanupAction($0) }
+        )
     }
 
     // MARK: - Agent Workflows row

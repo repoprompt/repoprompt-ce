@@ -129,66 +129,43 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             name: MCPWindowToolName.getCodeStructure,
             freshnessPolicy: .providerManaged,
             description: """
-            Return current, root-scoped code structure from content-addressed codemaps.
+            Return root-local committed code structure for explicit paths or the current selection.
 
-            Scopes:
-            - paths: Analyze explicit files/directories. paths is required.
-            - selected: Analyze the authoritative current selection. paths is forbidden.
+            - `paths`: Optional file/directory seeds; omit to use the authoritative current selection.
+            - `expand`: Optional `uses`, `used_by`, or `both`; omit for seeds only.
+            - `depth`: Relationship depth 1...4 (default 1; meaningful only with `expand`).
+            - `signatures`: Include codemap signature text (default true). False performs no artifact demands.
+            - `size`: Output size `small`, `medium` (default), or `large`.
 
-            Relationship expansion:
-            - Omit expand for seed-only output.
-            - referenced_definitions: follow definitions referenced by each seed.
-            - referrers: follow resident files that reference definitions in each seed.
-            - both: traverse both root-local directions.
-            - Cold relationship discovery waits for exact current coverage within the server's fixed 10-second deadline.
-
-            Limits:
-            - max_files (1...200, default 10)
-            - max_edges (1...10000, default 500)
-            - max_codemap_tokens (256...20000, default 6000)
-
-            Results report literal ready, budget, busy, timeout, unavailable, or stale status
-            with stable issue codes. Readiness pressure never returns partial structure.
-            Cancellation remains an MCP cancellation.
-            Per-file paths are logical paths; traversal cannot cross a root epoch.
+            Inspect per-root results in mixed workspaces. `updates_pending` graph data is usable.
+            When `truncated` is present, rerun the same call with the next larger `size`.
+            Seeds render before related files, so small outputs preserve the graph and degrade signature text gracefully.
 
             Examples:
-            - Seed only: {"scope":"paths","paths":["src/auth/"]}
-            - Selected with referrers: {"scope":"selected","expand":{"direction":"referrers","max_depth":1}}
+            - Signatures for a folder: {"paths":["Sources/Auth/"]}
+            - Who uses a file with large output: {"paths":["Sources/Auth/SessionStore.swift"],"expand":"used_by","size":"large"}
+            - Cheap graph-only sweep: {"expand":"both","depth":2,"signatures":false,"size":"small"}
             """,
             annotations: .repoPromptLocalReadOnly,
             inputSchema: .object(
                 properties: [
-                    "scope": .string(
-                        description: "Required seed source",
-                        enum: ["paths", "selected"]
-                    ),
                     "paths": .array(
-                        description: "One to 256 file or directory paths when scope='paths'",
+                        description: "Optional one to 256 file or directory paths; omit for current selection",
                         items: .string(description: "File or directory path")
                     ),
-                    "expand": .object(
-                        properties: [
-                            "direction": .string(
-                                description: "Root-local relationship direction",
-                                enum: ["referenced_definitions", "referrers", "both"]
-                            ),
-                            "max_depth": .integer(
-                                description: "Maximum graph hops (1...4, default 1)"
-                            )
-                        ],
-                        required: ["direction"]
+                    "expand": .string(
+                        description: "Relationships from each seed's perspective",
+                        enum: ["uses", "used_by", "both"]
                     ),
-                    "limits": .object(
-                        properties: [
-                            "max_files": .integer(description: "Maximum emitted seed plus related files"),
-                            "max_edges": .integer(description: "Maximum root-local graph edges examined"),
-                            "max_codemap_tokens": .integer(description: "Strict codemap-content token budget")
-                        ],
-                        required: []
+                    "depth": .integer(description: "Relationship depth 1...4 (default 1)"),
+                    "signatures": .boolean(description: "Include codemap signature text (default true)"),
+                    "size": .string(
+                        description: "Output size (default medium)",
+                        enum: ["small", "medium", "large"]
                     )
                 ],
-                required: ["scope"]
+                required: [],
+                additionalProperties: .boolean(false)
             )
         ) { [self] _, args in
             try await withActiveWorktreeStartupBenchmarkTag {
@@ -196,75 +173,70 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     operation: MCPWindowToolName.getCodeStructure
                 ) {
                     try Task.checkCancellation()
-                    let allowedRootKeys: Set = ["scope", "paths", "expand", "limits"]
-                    guard Set(args.keys).isSubset(of: allowedRootKeys) else {
+                    let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "size"]
+                    guard Set(args.keys).isSubset(of: allowedKeys) else {
                         throw MCPError.invalidParams("unknown get_code_structure parameter")
-                    }
-                    guard let scope = args["scope"]?.stringValue?.lowercased(),
-                          scope == "paths" || scope == "selected"
-                    else {
-                        throw MCPError.invalidParams("scope must be 'paths' or 'selected'")
                     }
 
                     let direction: WorkspaceCodemapStructureTraversalDirection?
-                    let maximumDepth: Int
-                    if let expandValue = args["expand"] {
-                        guard let expand = expandValue.objectValue else {
-                            throw MCPError.invalidParams("expand must be an object")
+                    if let value = args["expand"] {
+                        guard let raw = value.stringValue else {
+                            throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
                         }
-                        guard Set(expand.keys).isSubset(of: ["direction", "max_depth"]) else {
-                            throw MCPError.invalidParams("unknown expand parameter")
-                        }
-                        guard let rawDirection = expand["direction"]?.stringValue else {
-                            throw MCPError.invalidParams("expand.direction is required")
-                        }
-                        direction = switch rawDirection {
-                        case "referenced_definitions": .referencedDefinitions
-                        case "referrers": .referrers
+                        direction = switch raw {
+                        case "uses": .referencedDefinitions
+                        case "used_by": .referrers
                         case "both": .both
-                        default: throw MCPError.invalidParams("invalid expand.direction")
-                        }
-                        maximumDepth = expand["max_depth"]?.intValue ?? 1
-                        guard (1 ... 4).contains(maximumDepth) else {
-                            throw MCPError.invalidParams("expand.max_depth must be between 1 and 4")
+                        default: throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
                         }
                     } else {
                         direction = nil
-                        maximumDepth = 0
                     }
 
-                    let limits: [String: Value]
-                    if let limitsValue = args["limits"] {
-                        guard let object = limitsValue.objectValue else {
-                            throw MCPError.invalidParams("limits must be an object")
+                    let suppliedDepth: Int
+                    if let value = args["depth"] {
+                        guard let depth = value.intValue else {
+                            throw MCPError.invalidParams("depth must be an integer")
                         }
-                        guard Set(object.keys).isSubset(
-                            of: ["max_files", "max_edges", "max_codemap_tokens"]
-                        ) else {
-                            throw MCPError.invalidParams("unknown limits parameter")
-                        }
-                        limits = object
+                        suppliedDepth = depth
                     } else {
-                        limits = [:]
+                        suppliedDepth = 1
                     }
-                    let maximumFiles = limits["max_files"]?.intValue ?? 10
-                    let maximumEdges = limits["max_edges"]?.intValue ?? 500
-                    let maximumCodemapTokens = limits["max_codemap_tokens"]?.intValue ?? 6000
-                    guard (1 ... 200).contains(maximumFiles) else {
-                        throw MCPError.invalidParams("limits.max_files must be between 1 and 200")
+                    guard (1 ... 4).contains(suppliedDepth) else {
+                        throw MCPError.invalidParams("depth must be between 1 and 4")
                     }
-                    guard (1 ... 10000).contains(maximumEdges) else {
-                        throw MCPError.invalidParams("limits.max_edges must be between 1 and 10000")
+
+                    let includesSignatures: Bool
+                    if let value = args["signatures"] {
+                        guard let signatures = value.boolValue else {
+                            throw MCPError.invalidParams("signatures must be a boolean")
+                        }
+                        includesSignatures = signatures
+                    } else {
+                        includesSignatures = true
                     }
-                    guard (256 ... 20000).contains(maximumCodemapTokens) else {
-                        throw MCPError.invalidParams("limits.max_codemap_tokens must be between 256 and 20000")
+
+                    let size: WorkspaceCodemapGraphOutputSize
+                    if let value = args["size"] {
+                        guard let rawSize = value.stringValue,
+                              let parsedSize = WorkspaceCodemapGraphOutputSize(rawValue: rawSize)
+                        else {
+                            throw MCPError.invalidParams("size must be 'small', 'medium', or 'large'")
+                        }
+                        size = parsedSize
+                    } else {
+                        size = .medium
                     }
+                    let budget = WorkspaceCodemapGraphPolicy.initial.queryBudget(
+                        size: size,
+                        includesSignatures: includesSignatures
+                    )
                     let request = MCPServerViewModel.CodeStructureRequest(
                         direction: direction,
-                        maximumDepth: maximumDepth,
-                        maximumFiles: maximumFiles,
-                        maximumEdges: maximumEdges,
-                        maximumCodemapTokens: maximumCodemapTokens
+                        maximumDepth: direction == nil ? 0 : suppliedDepth,
+                        includesSignatures: includesSignatures,
+                        size: size,
+                        budget: budget
                     )
 
                     await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
@@ -278,11 +250,35 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     try Task.checkCancellation()
 
                     let files: [WorkspaceFileRecord]
-                    switch scope {
-                    case "selected":
-                        guard args["paths"] == nil else {
-                            throw MCPError.invalidParams("paths is forbidden when scope='selected'")
+                    var requestedPaths: [String] = []
+                    if let pathsValue = args["paths"] {
+                        guard let rawPaths = pathsValue.arrayValue,
+                              !rawPaths.isEmpty,
+                              rawPaths.count <= 256,
+                              rawPaths.allSatisfy({ $0.stringValue != nil })
+                        else {
+                            throw MCPError.invalidParams("paths must contain one to 256 strings")
                         }
+                        let translated = lookupContext.translateInputPaths(rawPaths.compactMap(\.stringValue))
+                        requestedPaths = translated
+                        for path in translated {
+                            try Task.checkCancellation()
+                            if let issue = await dependencies.promptVM.workspaceFileContextStore
+                                .exactPathResolutionIssue(
+                                    for: path,
+                                    kind: .either,
+                                    rootScope: lookupContext.rootScope
+                                )
+                            {
+                                throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+                            }
+                        }
+                        files = try await dependencies.resolveFilesForCodeStructure(
+                            translated,
+                            lookupContext.rootScope,
+                            MCPServerViewModel.codeStructureSeedLimit(for: request)
+                        )
+                    } else {
                         guard await dependencies.drainReadFileAutoSelection(
                             metadata,
                             .canonicalSelection
@@ -294,45 +290,13 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                             lookupContext,
                             MCPServerViewModel.codeStructureSeedLimit(for: request)
                         )
-                    case "paths":
-                        guard let rawPaths = args["paths"]?.arrayValue else {
-                            throw MCPError.invalidParams("paths is required when scope='paths'")
-                        }
-                        guard !rawPaths.isEmpty, rawPaths.count <= 256,
-                              rawPaths.allSatisfy({ $0.stringValue != nil })
-                        else {
-                            throw MCPError.invalidParams("paths must contain one to 256 strings")
-                        }
-                        let translated = lookupContext.translateInputPaths(
-                            rawPaths.compactMap(\.stringValue)
-                        )
-                        for path in translated {
-                            try Task.checkCancellation()
-                            if let issue = await dependencies.promptVM.workspaceFileContextStore
-                                .exactPathResolutionIssue(
-                                    for: path,
-                                    kind: .either,
-                                    rootScope: lookupContext.rootScope
-                                )
-                            {
-                                throw MCPError.invalidParams(
-                                    PathResolutionIssueRenderer.message(for: issue)
-                                )
-                            }
-                        }
-                        files = try await dependencies.resolveFilesForCodeStructure(
-                            translated,
-                            lookupContext.rootScope,
-                            MCPServerViewModel.codeStructureSeedLimit(for: request)
-                        )
-                    default:
-                        throw MCPError.invalidParams("invalid scope")
                     }
                     try Task.checkCancellation()
                     let reply = try await dependencies.buildCodeStructureDTO(
                         files,
                         request,
                         true,
+                        requestedPaths,
                         lookupContext
                     )
                     try Task.checkCancellation()

@@ -7822,7 +7822,7 @@ actor GitService {
 
             if let existingIndex = indexByPath[pathURL.path] {
                 let existing = resolvedRecords[existingIndex]
-                guard existing.layout == candidate.layout else {
+                guard repositoryLayoutsAreEquivalent(existing.layout, candidate.layout) else {
                     throw WorktreeAliasConflict.repositoryLayout
                 }
                 guard existing.record == candidate.record else {
@@ -7840,6 +7840,24 @@ actor GitService {
             records: resolvedRecords,
             collapsedAliasCount: collapsedAliasCount
         )
+    }
+
+    private static func repositoryLayoutsAreEquivalent(
+        _ lhs: GitRepositoryLayout?,
+        _ rhs: GitRepositoryLayout?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            true
+        case let (lhs?, rhs?):
+            lhs.workTreeRoot.path == rhs.workTreeRoot.path
+                && lhs.dotGitPath.path == rhs.dotGitPath.path
+                && lhs.gitDir.path == rhs.gitDir.path
+                && lhs.commonDir.path == rhs.commonDir.path
+                && lhs.isWorktree == rhs.isWorktree
+        default:
+            false
+        }
     }
 
     private static func standardizedRepositoryLayout(_ layout: GitRepositoryLayout) -> GitRepositoryLayout {
