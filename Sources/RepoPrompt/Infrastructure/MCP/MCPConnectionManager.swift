@@ -11161,6 +11161,20 @@ actor ServerNetworkManager {
                 EditFlowPerf.Dimensions(toolName: toolName)
             )
             defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.total, totalState) }
+            // Release-safe bounded concurrency evidence (counts/latency aggregates only;
+            // never arguments, paths, or result bodies). No admission behavior change.
+            let evidenceClock = ContinuousClock()
+            let evidenceArrival = evidenceClock.now
+            let evidenceClass = MCPToolConcurrencyEvidenceClass(
+                admissionClass: MCPToolAdmissionPolicy.classification(forCanonicalToolName: toolName)
+            )
+            defer {
+                MCPToolConcurrencyEvidenceRecorder.shared.recordCallCompleted(
+                    classKey: evidenceClass,
+                    canonicalToolName: toolName,
+                    totalMilliseconds: evidenceArrival.duration(to: evidenceClock.now).mcpMilliseconds
+                )
+            }
             let preLimiterEnvelopeState = EditFlowPerf.begin(
                 EditFlowPerf.Stage.MCPToolCall.preLimiterEnvelope,
                 EditFlowPerf.Dimensions(toolName: toolName)
@@ -11388,6 +11402,10 @@ actor ServerNetworkManager {
             // Connection lanes provide bounded FIFO admission only. Shared-state correctness is
             // enforced below by explicit window/app/repository resource ownership.
             guard let admissionClass = Self.admissionClass(forCanonicalToolName: toolName) else {
+                MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                    classKey: .unclassified,
+                    reason: .unclassifiedTool
+                )
                 return await finalizeToolResult(
                     Self.executionContractToolErrorResult(
                         rawJSON: capturedRawJSON,
@@ -11416,6 +11434,8 @@ actor ServerNetworkManager {
                 )
             }
             connectionLog("tools/call \(toolName): entering limiter lane=\(callLane.rawValue)")
+            let evidenceLaneWaitStart = evidenceClock.now
+            MCPToolConcurrencyEvidenceRecorder.shared.recordLaneWaitBegan(classKey: evidenceClass)
             let result = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.limiterEnvelope,
                 EditFlowPerf.Dimensions(toolName: toolName)
@@ -11437,13 +11457,23 @@ actor ServerNetworkManager {
                     toolName: toolName,
                     lifecycleCorrelation: lifecycleCorrelation,
                     cancellationResult: {
-                        Self.executionContractToolErrorResult(
+                        MCPToolConcurrencyEvidenceRecorder.shared.recordLaneWaitAbandoned(classKey: evidenceClass)
+                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                            classKey: evidenceClass,
+                            reason: .laneWaitCancelled
+                        )
+                        return Self.executionContractToolErrorResult(
                             rawJSON: capturedRawJSON,
                             code: "tool_execution_connection_terminal",
                             message: "The MCP connection is closing."
                         )
                     }
                 ) {
+                    MCPToolConcurrencyEvidenceRecorder.shared.recordLaneAdmitted(
+                        classKey: evidenceClass,
+                        waitMilliseconds: evidenceLaneWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
+                    )
+                    defer { MCPToolConcurrencyEvidenceRecorder.shared.recordLanePermitReleased(classKey: evidenceClass) }
                     guard !Task.isCancelled,
                           await !(self.executionWatchdogTerminalConnections.contains(connectionID))
                     else {
@@ -11664,8 +11694,17 @@ actor ServerNetworkManager {
                                         )
                                     }
                                     do {
+                                        let evidenceLeaseWaitStart = evidenceClock.now
                                         mutationAdmissionLease = try await self.mutationAdmissionController.acquire(mutationResource)
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
+                                            classKey: evidenceClass,
+                                            milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
+                                        )
                                     } catch {
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                                            classKey: evidenceClass,
+                                            reason: .leaseWaitTermination(for: error)
+                                        )
                                         return Self.executionContractToolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             code: "tool_execution_connection_terminal",
@@ -11687,8 +11726,17 @@ actor ServerNetworkManager {
                                         )
                                     }
                                     do {
+                                        let evidenceLeaseWaitStart = evidenceClock.now
                                         smallReadAdmissionLease = try await self.smallReadAdmissionController.acquire(.window(chosenID))
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
+                                            classKey: evidenceClass,
+                                            milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
+                                        )
                                     } catch {
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                                            classKey: evidenceClass,
+                                            reason: .leaseWaitTermination(for: error)
+                                        )
                                         return Self.executionContractToolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             code: "tool_execution_connection_terminal",

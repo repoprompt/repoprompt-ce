@@ -243,44 +243,52 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         }
     }
 
-    func testCodeStructureOutputShowsTypedPendingIssueAndWorktreeScope() throws {
+    func testCodeStructurePendingOutputUsesSemanticRecoveryAndWorktreeScope() throws {
+        let issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO(
+            code: "graph_indexing",
+            phase: "graph_snapshot",
+            path: "Project/Sources/App.swift",
+            retryable: true,
+            retryAfterMilliseconds: 50,
+            attempted: nil,
+            limit: nil,
+            message: "The committed graph is still indexing."
+        )
         let dto = ToolResultDTOs.CodeStructureReplyDTO(
-            status: "pending",
-            files: [],
-            summary: .init(
-                requestedSeeds: 1,
-                resolvedSeeds: 0,
-                returnedSeeds: 0,
-                returnedRelated: 0,
-                returnedFiles: 0,
-                codemapContentTokens: 0,
-                examinedEdges: 0
-            ),
-            issues: [
+            status: .pending,
+            size: .medium,
+            roots: [
                 .init(
-                    code: "artifact_pending",
-                    phase: "seed_demand",
-                    path: "Project/Sources/App.swift",
-                    retryable: true,
-                    retryAfterMilliseconds: 50,
-                    attempted: nil,
-                    limit: nil,
-                    message: "Codemap generation is still pending."
+                    root: "Project",
+                    status: .pending,
+                    index: .init(state: .indexing, indexed: 0, total: 1),
+                    updatesPending: nil,
+                    seeds: [.init(path: "Project/Sources/App.swift", state: .pending)],
+                    nodes: [],
+                    edges: [],
+                    unresolved: [],
+                    truncated: nil,
+                    issues: [issue]
                 )
             ],
+            files: [],
+            summary: .init(seeds: 1, nodes: 0, edges: 0, files: 0, tokens: 0),
+            issues: [],
             retry: .init(retryable: true, retryAfterMilliseconds: 50),
             worktreeScope: Self.scope()
         )
 
         let text = try Self.onlyText(ToolOutputFormatter.formatCodeStructure(value: Self.value(dto)))
 
-        XCTAssertTrue(text.contains("## Code Structure ⚠️"), text)
-        XCTAssertTrue(text.contains("**Status**: `pending`"), text)
-        XCTAssertTrue(text.contains("`artifact_pending`"), text)
-        XCTAssertTrue(text.contains("`Project/Sources/App.swift`"), text)
-        XCTAssertTrue(text.contains("codemap scans use"), text)
-        XCTAssertTrue(text.contains("Displayed paths use logical/canonical roots"), text)
-        XCTAssertTrue(text.contains("`Project` → session-bound worktree"), text)
+        XCTAssertTrue(text.contains("## Code Structure ⏳ pending — `Sources/App.swift` is not in the code graph yet"), text)
+        XCTAssertTrue(text.contains("- Retry shortly. If this persists, the file may be excluded or of an unsupported type."), text)
+        XCTAssertFalse(text.contains("**Status**"), text)
+        XCTAssertFalse(text.contains("Index:"), text)
+        XCTAssertFalse(text.contains("≈"), text)
+        XCTAssertFalse(text.contains("Unresolved"), text)
+        XCTAssertFalse(text.contains("Internal refs"), text)
+        XCTAssertFalse(text.contains("`Project/Sources/App.swift`"), text)
+        XCTAssertTrue(text.contains("- Root `Project` — paths below are root-relative; session-bound worktree `wt_123`"), text)
         XCTAssertFalse(text.contains("/repo/project"), text)
         XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
         XCTAssertTrue(text.contains("wt_123"), text)
@@ -487,6 +495,57 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             embedded.contains("- Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files"),
             embedded
         )
+    }
+
+    func testAgentRunApprovalGuidanceUsesCopyableCanonicalResponseCommand() throws {
+        let sessionID = "11111111-1111-1111-1111-111111111111"
+        let interactionID = "22222222-2222-2222-2222-222222222222"
+        let cases: [([Value], Bool)] = [
+            ([], true),
+            (
+                [
+                    .object(["label": .string("accept")]),
+                    .object(["label": .string("accept_with_amendment")]),
+                    .object(["label": .string("decline")])
+                ],
+                true
+            ),
+            (
+                [
+                    .object(["label": .string("accept")]),
+                    .object(["label": .string("decline")])
+                ],
+                false
+            )
+        ]
+
+        for (options, expectsAmendment) in cases {
+            let value = Value.object([
+                "op": .string("wait"),
+                "status": .string("waiting_for_input"),
+                "session_id": .string(sessionID),
+                "interaction_id": .string(interactionID),
+                "interaction": .object([
+                    "id": .string(interactionID),
+                    "kind": .string("approval"),
+                    "options": .array(options)
+                ])
+            ])
+            let text = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: value))
+
+            XCTAssertTrue(text.contains("### How to respond"), text)
+            XCTAssertTrue(
+                text.contains(
+                    "- Copyable response: `agent_run op=respond session_id=\"\(sessionID)\" interaction_id=\"\(interactionID)\" response=\"accept\"`"
+                ),
+                text
+            )
+            XCTAssertFalse(text.contains("Use `agent_run` with"), text)
+            XCTAssertTrue(text.contains("- Allowed response values:"), text)
+            XCTAssertFalse(text.contains("Allowed decisions"), text)
+            XCTAssertFalse(text.contains("decision="), text)
+            XCTAssertEqual(text.contains("response=\"accept_with_amendment\""), expectsAmendment, text)
+        }
     }
 
     func testAgentRunOutputShowsWorktreeSummaryAndUnavailableState() throws {

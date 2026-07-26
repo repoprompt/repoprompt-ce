@@ -21,12 +21,110 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
 tmp_root=""
-cleanup() {
+timing_helper="$repo_root/.agents/skills/rpce-contribution-check/scripts/preflight_timing.py"
+timing_artifact_dir="$repo_root/.build/validation-artifacts/pr-ready"
+timing_receipt_prefix=".build/validation-artifacts/pr-ready"
+timing_state=""
+timing_enabled=0
+timing_broken=0
+
+warn_timing() {
+  printf 'WARNING: PR-ready timing receipt unavailable; validation result is unchanged.\n' >&2
+}
+
+disable_timing() {
+  if (( timing_enabled )); then
+    timing_enabled=0
+    timing_broken=1
+    warn_timing
+  fi
+}
+
+timing_init() {
+  local head_commit
+  [[ "$mode" == "pr-ready" ]] || return 0
+  head_commit="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  if timing_state="$(python3 "$timing_helper" start \
+    --artifact-dir "$timing_artifact_dir" --head-commit "$head_commit" 2>/dev/null)"; then
+    timing_enabled=1
+  else
+    timing_state=""
+    timing_broken=1
+    warn_timing
+  fi
+}
+
+timing_phase_start() {
+  (( timing_enabled )) || return 0
+  if ! python3 "$timing_helper" phase-start --state "$timing_state" --phase "$1" \
+    >/dev/null 2>&1; then
+    disable_timing
+  fi
+  return 0
+}
+
+timing_phase_pass() {
+  (( timing_enabled )) || return 0
+  if ! python3 "$timing_helper" phase-pass --state "$timing_state" --phase "$1" \
+    >/dev/null 2>&1; then
+    disable_timing
+  fi
+  return 0
+}
+
+timing_record_provenance() {
+  (( timing_enabled )) || return 0
+  if ! python3 "$timing_helper" provenance --state "$timing_state" \
+    --base-kind "$1" --outgoing-count "$2" >/dev/null 2>&1; then
+    disable_timing
+  fi
+  return 0
+}
+
+timing_record_selection() {
+  local changed_path_count="$1"
+  shift
+  local args=(selection --state "$timing_state" --changed-path-count "$changed_path_count")
+  local lane_id
+  (( timing_enabled )) || return 0
+  for lane_id in "$@"; do
+    args+=(--lane-id "$lane_id")
+  done
+  if ! python3 "$timing_helper" "${args[@]}" >/dev/null 2>&1; then
+    disable_timing
+  fi
+  return 0
+}
+
+finalize() {
+  local original_exit_code=$?
+  local receipt_name=""
+  local receipt_status=0
+  set +e
+  trap - EXIT HUP INT TERM
+
+  if [[ "$mode" == "pr-ready" && -n "${timing_state:-}" ]]; then
+    if (( timing_enabled )) && (( ! timing_broken )); then
+      receipt_name="$(python3 "$timing_helper" finish --state "$timing_state" \
+        --exit-code "$original_exit_code" 2>/dev/null)"
+      receipt_status=$?
+      if (( receipt_status == 0 )) && [[ -n "$receipt_name" ]]; then
+        printf '\nPR-ready timing receipt: %s/%s\n' "$timing_receipt_prefix" "$receipt_name"
+      else
+        warn_timing
+      fi
+    else
+      python3 "$timing_helper" discard --state "$timing_state" >/dev/null 2>&1 || true
+    fi
+  fi
+
   if [[ -n "${tmp_root:-}" ]]; then
     rm -rf -- "$tmp_root"
   fi
+  exit "$original_exit_code"
 }
-trap cleanup EXIT
+
+trap finalize EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -77,10 +175,12 @@ resolve_outgoing_base() {
     && git rev-parse --verify --quiet "${upstream_ref}^{commit}" >/dev/null; then
     base_ref="$upstream_ref"
     base_reason="configured upstream"
+    base_kind="configured_upstream"
   elif [[ "$current_branch" != "main" ]] \
     && git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}' >/dev/null; then
     base_ref="refs/remotes/origin/main"
     base_reason="origin/main fallback for a current branch without configured upstream"
+    base_kind="origin_main_fallback"
   else
     fail "cannot determine outgoing base for '$current_branch'; configure its upstream or fetch origin/main for a non-main topic branch"
   fi
@@ -98,7 +198,7 @@ run_pr_ready_path_validations() {
   files="$tmp_root/range-files.z"
   write_range_files "$files"
 
-  local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/guardrails\.sh|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
+  local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/guardrails\.sh|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight(_timing\.py|\.sh)|Makefile)$'
   local ci_app_test_runner_paths_pattern='^(Scripts/ci_app_test_runner\.py|Scripts/test_ci_app_test_runner\.py|\.github/workflows/ci\.yml)$'
   local swift_paths_pattern='\.swift$'
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'
@@ -117,9 +217,11 @@ run_pr_ready_path_validations() {
   local has_mcp_product_changes=0
   local has_xcode_generator_test_changes=0
   local has_xcode_full_validation_changes=0
+  local changed_path_count=0
   local file
 
   while IFS= read -r -d '' file; do
+    changed_path_count=$((changed_path_count + 1))
     [[ "$file" =~ $control_plane_paths_pattern ]] && has_control_plane_changes=1
     [[ "$file" =~ $ci_app_test_runner_paths_pattern ]] && has_ci_app_test_runner_changes=1
     [[ "$file" =~ $swift_paths_pattern ]] && has_swift_changes=1
@@ -131,41 +233,76 @@ run_pr_ready_path_validations() {
     [[ "$file" =~ $xcode_full_validation_paths_pattern ]] && has_xcode_full_validation_changes=1
   done < "$files"
 
+  local selected_lane_ids=()
+  (( has_control_plane_changes )) && selected_lane_ids+=(conductor_selftests)
+  (( has_ci_app_test_runner_changes )) && selected_lane_ids+=(ci_app_test_runner_selftests)
+  (( has_swift_changes )) && selected_lane_ids+=(swift_lint)
+  (( has_root_test_changes )) && selected_lane_ids+=(root_tests)
+  (( has_provider_package_changes )) && selected_lane_ids+=(provider_tests)
+  (( has_repoprompt_product_changes )) && selected_lane_ids+=(repoprompt_build)
+  (( has_mcp_product_changes )) && selected_lane_ids+=(mcp_build)
+  (( has_xcode_generator_test_changes )) && selected_lane_ids+=(xcode_generator_tests)
+  (( has_xcode_full_validation_changes )) && selected_lane_ids+=(xcode_workspace_validation)
+  if (( ${#selected_lane_ids[@]} )); then
+    timing_record_selection "$changed_path_count" "${selected_lane_ids[@]}"
+  else
+    timing_record_selection "$changed_path_count"
+  fi
+  timing_phase_pass path_selection
+
   if (( has_control_plane_changes )); then
+    timing_phase_start conductor_selftests
     log "Run conductor self-tests"
     make conductor-selftest
+    timing_phase_pass conductor_selftests
   fi
   if (( has_ci_app_test_runner_changes )); then
+    timing_phase_start ci_app_test_runner_selftests
     log "Run CI app-test runner self-tests"
     make ci-app-test-runner-selftest
+    timing_phase_pass ci_app_test_runner_selftests
   fi
   if (( has_swift_changes )); then
+    timing_phase_start swift_lint
     log "Run coordinated Swift lint"
     make dev-lint
+    timing_phase_pass swift_lint
   fi
   if (( has_root_test_changes )); then
+    timing_phase_start root_tests
     log "Run coordinated root tests"
     make dev-test
+    timing_phase_pass root_tests
   fi
   if (( has_provider_package_changes )); then
+    timing_phase_start provider_tests
     log "Run coordinated provider tests"
     make dev-provider-test
+    timing_phase_pass provider_tests
   fi
   if (( has_repoprompt_product_changes )); then
+    timing_phase_start repoprompt_build
     log "Build RepoPrompt product"
     make dev-swift-build PRODUCT=RepoPrompt
+    timing_phase_pass repoprompt_build
   fi
   if (( has_mcp_product_changes )); then
+    timing_phase_start mcp_build
     log "Build repoprompt-mcp product"
     make dev-swift-build PRODUCT=repoprompt-mcp
+    timing_phase_pass mcp_build
   fi
   if (( has_xcode_generator_test_changes )); then
+    timing_phase_start xcode_generator_tests
     log "Run Xcode workspace generator tests"
     make xcode-generator-test
+    timing_phase_pass xcode_generator_tests
   fi
   if (( has_xcode_full_validation_changes )); then
+    timing_phase_start xcode_workspace_validation
     log "Validate generated Xcode workspace"
     make xcode-validate
+    timing_phase_pass xcode_workspace_validation
   fi
 }
 
@@ -188,18 +325,26 @@ Release validation, live smoke, destructive-operation approval, and any speciali
 EOF
 }
 
+timing_init
+
 require_tool git
 require_tool gitleaks
 
+timing_phase_start whitespace_checks
 log "Check whitespace"
 git diff --check
 git diff --cached --check
+timing_phase_pass whitespace_checks
 
+timing_phase_start staged_index_secret_scan
 log "Scan staged index blobs for secrets"
 scan_staged_index_blobs
+timing_phase_pass staged_index_secret_scan
 
+timing_phase_start repository_guardrails
 log "Run repository guardrails"
 make guardrails
+timing_phase_pass repository_guardrails
 
 if [[ "$mode" == "commit" ]]; then
   cat <<'EOF'
@@ -211,9 +356,12 @@ EOF
   exit 0
 fi
 
+timing_phase_start clean_worktree_check
 log "Require a clean working tree before push"
 require_clean_worktree
+timing_phase_pass clean_worktree_check
 
+timing_phase_start outgoing_range_resolution
 resolve_outgoing_base
 log "Review current-branch outgoing range"
 printf 'Current branch: %s\nComparison base (%s): %s\nComputed outgoing range: %s\n' \
@@ -221,6 +369,8 @@ printf 'Current branch: %s\nComparison base (%s): %s\nComputed outgoing range: %
 git log --oneline "$range_spec"
 
 outgoing_count="$(git rev-list --count "$range_spec")"
+timing_record_provenance "$base_kind" "$outgoing_count"
+timing_phase_pass outgoing_range_resolution
 if [[ "$outgoing_count" == "0" ]]; then
   echo "No outgoing commits in $range_spec."
   if [[ "$mode" == "pr-ready" ]]; then
@@ -231,13 +381,16 @@ if [[ "$outgoing_count" == "0" ]]; then
   exit 0
 fi
 
+timing_phase_start outgoing_range_secret_scan
 log "Scan outgoing commit range for secrets"
 gitleaks git --no-banner --redact --log-opts="$range_spec" .
+timing_phase_pass outgoing_range_secret_scan
 
 if [[ "$mode" == "push" ]]; then
   push_success
   exit 0
 fi
 
+timing_phase_start path_selection
 run_pr_ready_path_validations
 pr_ready_success

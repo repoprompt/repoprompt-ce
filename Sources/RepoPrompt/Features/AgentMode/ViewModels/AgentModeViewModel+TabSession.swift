@@ -59,6 +59,12 @@ extension AgentModeViewModel {
         @Published var runningStatusText: String? = nil
         var activeAgentRunStartedAt: Date?
 
+        struct DeferredActiveAgentRunTimerRollback {
+            let originalStartedAt: Date?
+        }
+
+        var deferredActiveAgentRunTimerRollback: DeferredActiveAgentRunTimerRollback?
+
         enum RunningStatusSource: Equatable {
             case transport
             case reasoning
@@ -248,7 +254,7 @@ extension AgentModeViewModel {
             let turnKind: CodexTurnKind
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -257,7 +263,7 @@ extension AgentModeViewModel {
             let turnKind: CodexTurnKind
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -356,7 +362,7 @@ extension AgentModeViewModel {
             let turnID: String
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -452,6 +458,7 @@ extension AgentModeViewModel {
 
         /// Selected workflow template for next message
         var selectedWorkflow: AgentWorkflowDefinition?
+        var userWorkflowSelectionMutationGeneration: UInt64 = 0
 
         // Pending image attachments for the next user turn
         @Published var pendingImageAttachments: [AgentImageAttachment] = []
@@ -461,6 +468,7 @@ extension AgentModeViewModel {
 
         // Provider session ID for resumption (e.g., Claude CLI session_id)
         var providerSessionID: String?
+        var providerCleanupHandle: ProviderConversationCleanupHandle?
         var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
         var pendingNonCodexUserInputTokenQueue: [Int] = []
         var activeNonCodexTurnTokenAccumulator: NonCodexTurnTokenAccumulator?
@@ -1535,6 +1543,7 @@ extension AgentModeViewModel {
             setItemsSilently(items, reason: .testOverride)
             pendingTurnRuntimeAnchors.removeAll()
             agentMessageRuntimeFootersByItemID.removeAll()
+            deferredActiveAgentRunTimerRollback = nil
             pendingSourceItemsMutationSummary = nil
             onSourceItemsChanged?(self, .replaceAll)
             lastActivityAt = Date()

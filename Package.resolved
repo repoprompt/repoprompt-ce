@@ -247,7 +247,7 @@
     {
       "identity" : "swift-sdk",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/provencher/swift-sdk.git",
+      "location" : "https://github.com/repoprompt/swift-sdk.git",
       "state" : {
         "revision" : "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"
       }
@@ -298,7 +298,7 @@
     {
       "identity" : "swiftopenai",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/provencher/SwiftOpenAI",
+      "location" : "https://github.com/repoprompt/SwiftOpenAI",
       "state" : {
         "revision" : "1211782eb337e7968124448a20d9260df1952012"
       }
