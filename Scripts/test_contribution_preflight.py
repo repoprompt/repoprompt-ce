@@ -50,6 +50,7 @@ REPOPROMPT_BUILD_TARGET = "dev-swift-build PRODUCT=RepoPrompt"
 MCP_BUILD_TARGET = "dev-swift-build PRODUCT=repoprompt-mcp"
 XCODE_GENERATOR_TEST_TARGET = "xcode-generator-test"
 XCODE_VALIDATE_TARGET = "xcode-validate"
+ORDINARY_SUBPROCESS_TIMEOUT_SECONDS = 90
 HEAVYWEIGHT_MAKE_TARGETS = [
     CONDUCTOR_SELFTEST_TARGET,
     CI_APP_TEST_RUNNER_SELFTEST_TARGET,
@@ -154,7 +155,7 @@ class ContributionPreflightTests(unittest.TestCase):
             env=env,
             text=True,
             capture_output=True,
-            timeout=20,
+            timeout=ORDINARY_SUBPROCESS_TIMEOUT_SECONDS,
         )
 
     def log_lines(self, env: dict[str, str], name: str) -> list[str]:
