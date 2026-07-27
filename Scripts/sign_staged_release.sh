@@ -11,6 +11,7 @@ load_release_metadata "$METADATA_ROOT"
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
+CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
@@ -70,6 +71,7 @@ text = text.replace("__BUNDLE_ID__", bundle_id).replace("__SIGNING_TEAM_ID__", t
 Path(output).write_text(text, encoding="utf-8")
 PYTHON
 plutil -lint "$app_entitlements"
+plutil -lint "$CODEX_V8_ENTITLEMENTS"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
 plutil -replace RepoPromptSigningMode -string developer-id "$APP_BUNDLE/Contents/Info.plist"
 
@@ -96,12 +98,25 @@ sign_sparkle_framework() {
 }
 
 sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"
-codex_mach_o_paths="$(python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
-    --manifest "$CODEX_MANIFEST" list-bundle-mach-o-paths --arch all)"
-while IFS= read -r relative_path; do
+# Manifest-driven Codex signing: each Mach-O gets exactly the release entitlement
+# profile pinned in Vendor/Codex/manifest.json. The trusted V8 JIT allowlist is a
+# repository-owned plist; vendor entitlement metadata is never preserved blindly.
+codex_signing_plan="$(python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$CODEX_MANIFEST" list-bundle-signing-plan --arch all)"
+while IFS=$'\t' read -r relative_path entitlement_profile; do
     [[ -n "$relative_path" ]] || continue
-    sign_path "$CODEX_BUNDLE/$relative_path"
-done <<< "$codex_mach_o_paths"
+    case "$entitlement_profile" in
+    v8-jit)
+        sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTITLEMENTS"
+        ;;
+    none)
+        sign_path "$CODEX_BUNDLE/$relative_path"
+        ;;
+    *)
+        fail "Unsupported Codex release entitlement profile for $relative_path: ${entitlement_profile:-<missing>}"
+        ;;
+    esac
+done <<< "$codex_signing_plan"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"

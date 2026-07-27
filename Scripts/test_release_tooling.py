@@ -207,22 +207,54 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
         self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
         self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
-        self.assertEqual(source.count("list-bundle-mach-o-paths --arch all"), 1)
+        self.assertEqual(source.count("list-bundle-signing-plan --arch all"), 1)
+        self.assertNotIn("list-bundle-mach-o-paths", source)
         self.assertEqual(source.count('--signed-team-identifier "$SIGNING_TEAM_ID"'), 1)
         self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
+        self.assertIn('CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"', source)
+        self.assertIn('plutil -lint "$CODEX_V8_ENTITLEMENTS"', source)
+        for line in source.splitlines():
+            if 'sign_path "$CODEX_BUNDLE' in line:
+                self.assertNotIn("--preserve-metadata", line)
 
         sparkle_sign = source.index('sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"')
-        enumerate_codex = source.index("list-bundle-mach-o-paths --arch all")
-        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path"')
+        enumerate_codex = source.index("list-bundle-signing-plan --arch all")
+        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTITLEMENTS"')
+        codex_sign_unprofiled = source.index('sign_path "$CODEX_BUNDLE/$relative_path"\n', codex_sign + 1)
         mcp_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"')
         app_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"')
         outer_sign = source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"')
         self.assertLess(sparkle_sign, enumerate_codex)
         self.assertLess(enumerate_codex, codex_sign)
-        self.assertLess(codex_sign, mcp_sign)
+        self.assertLess(codex_sign, codex_sign_unprofiled)
+        self.assertLess(codex_sign_unprofiled, mcp_sign)
         self.assertLess(mcp_sign, app_sign)
         self.assertLess(app_sign, outer_sign)
         self.assertNotIn('sign_path "$CODEX_BUNDLE"', source)
+
+    def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
+        v8_profile = {
+            "com.apple.security.cs.allow-jit": True,
+            "com.apple.security.cs.allow-unsigned-executable-memory": True,
+        }
+        plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "CodexV8JIT.entitlements").read_bytes())
+        self.assertEqual(plist, v8_profile)
+
+        manifest = json.loads(
+            (SCRIPT_DIR.parent / "Vendor" / "Codex" / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertEqual(
+            manifest["releaseSigningEntitlements"],
+            {
+                "bin/codex": v8_profile,
+                "bin/codex-code-mode-host": v8_profile,
+                "codex-path/rg": {},
+                "codex-resources/zsh/bin/zsh": {},
+            },
+        )
+        for policy in manifest["signedExecutables"]:
+            self.assertEqual(policy["entitlements"], v8_profile, policy["path"])
 
         for release_script_name in (
             "release.sh",
