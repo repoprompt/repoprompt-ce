@@ -204,6 +204,7 @@ enum WorkspaceCodemapGraphIndexLaunchPhase: Hashable {
     case handedOff
     case terminalNonGit
     case transientRetry
+    case retryExhausted
     case cancelled
     case superseded
 }
@@ -215,9 +216,10 @@ enum WorkspaceCodemapGraphIndexPhase: Hashable {
     case loadingEnvelopes
     case classifyingBatch
     case resolvingArtifacts
-    case writingManifestCheckpoint
+    case stagingManifestCache
     case publishingGraphChanges
     case checkpointed
+    case persistingManifestCache
     case suspendedBusy
     case budgetLimited
     case complete

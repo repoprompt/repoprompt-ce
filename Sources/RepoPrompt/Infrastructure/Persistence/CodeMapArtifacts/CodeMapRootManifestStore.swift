@@ -160,6 +160,59 @@ enum CodeMapRootManifestWriteResult: Equatable {
     case unchanged(manifestGeneration: UInt64)
 }
 
+#if DEBUG
+    private enum CodeMapRootManifestDebugOperationContext {
+        @TaskLocal static var operationID: UUID?
+    }
+
+    struct CodeMapRootManifestDebugAttemptMetrics: Hashable {
+        let ordinal: UInt64
+        let startedUptimeNanoseconds: UInt64
+        var completedUptimeNanoseconds: UInt64 = 0
+        var succeeded = false
+        var published = false
+        var inputSnapshotRecordCount: UInt64 = 0
+        var inputSnapshotEncodedByteCount: UInt64 = 0
+        var decodedByteCount: UInt64 = 0
+        var mutationCount: UInt64 = 0
+        var outputSnapshotRecordCount: UInt64 = 0
+        var outputSnapshotEncodedByteCount: UInt64 = 0
+        var loadReadDecodeDurationNanoseconds: UInt64 = 0
+        var mergeDurationNanoseconds: UInt64 = 0
+        var sortDurationNanoseconds: UInt64 = 0
+        var encodeDurationNanoseconds: UInt64 = 0
+        var temporaryWriteDurationNanoseconds: UInt64 = 0
+        var temporaryFileSyncDurationNanoseconds: UInt64 = 0
+        var atomicReplaceDurationNanoseconds: UInt64 = 0
+        var manifestDirectorySyncDurationNanoseconds: UInt64 = 0
+        var readbackDecodeDurationNanoseconds: UInt64 = 0
+        var totalDurationNanoseconds: UInt64 = 0
+    }
+
+    struct CodeMapRootManifestDebugPublicationMetrics: Equatable {
+        var attemptCount: UInt64 = 0
+        var successfulAttemptCount: UInt64 = 0
+        var publicationCount: UInt64 = 0
+        var inputSnapshotRecordVolume: UInt64 = 0
+        var inputSnapshotByteVolume: UInt64 = 0
+        var decodedByteVolume: UInt64 = 0
+        var mutationCountVolume: UInt64 = 0
+        var snapshotRecordVolume: UInt64 = 0
+        var snapshotByteVolume: UInt64 = 0
+        var loadReadDecodeDurationNanoseconds: UInt64 = 0
+        var mergeDurationNanoseconds: UInt64 = 0
+        var sortDurationNanoseconds: UInt64 = 0
+        var encodeDurationNanoseconds: UInt64 = 0
+        var temporaryWriteDurationNanoseconds: UInt64 = 0
+        var temporaryFileSyncDurationNanoseconds: UInt64 = 0
+        var atomicReplaceDurationNanoseconds: UInt64 = 0
+        var manifestDirectorySyncDurationNanoseconds: UInt64 = 0
+        var readbackDecodeDurationNanoseconds: UInt64 = 0
+        var totalDurationNanoseconds: UInt64 = 0
+        var lastAttempt: CodeMapRootManifestDebugAttemptMetrics?
+    }
+#endif
+
 struct CodeMapRootManifestAccounting: Equatable {
     let manifestCount: Int
     let manifestByteCount: UInt64
@@ -301,6 +354,16 @@ actor CodeMapRootManifestStore {
     private var decodedManifestCacheOrder: [ManifestCacheLocation] = []
     private var decodedManifestCacheByteCount: UInt64 = 0
     private var committedMaintenanceDebt: ManifestCommittedMaintenanceDebt = .idle
+    #if DEBUG
+        private var debugPublicationMetricsByNamespace: [
+            CodeMapRootManifestNamespace: CodeMapRootManifestDebugPublicationMetrics
+        ] = [:]
+        private var nextDebugPublicationAttemptOrdinal: UInt64 = 0
+        private var debugPublicationAttemptsByOperationID: [
+            UUID: CodeMapRootManifestDebugAttemptMetrics
+        ] = [:]
+        private var debugPublicationAttemptOperationOrder: [UUID] = []
+    #endif
 
     init(
         rootURL: URL,
@@ -345,6 +408,142 @@ actor CodeMapRootManifestStore {
         activeWriterSessions.insert(token)
         return token
     }
+
+    #if DEBUG
+        func debugPublicationMetrics(
+            namespace: CodeMapRootManifestNamespace
+        ) -> CodeMapRootManifestDebugPublicationMetrics {
+            debugPublicationMetricsByNamespace[namespace] ?? CodeMapRootManifestDebugPublicationMetrics()
+        }
+
+        func takeDebugPublicationAttempt(
+            operationID: UUID
+        ) -> CodeMapRootManifestDebugAttemptMetrics? {
+            guard let attempt = debugPublicationAttemptsByOperationID.removeValue(forKey: operationID) else {
+                return nil
+            }
+            debugPublicationAttemptOperationOrder.removeAll { $0 == operationID }
+            return attempt
+        }
+
+        private func nextDebugPublicationAttempt(
+            mutationCount: UInt64,
+            startedUptimeNanoseconds: UInt64
+        ) -> CodeMapRootManifestDebugAttemptMetrics {
+            nextDebugPublicationAttemptOrdinal = debugAddingSaturating(
+                nextDebugPublicationAttemptOrdinal,
+                1
+            )
+            var attempt = CodeMapRootManifestDebugAttemptMetrics(
+                ordinal: nextDebugPublicationAttemptOrdinal,
+                startedUptimeNanoseconds: startedUptimeNanoseconds
+            )
+            attempt.mutationCount = mutationCount
+            return attempt
+        }
+
+        private func recordDebugPublicationAttempt(
+            _ attempt: CodeMapRootManifestDebugAttemptMetrics,
+            namespace: CodeMapRootManifestNamespace,
+            operationID: UUID?
+        ) {
+            var aggregate = debugPublicationMetricsByNamespace[namespace]
+                ?? CodeMapRootManifestDebugPublicationMetrics()
+            aggregate.attemptCount = debugAddingSaturating(aggregate.attemptCount, 1)
+            if attempt.succeeded {
+                aggregate.successfulAttemptCount = debugAddingSaturating(
+                    aggregate.successfulAttemptCount,
+                    1
+                )
+            }
+            if attempt.published {
+                aggregate.publicationCount = debugAddingSaturating(aggregate.publicationCount, 1)
+                aggregate.snapshotRecordVolume = debugAddingSaturating(
+                    aggregate.snapshotRecordVolume,
+                    attempt.outputSnapshotRecordCount
+                )
+                aggregate.snapshotByteVolume = debugAddingSaturating(
+                    aggregate.snapshotByteVolume,
+                    attempt.outputSnapshotEncodedByteCount
+                )
+            }
+            aggregate.inputSnapshotRecordVolume = debugAddingSaturating(
+                aggregate.inputSnapshotRecordVolume,
+                attempt.inputSnapshotRecordCount
+            )
+            aggregate.inputSnapshotByteVolume = debugAddingSaturating(
+                aggregate.inputSnapshotByteVolume,
+                attempt.inputSnapshotEncodedByteCount
+            )
+            aggregate.decodedByteVolume = debugAddingSaturating(
+                aggregate.decodedByteVolume,
+                attempt.decodedByteCount
+            )
+            aggregate.mutationCountVolume = debugAddingSaturating(
+                aggregate.mutationCountVolume,
+                attempt.mutationCount
+            )
+            aggregate.loadReadDecodeDurationNanoseconds = debugAddingSaturating(
+                aggregate.loadReadDecodeDurationNanoseconds,
+                attempt.loadReadDecodeDurationNanoseconds
+            )
+            aggregate.mergeDurationNanoseconds = debugAddingSaturating(
+                aggregate.mergeDurationNanoseconds,
+                attempt.mergeDurationNanoseconds
+            )
+            aggregate.sortDurationNanoseconds = debugAddingSaturating(
+                aggregate.sortDurationNanoseconds,
+                attempt.sortDurationNanoseconds
+            )
+            aggregate.encodeDurationNanoseconds = debugAddingSaturating(
+                aggregate.encodeDurationNanoseconds,
+                attempt.encodeDurationNanoseconds
+            )
+            aggregate.temporaryWriteDurationNanoseconds = debugAddingSaturating(
+                aggregate.temporaryWriteDurationNanoseconds,
+                attempt.temporaryWriteDurationNanoseconds
+            )
+            aggregate.temporaryFileSyncDurationNanoseconds = debugAddingSaturating(
+                aggregate.temporaryFileSyncDurationNanoseconds,
+                attempt.temporaryFileSyncDurationNanoseconds
+            )
+            aggregate.atomicReplaceDurationNanoseconds = debugAddingSaturating(
+                aggregate.atomicReplaceDurationNanoseconds,
+                attempt.atomicReplaceDurationNanoseconds
+            )
+            aggregate.manifestDirectorySyncDurationNanoseconds = debugAddingSaturating(
+                aggregate.manifestDirectorySyncDurationNanoseconds,
+                attempt.manifestDirectorySyncDurationNanoseconds
+            )
+            aggregate.readbackDecodeDurationNanoseconds = debugAddingSaturating(
+                aggregate.readbackDecodeDurationNanoseconds,
+                attempt.readbackDecodeDurationNanoseconds
+            )
+            aggregate.totalDurationNanoseconds = debugAddingSaturating(
+                aggregate.totalDurationNanoseconds,
+                attempt.totalDurationNanoseconds
+            )
+            aggregate.lastAttempt = attempt
+            debugPublicationMetricsByNamespace[namespace] = aggregate
+            if let operationID {
+                debugPublicationAttemptsByOperationID[operationID] = attempt
+                debugPublicationAttemptOperationOrder.append(operationID)
+                while debugPublicationAttemptOperationOrder.count > 512 {
+                    let evicted = debugPublicationAttemptOperationOrder.removeFirst()
+                    debugPublicationAttemptsByOperationID.removeValue(forKey: evicted)
+                }
+            }
+        }
+
+        private func debugAddingSaturating(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
+
+        private func debugElapsedNanoseconds(from start: UInt64, to end: UInt64) -> UInt64 {
+            end >= start ? end - start : 0
+        }
+    #endif
 
     func decodeFailureAccounting() -> CodeMapRootManifestDecodeFailureAccounting {
         CodeMapRootManifestDecodeFailureAccounting(
@@ -718,6 +917,31 @@ actor CodeMapRootManifestStore {
         )
     }
 
+    #if DEBUG
+        func mergeCurrentManifestDebug(
+            namespace: CodeMapRootManifestNamespace,
+            authority: CodeMapRootManifestAuthority,
+            writerAuthority: CodeMapRootManifestWriterAuthorityToken,
+            replacingPreviouslyObservedAuthority predecessor: CodeMapRootManifestAuthority?,
+            upserting records: [CodeMapRootManifestRecord],
+            removing repositoryRelativePaths: Set<String>,
+            lastAccessEpochSeconds: UInt64,
+            operationID: UUID
+        ) async throws -> CodeMapRootManifestWriteResult {
+            try await CodeMapRootManifestDebugOperationContext.$operationID.withValue(operationID) {
+                try await mergeCurrentManifest(
+                    namespace: namespace,
+                    authority: authority,
+                    writerAuthority: writerAuthority,
+                    replacingPreviouslyObservedAuthority: predecessor,
+                    upserting: records,
+                    removing: repositoryRelativePaths,
+                    lastAccessEpochSeconds: lastAccessEpochSeconds
+                )
+            }
+        }
+    #endif
+
     private func publishCurrentManifest(
         namespace: CodeMapRootManifestNamespace,
         authority: CodeMapRootManifestAuthority,
@@ -729,6 +953,29 @@ actor CodeMapRootManifestStore {
         mergeExisting: Bool = false,
         removingRepositoryRelativePaths: Set<String> = []
     ) async throws -> CodeMapRootManifestWriteResult {
+        #if DEBUG
+            let debugAttemptStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+            let debugMutationCount = debugAddingSaturating(
+                UInt64(records.count),
+                UInt64(removingRepositoryRelativePaths.count)
+            )
+            var debugAttempt = nextDebugPublicationAttempt(
+                mutationCount: debugMutationCount,
+                startedUptimeNanoseconds: debugAttemptStartedUptimeNanoseconds
+            )
+            defer {
+                debugAttempt.completedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+                debugAttempt.totalDurationNanoseconds = debugElapsedNanoseconds(
+                    from: debugAttemptStartedUptimeNanoseconds,
+                    to: debugAttempt.completedUptimeNanoseconds
+                )
+                recordDebugPublicationAttempt(
+                    debugAttempt,
+                    namespace: namespace,
+                    operationID: CodeMapRootManifestDebugOperationContext.operationID
+                )
+            }
+        #endif
         guard namespace.isCurrent else {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
@@ -754,7 +1001,23 @@ actor CodeMapRootManifestStore {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
         let name = namespace.storageDigestHex
+        #if DEBUG
+            let debugLoadStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        #endif
         let existing = try inspectExisting(shard: shard, namespace: namespace, name: name)
+        #if DEBUG
+            debugAttempt.loadReadDecodeDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugLoadStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+            debugAttempt.inputSnapshotRecordCount = UInt64(existing.snapshot?.records.count ?? 0)
+            debugAttempt.inputSnapshotEncodedByteCount = existing.identity.map {
+                $0.size > 0 ? UInt64($0.size) : 0
+            } ?? 0
+            debugAttempt.decodedByteCount = existing.snapshot == nil
+                ? 0
+                : debugAttempt.inputSnapshotEncodedByteCount
+        #endif
         if let expectedSnapshot {
             guard let current = existing.snapshot,
                   current.manifestGeneration == expectedSnapshot.manifestGeneration,
@@ -776,7 +1039,13 @@ actor CodeMapRootManifestStore {
             }
         }
         let sortedRecords: [CodeMapRootManifestRecord]
+        #if DEBUG
+            var debugSortStartedUptimeNanoseconds: UInt64 = 0
+        #endif
         if mergeExisting {
+            #if DEBUG
+                let debugMergeStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+            #endif
             var recordsByPath: [String: CodeMapRootManifestRecord] = [:]
             if let snapshot = existing.snapshot, snapshot.authority == authority {
                 recordsByPath = Dictionary(
@@ -789,14 +1058,31 @@ actor CodeMapRootManifestStore {
             for record in records {
                 recordsByPath[record.repositoryRelativePath] = record
             }
+            #if DEBUG
+                debugAttempt.mergeDurationNanoseconds = debugElapsedNanoseconds(
+                    from: debugMergeStartedUptimeNanoseconds,
+                    to: DispatchTime.now().uptimeNanoseconds
+                )
+                debugSortStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+            #endif
             sortedRecords = recordsByPath.values.sorted {
                 $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
             }
         } else {
+            #if DEBUG
+                debugSortStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+            #endif
             sortedRecords = records.sorted {
                 $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
             }
         }
+        #if DEBUG
+            debugAttempt.sortDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugSortStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+            debugAttempt.outputSnapshotRecordCount = UInt64(sortedRecords.count)
+        #endif
         guard sortedRecords.count <= policy.maximumRecordCountPerManifest,
               sortedRecords.count <= CodeMapRootManifestCodec.maximumRecordCount
         else {
@@ -820,6 +1106,10 @@ actor CodeMapRootManifestStore {
            semanticUnchanged,
            current.lastAccessEpochSeconds == effectiveAccessEpoch
         {
+            #if DEBUG
+                debugAttempt.succeeded = true
+                debugAttempt.outputSnapshotEncodedByteCount = debugAttempt.inputSnapshotEncodedByteCount
+            #endif
             return .unchanged(manifestGeneration: current.manifestGeneration)
         }
         let nextGeneration: UInt64 = if semanticUnchanged, let previous = existing.snapshot?.manifestGeneration {
@@ -836,7 +1126,17 @@ actor CodeMapRootManifestStore {
             lastAccessEpochSeconds: effectiveAccessEpoch,
             records: sortedRecords
         )
+        #if DEBUG
+            let debugEncodeStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        #endif
         let encoded = try CodeMapRootManifestCodec.encode(snapshot: snapshot)
+        #if DEBUG
+            debugAttempt.encodeDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugEncodeStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+            debugAttempt.outputSnapshotEncodedByteCount = UInt64(encoded.count)
+        #endif
         guard UInt64(encoded.count) <= policy.maximumManifestByteCount else {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
@@ -895,12 +1195,30 @@ actor CodeMapRootManifestStore {
             expectedMode: Self.fileMode
         )
         guard initial.size == 0 else { throw CodeMapRootManifestStoreError.insecureLeaf }
+        #if DEBUG
+            let debugTemporaryWriteStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        #endif
         try Self.writeAll(descriptor, data: encoded)
+        #if DEBUG
+            debugAttempt.temporaryWriteDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugTemporaryWriteStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+        #endif
         if hooks.faultAction(.afterTemporaryWrite) == .simulateProcessTermination {
             temporaryExists = false
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterTemporaryWrite)
         }
+        #if DEBUG
+            let debugTemporarySyncStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        #endif
         try Self.synchronize(descriptor, operation: "temporary-fsync")
+        #if DEBUG
+            debugAttempt.temporaryFileSyncDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugTemporarySyncStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+        #endif
         if hooks.faultAction(.afterTemporaryFileSync) == .simulateProcessTermination {
             temporaryExists = false
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterTemporaryFileSync)
@@ -929,9 +1247,18 @@ actor CodeMapRootManifestStore {
         } else if try Self.fileIdentityAt(parent: shard, name: name) != nil {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
+        #if DEBUG
+            let debugAtomicReplaceStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        #endif
         guard renameat(shard.rawValue, temporaryName, shard.rawValue, name) == 0 else {
             throw Self.ioError("manifest-publish")
         }
+        #if DEBUG
+            debugAttempt.atomicReplaceDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugAtomicReplaceStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+        #endif
         temporaryExists = false
         if hooks.faultAction(.afterManifestRename) == .simulateProcessTermination {
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterManifestRename)
@@ -952,7 +1279,16 @@ actor CodeMapRootManifestStore {
         guard completed.sameObject(as: published), published.size == completed.size else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
+        #if DEBUG
+            let debugDirectorySyncStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        #endif
         try Self.synchronize(shard.rawValue, operation: "manifest-directory-fsync")
+        #if DEBUG
+            debugAttempt.manifestDirectorySyncDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugDirectorySyncStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+        #endif
         if hooks.faultAction(.afterManifestDirectorySync) == .simulateProcessTermination {
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterManifestDirectorySync)
         }
@@ -969,6 +1305,9 @@ actor CodeMapRootManifestStore {
         else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
+        #if DEBUG
+            let debugReadbackStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        #endif
         let readBack = try Self.readExactly(descriptor, byteCount: encoded.count)
         guard try CodeMapRootManifestCodec.decode(
             readBack,
@@ -977,6 +1316,13 @@ actor CodeMapRootManifestStore {
         ) == snapshot else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
+        #if DEBUG
+            debugAttempt.readbackDecodeDurationNanoseconds = debugElapsedNanoseconds(
+                from: debugReadbackStartedUptimeNanoseconds,
+                to: DispatchTime.now().uptimeNanoseconds
+            )
+            debugAttempt.published = true
+        #endif
         try cacheDecodedManifest(
             at: ManifestCacheLocation(shard: namespace.shard, digest: name),
             identity: committed,
@@ -992,6 +1338,9 @@ actor CodeMapRootManifestStore {
                 committedIdentity: committed
             )
         }
+        #if DEBUG
+            debugAttempt.succeeded = true
+        #endif
         if semanticUnchanged {
             return .unchanged(manifestGeneration: nextGeneration)
         }
@@ -1063,6 +1412,9 @@ actor CodeMapRootManifestStore {
         }
         if removed {
             regenerationFailures.removeValue(forKey: name)
+            #if DEBUG
+                debugPublicationMetricsByNamespace.removeValue(forKey: namespace)
+            #endif
         }
         return removed
     }
