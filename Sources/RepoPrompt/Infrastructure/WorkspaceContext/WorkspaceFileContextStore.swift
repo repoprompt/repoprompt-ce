@@ -14543,7 +14543,9 @@ actor WorkspaceFileContextStore {
                 fileID: $0.identity.fileID
             )
         }
-        guard let supportedCandidateCountThroughPage = UInt64(exactly: nextIndex) else {
+        guard let supportedCandidateCountThroughPage = UInt64(exactly: nextIndex),
+              let projectedSupportedCandidateTotal = UInt64(exactly: current.shard.projectionFiles.count)
+        else {
             return .unavailable(.catalogUnavailable)
         }
         switch WorkspaceCodemapGraphIndexCatalogPage.validated(
@@ -14552,7 +14554,8 @@ actor WorkspaceFileContextStore {
             entries: entries,
             nextCursor: nextCursor,
             isEnd: isEnd,
-            supportedCandidateCountThroughPage: supportedCandidateCountThroughPage
+            supportedCandidateCountThroughPage: supportedCandidateCountThroughPage,
+            projectedSupportedCandidateTotal: projectedSupportedCandidateTotal
         ) {
         case let .success(page):
             return .page(page)

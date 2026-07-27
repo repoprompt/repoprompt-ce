@@ -241,6 +241,12 @@ actor WorkspaceCodemapBindingEngine {
         let lease: CodeMapArtifactLease?
     }
 
+    private struct ManifestAdoptionAuthorityCandidate {
+        let record: CodeMapRootManifestRecord
+        let candidate: WorkspaceCodemapManifestBindingCandidate
+        let loadedPath: String
+    }
+
     private struct PendingManifestChange {
         let revision: UInt64
         let workItemID: UUID
@@ -1979,11 +1985,15 @@ actor WorkspaceCodemapBindingEngine {
                 )
             ).get()
         }
+        // The projection shard fixes the authoritative denominator before page one. Later
+        // publications for the same token may advance slots, but cannot change that total.
         guard pendingSlots.count == page.entries.count,
               await publishGraphIndexSlots(
                   rootEpoch: rootEpoch,
                   catalogToken: page.token,
                   slots: pendingSlots,
+                  projectedSupportedCandidateTotal: page.projectedSupportedCandidateTotal,
+                  catalogSealed: true,
                   enumerationFinished: page.isEnd && page.entries.isEmpty
               )
         else { return .superseded }
@@ -2056,6 +2066,47 @@ actor WorkspaceCodemapBindingEngine {
             let classificationsByPath = Dictionary(
                 uniqueKeysWithValues: classifications.classifications.map { ($0.relativePath, $0) }
             )
+            let authorityCandidates = misses.compactMap { candidate
+                -> (UUID, WorkspaceCodemapSourceAuthorityRequest)? in
+                guard let classification = classificationsByPath[
+                    candidate.identity.standardizedRelativePath
+                ], let repositoryRelativePath = classification.repositoryRelativePath else { return nil }
+                switch classification.outcome {
+                case .oidEligible, .requiresValidatedWorktreeBytes:
+                    break
+                case .securityExcluded, .unsupported, .unavailable:
+                    return nil
+                }
+                let currentPathGeneration = session.pathGenerations[
+                    candidate.identity.standardizedRelativePath
+                ] ?? afterPageRead.ingressGeneration
+                return (
+                    candidate.identity.fileID,
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: repositoryRelativePath,
+                        observedPathGeneration: candidate.pathGeneration,
+                        currentPathGeneration: currentPathGeneration,
+                        observedIngressGeneration: afterPageRead.ingressGeneration,
+                        currentIngressGeneration: session.registration.ingressGeneration
+                    )
+                )
+            }
+            let issuedAuthorities = await capabilityService.makeSourceAuthorities(
+                capability: session.capability,
+                observedRootEpoch: rootEpoch,
+                observedRepositoryAuthority: afterPageRead.repositoryAuthority,
+                candidates: authorityCandidates.map(\.1)
+            )
+            guard !Task.isCancelled,
+                  issuedAuthorities.count == authorityCandidates.count,
+                  currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil
+            else { return .cancelled }
+            let sourceAuthorityByFileID = Dictionary(uniqueKeysWithValues: zip(
+                authorityCandidates.map(\.0),
+                issuedAuthorities
+            ).compactMap { pair in
+                pair.1.map { (pair.0, $0) }
+            })
             guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .resolvingArtifacts) else {
                 return .cancelled
             }
@@ -2092,7 +2143,8 @@ actor WorkspaceCodemapBindingEngine {
                             rootEpoch: rootEpoch,
                             candidate: candidate,
                             pipelineIdentity: pipelineIdentity,
-                            classification: classification
+                            classification: classification,
+                            sourceAuthority: sourceAuthorityByFileID[candidate.identity.fileID]
                         )
                         return IndexedGraphIndexCandidateResolution(
                             index: index,
@@ -2125,7 +2177,8 @@ actor WorkspaceCodemapBindingEngine {
                             rootEpoch: rootEpoch,
                             candidate: candidate,
                             pipelineIdentity: pipelineIdentity,
-                            classification: classification
+                            classification: classification,
+                            sourceAuthority: sourceAuthorityByFileID[candidate.identity.fileID]
                         )
                         return IndexedGraphIndexCandidateResolution(
                             index: index,
@@ -2664,7 +2717,8 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         candidate: WorkspaceCodemapGraphIndexCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity,
-        classification: GitBlobIdentityClassification
+        classification: GitBlobIdentityClassification,
+        sourceAuthority: WorkspaceCodemapSourceAuthorityToken?
     ) async -> GraphIndexCandidateResolution {
         guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
@@ -2708,18 +2762,14 @@ actor WorkspaceCodemapBindingEngine {
             break
         }
 
-        let sourceAuthority = await capabilityService.makeSourceAuthority(
-            capability: session.capability,
-            observedRootEpoch: rootEpoch,
-            observedRepositoryAuthority: job.repositoryAuthority,
-            candidateRepositoryRelativePath: repositoryRelativePath,
-            observedPathGeneration: candidate.pathGeneration,
-            currentPathGeneration: candidate.pathGeneration,
-            observedIngressGeneration: job.ingressGeneration,
-            currentIngressGeneration: session.registration.ingressGeneration
-        )
         guard !Task.isCancelled,
               let sourceAuthority,
+              sourceAuthority.isFactoryValidated,
+              sourceAuthority.rootEpoch == rootEpoch,
+              sourceAuthority.repositoryAuthority == job.repositoryAuthority,
+              sourceAuthority.standardizedRepositoryRelativePath == repositoryRelativePath,
+              sourceAuthority.pathGeneration == candidate.pathGeneration,
+              sourceAuthority.ingressGeneration == job.ingressGeneration,
               graphIndexCandidateIsCurrent(
                   jobID: jobID,
                   rootEpoch: rootEpoch,
@@ -3181,6 +3231,8 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
         slots: [WorkspaceCodemapGraphSlot],
+        projectedSupportedCandidateTotal: UInt64? = nil,
+        catalogSealed: Bool = false,
         enumerationFinished: Bool
     ) async -> Bool {
         guard let graph = selectionGraphsByRootEpoch[rootEpoch] else { return false }
@@ -3188,6 +3240,8 @@ actor WorkspaceCodemapBindingEngine {
             rootEpoch: rootEpoch,
             catalogToken: catalogToken,
             slots: slots,
+            projectedSupportedCandidateTotal: projectedSupportedCandidateTotal,
+            catalogSealed: catalogSealed,
             enumerationFinished: enumerationFinished,
             reconciliationFence: { fileIDs, reason in
                 await graph.fenceFiles(fileIDs: fileIDs, reason: reason)
@@ -3216,6 +3270,7 @@ actor WorkspaceCodemapBindingEngine {
                   rootEpoch: rootEpoch,
                   catalogToken: generation.catalogToken,
                   slots: slots,
+                  catalogSealed: enumerationFinished,
                   enumerationFinished: enumerationFinished
               ),
               let overlaySnapshot = await overlay.snapshot(rootEpoch: rootEpoch),
@@ -3957,40 +4012,53 @@ actor WorkspaceCodemapBindingEngine {
 
         var prepared: [PreparedManifestAdoption] = []
         var automaticSelectionCandidateRecords: [String: CodeMapRootManifestRecord] = [:]
-        for record in snapshot.records {
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
+        let adoptionBatchSize = policy.maximumGraphIndexBatchCandidateCount
+        for batchStart in stride(from: 0, to: snapshot.records.count, by: adoptionBatchSize) {
+            let batchEnd = min(snapshot.records.count, batchStart + adoptionBatchSize)
+            var batchCandidates: [ManifestAdoptionAuthorityCandidate] = []
+            batchCandidates.reserveCapacity(batchEnd - batchStart)
+
+            for record in snapshot.records[batchStart ..< batchEnd] {
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
+                guard record.locatorIdentity.repositoryNamespace == initial.capability.repositoryNamespace,
+                      record.locatorIdentity.blobOID.objectFormat == initial.capability.objectFormat,
+                      record.locatorIdentity.pipelineIdentity == initialPipeline.pipelineIdentity,
+                      let loadedPath = loadedRootPath(
+                          repositoryRelativePath: record.repositoryRelativePath,
+                          prefix: initial.capability.repositoryRelativeLoadedRootPrefix
+                      ), !loadedPath.isEmpty
+                else { continue }
+                let candidate = await catalogClient.resolveManifestBinding(rootEpoch, loadedPath)
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
+                guard let candidate,
+                      candidate.identity.rootID == rootEpoch.rootID,
+                      candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
+                      candidate.identity.standardizedRootPath ==
+                      initial.registration.capabilityRequest.loadedRootURL.path,
+                      candidate.identity.standardizedRelativePath == loadedPath,
+                      candidate.ingressGeneration == initial.registration.ingressGeneration,
+                      candidate.requestGeneration == candidate.pathGeneration,
+                      candidate.pathGeneration == record.bindingGeneration
+                else { continue }
+                batchCandidates.append(ManifestAdoptionAuthorityCandidate(
+                    record: record,
+                    candidate: candidate,
+                    loadedPath: loadedPath
+                ))
             }
-            guard record.locatorIdentity.repositoryNamespace == initial.capability.repositoryNamespace,
-                  record.locatorIdentity.blobOID.objectFormat == initial.capability.objectFormat,
-                  record.locatorIdentity.pipelineIdentity == initialPipeline.pipelineIdentity,
-                  let loadedPath = loadedRootPath(
-                      repositoryRelativePath: record.repositoryRelativePath,
-                      prefix: initial.capability.repositoryRelativeLoadedRootPrefix
-                  ), !loadedPath.isEmpty
-            else { continue }
-            let candidate = await catalogClient.resolveManifestBinding(rootEpoch, loadedPath)
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
-            }
-            guard let candidate,
-                  candidate.identity.rootID == rootEpoch.rootID,
-                  candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
-                  candidate.identity.standardizedRootPath ==
-                  initial.registration.capabilityRequest.loadedRootURL.path,
-                  candidate.identity.standardizedRelativePath == loadedPath,
-                  candidate.ingressGeneration == initial.registration.ingressGeneration,
-                  candidate.requestGeneration == candidate.pathGeneration,
-                  candidate.pathGeneration == record.bindingGeneration
-            else { continue }
+            guard !batchCandidates.isEmpty else { continue }
 
             let classificationBatch = await identityService.classify(
                 workspaceRoot: initial.registration.capabilityRequest.loadedRootURL,
-                relativePaths: [loadedPath]
+                relativePaths: batchCandidates.map(\.loadedPath)
             )
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await closePreparedManifestAdoptions(prepared)
@@ -3998,105 +4066,126 @@ actor WorkspaceCodemapBindingEngine {
                 return .superseded
             }
             guard classificationBatch.failure == nil,
-                  classificationBatch.classifications.count == 1,
-                  let classification = classificationBatch.classifications.first,
-                  manifestClassificationMatches(
-                      classification,
-                      record: record,
-                      candidate: candidate,
-                      session: initial
-                  )
+                  classificationBatch.classifications.count == batchCandidates.count
             else { continue }
 
-            let sourceAuthority = await capabilityService.makeSourceAuthority(
+            var authorityCandidates: [ManifestAdoptionAuthorityCandidate] = []
+            for (classification, candidate) in zip(
+                classificationBatch.classifications,
+                batchCandidates
+            ) where manifestClassificationMatches(
+                classification,
+                record: candidate.record,
+                candidate: candidate.candidate,
+                session: initial
+            ) {
+                authorityCandidates.append(candidate)
+            }
+            guard !authorityCandidates.isEmpty else { continue }
+
+            let sourceAuthorities = await capabilityService.makeSourceAuthorities(
                 capability: initial.capability,
                 observedRootEpoch: rootEpoch,
                 observedRepositoryAuthority: initial.capability.repositoryAuthority,
-                candidateRepositoryRelativePath: record.repositoryRelativePath,
-                observedPathGeneration: candidate.pathGeneration,
-                currentPathGeneration: candidate.pathGeneration,
-                observedIngressGeneration: candidate.ingressGeneration,
-                currentIngressGeneration: initial.registration.ingressGeneration
+                candidates: authorityCandidates.map { candidate in
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: candidate.record.repositoryRelativePath,
+                        observedPathGeneration: candidate.candidate.pathGeneration,
+                        currentPathGeneration: candidate.candidate.pathGeneration,
+                        observedIngressGeneration: candidate.candidate.ingressGeneration,
+                        currentIngressGeneration: initial.registration.ingressGeneration
+                    )
+                }
             )
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch),
+                  sourceAuthorities.count == authorityCandidates.count
+            else {
                 await closePreparedManifestAdoptions(prepared)
                 releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                 return .superseded
             }
-            guard let sourceAuthority else { continue }
-            automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
 
-            let coordinatorResult = try? await runtime.coordinator.resolve(
-                CodeMapArtifactBuildRequest(
-                    ownerID: rootEpoch.rootLifetimeID,
-                    priority: .explicit,
-                    target: .artifactKey(record.artifactKey)
+            for (authorityCandidate, issuedAuthority) in zip(
+                authorityCandidates,
+                sourceAuthorities
+            ) {
+                guard let sourceAuthority = issuedAuthority else { continue }
+                let record = authorityCandidate.record
+                let candidate = authorityCandidate.candidate
+                automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
+
+                let coordinatorResult = try? await runtime.coordinator.resolve(
+                    CodeMapArtifactBuildRequest(
+                        ownerID: rootEpoch.rootLifetimeID,
+                        priority: .explicit,
+                        target: .artifactKey(record.artifactKey)
+                    )
                 )
-            )
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
-            }
-            guard case let .ready(resolution) = coordinatorResult,
-                  let association = try? VerifiedGitBlobCodeMapLocatorAssociation.revalidatePersisted(
-                      identity: record.locatorIdentity,
-                      artifactKey: record.artifactKey,
-                      casHandle: resolution.handle
-                  ), let verifiedRecord = try? makeManifestRecord(
-                      session: initial,
-                      pipeline: initialPipeline,
-                      repositoryRelativePath: record.repositoryRelativePath,
-                      gitMode: record.gitMode,
-                      association: association,
-                      bindingGeneration: record.bindingGeneration
-                  )
-            else { continue }
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
+                guard case let .ready(resolution) = coordinatorResult,
+                      let association = try? VerifiedGitBlobCodeMapLocatorAssociation.revalidatePersisted(
+                          identity: record.locatorIdentity,
+                          artifactKey: record.artifactKey,
+                          casHandle: resolution.handle
+                      ), let verifiedRecord = try? makeManifestRecord(
+                          session: initial,
+                          pipeline: initialPipeline,
+                          repositoryRelativePath: record.repositoryRelativePath,
+                          gitMode: record.gitMode,
+                          association: association,
+                          bindingGeneration: record.bindingGeneration
+                      )
+                else { continue }
 
-            guard record.outcome == .ready || record.outcome == .readyNoSymbols else {
+                guard record.outcome == .ready || record.outcome == .readyNoSymbols else {
+                    prepared.append(PreparedManifestAdoption(
+                        record: verifiedRecord,
+                        candidate: candidate,
+                        sourceAuthority: sourceAuthority,
+                        association: association,
+                        lease: nil
+                    ))
+                    continue
+                }
+                guard reserveAdoptionLease(
+                    relativePath: candidate.identity.standardizedRelativePath,
+                    bytes: resolution.handle.estimatedResidentByteCount,
+                    scope: pipelineScope,
+                    adoptionID: adoptionID
+                ) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    recordBusy(rootEpoch)
+                    return .retryable
+                }
+                guard let lease = try? await runtime.coordinator.acquireLease(for: resolution) else {
+                    releaseAdoptionLeaseReservation(
+                        relativePath: candidate.identity.standardizedRelativePath,
+                        scope: pipelineScope,
+                        adoptionID: adoptionID
+                    )
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .retryable
+                }
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await lease.close()
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
                 prepared.append(PreparedManifestAdoption(
                     record: verifiedRecord,
                     candidate: candidate,
                     sourceAuthority: sourceAuthority,
                     association: association,
-                    lease: nil
+                    lease: lease
                 ))
-                continue
             }
-            guard reserveAdoptionLease(
-                relativePath: candidate.identity.standardizedRelativePath,
-                bytes: resolution.handle.estimatedResidentByteCount,
-                scope: pipelineScope,
-                adoptionID: adoptionID
-            ) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                recordBusy(rootEpoch)
-                return .retryable
-            }
-            guard let lease = try? await runtime.coordinator.acquireLease(for: resolution) else {
-                releaseAdoptionLeaseReservation(
-                    relativePath: candidate.identity.standardizedRelativePath,
-                    scope: pipelineScope,
-                    adoptionID: adoptionID
-                )
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .retryable
-            }
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await lease.close()
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
-            }
-            prepared.append(PreparedManifestAdoption(
-                record: verifiedRecord,
-                candidate: candidate,
-                sourceAuthority: sourceAuthority,
-                association: association,
-                lease: lease
-            ))
         }
 
         guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {

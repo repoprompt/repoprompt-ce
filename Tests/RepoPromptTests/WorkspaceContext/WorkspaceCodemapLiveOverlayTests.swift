@@ -3076,6 +3076,88 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
     }
 
+    func testProjectedCatalogTotalDrivesDeterminateProgressAcrossSevenPages() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Seed.swift": "struct Seed {}"]
+        )
+        defer { fixture.cleanup() }
+        let token = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let identities = try (0 ..< 385).map { index in
+            let path = String(format: "Generated/%03d.swift", index)
+            return try XCTUnwrap(WorkspaceCodemapArtifactBindingIdentity(
+                rootID: fixture.rootEpoch.rootID,
+                rootLifetimeID: fixture.rootEpoch.rootLifetimeID,
+                fileID: UUID(),
+                standardizedRootPath: fixture.authority.loadedRoot.path,
+                standardizedRelativePath: path,
+                standardizedFullPath: fixture.authority.loadedRoot.appendingPathComponent(path).path
+            ))
+        }
+        func slots(
+            for identities: ArraySlice<WorkspaceCodemapArtifactBindingIdentity>,
+            state: WorkspaceCodemapGraphSlotState
+        ) throws -> [WorkspaceCodemapGraphSlot] {
+            try identities.map { identity in
+                try WorkspaceCodemapGraphSlot.validated(
+                    rootEpoch: fixture.rootEpoch,
+                    identity: identity,
+                    requestGeneration: 1,
+                    pathGeneration: 1,
+                    pipelineIdentity: fixture.namespace.pipelineIdentity,
+                    state: state,
+                    diagnostics: .init(contributionDigest: nil, source: .graphIndex)
+                ).get()
+            }
+        }
+
+        let firstPage = identities[0 ..< 64]
+        let firstPagePublished = try await fixture.overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: slots(for: firstPage, state: .pending),
+            projectedSupportedCandidateTotal: 385,
+            enumerationFinished: false
+        )
+        XCTAssertTrue(firstPagePublished)
+        guard case let .checkpoint(first) = await fixture.overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected first-page checkpoint.")
+        }
+        XCTAssertTrue(first.coverage.isCatalogSealed)
+        XCTAssertEqual(first.coverage.supportedCount, 385)
+        XCTAssertEqual(first.coverage.classifiedCount, 0)
+        XCTAssertEqual(first.coverage.pendingCount, 385)
+
+        for pageStart in stride(from: 0, to: identities.count, by: 64) {
+            let pageEnd = min(pageStart + 64, identities.count)
+            let isEnd = pageEnd == identities.count
+            let pagePublished = try await fixture.overlay.publishGraphIndexSlots(
+                rootEpoch: fixture.rootEpoch,
+                catalogToken: token,
+                slots: slots(
+                    for: identities[pageStart ..< pageEnd],
+                    state: .terminalExcluded(.nonRegular)
+                ),
+                enumerationFinished: isEnd
+            )
+            XCTAssertTrue(pagePublished)
+            guard case let .checkpoint(checkpoint) = await fixture.overlay.graphCheckpoint(
+                rootEpoch: fixture.rootEpoch
+            ) else { return XCTFail("Expected page checkpoint.") }
+            XCTAssertEqual(checkpoint.coverage.supportedCount, 385)
+            XCTAssertEqual(checkpoint.coverage.classifiedCount, UInt64(pageEnd))
+            XCTAssertEqual(checkpoint.coverage.pendingCount, UInt64(385 - pageEnd))
+            XCTAssertEqual(checkpoint.coverage.isComplete, isEnd)
+        }
+    }
+
     func testChangedSetOverflowForcesSuccessiveAuthoritativeResyncs() async throws {
         let graphPolicy = try XCTUnwrap(WorkspaceCodemapGraphPolicy(
             maximumChangedSetFileIDCount: 1
@@ -3134,6 +3216,23 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         guard case let .checkpoint(initial) = await overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
             return XCTFail("Expected initial checkpoint.")
         }
+        XCTAssertTrue(initial.coverage.isCatalogSealed)
+        XCTAssertTrue(initial.coverage.isComplete)
+
+        let beganSealResetReconciliation = await overlay.beginGraphReconciliation(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(beganSealResetReconciliation)
+        guard case let .checkpoint(reconciling) = await overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected reconciliation checkpoint.")
+        }
+        XCTAssertFalse(reconciling.coverage.isCatalogSealed)
+        XCTAssertFalse(reconciling.coverage.isComplete)
+        let resealedAfterReconciliation = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: token,
+            slots: [a1, b1],
+            enumerationFinished: true
+        )
+        XCTAssertTrue(resealedAfterReconciliation)
 
         let a2 = try await ready("A.swift", fileID: aID, generation: 2)
         let b2 = try await ready("B.swift", fileID: bID, generation: 2)
@@ -3143,13 +3242,18 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
             slots: [a2],
             enumerationFinished: false
         )
+        XCTAssertTrue(firstA)
+        guard case let .checkpoint(classifying) = await overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected classification checkpoint.")
+        }
+        XCTAssertTrue(classifying.coverage.isCatalogSealed)
+        XCTAssertFalse(classifying.coverage.isComplete)
         let firstB = await overlay.publishGraphIndexSlots(
             rootEpoch: fixture.rootEpoch,
             catalogToken: token,
             slots: [b2],
             enumerationFinished: true
         )
-        XCTAssertTrue(firstA)
         XCTAssertTrue(firstB)
         guard case let .resync(firstOverflow, firstGeneration) = await overlay.graphChanges(
             rootEpoch: fixture.rootEpoch,
@@ -3179,6 +3283,27 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         ) else { return XCTFail("A later changed-set overflow must force another resync.") }
         XCTAssertGreaterThan(secondGeneration, firstGeneration)
         XCTAssertEqual(Set(secondOverflow.slots.map(\.requestGeneration)), [3])
+
+        let replacementToken = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: fixture.rootEpoch,
+            topologyGeneration: 2,
+            appliedIndexGeneration: 2,
+            catalogGeneration: fixture.catalogGeneration,
+            ingressGeneration: 2,
+            graphIndexInvalidationGeneration: 2
+        )
+        let replacementPublished = await overlay.publishGraphIndexSlots(
+            rootEpoch: fixture.rootEpoch,
+            catalogToken: replacementToken,
+            slots: [a3],
+            enumerationFinished: false
+        )
+        XCTAssertTrue(replacementPublished)
+        guard case let .checkpoint(replaced) = await overlay.graphCheckpoint(rootEpoch: fixture.rootEpoch) else {
+            return XCTFail("Expected replacement-token checkpoint.")
+        }
+        XCTAssertFalse(replaced.coverage.isCatalogSealed)
+        XCTAssertFalse(replaced.coverage.isComplete)
     }
 
     private func makeRootFixture(
