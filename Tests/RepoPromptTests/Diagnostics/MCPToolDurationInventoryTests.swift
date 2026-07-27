@@ -83,7 +83,11 @@ import XCTest
                 XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 12, caseLabel)
                 XCTAssertEqual(
                     MCPToolDurationInventory.detachAndSettleToolNames,
-                    [MCPWindowToolName.getCodeStructure],
+                    [
+                        MCPWindowToolName.getCodeStructure,
+                        MCPWindowToolName.getFileTree,
+                        MCPWindowToolName.readFile
+                    ],
                     caseLabel
                 )
                 XCTAssertTrue(
@@ -237,7 +241,11 @@ import XCTest
                 )
                 XCTAssertEqual(
                     payload["detach_and_settle_tools"] as? [String],
-                    [MCPWindowToolName.getCodeStructure],
+                    [
+                        MCPWindowToolName.getCodeStructure,
+                        MCPWindowToolName.getFileTree,
+                        MCPWindowToolName.readFile
+                    ],
                     caseLabel
                 )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
