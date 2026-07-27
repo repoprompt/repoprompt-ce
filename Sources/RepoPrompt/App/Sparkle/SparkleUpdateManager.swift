@@ -402,10 +402,14 @@ final class SparkleUpdaterManager: ObservableObject {
         } ?? isVersion(appcastInfo.latestVersion, newerThan: currentVersion)
 
         if isNewer {
-            let sanitizedLatestVersion = Self.sanitizeVersionString(appcastInfo.latestVersion)
+            let presentationVersion = Self.presentationVersion(
+                channel: checkedChannel,
+                displayVersion: appcastInfo.latestVersion,
+                title: appcastInfo.title
+            )
             applyAvailableUpdateState(
                 channel: checkedChannel,
-                version: sanitizedLatestVersion,
+                version: presentationVersion,
                 buildNumber: appcastInfo.latestBuildNumber,
                 shortCommitSHA: AvailableUpdateNotice.shortCommitSHA(fromTipTitle: appcastInfo.title),
                 date: appcastInfo.date,
@@ -476,7 +480,11 @@ final class SparkleUpdaterManager: ObservableObject {
 
                     self.applyAvailableUpdateState(
                         channel: resultChannel,
-                        version: Self.sanitizeVersionString(appcastItem.displayVersionString),
+                        version: Self.presentationVersion(
+                            channel: resultChannel,
+                            displayVersion: appcastItem.displayVersionString,
+                            title: appcastItem.title
+                        ),
                         buildNumber: appcastItem.versionString,
                         shortCommitSHA: AvailableUpdateNotice.shortCommitSHA(fromTipTitle: appcastItem.title),
                         date: appcastItem.date,
@@ -521,6 +529,16 @@ final class SparkleUpdaterManager: ObservableObject {
         else { return true }
         guard let candidateBuild = SparkleBuildVersion(candidateBuildNumber) else { return false }
         return candidateBuild >= knownBuild
+    }
+
+    static func presentationVersion(
+        channel: UpdateChannel,
+        displayVersion: String,
+        title: String?
+    ) -> String {
+        let fallbackVersion = sanitizeVersionString(displayVersion)
+        guard channel == .tip else { return fallbackVersion }
+        return AvailableUpdateNotice.marketingVersion(fromTipTitle: title) ?? fallbackVersion
     }
 
     static func sanitizeVersionString(_ version: String) -> String {

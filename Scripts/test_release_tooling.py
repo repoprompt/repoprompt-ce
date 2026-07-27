@@ -2994,6 +2994,10 @@ label_generated_tip_appcast""",
         sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
         self.assertEqual(item.findtext(f"{{{sparkle}}}version"), "29.8.52")
         self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "9.8.7")
+        self.assertNotEqual(
+            item.findtext(f"{{{sparkle}}}shortVersionString"),
+            item.findtext(f"{{{sparkle}}}version"),
+        )
         self.assertEqual(item.findtext("title"), "Tip build 29.8.52 · v9.8.7 · commit abc1234def56")
         self.assertEqual(
             item.findtext(f"{{{sparkle}}}releaseNotesLink"),
