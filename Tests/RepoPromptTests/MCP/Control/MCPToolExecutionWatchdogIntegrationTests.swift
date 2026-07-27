@@ -2210,15 +2210,29 @@ import XCTest
                         lane: .smallRead
                     )
                     XCTAssertEqual(limiter?.activePermitCount, 0)
+
+                    // Every detach-disposition tool is fenced for this window until the detached
+                    // provider drains, while unrelated MCP traffic remains usable.
                     let readResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.readFile,
                         arguments: [
                             "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString,
+                            "_rawJSON": true
+                        ]
+                    )
+                    let readPayload = try Self.toolResultObject(readResponse)
+                    XCTAssertEqual(readPayload["code"] as? String, "tool_execution_structure_settlement_busy")
+                    XCTAssertEqual(readPayload["retryable"] as? Bool, true)
+                    XCTAssertTrue((readPayload["error"] as? String)?.contains("prior timed-out MCP operation") == true)
+                    XCTAssertFalse((readPayload["error"] as? String)?.contains("timed-out read_file") == true)
+                    _ = try await endpoint.callTool(
+                        name: MCPWindowToolName.manageSelection,
+                        arguments: [
+                            "op": "get",
                             "context_id": fixture.contextA.tabID.uuidString
                         ]
                     )
-                    let readText = try Self.toolResultText(readResponse)
-                    XCTAssertTrue(readText.contains(fixture.contextA.sentinel))
                     let readSleepersDrained = await Self.waitUntil { await clock.sleeperCount() == 0 }
                     XCTAssertTrue(readSleepersDrained)
 
@@ -2250,6 +2264,10 @@ import XCTest
                     XCTAssertEqual(detachedEvent.settlement, "detached")
                     XCTAssertTrue(detachedEvent.description.contains("cancellation_origin=watchdog_deadline"))
                     XCTAssertTrue(detachedEvent.description.contains("settlement=detached"))
+                    XCTAssertFalse(recorder.snapshot().contains {
+                        $0.invocationID == detachedEvent.invocationID
+                            && $0.phase == .connectionForceDisconnectRequested
+                    })
                     XCTAssertFalse(recorder.snapshot().contains {
                         $0.invocationID == detachedEvent.invocationID && $0.phase == .handlerCompleted
                     })
