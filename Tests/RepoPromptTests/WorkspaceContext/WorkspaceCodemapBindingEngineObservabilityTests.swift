@@ -508,14 +508,24 @@
                 return XCTFail("Expected baseline manifest persistence.")
             }
 
-            let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+            let fixture = try await makeEngineFixture(
+                root: root,
+                runtime: runtime,
+                projectionCatalogFactory: pagedCatalogFactory(
+                    root: root,
+                    paths: ["Sources/Feature.swift"]
+                )
+            )
             guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
                 return XCTFail("Expected graph root registration.")
             }
-            guard case .ready = await fixture.engine.demand(
-                fixture.demand(path: "Sources/Feature.swift")
-            ) else {
-                return XCTFail("Expected warm manifest hit demand readiness.")
+            let launch = await fixture.engine.scheduleGraphIndex(rootEpoch: fixture.rootEpoch)
+            XCTAssertEqual(launch, .handedOff)
+            try await AsyncTestWait.waitUntil("warm graph manifest completion", timeout: 15) {
+                guard let job = await fixture.engine.debugGraphIndexJobSnapshot(
+                    rootEpoch: fixture.rootEpoch
+                ) else { return false }
+                return job.phase == .complete && !job.workerPresent
             }
             let observedSnapshot = await fixture.engine.debugManifestAuthoritySnapshot(
                 rootEpoch: fixture.rootEpoch,
@@ -631,7 +641,7 @@
             })
         }
 
-        func testGraphIndexPageManifestPersistenceRedCharacterization() async throws {
+        func testGraphIndexManifestPersistenceOccursOnceAtEnumerationSeal() async throws {
             let repository = try makeRepositoryFixture(name: #function)
             let paths = (0 ..< 2).map { "Sources/Feature\($0).swift" }
             let root = try repository.makeRepository(
@@ -661,51 +671,63 @@
             }
             let counters = await fixture.engine.accounting().counters
             XCTAssertEqual(counters.graphIndexCatalogPages, 2)
-            XCTAssertEqual(counters.graphIndexPageManifestLoads, 2)
-            XCTAssertEqual(counters.graphIndexPageManifestSubmissions, 2)
-            XCTAssertEqual(counters.graphIndexPageManifestWaits, 2)
-            XCTAssertEqual(counters.graphIndexPageManifestWrites, 2)
-            XCTAssertEqual(counters.graphIndexPageManifestSnapshotRecordVolume, 3)
-            XCTAssertGreaterThan(counters.graphIndexPageManifestSnapshotByteVolume, 0)
-            XCTAssertEqual(counters.graphIndexSealManifestSubmissions, 0)
+            XCTAssertEqual(counters.graphIndexPageManifestLoads, 1)
+            XCTAssertEqual(counters.graphIndexPageManifestSubmissions, 0)
+            XCTAssertEqual(counters.graphIndexPageManifestWaits, 0)
+            XCTAssertEqual(counters.graphIndexPageManifestWrites, 0)
+            XCTAssertEqual(counters.graphIndexPageManifestSnapshotRecordVolume, 0)
+            XCTAssertEqual(counters.graphIndexPageManifestSnapshotByteVolume, 0)
+            XCTAssertEqual(counters.graphIndexSealManifestSubmissions, 1)
+            XCTAssertEqual(counters.graphIndexSealManifestWaits, 1)
+            XCTAssertEqual(counters.graphIndexSealManifestWrites, 1)
 
             let observedJob = await fixture.engine.debugGraphIndexJobSnapshot(
                 rootEpoch: fixture.rootEpoch
             )
             let job = try XCTUnwrap(observedJob)
             let jobMeasurements = job.manifestMeasurements
-            XCTAssertEqual(jobMeasurements.loadCount, 2)
-            XCTAssertEqual(jobMeasurements.submissionCount, 2)
-            XCTAssertEqual(jobMeasurements.waitCount, 2)
-            XCTAssertEqual(jobMeasurements.storeAttemptCount, 2)
-            XCTAssertEqual(jobMeasurements.writeCount, 2)
+            XCTAssertEqual(jobMeasurements.loadCount, 1)
+            XCTAssertEqual(jobMeasurements.submissionCount, 1)
+            XCTAssertEqual(jobMeasurements.waitCount, 1)
+            XCTAssertEqual(jobMeasurements.storeAttemptCount, 1)
+            XCTAssertEqual(jobMeasurements.writeCount, 1)
             XCTAssertEqual(jobMeasurements.failureCount, 0)
             XCTAssertEqual(jobMeasurements.retryAttemptCount, 0)
             XCTAssertEqual(jobMeasurements.mutationCountVolume, 2)
             XCTAssertGreaterThan(jobMeasurements.mutationByteVolume, 0)
-            XCTAssertEqual(jobMeasurements.inputSnapshotRecordVolume, 1)
-            XCTAssertEqual(jobMeasurements.attemptedOutputSnapshotRecordVolume, 3)
-            XCTAssertEqual(jobMeasurements.outputSnapshotRecordVolume, 3)
-            XCTAssertGreaterThan(jobMeasurements.inputSnapshotByteVolume, 0)
-            XCTAssertGreaterThan(jobMeasurements.decodedByteVolume, 0)
+            XCTAssertEqual(jobMeasurements.inputSnapshotRecordVolume, 0)
+            XCTAssertEqual(jobMeasurements.attemptedOutputSnapshotRecordVolume, 2)
+            XCTAssertEqual(jobMeasurements.outputSnapshotRecordVolume, 2)
+            XCTAssertEqual(jobMeasurements.inputSnapshotByteVolume, 0)
+            XCTAssertGreaterThanOrEqual(jobMeasurements.decodedByteVolume, 0)
             XCTAssertGreaterThan(jobMeasurements.outputSnapshotByteVolume, 0)
 
             let rootMeasurements = await fixture.engine.debugManifestMeasurementSnapshot(
                 rootEpoch: fixture.rootEpoch
             )
-            XCTAssertEqual(rootMeasurements.byOrigin[.page], jobMeasurements)
+            let pageMeasurements = try XCTUnwrap(rootMeasurements.byOrigin[.page])
+            XCTAssertEqual(pageMeasurements.loadCount, 1)
+            XCTAssertEqual(pageMeasurements.submissionCount, 0)
+            XCTAssertEqual(pageMeasurements.waitCount, 0)
+            XCTAssertEqual(pageMeasurements.storeAttemptCount, 0)
+            XCTAssertEqual(pageMeasurements.writeCount, 0)
+            let sealMeasurements = try XCTUnwrap(rootMeasurements.byOrigin[.seal])
+            XCTAssertEqual(sealMeasurements.loadCount, 0)
+            XCTAssertEqual(sealMeasurements.submissionCount, 1)
+            XCTAssertEqual(sealMeasurements.waitCount, 1)
+            XCTAssertEqual(sealMeasurements.storeAttemptCount, 1)
+            XCTAssertEqual(sealMeasurements.writeCount, 1)
             XCTAssertNil(rootMeasurements.byOrigin[.adoption])
             XCTAssertNil(rootMeasurements.byOrigin[.demand])
-            XCTAssertNil(rootMeasurements.byOrigin[.seal])
 
             let events = await fixture.engine.debugGraphIndexEvents(
                 rootID: fixture.rootEpoch.rootID,
                 sinceOrdinal: nil,
                 limit: 128
             ).events.filter { $0.kind == .manifestStoreAttempt }
-            XCTAssertEqual(events.count, 2)
+            XCTAssertEqual(events.count, 1)
             for event in events {
-                XCTAssertEqual(event.manifestMeasurementOrigin, .page)
+                XCTAssertEqual(event.manifestMeasurementOrigin, .seal)
                 XCTAssertEqual(
                     event.manifestMeasurementRetryKind,
                     WorkspaceCodemapManifestMeasurementRetryKind.none
@@ -714,7 +736,7 @@
                 XCTAssertEqual(event.manifestStoreAttempt?.published, true)
             }
             let attempts = events.compactMap(\.manifestStoreAttempt)
-            XCTAssertEqual(attempts.map(\.outputSnapshotRecordCount), [1, 2])
+            XCTAssertEqual(attempts.map(\.outputSnapshotRecordCount), [2])
             XCTAssertEqual(
                 jobMeasurements.totalDurationNanoseconds,
                 attempts.reduce(UInt64(0)) { partial, attempt in
@@ -800,7 +822,7 @@
                         standardizedRelativePath: path,
                         standardizedFullPath: root.appendingPathComponent(path).path
                     )!
-                    return try! WorkspaceCodemapGraphIndexCatalogCandidate(
+                    return WorkspaceCodemapGraphIndexCatalogCandidate(
                         identity: identity,
                         language: .swift,
                         requestGeneration: 1,

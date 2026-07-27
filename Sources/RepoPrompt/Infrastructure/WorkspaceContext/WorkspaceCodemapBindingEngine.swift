@@ -370,9 +370,12 @@ actor WorkspaceCodemapBindingEngine {
     private struct GraphIndexManifestStage {
         let namespace: CodeMapRootManifestNamespace
         let pipelineSessionID: UUID
-        var recordsByPath: [String: CodeMapRootManifestRecord]
-        var byteCount: UInt64
+        var cachedRecordsByPath: [String: CodeMapRootManifestRecord]
+        var stagedRecordsByPath: [String: CodeMapRootManifestRecord]
+        var stagedByteCount: UInt64
         var isDegraded: Bool
+        var sealAuthorityRecoveryAttempted: Bool
+        let wasVirginAtLoad: Bool
     }
 
     private enum GraphIndexManifestSealState {
@@ -2156,6 +2159,7 @@ actor WorkspaceCodemapBindingEngine {
                     return
                 }
             case .complete:
+                await persistGraphIndexManifestSeal(jobID: jobID, rootEpoch: rootEpoch)
                 completionReason = .complete
                 return
             case .budgetLimited:
@@ -2556,20 +2560,11 @@ actor WorkspaceCodemapBindingEngine {
         else { return .superseded }
 
         var manifestRecordsByPipeline: [CodeMapPipelineIdentity: [String: CodeMapRootManifestRecord]] = [:]
-        for (pipelineIdentity, candidates) in candidatesByPipeline {
+        for pipelineIdentity in candidatesByPipeline.keys {
             guard let records = await loadGraphIndexManifestRecords(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
-                pipelineIdentity: pipelineIdentity,
-                candidatePaths: Set(candidates.compactMap { candidate in
-                    guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
-                          case let .eligible(session)? = roots[rootEpoch]
-                    else { return nil }
-                    return repositoryPath(
-                        loadedRootRelativePath: candidate.identity.standardizedRelativePath,
-                        prefix: session.capability.repositoryRelativeLoadedRootPrefix
-                    )
-                })
+                pipelineIdentity: pipelineIdentity
             ) else { return .cancelled }
             manifestRecordsByPipeline[pipelineIdentity] = records
         }
@@ -2818,59 +2813,6 @@ actor WorkspaceCodemapBindingEngine {
             guard case let .entry(_, record) = resolution else { return nil }
             return record
         }
-        let manifestFileIDsByRelativePath = Dictionary(uniqueKeysWithValues: orderedResolutions.compactMap {
-            resolution -> (String, UUID)? in
-            guard case let .entry(entry, record?) = resolution else { return nil }
-            return (record.repositoryRelativePath, entry.identity.fileID)
-        })
-        var markerReadinessUnavailableFileIDs = Set<UUID>()
-        if !manifestRecords.isEmpty {
-            guard updateGraphIndexPhase(
-                jobID: jobID,
-                rootEpoch: rootEpoch,
-                phase: .stagingManifestCache
-            ) else { return .cancelled }
-            let grouped = Dictionary(grouping: manifestRecords, by: { $0.artifactKey.pipelineIdentity })
-            for (pipelineIdentity, records) in grouped {
-                let pipelineFileIDs = Set(records.compactMap {
-                    manifestFileIDsByRelativePath[$0.repositoryRelativePath]
-                })
-                for mutations in boundedManifestMutationBatches(records.map(ManifestMutation.upsert)) {
-                    let submission = await submitManifestMutations(
-                        rootEpoch: rootEpoch,
-                        pipelineIdentity: pipelineIdentity,
-                        mutations: mutations,
-                        proof: .graphIndex(
-                            jobID: jobID,
-                            generation: generation,
-                            origin: .pageCheckpoint
-                        ),
-                        retainRecordsInMemory: true
-                    )
-                    guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
-                        return .cancelled
-                    }
-                    switch submission {
-                    case .persisted:
-                        markerReadinessUnavailableFileIDs.subtract(pipelineFileIDs)
-                    case .staleAuthority, .discarded, .durabilityFailure:
-                        markerReadinessUnavailableFileIDs.formUnion(mutations.compactMap {
-                            manifestFileIDsByRelativePath[$0.repositoryRelativePath]
-                        })
-                    case .retry:
-                        return .retry
-                    case let .budget(budget):
-                        finishGraphIndexForBudget(
-                            jobID: jobID,
-                            rootEpoch: rootEpoch,
-                            budget: budget
-                        )
-                        return .budgetLimited
-                    }
-                }
-            }
-        }
-
         let changeGroups: [GraphIndexChangeGroup]
         switch graphIndexChangeGroups(entries) {
         case let .groups(groups):
@@ -2983,8 +2925,7 @@ actor WorkspaceCodemapBindingEngine {
                     progress: advanced,
                     enumerationFinished: false,
                     jobID: jobID,
-                    rootEpoch: rootEpoch,
-                    markerReadinessUnavailableFileIDs: markerReadinessUnavailableFileIDs
+                    rootEpoch: rootEpoch
                 )
                 releaseStagedGraphIndexBytes(
                     jobID: jobID,
@@ -3053,6 +2994,26 @@ actor WorkspaceCodemapBindingEngine {
             }
         }
 
+        if !manifestRecords.isEmpty {
+            guard updateGraphIndexPhase(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                phase: .stagingManifestCache
+            ) else { return .cancelled }
+            let recordsByPipeline = Dictionary(
+                grouping: manifestRecords,
+                by: { $0.artifactKey.pipelineIdentity }
+            )
+            for (pipelineIdentity, records) in recordsByPipeline {
+                guard stageGraphIndexManifestRecords(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    records: records
+                ) else { return .cancelled }
+            }
+        }
+
         guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return .cancelled }
         // Change progress already includes this page. For an empty page it was advanced above.
         guard job.progress.counts.supportedCandidateCount == page.supportedCandidateCountThroughPage
@@ -3102,7 +3063,13 @@ actor WorkspaceCodemapBindingEngine {
         switch finalDisposition {
         case let .accepted(accepted), let .exactDuplicate(accepted):
             let completedUptimeNanoseconds = uptimeNanoseconds()
-            completedJob.phase = .complete
+            let hasSealWork = completedJob.manifestStages.values.contains {
+                !$0.isDegraded && !$0.stagedRecordsByPath.isEmpty
+            }
+            completedJob.manifestSealState = hasSealWork ? .enumerationSealed : (
+                completedJob.manifestStages.values.contains(where: \.isDegraded) ? .degraded : .durable
+            )
+            completedJob.phase = hasSealWork ? .persistingManifestCache : .complete
             completedJob.phaseEnteredUptimeNanoseconds = completedUptimeNanoseconds
             completedJob.lastProgressUptimeNanoseconds = completedUptimeNanoseconds
             completedJob.progress = accepted
@@ -3145,16 +3112,214 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func loadGraphIndexManifestRecords(
+    private func persistGraphIndexManifestSeal(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              let generation = job.generation
+        else { return }
+        let pipelineIdentities = Array(job.manifestStages.keys)
+        job.manifestSealState = .persisting
+        job.phase = .persistingManifestCache
+        job.phaseEnteredUptimeNanoseconds = uptimeNanoseconds()
+        graphIndexJobs[rootEpoch] = job
+
+        for pipelineIdentity in pipelineIdentities {
+            guard let current = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+                  let stage = current.manifestStages[pipelineIdentity]
+            else { return }
+            guard !stage.isDegraded, !stage.stagedRecordsByPath.isEmpty else { continue }
+            let submission = await submitManifestMutations(
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                mutations: stage.stagedRecordsByPath.values.map(ManifestMutation.upsert),
+                proof: .graphIndex(
+                    jobID: jobID,
+                    generation: generation,
+                    origin: .enumerationSeal
+                ),
+                retainRecordsInMemory: true
+            )
+            guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else { return }
+            switch submission {
+            case .persisted:
+                finishGraphIndexManifestStage(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    degraded: false
+                )
+            case let .staleAuthority(observedAuthority):
+                if let restampedRecords = recoverVirginGraphIndexSealAuthority(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    observedAuthority: observedAuthority
+                ) {
+                    let recovery = await submitManifestMutations(
+                        rootEpoch: rootEpoch,
+                        pipelineIdentity: pipelineIdentity,
+                        mutations: restampedRecords.map(ManifestMutation.upsert),
+                        proof: .graphIndex(
+                            jobID: jobID,
+                            generation: generation,
+                            origin: .enumerationSeal
+                        ),
+                        retainRecordsInMemory: true
+                    )
+                    let recoveryPersisted = if case .persisted = recovery { true } else { false }
+                    finishGraphIndexManifestStage(
+                        jobID: jobID,
+                        rootEpoch: rootEpoch,
+                        pipelineIdentity: pipelineIdentity,
+                        degraded: !recoveryPersisted
+                    )
+                } else {
+                    finishGraphIndexManifestStage(
+                        jobID: jobID,
+                        rootEpoch: rootEpoch,
+                        pipelineIdentity: pipelineIdentity,
+                        degraded: true
+                    )
+                }
+            case .discarded, .durabilityFailure, .retry, .budget:
+                finishGraphIndexManifestStage(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    degraded: true
+                )
+            }
+        }
+        guard var completed = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) else { return }
+        completed.manifestSealState = completed.manifestStages.values.contains(where: \.isDegraded)
+            ? .degraded
+            : .durable
+        completed.phase = .complete
+        let completedUptimeNanoseconds = uptimeNanoseconds()
+        completed.phaseEnteredUptimeNanoseconds = completedUptimeNanoseconds
+        completed.lastProgressUptimeNanoseconds = completedUptimeNanoseconds
+        completed.checkpoint = makeGraphIndexCheckpoint(completed)
+        graphIndexJobs[rootEpoch] = completed
+    }
+
+    private func recoverVirginGraphIndexSealAuthority(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         pipelineIdentity: CodeMapPipelineIdentity,
-        candidatePaths: Set<String>
+        observedAuthority: CodeMapRootManifestAuthority
+    ) -> [CodeMapRootManifestRecord]? {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              var stage = job.manifestStages[pipelineIdentity],
+              stage.wasVirginAtLoad,
+              !stage.sealAuthorityRecoveryAttempted
+        else { return nil }
+        stage.sealAuthorityRecoveryAttempted = true
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+
+        guard case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[pipelineIdentity],
+              pipeline.id == stage.pipelineSessionID,
+              pipeline.namespace == stage.namespace,
+              observedAuthority != pipeline.authority,
+              observedAuthority.authorityGeneration >= pipeline.authority.authorityGeneration,
+              observedAuthority.authorityGeneration < UInt64.max,
+              pipeline.persistedManifestRevision == 0,
+              pipeline.manifestRevision == 1,
+              pipeline.pendingManifestChanges.isEmpty
+        else { return nil }
+        let stagedPaths = Set(stage.stagedRecordsByPath.keys)
+        guard Set(pipeline.manifestRecords.keys).isSubset(of: stagedPaths),
+              Set(pipeline.automaticSelectionCandidateRecords.keys).isSubset(of: stagedPaths)
+        else { return nil }
+        let workKey = ManifestWriterWorkKey(
+            scope: PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity),
+            sessionID: session.id,
+            pipelineSessionID: pipeline.id
+        )
+        if let writer = manifestWriters[pipeline.namespace] {
+            guard writer.inFlightBatch?.workKey != workKey,
+                  writer.deferredHeadBatch?.workKey != workKey,
+                  !writer.queuedWork.contains(where: { $0.workKey == workKey }),
+                  !writer.deferredWork.contains(where: { $0.workKey == workKey })
+            else { return nil }
+        }
+        let currentAuthority = pipeline.authority
+        guard let liftedAuthority = try? CodeMapRootManifestAuthority(
+            authorityGeneration: observedAuthority.authorityGeneration + 1,
+            repositoryBindingEpoch: currentAuthority.repositoryBindingEpoch,
+            worktreeBindingEpoch: currentAuthority.worktreeBindingEpoch,
+            layoutGeneration: currentAuthority.layoutGeneration,
+            indexGeneration: currentAuthority.indexGeneration,
+            checkoutConfigurationGeneration: currentAuthority.checkoutConfigurationGeneration,
+            attributeGeneration: currentAuthority.attributeGeneration,
+            sparseGeneration: currentAuthority.sparseGeneration,
+            metadataGeneration: currentAuthority.metadataGeneration
+        ) else { return nil }
+        let restamped = stage.stagedRecordsByPath.values.compactMap {
+            try? $0.restampedVerifiedAuthority(
+                namespace: pipeline.namespace,
+                authority: liftedAuthority
+            )
+        }
+        guard restamped.count == stage.stagedRecordsByPath.count else { return nil }
+        pipeline.authority = liftedAuthority
+        pipeline.previouslyObservedManifestAuthority = observedAuthority
+        for record in restamped {
+            pipeline.manifestRecords[record.repositoryRelativePath] = record
+            if record.contributionEnvelope != nil {
+                pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
+            }
+            stage.cachedRecordsByPath[record.repositoryRelativePath] = record
+            stage.stagedRecordsByPath[record.repositoryRelativePath] = record
+        }
+        session.pipelines[pipelineIdentity] = pipeline
+        roots[rootEpoch] = .eligible(session)
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+        return restamped
+    }
+
+    private func finishGraphIndexManifestStage(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        degraded: Bool
+    ) {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              var stage = job.manifestStages[pipelineIdentity]
+        else { return }
+        let releasedByteCount = stage.stagedByteCount
+        graphIndexManifestStagedByteCount = graphIndexManifestStagedByteCount >= releasedByteCount
+            ? graphIndexManifestStagedByteCount - releasedByteCount
+            : 0
+        job.manifestStagedByteCount = job.manifestStagedByteCount >= releasedByteCount
+            ? job.manifestStagedByteCount - releasedByteCount
+            : 0
+        stage.stagedRecordsByPath.removeAll(keepingCapacity: false)
+        stage.stagedByteCount = 0
+        stage.isDegraded = stage.isDegraded || degraded
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+    }
+
+    private func loadGraphIndexManifestRecords(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity
     ) async -> [String: CodeMapRootManifestRecord]? {
         guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
               let pipeline = session.pipelines[pipelineIdentity]
         else { return nil }
+        if let stage = job.manifestStages[pipelineIdentity] {
+            guard stage.namespace == pipeline.namespace,
+                  stage.pipelineSessionID == pipeline.id
+            else { return nil }
+            return stage.cachedRecordsByPath
+        }
         incrementCounter(\.manifestLoads)
         #if DEBUG
             incrementCounter(\.graphIndexPageManifestLoads)
@@ -3191,7 +3356,14 @@ actor WorkspaceCodemapBindingEngine {
             guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else { return nil }
             incrementCounter(\.graphIndexEnvelopeInvalid)
             emit(.graphIndexEnvelopeInvalid, rootEpoch: rootEpoch, graphIndexPhase: .loadingEnvelopes)
-            return [:]
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: [],
+                observedAuthority: nil,
+                isDegraded: true
+            )
         }
         #if DEBUG
             let debugLoadCompletedUptimeNanoseconds = uptimeNanoseconds()
@@ -3221,7 +3393,14 @@ actor WorkspaceCodemapBindingEngine {
                 pipelineIdentity: pipelineIdentity,
                 manifestGeneration: nil
             )
-            return [:]
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: [],
+                observedAuthority: nil,
+                isDegraded: false
+            )
         case let .stale(existingAuthority):
             guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
                   case var .eligible(currentSession)? = roots[rootEpoch],
@@ -3245,7 +3424,14 @@ actor WorkspaceCodemapBindingEngine {
                 pipelineIdentity: pipelineIdentity,
                 manifestGeneration: nil
             )
-            return [:]
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: [],
+                observedAuthority: existingAuthority,
+                isDegraded: false
+            )
         case let .hit(snapshot):
             guard snapshot.namespace == pipeline.namespace,
                   snapshot.authority == pipeline.authority
@@ -3260,12 +3446,131 @@ actor WorkspaceCodemapBindingEngine {
                 pipelineIdentity: pipelineIdentity,
                 manifestGeneration: snapshot.manifestGeneration
             )
-            return Dictionary(uniqueKeysWithValues: snapshot.records.compactMap { record in
-                candidatePaths.contains(record.repositoryRelativePath)
-                    ? (record.repositoryRelativePath, record)
-                    : nil
-            })
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: snapshot.records,
+                observedAuthority: snapshot.authority,
+                isDegraded: false
+            )
         }
+    }
+
+    private func installGraphIndexManifestStage(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        records: [CodeMapRootManifestRecord],
+        observedAuthority: CodeMapRootManifestAuthority?,
+        isDegraded: Bool
+    ) -> [String: CodeMapRootManifestRecord]? {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[pipelineIdentity]
+        else { return nil }
+        if let observedAuthority {
+            pipeline.previouslyObservedManifestAuthority = observedAuthority
+        }
+        let retainedCount = job.manifestStages.values.reduce(0) {
+            addingSaturating($0, $1.cachedRecordsByPath.count)
+        }
+        let projectedCount = addingSaturating(retainedCount, records.count)
+        let exceedsRecordCap = projectedCount > policy.maximumRetainedManifestRecordCountPerRoot
+        let cachedRecordsByPath = exceedsRecordCap
+            ? [:]
+            : Dictionary(uniqueKeysWithValues: records.map { ($0.repositoryRelativePath, $0) })
+        let scope = PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity)
+        job.manifestStages[pipelineIdentity] = GraphIndexManifestStage(
+            namespace: pipeline.namespace,
+            pipelineSessionID: pipeline.id,
+            cachedRecordsByPath: cachedRecordsByPath,
+            stagedRecordsByPath: [:],
+            stagedByteCount: 0,
+            isDegraded: isDegraded || exceedsRecordCap,
+            sealAuthorityRecoveryAttempted: false,
+            wasVirginAtLoad: manifestPipelineIsVirgin(
+                scope: scope,
+                session: session,
+                pipeline: pipeline
+            )
+        )
+        session.pipelines[pipelineIdentity] = pipeline
+        roots[rootEpoch] = .eligible(session)
+        graphIndexJobs[rootEpoch] = job
+        return cachedRecordsByPath
+    }
+
+    private func stageGraphIndexManifestRecords(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        records: [CodeMapRootManifestRecord]
+    ) -> Bool {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              var stage = job.manifestStages[pipelineIdentity],
+              case let .eligible(session)? = roots[rootEpoch],
+              let pipeline = session.pipelines[pipelineIdentity],
+              stage.namespace == pipeline.namespace,
+              stage.pipelineSessionID == pipeline.id
+        else { return false }
+        guard !stage.isDegraded else { return true }
+
+        var projectedStageBytes = stage.stagedByteCount
+        var projectedGlobalBytes = graphIndexManifestStagedByteCount
+        var projectedCachedCount = job.manifestStages.values.reduce(0) {
+            addingSaturating($0, $1.cachedRecordsByPath.count)
+        }
+        for record in records {
+            let oldByteCount = stage.stagedRecordsByPath[record.repositoryRelativePath].map {
+                manifestMutationByteCount(.upsert($0))
+            } ?? 0
+            let newByteCount = manifestMutationByteCount(.upsert(record))
+            projectedStageBytes = projectedStageBytes >= oldByteCount
+                ? projectedStageBytes - oldByteCount
+                : 0
+            projectedGlobalBytes = projectedGlobalBytes >= oldByteCount
+                ? projectedGlobalBytes - oldByteCount
+                : 0
+            projectedStageBytes = addingSaturating(projectedStageBytes, newByteCount)
+            projectedGlobalBytes = addingSaturating(projectedGlobalBytes, newByteCount)
+            if stage.cachedRecordsByPath[record.repositoryRelativePath] == nil {
+                projectedCachedCount = addingSaturating(projectedCachedCount, 1)
+            }
+            guard projectedCachedCount <= policy.maximumRetainedManifestRecordCountPerRoot,
+                  projectedStageBytes <= policy.maximumQueuedGraphIndexManifestMutationByteCountPerRoot,
+                  projectedGlobalBytes <= policy.maximumQueuedGraphIndexManifestMutationByteCount
+            else {
+                graphIndexManifestStagedByteCount = graphIndexManifestStagedByteCount >= stage.stagedByteCount
+                    ? graphIndexManifestStagedByteCount - stage.stagedByteCount
+                    : 0
+                job.manifestStagedByteCount = job.manifestStagedByteCount >= stage.stagedByteCount
+                    ? job.manifestStagedByteCount - stage.stagedByteCount
+                    : 0
+                stage.stagedRecordsByPath.removeAll(keepingCapacity: false)
+                stage.stagedByteCount = 0
+                stage.isDegraded = true
+                job.manifestStages[pipelineIdentity] = stage
+                job.manifestSealState = .degraded
+                graphIndexJobs[rootEpoch] = job
+                return true
+            }
+            stage.cachedRecordsByPath[record.repositoryRelativePath] = record
+            stage.stagedRecordsByPath[record.repositoryRelativePath] = record
+        }
+        let priorStageByteCount = stage.stagedByteCount
+        stage.stagedByteCount = projectedStageBytes
+        job.manifestStagedByteCount = job.manifestStagedByteCount >= priorStageByteCount
+            ? job.manifestStagedByteCount - priorStageByteCount
+            : 0
+        job.manifestStagedByteCount = addingSaturating(
+            job.manifestStagedByteCount,
+            projectedStageBytes
+        )
+        graphIndexManifestStagedByteCount = projectedGlobalBytes
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+        return true
     }
 
     private func graphIndexEntry(
@@ -4085,6 +4390,7 @@ actor WorkspaceCodemapBindingEngine {
         job.pageStartProcessedCandidateBaseline = nil
         job.nextGraphChangeSequence = 0
         job.pipelineScopes = [:]
+        discardGraphIndexManifestStages(&job)
         job.resources = .zero
         job.pendingManifestMutationCount = 0
         job.retryAttempt = 0
@@ -4775,12 +5081,23 @@ actor WorkspaceCodemapBindingEngine {
         }
     #endif
 
+    private func discardGraphIndexManifestStages(_ job: inout GraphIndexJob) {
+        let releasedByteCount = job.manifestStagedByteCount
+        graphIndexManifestStagedByteCount = graphIndexManifestStagedByteCount >= releasedByteCount
+            ? graphIndexManifestStagedByteCount - releasedByteCount
+            : 0
+        job.manifestStages.removeAll(keepingCapacity: false)
+        job.manifestStagedByteCount = 0
+        job.manifestSealState = .discarded
+    }
+
     @discardableResult
     private func cancelGraphIndexJob(
         rootEpoch: WorkspaceCodemapRootEpoch,
         terminalPhase: WorkspaceCodemapGraphIndexPhase
     ) -> Task<Void, Never>? {
         guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return nil }
+        discardGraphIndexManifestStages(&job)
         graphIndexWatchdogTasks.removeValue(forKey: job.id)?.cancel()
         if prioritizedGraphIndexRootEpoch == rootEpoch {
             prioritizedGraphIndexRootEpoch = nil
@@ -5398,6 +5715,29 @@ actor WorkspaceCodemapBindingEngine {
         waiter.resume()
     }
 
+    private func manifestPipelineIsVirgin(
+        scope: PipelineScope,
+        session: Session,
+        pipeline: PipelineSession
+    ) -> Bool {
+        guard pipeline.manifestRevision == 0,
+              pipeline.persistedManifestRevision == 0,
+              pipeline.pendingManifestChanges.isEmpty,
+              pipeline.manifestRecords.isEmpty,
+              pipeline.automaticSelectionCandidateRecords.isEmpty
+        else { return false }
+        let workKey = ManifestWriterWorkKey(
+            scope: scope,
+            sessionID: session.id,
+            pipelineSessionID: pipeline.id
+        )
+        guard let writer = manifestWriters[pipeline.namespace] else { return true }
+        return writer.inFlightBatch?.workKey != workKey &&
+            writer.deferredHeadBatch?.workKey != workKey &&
+            !writer.queuedWork.contains(where: { $0.workKey == workKey }) &&
+            !writer.deferredWork.contains(where: { $0.workKey == workKey })
+    }
+
     @discardableResult
     private func liftManifestAuthorityIfVirgin(
         scope: PipelineScope,
@@ -5409,24 +5749,8 @@ actor WorkspaceCodemapBindingEngine {
         guard observedAuthority != currentAuthority,
               observedAuthority.authorityGeneration >= currentAuthority.authorityGeneration,
               observedAuthority.authorityGeneration < UInt64.max,
-              pipeline.manifestRevision == 0,
-              pipeline.persistedManifestRevision == 0,
-              pipeline.pendingManifestChanges.isEmpty,
-              pipeline.manifestRecords.isEmpty,
-              pipeline.automaticSelectionCandidateRecords.isEmpty
+              manifestPipelineIsVirgin(scope: scope, session: session, pipeline: pipeline)
         else { return false }
-        let workKey = ManifestWriterWorkKey(
-            scope: scope,
-            sessionID: session.id,
-            pipelineSessionID: pipeline.id
-        )
-        if let writer = manifestWriters[pipeline.namespace] {
-            guard writer.inFlightBatch?.workKey != workKey,
-                  writer.deferredHeadBatch?.workKey != workKey,
-                  !writer.queuedWork.contains(where: { $0.workKey == workKey }),
-                  !writer.deferredWork.contains(where: { $0.workKey == workKey })
-            else { return false }
-        }
         guard let lifted = try? CodeMapRootManifestAuthority(
             authorityGeneration: observedAuthority.authorityGeneration + 1,
             repositoryBindingEpoch: currentAuthority.repositoryBindingEpoch,
