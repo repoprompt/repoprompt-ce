@@ -101,6 +101,11 @@ protocol CodexSessionControlling: AnyObject {
     func setThreadGoalObjective(_ objective: String) async throws -> CodexNativeSessionController.ThreadGoal
     func setThreadGoalStatus(_ status: CodexNativeSessionController.ThreadGoalStatus) async throws -> CodexNativeSessionController.ThreadGoal
     func clearThreadGoal() async throws -> Bool
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory
+    func trustHooksForCurrentWorkspace(
+        expectedCandidates: [CodexHookTrustCandidate],
+        expectedInventoryFingerprint: String
+    ) async throws -> CodexHookInventory
     func pendingTurnFailure(turnID: String?) async -> CodexNativeSessionController.TurnFailure?
     func acknowledgePendingTurnFailure(
         turnID: String?,
@@ -113,6 +118,17 @@ protocol CodexSessionControlling: AnyObject {
 }
 
 extension CodexSessionControlling {
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
+        throw CodexHookTrustError.unsupportedMethod(method: "hooks/list")
+    }
+
+    func trustHooksForCurrentWorkspace(
+        expectedCandidates _: [CodexHookTrustCandidate],
+        expectedInventoryFingerprint _: String
+    ) async throws -> CodexHookInventory {
+        throw CodexHookTrustError.unsupportedMethod(method: "config/batchWrite")
+    }
+
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
         .unsupported(message: "Codex runtime has no local API for \(action.rawValue) cleanup of conversations.")
     }
@@ -162,6 +178,7 @@ final class CodexNativeSessionController {
     private static let maxCompletedCanonicalItemScopes = 512
     private static let maxCanonicalCompletionTurnIDs = 128
     private static let maxPendingTurnFailures = 64
+    private static let hookTrustWriteMutex = AsyncMutex()
     private static let computerUseMCPServerName = "computer-use"
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
     private static let removedSyntheticNotificationMethods: Set<String> = [
@@ -709,6 +726,7 @@ final class CodexNativeSessionController {
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     private let eventsContinuationLock = NSLock()
     private let eventHandlingMutex = AsyncMutex()
+    private let hookOperationMutex = AsyncMutex()
     private let eventsStream: AsyncStream<Event>
     /// Protected by `eventsContinuationLock`.
     private var lifecycleState: LifecycleState = .fresh
@@ -832,6 +850,60 @@ final class CodexNativeSessionController {
             timeout: timeout,
             useDefaultTimeout: useDefaultTimeout
         )
+    }
+
+    private func hookTrustService() -> CodexHookTrustService {
+        CodexHookTrustService(
+            requestExecutor: { [weak self] method, params, timeout in
+                guard let self else { throw CodexAppServerClient.ClientError.invalidResponse }
+                return try await performRequest(
+                    method: method,
+                    params: params,
+                    timeout: timeout,
+                    useDefaultTimeout: false
+                )
+            },
+            executionCWD: workspacePaths.executionDirectory,
+            timeout: options.requestTimeout
+        )
+    }
+
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
+        let service = hookTrustService()
+        do {
+            return try await hookOperationMutex.withLock {
+                try await service.listHooks()
+            }
+        } catch is CancellationError {
+            throw CodexHookTrustError.cancelled
+        } catch let error as CodexHookTrustError {
+            throw error
+        } catch {
+            throw CodexHookTrustError.malformedListResponse
+        }
+    }
+
+    func trustHooksForCurrentWorkspace(
+        expectedCandidates: [CodexHookTrustCandidate],
+        expectedInventoryFingerprint: String
+    ) async throws -> CodexHookInventory {
+        let service = hookTrustService()
+        do {
+            return try await hookOperationMutex.withLock {
+                try await Self.hookTrustWriteMutex.withLock {
+                    try await service.trustHooks(
+                        expectedCandidates: expectedCandidates,
+                        expectedInventoryFingerprint: expectedInventoryFingerprint
+                    )
+                }
+            }
+        } catch is CancellationError {
+            throw CodexHookTrustError.cancelled
+        } catch let error as CodexHookTrustError {
+            throw error
+        } catch {
+            throw CodexHookTrustError.batchWriteFailed
+        }
     }
 
     func cleanupConversation(
