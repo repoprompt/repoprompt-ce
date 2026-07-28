@@ -12340,8 +12340,8 @@ actor ServerNetworkManager {
                                         code = "tool_execution_structure_settlement_busy"
                                         let abandoned = reason == .abandoned
                                         message = abandoned
-                                            ? "A prior canceled get_code_structure operation for window \(windowID) is still settling. Retry after it drains."
-                                            : "A prior timed-out get_code_structure operation for window \(windowID) is still settling. Retry after it drains."
+                                            ? "A prior canceled MCP operation for window \(windowID) is still settling. Retry after it drains."
+                                            : "A prior timed-out MCP operation for window \(windowID) is still settling. Retry after it drains."
                                         outcome = "executionStructureSettlementBusy"
                                         shouldForceDisconnect = false
                                         errorMetadata = [
@@ -12356,7 +12356,7 @@ actor ServerNetworkManager {
                                         ]
                                     case MCPToolExecutionDispatchError.structureSettlementWindowUnresolved:
                                         code = "tool_execution_structure_settlement_window_unresolved"
-                                        message = "get_code_structure requires a resolved window before its settlement policy can be selected."
+                                        message = "\(toolName) requires a resolved window before its settlement policy can be selected."
                                         outcome = "executionStructureSettlementWindowUnresolved"
                                         shouldForceDisconnect = false
                                         errorMetadata = ["retryable": .bool(false)]

@@ -1304,6 +1304,27 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func agentSessionHandoffInstructions() -> String {
+        scalarPreferences.agentMode?.agentSessionHandoffInstructions ?? ""
+    }
+
+    @discardableResult
+    func setAgentSessionHandoffInstructions(_ instructions: String, commit: Bool = true) -> Bool {
+        guard case .valid = AgentSessionHandoffInstructionsPolicy.validation(of: instructions) else {
+            return false
+        }
+
+        let proposedValue = instructions.isEmpty ? nil : instructions
+        guard scalarPreferences.agentMode?.agentSessionHandoffInstructions != proposedValue else {
+            return true
+        }
+
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.agentSessionHandoffInstructions = proposedValue
+        }
+        return true
+    }
+
     #if DEBUG
         func claudeRawEventLoggingEnabled() -> Bool {
             defaults.bool(forKey: "claudeRawEventLoggingEnabled")

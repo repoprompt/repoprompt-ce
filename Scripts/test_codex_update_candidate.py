@@ -67,6 +67,10 @@ esac
 set -euo pipefail
 if [[ "$1" == "--remove-signature" ]]; then exit 1; fi
 if [[ "$1" == "--verify" ]]; then exit 0; fi
+if [[ "$*" == *"--entitlements"* ]]; then
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/><key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/></dict></plist>\n'
+    exit 0
+fi
 path="${!#}"
 cat >&2 <<EOF
 Identifier=$(basename "$path")

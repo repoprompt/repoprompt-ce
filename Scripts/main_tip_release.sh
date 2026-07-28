@@ -28,7 +28,6 @@ fi
 TIP_BUILD_NUMBER="${TIP_BUILD_NUMBER//[[:space:]]/}"
 TIP_TAG="${TIP_TAG:-tip-$TIP_SHORT_SHA}"
 TIP_UPDATE_REPOSITORY="${TIP_UPDATE_REPOSITORY:-repoprompt/repoprompt-ce-tip-updates}"
-TIP_RELEASE_URL="${TIP_RELEASE_URL:-https://github.com/$TIP_UPDATE_REPOSITORY/releases/tag/$TIP_TAG}"
 TIP_DOWNLOAD_URL_PREFIX="${TIP_DOWNLOAD_URL_PREFIX:-https://github.com/$TIP_UPDATE_REPOSITORY/releases/download/$TIP_TAG/}"
 TIP_GH_TOKEN="${TIP_GH_TOKEN:-${GH_TOKEN:-}}"
 
@@ -222,7 +221,7 @@ derive_sparkle_public_key() {
 }
 
 label_generated_tip_appcast() {
-    python3 - "$APPCAST" "$MARKETING_VERSION" "$TIP_BUILD_NUMBER" "$TIP_SHORT_SHA" "$TIP_RELEASE_URL" <<'PYTHON'
+    python3 - "$APPCAST" "$MARKETING_VERSION" "$TIP_BUILD_NUMBER" "$TIP_SHORT_SHA" <<'PYTHON'
 import sys
 import xml.etree.ElementTree as ET
 
@@ -235,7 +234,7 @@ if len(items) != 1:
     raise SystemExit(f"tip appcast must contain exactly one item, got {len(items)}")
 
 item = items[0]
-marketing_version, build_number, short_sha, release_url = sys.argv[2:]
+marketing_version, build_number, short_sha = sys.argv[2:]
 
 def singleton_or_create(element_name, qualified_name):
     elements = item.findall(qualified_name)
@@ -251,10 +250,13 @@ short_version = singleton_or_create(
     "sparkle:shortVersionString", f"{{{sparkle}}}shortVersionString"
 )
 short_version.text = marketing_version
-release_notes_link = singleton_or_create(
-    "sparkle:releaseNotesLink", f"{{{sparkle}}}releaseNotesLink"
-)
-release_notes_link.text = release_url
+# Sparkle embeds releaseNotesLink targets inside its stock update window.
+# Tip releases intentionally keep that dialog compact instead of loading a full
+# GitHub release page as web content.
+for release_notes_link in item.findall(f"{{{sparkle}}}releaseNotesLink"):
+    item.remove(release_notes_link)
+for description in item.findall("description"):
+    item.remove(description)
 
 tree.write(sys.argv[1], encoding="utf-8", xml_declaration=True)
 PYTHON
@@ -280,6 +282,7 @@ titles = item.findall("title")
 versions = item.findall(f"{{{sparkle}}}version")
 short_versions = item.findall(f"{{{sparkle}}}shortVersionString")
 release_notes_links = item.findall(f"{{{sparkle}}}releaseNotesLink")
+descriptions = item.findall("description")
 if len(titles) != 1:
     raise SystemExit(f"tip appcast item must contain exactly one title, got {len(titles)}")
 if len(versions) != 1:
@@ -291,11 +294,12 @@ if len(short_versions) != 1:
         "tip appcast item must contain exactly one "
         f"sparkle:shortVersionString, got {len(short_versions)}"
     )
-if len(release_notes_links) != 1:
+if release_notes_links:
     raise SystemExit(
-        "tip appcast item must contain exactly one "
-        f"sparkle:releaseNotesLink, got {len(release_notes_links)}"
+        "tip appcast item must not contain sparkle:releaseNotesLink"
     )
+if descriptions:
+    raise SystemExit("tip appcast item must not contain description")
 values = [
     enclosure.attrib.get("url", ""),
     enclosure.attrib.get(f"{{{sparkle}}}edSignature", ""),
@@ -303,15 +307,14 @@ values = [
     versions[0].text or "",
     short_versions[0].text or "",
     titles[0].text or "",
-    release_notes_links[0].text or "",
 ]
 print("\x1f".join([str(len(values)), *values]))
 PYTHON
 
-    local appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title release_notes_link
-    IFS=$'\x1f' read -r appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title release_notes_link < "$appcast_values"
-    [[ "$appcast_field_count" == "7" ]] ||
-        fail "Tip appcast metadata field count mismatch: expected 7, got $appcast_field_count"
+    local appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title
+    IFS=$'\x1f' read -r appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title < "$appcast_values"
+    [[ "$appcast_field_count" == "6" ]] ||
+        fail "Tip appcast metadata field count mismatch: expected 6, got $appcast_field_count"
     [[ "$enclosure_url" == "$TIP_DOWNLOAD_URL_PREFIX$(basename "$UPDATE_ZIP")" ]] ||
         fail "Tip appcast enclosure URL mismatch: $enclosure_url"
     [[ -n "$enclosure_signature" ]] || fail "Tip appcast enclosure is missing an EdDSA signature"
@@ -323,8 +326,6 @@ PYTHON
         fail "Tip appcast marketing version mismatch: expected $MARKETING_VERSION, got $appcast_marketing"
     [[ "$appcast_title" == "Tip build $TIP_BUILD_NUMBER · v$MARKETING_VERSION · commit $TIP_SHORT_SHA" ]] ||
         fail "Tip appcast presentation title mismatch: $appcast_title"
-    [[ "$release_notes_link" == "$TIP_RELEASE_URL" ]] ||
-        fail "Tip appcast release notes link mismatch: $release_notes_link"
 
     local private_key_file="$TMP_DIR/tip-sparkle-private-key"
     local public_key_file="$TMP_DIR/tip-sparkle-public-key"
