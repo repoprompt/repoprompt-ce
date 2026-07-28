@@ -142,6 +142,26 @@ struct AvailableUpdateNotice: Equatable {
         }
     }
 
+    static func marketingVersion(fromTipTitle title: String?) -> String? {
+        guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              title.lowercased().hasPrefix("tip build "),
+              let versionSeparator = title.range(of: " · v", options: .caseInsensitive),
+              let commitSeparator = title.range(
+                  of: " · commit ",
+                  options: .caseInsensitive,
+                  range: versionSeparator.upperBound ..< title.endIndex
+              )
+        else { return nil }
+
+        let candidate = title[versionSeparator.upperBound ..< commitSeparator.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-"))
+        guard !candidate.isEmpty,
+              candidate.unicodeScalars.allSatisfy({ allowedCharacters.contains($0) })
+        else { return nil }
+        return candidate
+    }
+
     static func shortCommitSHA(fromTipTitle title: String?) -> String? {
         guard let title,
               let separator = title.range(of: " · commit ", options: .caseInsensitive)

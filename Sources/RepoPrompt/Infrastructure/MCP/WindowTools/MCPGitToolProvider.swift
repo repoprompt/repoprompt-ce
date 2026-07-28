@@ -510,8 +510,11 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         // Generic callers retain first-root compatibility. Exact Agent Context Builder Discover
         // runs instead use the immutable selected-repository target carried by their tab snapshot.
         let metadata = await dependencies.captureRequestMetadata()
+        let hasExplicitPathspecs = !(args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            || (args["paths"]?.arrayValue?.contains { !($0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) } ?? false)
         let preLookupSelectedPublicationContext: MCPServerViewModel.ResolvedTabContextSnapshot? = if op == .diff,
                                                                                                      args["artifacts"]?.boolValue == true,
+                                                                                                     !hasExplicitPathspecs,
                                                                                                      (args["scope"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "all") == "selected"
         {
             try dependencies.resolveTabContextSnapshot(
@@ -715,16 +718,22 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             )
             try Task.checkCancellation()
 
-            var readyCandidates: [GitDiffPublishedArtifact] = []
-            var advertisedCandidates: [GitDiffPublishedArtifact] = []
-            for published in publishedSets {
-                readyCandidates.append(contentsOf: ingress.selectionReadyArtifacts(for: published))
-                advertisedCandidates.append(contentsOf: ingress.advertisementReadyArtifacts(for: published))
-                for artifact in published.orderedArtifacts {
-                    guard let failure = ingress.failuresByArtifact[artifact] else { continue }
+            let readinessAggregation = try await ingress.aggregateReadiness(for: publishedSets)
+            let readyCandidates = readinessAggregation.selectionReadyArtifacts
+            let advertisedCandidates = readinessAggregation.advertisementReadyArtifacts
+            let warningLimitPerSnapshot = 20
+            for (snapshotDirectory, failures) in readinessAggregation.failuresBySnapshotDirectory {
+                for failure in failures.prefix(warningLimitPerSnapshot) {
+                    let artifact = failure.artifact
                     let label = artifact.clientAlias ?? artifact.gitDataRelativePath
-                    warningParts[published.snapshotRef.snapshotDirRel, default: []].append(
-                        "Git artifact readiness: \(label) was not selection-ready (\(artifactIngressFailureDescription(failure)))."
+                    warningParts[snapshotDirectory, default: []].append(
+                        "Git artifact readiness: \(label) was not selection-ready (\(artifactIngressFailureDescription(failure.status)))."
+                    )
+                }
+                let omittedCount = failures.count - min(failures.count, warningLimitPerSnapshot)
+                if omittedCount > 0 {
+                    warningParts[snapshotDirectory, default: []].append(
+                        "Git artifact readiness: \(omittedCount) additional failure(s) omitted."
                     )
                 }
             }
@@ -741,12 +750,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    let affectedSnapshotRefs = Set(publishedSets.compactMap { published -> String? in
-                        ingress.selectionReadyArtifacts(for: published).isEmpty
-                            ? nil
-                            : published.snapshotRef.snapshotDirRel
-                    })
-                    for snapshotRef in affectedSnapshotRefs {
+                    for snapshotRef in readinessAggregation.selectionReadySnapshotDirectories {
                         warningParts[snapshotRef, default: []].append(
                             "Git artifact readiness: cataloged primary artifacts could not be committed to the canonical tab selection (\(error.localizedDescription)); autoSelected was omitted."
                         )
@@ -1136,8 +1140,9 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 // physical projection. Bound logical-root descendants are translated to their
                 // worktree roots for snapshot publication, while the source selection committed
                 // back to the tab remains logical.
+                let usesSelectedScope = scope == .selected && pathspecs == nil
                 let allSelectedAbsolutePaths: [String]
-                if scope == .selected {
+                if usesSelectedScope {
                     let resolvedContext = try preLookupSelectedPublicationContext
                         ?? dependencies.resolveTabContextSnapshot(
                             metadata,
@@ -1177,7 +1182,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     let tabID = dependencies.boundTabID(connectionID)
 
                     // Group selection paths by repo
-                    let pathsByRepo = scope == .selected ? groupAbsolutePathsByRepo(paths: allSelectedAbsolutePaths, repos: repos) : [:]
+                    let pathsByRepo = usesSelectedScope ? groupAbsolutePathsByRepo(paths: allSelectedAbsolutePaths, repos: repos) : [:]
                     let outcomes = await BoundedOrderedConcurrentMap.map(
                         repos,
                         maxConcurrent: Self.maxConcurrentRepositories
@@ -1185,8 +1190,28 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                         do {
                             let repoCompare = try await resolveCompareSpec(compareRaw, for: repo)
                             let repoWorktree = await requestContext.worktreeDTO(for: repo.rootURL)
-                            let repoSelectedPaths = scope == .selected ? (pathsByRepo[repo] ?? []) : []
-                            if scope == .selected, repoSelectedPaths.isEmpty {
+                            let repoSelectedPaths = usesSelectedScope ? (pathsByRepo[repo] ?? []) : []
+                            if let pathspecs,
+                               GitDiffPathNormalization.gitPathspecs(
+                                   from: pathspecs,
+                                   repoRootPath: repo.rootPath
+                               ).isEmpty
+                            {
+                                return MCPGitArtifactRepoOutcome(
+                                    result: Reply.RepoResultDTO(
+                                        repoRoot: repo.rootPath,
+                                        repoKey: repo.repoKey,
+                                        repoName: repo.displayName,
+                                        worktree: repoWorktree,
+                                        emptyReason: "No requested paths in this repo"
+                                    ),
+                                    diff: nil,
+                                    manifest: nil,
+                                    snapshotDir: nil,
+                                    publishedArtifacts: nil
+                                )
+                            }
+                            if usesSelectedScope, repoSelectedPaths.isEmpty {
                                 return MCPGitArtifactRepoOutcome(
                                     result: Reply.RepoResultDTO(
                                         repoRoot: repo.rootPath,
@@ -1211,6 +1236,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                                 compareInput: repoCompare.input,
                                 scope: scope,
                                 selectedAbsolutePaths: repoSelectedPaths,
+                                pathspecs: pathspecs,
                                 contextLines: contextLines,
                                 detectRenames: detectRenames,
                                 snapshotIDOverride: snapshotIDOverride,
@@ -1322,6 +1348,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     compareInput: compare.input,
                     scope: scope,
                     selectedAbsolutePaths: allSelectedAbsolutePaths,
+                    pathspecs: pathspecs,
                     contextLines: contextLines,
                     detectRenames: detectRenames,
                     snapshotIDOverride: snapshotIDOverride,

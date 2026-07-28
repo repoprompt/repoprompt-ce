@@ -455,7 +455,7 @@ def build_candidate_manifest(
             "tree": trees[target],
         }
     return {
-        "schemaVersion": 1,
+        "schemaVersion": artifact.MANIFEST_SCHEMA_VERSION,
         "version": version,
         "tag": tag,
         "releaseURL": f"{artifact.OFFICIAL_REPOSITORY_URL}/releases/tag/{tag}",
@@ -467,6 +467,7 @@ def build_candidate_manifest(
         "packages": packages,
         "requiredLayout": copy.deepcopy(baseline["requiredLayout"]),
         "machOFiles": mach_o_files,
+        "releaseSigningEntitlements": copy.deepcopy(baseline["releaseSigningEntitlements"]),
         "signedExecutables": copy.deepcopy(baseline["signedExecutables"]),
     }
 

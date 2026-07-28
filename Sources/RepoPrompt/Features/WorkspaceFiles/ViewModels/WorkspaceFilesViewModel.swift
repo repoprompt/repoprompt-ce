@@ -762,6 +762,18 @@ class WorkspaceFilesViewModel: ObservableObject {
         handleCodemapRootStatus(update)
     }
 
+    @discardableResult
+    func prioritizeCodemapGraphIndexNow(
+        rootID: UUID
+    ) async -> WorkspaceCodemapGraphIndexPrioritizeDisposition {
+        let disposition = await workspaceFileContextStore.prioritizeCodemapGraphIndexNow(
+            rootID: rootID
+        )
+        let update = await workspaceFileContextStore.currentCodemapRootStatusUpdate()
+        handleCodemapRootStatus(update)
+        return disposition
+    }
+
     @MainActor
     func beginRootShellProjectionChangeBatch() {
         rootShellProjectionChangeBatchDepth += 1

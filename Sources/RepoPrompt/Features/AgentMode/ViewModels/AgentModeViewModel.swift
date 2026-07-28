@@ -72,7 +72,12 @@ final class AgentModeViewModel: ObservableObject {
     typealias PersistedProviderConversationCleaner = ProviderConversationCleaner
     typealias CodexActiveToolQuery = (_ runID: UUID) -> Bool
     typealias CodexAgentRunWaitQuery = (_ runID: UUID) -> Bool
-    typealias CodexAgentRunWaitDrain = @MainActor (_ runID: UUID, _ source: String) async -> Bool
+    typealias CodexAgentRunWaitDrain = @MainActor (
+        _ runID: UUID,
+        _ runAttemptID: UUID?,
+        _ source: String,
+        _ steeringMessage: String?
+    ) async -> Bool
 
     // MARK: - Published Session Proxies
 
@@ -1536,12 +1541,23 @@ final class AgentModeViewModel: ObservableObject {
             claudeCoordinator: claudeCoordinator
         )
         providerBindingService = AgentModeProviderBindingService()
-        codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, source in
+        codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, runAttemptID, source, steeringMessage in
             guard let self, let mcpServer = self.mcpServer else { return true }
             return await mcpServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
                 runID: runID,
                 source: source,
+                steeringMessage: steeringMessage,
                 timeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
+                steeringOriginRunID: { [weak self] in
+                    guard let self,
+                          sessions.values.contains(where: {
+                              $0.runID == runID
+                                  && $0.activeRunAttemptID == runAttemptID
+                                  && $0.runState.isActive
+                          })
+                    else { return nil }
+                    return runID
+                },
                 publicationForSessionID: { [weak self] childSessionID in
                     self?.mcpWaitPublication(sessionID: childSessionID)
                 }
@@ -1692,11 +1708,12 @@ final class AgentModeViewModel: ObservableObject {
                         testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
                     },
                 activeAgentRunWaitDrain: testCodexActiveAgentRunWaitDrain
-                    ?? { [weak testMCPServer] runID, source in
+                    ?? { [weak testMCPServer] runID, _, source, steeringMessage in
                         guard let testMCPServer else { return true }
                         return await testMCPServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
                             runID: runID,
                             source: source,
+                            steeringMessage: steeringMessage,
                             timeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
                             publicationForSessionID: { _ in nil }
                         )
@@ -4682,7 +4699,11 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func wakeCurrentMCPWaitersForSteeringRequestFireAndForget(for session: TabSession, source: String) {
+    private func wakeCurrentMCPWaitersForSteeringRequestFireAndForget(
+        for session: TabSession,
+        steeringMessage: String?,
+        source: String
+    ) {
         guard let snapshot = mcpSnapshot(for: session),
               let context = session.mcpControlContext
         else {
@@ -4690,28 +4711,41 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         let tabID = session.tabID
-        Task { @MainActor [weak self] in
-            guard self?.mcpControlContextMatches(
-                tabID: tabID,
-                sessionID: snapshot.sessionID,
-                activationID: context.activationID,
-                registration: context.registration
-            ) == true else {
+        let steeringOriginIdentity = activeRunSteeringOriginIdentity(for: session)
+        Task { @MainActor [weak self, weak session] in
+            guard let self,
+                  let session,
+                  mcpControlContextMatches(
+                      tabID: tabID,
+                      sessionID: snapshot.sessionID,
+                      activationID: context.activationID,
+                      registration: context.registration
+                  )
+            else {
                 Self.steeringDebugLog("[AgentRunSteeringWake] skip fire wake: control context mismatch source=\(source) sessionID=\(snapshot.sessionID) tab=\(tabID)")
                 return
+            }
+            let originRunID = steeringOriginIdentity.flatMap {
+                self.validatedSteeringOriginRunID($0, session: session)
             }
             Self.steeringDebugLog("[AgentRunSteeringWake] fire wake current waiters source=\(source) sessionID=\(snapshot.sessionID) tab=\(tabID) status=\(snapshot.status.rawValue)")
             await AgentRunSessionStore.wakeCurrentWaiters(
                 snapshot,
                 cursor: .init(registration: context.registration, epoch: context.currentEpoch),
-                reason: .steeringRequested
+                reason: .steeringRequested,
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: originRunID
             )
             await Task.yield()
             Self.steeringDebugLog("[AgentRunSteeringWake] fire wake yielded source=\(source) sessionID=\(snapshot.sessionID) tab=\(tabID)")
         }
     }
 
-    private func wakeCurrentMCPWaitersForSteeringRequest(for session: TabSession) async {
+    private func wakeCurrentMCPWaitersForSteeringRequest(
+        for session: TabSession,
+        steeringMessage: String?,
+        steeringOriginRunID: UUID?
+    ) async {
         guard let snapshot = mcpSnapshot(for: session),
               let context = session.mcpControlContext
         else {
@@ -4731,7 +4765,9 @@ final class AgentModeViewModel: ObservableObject {
         await AgentRunSessionStore.wakeCurrentWaiters(
             snapshot,
             cursor: .init(registration: context.registration, epoch: context.currentEpoch),
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: steeringOriginRunID
         )
     }
 
@@ -6837,7 +6873,37 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    private struct ActiveRunSteeringOriginIdentity: Equatable {
+        let tabID: UUID
+        let runID: UUID
+        let runAttemptID: UUID?
+    }
+
+    private func activeRunSteeringOriginIdentity(
+        for session: TabSession
+    ) -> ActiveRunSteeringOriginIdentity? {
+        guard let runID = session.runID else { return nil }
+        return ActiveRunSteeringOriginIdentity(
+            tabID: session.tabID,
+            runID: runID,
+            runAttemptID: session.activeRunAttemptID
+        )
+    }
+
+    private func validatedSteeringOriginRunID(
+        _ identity: ActiveRunSteeringOriginIdentity,
+        session: TabSession
+    ) -> UUID? {
+        guard sessions[identity.tabID] === session,
+              session.runState.isActive,
+              session.runID == identity.runID,
+              session.activeRunAttemptID == identity.runAttemptID
+        else { return nil }
+        return identity.runID
+    }
+
     private struct MCPActiveDispatchWakeIdentity: Equatable {
+        let tabID: UUID
         let sessionID: UUID
         let activationID: UUID
         let registration: AgentRunSessionStore.Registration
@@ -6845,6 +6911,8 @@ final class AgentModeViewModel: ObservableObject {
         let runAttemptID: UUID?
         let codexControllerInstanceID: ObjectIdentifier?
         let codexControllerGeneration: UUID?
+        let claudeControllerInstanceID: ObjectIdentifier?
+        let acpControllerInstanceID: ObjectIdentifier?
     }
 
     private func mcpActiveDispatchWakeIdentity(
@@ -6855,13 +6923,16 @@ final class AgentModeViewModel: ObservableObject {
               context.sessionID == sessionID
         else { return nil }
         return MCPActiveDispatchWakeIdentity(
+            tabID: session.tabID,
             sessionID: sessionID,
             activationID: context.activationID,
             registration: context.registration,
             runID: session.runID,
             runAttemptID: session.activeRunAttemptID,
             codexControllerInstanceID: session.codexController.map(ObjectIdentifier.init),
-            codexControllerGeneration: session.codexControllerGeneration
+            codexControllerGeneration: session.codexControllerGeneration,
+            claudeControllerInstanceID: session.claudeController.map(ObjectIdentifier.init),
+            acpControllerInstanceID: session.acpController.map(ObjectIdentifier.init)
         )
     }
 
@@ -6869,7 +6940,10 @@ final class AgentModeViewModel: ObservableObject {
         _ identity: MCPActiveDispatchWakeIdentity,
         session: TabSession
     ) -> Bool {
-        guard let context = session.mcpControlContext else { return false }
+        guard sessions[identity.tabID] === session,
+              session.runState.isActive,
+              let context = session.mcpControlContext
+        else { return false }
         return context.sessionID == identity.sessionID
             && context.activationID == identity.activationID
             && context.registration == identity.registration
@@ -6877,6 +6951,8 @@ final class AgentModeViewModel: ObservableObject {
             && session.activeRunAttemptID == identity.runAttemptID
             && session.codexController.map(ObjectIdentifier.init) == identity.codexControllerInstanceID
             && session.codexControllerGeneration == identity.codexControllerGeneration
+            && session.claudeController.map(ObjectIdentifier.init) == identity.claudeControllerInstanceID
+            && session.acpController.map(ObjectIdentifier.init) == identity.acpControllerInstanceID
     }
 
     private func mcpActiveInstructionDispatchPlan(for session: TabSession) -> MCPActiveInstructionDispatchPlan {
@@ -6914,15 +6990,10 @@ final class AgentModeViewModel: ObservableObject {
         delivery: MCPInstructionDispatch,
         session: TabSession,
         sessionID: UUID,
+        steeringMessage: String,
         expectedIdentity: MCPActiveDispatchWakeIdentity? = nil
     ) async -> Bool {
         guard delivery.isActiveRunDispatch else { return false }
-        if let expectedIdentity,
-           !mcpActiveDispatchWakeIdentityMatches(expectedIdentity, session: session)
-        {
-            Self.steeringDebugLog("[AgentRunSteeringWake] skip wake: active dispatch identity changed before wake sessionID=\(sessionID)")
-            return false
-        }
         let runIDToWake = expectedIdentity?.runID ?? session.runID
         if let runID = runIDToWake,
            let mcpServer
@@ -6930,6 +7001,15 @@ final class AgentModeViewModel: ObservableObject {
             await mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
                 runID: runID,
                 source: "mcp-dispatch-parent-run",
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: { [weak self, weak session] in
+                    guard let self,
+                          let session,
+                          let expectedIdentity,
+                          mcpActiveDispatchWakeIdentityMatches(expectedIdentity, session: session)
+                    else { return nil }
+                    return expectedIdentity.runID
+                },
                 publicationForSessionID: { [weak self] childSessionID in
                     self?.mcpWaitPublication(sessionID: childSessionID)
                 }
@@ -6941,11 +7021,36 @@ final class AgentModeViewModel: ObservableObject {
             Self.steeringDebugLog("[AgentRunSteeringWake] skip current wake: active dispatch identity changed after parent wake sessionID=\(sessionID)")
             return false
         }
-        await wakeCurrentMCPWaitersForSteeringRequest(for: session)
+        await wakeCurrentMCPWaitersForSteeringRequest(
+            for: session,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: expectedIdentity?.runID
+        )
         await Task.yield()
         Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch yielded after steering wake sessionID=\(sessionID)")
         return true
     }
+
+    #if DEBUG
+        func test_wakeMCPWaitersForActiveDispatch(
+            delivery: MCPInstructionDispatch,
+            session: TabSession,
+            sessionID: UUID,
+            steeringMessage: String
+        ) async -> Bool {
+            let expectedIdentity = mcpActiveDispatchWakeIdentity(
+                for: session,
+                sessionID: sessionID
+            )
+            return await wakeMCPWaitersForActiveDispatch(
+                delivery: delivery,
+                session: session,
+                sessionID: sessionID,
+                steeringMessage: steeringMessage,
+                expectedIdentity: expectedIdentity
+            )
+        }
+    #endif
 
     private func signalMCPInstructionDeliveredIfIdentityMatches(
         for session: TabSession,
@@ -7028,9 +7133,9 @@ final class AgentModeViewModel: ObservableObject {
             signalsDeliveryAfterDispatch = false
         }
 
-        let activeDispatchWakeIdentity = codexAttemptID == nil
-            ? nil
-            : mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
+        let activeDispatchWakeIdentity = delivery.isActiveRunDispatch
+            ? mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
+            : nil
         let ackCancellationTarget = codexAttemptID.map {
             (tracker: session.codexSteerAckTracker, attemptID: $0)
         }
@@ -7078,6 +7183,7 @@ final class AgentModeViewModel: ObservableObject {
                             delivery: delivery,
                             session: session,
                             sessionID: sessionID,
+                            steeringMessage: trimmedText,
                             expectedIdentity: activeDispatchWakeIdentity
                         )
                     } else {
@@ -7092,11 +7198,23 @@ final class AgentModeViewModel: ObservableObject {
                     }
                 } else {
                     if delivery == .queuedClaudeInterrupt {
-                        _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                        _ = await wakeMCPWaitersForActiveDispatch(
+                            delivery: delivery,
+                            session: session,
+                            sessionID: sessionID,
+                            steeringMessage: trimmedText,
+                            expectedIdentity: activeDispatchWakeIdentity
+                        )
                     }
                     try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
                     if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
-                        _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                        _ = await wakeMCPWaitersForActiveDispatch(
+                            delivery: delivery,
+                            session: session,
+                            sessionID: sessionID,
+                            steeringMessage: trimmedText,
+                            expectedIdentity: activeDispatchWakeIdentity
+                        )
                     }
                     if signalsDeliveryAfterDispatch {
                         await signalMCPInstructionDelivered(for: session)
@@ -12075,6 +12193,14 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    private static func validatedSteeringOriginRunID(
+        capturedRunID: UUID?,
+        currentRunID: UUID?
+    ) -> UUID? {
+        guard let capturedRunID, capturedRunID == currentRunID else { return nil }
+        return capturedRunID
+    }
+
     private static func shouldWakeParentAgentRunWaitersForActiveSubmit(
         selectedAgent: AgentProviderKind,
         codexCompactionInFlight: Bool
@@ -12083,6 +12209,16 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     #if DEBUG
+        static func test_validatedSteeringOriginRunID(
+            capturedRunID: UUID?,
+            currentRunID: UUID?
+        ) -> UUID? {
+            validatedSteeringOriginRunID(
+                capturedRunID: capturedRunID,
+                currentRunID: currentRunID
+            )
+        }
+
         static func test_shouldWakeParentAgentRunWaitersForActiveSubmit(
             selectedAgent: AgentProviderKind,
             codexCompactionInFlight: Bool
@@ -12216,21 +12352,30 @@ final class AgentModeViewModel: ObservableObject {
         updateBindingsFromSession(session)
         scheduleSave(for: tabID)
 
+        let steeringMessage = trimmedText.isEmpty ? nil : trimmedText
         if session.runState == .running,
            !session.isMCPInstructionDispatchInProgress
         {
             Self.steeringDebugLog("[AgentRunSteeringWake] manual active submit accepted tab=\(tabID) runState=\(session.runState.rawValue) agent=\(session.selectedAgent.displayName) runID=\(String(describing: session.runID)) hasMCPContext=\(session.mcpControlContext != nil)")
-            if let runID = session.runID,
+            if let steeringOriginIdentity = activeRunSteeringOriginIdentity(for: session),
                Self.shouldWakeParentAgentRunWaitersForActiveSubmit(
                    selectedAgent: session.selectedAgent,
                    codexCompactionInFlight: codexCompactionInFlight
                )
             {
-                Task { @MainActor [weak self] in
-                    guard let self, let mcpServer else { return }
+                Task { @MainActor [weak self, weak session] in
+                    guard let self, let session, let mcpServer else { return }
                     await mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
-                        runID: runID,
+                        runID: steeringOriginIdentity.runID,
                         source: "manual-active-submit-parent-run",
+                        steeringMessage: steeringMessage,
+                        steeringOriginRunID: { [weak self, weak session] in
+                            guard let self, let session else { return nil }
+                            return validatedSteeringOriginRunID(
+                                steeringOriginIdentity,
+                                session: session
+                            )
+                        },
                         publicationForSessionID: { [weak self] childSessionID in
                             self?.mcpWaitPublication(sessionID: childSessionID)
                         }
@@ -12238,7 +12383,11 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
             if session.mcpControlContext != nil {
-                wakeCurrentMCPWaitersForSteeringRequestFireAndForget(for: session, source: "manual-active-submit-controlled-session")
+                wakeCurrentMCPWaitersForSteeringRequestFireAndForget(
+                    for: session,
+                    steeringMessage: steeringMessage,
+                    source: "manual-active-submit-controlled-session"
+                )
             }
         }
 

@@ -432,6 +432,7 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceLookupContext?,
             ToolResultDTOs.SelectionReply
         ) -> Void)?
+        private var beforeAgentRunWaiterWakeForTesting: (@MainActor @Sendable (UUID, UUID) async -> Void)?
 
         func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
             oracleChatSendOverrideForTesting = override
@@ -445,6 +446,12 @@ final class MCPServerViewModel: ObservableObject {
             _ override: AgentExternalMCPRunStarter.DispatchInstruction?
         ) {
             agentRunDispatchOverrideForTesting = override
+        }
+
+        func setBeforeAgentRunWaiterWakeForTesting(
+            _ hook: (@MainActor @Sendable (UUID, UUID) async -> Void)?
+        ) {
+            beforeAgentRunWaiterWakeForTesting = hook
         }
 
         func executeAgentRunForTesting(args: [String: Value]) async throws -> Value {
@@ -2108,7 +2115,11 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    private func beginAgentRunWaitScope(metadata: RequestMetadata, sessionIDs: Set<UUID>, timeoutSeconds: TimeInterval?) async -> UUID? {
+    private func beginAgentRunWaitScope(
+        metadata: RequestMetadata,
+        sessionIDs: Set<UUID>,
+        timeoutSeconds: TimeInterval?
+    ) async -> AgentRunWaitScopeRegistration? {
         guard !sessionIDs.isEmpty else { return nil }
         purgeStaleAgentRunWaitScopes(source: "begin")
         let resolvedContext = try? resolveTabContextSnapshot(
@@ -2134,7 +2145,7 @@ final class MCPServerViewModel: ObservableObject {
             childAgentRunWaitCountsByParentRunID[parentRunID, default: [:]][sessionID, default: 0] += 1
         }
         steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope begin parentRunID=\(parentRunID) token=\(token) timeout=\(timeoutSeconds.map { String($0) } ?? "none") childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) counts=\(debugChildAgentRunWaits(for: parentRunID))")
-        return token
+        return AgentRunWaitScopeRegistration(token: token, parentRunID: parentRunID)
     }
 
     @MainActor
@@ -2192,6 +2203,8 @@ final class MCPServerViewModel: ObservableObject {
     func wakeAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
+        steeringMessage: String? = nil,
+        steeringOriginRunID: () -> UUID? = { nil },
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async {
         let sessionIDs = Set(childAgentRunWaitCountsByParentRunID[runID]?.keys.map(\.self) ?? [])
@@ -2205,10 +2218,18 @@ final class MCPServerViewModel: ObservableObject {
                 steeringDebugLog("[AgentRunSteeringWake] parent wake skipped missing child snapshot source=\(source) parentRunID=\(runID) childSessionID=\(sessionID)")
                 continue
             }
+            #if DEBUG
+                if let beforeAgentRunWaiterWakeForTesting {
+                    await beforeAgentRunWaiterWakeForTesting(runID, sessionID)
+                }
+            #endif
+            let validatedSteeringOriginRunID = steeringOriginRunID()
             await AgentRunSessionStore.wakeCurrentWaiters(
                 publication.snapshot,
                 cursor: publication.cursor,
-                reason: .steeringRequested
+                reason: .steeringRequested,
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: validatedSteeringOriginRunID
             )
         }
         await Task.yield()
@@ -2219,7 +2240,9 @@ final class MCPServerViewModel: ObservableObject {
     func wakeAndDrainAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
+        steeringMessage: String? = nil,
         timeoutSeconds: TimeInterval,
+        steeringOriginRunID: () -> UUID? = { nil },
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async -> Bool {
         guard hasActiveChildAgentRunWaits(runID: runID) else {
@@ -2232,6 +2255,8 @@ final class MCPServerViewModel: ObservableObject {
             await wakeAgentRunWaitersOwnedByActiveRun(
                 runID: runID,
                 source: source,
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: steeringOriginRunID,
                 publicationForSessionID: publicationForSessionID
             )
 
@@ -2357,7 +2382,7 @@ final class MCPServerViewModel: ObservableObject {
             metadata: RequestMetadata,
             sessionIDs: Set<UUID>,
             timeoutSeconds: TimeInterval?
-        ) async -> UUID? {
+        ) async -> AgentRunWaitScopeRegistration? {
             await beginAgentRunWaitScope(
                 metadata: metadata,
                 sessionIDs: sessionIDs,

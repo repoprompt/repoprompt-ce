@@ -683,7 +683,8 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             extraEnvironment: [
                 "ACP_EMPTY_PROMPT": "1",
                 "ACP_EMPTY_PROMPT_STDERR": #"timestamp=2026-06-27T15:45:21.351Z level=ERROR run=82912cb3 message="stream error" providerID=zai-coding-plan modelID=glm-5.2 error.error="AI_APICallError: Authentication Failed""#
-            ]
+            ],
+            releaseGates: [.emptyPromptResponse]
         )
         let collectedEvents = LockedACPStreamResults()
         let events = await fixture.controller.currentEventsStream()
@@ -703,7 +704,16 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         defer { eventTask.cancel() }
 
         _ = try await fixture.controller.bootstrap()
-        try await fixture.controller.prompt(AgentMessage(userMessage: "Say hello"))
+        let promptTask = Task {
+            try await fixture.controller.prompt(AgentMessage(userMessage: "Say hello"))
+        }
+        try await fixture.sync.waitForReleaseWaiter(.emptyPromptResponse)
+        try await collectedEvents.waitForText(
+            "Authentication Failed",
+            description: "OpenCode prompt-time stderr"
+        )
+        try fixture.sync.release(.emptyPromptResponse)
+        try await promptTask.value
         try await collectedEvents.waitForTerminal("OpenCode empty prompt terminal event")
         let results = collectedEvents.values
         await fixture.controller.shutdown()
@@ -996,12 +1006,14 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             case modelResponse = "model_response"
             case afterSetNotification = "after_set_notification"
             case processExit = "process_exit"
+            case emptyPromptResponse = "empty_prompt_response"
 
             var environmentKey: String {
                 switch self {
                 case .modelResponse: "ACP_MODEL_RELEASE_FIFO"
                 case .afterSetNotification: "ACP_AFTER_SET_NOTIFICATION_RELEASE_FIFO"
                 case .processExit: "ACP_EXIT_ON_CANCEL_RELEASE_FIFO"
+                case .emptyPromptResponse: "ACP_EMPTY_PROMPT_RESPONSE_RELEASE_FIFO"
                 }
             }
 
@@ -1567,6 +1579,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                     stderr_line = os.environ.get("ACP_EMPTY_PROMPT_STDERR")
                     if stderr_line:
                         print(stderr_line, file=sys.stderr, flush=True)
+                    response_release_fifo = os.environ.get("ACP_EMPTY_PROMPT_RESPONSE_RELEASE_FIFO")
+                    if response_release_fifo:
+                        wait_for_release_fifo(response_release_fifo, "empty_prompt_response")
                     respond(request.get("id"), {"stopReason": "end_turn", "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}})
                     continue
                 respond(request.get("id"), {"stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}})
@@ -1604,6 +1619,12 @@ private final class LockedACPStreamResults: @unchecked Sendable {
     func markTerminal() {
         condition.update { state in
             state.didSeeTerminal = true
+        }
+    }
+
+    func waitForText(_ text: String, description: String) async throws {
+        try await condition.waitUntil(description) { state in
+            state.values.contains { $0.text?.contains(text) == true }
         }
     }
 

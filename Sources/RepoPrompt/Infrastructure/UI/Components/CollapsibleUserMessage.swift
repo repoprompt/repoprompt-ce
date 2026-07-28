@@ -68,19 +68,35 @@ private struct MeasuredPlainTextView: View {
 
 // MARK: - Collapsible User Message
 
+struct CollapsibleUserMessagePreview {
+    let text: String
+    let needsCollapse: Bool
+
+    init(text: String, characterLimit: Int) {
+        precondition(characterLimit >= 0, "characterLimit must be nonnegative")
+
+        guard let previewEnd = text.index(
+            text.startIndex,
+            offsetBy: characterLimit,
+            limitedBy: text.endIndex
+        ), previewEnd != text.endIndex else {
+            self.text = text
+            needsCollapse = false
+            return
+        }
+
+        self.text = String(text[..<previewEnd])
+        needsCollapse = true
+    }
+}
+
 /// A user message view that collapses if the text exceeds a threshold.
 /// Provides expand/collapse functionality with smooth animations.
 struct CollapsibleUserMessage: View {
     let text: String
-
-    /// Number of characters to show in collapsed state
-    var previewCharCount: Int = 500
-
-    /// Label shown on expand button
-    var expandLabel: String = "Show more…"
-
-    /// Label shown on collapse button
-    var collapseLabel: String = "Show less"
+    let previewCharCount: Int
+    let expandLabel: String
+    let collapseLabel: String
 
     // UI state
     @State private var isCollapsed = true
@@ -91,15 +107,30 @@ struct CollapsibleUserMessage: View {
         fontScale.preset
     }
 
-    private var displayText: String {
-        if text.count > previewCharCount, isCollapsed {
-            return String(text.prefix(previewCharCount))
-        }
-        return text
+    /// Computed with a bounded grapheme traversal and reused for rendering.
+    private let preview: CollapsibleUserMessagePreview
+
+    init(
+        text: String,
+        previewCharCount: Int = 500,
+        expandLabel: String = "Show more…",
+        collapseLabel: String = "Show less"
+    ) {
+        self.text = text
+        self.previewCharCount = previewCharCount
+        self.expandLabel = expandLabel
+        self.collapseLabel = collapseLabel
+        preview = CollapsibleUserMessagePreview(
+            text: text,
+            characterLimit: previewCharCount
+        )
     }
 
-    private var needsCollapse: Bool {
-        text.count > previewCharCount
+    private var displayText: String {
+        if preview.needsCollapse, isCollapsed {
+            return preview.text
+        }
+        return text
     }
 
     private func updateLastKnownContentWidth(_ width: CGFloat) {
@@ -121,7 +152,7 @@ struct CollapsibleUserMessage: View {
         VStack(alignment: .leading, spacing: 6) {
             // Use normal Text for small messages or collapsed state.
             // Use the shared measured AppKit text path for expanded large messages.
-            if !needsCollapse || isCollapsed {
+            if !preview.needsCollapse || isCollapsed {
                 Text(displayText)
                     .font(fontPreset.font)
                     .textSelection(.enabled)
@@ -135,7 +166,7 @@ struct CollapsibleUserMessage: View {
                 .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
             }
 
-            if needsCollapse {
+            if preview.needsCollapse {
                 Button {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         isCollapsed.toggle()

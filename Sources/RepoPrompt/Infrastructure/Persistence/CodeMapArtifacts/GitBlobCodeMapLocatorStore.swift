@@ -15,18 +15,36 @@ struct GitBlobCodeMapLocatorStorePolicy: Equatable {
     let maximumRecordCount: Int
     let maximumByteCount: UInt64
     let maintenanceEntryLimit: Int
+    let maintenanceReconciliationInterval: Int
+    let maintenanceLowWaterPercentage: Int
 
     static let `default` = GitBlobCodeMapLocatorStorePolicy(
         maximumRecordCount: 4096,
         maximumByteCount: 16 * 1024 * 1024,
-        maintenanceEntryLimit: 8192
+        maintenanceEntryLimit: 8192,
+        maintenanceReconciliationInterval: 256,
+        maintenanceLowWaterPercentage: 90
     )
 
-    init(maximumRecordCount: Int, maximumByteCount: UInt64, maintenanceEntryLimit: Int) {
-        precondition(maximumRecordCount > 0 && maximumByteCount > 0 && maintenanceEntryLimit > 0)
+    init(
+        maximumRecordCount: Int,
+        maximumByteCount: UInt64,
+        maintenanceEntryLimit: Int,
+        maintenanceReconciliationInterval: Int = 256,
+        maintenanceLowWaterPercentage: Int = 90
+    ) {
+        precondition(
+            maximumRecordCount > 0 &&
+                maximumByteCount > 0 &&
+                maintenanceEntryLimit > 0 &&
+                maintenanceReconciliationInterval > 0 &&
+                (90 ... 95).contains(maintenanceLowWaterPercentage)
+        )
         self.maximumRecordCount = maximumRecordCount
         self.maximumByteCount = maximumByteCount
         self.maintenanceEntryLimit = maintenanceEntryLimit
+        self.maintenanceReconciliationInterval = maintenanceReconciliationInterval
+        self.maintenanceLowWaterPercentage = maintenanceLowWaterPercentage
     }
 }
 
@@ -39,6 +57,30 @@ struct GitBlobCodeMapLocatorMaintenanceResult: Equatable {
     let remainingRecordCount: Int
     let remainingByteCount: UInt64
     let hasMore: Bool
+}
+
+#if DEBUG
+    struct GitBlobCodeMapLocatorMaintenanceAccounting: Equatable {
+        let sweepCount: UInt64
+        let examinedRecordCount: UInt64
+        let isSeeded: Bool
+        let successfulInsertsSinceSweep: Int
+        let estimatedRecordCount: Int
+        let estimatedByteCount: UInt64
+        let lastResult: GitBlobCodeMapLocatorMaintenanceResult?
+    }
+#endif
+
+private struct GitBlobCodeMapLocatorMaintenanceEstimate {
+    var isSeeded = false
+    var successfulInsertsSinceSweep = 0
+    var recordCount = 0
+    var byteCount: UInt64 = 0
+}
+
+private enum GitBlobCodeMapLocatorMaintenanceQuotaTarget {
+    case exact
+    case automaticLowWater
 }
 
 struct GitBlobCodeMapLocatorStoreHooks {
@@ -85,6 +127,13 @@ actor GitBlobCodeMapLocatorStore {
     nonisolated let rootURL: URL
     private let policy: GitBlobCodeMapLocatorStorePolicy
     private let hooks: GitBlobCodeMapLocatorStoreHooks
+    private var maintenanceEstimate = GitBlobCodeMapLocatorMaintenanceEstimate()
+
+    #if DEBUG
+        private var debugMaintenanceSweepCount: UInt64 = 0
+        private var debugMaintenanceExaminedRecordCount: UInt64 = 0
+        private var debugLastMaintenanceResult: GitBlobCodeMapLocatorMaintenanceResult?
+    #endif
 
     init(
         rootURL: URL,
@@ -248,7 +297,11 @@ actor GitBlobCodeMapLocatorStore {
                     throw GitBlobCodeMapLocatorStoreError.integrityCollision
                 }
                 do {
-                    _ = try maintainLocked(layout: layout, maximumEntries: nil, protecting: name)
+                    try maintainAfterSuccessfulInsert(
+                        layout: layout,
+                        insertedByteCount: UInt64(record.count),
+                        protecting: name
+                    )
                 } catch GitBlobCodeMapLocatorStoreError.quotaExceeded {
                     _ = try Self.secureRemove(parent: shard, name: name, descriptor: descriptor)
                     throw GitBlobCodeMapLocatorStoreError.quotaExceeded
@@ -271,7 +324,9 @@ actor GitBlobCodeMapLocatorStore {
                     throw Self.ioError("temporary-unlink")
                 }
                 temporaryExists = false
-                _ = try maintainLocked(layout: layout, maximumEntries: nil, protecting: name)
+                // The secure match and temporary cleanup above are the entire idempotent mutation path.
+                // Before: every repeat write paid O(min(namespace records, maintenanceEntryLimit)).
+                // After: repeat writes remain O(one validated record) while still holding the same flock.
                 return .alreadyPresent
             }
 
@@ -353,24 +408,108 @@ actor GitBlobCodeMapLocatorStore {
             }
             displacedExists = false
             try Self.synchronize(shard.rawValue, operation: "record-repair-cleanup-directory-fsync")
-            _ = try maintainLocked(layout: layout, maximumEntries: nil, protecting: name)
+            // Repair swaps remain conservative: reconcile immediately because replacing an invalid record
+            // cannot safely update the actor-local byte estimate from the displaced payload.
+            let maintenance = try maintainLocked(
+                layout: layout,
+                maximumEntries: nil,
+                protecting: name,
+                quotaTarget: .automaticLowWater
+            )
+            updateMaintenanceEstimate(after: maintenance)
             return .inserted
         }
     }
 
     func maintain(maximumEntries: Int? = nil) throws -> GitBlobCodeMapLocatorMaintenanceResult {
         try Self.withMaintenanceLock(rootURL: rootURL) { layout in
-            try maintainLocked(layout: layout, maximumEntries: maximumEntries, protecting: nil)
+            let result = try maintainLocked(
+                layout: layout,
+                maximumEntries: maximumEntries,
+                protecting: nil,
+                quotaTarget: .exact
+            )
+            if !result.hasMore {
+                updateMaintenanceEstimate(after: result)
+            }
+            return result
         }
+    }
+
+    #if DEBUG
+        func debugMaintenanceAccounting() -> GitBlobCodeMapLocatorMaintenanceAccounting {
+            GitBlobCodeMapLocatorMaintenanceAccounting(
+                sweepCount: debugMaintenanceSweepCount,
+                examinedRecordCount: debugMaintenanceExaminedRecordCount,
+                isSeeded: maintenanceEstimate.isSeeded,
+                successfulInsertsSinceSweep: maintenanceEstimate.successfulInsertsSinceSweep,
+                estimatedRecordCount: maintenanceEstimate.recordCount,
+                estimatedByteCount: maintenanceEstimate.byteCount,
+                lastResult: debugLastMaintenanceResult
+            )
+        }
+    #endif
+
+    /// Amortizes namespace scans without weakening the publication lock or explicit maintenance contract.
+    ///
+    /// The first successful insert seeds exact actor-local estimates and removes crash residue. Later inserts
+    /// are O(1) estimate updates and reconcile at the count/byte high-water mark or every configured interval,
+    /// rather than making W writes cost O(W × min(namespace records, maintenanceEntryLimit)). Independently
+    /// initialized stores can each contribute at most `interval - 1` unseen inserts before reconciliation;
+    /// a full sweep remains capped by `maintenanceEntryLimit` and fails closed when it cannot prove compliance.
+    private func maintainAfterSuccessfulInsert(
+        layout: GitBlobLocatorStoreLayout,
+        insertedByteCount: UInt64,
+        protecting protectedDigest: String
+    ) throws {
+        let projectedRecordCount = maintenanceEstimate.recordCount + 1
+        let projectedByteCount = maintenanceEstimate.byteCount.addingReportingOverflow(insertedByteCount)
+        let projectedInsertCount = maintenanceEstimate.successfulInsertsSinceSweep + 1
+        let shouldSweep = !maintenanceEstimate.isSeeded ||
+            projectedRecordCount > policy.maximumRecordCount ||
+            projectedByteCount.overflow ||
+            projectedByteCount.partialValue > policy.maximumByteCount ||
+            projectedInsertCount >= policy.maintenanceReconciliationInterval
+
+        guard shouldSweep else {
+            maintenanceEstimate.recordCount = projectedRecordCount
+            maintenanceEstimate.byteCount = projectedByteCount.partialValue
+            maintenanceEstimate.successfulInsertsSinceSweep = projectedInsertCount
+            return
+        }
+
+        let result = try maintainLocked(
+            layout: layout,
+            maximumEntries: nil,
+            protecting: protectedDigest,
+            quotaTarget: .automaticLowWater
+        )
+        updateMaintenanceEstimate(after: result)
+    }
+
+    private func updateMaintenanceEstimate(after result: GitBlobCodeMapLocatorMaintenanceResult) {
+        maintenanceEstimate = GitBlobCodeMapLocatorMaintenanceEstimate(
+            isSeeded: !result.hasMore,
+            successfulInsertsSinceSweep: 0,
+            recordCount: result.remainingRecordCount,
+            byteCount: result.remainingByteCount
+        )
     }
 
     private func maintainLocked(
         layout: GitBlobLocatorStoreLayout,
         maximumEntries: Int?,
-        protecting protectedDigest: String?
+        protecting protectedDigest: String?,
+        quotaTarget: GitBlobCodeMapLocatorMaintenanceQuotaTarget
     ) throws -> GitBlobCodeMapLocatorMaintenanceResult {
         let limit = max(1, min(maximumEntries ?? policy.maintenanceEntryLimit, policy.maintenanceEntryLimit))
         var examined = 0
+        #if DEBUG
+            defer {
+                debugMaintenanceSweepCount &+= 1
+                debugMaintenanceExaminedRecordCount &+= UInt64(examined)
+            }
+        #endif
         var removedTemporary = 0
         var removedCorrupt = 0
         var evicted = 0
@@ -425,6 +564,29 @@ actor GitBlobCodeMapLocatorStore {
 
         var remainingCount = entries.count
         var remainingBytes = entries.reduce(UInt64(0)) { $0 &+ $1.byteCount }
+        let exceedsHighWater = remainingCount > policy.maximumRecordCount ||
+            remainingBytes > policy.maximumByteCount
+        let targetRecordCount: Int
+        let targetByteCount: UInt64
+        if quotaTarget == .automaticLowWater, exceedsHighWater {
+            targetRecordCount = max(
+                1,
+                Self.percentage(
+                    policy.maximumRecordCount,
+                    policy.maintenanceLowWaterPercentage
+                )
+            )
+            targetByteCount = max(
+                1,
+                Self.percentage(
+                    policy.maximumByteCount,
+                    policy.maintenanceLowWaterPercentage
+                )
+            )
+        } else {
+            targetRecordCount = policy.maximumRecordCount
+            targetByteCount = policy.maximumByteCount
+        }
         let ordered = entries.sorted {
             if $0.modificationSeconds != $1.modificationSeconds {
                 return $0.modificationSeconds < $1.modificationSeconds
@@ -434,7 +596,7 @@ actor GitBlobCodeMapLocatorStore {
             }
             return $0.name < $1.name
         }
-        for entry in ordered where remainingCount > policy.maximumRecordCount || remainingBytes > policy.maximumByteCount {
+        for entry in ordered where remainingCount > targetRecordCount || remainingBytes > targetByteCount {
             guard entry.name != protectedDigest,
                   let shard = try Self.openOwnedDirectory(parent: layout.records, name: entry.shard, create: false)
             else { continue }
@@ -459,7 +621,7 @@ actor GitBlobCodeMapLocatorStore {
                 throw Self.ioError("maintenance-shard-prune")
             }
         }
-        return GitBlobCodeMapLocatorMaintenanceResult(
+        let result = GitBlobCodeMapLocatorMaintenanceResult(
             examinedCount: examined,
             removedTemporaryCount: removedTemporary,
             removedCorruptCount: removedCorrupt,
@@ -469,6 +631,19 @@ actor GitBlobCodeMapLocatorStore {
             remainingByteCount: remainingBytes,
             hasMore: hasMore
         )
+        #if DEBUG
+            debugLastMaintenanceResult = result
+        #endif
+        return result
+    }
+
+    private static func percentage(_ value: Int, _ percentage: Int) -> Int {
+        (value / 100) * percentage + ((value % 100) * percentage) / 100
+    }
+
+    private static func percentage(_ value: UInt64, _ percentage: Int) -> UInt64 {
+        let multiplier = UInt64(percentage)
+        return (value / 100) * multiplier + ((value % 100) * multiplier) / 100
     }
 
     private static func recordMatches(

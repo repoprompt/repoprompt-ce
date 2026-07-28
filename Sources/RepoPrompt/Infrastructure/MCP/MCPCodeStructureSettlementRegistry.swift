@@ -1,11 +1,12 @@
 import Foundation
 
-/// Owns same-window `get_code_structure` settlement state outside ordinary lane accounting.
+/// Owns same-window settlement state for detach-disposition tools outside ordinary lane accounting.
 ///
-/// Every admitted provider receives an invocation-scoped lease. Completion, cleanup-grace
-/// expiry, and external cancellation transition that lease under this registry's single lock.
-/// Once any lease becomes detaching, detached, abandoned, or force-disconnecting, later calls
-/// receive typed busy until every unsettled lease clears.
+/// The fenced tools are `get_code_structure`, `read_file`, and `get_file_tree`. Every admitted
+/// provider receives an invocation-scoped lease. Completion, cleanup-grace expiry, and external
+/// cancellation transition that lease under this registry's single lock. Once any lease becomes
+/// detaching, detached, abandoned, or force-disconnecting, later same-window detach-disposition
+/// calls receive typed busy until every unsettled lease clears.
 final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
     enum BusyReason: Equatable {
         case detached
