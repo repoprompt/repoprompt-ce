@@ -58,20 +58,16 @@ enum CodeHighlighter {
     /// toggles dark/light mode (because colours change).
     private enum Cached {
         /// Light-mode colours follow the same ordering as `rawSpecs`.
-        private static var lightCache: [(NSRegularExpression, NSColor)] = []
+        /// Initialized once, thread-safely, via Swift's static let guarantee.
+        private static let lightCache: [(NSRegularExpression, NSColor)] = buildCache(dark: false)
 
         /// Dark-mode colours follow the same ordering as `rawSpecs`.
-        private static var darkCache: [(NSRegularExpression, NSColor)] = []
+        /// Initialized once, thread-safely, via Swift's static let guarantee.
+        private static let darkCache: [(NSRegularExpression, NSColor)] = buildCache(dark: true)
 
-        /// Return the correct cache; build it the first time it is requested.
+        /// Return the correct cache (always pre-built; no lazy init needed).
         static func compiled(darkMode: Bool) -> [(NSRegularExpression, NSColor)] {
-            if darkMode {
-                if darkCache.isEmpty { darkCache = buildCache(dark: true) }
-                return darkCache
-            } else {
-                if lightCache.isEmpty { lightCache = buildCache(dark: false) }
-                return lightCache
-            }
+            darkMode ? darkCache : lightCache
         }
 
         /// Build either the dark- or light-mode cache.
