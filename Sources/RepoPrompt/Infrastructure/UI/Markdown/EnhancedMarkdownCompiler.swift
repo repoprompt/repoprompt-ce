@@ -126,9 +126,17 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     mutating func visitInlineCode(_ inlineCode: Markdown.InlineCode) -> NSAttributedString {
         let font = NSFont.monospacedSystemFont(ofSize: fontSize - 1, weight: .regular)
+        // An attributed-string embedding keeps inline code left-to-right without
+        // inserting bidi controls or changing UTF-16 offsets. Embedding is not
+        // isolate semantics, and RTL runs inside the code remain subject to the
+        // Unicode bidi algorithm rather than being forcibly reordered.
+        let writingDirection = NSNumber(
+            value: NSWritingDirection.leftToRight.rawValue | NSWritingDirectionFormatType.embedding.rawValue
+        )
         return NSAttributedString(string: inlineCode.code, attributes: [
             .font: font,
-            .foregroundColor: NSColor.textColor
+            .foregroundColor: NSColor.textColor,
+            .writingDirection: [writingDirection]
         ])
     }
 
