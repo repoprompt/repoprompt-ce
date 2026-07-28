@@ -50,6 +50,8 @@ enum RepoPromptMCPInstructions {
         AGENT DELEGATION: Your system prompt lists the delegation tool available to you and how to use it. Use that tool to spawn or drive separate Agent Mode sessions when the task needs work in a fresh session or read-only exploration probes; do not assume any specific delegation tool is in scope for this connection.
 
         SHARING AN ORACLE / CONTEXT_BUILDER EXPORT: Pass `export_response: true` on `context_builder`, `ask_oracle`, or `oracle_send` to capture the response as a shareable file. The call returns `oracle_export_path` (the file path) and `oracle_export_instruction` (a ready-made "Read the Oracle export at `<path>` with `read_file` …" sentence). To hand the export to a delegated child agent, include `oracle_export_path` inside the `message` you send on your next delegation call — your system prompt names the specific delegation tool you should use. The child agent already has `read_file` and will open the export itself.
+
+        RESOURCE READING: Do not use `read_mcp_resource` for workspace files or root-prefixed paths such as `agno/AGENTS.md`; use `read_file` instead. Only use `read_mcp_resource` with exact URIs returned by `list_mcp_resources`, such as `repoprompt://instructions`.
         """
     }
 
@@ -78,6 +80,8 @@ enum RepoPromptMCPInstructions {
         SHARING AN ORACLE / CONTEXT_BUILDER EXPORT: Pass `export_response: true` on `context_builder` or `oracle_send` to capture the response as a shareable file. The call returns `oracle_export_path` (the file path) and `oracle_export_instruction` (a ready-made "Read the Oracle export at `<path>` with `read_file` …" sentence). To hand the export to a delegated child agent, include `oracle_export_path` inside the `message` you send on your next `agent_run` `start` or `steer` call. You may emit `oracle_export_instruction` verbatim at the head of that `message`; the child already has `read_file` and will open the export itself.
 
         Workspace tabs isolate tab contexts for parallel tasks. Use bind_context with context_id to bind this connection to the intended tab context for multi-window/tab routing.
+
+        RESOURCE READING: Do not use `read_mcp_resource` for workspace files or root-prefixed paths such as `agno/AGENTS.md`; use `read_file` instead. Only use `read_mcp_resource` with exact URIs returned by `list_mcp_resources`, such as `repoprompt://instructions`.
         """
     }
 
@@ -97,6 +101,8 @@ enum RepoPromptMCPInstructions {
         - manage_selection — curate file context for the response
         - workspace_context — render the current selection as a snapshot
         - git — read-only git operations (status/diff/log/blame)
+
+        RESOURCE READING: Do not use `read_mcp_resource` for workspace files or root-prefixed paths such as `agno/AGENTS.md`; use `read_file` instead. Only use `read_mcp_resource` with exact URIs returned by `list_mcp_resources`, such as `repoprompt://instructions`.
         """
     }
 }
