@@ -321,6 +321,11 @@ actor WorkspaceCodemapBindingEngine {
         let observedPredecessorAuthority: CodeMapRootManifestAuthority?
     }
 
+    private struct ManifestWriterFailureDisposition {
+        let terminalObservedStaleAuthority: Bool
+        let terminalCompletion: ManifestRevisionCompletion
+    }
+
     private struct ManifestWriterWorkKey: Hashable {
         let scope: PipelineScope
         let sessionID: UUID
@@ -428,6 +433,7 @@ actor WorkspaceCodemapBindingEngine {
         var workerID: UUID?
         var task: Task<Void, Never>?
         var workerRecoveryCount: UInt64
+        var workerRecoveryExhausted: Bool
         var lastWorkerCompletionReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
         var workerRestartRequestedReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
         var isPriorityPromoted: Bool
@@ -611,7 +617,32 @@ actor WorkspaceCodemapBindingEngine {
             let expiryTask: Task<Void, Never>
         }
 
+        private actor DebugGraphIndexNonCooperativeWorkerGate {
+            private var isReleased = false
+            private var continuation: CheckedContinuation<Void, Never>?
+
+            func wait() async {
+                guard !isReleased else { return }
+                await withCheckedContinuation { continuation in
+                    if isReleased {
+                        continuation.resume()
+                    } else {
+                        self.continuation = continuation
+                    }
+                }
+            }
+
+            func release() {
+                isReleased = true
+                continuation?.resume()
+                continuation = nil
+            }
+        }
+
         private var debugGraphIndexAdmissionHolds: [UUID: DebugGraphIndexAdmissionHold] = [:]
+        private var debugGraphIndexNonCooperativeWorkerGates: [
+            UUID: DebugGraphIndexNonCooperativeWorkerGate
+        ] = [:]
         private var debugGraphIndexEventRing = WorkspaceCodemapGraphIndexDebugEventRing()
         private var debugGraphIndexAdmissionEnqueuedAtNanoseconds: [UUID: UInt64] = [:]
         private var debugGraphIndexQueueWaitMillisecondsByRootEpoch: [
@@ -1017,7 +1048,10 @@ actor WorkspaceCodemapBindingEngine {
             case .scheduled, .waitingForAdmission, .readingCatalogPage, .loadingEnvelopes,
                  .classifyingBatch, .resolvingArtifacts, .stagingManifestCache,
                  .publishingGraphChanges, .checkpointed, .persistingManifestCache, .suspendedBusy:
-                guard existing.task == nil else { return .handedOff }
+                guard existing.task == nil,
+                      !existing.workerRecoveryExhausted,
+                      existing.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount
+                else { return .handedOff }
                 return startGraphIndexWorker(
                     jobID: existing.id,
                     rootEpoch: rootEpoch,
@@ -1058,6 +1092,7 @@ actor WorkspaceCodemapBindingEngine {
             workerID: nil,
             task: nil,
             workerRecoveryCount: 0,
+            workerRecoveryExhausted: false,
             lastWorkerCompletionReason: nil,
             workerRestartRequestedReason: nil,
             isPriorityPromoted: false,
@@ -1089,7 +1124,11 @@ actor WorkspaceCodemapBindingEngine {
         guard var job = graphIndexJobs[rootEpoch],
               job.id == jobID,
               job.task == nil,
+              !job.workerRecoveryExhausted,
               graphIndexJobIsCurrent(job)
+        else { return false }
+        guard recoveryReason == nil ||
+            job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount
         else { return false }
         let workerID = UUID()
         job.workerID = workerID
@@ -1146,6 +1185,16 @@ actor WorkspaceCodemapBindingEngine {
              .classifyingBatch, .resolvingArtifacts, .stagingManifestCache,
              .publishingGraphChanges, .checkpointed, .persistingManifestCache, .suspendedBusy:
             break
+        }
+        let workerRecoveryLimitReached =
+            job.workerRecoveryCount >= policy.maximumGraphIndexWorkerRecoveryCount
+        if job.task == nil,
+           job.workerRecoveryExhausted || workerRecoveryLimitReached
+        {
+            job.workerRecoveryExhausted = false
+            job.workerRecoveryCount = 0
+        } else if job.workerRecoveryExhausted {
+            return .unavailable
         }
         prioritizedGraphIndexRootEpoch = rootEpoch
         job.isPriorityPromoted = true
@@ -1863,6 +1912,72 @@ actor WorkspaceCodemapBindingEngine {
                 jobID: job.id,
                 phase: job.phase,
                 reason: graphIndexDebugReason(for: reason)
+            )
+        }
+
+        func debugInstallNonCooperativeGraphIndexWorkerForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> Bool {
+            guard var job = graphIndexJobs[rootEpoch], job.task == nil else { return false }
+            let workerID = UUID()
+            let jobID = job.id
+            let gate = DebugGraphIndexNonCooperativeWorkerGate()
+            debugGraphIndexNonCooperativeWorkerGates[jobID] = gate
+            job.workerID = workerID
+            job.workerFinishedUptimeNanoseconds = nil
+            let task = Task(priority: .utility) { [weak self] in
+                await gate.wait()
+                guard let self else { return }
+                await finishGraphIndexWorker(
+                    jobID: jobID,
+                    workerID: workerID,
+                    rootEpoch: rootEpoch,
+                    reason: .cancelled
+                )
+            }
+            job.task = task
+            graphIndexJobs[rootEpoch] = job
+            return true
+        }
+
+        func debugDrainNonCooperativeGraphIndexWorkerForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) async -> Bool {
+            guard let job = graphIndexJobs[rootEpoch],
+                  let gate = debugGraphIndexNonCooperativeWorkerGates[job.id]
+            else { return false }
+            await gate.release()
+            return true
+        }
+
+        func debugGraphIndexWorkerRecoveryStateForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (count: UInt64, exhausted: Bool, workerPresent: Bool, watchdogArmed: Bool)? {
+            guard let job = graphIndexJobs[rootEpoch] else { return nil }
+            return (
+                job.workerRecoveryCount,
+                job.workerRecoveryExhausted,
+                job.task != nil,
+                graphIndexWatchdogTasks[job.id] != nil
+            )
+        }
+
+        func debugGraphIndexManifestRetentionForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (
+            stageCount: Int,
+            cachedRecordCount: Int,
+            stagedRecordCount: Int,
+            stagedByteCount: UInt64,
+            globalStagedByteCount: UInt64
+        )? {
+            guard let job = graphIndexJobs[rootEpoch] else { return nil }
+            return (
+                job.manifestStages.count,
+                job.manifestStages.values.reduce(0) { $0 + $1.cachedRecordsByPath.count },
+                job.manifestStages.values.reduce(0) { $0 + $1.stagedRecordsByPath.count },
+                job.manifestStagedByteCount,
+                graphIndexManifestStagedByteCount
             )
         }
 
@@ -3033,7 +3148,9 @@ actor WorkspaceCodemapBindingEngine {
         job.pageStartProcessedCandidateBaseline = nil
         job.retryAttempt = 0
         job.retry = nil
-        job.workerRecoveryCount = 0
+        if !job.workerRecoveryExhausted {
+            job.workerRecoveryCount = 0
+        }
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
         #if DEBUG
@@ -3129,7 +3246,10 @@ actor WorkspaceCodemapBindingEngine {
             guard let current = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
                   let stage = current.manifestStages[pipelineIdentity]
             else { return }
-            guard !stage.isDegraded, !stage.stagedRecordsByPath.isEmpty else { continue }
+            guard !stage.isDegraded, !stage.stagedRecordsByPath.isEmpty else {
+                heartbeatGraphIndexManifestSealStage(jobID: jobID, rootEpoch: rootEpoch)
+                continue
+            }
             let submission = await submitManifestMutations(
                 rootEpoch: rootEpoch,
                 pipelineIdentity: pipelineIdentity,
@@ -3191,6 +3311,7 @@ actor WorkspaceCodemapBindingEngine {
                     degraded: true
                 )
             }
+            heartbeatGraphIndexManifestSealStage(jobID: jobID, rootEpoch: rootEpoch)
         }
         guard var completed = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) else { return }
         completed.manifestSealState = completed.manifestStages.values.contains(where: \.isDegraded)
@@ -3201,7 +3322,17 @@ actor WorkspaceCodemapBindingEngine {
         completed.phaseEnteredUptimeNanoseconds = completedUptimeNanoseconds
         completed.lastProgressUptimeNanoseconds = completedUptimeNanoseconds
         completed.checkpoint = makeGraphIndexCheckpoint(completed)
+        releaseGraphIndexManifestStageStorage(&completed)
         graphIndexJobs[rootEpoch] = completed
+    }
+
+    private func heartbeatGraphIndexManifestSealStage(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) else { return }
+        job.lastProgressUptimeNanoseconds = uptimeNanoseconds()
+        graphIndexJobs[rootEpoch] = job
     }
 
     private func recoverVirginGraphIndexSealAuthority(
@@ -4917,11 +5048,18 @@ actor WorkspaceCodemapBindingEngine {
             }
             return .current
         }
-        guard job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount else {
+        guard !job.workerRecoveryExhausted,
+              job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount
+        else {
+            job.workerRecoveryExhausted = true
             job.lastWorkerCompletionReason = .watchdogRecoveryExhausted
             job.workerRestartRequestedReason = nil
+            let task = job.task
             graphIndexJobs[rootEpoch] = job
             graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
+            // A cancellation-ignoring worker may still own mutation/publication work for an admitted batch.
+            // Keep its admission and resources quarantined until finishGraphIndexWorker releases them.
+            task?.cancel()
             #if DEBUG
                 recordGraphIndexDebugEvent(
                     kind: .graphIndexWorkerFinished,
@@ -4952,15 +5090,24 @@ actor WorkspaceCodemapBindingEngine {
         requestGraphIndexWorkerRestart(
             jobID: jobID,
             rootEpoch: rootEpoch,
-            reason: .watchdogNoProgress
+            reason: .watchdogNoProgress,
+            countsTowardRecoveryLimit: true
         )
+        if let currentWorkerID = job.workerID {
+            armGraphIndexWatchdog(
+                jobID: jobID,
+                workerID: currentWorkerID,
+                rootEpoch: rootEpoch
+            )
+        }
         return .restartRequested
     }
 
     private func requestGraphIndexWorkerRestart(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        reason: WorkspaceCodemapGraphIndexWorkerCompletionReason
+        reason: WorkspaceCodemapGraphIndexWorkerCompletionReason,
+        countsTowardRecoveryLimit: Bool = false
     ) {
         guard var job = graphIndexJobs[rootEpoch],
               job.id == jobID,
@@ -4969,6 +5116,9 @@ actor WorkspaceCodemapBindingEngine {
         else { return }
         job.workerRestartRequestedReason = reason
         job.lastWorkerCompletionReason = reason
+        if countsTowardRecoveryLimit {
+            job.workerRecoveryCount = addingSaturating(job.workerRecoveryCount, 1)
+        }
         let task = job.task
         graphIndexJobs[rootEpoch] = job
         if !job.isActiveBatch {
@@ -4998,10 +5148,15 @@ actor WorkspaceCodemapBindingEngine {
         drainingGraphIndexTasks.removeValue(forKey: jobID)
         drainingGraphIndexResources.removeValue(forKey: jobID)
         drainingGraphIndexRootEpochs.removeValue(forKey: jobID)
+        #if DEBUG
+            debugGraphIndexNonCooperativeWorkerGates.removeValue(forKey: jobID)
+        #endif
         let restartReason = job.workerRestartRequestedReason
         job.workerID = nil
         job.task = nil
-        job.lastWorkerCompletionReason = restartReason ?? reason
+        job.lastWorkerCompletionReason = job.workerRecoveryExhausted
+            ? .watchdogRecoveryExhausted
+            : restartReason ?? reason
         job.workerRestartRequestedReason = nil
         job.workerFinishedUptimeNanoseconds = uptimeNanoseconds()
         job.isQueuedForAdmission = false
@@ -5010,13 +5165,6 @@ actor WorkspaceCodemapBindingEngine {
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
         #if DEBUG
-            recordGraphIndexDebugEvent(
-                kind: .graphIndexWorkerFinished,
-                rootEpoch: rootEpoch,
-                jobID: jobID,
-                phase: job.phase,
-                reason: .workerFinished
-            )
             recordGraphIndexDebugEvent(
                 kind: .graphIndexWorkerFinished,
                 rootEpoch: rootEpoch,
@@ -5034,7 +5182,10 @@ actor WorkspaceCodemapBindingEngine {
             nil
         }
         let recoveryReason = restartReason ?? automaticRecoveryReason
+        let watchdogRecoveryWasReserved = restartReason == .watchdogNoProgress
         if let recoveryReason,
+           !job.workerRecoveryExhausted,
+           watchdogRecoveryWasReserved ||
            job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount,
            graphIndexJobIsCurrent(job),
            !graphIndexJobPhaseIsTerminal(job.phase)
@@ -5042,7 +5193,7 @@ actor WorkspaceCodemapBindingEngine {
             _ = startGraphIndexWorker(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
-                recoveryReason: recoveryReason
+                recoveryReason: watchdogRecoveryWasReserved ? nil : recoveryReason
             )
         }
         scheduleQueuedRequests()
@@ -5081,13 +5232,17 @@ actor WorkspaceCodemapBindingEngine {
         }
     #endif
 
-    private func discardGraphIndexManifestStages(_ job: inout GraphIndexJob) {
+    private func releaseGraphIndexManifestStageStorage(_ job: inout GraphIndexJob) {
         let releasedByteCount = job.manifestStagedByteCount
         graphIndexManifestStagedByteCount = graphIndexManifestStagedByteCount >= releasedByteCount
             ? graphIndexManifestStagedByteCount - releasedByteCount
             : 0
         job.manifestStages.removeAll(keepingCapacity: false)
         job.manifestStagedByteCount = 0
+    }
+
+    private func discardGraphIndexManifestStages(_ job: inout GraphIndexJob) {
+        releaseGraphIndexManifestStageStorage(&job)
         job.manifestSealState = .discarded
     }
 
@@ -7689,6 +7844,27 @@ actor WorkspaceCodemapBindingEngine {
         ), false)
     }
 
+    /// Keep the error downcast and optional projection outside the optimized async writer.
+    /// Swift 6.3.2 CopyPropagation otherwise produces invalid ownership SIL for this value.
+    @inline(never)
+    private func manifestWriterFailureDisposition(
+        _ error: any Error
+    ) -> ManifestWriterFailureDisposition {
+        guard let failure = error as? WorkspaceCodemapObservedStaleAuthorityError,
+              let observedAuthority = failure.observedPredecessorAuthority
+        else {
+            return ManifestWriterFailureDisposition(
+                terminalObservedStaleAuthority: false,
+                terminalCompletion: .failed
+            )
+        }
+        return ManifestWriterFailureDisposition(
+            terminalObservedStaleAuthority:
+            observedAuthority.authorityGeneration >= failure.currentAuthorityGeneration,
+            terminalCompletion: .staleAuthority(observedAuthority: observedAuthority)
+        )
+    }
+
     private func runManifestWriter(
         namespace: CodeMapRootManifestNamespace,
         writerID: UUID
@@ -7971,13 +8147,7 @@ actor WorkspaceCodemapBindingEngine {
                 #if DEBUG
                     manifestAttemptCompletedUptimeNanoseconds = uptimeNanoseconds()
                 #endif
-                let observedStaleAuthorityError = error as? WorkspaceCodemapObservedStaleAuthorityError
-                let terminalObservedStaleAuthority = observedStaleAuthorityError
-                    .flatMap { failure in
-                        failure.observedPredecessorAuthorityGeneration.map {
-                            $0 >= failure.currentAuthorityGeneration
-                        }
-                    } ?? false
+                let failureDisposition = manifestWriterFailureDisposition(error)
                 guard var currentWriter = currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
@@ -7992,7 +8162,7 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 currentWriter.deferredWork.append(contentsOf: currentWriter.queuedWork.drain())
                 recordManifestWriterPeakQueuedItems(in: currentWriter)
-                if terminalObservedStaleAuthority ||
+                if failureDisposition.terminalObservedStaleAuthority ||
                     currentWriter.deferredFailureCount >= Self.maximumManifestWriterDeferredAttempts,
                     let exhaustedHead = currentWriter.deferredHeadBatch
                 {
@@ -8002,11 +8172,7 @@ actor WorkspaceCodemapBindingEngine {
                         exhaustedHead.items,
                         from: &currentWriter,
                         terminalWaiterRevision: exhaustedHead.highestRevision,
-                        terminalCompletion: observedStaleAuthorityError.flatMap {
-                            $0.observedPredecessorAuthority.map {
-                                .staleAuthority(observedAuthority: $0)
-                            }
-                        } ?? .failed
+                        terminalCompletion: failureDisposition.terminalCompletion
                     )
                 }
                 shedNewestDeferredManifestWorkIfNeeded(from: &currentWriter)

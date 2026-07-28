@@ -3226,6 +3226,7 @@ actor GitService {
     func getDiffNumstat(
         compare: GitDiffCompareSpec,
         detectRenames: Bool = false,
+        paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> String {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .numstat)
@@ -3234,7 +3235,7 @@ actor GitService {
             contextLines: nil,
             detectRenames: detectRenames,
             refArg: refArg,
-            paths: nil,
+            paths: paths,
             at: repoURL
         )
     }
@@ -3242,6 +3243,7 @@ actor GitService {
     func getDiffNameStatus(
         compare: GitDiffCompareSpec,
         detectRenames: Bool = false,
+        paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> String {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .nameStatus)
@@ -3250,7 +3252,7 @@ actor GitService {
             contextLines: nil,
             detectRenames: detectRenames,
             refArg: refArg,
-            paths: nil,
+            paths: paths,
             at: repoURL
         )
     }
@@ -3259,8 +3261,10 @@ actor GitService {
         compare: GitDiffCompareSpec,
         includeUntrackedWhenApplicable: Bool,
         detectRenames: Bool = false,
+        paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
+        if let paths, paths.isEmpty { return [] }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
             case .uncommitted, .uncommittedMergeBase, .unstaged:
@@ -3270,9 +3274,9 @@ actor GitService {
             }
         }()
 
-        async let numOutTask = getDiffNumstat(compare: compare, detectRenames: detectRenames, at: repoURL)
-        async let nameOutTask = getDiffNameStatus(compare: compare, detectRenames: detectRenames, at: repoURL)
-        async let untrackedFilesTask = includeUntracked ? getUntrackedPaths(at: repoURL) : []
+        async let numOutTask = getDiffNumstat(compare: compare, detectRenames: detectRenames, paths: paths, at: repoURL)
+        async let nameOutTask = getDiffNameStatus(compare: compare, detectRenames: detectRenames, paths: paths, at: repoURL)
+        async let untrackedFilesTask = includeUntracked ? getUntrackedPaths(paths: paths, at: repoURL) : []
         let (numOut, nameOut, untrackedFiles) = try await (numOutTask, nameOutTask, untrackedFilesTask)
         let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
             (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
@@ -3323,9 +3327,15 @@ actor GitService {
         }.map(\.file)
     }
 
-    private func getUntrackedPaths(at repoURL: URL) async throws -> [String] {
+    private func getUntrackedPaths(paths: [String]?, at repoURL: URL) async throws -> [String] {
+        if let paths, paths.isEmpty { return [] }
+        var args = ["ls-files", "--others", "--exclude-standard"]
+        if let paths {
+            args.append("--")
+            args.append(contentsOf: paths)
+        }
         let (stdout, stderr, exitCode) = try await runGit(
-            ["ls-files", "--others", "--exclude-standard"],
+            args,
             at: repoURL
         )
         guard exitCode == 0 else {

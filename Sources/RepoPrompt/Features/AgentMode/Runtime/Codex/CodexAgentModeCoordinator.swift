@@ -842,6 +842,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case processID
     }
 
+    private static func isSnapshotCommandExecutionToolName(_ normalizedToolName: String?) -> Bool {
+        switch normalizedToolName {
+        case "bash", "exec", "wait", "write_stdin":
+            true
+        default:
+            false
+        }
+    }
+
     private func snapshotToolKindIsCompatible(
         _ item: CodexNativeSessionController.ThreadSnapshot.ToolItemObservation,
         execution: AgentModeViewModel.CodexNativeToolLivenessState.Execution
@@ -849,7 +858,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let normalizedToolName = Self.normalizedExternalToolName(execution.toolName)
         return switch item.kind {
         case .commandExecution:
-            normalizedToolName == "bash"
+            Self.isSnapshotCommandExecutionToolName(normalizedToolName)
         case .mcpToolCall, .dynamicToolCall:
             normalizedToolName != "bash"
                 && Self.normalizedExternalToolName(item.toolName).map { $0 == normalizedToolName } == true
@@ -6499,7 +6508,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         flushPendingAssistantDelta(session)
         finalizeStreamingItems(in: session)
         finalizePendingToolCalls(in: session, turnStatus: turnStatus)
-        finalizeLingeringRunningBashResults(in: session, turnStatus: turnStatus)
+        finalizeLingeringRunningCommandExecutionResults(in: session, turnStatus: turnStatus)
         reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
         session.providerTerminalDrainGeneration &+= 1
     }
@@ -8786,7 +8795,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    private func finalizeLingeringRunningBashResults(
+    private func finalizeLingeringRunningCommandExecutionResults(
         in session: AgentModeViewModel.TabSession,
         turnStatus: CodexNativeSessionController.TurnStatus
     ) {
@@ -8803,6 +8812,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session,
                 observedAt: Date()
             )
+        }
+
+        for index in session.items.indices {
+            let item = session.items[index]
+            guard item.kind == .toolResult,
+                  Self.resultPayloadIsRunningCommandExecution(item.toolResultJSON)
+            else {
+                continue
+            }
+            var updated = item
+            let resultJSON = Self.withCommandExecutionTerminalStatus(
+                raw: item.toolResultJSON,
+                status: terminalStatus
+            )
+            updated.toolResultJSON = resultJSON
+            updated.toolIsError = shouldError
+            updated.text = resultJSON
+            session.replaceItem(at: index, with: updated)
         }
     }
 
@@ -8829,6 +8856,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case .failed:
             "failed"
         }
+    }
+
+    private static func resultPayloadIsRunningCommandExecution(_ raw: String?) -> Bool {
+        guard let raw,
+              let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = object["type"] as? String
+        else {
+            return false
+        }
+        let normalizedType = type
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        guard normalizedType == "commandexecution" else { return false }
+        return BashToolResultParser.parseLivenessMetadata(raw: raw).isRunning
     }
 
     private static func withCommandExecutionTerminalStatus(raw: String?, status: String) -> String {

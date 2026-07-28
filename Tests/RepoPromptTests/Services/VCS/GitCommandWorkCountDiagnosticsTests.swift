@@ -86,6 +86,68 @@ import XCTest
             }
         }
 
+        func testExplicitArtifactPathScopesDiscoveryAmidManyUnrelatedUntrackedFiles() async throws {
+            let fixture = try GitWorkCountFixture()
+            defer { fixture.cleanup() }
+            for index in 0 ..< 128 {
+                try fixture.writeUntracked("Noise/File-\(index).txt", contents: "noise \(index)\n")
+            }
+
+            let vcs = VCSService()
+            let store = GitDiffSnapshotStore()
+            let publisher = GitDiffSnapshotPublisher(
+                engine: GitDiffEngine(vcsService: vcs, gitService: GitService()),
+                store: store,
+                vcsService: vcs
+            )
+            let repo = GitRepoDescriptor(rootURL: fixture.repo)
+            let requestedAbsolutePath = fixture.repo.appendingPathComponent("Untracked.txt").path
+            let snapshotID = "path-scoped-\(UUID().uuidString)"
+
+            let (manifest, snapshot) = try await captureResult(operation: "artifact_path_scoped") {
+                try await publisher.publish(
+                    workspaceDirectory: fixture.workspace,
+                    repo: repo,
+                    mode: .standard,
+                    compareSpec: .uncommitted(base: "HEAD"),
+                    compareDisplay: "uncommitted:HEAD",
+                    compareInput: nil,
+                    scope: .all,
+                    selectedAbsolutePaths: [],
+                    pathspecs: [requestedAbsolutePath],
+                    contextLines: 3,
+                    detectRenames: false,
+                    snapshotIDOverride: snapshotID,
+                    tabID: nil
+                )
+            }
+
+            XCTAssertEqual(manifest.scope, .selected)
+            XCTAssertEqual(manifest.requestedPaths, ["Untracked.txt"])
+            XCTAssertEqual(manifest.files.map(\.gitPath), ["Untracked.txt"])
+            XCTAssertEqual(manifest.summary.files, 1)
+
+            let discoveryCommands = zip(snapshot.commands, snapshot.inlinePathspecCounts).filter { command, _ in
+                command.hasPrefix("diff --numstat")
+                    || command.hasPrefix("diff --name-status")
+                    || command.hasPrefix("ls-files --others")
+            }
+            XCTAssertEqual(discoveryCommands.count, 3, snapshot.commands.joined(separator: "\n"))
+            XCTAssertTrue(discoveryCommands.allSatisfy { _, pathspecCount in pathspecCount == 1 })
+
+            let snapshotDirectory = store.snapshotDir(
+                workspaceDirectory: fixture.workspace,
+                repoKey: repo.repoKey,
+                snapshotID: snapshotID
+            )
+            let allPatch = try String(
+                contentsOf: snapshotDirectory.appendingPathComponent("diff/all.patch"),
+                encoding: .utf8
+            )
+            XCTAssertTrue(allPatch.contains("Untracked.txt"), allPatch)
+            XCTAssertFalse(allPatch.contains("Noise/"), allPatch)
+        }
+
         func testBatchedUntrackedDiffPreservesRepositoryRelativePatchPaths() async throws {
             let fixture = try GitWorkCountFixture()
             defer { fixture.cleanup() }
@@ -131,9 +193,17 @@ import XCTest
             operation: String,
             body: () async throws -> Void
         ) async throws -> MCPToolWorkCountDiagnostics.GitInvocationSnapshot {
+            let (_, snapshot) = try await captureResult(operation: operation, body: body)
+            return snapshot
+        }
+
+        private func captureResult<T>(
+            operation: String,
+            body: () async throws -> T
+        ) async throws -> (T, MCPToolWorkCountDiagnostics.GitInvocationSnapshot) {
             MCPToolWorkCountDiagnostics.resetForTesting()
-            try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation, body)
-            return try XCTUnwrap(MCPToolWorkCountDiagnostics.debugSnapshots().git.last)
+            let result = try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation, body)
+            return try (result, XCTUnwrap(MCPToolWorkCountDiagnostics.debugSnapshots().git.last))
         }
     }
 

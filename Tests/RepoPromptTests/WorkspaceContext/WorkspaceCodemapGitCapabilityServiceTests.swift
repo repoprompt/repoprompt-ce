@@ -662,6 +662,42 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         XCTAssertNotNil(batchAuthorities[1])
         XCTAssertNotNil(batchAuthorities[2])
 
+        let postPathRoot = try fixture.makeRepository(named: "post-path-authority")
+        try fixture.write("let value = true\n", to: path, at: postPathRoot)
+        let postPathMutation = AuthorityFileMutationOnInvocation(
+            url: postPathRoot.appendingPathComponent(".git/index"),
+            targetInvocation: 2
+        )
+        let postPathService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: {
+                    await postPathMutation.mutateOnTargetInvocation()
+                }
+            )
+        )
+        let postPathCapability = try await capability(
+            postPathService.resolve(root: request(for: postPathRoot, seed: 53))
+        )
+        let postPathCapturesBefore = await postPathService.snapshotForTesting().authorityCaptureCount
+        let postPathAuthorities = await postPathService.makeSourceAuthorities(
+            capability: postPathCapability,
+            observedRootEpoch: postPathCapability.rootEpoch,
+            observedRepositoryAuthority: postPathCapability.repositoryAuthority,
+            candidates: [WorkspaceCodemapSourceAuthorityRequest(
+                candidateRepositoryRelativePath: path,
+                observedPathGeneration: 1,
+                currentPathGeneration: 1,
+                observedIngressGeneration: 1,
+                currentIngressGeneration: 1
+            )]
+        )
+        let postPathCapturesAfter = await postPathService.snapshotForTesting().authorityCaptureCount
+        XCTAssertEqual(postPathCapturesAfter - postPathCapturesBefore, 2)
+        let postPathFingerprintCaptureCount = await postPathMutation.invocationCount()
+        XCTAssertEqual(postPathFingerprintCaptureCount, 2)
+        XCTAssertNil(postPathAuthorities[0])
+
         for (offset, evidenceKind) in ["index", "config", "ref"].enumerated() {
             let mutationRoot = try fixture.makeRepository(named: "authority-\(evidenceKind)")
             try fixture.write("let a = true\n", to: "Sources/A.swift", at: mutationRoot)
@@ -1240,6 +1276,28 @@ private final class ExactPathFingerprintRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Snapshot(callCount: callCount, allPathsMatched: allPathsMatched)
+    }
+}
+
+private actor AuthorityFileMutationOnInvocation {
+    private let url: URL
+    private let targetInvocation: Int
+    private var invocations = 0
+
+    init(url: URL, targetInvocation: Int) {
+        self.url = url
+        self.targetInvocation = targetInvocation
+    }
+
+    func mutateOnTargetInvocation() {
+        invocations += 1
+        guard invocations == targetInvocation else { return }
+        let data = (try? Data(contentsOf: url)) ?? Data()
+        try? (data + Data("\n# post-path authority mutation\n".utf8)).write(to: url, options: .atomic)
+    }
+
+    func invocationCount() -> Int {
+        invocations
     }
 }
 
