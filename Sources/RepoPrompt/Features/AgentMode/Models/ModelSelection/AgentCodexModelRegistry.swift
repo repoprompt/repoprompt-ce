@@ -239,7 +239,15 @@ final class AgentCodexModelRegistry {
                         description: $0.description
                     )
                 },
-                defaultReasoningEffort: record.defaultReasoningEffort
+                defaultReasoningEffort: record.defaultReasoningEffort,
+                serviceTiers: record.serviceTiers.map {
+                    CodexAppServerClient.RemoteServiceTier(
+                        id: $0.id,
+                        name: $0.name,
+                        description: $0.description
+                    )
+                },
+                defaultServiceTier: record.defaultServiceTier
             )
         }
     }

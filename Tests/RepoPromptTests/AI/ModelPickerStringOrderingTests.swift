@@ -325,6 +325,139 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(options.first { $0.id == "gpt-5.6-luna-medium" }).isDefault)
     }
 
+    @MainActor
+    func testAdvertisedUltrafastMetadataProducesSharedPickerParityAndExactWireSelection() throws {
+        let advertisedModel = try XCTUnwrap(CodexAppServerClient.remoteModel(from: [
+            "id": "gpt-5.6-sol",
+            "model": "gpt-5.6-sol",
+            "displayName": "GPT-5.6 Sol",
+            "description": "Frontier coding model",
+            "isDefault": true,
+            "supportedReasoningEfforts": [
+                ["reasoningEffort": "high", "description": "High effort"]
+            ],
+            "defaultReasoningEffort": "high",
+            "serviceTiers": [
+                ["id": "priority", "name": "Priority", "description": "Priority processing"],
+                ["id": "ultrafast", "name": "Ultrafast", "description": "Lowest-latency public beta"]
+            ],
+            "defaultServiceTier": "priority"
+        ]))
+        let autoReviewModel = try XCTUnwrap(CodexAppServerClient.remoteModel(from: [
+            "id": "codex-auto-review",
+            "model": "codex-auto-review",
+            "displayName": "Codex Auto Review",
+            "description": "Automated review",
+            "isDefault": false,
+            "supportedReasoningEfforts": [],
+            "serviceTiers": []
+        ]))
+
+        XCTAssertEqual(advertisedModel.serviceTiers.map(\.id), ["priority", "ultrafast"])
+        XCTAssertEqual(advertisedModel.defaultServiceTier, "priority")
+
+        let records = CodexDynamicModelStore.canonicalRecords(from: [advertisedModel, autoReviewModel])
+        let roundTrippedRecords = try JSONDecoder().decode(
+            [CodexDynamicModelRecord].self,
+            from: JSONEncoder().encode(records)
+        )
+        XCTAssertEqual(roundTrippedRecords, records)
+
+        let dynamicOptions = CodexDynamicModelMapper.options(from: records)
+        let ultrafastHigh = try XCTUnwrap(dynamicOptions.first { $0.id == "gpt-5.6-sol-ultrafast-high" })
+        XCTAssertEqual(ultrafastHigh.displayName, "GPT-5.6 Sol Ultrafast — Public Beta High")
+        XCTAssertEqual(ultrafastHigh.serviceTier, "ultrafast")
+        XCTAssertEqual(ultrafastHigh.reasoningEffort, .high)
+        XCTAssertFalse(dynamicOptions.contains { $0.id.contains("-priority") })
+        XCTAssertFalse(dynamicOptions.contains { $0.id.hasPrefix("codex-auto-review-ultrafast") })
+
+        let agentOptions = AgentCodexModelRegistry.shared.resolvedOptions(
+            staticOptions: [],
+            preferredLiveModels: [advertisedModel, autoReviewModel]
+        )
+        let agentUltrafastIDs = Set(agentOptions.filter {
+            CodexModelSpecifier(raw: $0.rawValue).serviceTier == "ultrafast"
+        }.map(\.rawValue))
+        let aiModels = CodexAIModelCatalog.modelsForPicker(
+            dynamicOptions: dynamicOptions,
+            staticModels: []
+        )
+        let aiUltrafastIDs = Set(aiModels.compactMap { model -> String? in
+            guard CodexModelSpecifier(raw: model.modelName).serviceTier == "ultrafast" else { return nil }
+            return model.modelName
+        })
+        XCTAssertEqual(agentUltrafastIDs, aiUltrafastIDs)
+        XCTAssertEqual(agentUltrafastIDs, ["gpt-5.6-sol-ultrafast-high"])
+        XCTAssertTrue(agentOptions.contains { $0.rawValue == "codex-auto-review" })
+        XCTAssertFalse(agentOptions.contains { $0.rawValue.hasPrefix("codex-auto-review-ultrafast") })
+
+        let expectedGroupLabel = "GPT-5.6 Sol Ultrafast — Public Beta"
+        let agentMenu = AgentModelCatalog.codexMenu(for: agentOptions)
+        XCTAssertEqual(
+            agentMenu.groups.first { $0.baseModelID == "gpt-5.6-sol-ultrafast" }?.displayName,
+            expectedGroupLabel
+        )
+        let aiMenuGroups = AIModel.codexMenuGroups(for: aiModels)
+        XCTAssertEqual(
+            aiMenuGroups.first { $0.baseModelID == "gpt-5.6-sol-ultrafast" }?.displayName,
+            expectedGroupLabel
+        )
+        let collapsedAgentOptions = CodexAgentModeCoordinator.test_collapseCodexModelOptions(agentOptions)
+        XCTAssertEqual(
+            collapsedAgentOptions.first { $0.rawValue == "gpt-5.6-sol-ultrafast" }?.displayName,
+            expectedGroupLabel
+        )
+
+        let ultrafastSpecifier = CodexModelSpecifier(raw: ultrafastHigh.id)
+        XCTAssertEqual(ultrafastSpecifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(ultrafastSpecifier.reasoningEffort, .high)
+        XCTAssertEqual(ultrafastSpecifier.serviceTier, "ultrafast")
+        XCTAssertEqual(ultrafastSpecifier.cliModelArgs, ["--model", "gpt-5.6-sol"])
+        XCTAssertEqual(ultrafastSpecifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=high"])
+        XCTAssertEqual(ultrafastSpecifier.cliServiceTierConfigArgs, ["-c", "service_tier=ultrafast"])
+        XCTAssertEqual(ultrafastSpecifier.appServerServiceTierParam, "ultrafast")
+
+        let execArguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: ultrafastHigh.id,
+            serverEntries: [],
+            brokenServers: []
+        ).args
+        XCTAssertEqual(Array(execArguments.prefix(3)), ["--model", "gpt-5.6-sol", "exec"])
+        func containsConfig(_ value: String) -> Bool {
+            zip(execArguments, execArguments.dropFirst()).contains { flag, argument in
+                flag == "-c" && argument == value
+            }
+        }
+        XCTAssertTrue(containsConfig("model_reasoning_effort=high"))
+        XCTAssertTrue(containsConfig("service_tier=ultrafast"))
+
+        let defaultSpecifier = CodexModelSpecifier(raw: "gpt-5.6-sol-high")
+        XCTAssertNil(defaultSpecifier.serviceTier)
+        XCTAssertTrue(defaultSpecifier.cliServiceTierConfigArgs.isEmpty)
+        XCTAssertNil(defaultSpecifier.appServerServiceTierParam)
+
+        let fastSpecifier = CodexModelSpecifier(raw: "gpt-5.6-sol-fast-high")
+        XCTAssertEqual(fastSpecifier.serviceTier, "fast")
+        XCTAssertEqual(fastSpecifier.cliServiceTierConfigArgs, ["-c", "service_tier=fast"])
+        XCTAssertEqual(fastSpecifier.appServerServiceTierParam, "fast")
+
+        let rejection = "service tier ultrafast is unavailable for this account"
+        XCTAssertNil(
+            CodexProviderHelpers.codexFallbackModelIfNeeded(
+                attemptedModel: ultrafastHigh.id,
+                errorDetail: rejection
+            )
+        )
+        XCTAssertEqual(
+            CodexExecAgentProvider.processFailureError(
+                exitCode: 1,
+                stderr: rejection,
+                timedOut: false
+            ).localizedDescription,
+            rejection
+        )
+    }
+
     func testBestPracticeRecommendationsDoNotDefaultToMaxOrUltra() {
         XCTAssertEqual(BestPracticeProfiles.bestPlanning.modelLabel, "GPT-5.6 Sol")
         XCTAssertEqual(BestPracticeProfiles.bestPlanning.modelString, "gpt-5.6-sol")

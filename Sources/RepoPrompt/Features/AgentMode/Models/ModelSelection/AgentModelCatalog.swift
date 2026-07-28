@@ -667,7 +667,13 @@ enum AgentModelCatalog {
 
             let fallbackBaseDisplayName = stripEffortSuffix(fallbackDisplayName)
             let loweredFallback = fallbackBaseDisplayName.lowercased()
-            if loweredFallback.hasSuffix(" \(serviceTier)") || loweredFallback.hasSuffix("-\(serviceTier)") {
+            let tierDisplayName = CodexServiceTierVariantCatalog.displayName(for: serviceTier)
+            let loweredTierDisplayName = tierDisplayName.lowercased()
+            if loweredFallback.hasSuffix(" \(serviceTier)")
+                || loweredFallback.hasSuffix("-\(serviceTier)")
+                || loweredFallback.hasSuffix(" \(loweredTierDisplayName)")
+                || loweredFallback.hasSuffix("-\(loweredTierDisplayName)")
+            {
                 return fallbackBaseDisplayName
             }
 
@@ -675,10 +681,7 @@ enum AgentModelCatalog {
                 for: baseModel,
                 fallbackDisplayName: fallbackBaseDisplayName
             )
-            if serviceTier == CodexServiceTierVariantCatalog.fastServiceTier {
-                return "\(baseDisplayName) Fast"
-            }
-            return "\(baseDisplayName) \(serviceTier.capitalized)"
+            return "\(baseDisplayName) \(tierDisplayName)"
         }
 
         let entries = modelOptions.map { option -> Entry in

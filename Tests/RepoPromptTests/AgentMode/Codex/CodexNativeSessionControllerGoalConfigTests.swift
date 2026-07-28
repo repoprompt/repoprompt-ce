@@ -296,13 +296,19 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         addTeardownBlock {
             await startController.shutdown()
         }
-        let started = try await startController.startOrResume(existing: nil, baseInstructions: "Agent")
+        let started = try await startController.startOrResume(
+            existing: nil,
+            baseInstructions: "Agent",
+            model: "fresh-model",
+            reasoningEffort: "high",
+            serviceTier: "ultrafast"
+        )
         let startReceipt = try await startController.startUserTurn(
             text: "fresh turn",
             images: [],
             model: "fresh-model",
             reasoningEffort: "high",
-            serviceTier: "fast"
+            serviceTier: "ultrafast"
         )
         await startController.shutdown()
 
@@ -325,14 +331,17 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 model: nil,
                 reasoningEffort: nil
             ),
-            baseInstructions: "Agent"
+            baseInstructions: "Agent",
+            model: "resume-model",
+            reasoningEffort: "medium",
+            serviceTier: "ultrafast"
         )
         let resumeReceipt = try await resumeController.startUserTurn(
             text: "resumed turn",
             images: [],
             model: "resume-model",
             reasoningEffort: "medium",
-            serviceTier: nil
+            serviceTier: "ultrafast"
         )
         await resumeController.shutdown()
 
@@ -348,10 +357,14 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let startParams = try recordedParams(for: "thread/start", at: recordURL)
         XCTAssertEqual(startParams["cwd"] as? String, worktreeRoot.path)
+        XCTAssertEqual(startParams["model"] as? String, "fresh-model")
+        XCTAssertEqual(startParams["serviceTier"] as? String, "ultrafast")
         let resumeParams = try recordedParams(for: "thread/resume", at: recordURL)
         XCTAssertEqual(resumeParams["cwd"] as? String, worktreeRoot.path)
         XCTAssertEqual(resumeParams["threadId"] as? String, "existing-thread")
         XCTAssertEqual(resumeParams["path"] as? String, "/tmp/existing-thread.jsonl")
+        XCTAssertEqual(resumeParams["model"] as? String, "resume-model")
+        XCTAssertEqual(resumeParams["serviceTier"] as? String, "ultrafast")
 
         let turnParams = try recordedRequests(for: "turn/start", at: recordURL)
             .map { try XCTUnwrap($0["params"] as? [String: Any]) }
@@ -360,6 +373,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertEqual(turnParams.compactMap { $0["cwd"] as? String }, [worktreeRoot.path, worktreeRoot.path])
         XCTAssertEqual(turnParams.compactMap { $0["model"] as? String }, ["fresh-model", "resume-model"])
         XCTAssertEqual(turnParams.compactMap { $0["effort"] as? String }, ["high", "medium"])
+        XCTAssertEqual(turnParams.compactMap { $0["serviceTier"] as? String }, ["ultrafast", "ultrafast"])
         for params in turnParams {
             let sandbox = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
             XCTAssertEqual(sandbox["type"] as? String, "workspaceWrite")
@@ -838,11 +852,12 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     }
 
     func testUnrelatedRequestFailureDoesNotAddCLIUpdateHint() {
+        let rejection = "service tier ultrafast is unavailable for this account"
         let error = CodexAppServerClient.ClientError.requestFailed(
-            .init(method: "turn/start", code: -32602, message: "turn rejected", data: nil)
+            .init(method: "turn/start", code: -32602, message: rejection, data: nil)
         )
 
-        XCTAssertEqual(error.localizedDescription, "turn rejected")
+        XCTAssertEqual(error.localizedDescription, rejection)
     }
 
     func testSafeManagedMCPOverridesSuppressThirdPartyServers() {

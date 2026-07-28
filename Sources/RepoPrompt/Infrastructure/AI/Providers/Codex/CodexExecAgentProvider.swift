@@ -444,7 +444,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                             if self.enableDebugLogging {
                                                 print("[DEBUG] CodexExec: ERROR - Exit status: \(status), stderr: \(stderrString)")
                                             }
-                                            throw self.mapProcessFailure(exitCode: status, stderr: stderrString, timedOut: timedOut)
+                                            throw Self.processFailureError(exitCode: status, stderr: stderrString, timedOut: timedOut)
                                         }
                                     }
 
@@ -959,11 +959,15 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         return nil
     }
 
-    private func mapProcessFailure(exitCode: Int32, stderr: String, timedOut: Bool) -> Error {
+    static func processFailureError(exitCode: Int32, stderr: String, timedOut: Bool) -> Error {
         if timedOut {
             return AIProviderError.invalidConfiguration(detail: "codex exec timed out. Please retry shortly.")
         }
-        let lower = stderr.lowercased()
+        let trimmedStderr = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmedStderr.lowercased()
+        if lower.contains("service tier") || lower.contains("service_tier") {
+            return AIProviderError.invalidConfiguration(detail: trimmedStderr)
+        }
         if lower.contains("command not found") || lower.contains("no such file") {
             return AIProviderError.invalidConfiguration(
                 detail: "The selected Codex runtime could not be started. Reinstall RepoPrompt CE or configure a valid explicit override."
@@ -978,9 +982,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if lower.contains("overload") || lower.contains("busy") || lower.contains("unavailable") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI backend overloaded. Please retry soon.")
         }
-        if stderr.isEmpty {
+        if trimmedStderr.isEmpty {
             return AIProviderError.apiError(source: NSError(domain: "CodexCLI", code: Int(exitCode), userInfo: [NSLocalizedDescriptionKey: "codex exec exited with status \(exitCode)"]))
         }
-        return AIProviderError.apiError(source: NSError(domain: "CodexCLI", code: Int(exitCode), userInfo: [NSLocalizedDescriptionKey: stderr]))
+        return AIProviderError.apiError(source: NSError(domain: "CodexCLI", code: Int(exitCode), userInfo: [NSLocalizedDescriptionKey: trimmedStderr]))
     }
 }

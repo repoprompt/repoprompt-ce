@@ -1462,6 +1462,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private static func codexDisplayName(forBaseModel rawModel: String) -> String {
         let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return rawModel }
+        let specifier = CodexModelSpecifier(raw: trimmed)
+        if let serviceTier = specifier.serviceTier,
+           let baseModel = specifier.baseModel
+        {
+            return "\(codexDisplayName(forBaseModel: baseModel)) \(CodexServiceTierVariantCatalog.displayName(for: serviceTier))"
+        }
         let normalized = trimmed
             .replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: "-", with: " ")

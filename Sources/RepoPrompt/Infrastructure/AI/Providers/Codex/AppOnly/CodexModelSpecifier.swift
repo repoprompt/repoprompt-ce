@@ -62,7 +62,7 @@ struct CodexModelSpecifier: Equatable {
         }
 
         // Then check for a service tier infix (e.g. "gpt-5.4-fast" → base "gpt-5.4", tier "fast")
-        let knownTiers = [CodexServiceTierVariantCatalog.fastServiceTier]
+        let knownTiers = CodexServiceTierVariantCatalog.knownServiceTiers
         var tier: String? = nil
         let baseLowered = base.lowercased()
         for knownTier in knownTiers {
@@ -98,7 +98,7 @@ struct CodexModelSpecifier: Equatable {
     private static func serviceTierStrippedBase(_ candidate: String) -> String {
         var base = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
         let baseLowered = base.lowercased()
-        for knownTier in [CodexServiceTierVariantCatalog.fastServiceTier] {
+        for knownTier in CodexServiceTierVariantCatalog.knownServiceTiers {
             let tierSuffix = "-\(knownTier)"
             if baseLowered.hasSuffix(tierSuffix) {
                 let stripped = String(base.dropLast(tierSuffix.count))

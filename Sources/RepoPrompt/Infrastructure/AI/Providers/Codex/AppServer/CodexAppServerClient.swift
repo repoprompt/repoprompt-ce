@@ -112,6 +112,12 @@ actor CodexAppServerClient {
         let description: String
     }
 
+    struct RemoteServiceTier: Hashable {
+        let id: String
+        let name: String
+        let description: String
+    }
+
     struct RemoteModel: Hashable {
         let id: String
         let model: String
@@ -120,6 +126,30 @@ actor CodexAppServerClient {
         let isDefault: Bool
         let supportedReasoningEfforts: [RemoteReasoningEffort]
         let defaultReasoningEffort: String?
+        let serviceTiers: [RemoteServiceTier]
+        let defaultServiceTier: String?
+
+        init(
+            id: String,
+            model: String,
+            displayName: String,
+            description: String,
+            isDefault: Bool,
+            supportedReasoningEfforts: [RemoteReasoningEffort],
+            defaultReasoningEffort: String?,
+            serviceTiers: [RemoteServiceTier] = [],
+            defaultServiceTier: String? = nil
+        ) {
+            self.id = id
+            self.model = model
+            self.displayName = displayName
+            self.description = description
+            self.isDefault = isDefault
+            self.supportedReasoningEfforts = supportedReasoningEfforts
+            self.defaultReasoningEffort = defaultReasoningEffort
+            self.serviceTiers = serviceTiers
+            self.defaultServiceTier = defaultServiceTier
+        }
     }
 
     struct ServerRequest {
@@ -1249,38 +1279,10 @@ actor CodexAppServerClient {
             }
 
             for entry in pageItems {
-                guard
-                    let id = entry["id"] as? String,
-                    !id.isEmpty
-                else { continue }
+                guard let remoteModel = Self.remoteModel(from: entry) else { continue }
+                let id = remoteModel.id
                 guard seenModelIDs.insert(id).inserted else { continue }
-
-                let model = (entry["model"] as? String) ?? id
-                let displayName = (entry["displayName"] as? String) ?? model
-                let description = (entry["description"] as? String) ?? ""
-                let isDefault = entry["isDefault"] as? Bool ?? false
-                let defaultReasoningEffort = entry["defaultReasoningEffort"] as? String
-                let supportedReasoningEfforts = (entry["supportedReasoningEfforts"] as? [[String: Any]] ?? [])
-                    .compactMap { effortEntry -> RemoteReasoningEffort? in
-                        guard let reasoningEffort = effortEntry["reasoningEffort"] as? String,
-                              !reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        else {
-                            return nil
-                        }
-                        let effortDescription = (effortEntry["description"] as? String) ?? ""
-                        return RemoteReasoningEffort(reasoningEffort: reasoningEffort, description: effortDescription)
-                    }
-                models.append(
-                    RemoteModel(
-                        id: id,
-                        model: model,
-                        displayName: displayName,
-                        description: description,
-                        isDefault: isDefault,
-                        supportedReasoningEfforts: supportedReasoningEfforts,
-                        defaultReasoningEffort: defaultReasoningEffort
-                    )
-                )
+                models.append(remoteModel)
             }
 
             let nextCursor = result["nextCursor"] as? String
@@ -1291,6 +1293,53 @@ actor CodexAppServerClient {
         }
 
         return models
+    }
+
+    static func remoteModel(from entry: [String: Any]) -> RemoteModel? {
+        guard let id = entry["id"] as? String,
+              !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return nil
+        }
+
+        let model = (entry["model"] as? String) ?? id
+        let supportedReasoningEfforts = (entry["supportedReasoningEfforts"] as? [[String: Any]] ?? [])
+            .compactMap { effortEntry -> RemoteReasoningEffort? in
+                guard let reasoningEffort = effortEntry["reasoningEffort"] as? String,
+                      !reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else {
+                    return nil
+                }
+                return RemoteReasoningEffort(
+                    reasoningEffort: reasoningEffort,
+                    description: (effortEntry["description"] as? String) ?? ""
+                )
+            }
+        let serviceTiers = (entry["serviceTiers"] as? [[String: Any]] ?? [])
+            .compactMap { tierEntry -> RemoteServiceTier? in
+                guard let tierID = tierEntry["id"] as? String,
+                      !tierID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else {
+                    return nil
+                }
+                return RemoteServiceTier(
+                    id: tierID,
+                    name: (tierEntry["name"] as? String) ?? tierID,
+                    description: (tierEntry["description"] as? String) ?? ""
+                )
+            }
+
+        return RemoteModel(
+            id: id,
+            model: model,
+            displayName: (entry["displayName"] as? String) ?? model,
+            description: (entry["description"] as? String) ?? "",
+            isDefault: entry["isDefault"] as? Bool ?? false,
+            supportedReasoningEfforts: supportedReasoningEfforts,
+            defaultReasoningEffort: entry["defaultReasoningEffort"] as? String,
+            serviceTiers: serviceTiers,
+            defaultServiceTier: entry["defaultServiceTier"] as? String
+        )
     }
 
     private func initializeIfNeeded() async throws {

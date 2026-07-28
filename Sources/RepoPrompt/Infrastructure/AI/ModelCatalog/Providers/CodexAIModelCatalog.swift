@@ -5,6 +5,12 @@ struct CodexDynamicReasoningRecord: Codable, Hashable {
     let description: String
 }
 
+struct CodexDynamicServiceTierRecord: Codable, Hashable {
+    let id: String
+    let name: String
+    let description: String
+}
+
 struct CodexDynamicModelRecord: Codable, Hashable {
     let id: String
     let model: String
@@ -13,6 +19,8 @@ struct CodexDynamicModelRecord: Codable, Hashable {
     let isDefault: Bool
     let supportedReasoningEfforts: [CodexDynamicReasoningRecord]
     let defaultReasoningEffort: String?
+    let serviceTiers: [CodexDynamicServiceTierRecord]
+    let defaultServiceTier: String?
 
     init(
         id: String,
@@ -21,7 +29,9 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         description: String,
         isDefault: Bool,
         supportedReasoningEfforts: [CodexDynamicReasoningRecord] = [],
-        defaultReasoningEffort: String? = nil
+        defaultReasoningEffort: String? = nil,
+        serviceTiers: [CodexDynamicServiceTierRecord] = [],
+        defaultServiceTier: String? = nil
     ) {
         self.id = id
         self.model = model
@@ -30,6 +40,8 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         self.isDefault = isDefault
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
+        self.serviceTiers = serviceTiers
+        self.defaultServiceTier = defaultServiceTier
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -40,6 +52,8 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         case isDefault
         case supportedReasoningEfforts
         case defaultReasoningEffort
+        case serviceTiers
+        case defaultServiceTier
     }
 
     init(from decoder: Decoder) throws {
@@ -51,6 +65,8 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         isDefault = try container.decode(Bool.self, forKey: .isDefault)
         supportedReasoningEfforts = try container.decodeIfPresent([CodexDynamicReasoningRecord].self, forKey: .supportedReasoningEfforts) ?? []
         defaultReasoningEffort = try container.decodeIfPresent(String.self, forKey: .defaultReasoningEffort)
+        serviceTiers = try container.decodeIfPresent([CodexDynamicServiceTierRecord].self, forKey: .serviceTiers) ?? []
+        defaultServiceTier = try container.decodeIfPresent(String.self, forKey: .defaultServiceTier)
     }
 }
 
@@ -61,6 +77,7 @@ struct CodexDynamicModelOption: Hashable {
     let isDefault: Bool
     let baseID: String
     let reasoningEffort: CodexReasoningEffort?
+    let serviceTier: String?
 }
 
 enum CodexDynamicModelMapper {
@@ -81,7 +98,11 @@ enum CodexDynamicModelMapper {
                 supportedReasoningEfforts: model.supportedReasoningEfforts.map {
                     CodexDynamicReasoningRecord(reasoningEffort: $0.reasoningEffort, description: $0.description)
                 },
-                defaultReasoningEffort: model.defaultReasoningEffort
+                defaultReasoningEffort: model.defaultReasoningEffort,
+                serviceTiers: model.serviceTiers.map {
+                    CodexDynamicServiceTierRecord(id: $0.id, name: $0.name, description: $0.description)
+                },
+                defaultServiceTier: model.defaultServiceTier
             )
         }
         return options(from: records)
@@ -102,17 +123,23 @@ enum CodexDynamicModelMapper {
             )
             let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
             let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription)
+            let advertisedUltrafast = record.serviceTiers.first {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    == CodexServiceTierVariantCatalog.ultrafastServiceTier
+            }
 
             if effortEntries.isEmpty {
-                appendOption(
-                    CodexDynamicModelOption(
+                appendBaseAndAdvertisedUltrafast(
+                    baseOption: CodexDynamicModelOption(
                         id: baseID,
                         displayName: baseName,
                         description: baseDescription,
                         isDefault: record.isDefault,
                         baseID: baseID,
-                        reasoningEffort: nil
+                        reasoningEffort: nil,
+                        serviceTier: nil
                     ),
+                    advertisedUltrafast: advertisedUltrafast,
                     seen: &seen,
                     into: &options
                 )
@@ -122,15 +149,17 @@ enum CodexDynamicModelMapper {
             for effortEntry in effortEntries {
                 let optionID = "\(baseID)-\(effortEntry.effort.rawValue)"
                 let optionDescription = effortEntry.description.isEmpty ? baseDescription : effortEntry.description
-                appendOption(
-                    CodexDynamicModelOption(
+                appendBaseAndAdvertisedUltrafast(
+                    baseOption: CodexDynamicModelOption(
                         id: optionID,
                         displayName: "\(baseName) \(effortEntry.effort.displayName)",
                         description: optionDescription,
                         isDefault: record.isDefault && effortEntry.isDefault,
                         baseID: baseID,
-                        reasoningEffort: effortEntry.effort
+                        reasoningEffort: effortEntry.effort,
+                        serviceTier: nil
                     ),
+                    advertisedUltrafast: advertisedUltrafast,
                     seen: &seen,
                     into: &options
                 )
@@ -159,39 +188,51 @@ enum CodexDynamicModelMapper {
 
     static func displayName(forModelID id: String, records: [CodexDynamicModelRecord]) -> String? {
         let normalizedID = normalizeID(id)
-        let lookupID = normalizedID.lowercased()
-        guard !lookupID.isEmpty else { return nil }
+        guard !normalizedID.isEmpty else { return nil }
+        return options(from: records).first {
+            $0.id.caseInsensitiveCompare(normalizedID) == .orderedSame
+        }?.displayName
+    }
 
-        for record in records {
-            let baseID = normalizeID(record.id)
-            guard !baseID.isEmpty else { continue }
-            let baseLookupID = baseID.lowercased()
-            guard lookupID == baseLookupID || lookupID.hasPrefix("\(baseLookupID)-") else { continue }
-
-            let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
-            let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription)
-            if effortEntries.isEmpty {
-                guard lookupID == baseLookupID else { continue }
-                return formatBaseDisplayName(
-                    record.displayName,
-                    fallbackModel: record.model,
-                    fallbackID: baseID
-                )
-            }
-
-            for effortEntry in effortEntries {
-                let optionID = "\(baseID)-\(effortEntry.effort.rawValue)".lowercased()
-                guard lookupID == optionID else { continue }
-                let baseName = formatBaseDisplayName(
-                    record.displayName,
-                    fallbackModel: record.model,
-                    fallbackID: baseID
-                )
-                return "\(baseName) \(effortEntry.effort.displayName)"
-            }
+    private static func appendBaseAndAdvertisedUltrafast(
+        baseOption: CodexDynamicModelOption,
+        advertisedUltrafast: CodexDynamicServiceTierRecord?,
+        seen: inout Set<String>,
+        into output: inout [CodexDynamicModelOption]
+    ) {
+        appendOption(baseOption, seen: &seen, into: &output)
+        guard let advertisedUltrafast,
+              let variantID = CodexServiceTierVariantCatalog.variantID(
+                  baseModelID: baseOption.baseID,
+                  reasoningEffort: baseOption.reasoningEffort,
+                  serviceTier: CodexServiceTierVariantCatalog.ultrafastServiceTier
+              )
+        else {
+            return
         }
 
-        return nil
+        let tierDescription = advertisedUltrafast.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let description = tierDescription.isEmpty
+            ? baseOption.description
+            : [baseOption.description, tierDescription].filter { !$0.isEmpty }.joined(separator: " ")
+        let baseName = AIModel.stripCodexReasoningSuffix(from: baseOption.displayName)
+        var displayName = "\(baseName) \(CodexServiceTierVariantCatalog.ultrafastDisplayName)"
+        if let reasoningEffort = baseOption.reasoningEffort {
+            displayName += " \(reasoningEffort.displayName)"
+        }
+        appendOption(
+            CodexDynamicModelOption(
+                id: variantID,
+                displayName: displayName,
+                description: description,
+                isDefault: false,
+                baseID: baseOption.baseID,
+                reasoningEffort: baseOption.reasoningEffort,
+                serviceTier: CodexServiceTierVariantCatalog.ultrafastServiceTier
+            ),
+            seen: &seen,
+            into: &output
+        )
     }
 
     private static func appendOption(_ option: CodexDynamicModelOption, seen: inout Set<String>, into output: inout [CodexDynamicModelOption]) {
@@ -346,6 +387,7 @@ enum CodexDynamicModelStore {
         let displayName = model.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let description = model.description.trimmingCharacters(in: .whitespacesAndNewlines)
         let defaultReasoningEffort = CodexReasoningEffort.parse(model.defaultReasoningEffort)?.rawValue
+        let defaultServiceTier = normalizedServiceTierID(model.defaultServiceTier)
         var reasoningDescriptionsByEffort: [CodexReasoningEffort: String] = [:]
         for entry in model.supportedReasoningEfforts {
             guard let effort = CodexReasoningEffort.parse(entry.reasoningEffort) else { continue }
@@ -372,6 +414,19 @@ enum CodexDynamicModelStore {
                 description: effortDescription
             )
         }
+        var serviceTierRecordsByID: [String: CodexDynamicServiceTierRecord] = [:]
+        for tier in model.serviceTiers {
+            guard let tierID = normalizedServiceTierID(tier.id) else { continue }
+            let record = CodexDynamicServiceTierRecord(
+                id: tierID,
+                name: tier.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                description: tier.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            serviceTierRecordsByID[tierID] = record
+        }
+        let serviceTiers = serviceTierRecordsByID.values.sorted {
+            $0.id.localizedCaseInsensitiveCompare($1.id) == .orderedAscending
+        }
 
         return CodexDynamicModelRecord(
             id: id,
@@ -380,8 +435,15 @@ enum CodexDynamicModelStore {
             description: description,
             isDefault: model.isDefault,
             supportedReasoningEfforts: reasoningEfforts,
-            defaultReasoningEffort: defaultReasoningEffort
+            defaultReasoningEffort: defaultReasoningEffort,
+            serviceTiers: serviceTiers,
+            defaultServiceTier: defaultServiceTier
         )
+    }
+
+    private static func normalizedServiceTierID(_ raw: String?) -> String? {
+        let normalized = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized?.isEmpty == false ? normalized : nil
     }
 
     private static func canonicalRecordSort(_ lhs: CodexDynamicModelRecord, _ rhs: CodexDynamicModelRecord) -> Bool {
@@ -413,15 +475,27 @@ enum CodexDynamicModelStore {
 enum CodexAIModelCatalog {
     static func modelsForPicker(staticModels: [AIModel]) -> [AIModel] {
         let dynamicModels = dynamicModelsFromStore()
-        if !dynamicModels.isEmpty {
-            let dynamicWithFastVariants = dynamicModels + synthesizedFastAIModels(from: dynamicModels)
-            return backfilledRecommendedModels(primary: dynamicWithFastVariants, fallback: staticModels)
-        }
-        return staticModels
+        return modelsForPicker(dynamicModels: dynamicModels, staticModels: staticModels)
+    }
+
+    static func modelsForPicker(
+        dynamicOptions: [CodexDynamicModelOption],
+        staticModels: [AIModel]
+    ) -> [AIModel] {
+        modelsForPicker(
+            dynamicModels: dynamicOptions.map { .codexCustom(name: $0.id) },
+            staticModels: staticModels
+        )
     }
 
     private static func dynamicModelsFromStore() -> [AIModel] {
         CodexDynamicModelStore.modelOptions().map { .codexCustom(name: $0.id) }
+    }
+
+    private static func modelsForPicker(dynamicModels: [AIModel], staticModels: [AIModel]) -> [AIModel] {
+        guard !dynamicModels.isEmpty else { return staticModels }
+        let dynamicWithFastVariants = dynamicModels + synthesizedFastAIModels(from: dynamicModels)
+        return backfilledRecommendedModels(primary: dynamicWithFastVariants, fallback: staticModels)
     }
 
     private static func backfilledRecommendedModels(primary: [AIModel], fallback: [AIModel]) -> [AIModel] {

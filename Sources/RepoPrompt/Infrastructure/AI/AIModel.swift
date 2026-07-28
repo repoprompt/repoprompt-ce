@@ -1127,7 +1127,6 @@ public enum AIModel: Equatable, Hashable {
     }
 
     /// Returns the Codex service tier override for this model, if any.
-    /// Currently only GPT-5.4 Fast variants request the "fast" service tier.
     var codexServiceTier: String? {
         switch self {
         case let .codexCustom(name):
@@ -1632,7 +1631,7 @@ public enum AIModel: Equatable, Hashable {
 
         var label = canonicalBase
         if let serviceTier = specifier.serviceTier {
-            label += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier ? " Fast" : " \(serviceTier.capitalized)"
+            label += " \(CodexServiceTierVariantCatalog.displayName(for: serviceTier))"
         }
         if let reasoningEffort = specifier.reasoningEffort {
             label += " \(reasoningEffort.displayName)"
@@ -1651,9 +1650,7 @@ public enum AIModel: Equatable, Hashable {
 
         var stripped = humanizedCodexBaseModel(baseModel)
         if let serviceTier = specifier.serviceTier {
-            stripped += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier
-                ? " Fast"
-                : " \(serviceTier.capitalized)"
+            stripped += " \(CodexServiceTierVariantCatalog.displayName(for: serviceTier))"
         }
         return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
