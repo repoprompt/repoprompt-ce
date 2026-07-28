@@ -1,6 +1,10 @@
 import Foundation
 import RepoPromptCodeMapCore
 
+#if !DEBUG
+    struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {}
+#endif
+
 struct WorkspaceCodemapBindingEnginePolicy: Equatable {
     static let `default` = WorkspaceCodemapBindingEnginePolicy()
 
@@ -50,6 +54,8 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
     let graphIndexRetryInitialMilliseconds: UInt64
     let graphIndexRetryMaximumMilliseconds: UInt64
     let graphIndexRetryJitterPercent: UInt64
+    let graphIndexWorkerNoProgressTimeoutMilliseconds: UInt64
+    let maximumGraphIndexWorkerRecoveryCount: UInt64
 
     init(
         maximumRootCount: Int = 64,
@@ -97,7 +103,9 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         manifestWriterDeferredRetryMilliseconds: UInt64 = 100,
         graphIndexRetryInitialMilliseconds: UInt64 = 250,
         graphIndexRetryMaximumMilliseconds: UInt64 = 30000,
-        graphIndexRetryJitterPercent: UInt64 = 20
+        graphIndexRetryJitterPercent: UInt64 = 20,
+        graphIndexWorkerNoProgressTimeoutMilliseconds: UInt64 = 120_000,
+        maximumGraphIndexWorkerRecoveryCount: UInt64 = 3
     ) {
         precondition(maximumRootCount > 0)
         precondition(maximumActiveRequestCountPerRoot > 0)
@@ -153,6 +161,8 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         precondition(graphIndexRetryInitialMilliseconds > 0)
         precondition(graphIndexRetryMaximumMilliseconds >= graphIndexRetryInitialMilliseconds)
         precondition(graphIndexRetryJitterPercent <= 100)
+        precondition(graphIndexWorkerNoProgressTimeoutMilliseconds > 0)
+        precondition(maximumGraphIndexWorkerRecoveryCount > 0)
         self.maximumRootCount = maximumRootCount
         self.maximumActiveRequestCountPerRoot = maximumActiveRequestCountPerRoot
         self.maximumActiveRequestCount = maximumActiveRequestCount
@@ -203,6 +213,21 @@ struct WorkspaceCodemapBindingEnginePolicy: Equatable {
         self.graphIndexRetryInitialMilliseconds = graphIndexRetryInitialMilliseconds
         self.graphIndexRetryMaximumMilliseconds = graphIndexRetryMaximumMilliseconds
         self.graphIndexRetryJitterPercent = graphIndexRetryJitterPercent
+        self.graphIndexWorkerNoProgressTimeoutMilliseconds = graphIndexWorkerNoProgressTimeoutMilliseconds
+        self.maximumGraphIndexWorkerRecoveryCount = maximumGraphIndexWorkerRecoveryCount
+    }
+}
+
+struct WorkspaceCodemapObservedStaleAuthorityError: Error, Equatable {
+    let currentAuthority: CodeMapRootManifestAuthority
+    let observedPredecessorAuthority: CodeMapRootManifestAuthority?
+
+    var currentAuthorityGeneration: UInt64 {
+        currentAuthority.authorityGeneration
+    }
+
+    var observedPredecessorAuthorityGeneration: UInt64? {
+        observedPredecessorAuthority?.authorityGeneration
     }
 }
 
@@ -409,7 +434,7 @@ struct WorkspaceCodemapBindingInvalidationResult: Equatable {
     let manifestWriteFailed: Bool
 }
 
-enum WorkspaceCodemapBindingEngineHookKind: String {
+enum WorkspaceCodemapBindingEngineHookKind: String, Hashable {
     case capabilityEligible
     case capabilityTerminalUnavailable
     case capabilityTransientRetry
@@ -439,6 +464,7 @@ enum WorkspaceCodemapBindingEngineHookKind: String {
     case publishedArtifactLookupMiss
     #if DEBUG
         case publishedArtifactPostLookupCurrentnessRejection
+        case manifestStoreAttempt
     #endif
     case rootUnload
     case graphIndexRunScheduled
@@ -469,6 +495,12 @@ enum WorkspaceCodemapBindingEngineHookKind: String {
     case graphIndexRootOvertake
     case graphIndexExplicitOvertake
     case graphIndexBudget
+    #if DEBUG
+        case graphIndexPhaseEntered
+        case graphIndexPageAccepted
+        case graphIndexCheckpointed
+        case graphIndexWorkerFinished
+    #endif
 }
 
 /// Hook payloads deliberately contain no physical or logical path.
@@ -579,6 +611,7 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var manifestWrites: UInt64 = 0
     var manifestFailures: UInt64 = 0
     var manifestWriteBatches: UInt64 = 0
+    var manifestWriteRetries: UInt64 = 0
     var manifestWriteItems: UInt64 = 0
     var manifestWriteBatchBytes: UInt64 = 0
     var manifestWriteCoalescedItems: UInt64 = 0
@@ -599,6 +632,21 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var publishedArtifactLookupMisses: UInt64 = 0
     #if DEBUG
         var publishedArtifactPostLookupCurrentnessRejections: UInt64 = 0
+        var graphIndexPageManifestLoads: UInt64 = 0
+        var graphIndexPageManifestSubmissions: UInt64 = 0
+        var graphIndexPageManifestWaits: UInt64 = 0
+        var graphIndexPageManifestWrites: UInt64 = 0
+        var graphIndexPageManifestSnapshotRecordVolume: UInt64 = 0
+        var graphIndexPageManifestSnapshotByteVolume: UInt64 = 0
+        var graphIndexSealManifestSubmissions: UInt64 = 0
+        var graphIndexSealManifestWaits: UInt64 = 0
+        var graphIndexSealManifestWrites: UInt64 = 0
+        var graphIndexSealManifestAuthorityResubmissions: UInt64 = 0
+        var graphIndexSealManifestSnapshotRecordVolume: UInt64 = 0
+        var graphIndexSealManifestSnapshotByteVolume: UInt64 = 0
+        var graphIndexManifestStagedRecords: UInt64 = 0
+        var graphIndexManifestStagedBytes: UInt64 = 0
+        var graphIndexManifestStagesDegraded: UInt64 = 0
     #endif
     var graphIndexRunsScheduled: UInt64 = 0
     var graphIndexRunsStarted: UInt64 = 0
@@ -646,6 +694,7 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         manifestWrites = initialValue
         manifestFailures = initialValue
         manifestWriteBatches = initialValue
+        manifestWriteRetries = initialValue
         manifestWriteItems = initialValue
         manifestWriteBatchBytes = initialValue
         manifestWriteCoalescedItems = initialValue
@@ -666,6 +715,21 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         publishedArtifactLookupMisses = initialValue
         #if DEBUG
             publishedArtifactPostLookupCurrentnessRejections = initialValue
+            graphIndexPageManifestLoads = initialValue
+            graphIndexPageManifestSubmissions = initialValue
+            graphIndexPageManifestWaits = initialValue
+            graphIndexPageManifestWrites = initialValue
+            graphIndexPageManifestSnapshotRecordVolume = initialValue
+            graphIndexPageManifestSnapshotByteVolume = initialValue
+            graphIndexSealManifestSubmissions = initialValue
+            graphIndexSealManifestWaits = initialValue
+            graphIndexSealManifestWrites = initialValue
+            graphIndexSealManifestAuthorityResubmissions = initialValue
+            graphIndexSealManifestSnapshotRecordVolume = initialValue
+            graphIndexSealManifestSnapshotByteVolume = initialValue
+            graphIndexManifestStagedRecords = initialValue
+            graphIndexManifestStagedBytes = initialValue
+            graphIndexManifestStagesDegraded = initialValue
         #endif
         graphIndexRunsScheduled = initialValue
         graphIndexRunsStarted = initialValue
@@ -699,16 +763,71 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     }
 }
 
+enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
+    case complete
+    case budgetLimited
+    case cancelled
+    case superseded
+    case currentnessLost
+    case admissionUnavailable
+    case checkpointTransitionRejected
+    case generationResetRejected
+    case retryCancelled
+    case watchdogNoProgress
+    case watchdogRecoveryExhausted
+    case prioritizeRestart
+}
+
+enum WorkspaceCodemapGraphIndexWatchdogDisposition: Hashable {
+    case current
+    case restarted
+    case restartRequested
+    case exhausted
+    case terminal
+    case unavailable
+}
+
+enum WorkspaceCodemapGraphIndexPrioritizeDisposition: Hashable {
+    case scheduled
+    case restarted
+    case promoted
+    case alreadyComplete
+    case unavailable
+}
+
 struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
     let rootEpoch: WorkspaceCodemapRootEpoch
+    let jobID: UUID
     let phase: WorkspaceCodemapGraphIndexPhase
     let progress: WorkspaceCodemapGraphIndexProgress
+    let workerPresent: Bool
+    let workerRecoveryCount: UInt64
+    let lastWorkerCompletionReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
+    let isPriorityPromoted: Bool
+    let isQueuedForAdmission: Bool
+    let queuePosition: Int?
     let queuedBatchCount: Int
     let activeBatchCount: Int
     let drainingBatchCount: Int
     let resources: WorkspaceCodemapGraphIndexResourceAccounting
+    let retryAttempt: UInt64
     let retry: WorkspaceCodemapGraphIndexRetry?
     let budget: WorkspaceCodemapGraphIndexBudget?
+    let scheduledUptimeNanoseconds: UInt64
+    let admissionWaitStartUptimeNanoseconds: UInt64?
+    let admittedUptimeNanoseconds: UInt64?
+    let phaseEnteredUptimeNanoseconds: UInt64
+    let lastProgressUptimeNanoseconds: UInt64
+    let workerFinishedUptimeNanoseconds: UInt64?
+    let lastProjectedSupportedCandidateTotal: UInt64?
+    let pageStartProcessedCandidateBaseline: UInt64?
+    let pageOrdinal: UInt64
+    let cursorPresent: Bool
+    let cursorFingerprint: String?
+    let inBatchCandidateCount: UInt64?
+    let inBatchResolvedCandidateCount: UInt64?
+    let checkpointPresent: Bool
+    let manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
 }
 
 struct WorkspaceCodemapBindingEngineAccounting: Equatable {
