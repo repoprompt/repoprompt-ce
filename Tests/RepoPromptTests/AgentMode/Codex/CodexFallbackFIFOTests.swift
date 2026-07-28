@@ -229,6 +229,137 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertNil(session.codexAuthoritativeActiveTurn)
     }
 
+    func testIdlePumpFallbackWaitsForHookReviewBeforeClaimingHeadOrAttachments() async throws {
+        let image = AgentImageAttachment(
+            source: .localFile(path: "/tmp/idle-hook-gate.png"),
+            title: "idle-hook-gate.png"
+        )
+        let reservationID = UUID()
+        let controller = try FallbackFIFOController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            steerResults: [
+                .failure(CodexTurnSteerError.noActiveTurn(
+                    requestFailure(message: "no active turn to steer")
+                ))
+            ],
+            hookInventory: fallbackHookInventory()
+        )
+        let (viewModel, session) = makeRunningSession(controller: controller)
+        let originalAttemptID = session.activeRunAttemptID
+        session.attachmentTurnState = .reserved(
+            reservationID: reservationID,
+            attachments: [image]
+        )
+        let context = fallbackContext(
+            queueID: UUID(),
+            origin: .manual,
+            text: "idle gated fallback",
+            images: [image]
+        )
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: context.providerText,
+            attachments: [image],
+            fallbackContext: context,
+            attachmentReservationID: reservationID
+        )
+        guard case .queuedFallback = outcome else {
+            return XCTFail("Expected queued fallback, got \(outcome)")
+        }
+        let request = try await waitForHookRequest(session)
+
+        XCTAssertEqual(controller.hookListCount, 1)
+        XCTAssertEqual(controller.startCount, 0)
+        XCTAssertEqual(session.codexFallbackQueue.first?.state, .queued)
+        XCTAssertNil(session.codexFallbackDispatchInFlight)
+        XCTAssertEqual(session.activeRunAttemptID, originalAttemptID)
+        guard case .idle = session.attachmentTurnState else {
+            return XCTFail("Fallback attachments must remain detached while review is suspended")
+        }
+
+        try await viewModel.test_codexCoordinator.resolveCodexHookReview(
+            session: session,
+            requestID: request.id,
+            decision: .continueWithoutHooks
+        )
+        try await waitUntil { controller.startCount == 1 }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertNotNil(session.codexFallbackDispatchInFlight)
+        XCTAssertEqual(session.activeRunAttemptID, originalAttemptID)
+        guard case let .consumed(storedID, attachments) = session.attachmentTurnState else {
+            return XCTFail("Claimed idle fallback must consume its attachment reservation")
+        }
+        XCTAssertEqual(storedID, reservationID)
+        XCTAssertEqual(attachments, [image])
+    }
+
+    func testTerminalSuccessorFallbackWaitsForHookReviewBeforeSuccessorClaim() async throws {
+        let image = AgentImageAttachment(
+            source: .localFile(path: "/tmp/successor-hook-gate.png"),
+            title: "successor-hook-gate.png"
+        )
+        let reservationID = UUID()
+        let nonSteerable = CodexTurnSteerError.activeTurnNotSteerable(
+            turnKind: "compact",
+            failure: requestFailure(message: "cannot steer a compact turn")
+        )
+        let controller = try FallbackFIFOController(
+            steerResults: [.failure(nonSteerable)],
+            hookInventory: fallbackHookInventory()
+        )
+        let (viewModel, session) = makeRunningSession(controller: controller)
+        let originalAttemptID = session.activeRunAttemptID
+        session.attachmentTurnState = .reserved(
+            reservationID: reservationID,
+            attachments: [image]
+        )
+        let context = fallbackContext(
+            queueID: UUID(),
+            origin: .manual,
+            text: "successor gated fallback",
+            images: [image]
+        )
+
+        _ = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: context.providerText,
+            attachments: [image],
+            fallbackContext: context,
+            attachmentReservationID: reservationID
+        )
+        let completion = Task {
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+                .turnCompleted(turnID: "turn", status: .completed),
+                session: session
+            )
+        }
+        let request = try await waitForHookRequest(session)
+
+        XCTAssertEqual(controller.hookListCount, 1)
+        XCTAssertEqual(controller.startCount, 0)
+        XCTAssertEqual(session.codexFallbackQueue.first?.state, .queued)
+        XCTAssertNil(session.codexFallbackDispatchInFlight)
+        XCTAssertEqual(session.activeRunAttemptID, originalAttemptID)
+        guard case .idle = session.attachmentTurnState else {
+            return XCTFail("Successor attachments must remain detached while review is suspended")
+        }
+
+        try await viewModel.test_codexCoordinator.resolveCodexHookReview(
+            session: session,
+            requestID: request.id,
+            decision: .continueWithoutHooks
+        )
+        await completion.value
+        try await waitUntil { controller.startCount == 1 }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        let inFlight = try XCTUnwrap(session.codexFallbackDispatchInFlight)
+        XCTAssertNotEqual(session.activeRunAttemptID, originalAttemptID)
+        XCTAssertEqual(inFlight.attachmentReservationID, reservationID)
+        XCTAssertEqual(inFlight.images, [image])
+    }
+
     func testDurablyQueuedMCPFallbackInterruptsWaiterOnlyAfterQueueAck() async throws {
         let steerGate = FallbackStartGate()
         let controller = FallbackFIFOController(
@@ -975,12 +1106,13 @@ final class CodexFallbackFIFOTests: XCTestCase {
     private func fallbackContext(
         queueID: UUID,
         origin: AgentModeViewModel.TabSession.CodexFallbackOrigin,
-        text: String
+        text: String,
+        images: [AgentImageAttachment] = []
     ) -> AgentModeViewModel.TabSession.CodexFallbackSubmissionContext {
         .init(
             queueID: queueID,
             providerText: text,
-            images: [],
+            images: images,
             taggedFileAttachments: [],
             draftText: text,
             optimisticUserItemID: nil,
@@ -1038,6 +1170,36 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
     }
 
+    private func fallbackHookInventory() throws -> CodexHookInventory {
+        try CodexHookInventory(
+            executionCWD: "/repo",
+            hooks: [
+                CodexHookMetadata(
+                    eventName: "PreToolUse",
+                    source: "project",
+                    sourcePath: "/repo/.codex/config.toml",
+                    key: "fallback-hook",
+                    currentHash: "fallback-hash",
+                    enabled: true,
+                    handlerType: "command",
+                    trustStatus: .untrusted,
+                    commandOrHandler: "./hooks/fallback"
+                )
+            ]
+        )
+    }
+
+    private func waitForHookRequest(
+        _ session: AgentModeViewModel.TabSession,
+        timeout: TimeInterval = 2
+    ) async throws -> AgentCodexHookReviewRequest {
+        try await waitForPendingCodexHookReview(
+            in: session,
+            timeout: timeout,
+            diagnostic: "Timed out waiting for fallback hook review"
+        )
+    }
+
     private func waitUntil(
         timeout: TimeInterval = 2,
         _ predicate: @escaping () -> Bool
@@ -1058,9 +1220,11 @@ private final class FallbackFIFOController: CodexSessionControlling {
     private var steerResults: [Result<CodexTurnSteerReceipt, Error>]
     private let startGate: FallbackStartGate?
     private let steerGate: FallbackStartGate?
+    private let hookInventory: CodexHookInventory?
 
     private(set) var steerTurnIDs: [String] = []
     private(set) var startCount = 0
+    private(set) var hookListCount = 0
     private(set) var hasActiveThread = true
 
     init(
@@ -1069,7 +1233,8 @@ private final class FallbackFIFOController: CodexSessionControlling {
         snapshotResults: [Result<CodexNativeSessionController.ThreadSnapshot, Error>] = [],
         steerResults: [Result<CodexTurnSteerReceipt, Error>],
         startGate: FallbackStartGate? = nil,
-        steerGate: FallbackStartGate? = nil
+        steerGate: FallbackStartGate? = nil,
+        hookInventory: CodexHookInventory? = nil
     ) {
         self.snapshot = snapshot
         self.activeTurnIDs = activeTurnIDs
@@ -1077,6 +1242,7 @@ private final class FallbackFIFOController: CodexSessionControlling {
         self.steerResults = steerResults
         self.startGate = startGate
         self.steerGate = steerGate
+        self.hookInventory = hookInventory
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -1177,6 +1343,15 @@ private final class FallbackFIFOController: CodexSessionControlling {
     }
 
     func compactThread() async throws {}
+
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
+        hookListCount += 1
+        if let hookInventory {
+            return hookInventory
+        }
+        return try CodexHookInventory(executionCWD: "/tmp", hooks: [])
+    }
+
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil
     }

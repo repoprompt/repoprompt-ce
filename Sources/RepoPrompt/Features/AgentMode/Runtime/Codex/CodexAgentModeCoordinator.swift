@@ -262,6 +262,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let activeAgentRunWaitQuery: ActiveAgentRunWaitQuery
     private var activeAgentRunWaitDrain: ActiveAgentRunWaitDrain
     private let authRecovery: any CodexManagedAuthRecovering
+    private let codexHookApprovalSettings: any CodexHookApprovalSettingsProviding
     private var codexModelsSubscriptionTask: Task<Void, Never>?
     private let commandRunningStatusCoalesceDelayNanos: UInt64 = 75_000_000
     private let commandRunningLiveOutputCoalesceDelayNanos: UInt64 = 225_000_000
@@ -371,6 +372,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         connectionPolicyInstaller: @escaping ConnectionPolicyInstaller,
         shouldManageCodexTooling: Bool,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
+        codexHookApprovalSettings: any CodexHookApprovalSettingsProviding,
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
         activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in true },
@@ -391,6 +393,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.connectionPolicyInstaller = connectionPolicyInstaller
         self.shouldManageCodexTooling = shouldManageCodexTooling
         self.authRecovery = authRecovery
+        self.codexHookApprovalSettings = codexHookApprovalSettings
         self.activeToolQuery = activeToolQuery
         self.activeAgentRunWaitQuery = activeAgentRunWaitQuery
         self.activeAgentRunWaitDrain = activeAgentRunWaitDrain
@@ -552,6 +555,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private func hasPendingCodexInteraction(for session: AgentModeViewModel.TabSession) -> Bool {
         session.pendingApproval != nil
+            || session.hasPendingCodexHookReviewWait
             || session.pendingPermissionsRequest != nil
             || session.pendingMCPElicitationRequest != nil
             || !session.queuedMCPElicitationRequests.isEmpty
@@ -563,12 +567,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     @discardableResult
     private func clearCodexPendingInteractions(in session: AgentModeViewModel.TabSession) -> Bool {
         let didClear = session.pendingApproval != nil
+            || session.hasPendingCodexHookReviewWait
             || session.pendingPermissionsRequest != nil
             || session.pendingMCPElicitationRequest != nil
             || !session.queuedMCPElicitationRequests.isEmpty
             || session.pendingUserInputRequest != nil
             || !session.queuedUserInputRequests.isEmpty
         session.pendingApproval = nil
+        if session.hasActiveCodexHookGateOperation {
+            session.resetCodexHookGateBinding()
+        }
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil
         session.queuedMCPElicitationRequests.removeAll()
@@ -590,7 +598,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ turnID: String?,
         session: AgentModeViewModel.TabSession
     ) {
-        guard let turnID,
+        // Hook approval is a controller-binding startup gate, not a turn-scoped
+        // server request. A turnStarted event must never stale-match or clear it.
+        guard !session.hasPendingCodexHookReviewWait,
+              let turnID,
               hasPendingCodexInteraction(for: session),
               !pendingCodexInteractionMatches(turnID: turnID, session: session)
         else {
@@ -601,6 +612,523 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.publishMCPStateChange(for: session)
         handleRunInteractionStateChange(for: session, reason: .pendingQuestionCancelled)
         logCodex("[AgentModeVM][CodexUI] cleared stale pending Codex interactions for tab \(session.tabID) before new turn \(turnID)")
+    }
+
+    func isCodexHookApprovalStrictModeEnabled() -> Bool {
+        codexHookApprovalSettings.codexHookApprovalStrictModeEnabled(
+            workspaceID: viewModel?.activeWorkspaceIDForSessionIndexOwnership
+        )
+    }
+
+    private struct CodexHookGateOperationAuthority {
+        enum Scope {
+            case initialDiscovery
+            case review(requestID: UUID, gateGeneration: UInt64)
+        }
+
+        let attemptToken: UUID
+        let scope: Scope
+        let binding: AgentModeViewModel.TabSession.CodexHookGateBindingIdentity
+
+        init(
+            attemptToken: UUID,
+            scope: Scope,
+            binding: AgentModeViewModel.TabSession.CodexHookGateBindingIdentity
+        ) {
+            self.attemptToken = attemptToken
+            self.scope = scope
+            self.binding = binding
+        }
+
+        @MainActor
+        func isCurrent(in session: AgentModeViewModel.TabSession) -> Bool {
+            guard session.codexHookGateAttemptToken == attemptToken,
+                  let currentController = session.codexController,
+                  ObjectIdentifier(currentController as AnyObject) == binding.controllerInstanceID,
+                  binding.controllerGeneration == session.codexControllerGeneration
+            else {
+                return false
+            }
+            switch scope {
+            case .initialDiscovery:
+                return true
+            case let .review(requestID, gateGeneration):
+                return session.pendingCodexHookReview?.id == requestID
+                    && session.codexHookGateGeneration == gateGeneration
+                    && session.codexHookGateActiveBinding == binding
+            }
+        }
+    }
+
+    private func codexHookGateBinding(
+        for session: AgentModeViewModel.TabSession,
+        controller: any CodexSessionControlling
+    ) -> AgentModeViewModel.TabSession.CodexHookGateBindingIdentity {
+        .init(
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration
+        )
+    }
+
+    private func isCurrentCodexHookGateBinding(
+        _ binding: AgentModeViewModel.TabSession.CodexHookGateBindingIdentity,
+        session: AgentModeViewModel.TabSession,
+        controller: any CodexSessionControlling
+    ) -> Bool {
+        guard let currentController = session.codexController else { return false }
+        return Self.sameCodexControllerInstance(currentController, controller)
+            && binding == codexHookGateBinding(for: session, controller: controller)
+    }
+
+    private func publishCodexHookGateState(for session: AgentModeViewModel.TabSession) {
+        viewModel?.reconcileInteractiveRunState(session)
+        updateCodexStallWatchdogState(for: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.publishMCPStateChange(for: session)
+    }
+
+    private func finishCodexHookReviewAttempt(
+        session: AgentModeViewModel.TabSession,
+        request: AgentCodexHookReviewRequest,
+        phase: AgentCodexHookReviewRequest.Phase,
+        errorMessage: String?
+    ) {
+        session.codexHookGateAttemptToken = nil
+        var transitionedRequest = request
+        transitionedRequest.phase = phase
+        transitionedRequest.errorMessage = errorMessage
+        session.pendingCodexHookReview = transitionedRequest
+        publishCodexHookGateState(for: session)
+    }
+
+    private func codexHookReviewRequest(
+        session: AgentModeViewModel.TabSession,
+        executionCWD: String,
+        hooks: [CodexHookMetadata],
+        warnings: [String],
+        phase: AgentCodexHookReviewRequest.Phase,
+        errorMessage: String? = nil
+    ) -> AgentCodexHookReviewRequest {
+        AgentCodexHookReviewRequest(
+            tabID: session.tabID,
+            runAttemptID: session.activeRunAttemptID,
+            runID: session.runID,
+            executionCWD: executionCWD,
+            hooks: hooks.map(AgentCodexHookReviewHook.init(metadata:)),
+            warnings: warnings,
+            phase: phase,
+            errorMessage: errorMessage,
+            gateGeneration: session.codexHookGateGeneration
+        )
+    }
+
+    private func codexHookDiscoveryFailureMessage(_ error: Error) -> String {
+        if let hookError = error as? CodexHookTrustError,
+           case let .discoveryFailed(cwdErrors) = hookError
+        {
+            let details = cwdErrors.prefix(3).map { raw in
+                let normalized = raw
+                    .components(separatedBy: .newlines)
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return String(normalized.prefix(300))
+            }.filter { !$0.isEmpty }
+            if !details.isEmpty {
+                return "Codex hook discovery failed: \(details.joined(separator: "; "))"
+            }
+        }
+        return (error as? LocalizedError)?.errorDescription
+            ?? "Codex hook discovery failed. Retry hook discovery."
+    }
+
+    private func codexHookExecutionCWD(for session: AgentModeViewModel.TabSession) -> String {
+        if let path = session.codexControllerWorkspacePaths?.executionDirectory,
+           !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return path
+        }
+        if let paths = try? runtimeWorkspacePathsProvider(session),
+           let path = paths.executionDirectory,
+           !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return path
+        }
+        return "<execution-cwd-unavailable>"
+    }
+
+    private func suspendForCodexHookReview(
+        session: AgentModeViewModel.TabSession,
+        binding: AgentModeViewModel.TabSession.CodexHookGateBindingIdentity
+    ) async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard !Task.isCancelled,
+                      session.codexHookGateActiveBinding == binding,
+                      session.hasPendingCodexHookReviewRequest,
+                      session.codexHookReviewContinuation == nil
+                else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                session.codexHookReviewContinuation = continuation
+            }
+        } onCancel: { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session,
+                      session.codexHookGateActiveBinding == binding
+                else { return }
+                session.resetCodexHookGateBinding()
+                self.publishCodexHookGateState(for: session)
+            }
+        }
+    }
+
+    private func gateFirstTurnForProjectHooks(
+        session: AgentModeViewModel.TabSession,
+        controller: any CodexSessionControlling
+    ) async throws {
+        let binding = codexHookGateBinding(for: session, controller: controller)
+        if session.codexHookGateBindingMemo == binding {
+            return
+        }
+        guard !session.hasPendingCodexHookReviewWait else {
+            guard session.codexHookGateActiveBinding == binding else {
+                throw AgentCodexHookReviewResolutionError.staleController
+            }
+            try await suspendForCodexHookReview(session: session, binding: binding)
+            return
+        }
+
+        session.codexHookGateGeneration &+= 1
+        session.codexHookGateActiveBinding = binding
+        session.codexHookGateAudit = nil
+        let attemptToken = UUID()
+        session.codexHookGateAttemptToken = attemptToken
+        let authority = CodexHookGateOperationAuthority(
+            attemptToken: attemptToken,
+            scope: .initialDiscovery,
+            binding: binding
+        )
+
+        do {
+            let inventory = try await controller.listHooksForCurrentWorkspace()
+            try Task.checkCancellation()
+            guard authority.isCurrent(in: session) else {
+                throw CancellationError()
+            }
+            let unresolved = inventory.unresolvedProjectHooks
+            if unresolved.isEmpty {
+                session.codexHookGateAttemptToken = nil
+                session.codexHookGateActiveBinding = nil
+                session.codexHookGateInventoryFingerprint = nil
+                session.codexHookGateBindingMemo = binding
+                return
+            }
+            session.codexHookGateAttemptToken = nil
+            session.codexHookGateInventoryFingerprint = inventory.fingerprint
+            session.pendingCodexHookReview = codexHookReviewRequest(
+                session: session,
+                executionCWD: inventory.executionCWD,
+                hooks: unresolved,
+                warnings: inventory.warnings,
+                phase: .reviewRequired
+            )
+        } catch is CancellationError {
+            if session.codexHookGateAttemptToken == attemptToken {
+                session.resetCodexHookGateBinding()
+            }
+            throw CancellationError()
+        } catch {
+            guard authority.isCurrent(in: session) else {
+                throw CancellationError()
+            }
+            session.codexHookGateAttemptToken = nil
+            session.codexHookGateInventoryFingerprint = nil
+            session.pendingCodexHookReview = codexHookReviewRequest(
+                session: session,
+                executionCWD: codexHookExecutionCWD(for: session),
+                hooks: [],
+                warnings: [],
+                phase: .discoveryFailed,
+                errorMessage: codexHookDiscoveryFailureMessage(error)
+            )
+        }
+
+        publishCodexHookGateState(for: session)
+        try await suspendForCodexHookReview(session: session, binding: binding)
+    }
+
+    func resolveCodexHookReview(
+        session: AgentModeViewModel.TabSession,
+        requestID: UUID,
+        decision: AgentCodexHookReviewDecision
+    ) async throws {
+        guard var request = session.pendingCodexHookReview else {
+            throw AgentCodexHookReviewResolutionError.noPendingReview
+        }
+        guard request.id == requestID else {
+            throw AgentCodexHookReviewResolutionError.staleRequest(currentID: request.id)
+        }
+        guard request.phase != .submitting, request.phase != .discovering else {
+            throw AgentCodexHookReviewResolutionError.busy
+        }
+        guard let controller = session.codexController,
+              let binding = session.codexHookGateActiveBinding,
+              request.gateGeneration == session.codexHookGateGeneration,
+              isCurrentCodexHookGateBinding(binding, session: session, controller: controller)
+        else {
+            throw AgentCodexHookReviewResolutionError.staleController
+        }
+
+        switch decision {
+        case .continueWithoutHooks:
+            guard request.phase.allowsApprovalDecision else {
+                throw AgentCodexHookReviewResolutionError.invalidDecision
+            }
+            guard !isCodexHookApprovalStrictModeEnabled() else {
+                throw AgentCodexHookReviewResolutionError.strictModeRequiresApproval
+            }
+            completeCodexHookReview(
+                session: session,
+                request: request,
+                binding: binding,
+                status: .continuedWithoutHooks,
+                approvedCount: 0,
+                skippedCount: request.hooks.count,
+                notice: "Continued without trusting \(request.hooks.count) Codex project hook(s). The hooks remain untrusted for this controller binding."
+            )
+
+        case .retryDiscovery:
+            guard request.phase == .discoveryFailed else {
+                throw AgentCodexHookReviewResolutionError.invalidDecision
+            }
+            request.phase = .discovering
+            request.errorMessage = nil
+            session.pendingCodexHookReview = request
+            let token = UUID()
+            session.codexHookGateAttemptToken = token
+            let authority = CodexHookGateOperationAuthority(
+                attemptToken: token,
+                scope: .review(requestID: requestID, gateGeneration: request.gateGeneration),
+                binding: binding
+            )
+            publishCodexHookGateState(for: session)
+            do {
+                let inventory = try await controller.listHooksForCurrentWorkspace()
+                try Task.checkCancellation()
+                guard authority.isCurrent(in: session) else { return }
+                applyCodexHookInventoryRefresh(
+                    inventory,
+                    session: session,
+                    priorRequest: request,
+                    binding: binding
+                )
+            } catch is CancellationError {
+                guard session.codexHookGateAttemptToken == token else { return }
+                session.resetCodexHookGateBinding()
+                publishCodexHookGateState(for: session)
+            } catch {
+                guard authority.isCurrent(in: session) else { return }
+                finishCodexHookReviewAttempt(
+                    session: session,
+                    request: request,
+                    phase: .discoveryFailed,
+                    errorMessage: codexHookDiscoveryFailureMessage(error)
+                )
+            }
+
+        case let .approveSelected(hookKeys):
+            guard !hookKeys.isEmpty,
+                  Set(hookKeys.map(CodexHookUTF8Identity.init)).count == hookKeys.count
+            else {
+                throw AgentCodexHookReviewResolutionError.invalidSelection
+            }
+            let requestedKeys = Set(hookKeys.map(CodexHookUTF8Identity.init))
+            let selected = request.hooks.filter { requestedKeys.contains(CodexHookUTF8Identity($0.key)) }
+            guard selected.count == hookKeys.count else {
+                throw AgentCodexHookReviewResolutionError.invalidSelection
+            }
+            try await submitCodexHookApproval(
+                session: session,
+                request: request,
+                candidates: selected.map(\.trustCandidate),
+                status: .approvedSelected,
+                controller: controller,
+                binding: binding
+            )
+
+        case .approveAll:
+            guard !request.hooks.isEmpty else {
+                throw AgentCodexHookReviewResolutionError.invalidSelection
+            }
+            try await submitCodexHookApproval(
+                session: session,
+                request: request,
+                candidates: request.trustCandidates,
+                status: .approvedAll,
+                controller: controller,
+                binding: binding
+            )
+        }
+    }
+
+    private func submitCodexHookApproval(
+        session: AgentModeViewModel.TabSession,
+        request: AgentCodexHookReviewRequest,
+        candidates: [CodexHookTrustCandidate],
+        status: AgentCodexHookGateAudit.Status,
+        controller: any CodexSessionControlling,
+        binding: AgentModeViewModel.TabSession.CodexHookGateBindingIdentity
+    ) async throws {
+        guard request.phase.allowsApprovalDecision else {
+            throw AgentCodexHookReviewResolutionError.invalidDecision
+        }
+        guard let fingerprint = session.codexHookGateInventoryFingerprint else {
+            throw AgentCodexHookReviewResolutionError.invalidDecision
+        }
+        var submittingRequest = request
+        submittingRequest.phase = .submitting
+        submittingRequest.errorMessage = nil
+        session.pendingCodexHookReview = submittingRequest
+        let token = UUID()
+        session.codexHookGateAttemptToken = token
+        let authority = CodexHookGateOperationAuthority(
+            attemptToken: token,
+            scope: .review(requestID: request.id, gateGeneration: request.gateGeneration),
+            binding: binding
+        )
+        publishCodexHookGateState(for: session)
+
+        do {
+            let verified = try await controller.trustHooksForCurrentWorkspace(
+                expectedCandidates: candidates,
+                expectedInventoryFingerprint: fingerprint
+            )
+            try Task.checkCancellation()
+            guard authority.isCurrent(in: session) else { return }
+            guard verified.verifies(candidates) else {
+                finishCodexHookReviewAttempt(
+                    session: session,
+                    request: request,
+                    phase: .verificationFailed,
+                    errorMessage: CodexHookTrustError.postWriteVerificationFailed(latest: verified).localizedDescription
+                )
+                return
+            }
+            completeCodexHookReview(
+                session: session,
+                request: request,
+                binding: binding,
+                status: status,
+                approvedCount: candidates.count,
+                skippedCount: max(0, request.hooks.count - candidates.count),
+                notice: "Trusted \(candidates.count) Codex project hook(s); \(max(0, request.hooks.count - candidates.count)) remain untrusted for this controller binding."
+            )
+        } catch is CancellationError {
+            guard session.codexHookGateAttemptToken == token else { return }
+            session.resetCodexHookGateBinding()
+            publishCodexHookGateState(for: session)
+        } catch let error as CodexHookTrustError {
+            guard authority.isCurrent(in: session) else { return }
+            switch error {
+            case let .inventoryChanged(replacement):
+                session.codexHookGateAttemptToken = nil
+                applyCodexHookInventoryRefresh(
+                    replacement,
+                    session: session,
+                    priorRequest: request,
+                    binding: binding
+                )
+            case .postWriteVerificationFailed:
+                finishCodexHookReviewAttempt(
+                    session: session,
+                    request: request,
+                    phase: .verificationFailed,
+                    errorMessage: error.localizedDescription
+                )
+            default:
+                finishCodexHookReviewAttempt(
+                    session: session,
+                    request: request,
+                    phase: .writeFailed,
+                    errorMessage: error.localizedDescription
+                )
+            }
+        } catch {
+            guard authority.isCurrent(in: session) else { return }
+            finishCodexHookReviewAttempt(
+                session: session,
+                request: request,
+                phase: .writeFailed,
+                errorMessage: error.localizedDescription
+            )
+        }
+    }
+
+    private func applyCodexHookInventoryRefresh(
+        _ inventory: CodexHookInventory,
+        session: AgentModeViewModel.TabSession,
+        priorRequest: AgentCodexHookReviewRequest,
+        binding: AgentModeViewModel.TabSession.CodexHookGateBindingIdentity
+    ) {
+        let unresolved = inventory.unresolvedProjectHooks
+        if unresolved.isEmpty {
+            completeCodexHookReview(
+                session: session,
+                request: priorRequest,
+                binding: binding,
+                status: .resolvedExternally,
+                approvedCount: 0,
+                skippedCount: 0,
+                notice: "Codex project hooks were resolved externally after the review was shown."
+            )
+            return
+        }
+        session.codexHookGateAttemptToken = nil
+        session.codexHookGateInventoryFingerprint = inventory.fingerprint
+        session.pendingCodexHookReview = codexHookReviewRequest(
+            session: session,
+            executionCWD: inventory.executionCWD,
+            hooks: unresolved,
+            warnings: inventory.warnings,
+            phase: .reviewRequired
+        )
+        publishCodexHookGateState(for: session)
+    }
+
+    private func completeCodexHookReview(
+        session: AgentModeViewModel.TabSession,
+        request: AgentCodexHookReviewRequest,
+        binding: AgentModeViewModel.TabSession.CodexHookGateBindingIdentity,
+        status: AgentCodexHookGateAudit.Status,
+        approvedCount: Int,
+        skippedCount: Int,
+        notice: String
+    ) {
+        guard session.pendingCodexHookReview?.id == request.id,
+              session.codexHookGateActiveBinding == binding
+        else { return }
+        let continuation = session.codexHookReviewContinuation
+        session.codexHookReviewContinuation = nil
+        session.pendingCodexHookReview = nil
+        session.codexHookGateAttemptToken = nil
+        session.codexHookGateInventoryFingerprint = nil
+        session.codexHookGateActiveBinding = nil
+        session.codexHookGateBindingMemo = binding
+        session.codexHookGateAudit = AgentCodexHookGateAudit(
+            status: status,
+            approvedCount: approvedCount,
+            skippedCount: skippedCount,
+            resolvedAt: Date(),
+            interactionID: request.id
+        )
+        session.appendItem(AgentChatItem.system(
+            notice,
+            sequenceIndex: session.nextSequenceIndex
+        ))
+        viewModel?.scheduleSave(for: session.tabID)
+        publishCodexHookGateState(for: session)
+        continuation?.resume()
     }
 
     private static func isCodexWaitingOnUserInputFlag(_ flag: String) -> Bool {
@@ -638,6 +1166,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if activeFlags.contains(where: Self.isCodexWaitingOnApprovalFlag),
            session.pendingApproval == nil,
+           !session.hasPendingCodexHookReviewWait,
            session.pendingPermissionsRequest == nil,
            session.pendingMCPElicitationRequest == nil,
            session.queuedMCPElicitationRequests.isEmpty,
@@ -2509,6 +3038,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         expectedQueueID: UUID,
         beginsSuccessorAttempt: Bool
     ) async -> Bool {
+        guard let queuedHead = session.codexFallbackQueue.first,
+              queuedHead.id == expectedQueueID,
+              let controller = session.codexController,
+              ObjectIdentifier(controller) == queuedHead.originControllerInstanceID
+        else {
+            return false
+        }
+        do {
+            try await gateFirstTurnForProjectHooks(session: session, controller: controller)
+        } catch {
+            return false
+        }
         guard let head = claimCodexFallbackHead(
             session: session,
             expectedQueueID: expectedQueueID,
@@ -2535,6 +3076,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         do {
+            updateCodexStallWatchdogState(for: session)
             _ = try await controller.startUserTurn(
                 text: head.providerText,
                 images: head.images,
@@ -2749,12 +3291,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         status: CodexNativeSessionController.TurnStatus,
         completedIdentity: AgentModeViewModel.TabSession.CodexAuthoritativeTurnIdentity?,
         session: AgentModeViewModel.TabSession
-    ) -> AgentRunTerminalCommitBarrier.ProviderSuccessor? {
+    ) async -> AgentRunTerminalCommitBarrier.ProviderSuccessor? {
         guard status == .completed,
               let turnID,
               let completedIdentity,
               completedIdentity.turnID == turnID,
-              var head = session.codexFallbackQueue.first,
+              let queuedHead = session.codexFallbackQueue.first,
+              queuedHead.state == .queued,
+              queuedHead.blockingTurn == codexFallbackBlockingTurn(for: completedIdentity),
+              let controller = session.codexController,
+              ObjectIdentifier(controller) == queuedHead.originControllerInstanceID
+        else { return nil }
+        do {
+            try await gateFirstTurnForProjectHooks(session: session, controller: controller)
+        } catch {
+            return nil
+        }
+        guard var head = session.codexFallbackQueue.first,
+              head.id == queuedHead.id,
               head.state == .queued,
               head.blockingTurn == codexFallbackBlockingTurn(for: completedIdentity)
         else { return nil }
@@ -4308,6 +4862,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard replayTurn.expectedTurnID == nil else {
                 return false
             }
+            try await gateFirstTurnForProjectHooks(session: session, controller: controller)
             _ = try await controller.startUserTurn(
                 text: replayTurn.text,
                 images: replayTurn.images,
@@ -5499,6 +6054,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             setRunningStatus("Sending message…", source: .transport, session: session, urgent: true)
             switch dispatchPlan {
             case .start:
+                try await gateFirstTurnForProjectHooks(session: session, controller: controller)
                 beginTrackedCodexUserTurn(session)
                 updateCodexStallWatchdogState(for: session)
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
@@ -5664,13 +6220,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         } catch {
             session.codexPendingTurnKind = nil
-            guard session.runID == sendRunID,
-                  let activeController = session.codexController,
-                  Self.sameCodexControllerInstance(activeController, controller)
-            else {
-                logCodex("[AgentModeVM] sendCodexNativeMessage: ignoring late send error for stale controller - \(error.localizedDescription)")
-                return .stale(reason: "Codex ignored a late send failure because the active run/controller changed.")
-            }
             if error is CancellationError {
                 clearCodexPendingAuthRetryTurn(session)
                 if terminalizeRejectedSend {
@@ -5690,6 +6239,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 }
                 return .cancelled
+            }
+            guard session.runID == sendRunID,
+                  let activeController = session.codexController,
+                  Self.sameCodexControllerInstance(activeController, controller)
+            else {
+                logCodex("[AgentModeVM] sendCodexNativeMessage: ignoring late send error for stale controller - \(error.localizedDescription)")
+                return .stale(reason: "Codex ignored a late send failure because the active run/controller changed.")
             }
             logCodex("[AgentModeVM] sendCodexNativeMessage: error - \(error)")
             if await attemptManagedCodexAuthRecovery(
@@ -7113,7 +7669,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             let turnKind = completion.turnKind
             let completedIdentity = completion.authoritativeIdentity
-            let providerSuccessor = codexFallbackSuccessorForCompletion(
+            let providerSuccessor = await codexFallbackSuccessorForCompletion(
                 turnID: turnID,
                 status: status,
                 completedIdentity: completedIdentity,

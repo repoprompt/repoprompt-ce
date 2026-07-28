@@ -2697,6 +2697,60 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         )
     }
 
+    func testPendingCodexHookReviewSuppressesStallWatchdog() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 0.02,
+            watchdogRecoveryThreshold: 0.06
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.pendingCodexHookReview = makeHookReviewRequest(for: session)
+        session.runState = .waitingForApproval
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("blocked"),
+            session: session,
+            sourceController: controller
+        )
+        try await Task.sleep(nanoseconds: 120_000_000)
+
+        XCTAssertEqual(controller.readSnapshotCountSync(), 0)
+        XCTAssertNotNil(session.pendingCodexHookReview)
+    }
+
+    func testTurnStartedDoesNotClearBindingScopedCodexHookReview() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let request = makeHookReviewRequest(for: session)
+        session.pendingCodexHookReview = request
+        session.runState = .waitingForApproval
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "replacement-turn"),
+            session: session,
+            sourceController: controller
+        )
+
+        XCTAssertEqual(session.pendingCodexHookReview?.id, request.id)
+    }
+
+    private func makeHookReviewRequest(
+        for session: AgentModeViewModel.TabSession
+    ) -> AgentCodexHookReviewRequest {
+        AgentCodexHookReviewRequest(
+            tabID: session.tabID,
+            runAttemptID: session.activeRunAttemptID,
+            runID: session.runID,
+            executionCWD: "/tmp",
+            hooks: [],
+            phase: .discoveryFailed,
+            errorMessage: "Discovery failed",
+            gateGeneration: session.codexHookGateGeneration
+        )
+    }
+
     private func makeViewModel(
         controller: LivenessFakeCodexController,
         drain: AgentModeViewModel.CodexAgentRunWaitDrain? = nil,
@@ -2897,7 +2951,7 @@ private final class LivenessSnapshotReadGate: @unchecked Sendable {
     }
 }
 
-private final class LivenessFakeCodexController: CodexSessionControlling {
+private final class LivenessFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     private var readSnapshotCount = 0
     private var readSnapshotIncludeTurnsValues: [Bool] = []
     private var startOrResumeCount = 0
@@ -3129,6 +3183,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     }
 
     func compactThread() async throws {}
+
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil
     }

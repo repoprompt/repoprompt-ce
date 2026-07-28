@@ -60,6 +60,56 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
     }
 
+    func testCodexHookApprovalStrictModeIsHumanOnlyAndPersistsWorkspaceOverride() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        let workspaceID = UUID()
+
+        XCTAssertFalse(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+        store.setGlobalCodexHookApprovalStrictModeEnabled(true)
+        XCTAssertTrue(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+        store.setCodexHookApprovalStrictModeOverride(false, for: workspaceID)
+        XCTAssertFalse(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+
+        let reloaded = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertTrue(reloaded.globalCodexHookApprovalStrictModeEnabled())
+        XCTAssertEqual(reloaded.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID), false)
+        XCTAssertFalse(reloaded.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+
+        let service = AppSettingsMCPService(store: reloaded)
+        for key in [
+            "agent_mode.codex_hook_approval_strict_mode_enabled",
+            "agent_mode.codex_hook_approval_strict_mode_workspace_overrides"
+        ] {
+            do {
+                _ = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string(key),
+                    "value": .bool(true)
+                ])
+                XCTFail("Expected human-only setting rejection for \(key)")
+            } catch {
+                let diagnostic = String(describing: error)
+                XCTAssertTrue(diagnostic.contains("security-sensitive"), diagnostic)
+                XCTAssertTrue(diagnostic.contains("human"), diagnostic)
+            }
+        }
+    }
+
     func testHandoffInstructionsRemainOutsideAppSettingsCatalog() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)

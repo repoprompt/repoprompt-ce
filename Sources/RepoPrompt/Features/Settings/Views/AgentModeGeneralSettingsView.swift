@@ -24,6 +24,7 @@ import SwiftUI
 struct AgentModeGeneralSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
+    var workspaceID: UUID?
     var onNavigate: ((SettingsTab) -> Void)?
 
     /// Observe secure permission-store changes so the read-only summary rebuilds
@@ -125,6 +126,8 @@ struct AgentModeGeneralSettingsView: View {
 
             providerCleanupActionCard
 
+            codexHookApprovalStrictModeCard
+
             handoffInstructionsCard
 
             agentPermissionsCard
@@ -173,6 +176,59 @@ struct AgentModeGeneralSettingsView: View {
         Binding(
             get: { globalSettings.providerConversationCleanupAction() },
             set: { globalSettings.setProviderConversationCleanupAction($0) }
+        )
+    }
+
+    // MARK: - Codex hook approval
+
+    private var codexHookApprovalStrictModeCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "checkmark.shield")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Toggle("Require Codex project-hook approval", isOn: codexHookApprovalStrictModeBinding)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+                if workspaceID != nil {
+                    Toggle("Override for this workspace", isOn: codexHookApprovalUsesWorkspaceOverrideBinding)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                }
+                Text("When enabled, Continue Without Hooks is unavailable. Codex first turns remain blocked until the displayed project hooks are approved or become trusted externally.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var codexHookApprovalStrictModeBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID) },
+            set: { enabled in
+                globalSettings.setCodexHookApprovalStrictModeEnabled(
+                    enabled,
+                    workspaceID: workspaceID
+                )
+            }
+        )
+    }
+
+    private var codexHookApprovalUsesWorkspaceOverrideBinding: Binding<Bool> {
+        Binding(
+            get: {
+                guard let workspaceID else { return false }
+                return globalSettings.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID) != nil
+            },
+            set: { useOverride in
+                guard let workspaceID else { return }
+                let override = useOverride
+                    ? globalSettings.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID)
+                    : nil
+                globalSettings.setCodexHookApprovalStrictModeOverride(override, for: workspaceID)
+            }
         )
     }
 

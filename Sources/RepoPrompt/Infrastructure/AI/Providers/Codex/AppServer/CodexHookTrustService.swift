@@ -70,7 +70,7 @@ struct CodexHookTrustService {
         for candidates: [CodexHookTrustCandidate],
         in inventory: CodexHookInventory
     ) throws -> [String: Any] {
-        guard inventory.validatedUnresolvedProjectHooks(for: candidates) != nil else {
+        guard inventory.validatesUnresolvedProjectHooks(for: candidates) else {
             throw CodexHookTrustError.inventoryChanged(replacement: inventory)
         }
 

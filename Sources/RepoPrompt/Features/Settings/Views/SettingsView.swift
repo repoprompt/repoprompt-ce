@@ -391,6 +391,7 @@ struct SettingsView: View {
             AgentModeGeneralSettingsView(
                 promptVM: promptViewModel,
                 apiSettingsVM: apiSettingsViewModel,
+                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))

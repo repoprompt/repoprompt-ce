@@ -191,23 +191,21 @@ struct CodexHookInventory: Hashable {
         projectHooks.filter { !$0.trustStatus.isResolved }
     }
 
-    func validatedUnresolvedProjectHooks(
+    func validatesUnresolvedProjectHooks(
         for candidates: [CodexHookTrustCandidate]
-    ) -> [CodexHookMetadata]? {
-        guard !candidates.isEmpty else { return nil }
+    ) -> Bool {
+        guard !candidates.isEmpty else { return false }
         var selectedKeys = Set<CodexHookUTF8Identity>()
-        var selectedHooks: [CodexHookMetadata] = []
         for candidate in candidates {
             guard candidate.isValid,
                   selectedKeys.insert(candidate.keyIdentity).inserted,
                   let hook = unresolvedProjectHooks.first(where: { $0.keyIdentity == candidate.keyIdentity }),
                   hook.hashIdentity == candidate.hashIdentity
             else {
-                return nil
+                return false
             }
-            selectedHooks.append(hook)
         }
-        return selectedHooks
+        return true
     }
 
     func verifies(_ candidates: [CodexHookTrustCandidate]) -> Bool {
