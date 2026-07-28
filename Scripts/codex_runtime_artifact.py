@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import stat
@@ -68,6 +69,21 @@ TARGET_PAGE_SIZES = {
     CPU_TYPE_ARM64: 0x4000,
 }
 STABLE_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+MANIFEST_SCHEMA_VERSION = 2
+# Closed-world entitlement policy: these are the only entitlement keys any bundled
+# Codex Mach-O may ever carry. Growing this set is an intentionally reviewable
+# privilege change; verification rejects every key outside this allowlist.
+APPROVED_ENTITLEMENT_KEYS = frozenset(
+    {
+        "com.apple.security.cs.allow-jit",
+        "com.apple.security.cs.allow-unsigned-executable-memory",
+    }
+)
+V8_JIT_ENTITLEMENT_PROFILE = {key: True for key in sorted(APPROVED_ENTITLEMENT_KEYS)}
+SIGNING_PLAN_PROFILE_LABELS = {
+    "v8-jit": V8_JIT_ENTITLEMENT_PROFILE,
+    "none": {},
+}
 
 
 class ContractError(RuntimeError):
@@ -98,7 +114,7 @@ def load_manifest(
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ContractError(f"could not read pinned manifest {path}: {exc}") from exc
-    if manifest.get("schemaVersion") != 1:
+    if manifest.get("schemaVersion") != MANIFEST_SCHEMA_VERSION:
         raise ContractError("unsupported Codex manifest schema")
     if manifest.get("version") != effective_version or manifest.get("tag") != effective_tag:
         raise ContractError(f"pinned manifest must describe Codex {effective_version} / {effective_tag}")
@@ -163,6 +179,17 @@ def load_manifest(
                 raise ContractError(
                     f"{target}: non-Mach-O manifest entry has a normalized digest: {entry['path']}"
                 )
+    release_entitlements = manifest.get("releaseSigningEntitlements")
+    if not isinstance(release_entitlements, dict):
+        raise ContractError("pinned manifest must contain the release-signing entitlement profile")
+    if set(release_entitlements) != set(mach_o_files):
+        raise ContractError(
+            "release-signing entitlement profile must cover exactly the Mach-O inventory"
+            f"\nmissing={sorted(set(mach_o_files) - set(release_entitlements))}"
+            f"\nextra={sorted(set(release_entitlements) - set(mach_o_files))}"
+        )
+    for relative, profile in release_entitlements.items():
+        validate_entitlement_profile(profile, f"release-signing entitlements for {relative}")
     signed = manifest.get("signedExecutables")
     if not isinstance(signed, list) or {item.get("path") for item in signed if isinstance(item, dict)} != {
         "bin/codex",
@@ -179,7 +206,29 @@ def load_manifest(
             raise ContractError(f"{policy['path']}: hardened runtime must be required")
         if policy.get("requiresTimestamp") is not True:
             raise ContractError(f"{policy['path']}: a trusted signing timestamp must be required")
+        validate_entitlement_profile(
+            policy.get("entitlements"),
+            f"vendor signature policy entitlements for {policy['path']}",
+        )
     return manifest
+
+
+def validate_entitlement_profile(raw: object, context: str) -> dict[str, bool]:
+    if not isinstance(raw, dict):
+        raise ContractError(f"{context}: entitlement profile must be an object")
+    for key, value in raw.items():
+        if key not in APPROVED_ENTITLEMENT_KEYS:
+            raise ContractError(f"{context}: unapproved entitlement key {key!r}")
+        if value is not True:
+            raise ContractError(f"{context}: entitlement {key!r} must be exactly true")
+    return dict(raw)
+
+
+def signing_plan_profile_label(profile: dict[str, bool], context: str) -> str:
+    for label, expected in SIGNING_PLAN_PROFILE_LABELS.items():
+        if profile == expected:
+            return label
+    raise ContractError(f"{context}: unsupported release-signing entitlement profile {profile!r}")
 
 
 def validate_digest(raw: object, context: str) -> str:
@@ -365,6 +414,51 @@ def normalized_mach_o_sha256(path: Path, codesign: str) -> str:
         return digest.hexdigest()
 
 
+def signed_entitlements_dictionary(binary: Path, codesign: str, context: str) -> dict[str, Any]:
+    argv = [codesign, "-d", "--entitlements", ":-", str(binary)]
+    try:
+        result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise ContractError(f"could not run entitlement inspection for {context}: {exc}") from exc
+    if result.returncode != 0:
+        diagnostics = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ContractError(
+            f"entitlement inspection failed for {context} ({' '.join(argv)}):\n{diagnostics}"
+        )
+    payload = result.stdout.strip()
+    if not payload:
+        return {}
+    try:
+        value = plistlib.loads(payload)
+    except Exception as exc:
+        raise ContractError(f"{context}: malformed signed entitlements: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContractError(f"{context}: signed entitlements must decode to a dictionary")
+    return value
+
+
+def verify_signed_entitlements(
+    binary: Path,
+    expected: dict[str, Any],
+    codesign: str,
+    context: str,
+) -> None:
+    actual = signed_entitlements_dictionary(binary, codesign, context)
+    if actual == expected:
+        return
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    changed = sorted(
+        key for key in set(actual) & set(expected) if actual[key] != expected[key]
+    )
+    raise ContractError(
+        f"{context}: signed entitlements do not match the pinned entitlement profile"
+        f"\nmissing={missing}\nunexpected={unexpected}\nchanged={changed}"
+        f"\nexpected={json.dumps(expected, sort_keys=True)}"
+        f"\nactual={json.dumps(actual, sort_keys=True, default=repr)}"
+    )
+
+
 def parse_codesign_metadata(details: str) -> dict[str, list[str]]:
     fields: dict[str, list[str]] = {}
     for raw_line in details.splitlines():
@@ -492,6 +586,7 @@ def verify_package(
                 "path": relative,
                 "teamIdentifier": signed_team_identifier,
                 "authorityPrefix": "Developer ID Application:",
+                "entitlements": manifest["releaseSigningEntitlements"][relative],
             }
             for relative in manifest["machOFiles"]
         ]
@@ -533,6 +628,12 @@ def verify_package(
         timestamps = fields.get("Timestamp", [])
         if len(timestamps) != 1 or not timestamps[0].strip() or timestamps[0].strip().casefold() == "none":
             raise ContractError(f"{target}: {policy['path']} is missing a trusted signing timestamp")
+        verify_signed_entitlements(
+            binary,
+            policy["entitlements"],
+            codesign,
+            f"{target}: {policy['path']}",
+        )
 
 
 def safe_extract(archive: Path, destination: Path, expected_paths: set[str]) -> None:
@@ -799,6 +900,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="list target-relative paths for every pinned Mach-O in bundle signing order",
     )
     list_mach_o_parser.add_argument("--arch", default="all")
+    signing_plan_parser = subparsers.add_parser(
+        "list-bundle-signing-plan",
+        help="list every pinned Mach-O in bundle signing order with its release entitlement profile",
+    )
+    signing_plan_parser.add_argument("--arch", default="all")
     status_parser = subparsers.add_parser("status", help="verify both cached packages without network access")
     status_parser.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT))
     refresh_parser = subparsers.add_parser(
@@ -841,6 +947,14 @@ def main() -> int:
             for target in selected_targets(args.arch):
                 for relative in manifest["machOFiles"]:
                     print(f"{target}/{relative}")
+        elif args.command == "list-bundle-signing-plan":
+            for target in selected_targets(args.arch):
+                for relative in manifest["machOFiles"]:
+                    label = signing_plan_profile_label(
+                        manifest["releaseSigningEntitlements"][relative],
+                        f"{target}/{relative}",
+                    )
+                    print(f"{target}/{relative}\t{label}")
         elif args.command == "status":
             status(args, manifest)
         elif args.command == "refresh-normalized-digests":

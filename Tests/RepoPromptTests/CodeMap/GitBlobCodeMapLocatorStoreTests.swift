@@ -705,6 +705,177 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         XCTAssertLessThanOrEqual(byteResult.remainingByteCount, bytePolicy.maximumByteCount)
     }
 
+    func testIdempotentWritesSkipMaintenanceAndInsertedWritesReconcileAtConfiguredInterval() async throws {
+        let root = try makeSecureRoot()
+        let commonDirectory = try makeDirectory(prefix: "GitBlobLocatorAmortizedCommon")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: commonDirectory)
+        }
+        let policy = GitBlobCodeMapLocatorStorePolicy(
+            maximumRecordCount: 100,
+            maximumByteCount: UInt64(GitBlobCodeMapLocatorRecordCodec.maximumRecordByteCount * 100),
+            maintenanceEntryLimit: 128,
+            maintenanceReconciliationInterval: 3
+        )
+        let store = try GitBlobCodeMapLocatorStore(rootURL: root, policy: policy)
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let namespace = try makeNamespace(commonDirectory: commonDirectory)
+        let pipeline = try pipelineIdentity(.swift)
+        var associations: [VerifiedGitBlobCodeMapLocatorAssociation] = []
+        for index in 0 ..< 4 {
+            try await associations.append(makeVerifiedAssociation(
+                text: "amortized-\(index)",
+                namespace: namespace,
+                format: .sha1,
+                pipeline: pipeline,
+                artifactStore: artifactStore
+            ))
+        }
+
+        let firstWrite = try await store.write(association: associations[0])
+        XCTAssertEqual(firstWrite, .inserted)
+        let seeded = await store.debugMaintenanceAccounting()
+        XCTAssertEqual(seeded.sweepCount, 1)
+        XCTAssertEqual(seeded.successfulInsertsSinceSweep, 0)
+
+        let repeatedWrite = try await store.write(association: associations[0])
+        let afterRepeatedWrite = await store.debugMaintenanceAccounting()
+        XCTAssertEqual(repeatedWrite, .alreadyPresent)
+        XCTAssertEqual(afterRepeatedWrite.sweepCount, seeded.sweepCount)
+
+        let secondWrite = try await store.write(association: associations[1])
+        let thirdWrite = try await store.write(association: associations[2])
+        XCTAssertEqual(secondWrite, .inserted)
+        XCTAssertEqual(thirdWrite, .inserted)
+        let beforeInterval = await store.debugMaintenanceAccounting()
+        XCTAssertEqual(beforeInterval.sweepCount, 1)
+        XCTAssertEqual(beforeInterval.successfulInsertsSinceSweep, 2)
+
+        let fourthWrite = try await store.write(association: associations[3])
+        XCTAssertEqual(fourthWrite, .inserted)
+        let reconciled = await store.debugMaintenanceAccounting()
+        XCTAssertEqual(reconciled.sweepCount, 2)
+        XCTAssertEqual(reconciled.successfulInsertsSinceSweep, 0)
+        XCTAssertEqual(reconciled.lastResult?.remainingRecordCount, 4)
+        XCTAssertGreaterThan(reconciled.examinedRecordCount, seeded.examinedRecordCount)
+    }
+
+    func testAutomaticMaintenanceSeedsCrashCleanupAndEvictsToLowWaterProtectingNewRecord() async throws {
+        let root = try makeSecureRoot()
+        let commonDirectory = try makeDirectory(prefix: "GitBlobLocatorLowWaterCommon")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: commonDirectory)
+        }
+        let policy = GitBlobCodeMapLocatorStorePolicy(
+            maximumRecordCount: 10,
+            maximumByteCount: UInt64(GitBlobCodeMapLocatorRecordCodec.maximumRecordByteCount * 20),
+            maintenanceEntryLimit: 32,
+            maintenanceReconciliationInterval: 256,
+            maintenanceLowWaterPercentage: 90
+        )
+        let store = try GitBlobCodeMapLocatorStore(rootURL: root, policy: policy)
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let namespace = try makeNamespace(commonDirectory: commonDirectory)
+        let pipeline = try pipelineIdentity(.swift)
+        var associations: [VerifiedGitBlobCodeMapLocatorAssociation] = []
+        for index in 0 ..< 11 {
+            try await associations.append(makeVerifiedAssociation(
+                text: "low-water-\(index)",
+                namespace: namespace,
+                format: .sha1,
+                pipeline: pipeline,
+                artifactStore: artifactStore
+            ))
+        }
+
+        let firstRecordURL = store.recordURL(for: associations[0].identity)
+        let shardURL = firstRecordURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: shardURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let crashResidue = shardURL.appendingPathComponent(".tmp.999999.crash")
+        try Data("residue".utf8).write(to: crashResidue)
+        XCTAssertEqual(chmod(crashResidue.path, 0o600), 0)
+
+        let firstWrite = try await store.write(association: associations[0])
+        XCTAssertEqual(firstWrite, .inserted)
+        let seeded = await store.debugMaintenanceAccounting()
+        XCTAssertEqual(seeded.sweepCount, 1)
+        XCTAssertEqual(seeded.lastResult?.removedTemporaryCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: crashResidue.path))
+
+        for association in associations.dropFirst() {
+            let result = try await store.write(association: association)
+            XCTAssertEqual(result, .inserted)
+        }
+        let lowWater = await store.debugMaintenanceAccounting()
+        XCTAssertEqual(lowWater.sweepCount, 2)
+        XCTAssertEqual(lowWater.lastResult?.remainingRecordCount, 9)
+        XCTAssertEqual(lowWater.lastResult?.evictedCount, 2)
+        let protectedRead = try await store.read(identity: associations[10].identity)
+        XCTAssertEqual(protectedRead, .hit(associations[10].artifactKey))
+    }
+
+    func testCrossInstanceDebtIsIntervalBoundedAndExplicitMaintenanceRestoresExactQuota() async throws {
+        let root = try makeSecureRoot()
+        let commonDirectory = try makeDirectory(prefix: "GitBlobLocatorDebtCommon")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: commonDirectory)
+        }
+        let interval = 3
+        let policy = GitBlobCodeMapLocatorStorePolicy(
+            maximumRecordCount: 4,
+            maximumByteCount: UInt64(GitBlobCodeMapLocatorRecordCodec.maximumRecordByteCount * 16),
+            maintenanceEntryLimit: 32,
+            maintenanceReconciliationInterval: interval
+        )
+        let first = try GitBlobCodeMapLocatorStore(rootURL: root, policy: policy)
+        let second = try GitBlobCodeMapLocatorStore(rootURL: root, policy: policy)
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let namespace = try makeNamespace(commonDirectory: commonDirectory)
+        let pipeline = try pipelineIdentity(.swift)
+        var associations: [VerifiedGitBlobCodeMapLocatorAssociation] = []
+        for index in 0 ..< 6 {
+            try await associations.append(makeVerifiedAssociation(
+                text: "cross-instance-debt-\(index)",
+                namespace: namespace,
+                format: .sha1,
+                pipeline: pipeline,
+                artifactStore: artifactStore
+            ))
+        }
+
+        let firstSeed = try await first.write(association: associations[0])
+        let secondSeed = try await second.write(association: associations[1])
+        XCTAssertEqual(firstSeed, .inserted)
+        XCTAssertEqual(secondSeed, .inserted)
+        for association in associations[2 ... 3] {
+            let result = try await first.write(association: association)
+            XCTAssertEqual(result, .inserted)
+        }
+        for association in associations[4 ... 5] {
+            let result = try await second.write(association: association)
+            XCTAssertEqual(result, .inserted)
+        }
+
+        let recordCountBeforeMaintenance = associations.count {
+            FileManager.default.fileExists(atPath: first.recordURL(for: $0.identity).path)
+        }
+        let documentedDebtCeiling = policy.maximumRecordCount + 2 * (interval - 1)
+        XCTAssertGreaterThan(recordCountBeforeMaintenance, policy.maximumRecordCount)
+        XCTAssertLessThanOrEqual(recordCountBeforeMaintenance, documentedDebtCeiling)
+
+        let exact = try await first.maintain()
+        XCTAssertEqual(exact.remainingRecordCount, policy.maximumRecordCount)
+        XCTAssertLessThanOrEqual(exact.remainingByteCount, policy.maximumByteCount)
+        XCTAssertFalse(exact.hasMore)
+    }
+
     func testReadMapsTruncateAndAtomicReplaceRacesToCorruptOrMiss() async throws {
         let root = try makeSecureRoot()
         let commonDirectory = try makeDirectory(prefix: "GitBlobLocatorReadRaceCommon")

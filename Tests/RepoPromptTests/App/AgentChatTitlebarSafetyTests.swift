@@ -164,6 +164,81 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         )
     }
 
+    func testHandoffPromptExplicitEmptyMatchesLegacyPromptByteForByte() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Captured"
+        )
+
+        for cliCommandName in ["rpce-cli-debug", "rpce-cli"] {
+            XCTAssertEqual(
+                AgentSessionHandoffPrompt.render(target: target, cliCommandName: cliCommandName, instructions: ""),
+                AgentSessionHandoffPrompt.render(target: target, cliCommandName: cliCommandName)
+            )
+        }
+    }
+
+    func testHandoffPromptAppendsInstructionsVerbatim() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Captured"
+        )
+        let instructions = "  Lead with this\n\nKeep the blank line\t"
+        let legacyPrompt = AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli-debug")
+
+        XCTAssertEqual(
+            AgentSessionHandoffPrompt.render(
+                target: target,
+                cliCommandName: "rpce-cli-debug",
+                instructions: instructions
+            ),
+            legacyPrompt + "\n\nAdditional instructions:\n" + instructions
+        )
+    }
+
+    func testHandoffPromptTreatsWhitespaceOnlyInstructionsAsNonEmpty() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Captured"
+        )
+        let instructions = " \n\t"
+        let legacyPrompt = AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli")
+
+        XCTAssertEqual(
+            AgentSessionHandoffPrompt.render(
+                target: target,
+                cliCommandName: "rpce-cli",
+                instructions: instructions
+            ),
+            legacyPrompt + "\n\nAdditional instructions:\n" + instructions
+        )
+    }
+
+    func testHandoffInstructionsPolicyAcceptsTwentyThousandAndRejectsTwentyThousandOne() {
+        let maximum = AgentSessionHandoffInstructionsPolicy.maximumCharacterCount
+        let composedGrapheme = "👨‍👩‍👧‍👦"
+
+        XCTAssertEqual(AgentSessionHandoffInstructionsPolicy.characterCount(of: composedGrapheme), 1)
+        XCTAssertEqual(AgentSessionHandoffInstructionsPolicy.validation(of: ""), .valid(count: 0))
+        XCTAssertEqual(
+            AgentSessionHandoffInstructionsPolicy.validation(of: String(repeating: "a", count: maximum)),
+            .valid(count: maximum)
+        )
+        XCTAssertEqual(
+            AgentSessionHandoffInstructionsPolicy.validation(of: String(repeating: "a", count: maximum + 1)),
+            .tooLong(count: maximum + 1, maximum: maximum)
+        )
+    }
+
     func testSnapshotAndTargetValidationFailClosedAcrossLifecycleChanges() async throws {
         try await withFixture { fixture in
             let snapshot = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot())
@@ -239,34 +314,90 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
-    func testCopyHandoffPromptWritesValidTargetAndRejectsStaleTarget() async throws {
+    func testQuickHandoffUsesCurrentStoredDefault() async throws {
         try await withFixture { fixture in
             let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+            var storedDefault = "Earlier default"
+            var providerReadCount = 0
             var clipboard = "sentinel"
             var writeCount = 0
-            let actions = fixture.window.agentChatTitleClusterMenuActions { value in
-                clipboard = value
-                writeCount += 1
-            }
+            let actions = fixture.window.agentChatTitleClusterMenuActions(
+                handoffInstructionsProvider: {
+                    providerReadCount += 1
+                    return storedDefault
+                },
+                copyToClipboard: { value in
+                    clipboard = value
+                    writeCount += 1
+                }
+            )
 
+            storedDefault = "Current default"
             actions.copyHandoffPrompt(target)
 
+            XCTAssertEqual(providerReadCount, 1)
             XCTAssertEqual(writeCount, 1)
             XCTAssertEqual(
                 clipboard,
                 AgentSessionHandoffPrompt.render(
                     target: target,
-                    cliCommandName: MCPFilesystemConstants.identity.pathCLICommandName
+                    cliCommandName: MCPFilesystemConstants.identity.pathCLICommandName,
+                    instructions: "Current default"
                 )
             )
+        }
+    }
 
-            clipboard = "sentinel"
+    func testQuickHandoffRejectsStaleTargetWithoutClipboardWrite() async throws {
+        try await withFixture { fixture in
+            let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+            var providerReadCount = 0
+            var clipboard = "sentinel"
+            var writeCount = 0
+            let actions = fixture.window.agentChatTitleClusterMenuActions(
+                handoffInstructionsProvider: {
+                    providerReadCount += 1
+                    return "Saved default"
+                },
+                copyToClipboard: { value in
+                    clipboard = value
+                    writeCount += 1
+                }
+            )
+
             fixture.window.promptManager.renameComposeTab(target.tabID, to: "Stale")
             XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
+            actions.copyHandoffPrompt(target)
+
+            XCTAssertEqual(providerReadCount, 0)
+            XCTAssertEqual(writeCount, 0)
+            XCTAssertEqual(clipboard, "sentinel")
+        }
+    }
+
+    func testQuickHandoffReportsOversizedStoredInstructionsWithoutCopying() async throws {
+        try await withFixture { fixture in
+            let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+            let maximum = AgentSessionHandoffInstructionsPolicy.maximumCharacterCount
+            let oversized = String(repeating: "a", count: maximum + 1)
+            var feedback: [(count: Int, maximum: Int)] = []
+            var clipboard = "sentinel"
+            var writeCount = 0
+            let actions = fixture.window.agentChatTitleClusterMenuActions(
+                handoffInstructionsProvider: { oversized },
+                handoffOversizedFeedback: { feedback.append((count: $0, maximum: $1)) },
+                copyToClipboard: { value in
+                    clipboard = value
+                    writeCount += 1
+                }
+            )
 
             actions.copyHandoffPrompt(target)
 
-            XCTAssertEqual(writeCount, 1)
+            XCTAssertEqual(feedback.count, 1)
+            XCTAssertEqual(feedback.first?.count, maximum + 1)
+            XCTAssertEqual(feedback.first?.maximum, maximum)
+            XCTAssertEqual(writeCount, 0)
             XCTAssertEqual(clipboard, "sentinel")
         }
     }

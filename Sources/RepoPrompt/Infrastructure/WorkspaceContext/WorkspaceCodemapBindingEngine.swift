@@ -131,7 +131,7 @@ actor WorkspaceCodemapBindingEngine {
         let language: LanguageType
         let pipelineIdentity: CodeMapPipelineIdentity
         let namespace: CodeMapRootManifestNamespace
-        let authority: CodeMapRootManifestAuthority
+        var authority: CodeMapRootManifestAuthority
         var previouslyObservedManifestAuthority: CodeMapRootManifestAuthority?
         var manifestRecords: [String: CodeMapRootManifestRecord]
         var automaticSelectionCandidateRecords: [String: CodeMapRootManifestRecord]
@@ -160,7 +160,10 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     private enum ManifestAdoptionOutcome {
-        case terminal(adoptedReadyCount: Int)
+        case terminal(
+            adoptedReadyCount: Int,
+            observedStaleAuthority: CodeMapRootManifestAuthority? = nil
+        )
         case retryable
         case superseded
     }
@@ -241,6 +244,12 @@ actor WorkspaceCodemapBindingEngine {
         let lease: CodeMapArtifactLease?
     }
 
+    private struct ManifestAdoptionAuthorityCandidate {
+        let record: CodeMapRootManifestRecord
+        let candidate: WorkspaceCodemapManifestBindingCandidate
+        let loadedPath: String
+    }
+
     private struct PendingManifestChange {
         let revision: UInt64
         let workItemID: UUID
@@ -266,16 +275,55 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
+    private enum GraphIndexManifestSubmissionOrigin: Equatable {
+        case pageCheckpoint
+        case enumerationSeal
+    }
+
     private enum ManifestMutationAuthority: Equatable {
         case session(invalidationGeneration: UInt64)
-        case graphIndex(jobID: UUID, generation: WorkspaceCodemapGraphIndexGeneration)
+        case graphIndex(
+            jobID: UUID,
+            generation: WorkspaceCodemapGraphIndexGeneration,
+            origin: GraphIndexManifestSubmissionOrigin
+        )
     }
+
+    #if DEBUG
+        private struct DebugManifestStoreAttemptContext {
+            let rootEpoch: WorkspaceCodemapRootEpoch
+            let proof: ManifestMutationAuthority
+            let deferredRetry: Bool
+            let mutationByteCount: UInt64
+        }
+
+        @TaskLocal private static var debugManifestStoreAttemptContext: DebugManifestStoreAttemptContext?
+    #endif
 
     private enum ManifestMutationSubmissionResult {
         case persisted
+        case staleAuthority(observedAuthority: CodeMapRootManifestAuthority)
+        case discarded
         case durabilityFailure
         case retry
         case budget(WorkspaceCodemapGraphIndexBudget)
+    }
+
+    private enum ManifestRevisionCompletion {
+        case persisted
+        case staleAuthority(observedAuthority: CodeMapRootManifestAuthority)
+        case discarded
+        case failed
+    }
+
+    private struct ManifestMergeOutcome {
+        let writeResult: CodeMapRootManifestWriteResult
+        let observedPredecessorAuthority: CodeMapRootManifestAuthority?
+    }
+
+    private struct ManifestWriterFailureDisposition {
+        let terminalObservedStaleAuthority: Bool
+        let terminalCompletion: ManifestRevisionCompletion
     }
 
     private struct ManifestWriterWorkKey: Hashable {
@@ -307,7 +355,7 @@ actor WorkspaceCodemapBindingEngine {
     private struct ManifestWriteWaiter {
         let id: UUID
         let revision: UInt64
-        let continuation: CheckedContinuation<Bool, Never>
+        let continuation: CheckedContinuation<ManifestRevisionCompletion, Never>
     }
 
     private struct ManifestWriterState {
@@ -322,6 +370,26 @@ actor WorkspaceCodemapBindingEngine {
         var inFlightBatch: ManifestMutationBatch?
         var waitersByWorkKey: [ManifestWriterWorkKey: [ManifestWriteWaiter]] = [:]
         var waiterWorkKeyByID: [UUID: ManifestWriterWorkKey] = [:]
+    }
+
+    private struct GraphIndexManifestStage {
+        let namespace: CodeMapRootManifestNamespace
+        let pipelineSessionID: UUID
+        var cachedRecordsByPath: [String: CodeMapRootManifestRecord]
+        var stagedRecordsByPath: [String: CodeMapRootManifestRecord]
+        var stagedByteCount: UInt64
+        var isDegraded: Bool
+        var sealAuthorityRecoveryAttempted: Bool
+        let wasVirginAtLoad: Bool
+    }
+
+    private enum GraphIndexManifestSealState {
+        case collecting
+        case enumerationSealed
+        case persisting
+        case durable
+        case degraded
+        case discarded
     }
 
     private struct GraphIndexAdmissionWaiter {
@@ -355,13 +423,30 @@ actor WorkspaceCodemapBindingEngine {
         var pipelineScopes: [CodeMapPipelineIdentity: WorkspaceCodemapGraphIndexPipelineScope]
         var resources: WorkspaceCodemapGraphIndexResourceAccounting
         var pendingManifestMutationCount: UInt64
+        var manifestStages: [CodeMapPipelineIdentity: GraphIndexManifestStage]
+        var manifestStagedByteCount: UInt64
+        var manifestSealState: GraphIndexManifestSealState
         var retryAttempt: UInt64
         var retry: WorkspaceCodemapGraphIndexRetry?
         var budget: WorkspaceCodemapGraphIndexBudget?
         var checkpoint: WorkspaceCodemapGraphIndexCheckpoint?
+        var workerID: UUID?
         var task: Task<Void, Never>?
+        var workerRecoveryCount: UInt64
+        var workerRecoveryExhausted: Bool
+        var lastWorkerCompletionReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
+        var workerRestartRequestedReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
+        var isPriorityPromoted: Bool
         var isQueuedForAdmission: Bool
         var isActiveBatch: Bool
+        var scheduledUptimeNanoseconds: UInt64
+        var admissionWaitStartUptimeNanoseconds: UInt64?
+        var admittedUptimeNanoseconds: UInt64?
+        var phaseEnteredUptimeNanoseconds: UInt64
+        var lastProgressUptimeNanoseconds: UInt64
+        var workerFinishedUptimeNanoseconds: UInt64?
+        var lastProjectedSupportedCandidateTotal: UInt64?
+        var manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
     }
 
     private enum GraphIndexCandidateResolution {
@@ -511,6 +596,9 @@ actor WorkspaceCodemapBindingEngine {
     ] = [:]
     private var graphIndexAdmissionQueue: [GraphIndexAdmissionWaiter] = []
     private var activeGraphIndexJobIDs: Set<UUID> = []
+    private var graphIndexWatchdogTasks: [UUID: Task<Void, Never>] = [:]
+    private var prioritizedGraphIndexRootEpoch: WorkspaceCodemapRootEpoch?
+    private var graphIndexManifestStagedByteCount: UInt64 = 0
     private var drainingGraphIndexTasks: [UUID: Task<Void, Never>] = [:]
     private var drainingGraphIndexResources: [UUID: WorkspaceCodemapGraphIndexResourceAccounting] = [:]
     private var drainingGraphIndexRootEpochs: [UUID: WorkspaceCodemapRootEpoch] = [:]
@@ -529,13 +617,50 @@ actor WorkspaceCodemapBindingEngine {
             let expiryTask: Task<Void, Never>
         }
 
+        private actor DebugGraphIndexNonCooperativeWorkerGate {
+            private var isReleased = false
+            private var continuation: CheckedContinuation<Void, Never>?
+
+            func wait() async {
+                guard !isReleased else { return }
+                await withCheckedContinuation { continuation in
+                    if isReleased {
+                        continuation.resume()
+                    } else {
+                        self.continuation = continuation
+                    }
+                }
+            }
+
+            func release() {
+                isReleased = true
+                continuation?.resume()
+                continuation = nil
+            }
+        }
+
         private var debugGraphIndexAdmissionHolds: [UUID: DebugGraphIndexAdmissionHold] = [:]
+        private var debugGraphIndexNonCooperativeWorkerGates: [
+            UUID: DebugGraphIndexNonCooperativeWorkerGate
+        ] = [:]
+        private var debugGraphIndexEventRing = WorkspaceCodemapGraphIndexDebugEventRing()
         private var debugGraphIndexAdmissionEnqueuedAtNanoseconds: [UUID: UInt64] = [:]
         private var debugGraphIndexQueueWaitMillisecondsByRootEpoch: [
             WorkspaceCodemapRootEpoch: [UInt64]
         ] = [:]
         private var debugGraphIndexQueueWaitSampleOrdinalByRootEpoch: [
             WorkspaceCodemapRootEpoch: UInt64
+        ] = [:]
+        private var debugManifestFailureCountsByRootEpoch: [
+            WorkspaceCodemapRootEpoch: [WorkspaceCodemapManifestFailureReason: UInt64]
+        ] = [:]
+        private var debugLastManifestFailureByRootEpoch: [
+            WorkspaceCodemapRootEpoch: WorkspaceCodemapManifestFailureDiagnostic
+        ] = [:]
+        private var debugManifestMeasurementsByRootEpoch: [
+            WorkspaceCodemapRootEpoch: [
+                WorkspaceCodemapManifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementAggregate
+            ]
         ] = [:]
     #endif
 
@@ -908,16 +1033,35 @@ actor WorkspaceCodemapBindingEngine {
         guard !isShuttingDown else { return .cancelled }
         guard case let .eligible(session)? = roots[rootEpoch] else { return .superseded }
         if let existing = graphIndexJobs[rootEpoch] {
-            if existing.phase == .superseded {
-                return .superseded
+            guard graphIndexJobIsCurrent(existing) else {
+                _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .superseded)
+                return scheduleGraphIndex(rootEpoch: rootEpoch)
             }
-            if existing.phase == .cancelled {
-                return .cancelled
+            switch existing.phase {
+            case .complete:
+                return .handedOff
+            case .budgetLimited:
+                return .handedOff
+            case .cancelled, .superseded:
+                _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: existing.phase)
+                return scheduleGraphIndex(rootEpoch: rootEpoch)
+            case .scheduled, .waitingForAdmission, .readingCatalogPage, .loadingEnvelopes,
+                 .classifyingBatch, .resolvingArtifacts, .stagingManifestCache,
+                 .publishingGraphChanges, .checkpointed, .persistingManifestCache, .suspendedBusy:
+                guard existing.task == nil,
+                      !existing.workerRecoveryExhausted,
+                      existing.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount
+                else { return .handedOff }
+                return startGraphIndexWorker(
+                    jobID: existing.id,
+                    rootEpoch: rootEpoch,
+                    recoveryReason: existing.lastWorkerCompletionReason ?? .admissionUnavailable
+                ) ? .handedOff : .superseded
             }
-            return graphIndexJobIsCurrent(existing) ? .handedOff : .superseded
         }
 
         let jobID = UUID()
+        let scheduledUptimeNanoseconds = uptimeNanoseconds()
         graphIndexJobs[rootEpoch] = GraphIndexJob(
             id: jobID,
             rootEpoch: rootEpoch,
@@ -938,26 +1082,151 @@ actor WorkspaceCodemapBindingEngine {
             pipelineScopes: [:],
             resources: .zero,
             pendingManifestMutationCount: 0,
+            manifestStages: [:],
+            manifestStagedByteCount: 0,
+            manifestSealState: .collecting,
             retryAttempt: 0,
             retry: nil,
             budget: nil,
             checkpoint: nil,
+            workerID: nil,
             task: nil,
+            workerRecoveryCount: 0,
+            workerRecoveryExhausted: false,
+            lastWorkerCompletionReason: nil,
+            workerRestartRequestedReason: nil,
+            isPriorityPromoted: false,
             isQueuedForAdmission: false,
-            isActiveBatch: false
+            isActiveBatch: false,
+            scheduledUptimeNanoseconds: scheduledUptimeNanoseconds,
+            admissionWaitStartUptimeNanoseconds: nil,
+            admittedUptimeNanoseconds: nil,
+            phaseEnteredUptimeNanoseconds: scheduledUptimeNanoseconds,
+            lastProgressUptimeNanoseconds: scheduledUptimeNanoseconds,
+            workerFinishedUptimeNanoseconds: nil,
+            lastProjectedSupportedCandidateTotal: nil,
+            manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate()
         )
         incrementCounter(\.graphIndexRunsScheduled)
         emit(.graphIndexRunScheduled, rootEpoch: rootEpoch, graphIndexPhase: .scheduled)
-        let task = Task(priority: .background) {
-            await self.runGraphIndex(jobID: jobID, rootEpoch: rootEpoch)
+        return startGraphIndexWorker(
+            jobID: jobID,
+            rootEpoch: rootEpoch,
+            recoveryReason: nil
+        ) ? .handedOff : .superseded
+    }
+
+    private func startGraphIndexWorker(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        recoveryReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
+    ) -> Bool {
+        guard var job = graphIndexJobs[rootEpoch],
+              job.id == jobID,
+              job.task == nil,
+              !job.workerRecoveryExhausted,
+              graphIndexJobIsCurrent(job)
+        else { return false }
+        guard recoveryReason == nil ||
+            job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount
+        else { return false }
+        let workerID = UUID()
+        job.workerID = workerID
+        job.workerFinishedUptimeNanoseconds = nil
+        job.workerRestartRequestedReason = nil
+        if recoveryReason != nil {
+            job.workerRecoveryCount = addingSaturating(job.workerRecoveryCount, 1)
         }
-        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else {
-            task.cancel()
-            return .superseded
-        }
-        job.task = task
         graphIndexJobs[rootEpoch] = job
-        return .handedOff
+        let task = Task(priority: .utility) {
+            await self.runGraphIndex(
+                jobID: jobID,
+                workerID: workerID,
+                rootEpoch: rootEpoch
+            )
+        }
+        guard var installed = graphIndexJobs[rootEpoch],
+              installed.id == jobID,
+              installed.workerID == workerID,
+              installed.task == nil
+        else {
+            task.cancel()
+            return false
+        }
+        installed.task = task
+        graphIndexJobs[rootEpoch] = installed
+        armGraphIndexWatchdog(jobID: jobID, workerID: workerID, rootEpoch: rootEpoch)
+        return true
+    }
+
+    @discardableResult
+    func prioritizeGraphIndexNow(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapGraphIndexPrioritizeDisposition {
+        guard !isShuttingDown,
+              case .eligible? = roots[rootEpoch]
+        else { return .unavailable }
+        guard var job = graphIndexJobs[rootEpoch] else {
+            return scheduleGraphIndex(rootEpoch: rootEpoch) == .handedOff ? .scheduled : .unavailable
+        }
+        guard graphIndexJobIsCurrent(job) else {
+            _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .superseded)
+            return scheduleGraphIndex(rootEpoch: rootEpoch) == .handedOff ? .scheduled : .unavailable
+        }
+        switch job.phase {
+        case .complete:
+            return .alreadyComplete
+        case .cancelled, .superseded:
+            _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: job.phase)
+            return scheduleGraphIndex(rootEpoch: rootEpoch) == .handedOff ? .scheduled : .unavailable
+        case .budgetLimited:
+            return .unavailable
+        case .scheduled, .waitingForAdmission, .readingCatalogPage, .loadingEnvelopes,
+             .classifyingBatch, .resolvingArtifacts, .stagingManifestCache,
+             .publishingGraphChanges, .checkpointed, .persistingManifestCache, .suspendedBusy:
+            break
+        }
+        let workerRecoveryLimitReached =
+            job.workerRecoveryCount >= policy.maximumGraphIndexWorkerRecoveryCount
+        if job.task == nil,
+           job.workerRecoveryExhausted || workerRecoveryLimitReached
+        {
+            job.workerRecoveryExhausted = false
+            job.workerRecoveryCount = 0
+        } else if job.workerRecoveryExhausted {
+            return .unavailable
+        }
+        prioritizedGraphIndexRootEpoch = rootEpoch
+        job.isPriorityPromoted = true
+        job.retryAttempt = 0
+        job.retry = nil
+        graphIndexJobs[rootEpoch] = job
+        #if DEBUG
+            recordGraphIndexDebugEvent(
+                kind: .graphIndexRunScheduled,
+                rootEpoch: rootEpoch,
+                jobID: job.id,
+                phase: job.phase,
+                reason: .prioritizeRestart
+            )
+        #endif
+        guard job.task != nil else {
+            return startGraphIndexWorker(
+                jobID: job.id,
+                rootEpoch: rootEpoch,
+                recoveryReason: .prioritizeRestart
+            ) ? .restarted : .unavailable
+        }
+        if job.phase == .suspendedBusy {
+            requestGraphIndexWorkerRestart(
+                jobID: job.id,
+                rootEpoch: rootEpoch,
+                reason: .prioritizeRestart
+            )
+            return .restarted
+        }
+        scheduleGraphIndexAdmissions()
+        return .promoted
     }
 
     func cancelGraphIndex(rootEpoch: WorkspaceCodemapRootEpoch) {
@@ -1196,6 +1465,13 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     func unloadRoot(rootEpoch: WorkspaceCodemapRootEpoch) async {
+        #if DEBUG
+            defer {
+                debugManifestFailureCountsByRootEpoch.removeValue(forKey: rootEpoch)
+                debugLastManifestFailureByRootEpoch.removeValue(forKey: rootEpoch)
+                debugManifestMeasurementsByRootEpoch.removeValue(forKey: rootEpoch)
+            }
+        #endif
         if case .registering? = roots[rootEpoch] {
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
@@ -1255,6 +1531,9 @@ actor WorkspaceCodemapBindingEngine {
             }
             debugGraphIndexAdmissionHolds.removeAll()
             debugGraphIndexAdmissionEnqueuedAtNanoseconds.removeAll()
+            debugManifestFailureCountsByRootEpoch.removeAll()
+            debugLastManifestFailureByRootEpoch.removeAll()
+            debugManifestMeasurementsByRootEpoch.removeAll()
         #endif
         let rootEpochs = Array(roots.keys)
         for rootEpoch in rootEpochs {
@@ -1317,6 +1596,11 @@ actor WorkspaceCodemapBindingEngine {
         retainedAdoptions.removeAll()
         drainingManifestAdoptionTasks.removeAll()
         drainingRequestTasks.removeAll()
+        for task in graphIndexWatchdogTasks.values {
+            task.cancel()
+        }
+        graphIndexWatchdogTasks.removeAll()
+        prioritizedGraphIndexRootEpoch = nil
         drainingGraphIndexTasks.removeAll()
         drainingGraphIndexResources.removeAll()
         drainingGraphIndexRootEpochs.removeAll()
@@ -1391,6 +1675,21 @@ actor WorkspaceCodemapBindingEngine {
             addingSaturating($0, $1.reservedSourceBytes)
         }
         let adoptionUsage = adoptionLeaseUsage()
+        let orderedGraphIndexAdmissionQueue = graphIndexAdmissionQueue.sorted { left, right in
+            let leftAdmission = graphIndexRootLastAdmission[left.rootEpoch] ?? 0
+            let rightAdmission = graphIndexRootLastAdmission[right.rootEpoch] ?? 0
+            if leftAdmission != rightAdmission { return leftAdmission < rightAdmission }
+            if left.enqueueOrdinal != right.enqueueOrdinal {
+                return left.enqueueOrdinal < right.enqueueOrdinal
+            }
+            return rootEpochPrecedes(left.rootEpoch, right.rootEpoch)
+        }
+        let graphIndexQueuePositionByJobID = Dictionary(
+            uniqueKeysWithValues:
+            orderedGraphIndexAdmissionQueue.enumerated().map { index, waiter in
+                (waiter.jobID, index + 1)
+            }
+        )
         let graphIndexRoots: [WorkspaceCodemapBindingEngineGraphIndexRootAccounting] = graphIndexJobs.values.sorted {
             rootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
         }.map { job -> WorkspaceCodemapBindingEngineGraphIndexRootAccounting in
@@ -1424,18 +1723,47 @@ actor WorkspaceCodemapBindingEngine {
                     queuedManifestMutationBytes: .max
                 )
             }
+            let cursor = job.cursor ?? job.lastProcessedCursor
+            #if DEBUG
+                let cursorFingerprint = cursor.map(graphIndexCursorFingerprint)
+            #else
+                let cursorFingerprint: String? = nil
+            #endif
             return WorkspaceCodemapBindingEngineGraphIndexRootAccounting(
                 rootEpoch: job.rootEpoch,
+                jobID: job.id,
                 phase: job.phase,
                 progress: job.progress,
+                workerPresent: job.task != nil,
+                workerRecoveryCount: job.workerRecoveryCount,
+                lastWorkerCompletionReason: job.lastWorkerCompletionReason,
+                isPriorityPromoted: job.isPriorityPromoted,
+                isQueuedForAdmission: job.isQueuedForAdmission,
+                queuePosition: graphIndexQueuePositionByJobID[job.id],
                 queuedBatchCount: job.isQueuedForAdmission ? 1 : 0,
                 activeBatchCount: activeGraphIndexBatchCount(rootEpoch: job.rootEpoch),
                 drainingBatchCount: drainingGraphIndexRootEpochs.values.count(where: {
                     $0 == job.rootEpoch
                 }),
                 resources: rootResources,
+                retryAttempt: job.retryAttempt,
                 retry: job.retry,
-                budget: job.budget
+                budget: job.budget,
+                scheduledUptimeNanoseconds: job.scheduledUptimeNanoseconds,
+                admissionWaitStartUptimeNanoseconds: job.admissionWaitStartUptimeNanoseconds,
+                admittedUptimeNanoseconds: job.admittedUptimeNanoseconds,
+                phaseEnteredUptimeNanoseconds: job.phaseEnteredUptimeNanoseconds,
+                lastProgressUptimeNanoseconds: job.lastProgressUptimeNanoseconds,
+                workerFinishedUptimeNanoseconds: job.workerFinishedUptimeNanoseconds,
+                lastProjectedSupportedCandidateTotal: job.lastProjectedSupportedCandidateTotal,
+                pageStartProcessedCandidateBaseline: job.pageStartProcessedCandidateBaseline,
+                pageOrdinal: job.progress.catalogPageCount,
+                cursorPresent: cursor != nil,
+                cursorFingerprint: cursorFingerprint,
+                inBatchCandidateCount: job.inBatchProgress?.candidateCount,
+                inBatchResolvedCandidateCount: job.inBatchProgress?.resolvedCandidateCount,
+                checkpointPresent: job.checkpoint != nil,
+                manifestMeasurements: job.manifestMeasurements
             )
         }
         let liveGraphIndexResources = graphIndexJobs.values.reduce(
@@ -1541,6 +1869,233 @@ actor WorkspaceCodemapBindingEngine {
             return (released, snapshot.metrics, snapshot.queueWaitMilliseconds)
         }
 
+        func debugGraphIndexEvents(
+            rootID: UUID? = nil,
+            sinceOrdinal: UInt64?,
+            limit: Int
+        ) -> WorkspaceCodemapGraphIndexDebugEventPage {
+            debugGraphIndexEventRing.page(
+                rootID: rootID,
+                sinceOrdinal: sinceOrdinal,
+                limit: limit
+            )
+        }
+
+        func debugGraphIndexJobSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> WorkspaceCodemapBindingEngineGraphIndexRootAccounting? {
+            accounting().graphIndexRoots.first { $0.rootEpoch == rootEpoch }
+        }
+
+        func debugSimulateGraphIndexWorkerExitForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            reason: WorkspaceCodemapGraphIndexWorkerCompletionReason
+        ) {
+            guard var job = graphIndexJobs[rootEpoch] else { return }
+            let task = job.task
+            graphIndexWatchdogTasks.removeValue(forKey: job.id)?.cancel()
+            activeGraphIndexJobIDs.remove(job.id)
+            cancelGraphIndexAdmission(jobID: job.id)
+            job.workerID = nil
+            job.task = nil
+            job.lastWorkerCompletionReason = reason
+            job.workerRestartRequestedReason = nil
+            job.workerFinishedUptimeNanoseconds = uptimeNanoseconds()
+            job.isQueuedForAdmission = false
+            job.isActiveBatch = false
+            job.resources = .zero
+            graphIndexJobs[rootEpoch] = job
+            task?.cancel()
+            recordGraphIndexDebugEvent(
+                kind: .graphIndexWorkerFinished,
+                rootEpoch: rootEpoch,
+                jobID: job.id,
+                phase: job.phase,
+                reason: graphIndexDebugReason(for: reason)
+            )
+        }
+
+        func debugInstallNonCooperativeGraphIndexWorkerForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> Bool {
+            guard var job = graphIndexJobs[rootEpoch], job.task == nil else { return false }
+            let workerID = UUID()
+            let jobID = job.id
+            let gate = DebugGraphIndexNonCooperativeWorkerGate()
+            debugGraphIndexNonCooperativeWorkerGates[jobID] = gate
+            job.workerID = workerID
+            job.workerFinishedUptimeNanoseconds = nil
+            let task = Task(priority: .utility) { [weak self] in
+                await gate.wait()
+                guard let self else { return }
+                await finishGraphIndexWorker(
+                    jobID: jobID,
+                    workerID: workerID,
+                    rootEpoch: rootEpoch,
+                    reason: .cancelled
+                )
+            }
+            job.task = task
+            graphIndexJobs[rootEpoch] = job
+            return true
+        }
+
+        func debugDrainNonCooperativeGraphIndexWorkerForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) async -> Bool {
+            guard let job = graphIndexJobs[rootEpoch],
+                  let gate = debugGraphIndexNonCooperativeWorkerGates[job.id]
+            else { return false }
+            await gate.release()
+            return true
+        }
+
+        func debugGraphIndexWorkerRecoveryStateForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (count: UInt64, exhausted: Bool, workerPresent: Bool, watchdogArmed: Bool)? {
+            guard let job = graphIndexJobs[rootEpoch] else { return nil }
+            return (
+                job.workerRecoveryCount,
+                job.workerRecoveryExhausted,
+                job.task != nil,
+                graphIndexWatchdogTasks[job.id] != nil
+            )
+        }
+
+        func debugGraphIndexManifestRetentionForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (
+            stageCount: Int,
+            cachedRecordCount: Int,
+            stagedRecordCount: Int,
+            stagedByteCount: UInt64,
+            globalStagedByteCount: UInt64
+        )? {
+            guard let job = graphIndexJobs[rootEpoch] else { return nil }
+            return (
+                job.manifestStages.count,
+                job.manifestStages.values.reduce(0) { $0 + $1.cachedRecordsByPath.count },
+                job.manifestStages.values.reduce(0) { $0 + $1.stagedRecordsByPath.count },
+                job.manifestStagedByteCount,
+                graphIndexManifestStagedByteCount
+            )
+        }
+
+        func debugSetGraphIndexLastProgressForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            uptimeNanoseconds: UInt64
+        ) {
+            guard var job = graphIndexJobs[rootEpoch] else { return }
+            job.lastProgressUptimeNanoseconds = uptimeNanoseconds
+            graphIndexJobs[rootEpoch] = job
+        }
+
+        func debugSetGraphIndexRetryForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            attempt: UInt64
+        ) {
+            guard var job = graphIndexJobs[rootEpoch] else { return }
+            job.phase = .suspendedBusy
+            job.retryAttempt = attempt
+            job.retry = WorkspaceCodemapGraphIndexRetry(
+                attempt: attempt,
+                retryAfterMilliseconds: policy.graphIndexRetryMaximumMilliseconds,
+                nextEligibleAdmissionUptimeNanoseconds: .max
+            )
+            graphIndexJobs[rootEpoch] = job
+        }
+
+        func debugEvaluateGraphIndexWatchdogForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            nowUptimeNanoseconds: UInt64
+        ) -> WorkspaceCodemapGraphIndexWatchdogDisposition {
+            guard let job = graphIndexJobs[rootEpoch] else { return .unavailable }
+            return evaluateGraphIndexWatchdog(
+                jobID: job.id,
+                workerID: job.workerID,
+                rootEpoch: rootEpoch,
+                nowUptimeNanoseconds: nowUptimeNanoseconds
+            )
+        }
+
+        func debugManifestFailureSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (
+            counts: [WorkspaceCodemapManifestFailureReason: UInt64],
+            lastFailure: WorkspaceCodemapManifestFailureDiagnostic?
+        ) {
+            (
+                debugManifestFailureCountsByRootEpoch[rootEpoch] ?? [:],
+                debugLastManifestFailureByRootEpoch[rootEpoch]
+            )
+        }
+
+        func debugManifestMeasurementSnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> WorkspaceCodemapManifestMeasurementSnapshot {
+            WorkspaceCodemapManifestMeasurementSnapshot(
+                byOrigin: debugManifestMeasurementsByRootEpoch[rootEpoch] ?? [:]
+            )
+        }
+
+        private func updateDebugManifestMeasurements(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            jobID: UUID?,
+            origin: WorkspaceCodemapManifestMeasurementOrigin,
+            _ update: (inout WorkspaceCodemapManifestMeasurementAggregate) -> Void
+        ) {
+            var byOrigin = debugManifestMeasurementsByRootEpoch[rootEpoch] ?? [:]
+            var aggregate = byOrigin[origin] ?? WorkspaceCodemapManifestMeasurementAggregate()
+            update(&aggregate)
+            byOrigin[origin] = aggregate
+            debugManifestMeasurementsByRootEpoch[rootEpoch] = byOrigin
+
+            guard origin == .page || origin == .seal,
+                  let jobID,
+                  var job = graphIndexJobs[rootEpoch],
+                  job.id == jobID
+            else { return }
+            update(&job.manifestMeasurements)
+            graphIndexJobs[rootEpoch] = job
+        }
+
+        private func recordDebugManifestStoreAttempt(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            jobID: UUID?,
+            origin: WorkspaceCodemapManifestMeasurementOrigin,
+            retryKind: WorkspaceCodemapManifestMeasurementRetryKind,
+            mutationByteCount: UInt64,
+            attempt: CodeMapRootManifestDebugAttemptMetrics,
+            succeeded: Bool
+        ) {
+            guard roots[rootEpoch] != nil else { return }
+            updateDebugManifestMeasurements(
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                origin: origin
+            ) { aggregate in
+                aggregate.recordStoreAttempt(
+                    attempt,
+                    mutationByteCount: mutationByteCount,
+                    succeeded: succeeded,
+                    retryKind: retryKind
+                )
+            }
+        }
+
+        func debugManifestAuthoritySnapshot(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            pipelineIdentity: CodeMapPipelineIdentity
+        ) -> (
+            current: CodeMapRootManifestAuthority,
+            observedPredecessor: CodeMapRootManifestAuthority?
+        )? {
+            guard case let .eligible(session)? = roots[rootEpoch],
+                  let pipeline = session.pipelines[pipelineIdentity]
+            else { return nil }
+            return (pipeline.authority, pipeline.previouslyObservedManifestAuthority)
+        }
+
         func debugGraphIndexAdmissionSnapshot(
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> (
@@ -1560,14 +2115,57 @@ actor WorkspaceCodemapBindingEngine {
                         debugGraphIndexQueueWaitSampleOrdinalByRootEpoch[rootEpoch] ?? 0,
                     "queued_graph_index_batch_count": UInt64(current.queuedGraphIndexBatchCount),
                     "active_graph_index_batch_count": UInt64(current.activeGraphIndexBatchCount),
+                    "capability_resolutions": current.counters.capabilityResolutions,
+                    "capability_retries": current.counters.capabilityRetries,
+                    "classifications": current.counters.classifications,
+                    "clean_classifications": current.counters.cleanClassifications,
+                    "worktree_classifications": current.counters.worktreeClassifications,
+                    "locator_fast_paths": current.counters.locatorFastPaths,
+                    "cas_fast_paths": current.counters.casFastPaths,
                     "builds": current.counters.builds,
                     "materializations": current.counters.materializations,
+                    "materialized_bytes": current.counters.materializedBytes,
+                    "published_artifact_graph_index_cas_hits":
+                        current.counters.publishedArtifactGraphIndexCASHits,
+                    "published_artifact_locator_cas_hits":
+                        current.counters.publishedArtifactLocatorCASHits,
+                    "published_artifact_lookup_misses": current.counters.publishedArtifactLookupMisses,
+                    "graph_index_envelope_hits": current.counters.graphIndexEnvelopeHits,
+                    "graph_index_envelope_stale": current.counters.graphIndexEnvelopeStale,
+                    "graph_index_envelope_invalid": current.counters.graphIndexEnvelopeInvalid,
+                    "graph_index_terminal_record_hits": current.counters.graphIndexTerminalRecordHits,
+                    "graph_index_locator_misses": current.counters.graphIndexLocatorMisses,
+                    "graph_index_locator_corruptions": current.counters.graphIndexLocatorCorruptions,
+                    "graph_index_cas_misses": current.counters.graphIndexCASMisses,
+                    "graph_index_artifact_builds_joined": current.counters.graphIndexArtifactBuildsJoined,
+                    "graph_index_artifact_builds_started": current.counters.graphIndexArtifactBuildsStarted,
+                    "graph_index_artifact_builds_completed": current.counters.graphIndexArtifactBuildsCompleted,
                     "manifest_writes": current.counters.manifestWrites,
                     "manifest_write_batches": current.counters.manifestWriteBatches,
+                    "manifest_write_retries": current.counters.manifestWriteRetries,
                     "manifest_write_items": current.counters.manifestWriteItems,
                     "manifest_write_batch_bytes": current.counters.manifestWriteBatchBytes,
                     "manifest_write_coalesced_items": current.counters.manifestWriteCoalescedItems,
                     "manifest_writer_peak_queued_items": current.counters.manifestWriterPeakQueuedItems,
+                    "graph_index_page_manifest_loads": current.counters.graphIndexPageManifestLoads,
+                    "graph_index_page_manifest_submissions":
+                        current.counters.graphIndexPageManifestSubmissions,
+                    "graph_index_page_manifest_waits": current.counters.graphIndexPageManifestWaits,
+                    "graph_index_page_manifest_writes": current.counters.graphIndexPageManifestWrites,
+                    "graph_index_page_manifest_snapshot_record_volume":
+                        current.counters.graphIndexPageManifestSnapshotRecordVolume,
+                    "graph_index_page_manifest_snapshot_byte_volume":
+                        current.counters.graphIndexPageManifestSnapshotByteVolume,
+                    "graph_index_seal_manifest_submissions":
+                        current.counters.graphIndexSealManifestSubmissions,
+                    "graph_index_seal_manifest_waits": current.counters.graphIndexSealManifestWaits,
+                    "graph_index_seal_manifest_writes": current.counters.graphIndexSealManifestWrites,
+                    "graph_index_seal_manifest_authority_resubmissions":
+                        current.counters.graphIndexSealManifestAuthorityResubmissions,
+                    "graph_index_seal_manifest_snapshot_record_volume":
+                        current.counters.graphIndexSealManifestSnapshotRecordVolume,
+                    "graph_index_seal_manifest_snapshot_byte_volume":
+                        current.counters.graphIndexSealManifestSnapshotByteVolume,
                     "failures": current.counters.failures,
                     "manifest_failures": current.counters.manifestFailures,
                     "busy_rejections": current.counters.busyRejections,
@@ -1603,17 +2201,36 @@ actor WorkspaceCodemapBindingEngine {
 
     private func runGraphIndex(
         jobID: UUID,
+        workerID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) async {
-        defer { finishGraphIndexWorker(jobID: jobID, rootEpoch: rootEpoch) }
+        var completionReason = WorkspaceCodemapGraphIndexWorkerCompletionReason.cancelled
+        defer {
+            finishGraphIndexWorker(
+                jobID: jobID,
+                workerID: workerID,
+                rootEpoch: rootEpoch,
+                reason: completionReason
+            )
+        }
         guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .waitingForAdmission) else {
+            completionReason = .currentnessLost
             return
         }
         incrementCounter(\.graphIndexRunsStarted)
         emit(.graphIndexRunStarted, rootEpoch: rootEpoch, graphIndexPhase: .waitingForAdmission)
 
         while !Task.isCancelled {
-            guard await awaitGraphIndexAdmission(jobID: jobID, rootEpoch: rootEpoch) else { return }
+            guard await awaitGraphIndexAdmission(jobID: jobID, rootEpoch: rootEpoch) else {
+                completionReason = Task.isCancelled
+                    ? .cancelled
+                    : (
+                        currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) == nil
+                            ? .currentnessLost
+                            : .admissionUnavailable
+                    )
+                return
+            }
             let result = await processGraphIndexBatch(jobID: jobID, rootEpoch: rootEpoch)
             releaseGraphIndexAdmission(jobID: jobID, rootEpoch: rootEpoch)
             switch result {
@@ -1622,13 +2239,17 @@ actor WorkspaceCodemapBindingEngine {
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     phase: .waitingForAdmission
-                ) else { return }
+                ) else {
+                    completionReason = .checkpointTransitionRejected
+                    return
+                }
             case .restartGeneration:
                 guard resetGraphIndexForLatestGeneration(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     recordSupersession: true
                 ) else {
+                    completionReason = .generationResetRejected
                     return
                 }
             case .restartPage:
@@ -1636,27 +2257,51 @@ actor WorkspaceCodemapBindingEngine {
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     recordSupersession: false
-                ), await waitForGraphIndexRetry(jobID: jobID, rootEpoch: rootEpoch),
-                updateGraphIndexPhase(
-                    jobID: jobID,
-                    rootEpoch: rootEpoch,
-                    phase: .waitingForAdmission
                 ) else {
+                    completionReason = .generationResetRejected
                     return
                 }
-            case .complete, .budgetLimited, .cancelled, .superseded:
-                return
-            case .retry:
                 guard await waitForGraphIndexRetry(jobID: jobID, rootEpoch: rootEpoch) else {
+                    completionReason = Task.isCancelled ? .cancelled : .retryCancelled
                     return
                 }
                 guard updateGraphIndexPhase(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     phase: .waitingForAdmission
-                ) else { return }
+                ) else {
+                    completionReason = .checkpointTransitionRejected
+                    return
+                }
+            case .complete:
+                await persistGraphIndexManifestSeal(jobID: jobID, rootEpoch: rootEpoch)
+                completionReason = .complete
+                return
+            case .budgetLimited:
+                completionReason = .budgetLimited
+                return
+            case .cancelled:
+                completionReason = Task.isCancelled ? .cancelled : .currentnessLost
+                return
+            case .superseded:
+                completionReason = .superseded
+                return
+            case .retry:
+                guard await waitForGraphIndexRetry(jobID: jobID, rootEpoch: rootEpoch) else {
+                    completionReason = Task.isCancelled ? .cancelled : .retryCancelled
+                    return
+                }
+                guard updateGraphIndexPhase(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    phase: .waitingForAdmission
+                ) else {
+                    completionReason = .checkpointTransitionRejected
+                    return
+                }
             }
         }
+        completionReason = .cancelled
     }
 
     private func awaitGraphIndexAdmission(
@@ -1688,8 +2333,11 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 let ordinal = nextGraphIndexQueueOrdinal
                 nextGraphIndexQueueOrdinal = addingChecked(nextGraphIndexQueueOrdinal, 1) ?? .max
+                let queuedUptimeNanoseconds = uptimeNanoseconds()
                 current.isQueuedForAdmission = true
                 current.phase = .waitingForAdmission
+                current.admissionWaitStartUptimeNanoseconds = queuedUptimeNanoseconds
+                current.phaseEnteredUptimeNanoseconds = queuedUptimeNanoseconds
                 graphIndexJobs[rootEpoch] = current
                 graphIndexAdmissionQueue.append(GraphIndexAdmissionWaiter(
                     jobID: jobID,
@@ -1755,17 +2403,25 @@ actor WorkspaceCodemapBindingEngine {
                 return activeGraphIndexJobIDs.count < policy.maximumActiveGraphIndexBatchCount
             }
             guard !eligible.isEmpty else { return }
-            let selectedIndex = eligible.min { lhs, rhs in
-                let left = graphIndexAdmissionQueue[lhs]
-                let right = graphIndexAdmissionQueue[rhs]
-                let leftAdmission = graphIndexRootLastAdmission[left.rootEpoch] ?? 0
-                let rightAdmission = graphIndexRootLastAdmission[right.rootEpoch] ?? 0
-                if leftAdmission != rightAdmission { return leftAdmission < rightAdmission }
-                if left.enqueueOrdinal != right.enqueueOrdinal {
-                    return left.enqueueOrdinal < right.enqueueOrdinal
-                }
-                return rootEpochPrecedes(left.rootEpoch, right.rootEpoch)
-            }!
+            let selectedIndex: Int = if let prioritizedGraphIndexRootEpoch,
+                                        let prioritizedIndex = eligible.first(where: {
+                                            graphIndexAdmissionQueue[$0].rootEpoch == prioritizedGraphIndexRootEpoch
+                                        })
+            {
+                prioritizedIndex
+            } else {
+                eligible.min { lhs, rhs in
+                    let left = graphIndexAdmissionQueue[lhs]
+                    let right = graphIndexAdmissionQueue[rhs]
+                    let leftAdmission = graphIndexRootLastAdmission[left.rootEpoch] ?? 0
+                    let rightAdmission = graphIndexRootLastAdmission[right.rootEpoch] ?? 0
+                    if leftAdmission != rightAdmission { return leftAdmission < rightAdmission }
+                    if left.enqueueOrdinal != right.enqueueOrdinal {
+                        return left.enqueueOrdinal < right.enqueueOrdinal
+                    }
+                    return rootEpochPrecedes(left.rootEpoch, right.rootEpoch)
+                }!
+            }
             let waiter = graphIndexAdmissionQueue.remove(at: selectedIndex)
             guard var job = graphIndexJobs[waiter.rootEpoch],
                   job.id == waiter.jobID,
@@ -1796,10 +2452,18 @@ actor WorkspaceCodemapBindingEngine {
                     debugGraphIndexQueueWaitSampleOrdinalByRootEpoch[waiter.rootEpoch, default: 0] &+= 1
                 }
             #endif
+            let admittedUptimeNanoseconds = uptimeNanoseconds()
             job.isQueuedForAdmission = false
             job.isActiveBatch = true
             job.phase = .readingCatalogPage
+            job.admittedUptimeNanoseconds = admittedUptimeNanoseconds
+            job.phaseEnteredUptimeNanoseconds = admittedUptimeNanoseconds
+            job.lastProgressUptimeNanoseconds = admittedUptimeNanoseconds
             job.retry = nil
+            job.isPriorityPromoted = false
+            if prioritizedGraphIndexRootEpoch == waiter.rootEpoch {
+                prioritizedGraphIndexRootEpoch = nil
+            }
             graphIndexJobs[waiter.rootEpoch] = job
             activeGraphIndexJobIDs.insert(waiter.jobID)
             ensureAdmissionOrdinalCapacity()
@@ -1928,6 +2592,24 @@ actor WorkspaceCodemapBindingEngine {
         guard let generation = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)?.generation,
               generation.catalogToken == page.token
         else { return .superseded }
+        if var acceptedPageJob = graphIndexJobs[rootEpoch], acceptedPageJob.id == jobID {
+            let acceptedUptimeNanoseconds = uptimeNanoseconds()
+            acceptedPageJob.lastProjectedSupportedCandidateTotal = page.projectedSupportedCandidateTotal
+            acceptedPageJob.pageStartProcessedCandidateBaseline =
+                acceptedPageJob.progress.counts.processedCandidateCount
+            acceptedPageJob.lastProgressUptimeNanoseconds = acceptedUptimeNanoseconds
+            graphIndexJobs[rootEpoch] = acceptedPageJob
+        }
+        #if DEBUG
+            recordGraphIndexDebugEvent(
+                kind: .graphIndexPageAccepted,
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                phase: .readingCatalogPage,
+                numericValue: UInt64(page.entries.count),
+                reason: .pageAccepted
+            )
+        #endif
         incrementCounter(\.graphIndexCatalogPages)
         addToCounter(\.graphIndexCatalogCandidates, UInt64(page.entries.count))
         addToCounter(\.graphIndexCatalogPathBytes, page.pathByteCount)
@@ -1979,30 +2661,25 @@ actor WorkspaceCodemapBindingEngine {
                 )
             ).get()
         }
+        // The projection shard fixes the authoritative denominator before page one. Later
+        // publications for the same token may advance slots, but cannot change that total.
         guard pendingSlots.count == page.entries.count,
               await publishGraphIndexSlots(
                   rootEpoch: rootEpoch,
                   catalogToken: page.token,
                   slots: pendingSlots,
+                  projectedSupportedCandidateTotal: page.projectedSupportedCandidateTotal,
+                  catalogSealed: true,
                   enumerationFinished: page.isEnd && page.entries.isEmpty
               )
         else { return .superseded }
 
         var manifestRecordsByPipeline: [CodeMapPipelineIdentity: [String: CodeMapRootManifestRecord]] = [:]
-        for (pipelineIdentity, candidates) in candidatesByPipeline {
+        for pipelineIdentity in candidatesByPipeline.keys {
             guard let records = await loadGraphIndexManifestRecords(
                 jobID: jobID,
                 rootEpoch: rootEpoch,
-                pipelineIdentity: pipelineIdentity,
-                candidatePaths: Set(candidates.compactMap { candidate in
-                    guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
-                          case let .eligible(session)? = roots[rootEpoch]
-                    else { return nil }
-                    return repositoryPath(
-                        loadedRootRelativePath: candidate.identity.standardizedRelativePath,
-                        prefix: session.capability.repositoryRelativeLoadedRootPrefix
-                    )
-                })
+                pipelineIdentity: pipelineIdentity
             ) else { return .cancelled }
             manifestRecordsByPipeline[pipelineIdentity] = records
         }
@@ -2056,12 +2733,58 @@ actor WorkspaceCodemapBindingEngine {
             let classificationsByPath = Dictionary(
                 uniqueKeysWithValues: classifications.classifications.map { ($0.relativePath, $0) }
             )
+            let authorityCandidates = misses.compactMap { candidate
+                -> (UUID, WorkspaceCodemapSourceAuthorityRequest)? in
+                guard let classification = classificationsByPath[
+                    candidate.identity.standardizedRelativePath
+                ], let repositoryRelativePath = classification.repositoryRelativePath else { return nil }
+                switch classification.outcome {
+                case .oidEligible, .requiresValidatedWorktreeBytes:
+                    break
+                case .securityExcluded, .unsupported, .unavailable:
+                    return nil
+                }
+                let currentPathGeneration = session.pathGenerations[
+                    candidate.identity.standardizedRelativePath
+                ] ?? afterPageRead.ingressGeneration
+                return (
+                    candidate.identity.fileID,
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: repositoryRelativePath,
+                        observedPathGeneration: candidate.pathGeneration,
+                        currentPathGeneration: currentPathGeneration,
+                        observedIngressGeneration: afterPageRead.ingressGeneration,
+                        currentIngressGeneration: session.registration.ingressGeneration
+                    )
+                )
+            }
+            let issuedAuthorities = await capabilityService.makeSourceAuthorities(
+                capability: session.capability,
+                observedRootEpoch: rootEpoch,
+                observedRepositoryAuthority: afterPageRead.repositoryAuthority,
+                candidates: authorityCandidates.map(\.1)
+            )
+            guard !Task.isCancelled,
+                  issuedAuthorities.count == authorityCandidates.count,
+                  currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil
+            else { return .cancelled }
+            let sourceAuthorityByFileID = Dictionary(uniqueKeysWithValues: zip(
+                authorityCandidates.map(\.0),
+                issuedAuthorities
+            ).compactMap { pair in
+                pair.1.map { (pair.0, $0) }
+            })
             guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .resolvingArtifacts) else {
                 return .cancelled
             }
             let maximumConcurrentResolutions = min(
                 misses.count,
                 policy.maximumConcurrentMaterializationCountPerOwner
+            )
+            beginGraphIndexBatchProgress(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                candidateCount: UInt64(misses.count)
             )
             let indexedResolutions = await withTaskGroup(
                 of: IndexedGraphIndexCandidateResolution.self,
@@ -2092,7 +2815,8 @@ actor WorkspaceCodemapBindingEngine {
                             rootEpoch: rootEpoch,
                             candidate: candidate,
                             pipelineIdentity: pipelineIdentity,
-                            classification: classification
+                            classification: classification,
+                            sourceAuthority: sourceAuthorityByFileID[candidate.identity.fileID]
                         )
                         return IndexedGraphIndexCandidateResolution(
                             index: index,
@@ -2104,6 +2828,7 @@ actor WorkspaceCodemapBindingEngine {
 
                 while let result = await group.next() {
                     completed.append(result)
+                    advanceGraphIndexBatchProgress(jobID: jobID, rootEpoch: rootEpoch)
                     guard nextIndex < misses.count else { continue }
                     let index = nextIndex
                     let candidate = misses[index]
@@ -2125,7 +2850,8 @@ actor WorkspaceCodemapBindingEngine {
                             rootEpoch: rootEpoch,
                             candidate: candidate,
                             pipelineIdentity: pipelineIdentity,
-                            classification: classification
+                            classification: classification,
+                            sourceAuthority: sourceAuthorityByFileID[candidate.identity.fileID]
                         )
                         return IndexedGraphIndexCandidateResolution(
                             index: index,
@@ -2202,55 +2928,6 @@ actor WorkspaceCodemapBindingEngine {
             guard case let .entry(_, record) = resolution else { return nil }
             return record
         }
-        let manifestFileIDsByRelativePath = Dictionary(uniqueKeysWithValues: orderedResolutions.compactMap {
-            resolution -> (String, UUID)? in
-            guard case let .entry(entry, record?) = resolution else { return nil }
-            return (record.repositoryRelativePath, entry.identity.fileID)
-        })
-        var markerReadinessUnavailableFileIDs = Set<UUID>()
-        if !manifestRecords.isEmpty {
-            guard updateGraphIndexPhase(
-                jobID: jobID,
-                rootEpoch: rootEpoch,
-                phase: .writingManifestCheckpoint
-            ) else { return .cancelled }
-            let grouped = Dictionary(grouping: manifestRecords, by: { $0.artifactKey.pipelineIdentity })
-            for (pipelineIdentity, records) in grouped {
-                let pipelineFileIDs = Set(records.compactMap {
-                    manifestFileIDsByRelativePath[$0.repositoryRelativePath]
-                })
-                for mutations in boundedManifestMutationBatches(records.map(ManifestMutation.upsert)) {
-                    let submission = await submitManifestMutations(
-                        rootEpoch: rootEpoch,
-                        pipelineIdentity: pipelineIdentity,
-                        mutations: mutations,
-                        proof: .graphIndex(jobID: jobID, generation: generation),
-                        retainRecordsInMemory: true
-                    )
-                    guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
-                        return .cancelled
-                    }
-                    switch submission {
-                    case .persisted:
-                        markerReadinessUnavailableFileIDs.subtract(pipelineFileIDs)
-                    case .durabilityFailure:
-                        markerReadinessUnavailableFileIDs.formUnion(mutations.compactMap {
-                            manifestFileIDsByRelativePath[$0.repositoryRelativePath]
-                        })
-                    case .retry:
-                        return .retry
-                    case let .budget(budget):
-                        finishGraphIndexForBudget(
-                            jobID: jobID,
-                            rootEpoch: rootEpoch,
-                            budget: budget
-                        )
-                        return .budgetLimited
-                    }
-                }
-            }
-        }
-
         let changeGroups: [GraphIndexChangeGroup]
         switch graphIndexChangeGroups(entries) {
         case let .groups(groups):
@@ -2363,8 +3040,7 @@ actor WorkspaceCodemapBindingEngine {
                     progress: advanced,
                     enumerationFinished: false,
                     jobID: jobID,
-                    rootEpoch: rootEpoch,
-                    markerReadinessUnavailableFileIDs: markerReadinessUnavailableFileIDs
+                    rootEpoch: rootEpoch
                 )
                 releaseStagedGraphIndexBytes(
                     jobID: jobID,
@@ -2381,6 +3057,7 @@ actor WorkspaceCodemapBindingEngine {
                     job = graphIndexJobs[rootEpoch]!
                     job.progress = accepted
                     job.nextGraphChangeSequence += 1
+                    job.lastProgressUptimeNanoseconds = uptimeNanoseconds()
                     job.retry = nil
                     graphIndexJobs[rootEpoch] = job
                     incrementCounter(\.graphIndexChangesPublished)
@@ -2432,6 +3109,26 @@ actor WorkspaceCodemapBindingEngine {
             }
         }
 
+        if !manifestRecords.isEmpty {
+            guard updateGraphIndexPhase(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                phase: .stagingManifestCache
+            ) else { return .cancelled }
+            let recordsByPipeline = Dictionary(
+                grouping: manifestRecords,
+                by: { $0.artifactKey.pipelineIdentity }
+            )
+            for (pipelineIdentity, records) in recordsByPipeline {
+                guard stageGraphIndexManifestRecords(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    records: records
+                ) else { return .cancelled }
+            }
+        }
+
         guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return .cancelled }
         // Change progress already includes this page. For an empty page it was advanced above.
         guard job.progress.counts.supportedCandidateCount == page.supportedCandidateCountThroughPage
@@ -2442,14 +3139,29 @@ actor WorkspaceCodemapBindingEngine {
         job.cursor = page.nextCursor
         job.lastProcessedCursor = pageLastCursor
         progress = graphIndexProgress(progress, phase: .checkpointed)
+        let checkpointedUptimeNanoseconds = uptimeNanoseconds()
         job.phase = .checkpointed
+        job.phaseEnteredUptimeNanoseconds = checkpointedUptimeNanoseconds
+        job.lastProgressUptimeNanoseconds = checkpointedUptimeNanoseconds
         job.progress = progress
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
         job.retryAttempt = 0
         job.retry = nil
+        if !job.workerRecoveryExhausted {
+            job.workerRecoveryCount = 0
+        }
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
+        #if DEBUG
+            recordGraphIndexDebugEvent(
+                kind: .graphIndexCheckpointed,
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                phase: .checkpointed,
+                reason: .checkpointed
+            )
+        #endif
 
         guard page.isEnd else { return .checkpointed }
         guard let completion = catalogCompletion,
@@ -2467,7 +3179,16 @@ actor WorkspaceCodemapBindingEngine {
         }
         switch finalDisposition {
         case let .accepted(accepted), let .exactDuplicate(accepted):
-            completedJob.phase = .complete
+            let completedUptimeNanoseconds = uptimeNanoseconds()
+            let hasSealWork = completedJob.manifestStages.values.contains {
+                !$0.isDegraded && !$0.stagedRecordsByPath.isEmpty
+            }
+            completedJob.manifestSealState = hasSealWork ? .enumerationSealed : (
+                completedJob.manifestStages.values.contains(where: \.isDegraded) ? .degraded : .durable
+            )
+            completedJob.phase = hasSealWork ? .persistingManifestCache : .complete
+            completedJob.phaseEnteredUptimeNanoseconds = completedUptimeNanoseconds
+            completedJob.lastProgressUptimeNanoseconds = completedUptimeNanoseconds
             completedJob.progress = accepted
             completedJob.inBatchProgress = nil
             completedJob.pageStartProcessedCandidateBaseline = nil
@@ -2508,17 +3229,238 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func loadGraphIndexManifestRecords(
+    private func persistGraphIndexManifestSeal(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              let generation = job.generation
+        else { return }
+        let pipelineIdentities = Array(job.manifestStages.keys)
+        job.manifestSealState = .persisting
+        job.phase = .persistingManifestCache
+        job.phaseEnteredUptimeNanoseconds = uptimeNanoseconds()
+        graphIndexJobs[rootEpoch] = job
+
+        for pipelineIdentity in pipelineIdentities {
+            guard let current = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+                  let stage = current.manifestStages[pipelineIdentity]
+            else { return }
+            guard !stage.isDegraded, !stage.stagedRecordsByPath.isEmpty else {
+                heartbeatGraphIndexManifestSealStage(jobID: jobID, rootEpoch: rootEpoch)
+                continue
+            }
+            let submission = await submitManifestMutations(
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                mutations: stage.stagedRecordsByPath.values.map(ManifestMutation.upsert),
+                proof: .graphIndex(
+                    jobID: jobID,
+                    generation: generation,
+                    origin: .enumerationSeal
+                ),
+                retainRecordsInMemory: true
+            )
+            guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else { return }
+            switch submission {
+            case .persisted:
+                finishGraphIndexManifestStage(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    degraded: false
+                )
+            case let .staleAuthority(observedAuthority):
+                if let restampedRecords = recoverVirginGraphIndexSealAuthority(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    observedAuthority: observedAuthority
+                ) {
+                    let recovery = await submitManifestMutations(
+                        rootEpoch: rootEpoch,
+                        pipelineIdentity: pipelineIdentity,
+                        mutations: restampedRecords.map(ManifestMutation.upsert),
+                        proof: .graphIndex(
+                            jobID: jobID,
+                            generation: generation,
+                            origin: .enumerationSeal
+                        ),
+                        retainRecordsInMemory: true
+                    )
+                    let recoveryPersisted = if case .persisted = recovery { true } else { false }
+                    finishGraphIndexManifestStage(
+                        jobID: jobID,
+                        rootEpoch: rootEpoch,
+                        pipelineIdentity: pipelineIdentity,
+                        degraded: !recoveryPersisted
+                    )
+                } else {
+                    finishGraphIndexManifestStage(
+                        jobID: jobID,
+                        rootEpoch: rootEpoch,
+                        pipelineIdentity: pipelineIdentity,
+                        degraded: true
+                    )
+                }
+            case .discarded, .durabilityFailure, .retry, .budget:
+                finishGraphIndexManifestStage(
+                    jobID: jobID,
+                    rootEpoch: rootEpoch,
+                    pipelineIdentity: pipelineIdentity,
+                    degraded: true
+                )
+            }
+            heartbeatGraphIndexManifestSealStage(jobID: jobID, rootEpoch: rootEpoch)
+        }
+        guard var completed = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) else { return }
+        completed.manifestSealState = completed.manifestStages.values.contains(where: \.isDegraded)
+            ? .degraded
+            : .durable
+        completed.phase = .complete
+        let completedUptimeNanoseconds = uptimeNanoseconds()
+        completed.phaseEnteredUptimeNanoseconds = completedUptimeNanoseconds
+        completed.lastProgressUptimeNanoseconds = completedUptimeNanoseconds
+        completed.checkpoint = makeGraphIndexCheckpoint(completed)
+        releaseGraphIndexManifestStageStorage(&completed)
+        graphIndexJobs[rootEpoch] = completed
+    }
+
+    private func heartbeatGraphIndexManifestSealStage(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) else { return }
+        job.lastProgressUptimeNanoseconds = uptimeNanoseconds()
+        graphIndexJobs[rootEpoch] = job
+    }
+
+    private func recoverVirginGraphIndexSealAuthority(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         pipelineIdentity: CodeMapPipelineIdentity,
-        candidatePaths: Set<String>
+        observedAuthority: CodeMapRootManifestAuthority
+    ) -> [CodeMapRootManifestRecord]? {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              var stage = job.manifestStages[pipelineIdentity],
+              stage.wasVirginAtLoad,
+              !stage.sealAuthorityRecoveryAttempted
+        else { return nil }
+        stage.sealAuthorityRecoveryAttempted = true
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+
+        guard case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[pipelineIdentity],
+              pipeline.id == stage.pipelineSessionID,
+              pipeline.namespace == stage.namespace,
+              observedAuthority != pipeline.authority,
+              observedAuthority.authorityGeneration >= pipeline.authority.authorityGeneration,
+              observedAuthority.authorityGeneration < UInt64.max,
+              pipeline.persistedManifestRevision == 0,
+              pipeline.manifestRevision == 1,
+              pipeline.pendingManifestChanges.isEmpty
+        else { return nil }
+        let stagedPaths = Set(stage.stagedRecordsByPath.keys)
+        guard Set(pipeline.manifestRecords.keys).isSubset(of: stagedPaths),
+              Set(pipeline.automaticSelectionCandidateRecords.keys).isSubset(of: stagedPaths)
+        else { return nil }
+        let workKey = ManifestWriterWorkKey(
+            scope: PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity),
+            sessionID: session.id,
+            pipelineSessionID: pipeline.id
+        )
+        if let writer = manifestWriters[pipeline.namespace] {
+            guard writer.inFlightBatch?.workKey != workKey,
+                  writer.deferredHeadBatch?.workKey != workKey,
+                  !writer.queuedWork.contains(where: { $0.workKey == workKey }),
+                  !writer.deferredWork.contains(where: { $0.workKey == workKey })
+            else { return nil }
+        }
+        let currentAuthority = pipeline.authority
+        guard let liftedAuthority = try? CodeMapRootManifestAuthority(
+            authorityGeneration: observedAuthority.authorityGeneration + 1,
+            repositoryBindingEpoch: currentAuthority.repositoryBindingEpoch,
+            worktreeBindingEpoch: currentAuthority.worktreeBindingEpoch,
+            layoutGeneration: currentAuthority.layoutGeneration,
+            indexGeneration: currentAuthority.indexGeneration,
+            checkoutConfigurationGeneration: currentAuthority.checkoutConfigurationGeneration,
+            attributeGeneration: currentAuthority.attributeGeneration,
+            sparseGeneration: currentAuthority.sparseGeneration,
+            metadataGeneration: currentAuthority.metadataGeneration
+        ) else { return nil }
+        let restamped = stage.stagedRecordsByPath.values.compactMap {
+            try? $0.restampedVerifiedAuthority(
+                namespace: pipeline.namespace,
+                authority: liftedAuthority
+            )
+        }
+        guard restamped.count == stage.stagedRecordsByPath.count else { return nil }
+        pipeline.authority = liftedAuthority
+        pipeline.previouslyObservedManifestAuthority = observedAuthority
+        for record in restamped {
+            pipeline.manifestRecords[record.repositoryRelativePath] = record
+            if record.contributionEnvelope != nil {
+                pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
+            }
+            stage.cachedRecordsByPath[record.repositoryRelativePath] = record
+            stage.stagedRecordsByPath[record.repositoryRelativePath] = record
+        }
+        session.pipelines[pipelineIdentity] = pipeline
+        roots[rootEpoch] = .eligible(session)
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+        return restamped
+    }
+
+    private func finishGraphIndexManifestStage(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        degraded: Bool
+    ) {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              var stage = job.manifestStages[pipelineIdentity]
+        else { return }
+        let releasedByteCount = stage.stagedByteCount
+        graphIndexManifestStagedByteCount = graphIndexManifestStagedByteCount >= releasedByteCount
+            ? graphIndexManifestStagedByteCount - releasedByteCount
+            : 0
+        job.manifestStagedByteCount = job.manifestStagedByteCount >= releasedByteCount
+            ? job.manifestStagedByteCount - releasedByteCount
+            : 0
+        stage.stagedRecordsByPath.removeAll(keepingCapacity: false)
+        stage.stagedByteCount = 0
+        stage.isDegraded = stage.isDegraded || degraded
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+    }
+
+    private func loadGraphIndexManifestRecords(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity
     ) async -> [String: CodeMapRootManifestRecord]? {
         guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
               let pipeline = session.pipelines[pipelineIdentity]
         else { return nil }
+        if let stage = job.manifestStages[pipelineIdentity] {
+            guard stage.namespace == pipeline.namespace,
+                  stage.pipelineSessionID == pipeline.id
+            else { return nil }
+            return stage.cachedRecordsByPath
+        }
         incrementCounter(\.manifestLoads)
+        #if DEBUG
+            incrementCounter(\.graphIndexPageManifestLoads)
+            let debugLoadStartedUptimeNanoseconds = uptimeNanoseconds()
+            updateDebugManifestMeasurements(
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                origin: .page
+            ) { $0.add(\.loadCount) }
+        #endif
         let load: CodeMapRootManifestLoadResult
         do {
             load = try await runtime.manifestStore.loadCurrentManifest(
@@ -2526,11 +3468,50 @@ actor WorkspaceCodemapBindingEngine {
                 currentAuthority: pipeline.authority
             )
         } catch {
+            #if DEBUG
+                let debugLoadCompletedUptimeNanoseconds = uptimeNanoseconds()
+                updateDebugManifestMeasurements(
+                    rootEpoch: rootEpoch,
+                    jobID: jobID,
+                    origin: .page
+                ) {
+                    $0.add(
+                        \.loadDurationNanoseconds,
+                        elapsedNanoseconds(
+                            from: debugLoadStartedUptimeNanoseconds,
+                            to: debugLoadCompletedUptimeNanoseconds
+                        )
+                    )
+                }
+            #endif
             guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil else { return nil }
             incrementCounter(\.graphIndexEnvelopeInvalid)
             emit(.graphIndexEnvelopeInvalid, rootEpoch: rootEpoch, graphIndexPhase: .loadingEnvelopes)
-            return [:]
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: [],
+                observedAuthority: nil,
+                isDegraded: true
+            )
         }
+        #if DEBUG
+            let debugLoadCompletedUptimeNanoseconds = uptimeNanoseconds()
+            updateDebugManifestMeasurements(
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                origin: .page
+            ) {
+                $0.add(
+                    \.loadDurationNanoseconds,
+                    elapsedNanoseconds(
+                        from: debugLoadStartedUptimeNanoseconds,
+                        to: debugLoadCompletedUptimeNanoseconds
+                    )
+                )
+            }
+        #endif
         guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
               job.sessionID == session.id
         else { return nil }
@@ -2543,8 +3524,29 @@ actor WorkspaceCodemapBindingEngine {
                 pipelineIdentity: pipelineIdentity,
                 manifestGeneration: nil
             )
-            return [:]
-        case .stale:
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: [],
+                observedAuthority: nil,
+                isDegraded: false
+            )
+        case let .stale(existingAuthority):
+            guard currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil,
+                  case var .eligible(currentSession)? = roots[rootEpoch],
+                  currentSession.id == session.id,
+                  var currentPipeline = currentSession.pipelines[pipelineIdentity],
+                  currentPipeline.id == pipeline.id
+            else { return nil }
+            _ = liftManifestAuthorityIfVirgin(
+                scope: PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity),
+                observedAuthority: existingAuthority,
+                session: &currentSession,
+                pipeline: &currentPipeline
+            )
+            currentSession.pipelines[pipelineIdentity] = currentPipeline
+            roots[rootEpoch] = .eligible(currentSession)
             incrementCounter(\.graphIndexEnvelopeStale)
             emit(.graphIndexEnvelopeStale, rootEpoch: rootEpoch, graphIndexPhase: .loadingEnvelopes)
             updateGraphIndexPipelineScope(
@@ -2553,7 +3555,14 @@ actor WorkspaceCodemapBindingEngine {
                 pipelineIdentity: pipelineIdentity,
                 manifestGeneration: nil
             )
-            return [:]
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: [],
+                observedAuthority: existingAuthority,
+                isDegraded: false
+            )
         case let .hit(snapshot):
             guard snapshot.namespace == pipeline.namespace,
                   snapshot.authority == pipeline.authority
@@ -2568,12 +3577,131 @@ actor WorkspaceCodemapBindingEngine {
                 pipelineIdentity: pipelineIdentity,
                 manifestGeneration: snapshot.manifestGeneration
             )
-            return Dictionary(uniqueKeysWithValues: snapshot.records.compactMap { record in
-                candidatePaths.contains(record.repositoryRelativePath)
-                    ? (record.repositoryRelativePath, record)
-                    : nil
-            })
+            return installGraphIndexManifestStage(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                pipelineIdentity: pipelineIdentity,
+                records: snapshot.records,
+                observedAuthority: snapshot.authority,
+                isDegraded: false
+            )
         }
+    }
+
+    private func installGraphIndexManifestStage(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        records: [CodeMapRootManifestRecord],
+        observedAuthority: CodeMapRootManifestAuthority?,
+        isDegraded: Bool
+    ) -> [String: CodeMapRootManifestRecord]? {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[pipelineIdentity]
+        else { return nil }
+        if let observedAuthority {
+            pipeline.previouslyObservedManifestAuthority = observedAuthority
+        }
+        let retainedCount = job.manifestStages.values.reduce(0) {
+            addingSaturating($0, $1.cachedRecordsByPath.count)
+        }
+        let projectedCount = addingSaturating(retainedCount, records.count)
+        let exceedsRecordCap = projectedCount > policy.maximumRetainedManifestRecordCountPerRoot
+        let cachedRecordsByPath = exceedsRecordCap
+            ? [:]
+            : Dictionary(uniqueKeysWithValues: records.map { ($0.repositoryRelativePath, $0) })
+        let scope = PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity)
+        job.manifestStages[pipelineIdentity] = GraphIndexManifestStage(
+            namespace: pipeline.namespace,
+            pipelineSessionID: pipeline.id,
+            cachedRecordsByPath: cachedRecordsByPath,
+            stagedRecordsByPath: [:],
+            stagedByteCount: 0,
+            isDegraded: isDegraded || exceedsRecordCap,
+            sealAuthorityRecoveryAttempted: false,
+            wasVirginAtLoad: manifestPipelineIsVirgin(
+                scope: scope,
+                session: session,
+                pipeline: pipeline
+            )
+        )
+        session.pipelines[pipelineIdentity] = pipeline
+        roots[rootEpoch] = .eligible(session)
+        graphIndexJobs[rootEpoch] = job
+        return cachedRecordsByPath
+    }
+
+    private func stageGraphIndexManifestRecords(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        records: [CodeMapRootManifestRecord]
+    ) -> Bool {
+        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              var stage = job.manifestStages[pipelineIdentity],
+              case let .eligible(session)? = roots[rootEpoch],
+              let pipeline = session.pipelines[pipelineIdentity],
+              stage.namespace == pipeline.namespace,
+              stage.pipelineSessionID == pipeline.id
+        else { return false }
+        guard !stage.isDegraded else { return true }
+
+        var projectedStageBytes = stage.stagedByteCount
+        var projectedGlobalBytes = graphIndexManifestStagedByteCount
+        var projectedCachedCount = job.manifestStages.values.reduce(0) {
+            addingSaturating($0, $1.cachedRecordsByPath.count)
+        }
+        for record in records {
+            let oldByteCount = stage.stagedRecordsByPath[record.repositoryRelativePath].map {
+                manifestMutationByteCount(.upsert($0))
+            } ?? 0
+            let newByteCount = manifestMutationByteCount(.upsert(record))
+            projectedStageBytes = projectedStageBytes >= oldByteCount
+                ? projectedStageBytes - oldByteCount
+                : 0
+            projectedGlobalBytes = projectedGlobalBytes >= oldByteCount
+                ? projectedGlobalBytes - oldByteCount
+                : 0
+            projectedStageBytes = addingSaturating(projectedStageBytes, newByteCount)
+            projectedGlobalBytes = addingSaturating(projectedGlobalBytes, newByteCount)
+            if stage.cachedRecordsByPath[record.repositoryRelativePath] == nil {
+                projectedCachedCount = addingSaturating(projectedCachedCount, 1)
+            }
+            guard projectedCachedCount <= policy.maximumRetainedManifestRecordCountPerRoot,
+                  projectedStageBytes <= policy.maximumQueuedGraphIndexManifestMutationByteCountPerRoot,
+                  projectedGlobalBytes <= policy.maximumQueuedGraphIndexManifestMutationByteCount
+            else {
+                graphIndexManifestStagedByteCount = graphIndexManifestStagedByteCount >= stage.stagedByteCount
+                    ? graphIndexManifestStagedByteCount - stage.stagedByteCount
+                    : 0
+                job.manifestStagedByteCount = job.manifestStagedByteCount >= stage.stagedByteCount
+                    ? job.manifestStagedByteCount - stage.stagedByteCount
+                    : 0
+                stage.stagedRecordsByPath.removeAll(keepingCapacity: false)
+                stage.stagedByteCount = 0
+                stage.isDegraded = true
+                job.manifestStages[pipelineIdentity] = stage
+                job.manifestSealState = .degraded
+                graphIndexJobs[rootEpoch] = job
+                return true
+            }
+            stage.cachedRecordsByPath[record.repositoryRelativePath] = record
+            stage.stagedRecordsByPath[record.repositoryRelativePath] = record
+        }
+        let priorStageByteCount = stage.stagedByteCount
+        stage.stagedByteCount = projectedStageBytes
+        job.manifestStagedByteCount = job.manifestStagedByteCount >= priorStageByteCount
+            ? job.manifestStagedByteCount - priorStageByteCount
+            : 0
+        job.manifestStagedByteCount = addingSaturating(
+            job.manifestStagedByteCount,
+            projectedStageBytes
+        )
+        graphIndexManifestStagedByteCount = projectedGlobalBytes
+        job.manifestStages[pipelineIdentity] = stage
+        graphIndexJobs[rootEpoch] = job
+        return true
     }
 
     private func graphIndexEntry(
@@ -2664,7 +3792,8 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         candidate: WorkspaceCodemapGraphIndexCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity,
-        classification: GitBlobIdentityClassification
+        classification: GitBlobIdentityClassification,
+        sourceAuthority: WorkspaceCodemapSourceAuthorityToken?
     ) async -> GraphIndexCandidateResolution {
         guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
@@ -2708,18 +3837,14 @@ actor WorkspaceCodemapBindingEngine {
             break
         }
 
-        let sourceAuthority = await capabilityService.makeSourceAuthority(
-            capability: session.capability,
-            observedRootEpoch: rootEpoch,
-            observedRepositoryAuthority: job.repositoryAuthority,
-            candidateRepositoryRelativePath: repositoryRelativePath,
-            observedPathGeneration: candidate.pathGeneration,
-            currentPathGeneration: candidate.pathGeneration,
-            observedIngressGeneration: job.ingressGeneration,
-            currentIngressGeneration: session.registration.ingressGeneration
-        )
         guard !Task.isCancelled,
               let sourceAuthority,
+              sourceAuthority.isFactoryValidated,
+              sourceAuthority.rootEpoch == rootEpoch,
+              sourceAuthority.repositoryAuthority == job.repositoryAuthority,
+              sourceAuthority.standardizedRepositoryRelativePath == repositoryRelativePath,
+              sourceAuthority.pathGeneration == candidate.pathGeneration,
+              sourceAuthority.ingressGeneration == job.ingressGeneration,
               graphIndexCandidateIsCurrent(
                   jobID: jobID,
                   rootEpoch: rootEpoch,
@@ -3181,6 +4306,8 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
         slots: [WorkspaceCodemapGraphSlot],
+        projectedSupportedCandidateTotal: UInt64? = nil,
+        catalogSealed: Bool = false,
         enumerationFinished: Bool
     ) async -> Bool {
         guard let graph = selectionGraphsByRootEpoch[rootEpoch] else { return false }
@@ -3188,6 +4315,8 @@ actor WorkspaceCodemapBindingEngine {
             rootEpoch: rootEpoch,
             catalogToken: catalogToken,
             slots: slots,
+            projectedSupportedCandidateTotal: projectedSupportedCandidateTotal,
+            catalogSealed: catalogSealed,
             enumerationFinished: enumerationFinished,
             reconciliationFence: { fileIDs, reason in
                 await graph.fenceFiles(fileIDs: fileIDs, reason: reason)
@@ -3216,6 +4345,7 @@ actor WorkspaceCodemapBindingEngine {
                   rootEpoch: rootEpoch,
                   catalogToken: generation.catalogToken,
                   slots: slots,
+                  catalogSealed: enumerationFinished,
                   enumerationFinished: enumerationFinished
               ),
               let overlaySnapshot = await overlay.snapshot(rootEpoch: rootEpoch),
@@ -3295,6 +4425,7 @@ actor WorkspaceCodemapBindingEngine {
         let now = uptimeNanoseconds()
         let next = addingSaturating(now, nanoseconds)
         job.phase = .suspendedBusy
+        job.phaseEnteredUptimeNanoseconds = now
         job.retryAttempt = attempt
         job.retry = WorkspaceCodemapGraphIndexRetry(
             attempt: attempt,
@@ -3378,7 +4509,10 @@ actor WorkspaceCodemapBindingEngine {
               graphIndexJobAuthorityIsCurrent(job),
               job.generation != nil
         else { return false }
+        let resetUptimeNanoseconds = uptimeNanoseconds()
         job.phase = .waitingForAdmission
+        job.phaseEnteredUptimeNanoseconds = resetUptimeNanoseconds
+        job.lastProgressUptimeNanoseconds = resetUptimeNanoseconds
         job.generation = nil
         job.cursor = nil
         job.lastProcessedCursor = nil
@@ -3387,6 +4521,7 @@ actor WorkspaceCodemapBindingEngine {
         job.pageStartProcessedCandidateBaseline = nil
         job.nextGraphChangeSequence = 0
         job.pipelineScopes = [:]
+        discardGraphIndexManifestStages(&job)
         job.resources = .zero
         job.pendingManifestMutationCount = 0
         job.retryAttempt = 0
@@ -3467,9 +4602,19 @@ actor WorkspaceCodemapBindingEngine {
             return false
         }
         job.phase = phase
+        job.phaseEnteredUptimeNanoseconds = uptimeNanoseconds()
         job.progress = graphIndexProgress(job.progress, phase: phase)
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
+        #if DEBUG
+            recordGraphIndexDebugEvent(
+                kind: .graphIndexPhaseEntered,
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                phase: phase,
+                reason: .phaseEntered
+            )
+        #endif
         return true
     }
 
@@ -3490,7 +4635,42 @@ actor WorkspaceCodemapBindingEngine {
     ) {
         guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
         job.progress = progress
+        job.lastProgressUptimeNanoseconds = uptimeNanoseconds()
         job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
+    }
+
+    private func beginGraphIndexBatchProgress(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        candidateCount: UInt64
+    ) {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
+        job.inBatchProgress = WorkspaceCodemapGraphIndexInBatchProgress(
+            batchID: UUID(),
+            acceptedProcessedCandidateBaseline: job.progress.counts.processedCandidateCount,
+            resolvedCandidateCount: 0,
+            candidateCount: candidateCount
+        )
+        job.lastProgressUptimeNanoseconds = uptimeNanoseconds()
+        graphIndexJobs[rootEpoch] = job
+    }
+
+    private func advanceGraphIndexBatchProgress(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID,
+              let progress = job.inBatchProgress,
+              progress.resolvedCandidateCount < progress.candidateCount
+        else { return }
+        job.inBatchProgress = WorkspaceCodemapGraphIndexInBatchProgress(
+            batchID: progress.batchID,
+            acceptedProcessedCandidateBaseline: progress.acceptedProcessedCandidateBaseline,
+            resolvedCandidateCount: progress.resolvedCandidateCount + 1,
+            candidateCount: progress.candidateCount
+        )
+        job.lastProgressUptimeNanoseconds = uptimeNanoseconds()
         graphIndexJobs[rootEpoch] = job
     }
 
@@ -3778,6 +4958,7 @@ actor WorkspaceCodemapBindingEngine {
         guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
         incrementCounter(\.graphIndexBudgetRejections)
         job.phase = .budgetLimited
+        job.phaseEnteredUptimeNanoseconds = uptimeNanoseconds()
         job.progress = graphIndexProgress(job.progress, phase: .budgetLimited)
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
@@ -3796,6 +4977,7 @@ actor WorkspaceCodemapBindingEngine {
     private func supersedeGraphIndexJob(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
         guard var job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
         job.phase = .superseded
+        job.phaseEnteredUptimeNanoseconds = uptimeNanoseconds()
         job.progress = graphIndexProgress(job.progress, phase: .superseded)
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
@@ -3805,22 +4987,263 @@ actor WorkspaceCodemapBindingEngine {
         emit(.graphIndexCoverageSuperseded, rootEpoch: rootEpoch, graphIndexPhase: .superseded)
     }
 
-    private func finishGraphIndexWorker(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
+    private func armGraphIndexWatchdog(
+        jobID: UUID,
+        workerID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
+        let milliseconds = policy.graphIndexWorkerNoProgressTimeoutMilliseconds
+        let nanoseconds = milliseconds.multipliedReportingOverflow(by: 1_000_000).overflow
+            ? UInt64.max
+            : milliseconds * 1_000_000
+        graphIndexWatchdogTasks[jobID] = Task(priority: .utility) { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            await evaluateGraphIndexWatchdog(
+                jobID: jobID,
+                workerID: workerID,
+                rootEpoch: rootEpoch,
+                nowUptimeNanoseconds: nil
+            )
+        }
+    }
+
+    @discardableResult
+    private func evaluateGraphIndexWatchdog(
+        jobID: UUID,
+        workerID: UUID?,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        nowUptimeNanoseconds: UInt64?
+    ) -> WorkspaceCodemapGraphIndexWatchdogDisposition {
+        guard var job = graphIndexJobs[rootEpoch],
+              job.id == jobID,
+              graphIndexJobIsCurrent(job)
+        else { return .unavailable }
+        if graphIndexJobPhaseIsTerminal(job.phase) {
+            graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
+            return .terminal
+        }
+        if let workerID, job.workerID != workerID {
+            return .current
+        }
+        let now = nowUptimeNanoseconds ?? uptimeNanoseconds()
+        let timeoutNanoseconds = policy.graphIndexWorkerNoProgressTimeoutMilliseconds
+            .multipliedReportingOverflow(by: 1_000_000)
+        let timeout = timeoutNanoseconds.overflow ? UInt64.max : timeoutNanoseconds.partialValue
+        let age = now >= job.lastProgressUptimeNanoseconds
+            ? now - job.lastProgressUptimeNanoseconds
+            : 0
+        guard age >= timeout else {
+            if let currentWorkerID = job.workerID {
+                armGraphIndexWatchdog(
+                    jobID: jobID,
+                    workerID: currentWorkerID,
+                    rootEpoch: rootEpoch
+                )
+            }
+            return .current
+        }
+        guard !job.workerRecoveryExhausted,
+              job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount
+        else {
+            job.workerRecoveryExhausted = true
+            job.lastWorkerCompletionReason = .watchdogRecoveryExhausted
+            job.workerRestartRequestedReason = nil
+            let task = job.task
+            graphIndexJobs[rootEpoch] = job
+            graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
+            // A cancellation-ignoring worker may still own mutation/publication work for an admitted batch.
+            // Keep its admission and resources quarantined until finishGraphIndexWorker releases them.
+            task?.cancel()
+            #if DEBUG
+                recordGraphIndexDebugEvent(
+                    kind: .graphIndexWorkerFinished,
+                    rootEpoch: rootEpoch,
+                    jobID: jobID,
+                    phase: job.phase,
+                    reason: .watchdogRecoveryExhausted
+                )
+            #endif
+            return .exhausted
+        }
+        #if DEBUG
+            recordGraphIndexDebugEvent(
+                kind: .graphIndexWorkerFinished,
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                phase: job.phase,
+                reason: .watchdogNoProgress
+            )
+        #endif
+        guard job.task != nil else {
+            return startGraphIndexWorker(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                recoveryReason: .watchdogNoProgress
+            ) ? .restarted : .unavailable
+        }
+        requestGraphIndexWorkerRestart(
+            jobID: jobID,
+            rootEpoch: rootEpoch,
+            reason: .watchdogNoProgress,
+            countsTowardRecoveryLimit: true
+        )
+        if let currentWorkerID = job.workerID {
+            armGraphIndexWatchdog(
+                jobID: jobID,
+                workerID: currentWorkerID,
+                rootEpoch: rootEpoch
+            )
+        }
+        return .restartRequested
+    }
+
+    private func requestGraphIndexWorkerRestart(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        reason: WorkspaceCodemapGraphIndexWorkerCompletionReason,
+        countsTowardRecoveryLimit: Bool = false
+    ) {
+        guard var job = graphIndexJobs[rootEpoch],
+              job.id == jobID,
+              graphIndexJobIsCurrent(job),
+              !graphIndexJobPhaseIsTerminal(job.phase)
+        else { return }
+        job.workerRestartRequestedReason = reason
+        job.lastWorkerCompletionReason = reason
+        if countsTowardRecoveryLimit {
+            job.workerRecoveryCount = addingSaturating(job.workerRecoveryCount, 1)
+        }
+        let task = job.task
+        graphIndexJobs[rootEpoch] = job
+        if !job.isActiveBatch {
+            cancelGraphIndexAdmission(jobID: jobID)
+        }
+        task?.cancel()
+    }
+
+    private func finishGraphIndexWorker(
+        jobID: UUID,
+        workerID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        reason: WorkspaceCodemapGraphIndexWorkerCompletionReason
+    ) {
+        guard var job = graphIndexJobs[rootEpoch], job.id == jobID else {
+            activeGraphIndexJobIDs.remove(jobID)
+            cancelGraphIndexAdmission(jobID: jobID)
+            drainingGraphIndexTasks.removeValue(forKey: jobID)
+            drainingGraphIndexResources.removeValue(forKey: jobID)
+            drainingGraphIndexRootEpochs.removeValue(forKey: jobID)
+            return
+        }
+        guard job.workerID == workerID else { return }
+        graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
         activeGraphIndexJobIDs.remove(jobID)
         cancelGraphIndexAdmission(jobID: jobID)
         drainingGraphIndexTasks.removeValue(forKey: jobID)
         drainingGraphIndexResources.removeValue(forKey: jobID)
         drainingGraphIndexRootEpochs.removeValue(forKey: jobID)
-        if var job = graphIndexJobs[rootEpoch], job.id == jobID {
-            job.task = nil
-            job.isQueuedForAdmission = false
-            job.isActiveBatch = false
-            job.resources = .zero
-            job.checkpoint = makeGraphIndexCheckpoint(job)
-            graphIndexJobs[rootEpoch] = job
+        #if DEBUG
+            debugGraphIndexNonCooperativeWorkerGates.removeValue(forKey: jobID)
+        #endif
+        let restartReason = job.workerRestartRequestedReason
+        job.workerID = nil
+        job.task = nil
+        job.lastWorkerCompletionReason = job.workerRecoveryExhausted
+            ? .watchdogRecoveryExhausted
+            : restartReason ?? reason
+        job.workerRestartRequestedReason = nil
+        job.workerFinishedUptimeNanoseconds = uptimeNanoseconds()
+        job.isQueuedForAdmission = false
+        job.isActiveBatch = false
+        job.resources = .zero
+        job.checkpoint = makeGraphIndexCheckpoint(job)
+        graphIndexJobs[rootEpoch] = job
+        #if DEBUG
+            recordGraphIndexDebugEvent(
+                kind: .graphIndexWorkerFinished,
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                phase: job.phase,
+                reason: graphIndexDebugReason(for: job.lastWorkerCompletionReason ?? reason)
+            )
+        #endif
+        let automaticRecoveryReason: WorkspaceCodemapGraphIndexWorkerCompletionReason? = switch reason {
+        case .admissionUnavailable, .checkpointTransitionRejected, .generationResetRejected,
+             .retryCancelled:
+            reason
+        case .complete, .budgetLimited, .cancelled, .superseded, .currentnessLost,
+             .watchdogNoProgress, .watchdogRecoveryExhausted, .prioritizeRestart:
+            nil
+        }
+        let recoveryReason = restartReason ?? automaticRecoveryReason
+        let watchdogRecoveryWasReserved = restartReason == .watchdogNoProgress
+        if let recoveryReason,
+           !job.workerRecoveryExhausted,
+           watchdogRecoveryWasReserved ||
+           job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount,
+           graphIndexJobIsCurrent(job),
+           !graphIndexJobPhaseIsTerminal(job.phase)
+        {
+            _ = startGraphIndexWorker(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                recoveryReason: watchdogRecoveryWasReserved ? nil : recoveryReason
+            )
         }
         scheduleQueuedRequests()
         scheduleGraphIndexAdmissions()
+    }
+
+    private func graphIndexJobPhaseIsTerminal(_ phase: WorkspaceCodemapGraphIndexPhase) -> Bool {
+        switch phase {
+        case .budgetLimited, .complete, .cancelled, .superseded:
+            true
+        case .scheduled, .waitingForAdmission, .readingCatalogPage, .loadingEnvelopes,
+             .classifyingBatch, .resolvingArtifacts, .stagingManifestCache,
+             .publishingGraphChanges, .checkpointed, .persistingManifestCache, .suspendedBusy:
+            false
+        }
+    }
+
+    #if DEBUG
+        private func graphIndexDebugReason(
+            for reason: WorkspaceCodemapGraphIndexWorkerCompletionReason
+        ) -> WorkspaceCodemapGraphIndexDebugReason {
+            switch reason {
+            case .complete: .workerComplete
+            case .budgetLimited: .workerBudgetLimited
+            case .cancelled: .workerCancelled
+            case .superseded: .workerSuperseded
+            case .currentnessLost: .workerCurrentnessLost
+            case .admissionUnavailable: .workerAdmissionUnavailable
+            case .checkpointTransitionRejected: .workerCheckpointTransitionRejected
+            case .generationResetRejected: .workerGenerationResetRejected
+            case .retryCancelled: .workerRetryCancelled
+            case .watchdogNoProgress: .watchdogNoProgress
+            case .watchdogRecoveryExhausted: .watchdogRecoveryExhausted
+            case .prioritizeRestart: .prioritizeRestart
+            }
+        }
+    #endif
+
+    private func releaseGraphIndexManifestStageStorage(_ job: inout GraphIndexJob) {
+        let releasedByteCount = job.manifestStagedByteCount
+        graphIndexManifestStagedByteCount = graphIndexManifestStagedByteCount >= releasedByteCount
+            ? graphIndexManifestStagedByteCount - releasedByteCount
+            : 0
+        job.manifestStages.removeAll(keepingCapacity: false)
+        job.manifestStagedByteCount = 0
+    }
+
+    private func discardGraphIndexManifestStages(_ job: inout GraphIndexJob) {
+        releaseGraphIndexManifestStageStorage(&job)
+        job.manifestSealState = .discarded
     }
 
     @discardableResult
@@ -3829,6 +5252,11 @@ actor WorkspaceCodemapBindingEngine {
         terminalPhase: WorkspaceCodemapGraphIndexPhase
     ) -> Task<Void, Never>? {
         guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return nil }
+        discardGraphIndexManifestStages(&job)
+        graphIndexWatchdogTasks.removeValue(forKey: job.id)?.cancel()
+        if prioritizedGraphIndexRootEpoch == rootEpoch {
+            prioritizedGraphIndexRootEpoch = nil
+        }
         let wasComplete = job.phase == .complete
         let wasActive = activeGraphIndexJobIDs.contains(job.id)
         job.phase = terminalPhase
@@ -3909,6 +5337,14 @@ actor WorkspaceCodemapBindingEngine {
         )
         guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return .superseded }
         incrementCounter(\.manifestLoads)
+        #if DEBUG
+            let debugLoadStartedUptimeNanoseconds = uptimeNanoseconds()
+            updateDebugManifestMeasurements(
+                rootEpoch: rootEpoch,
+                jobID: nil,
+                origin: .adoption
+            ) { $0.add(\.loadCount) }
+        #endif
         let load: CodeMapRootManifestLoadResult
         do {
             load = try await runtime.manifestStore.loadCurrentManifest(
@@ -3916,12 +5352,44 @@ actor WorkspaceCodemapBindingEngine {
                 currentAuthority: initialPipeline.authority
             )
         } catch {
+            #if DEBUG
+                let debugLoadCompletedUptimeNanoseconds = uptimeNanoseconds()
+                updateDebugManifestMeasurements(
+                    rootEpoch: rootEpoch,
+                    jobID: nil,
+                    origin: .adoption
+                ) {
+                    $0.add(
+                        \.loadDurationNanoseconds,
+                        elapsedNanoseconds(
+                            from: debugLoadStartedUptimeNanoseconds,
+                            to: debugLoadCompletedUptimeNanoseconds
+                        )
+                    )
+                }
+            #endif
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return .superseded }
             updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
             incrementCounter(\.manifestFailures)
             emit(.manifestFailure, rootEpoch: rootEpoch)
             return .retryable
         }
+        #if DEBUG
+            let debugLoadCompletedUptimeNanoseconds = uptimeNanoseconds()
+            updateDebugManifestMeasurements(
+                rootEpoch: rootEpoch,
+                jobID: nil,
+                origin: .adoption
+            ) {
+                $0.add(
+                    \.loadDurationNanoseconds,
+                    elapsedNanoseconds(
+                        from: debugLoadStartedUptimeNanoseconds,
+                        to: debugLoadCompletedUptimeNanoseconds
+                    )
+                )
+            }
+        #endif
         guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return .superseded }
         switch load {
         case .miss:
@@ -3937,6 +5405,14 @@ actor WorkspaceCodemapBindingEngine {
                 snapshot.authority,
                 context: context,
                 rootEpoch: rootEpoch
+            )
+        }
+        if case let .stale(existingAuthority) = load {
+            updateManifestState(.miss, context: context, rootEpoch: rootEpoch)
+            emit(.manifestLoadMiss, rootEpoch: rootEpoch)
+            return .terminal(
+                adoptedReadyCount: 0,
+                observedStaleAuthority: existingAuthority
             )
         }
         guard case let .hit(snapshot) = load,
@@ -3957,40 +5433,53 @@ actor WorkspaceCodemapBindingEngine {
 
         var prepared: [PreparedManifestAdoption] = []
         var automaticSelectionCandidateRecords: [String: CodeMapRootManifestRecord] = [:]
-        for record in snapshot.records {
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
+        let adoptionBatchSize = policy.maximumGraphIndexBatchCandidateCount
+        for batchStart in stride(from: 0, to: snapshot.records.count, by: adoptionBatchSize) {
+            let batchEnd = min(snapshot.records.count, batchStart + adoptionBatchSize)
+            var batchCandidates: [ManifestAdoptionAuthorityCandidate] = []
+            batchCandidates.reserveCapacity(batchEnd - batchStart)
+
+            for record in snapshot.records[batchStart ..< batchEnd] {
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
+                guard record.locatorIdentity.repositoryNamespace == initial.capability.repositoryNamespace,
+                      record.locatorIdentity.blobOID.objectFormat == initial.capability.objectFormat,
+                      record.locatorIdentity.pipelineIdentity == initialPipeline.pipelineIdentity,
+                      let loadedPath = loadedRootPath(
+                          repositoryRelativePath: record.repositoryRelativePath,
+                          prefix: initial.capability.repositoryRelativeLoadedRootPrefix
+                      ), !loadedPath.isEmpty
+                else { continue }
+                let candidate = await catalogClient.resolveManifestBinding(rootEpoch, loadedPath)
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
+                guard let candidate,
+                      candidate.identity.rootID == rootEpoch.rootID,
+                      candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
+                      candidate.identity.standardizedRootPath ==
+                      initial.registration.capabilityRequest.loadedRootURL.path,
+                      candidate.identity.standardizedRelativePath == loadedPath,
+                      candidate.ingressGeneration == initial.registration.ingressGeneration,
+                      candidate.requestGeneration == candidate.pathGeneration,
+                      candidate.pathGeneration == record.bindingGeneration
+                else { continue }
+                batchCandidates.append(ManifestAdoptionAuthorityCandidate(
+                    record: record,
+                    candidate: candidate,
+                    loadedPath: loadedPath
+                ))
             }
-            guard record.locatorIdentity.repositoryNamespace == initial.capability.repositoryNamespace,
-                  record.locatorIdentity.blobOID.objectFormat == initial.capability.objectFormat,
-                  record.locatorIdentity.pipelineIdentity == initialPipeline.pipelineIdentity,
-                  let loadedPath = loadedRootPath(
-                      repositoryRelativePath: record.repositoryRelativePath,
-                      prefix: initial.capability.repositoryRelativeLoadedRootPrefix
-                  ), !loadedPath.isEmpty
-            else { continue }
-            let candidate = await catalogClient.resolveManifestBinding(rootEpoch, loadedPath)
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
-            }
-            guard let candidate,
-                  candidate.identity.rootID == rootEpoch.rootID,
-                  candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
-                  candidate.identity.standardizedRootPath ==
-                  initial.registration.capabilityRequest.loadedRootURL.path,
-                  candidate.identity.standardizedRelativePath == loadedPath,
-                  candidate.ingressGeneration == initial.registration.ingressGeneration,
-                  candidate.requestGeneration == candidate.pathGeneration,
-                  candidate.pathGeneration == record.bindingGeneration
-            else { continue }
+            guard !batchCandidates.isEmpty else { continue }
 
             let classificationBatch = await identityService.classify(
                 workspaceRoot: initial.registration.capabilityRequest.loadedRootURL,
-                relativePaths: [loadedPath]
+                relativePaths: batchCandidates.map(\.loadedPath)
             )
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await closePreparedManifestAdoptions(prepared)
@@ -3998,105 +5487,126 @@ actor WorkspaceCodemapBindingEngine {
                 return .superseded
             }
             guard classificationBatch.failure == nil,
-                  classificationBatch.classifications.count == 1,
-                  let classification = classificationBatch.classifications.first,
-                  manifestClassificationMatches(
-                      classification,
-                      record: record,
-                      candidate: candidate,
-                      session: initial
-                  )
+                  classificationBatch.classifications.count == batchCandidates.count
             else { continue }
 
-            let sourceAuthority = await capabilityService.makeSourceAuthority(
+            var authorityCandidates: [ManifestAdoptionAuthorityCandidate] = []
+            for (classification, candidate) in zip(
+                classificationBatch.classifications,
+                batchCandidates
+            ) where manifestClassificationMatches(
+                classification,
+                record: candidate.record,
+                candidate: candidate.candidate,
+                session: initial
+            ) {
+                authorityCandidates.append(candidate)
+            }
+            guard !authorityCandidates.isEmpty else { continue }
+
+            let sourceAuthorities = await capabilityService.makeSourceAuthorities(
                 capability: initial.capability,
                 observedRootEpoch: rootEpoch,
                 observedRepositoryAuthority: initial.capability.repositoryAuthority,
-                candidateRepositoryRelativePath: record.repositoryRelativePath,
-                observedPathGeneration: candidate.pathGeneration,
-                currentPathGeneration: candidate.pathGeneration,
-                observedIngressGeneration: candidate.ingressGeneration,
-                currentIngressGeneration: initial.registration.ingressGeneration
+                candidates: authorityCandidates.map { candidate in
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: candidate.record.repositoryRelativePath,
+                        observedPathGeneration: candidate.candidate.pathGeneration,
+                        currentPathGeneration: candidate.candidate.pathGeneration,
+                        observedIngressGeneration: candidate.candidate.ingressGeneration,
+                        currentIngressGeneration: initial.registration.ingressGeneration
+                    )
+                }
             )
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch),
+                  sourceAuthorities.count == authorityCandidates.count
+            else {
                 await closePreparedManifestAdoptions(prepared)
                 releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                 return .superseded
             }
-            guard let sourceAuthority else { continue }
-            automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
 
-            let coordinatorResult = try? await runtime.coordinator.resolve(
-                CodeMapArtifactBuildRequest(
-                    ownerID: rootEpoch.rootLifetimeID,
-                    priority: .explicit,
-                    target: .artifactKey(record.artifactKey)
+            for (authorityCandidate, issuedAuthority) in zip(
+                authorityCandidates,
+                sourceAuthorities
+            ) {
+                guard let sourceAuthority = issuedAuthority else { continue }
+                let record = authorityCandidate.record
+                let candidate = authorityCandidate.candidate
+                automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
+
+                let coordinatorResult = try? await runtime.coordinator.resolve(
+                    CodeMapArtifactBuildRequest(
+                        ownerID: rootEpoch.rootLifetimeID,
+                        priority: .explicit,
+                        target: .artifactKey(record.artifactKey)
+                    )
                 )
-            )
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
-            }
-            guard case let .ready(resolution) = coordinatorResult,
-                  let association = try? VerifiedGitBlobCodeMapLocatorAssociation.revalidatePersisted(
-                      identity: record.locatorIdentity,
-                      artifactKey: record.artifactKey,
-                      casHandle: resolution.handle
-                  ), let verifiedRecord = try? makeManifestRecord(
-                      session: initial,
-                      pipeline: initialPipeline,
-                      repositoryRelativePath: record.repositoryRelativePath,
-                      gitMode: record.gitMode,
-                      association: association,
-                      bindingGeneration: record.bindingGeneration
-                  )
-            else { continue }
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
+                guard case let .ready(resolution) = coordinatorResult,
+                      let association = try? VerifiedGitBlobCodeMapLocatorAssociation.revalidatePersisted(
+                          identity: record.locatorIdentity,
+                          artifactKey: record.artifactKey,
+                          casHandle: resolution.handle
+                      ), let verifiedRecord = try? makeManifestRecord(
+                          session: initial,
+                          pipeline: initialPipeline,
+                          repositoryRelativePath: record.repositoryRelativePath,
+                          gitMode: record.gitMode,
+                          association: association,
+                          bindingGeneration: record.bindingGeneration
+                      )
+                else { continue }
 
-            guard record.outcome == .ready || record.outcome == .readyNoSymbols else {
+                guard record.outcome == .ready || record.outcome == .readyNoSymbols else {
+                    prepared.append(PreparedManifestAdoption(
+                        record: verifiedRecord,
+                        candidate: candidate,
+                        sourceAuthority: sourceAuthority,
+                        association: association,
+                        lease: nil
+                    ))
+                    continue
+                }
+                guard reserveAdoptionLease(
+                    relativePath: candidate.identity.standardizedRelativePath,
+                    bytes: resolution.handle.estimatedResidentByteCount,
+                    scope: pipelineScope,
+                    adoptionID: adoptionID
+                ) else {
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    recordBusy(rootEpoch)
+                    return .retryable
+                }
+                guard let lease = try? await runtime.coordinator.acquireLease(for: resolution) else {
+                    releaseAdoptionLeaseReservation(
+                        relativePath: candidate.identity.standardizedRelativePath,
+                        scope: pipelineScope,
+                        adoptionID: adoptionID
+                    )
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .retryable
+                }
+                guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
+                    await lease.close()
+                    await closePreparedManifestAdoptions(prepared)
+                    releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                    return .superseded
+                }
                 prepared.append(PreparedManifestAdoption(
                     record: verifiedRecord,
                     candidate: candidate,
                     sourceAuthority: sourceAuthority,
                     association: association,
-                    lease: nil
+                    lease: lease
                 ))
-                continue
             }
-            guard reserveAdoptionLease(
-                relativePath: candidate.identity.standardizedRelativePath,
-                bytes: resolution.handle.estimatedResidentByteCount,
-                scope: pipelineScope,
-                adoptionID: adoptionID
-            ) else {
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                recordBusy(rootEpoch)
-                return .retryable
-            }
-            guard let lease = try? await runtime.coordinator.acquireLease(for: resolution) else {
-                releaseAdoptionLeaseReservation(
-                    relativePath: candidate.identity.standardizedRelativePath,
-                    scope: pipelineScope,
-                    adoptionID: adoptionID
-                )
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .retryable
-            }
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
-                await lease.close()
-                await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
-                return .superseded
-            }
-            prepared.append(PreparedManifestAdoption(
-                record: verifiedRecord,
-                candidate: candidate,
-                sourceAuthority: sourceAuthority,
-                association: association,
-                lease: lease
-            ))
         }
 
         guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
@@ -4360,6 +5870,59 @@ actor WorkspaceCodemapBindingEngine {
         waiter.resume()
     }
 
+    private func manifestPipelineIsVirgin(
+        scope: PipelineScope,
+        session: Session,
+        pipeline: PipelineSession
+    ) -> Bool {
+        guard pipeline.manifestRevision == 0,
+              pipeline.persistedManifestRevision == 0,
+              pipeline.pendingManifestChanges.isEmpty,
+              pipeline.manifestRecords.isEmpty,
+              pipeline.automaticSelectionCandidateRecords.isEmpty
+        else { return false }
+        let workKey = ManifestWriterWorkKey(
+            scope: scope,
+            sessionID: session.id,
+            pipelineSessionID: pipeline.id
+        )
+        guard let writer = manifestWriters[pipeline.namespace] else { return true }
+        return writer.inFlightBatch?.workKey != workKey &&
+            writer.deferredHeadBatch?.workKey != workKey &&
+            !writer.queuedWork.contains(where: { $0.workKey == workKey }) &&
+            !writer.deferredWork.contains(where: { $0.workKey == workKey })
+    }
+
+    @discardableResult
+    private func liftManifestAuthorityIfVirgin(
+        scope: PipelineScope,
+        observedAuthority: CodeMapRootManifestAuthority,
+        session: inout Session,
+        pipeline: inout PipelineSession
+    ) -> Bool {
+        let currentAuthority = pipeline.authority
+        guard observedAuthority != currentAuthority,
+              observedAuthority.authorityGeneration >= currentAuthority.authorityGeneration,
+              observedAuthority.authorityGeneration < UInt64.max,
+              manifestPipelineIsVirgin(scope: scope, session: session, pipeline: pipeline)
+        else { return false }
+        guard let lifted = try? CodeMapRootManifestAuthority(
+            authorityGeneration: observedAuthority.authorityGeneration + 1,
+            repositoryBindingEpoch: currentAuthority.repositoryBindingEpoch,
+            worktreeBindingEpoch: currentAuthority.worktreeBindingEpoch,
+            layoutGeneration: currentAuthority.layoutGeneration,
+            indexGeneration: currentAuthority.indexGeneration,
+            checkoutConfigurationGeneration: currentAuthority.checkoutConfigurationGeneration,
+            attributeGeneration: currentAuthority.attributeGeneration,
+            sparseGeneration: currentAuthority.sparseGeneration,
+            metadataGeneration: currentAuthority.metadataGeneration
+        )
+        else { return false }
+        pipeline.authority = lifted
+        pipeline.previouslyObservedManifestAuthority = observedAuthority
+        return true
+    }
+
     private func completeManifestAdoption(
         scope: PipelineScope,
         operationID: UUID,
@@ -4380,7 +5943,15 @@ actor WorkspaceCodemapBindingEngine {
            currentPipeline.manifestRevision == attempt.manifestRevision
         {
             switch outcome {
-            case .terminal:
+            case let .terminal(_, observedStaleAuthority):
+                if let observedStaleAuthority {
+                    _ = liftManifestAuthorityIfVirgin(
+                        scope: scope,
+                        observedAuthority: observedStaleAuthority,
+                        session: &current,
+                        pipeline: &currentPipeline
+                    )
+                }
                 currentPipeline.manifestLoadFinished = true
             case .retryable:
                 currentPipeline.manifestLoadStarted = false
@@ -5984,7 +7555,25 @@ actor WorkspaceCodemapBindingEngine {
         let byteCount = mutations.reduce(UInt64(0)) {
             addingSaturating($0, manifestMutationByteCount($1))
         }
-        if case let .graphIndex(jobID, _) = proof {
+        if case let .graphIndex(jobID, _, origin) = proof {
+            #if DEBUG
+                switch origin {
+                case .pageCheckpoint:
+                    incrementCounter(\.graphIndexPageManifestSubmissions)
+                    updateDebugManifestMeasurements(
+                        rootEpoch: rootEpoch,
+                        jobID: jobID,
+                        origin: .page
+                    ) { $0.add(\.submissionCount) }
+                case .enumerationSeal:
+                    incrementCounter(\.graphIndexSealManifestSubmissions)
+                    updateDebugManifestMeasurements(
+                        rootEpoch: rootEpoch,
+                        jobID: jobID,
+                        origin: .seal
+                    ) { $0.add(\.submissionCount) }
+                }
+            #endif
             guard let nextPendingCount = graphIndexJobs[rootEpoch].flatMap({ job in
                 job.id == jobID
                     ? addingChecked(job.pendingManifestMutationCount, UInt64(mutations.count))
@@ -6012,6 +7601,14 @@ actor WorkspaceCodemapBindingEngine {
             job.pendingManifestMutationCount = nextPendingCount
             job.checkpoint = makeGraphIndexCheckpoint(job)
             graphIndexJobs[rootEpoch] = job
+        } else {
+            #if DEBUG
+                updateDebugManifestMeasurements(
+                    rootEpoch: rootEpoch,
+                    jobID: nil,
+                    origin: .demand
+                ) { $0.add(\.submissionCount) }
+            #endif
         }
 
         if retainRecordsInMemory {
@@ -6081,13 +7678,39 @@ actor WorkspaceCodemapBindingEngine {
         enqueueManifestWorkItem(item, namespace: pipeline.namespace)
         emit(.manifestRevisionQueued, rootEpoch: rootEpoch, numericValue: revision)
         await hooks.afterManifestRevisionQueuedBeforeWaiterInstall(rootEpoch, revision)
-        let succeeded = await waitForManifestRevision(
+        #if DEBUG
+            if case let .graphIndex(jobID, _, origin) = proof {
+                switch origin {
+                case .pageCheckpoint:
+                    incrementCounter(\.graphIndexPageManifestWaits)
+                    updateDebugManifestMeasurements(
+                        rootEpoch: rootEpoch,
+                        jobID: jobID,
+                        origin: .page
+                    ) { $0.add(\.waitCount) }
+                case .enumerationSeal:
+                    incrementCounter(\.graphIndexSealManifestWaits)
+                    updateDebugManifestMeasurements(
+                        rootEpoch: rootEpoch,
+                        jobID: jobID,
+                        origin: .seal
+                    ) { $0.add(\.waitCount) }
+                }
+            } else {
+                updateDebugManifestMeasurements(
+                    rootEpoch: rootEpoch,
+                    jobID: nil,
+                    origin: .demand
+                ) { $0.add(\.waitCount) }
+            }
+        #endif
+        let completion = await waitForManifestRevision(
             scope: scope,
             revision: revision,
             workKey: workKey,
             namespace: pipeline.namespace
         )
-        if case let .graphIndex(jobID, _) = proof,
+        if case let .graphIndex(jobID, _, _) = proof,
            var job = graphIndexJobs[rootEpoch], job.id == jobID
         {
             job.resources = WorkspaceCodemapGraphIndexResourceAccounting(
@@ -6106,7 +7729,16 @@ actor WorkspaceCodemapBindingEngine {
             job.checkpoint = makeGraphIndexCheckpoint(job)
             graphIndexJobs[rootEpoch] = job
         }
-        return succeeded ? .persisted : .durabilityFailure
+        return switch completion {
+        case .persisted:
+            .persisted
+        case let .staleAuthority(observedAuthority):
+            .staleAuthority(observedAuthority: observedAuthority)
+        case .discarded:
+            .discarded
+        case .failed:
+            .durabilityFailure
+        }
     }
 
     private func enqueueManifestWorkItem(
@@ -6169,9 +7801,11 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func dequeueManifestBatch(from writer: inout ManifestWriterState) -> ManifestMutationBatch? {
+    private func dequeueManifestBatch(
+        from writer: inout ManifestWriterState
+    ) -> (batch: ManifestMutationBatch, isDeferredRetry: Bool)? {
         if let deferredHeadBatch = writer.deferredHeadBatch {
-            return deferredHeadBatch
+            return (deferredHeadBatch, true)
         }
         let maximumByteCount = policy.maximumQueuedGraphIndexManifestMutationByteCountPerRoot
         let items = writer.queuedWork.popBatch(
@@ -6198,7 +7832,7 @@ actor WorkspaceCodemapBindingEngine {
                 )
             }
         }
-        return ManifestMutationBatch(
+        return (ManifestMutationBatch(
             id: UUID(),
             workKey: first.workKey,
             proof: first.proof,
@@ -6207,6 +7841,27 @@ actor WorkspaceCodemapBindingEngine {
             changesByPath: changesByPath,
             byteCount: byteCount,
             absorbedWorkItemCount: items.count
+        ), false)
+    }
+
+    /// Keep the error downcast and optional projection outside the optimized async writer.
+    /// Swift 6.3.2 CopyPropagation otherwise produces invalid ownership SIL for this value.
+    @inline(never)
+    private func manifestWriterFailureDisposition(
+        _ error: any Error
+    ) -> ManifestWriterFailureDisposition {
+        guard let failure = error as? WorkspaceCodemapObservedStaleAuthorityError,
+              let observedAuthority = failure.observedPredecessorAuthority
+        else {
+            return ManifestWriterFailureDisposition(
+                terminalObservedStaleAuthority: false,
+                terminalCompletion: .failed
+            )
+        }
+        return ManifestWriterFailureDisposition(
+            terminalObservedStaleAuthority:
+            observedAuthority.authorityGeneration >= failure.currentAuthorityGeneration,
+            terminalCompletion: .staleAuthority(observedAuthority: observedAuthority)
         )
     }
 
@@ -6216,9 +7871,12 @@ actor WorkspaceCodemapBindingEngine {
     ) async {
         while !Task.isCancelled {
             let batch: ManifestMutationBatch
+            #if DEBUG
+                let debugDeferredRetry: Bool
+            #endif
             do {
                 guard var writer = manifestWriters[namespace], writer.writerID == writerID else { return }
-                guard let nextBatch = dequeueManifestBatch(from: &writer) else {
+                guard let dequeued = dequeueManifestBatch(from: &writer) else {
                     let orphaned = Array(writer.waitersByWorkKey.values.joined())
                     writer.waitersByWorkKey.removeAll()
                     writer.waiterWorkKeyByID.removeAll()
@@ -6227,18 +7885,25 @@ actor WorkspaceCodemapBindingEngine {
                     writer.inFlightBatch = nil
                     storeManifestWriterState(writer, namespace: namespace)
                     for waiter in orphaned {
-                        waiter.continuation.resume(returning: false)
+                        waiter.continuation.resume(returning: .failed)
                     }
                     return
                 }
-                batch = nextBatch
+                batch = dequeued.batch
+                #if DEBUG
+                    debugDeferredRetry = dequeued.isDeferredRetry
+                #endif
                 writer.inFlightBatch = batch
                 manifestWriters[namespace] = writer
-                incrementCounter(\.manifestWriteBatches)
-                addToCounter(\.manifestWriteItems, UInt64(batch.absorbedWorkItemCount))
-                addToCounter(\.manifestWriteBatchBytes, batch.byteCount)
-                if batch.absorbedWorkItemCount > 1 {
-                    addToCounter(\.manifestWriteCoalescedItems, UInt64(batch.absorbedWorkItemCount - 1))
+                if dequeued.isDeferredRetry {
+                    incrementCounter(\.manifestWriteRetries)
+                } else {
+                    incrementCounter(\.manifestWriteBatches)
+                    addToCounter(\.manifestWriteItems, UInt64(batch.absorbedWorkItemCount))
+                    addToCounter(\.manifestWriteBatchBytes, batch.byteCount)
+                    if batch.absorbedWorkItemCount > 1 {
+                        addToCounter(\.manifestWriteCoalescedItems, UInt64(batch.absorbedWorkItemCount - 1))
+                    }
                 }
             }
             let workKey = batch.workKey
@@ -6278,11 +7943,11 @@ actor WorkspaceCodemapBindingEngine {
                 )
                 storeManifestWriterState(currentWriter, namespace: namespace)
                 for waiter in completed {
-                    waiter.continuation.resume(returning: true)
+                    waiter.continuation.resume(returning: .persisted)
                 }
                 continue
             }
-            if case let .graphIndex(_, generation) = batch.proof {
+            if case let .graphIndex(_, generation, _) = batch.proof {
                 let tokenDisposition = await catalogClient.revalidateGraphIndexCatalogToken(
                     scope.rootEpoch,
                     generation.catalogToken
@@ -6323,7 +7988,22 @@ actor WorkspaceCodemapBindingEngine {
             let removals = Set(changes.compactMap { path, change in
                 change.record == nil ? path : nil
             })
+            #if DEBUG
+                let debugMutationByteCount = changes.reduce(UInt64(0)) { partial, element in
+                    let mutation: ManifestMutation = if let record = element.value.record {
+                        .upsert(record)
+                    } else {
+                        .remove(repositoryRelativePath: element.key)
+                    }
+                    return addingSaturating(partial, manifestMutationByteCount(mutation))
+                }
+                var manifestAttemptStartedUptimeNanoseconds: UInt64?
+                var manifestAttemptCompletedUptimeNanoseconds: UInt64?
+            #endif
             do {
+                #if DEBUG
+                    manifestAttemptStartedUptimeNanoseconds = uptimeNanoseconds()
+                #endif
                 let claimedWriterAuthority = await runtime.manifestStore.claimManifestWriterAuthority(
                     namespace: namespace,
                     authority: pipeline.authority,
@@ -6351,14 +8031,46 @@ actor WorkspaceCodemapBindingEngine {
                     discardManifestBatch(batch, namespace: namespace, writerID: writerID)
                     continue
                 }
-                let result = try await mergeManifestChanges(
-                    namespace: namespace,
-                    authority: pipeline.authority,
-                    writerAuthority: writerAuthority,
-                    previouslyObservedAuthority: pipeline.previouslyObservedManifestAuthority,
-                    upserts: upserts,
-                    removals: removals
-                )
+                #if DEBUG
+                    let debugContext = DebugManifestStoreAttemptContext(
+                        rootEpoch: scope.rootEpoch,
+                        proof: batch.proof,
+                        deferredRetry: debugDeferredRetry,
+                        mutationByteCount: debugMutationByteCount
+                    )
+                    let result = try await Self.$debugManifestStoreAttemptContext.withValue(
+                        debugContext
+                    ) {
+                        try await mergeManifestChanges(
+                            namespace: namespace,
+                            authority: pipeline.authority,
+                            writerAuthority: writerAuthority,
+                            previouslyObservedAuthority: pipeline.previouslyObservedManifestAuthority,
+                            upserts: upserts,
+                            removals: removals
+                        )
+                    }
+                #else
+                    let result = try await mergeManifestChanges(
+                        namespace: namespace,
+                        authority: pipeline.authority,
+                        writerAuthority: writerAuthority,
+                        previouslyObservedAuthority: pipeline.previouslyObservedManifestAuthority,
+                        upserts: upserts,
+                        removals: removals
+                    )
+                #endif
+                #if DEBUG
+                    manifestAttemptCompletedUptimeNanoseconds = uptimeNanoseconds()
+                    if case let .graphIndex(_, _, origin) = batch.proof {
+                        switch origin {
+                        case .pageCheckpoint:
+                            incrementCounter(\.graphIndexPageManifestWrites)
+                        case .enumerationSeal:
+                            incrementCounter(\.graphIndexSealManifestWrites)
+                        }
+                    }
+                #endif
                 guard currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
@@ -6386,7 +8098,9 @@ actor WorkspaceCodemapBindingEngine {
                    currentPipeline.id == pipelineSessionID,
                    currentPipeline.namespace == namespace
                 {
-                    currentPipeline.previouslyObservedManifestAuthority = currentPipeline.authority
+                    if let observedPredecessorAuthority = result.observedPredecessorAuthority {
+                        currentPipeline.previouslyObservedManifestAuthority = observedPredecessorAuthority
+                    }
                     for (path, change) in changes
                         where currentPipeline.pendingManifestChanges[path]?.revision == change.revision
                     {
@@ -6399,7 +8113,9 @@ actor WorkspaceCodemapBindingEngine {
                     if currentPipeline.pendingManifestChanges.isEmpty,
                        currentPipeline.manifestRevision == revision
                     {
-                        currentPipeline.manifestState = .clean(generation: manifestGeneration(result))
+                        currentPipeline.manifestState = .clean(
+                            generation: manifestGeneration(result.writeResult)
+                        )
                     } else {
                         currentPipeline.manifestState = .dirtyRetryRequired
                     }
@@ -6408,10 +8124,30 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 storeManifestWriterState(currentWriter, namespace: namespace)
                 incrementCounter(\.manifestWrites)
+                #if DEBUG
+                    let attemptCompletedUptimeNanoseconds = manifestAttemptCompletedUptimeNanoseconds
+                        ?? manifestAttemptStartedUptimeNanoseconds
+                        ?? uptimeNanoseconds()
+                    recordManifestWriteDebugEvent(
+                        kind: .manifestWrite,
+                        rootEpoch: scope.rootEpoch,
+                        currentAuthorityGeneration: pipeline.authority.authorityGeneration,
+                        observedPredecessorAuthorityGeneration:
+                        result.observedPredecessorAuthority?.authorityGeneration,
+                        attemptStartedUptimeNanoseconds:
+                        manifestAttemptStartedUptimeNanoseconds ?? attemptCompletedUptimeNanoseconds,
+                        attemptCompletedUptimeNanoseconds: attemptCompletedUptimeNanoseconds,
+                        failure: nil
+                    )
+                #endif
                 for waiter in completed {
-                    waiter.continuation.resume(returning: true)
+                    waiter.continuation.resume(returning: .persisted)
                 }
             } catch {
+                #if DEBUG
+                    manifestAttemptCompletedUptimeNanoseconds = uptimeNanoseconds()
+                #endif
+                let failureDisposition = manifestWriterFailureDisposition(error)
                 guard var currentWriter = currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
@@ -6426,15 +8162,17 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 currentWriter.deferredWork.append(contentsOf: currentWriter.queuedWork.drain())
                 recordManifestWriterPeakQueuedItems(in: currentWriter)
-                if currentWriter.deferredFailureCount >= Self.maximumManifestWriterDeferredAttempts,
-                   let exhaustedHead = currentWriter.deferredHeadBatch
+                if failureDisposition.terminalObservedStaleAuthority ||
+                    currentWriter.deferredFailureCount >= Self.maximumManifestWriterDeferredAttempts,
+                    let exhaustedHead = currentWriter.deferredHeadBatch
                 {
                     currentWriter.deferredHeadBatch = nil
                     currentWriter.deferredFailureCount = 0
                     discardManifestWorkItems(
                         exhaustedHead.items,
                         from: &currentWriter,
-                        terminalWaiterRevision: exhaustedHead.highestRevision
+                        terminalWaiterRevision: exhaustedHead.highestRevision,
+                        terminalCompletion: failureDisposition.terminalCompletion
                     )
                 }
                 shedNewestDeferredManifestWorkIfNeeded(from: &currentWriter)
@@ -6448,6 +8186,39 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 storeManifestWriterState(currentWriter, namespace: namespace)
                 incrementCounter(\.manifestFailures)
+                #if DEBUG
+                    let attemptCompletedUptimeNanoseconds = manifestAttemptCompletedUptimeNanoseconds
+                        ?? manifestAttemptStartedUptimeNanoseconds
+                        ?? uptimeNanoseconds()
+                    let classified = WorkspaceCodemapManifestFailureClassifier.classify(error)
+                    let failure = WorkspaceCodemapManifestFailureDiagnostic(
+                        reason: classified.reason,
+                        operation: classified.operation,
+                        currentAuthorityGeneration: classified.currentAuthorityGeneration
+                            ?? pipeline.authority.authorityGeneration,
+                        observedPredecessorAuthorityGeneration:
+                        classified.observedPredecessorAuthorityGeneration
+                            ?? pipeline.previouslyObservedManifestAuthority?.authorityGeneration,
+                        attemptStartedUptimeNanoseconds:
+                        manifestAttemptStartedUptimeNanoseconds ?? attemptCompletedUptimeNanoseconds,
+                        attemptCompletedUptimeNanoseconds: attemptCompletedUptimeNanoseconds,
+                        attemptDurationNanoseconds: elapsedNanoseconds(
+                            from: manifestAttemptStartedUptimeNanoseconds ?? attemptCompletedUptimeNanoseconds,
+                            to: attemptCompletedUptimeNanoseconds
+                        )
+                    )
+                    recordManifestWriteDebugEvent(
+                        kind: .manifestFailure,
+                        rootEpoch: scope.rootEpoch,
+                        currentAuthorityGeneration: failure.currentAuthorityGeneration
+                            ?? pipeline.authority.authorityGeneration,
+                        observedPredecessorAuthorityGeneration:
+                        failure.observedPredecessorAuthorityGeneration,
+                        attemptStartedUptimeNanoseconds: failure.attemptStartedUptimeNanoseconds,
+                        attemptCompletedUptimeNanoseconds: attemptCompletedUptimeNanoseconds,
+                        failure: failure
+                    )
+                #endif
                 emit(.manifestFailure, rootEpoch: scope.rootEpoch)
                 return
             }
@@ -6532,7 +8303,7 @@ actor WorkspaceCodemapBindingEngine {
         }
         storeManifestWriterState(writer, namespace: namespace)
         for waiter in detached {
-            waiter.continuation.resume(returning: false)
+            waiter.continuation.resume(returning: .discarded)
         }
     }
 
@@ -6557,7 +8328,8 @@ actor WorkspaceCodemapBindingEngine {
     private func discardManifestWorkItems(
         _ workItems: [ManifestMutationWorkItem],
         from state: inout ManifestWriterState,
-        terminalWaiterRevision: UInt64? = nil
+        terminalWaiterRevision: UInt64? = nil,
+        terminalCompletion: ManifestRevisionCompletion = .discarded
     ) {
         guard !workItems.isEmpty else { return }
         var byWorkKey: [
@@ -6590,7 +8362,7 @@ actor WorkspaceCodemapBindingEngine {
                 )
             }
             for waiter in detached {
-                waiter.continuation.resume(returning: false)
+                waiter.continuation.resume(returning: terminalCompletion)
             }
             guard case var .eligible(session)? = roots[workKey.scope.rootEpoch],
                   session.id == workKey.sessionID,
@@ -6717,7 +8489,7 @@ actor WorkspaceCodemapBindingEngine {
         case let .session(invalidationGeneration):
             return session.capability.rootEpoch == rootEpoch &&
                 session.invalidationGeneration == invalidationGeneration
-        case let .graphIndex(jobID, generation):
+        case let .graphIndex(jobID, generation, _):
             guard let job = graphIndexJobs[rootEpoch],
                   job.id == jobID,
                   graphIndexJobIsCurrent(job),
@@ -6771,6 +8543,84 @@ actor WorkspaceCodemapBindingEngine {
         return batches
     }
 
+    #if DEBUG
+        private func debugManifestMeasurementIdentity(
+            _ context: DebugManifestStoreAttemptContext
+        ) -> (
+            origin: WorkspaceCodemapManifestMeasurementOrigin,
+            jobID: UUID?
+        ) {
+            switch context.proof {
+            case .session:
+                (.demand, nil)
+            case let .graphIndex(jobID, _, submissionOrigin):
+                switch submissionOrigin {
+                case .pageCheckpoint:
+                    (.page, jobID)
+                case .enumerationSeal:
+                    (.seal, jobID)
+                }
+            }
+        }
+
+        private func debugMergeCurrentManifest(
+            namespace: CodeMapRootManifestNamespace,
+            authority: CodeMapRootManifestAuthority,
+            writerAuthority: CodeMapRootManifestWriterAuthorityToken,
+            replacingPreviouslyObservedAuthority predecessor: CodeMapRootManifestAuthority?,
+            upserting records: [CodeMapRootManifestRecord],
+            removing repositoryRelativePaths: Set<String>,
+            debugContext: DebugManifestStoreAttemptContext,
+            retryKind: WorkspaceCodemapManifestMeasurementRetryKind,
+            mutationByteCount: UInt64
+        ) async throws -> CodeMapRootManifestWriteResult {
+            let operationID = UUID()
+            do {
+                let result = try await runtime.manifestStore.mergeCurrentManifestDebug(
+                    namespace: namespace,
+                    authority: authority,
+                    writerAuthority: writerAuthority,
+                    replacingPreviouslyObservedAuthority: predecessor,
+                    upserting: records,
+                    removing: repositoryRelativePaths,
+                    lastAccessEpochSeconds: accessEpochSeconds(),
+                    operationID: operationID
+                )
+                if let attempt = await runtime.manifestStore.takeDebugPublicationAttempt(
+                    operationID: operationID
+                ) {
+                    let identity = debugManifestMeasurementIdentity(debugContext)
+                    recordManifestStoreAttemptDebugEvent(
+                        rootEpoch: debugContext.rootEpoch,
+                        jobID: identity.jobID,
+                        origin: identity.origin,
+                        retryKind: retryKind,
+                        mutationByteCount: mutationByteCount,
+                        attempt: attempt,
+                        succeeded: attempt.succeeded
+                    )
+                }
+                return result
+            } catch {
+                if let attempt = await runtime.manifestStore.takeDebugPublicationAttempt(
+                    operationID: operationID
+                ) {
+                    let identity = debugManifestMeasurementIdentity(debugContext)
+                    recordManifestStoreAttemptDebugEvent(
+                        rootEpoch: debugContext.rootEpoch,
+                        jobID: identity.jobID,
+                        origin: identity.origin,
+                        retryKind: retryKind,
+                        mutationByteCount: mutationByteCount,
+                        attempt: attempt,
+                        succeeded: attempt.succeeded
+                    )
+                }
+                throw error
+            }
+        }
+    #endif
+
     private func mergeManifestChanges(
         namespace: CodeMapRootManifestNamespace,
         authority: CodeMapRootManifestAuthority,
@@ -6778,30 +8628,64 @@ actor WorkspaceCodemapBindingEngine {
         previouslyObservedAuthority: CodeMapRootManifestAuthority?,
         upserts: [CodeMapRootManifestRecord],
         removals: Set<String>
-    ) async throws -> CodeMapRootManifestWriteResult {
+    ) async throws -> ManifestMergeOutcome {
+        #if DEBUG
+            guard let debugContext = Self.debugManifestStoreAttemptContext else {
+                preconditionFailure("Missing DEBUG manifest store attempt context.")
+            }
+        #endif
         var predecessor = previouslyObservedAuthority
         for attempt in 0 ... 1 {
             do {
-                return try await runtime.manifestStore.mergeCurrentManifest(
-                    namespace: namespace,
-                    authority: authority,
-                    writerAuthority: writerAuthority,
-                    replacingPreviouslyObservedAuthority: predecessor,
-                    upserting: upserts,
-                    removing: removals,
-                    lastAccessEpochSeconds: accessEpochSeconds()
+                #if DEBUG
+                    let retryKind: WorkspaceCodemapManifestMeasurementRetryKind = if attempt > 0 {
+                        .authority
+                    } else if debugContext.deferredRetry {
+                        .deferred
+                    } else {
+                        .none
+                    }
+                    let writeResult = try await debugMergeCurrentManifest(
+                        namespace: namespace,
+                        authority: authority,
+                        writerAuthority: writerAuthority,
+                        replacingPreviouslyObservedAuthority: predecessor,
+                        upserting: upserts,
+                        removing: removals,
+                        debugContext: debugContext,
+                        retryKind: retryKind,
+                        mutationByteCount: debugContext.mutationByteCount
+                    )
+                #else
+                    let writeResult = try await runtime.manifestStore.mergeCurrentManifest(
+                        namespace: namespace,
+                        authority: authority,
+                        writerAuthority: writerAuthority,
+                        replacingPreviouslyObservedAuthority: predecessor,
+                        upserting: upserts,
+                        removing: removals,
+                        lastAccessEpochSeconds: accessEpochSeconds()
+                    )
+                #endif
+                return ManifestMergeOutcome(
+                    writeResult: writeResult,
+                    observedPredecessorAuthority: predecessor
                 )
             } catch CodeMapRootManifestStoreError.quotaExceeded {
-                return try await mergeManifestRetainingBoundedSubset(
+                let writeResult = try await mergeManifestRetainingBoundedSubset(
                     namespace: namespace,
                     authority: authority,
                     writerAuthority: writerAuthority,
                     previouslyObservedAuthority: predecessor,
                     upserts: upserts,
                     removals: removals
+                )
+                return ManifestMergeOutcome(
+                    writeResult: writeResult,
+                    observedPredecessorAuthority: predecessor
                 )
             } catch CodeMapRootManifestModelError.inputTooLarge {
-                return try await mergeManifestRetainingBoundedSubset(
+                let writeResult = try await mergeManifestRetainingBoundedSubset(
                     namespace: namespace,
                     authority: authority,
                     writerAuthority: writerAuthority,
@@ -6809,14 +8693,22 @@ actor WorkspaceCodemapBindingEngine {
                     upserts: upserts,
                     removals: removals
                 )
+                return ManifestMergeOutcome(
+                    writeResult: writeResult,
+                    observedPredecessorAuthority: predecessor
+                )
             } catch CodeMapRootManifestModelError.invalidContribution {
-                return try await mergeManifestRetainingBoundedSubset(
+                let writeResult = try await mergeManifestRetainingBoundedSubset(
                     namespace: namespace,
                     authority: authority,
                     writerAuthority: writerAuthority,
                     previouslyObservedAuthority: predecessor,
                     upserts: upserts,
                     removals: removals
+                )
+                return ManifestMergeOutcome(
+                    writeResult: writeResult,
+                    observedPredecessorAuthority: predecessor
                 )
             } catch CodeMapRootManifestModelError.staleAuthority where attempt == 0 {
                 guard await runtime.manifestStore.manifestWriterAuthorityIsCurrent(writerAuthority) else {
@@ -6837,11 +8729,17 @@ actor WorkspaceCodemapBindingEngine {
                 if let predecessor, predecessor != authority,
                    predecessor.authorityGeneration >= authority.authorityGeneration
                 {
-                    throw CodeMapRootManifestModelError.staleAuthority
+                    throw WorkspaceCodemapObservedStaleAuthorityError(
+                        currentAuthority: authority,
+                        observedPredecessorAuthority: predecessor
+                    )
                 }
             }
         }
-        throw CodeMapRootManifestModelError.staleAuthority
+        throw WorkspaceCodemapObservedStaleAuthorityError(
+            currentAuthority: authority,
+            observedPredecessorAuthority: predecessor
+        )
     }
 
     private func mergeManifestRetainingBoundedSubset(
@@ -6852,6 +8750,11 @@ actor WorkspaceCodemapBindingEngine {
         upserts: [CodeMapRootManifestRecord],
         removals: Set<String>
     ) async throws -> CodeMapRootManifestWriteResult {
+        #if DEBUG
+            guard let debugContext = Self.debugManifestStoreAttemptContext else {
+                preconditionFailure("Missing DEBUG manifest store attempt context.")
+            }
+        #endif
         guard await runtime.manifestStore.manifestWriterAuthorityIsCurrent(writerAuthority) else {
             throw CodeMapRootManifestStoreError.staleWriterAuthority
         }
@@ -6866,7 +8769,12 @@ actor WorkspaceCodemapBindingEngine {
         case let .stale(existingAuthority):
             guard existingAuthority == previouslyObservedAuthority,
                   existingAuthority.authorityGeneration < authority.authorityGeneration
-            else { throw CodeMapRootManifestModelError.staleAuthority }
+            else {
+                throw WorkspaceCodemapObservedStaleAuthorityError(
+                    currentAuthority: authority,
+                    observedPredecessorAuthority: existingAuthority
+                )
+            }
         case let .hit(snapshot):
             recordsByPath = Dictionary(
                 uniqueKeysWithValues: snapshot.records.map { ($0.repositoryRelativePath, $0) }
@@ -6894,15 +8802,43 @@ actor WorkspaceCodemapBindingEngine {
             let retainedPaths = Set(retained.map(\.repositoryRelativePath))
             let evictedPaths = Set(ordered.lazy.map(\.repositoryRelativePath)).subtracting(retainedPaths)
             do {
-                return try await runtime.manifestStore.mergeCurrentManifest(
-                    namespace: namespace,
-                    authority: authority,
-                    writerAuthority: writerAuthority,
-                    replacingPreviouslyObservedAuthority: previouslyObservedAuthority,
-                    upserting: retained,
-                    removing: removals.union(evictedPaths),
-                    lastAccessEpochSeconds: accessEpochSeconds()
-                )
+                let retainedRemovals = removals.union(evictedPaths)
+                #if DEBUG
+                    let retainedUpsertByteCount = retained.reduce(UInt64(0)) { partial, record in
+                        addingSaturating(partial, manifestMutationByteCount(.upsert(record)))
+                    }
+                    let retainedRemovalByteCount = retainedRemovals.reduce(UInt64(0)) { partial, path in
+                        addingSaturating(
+                            partial,
+                            manifestMutationByteCount(.remove(repositoryRelativePath: path))
+                        )
+                    }
+                    let retainedMutationByteCount = addingSaturating(
+                        retainedUpsertByteCount,
+                        retainedRemovalByteCount
+                    )
+                    return try await debugMergeCurrentManifest(
+                        namespace: namespace,
+                        authority: authority,
+                        writerAuthority: writerAuthority,
+                        replacingPreviouslyObservedAuthority: previouslyObservedAuthority,
+                        upserting: retained,
+                        removing: retainedRemovals,
+                        debugContext: debugContext,
+                        retryKind: .boundedSubset,
+                        mutationByteCount: retainedMutationByteCount
+                    )
+                #else
+                    return try await runtime.manifestStore.mergeCurrentManifest(
+                        namespace: namespace,
+                        authority: authority,
+                        writerAuthority: writerAuthority,
+                        replacingPreviouslyObservedAuthority: previouslyObservedAuthority,
+                        upserting: retained,
+                        removing: retainedRemovals,
+                        lastAccessEpochSeconds: accessEpochSeconds()
+                    )
+                #endif
             } catch CodeMapRootManifestStoreError.quotaExceeded where retainedCount > 0 {
                 retainedCount /= 2
             } catch CodeMapRootManifestModelError.inputTooLarge where retainedCount > 0 {
@@ -6916,24 +8852,24 @@ actor WorkspaceCodemapBindingEngine {
         revision: UInt64,
         workKey: ManifestWriterWorkKey,
         namespace: CodeMapRootManifestNamespace
-    ) async -> Bool {
+    ) async -> ManifestRevisionCompletion {
         guard case let .eligible(session)? = roots[scope.rootEpoch],
               let pipeline = session.pipelines[scope.pipelineIdentity]
-        else { return false }
+        else { return .discarded }
         if pipeline.persistedManifestRevision >= revision {
-            return true
+            return .persisted
         }
         let waiterID = UUID()
         guard workKey.sessionID == session.id,
               workKey.pipelineSessionID == pipeline.id,
               pipeline.namespace == namespace
-        else { return false }
+        else { return .discarded }
         pendingManifestWaiterInstalls.insert(waiterID)
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 pendingManifestWaiterInstalls.remove(waiterID)
                 if cancelledManifestWaiterInstalls.remove(waiterID) != nil {
-                    continuation.resume(returning: false)
+                    continuation.resume(returning: .discarded)
                     return
                 }
                 guard !Task.isCancelled,
@@ -6943,11 +8879,11 @@ actor WorkspaceCodemapBindingEngine {
                       currentPipeline.id == workKey.pipelineSessionID,
                       currentPipeline.namespace == namespace
                 else {
-                    continuation.resume(returning: false)
+                    continuation.resume(returning: .discarded)
                     return
                 }
                 if currentPipeline.persistedManifestRevision >= revision {
-                    continuation.resume(returning: true)
+                    continuation.resume(returning: .persisted)
                     return
                 }
                 var state = manifestWriters[namespace] ?? ManifestWriterState()
@@ -6963,7 +8899,7 @@ actor WorkspaceCodemapBindingEngine {
                         (state.inFlightBatch?.highestRevision ?? 0) >= revision
                 )
                 guard hasRelevantWork else {
-                    continuation.resume(returning: false)
+                    continuation.resume(returning: .failed)
                     return
                 }
                 state.waitersByWorkKey[workKey, default: []].append(ManifestWriteWaiter(
@@ -7002,7 +8938,7 @@ actor WorkspaceCodemapBindingEngine {
             state.waitersByWorkKey[workKey] = waiters
         }
         storeManifestWriterState(state, namespace: namespace)
-        waiter.continuation.resume(returning: false)
+        waiter.continuation.resume(returning: .discarded)
     }
 
     private func detachManifestWriters(rootEpoch: WorkspaceCodemapRootEpoch) {
@@ -7037,7 +8973,7 @@ actor WorkspaceCodemapBindingEngine {
             }
             storeManifestWriterState(state, namespace: namespace)
             for waiter in detached {
-                waiter.continuation.resume(returning: false)
+                waiter.continuation.resume(returning: .discarded)
             }
         }
     }
@@ -7051,7 +8987,7 @@ actor WorkspaceCodemapBindingEngine {
             state.task?.cancel()
             state.retryTask?.cancel()
             for waiter in state.waitersByWorkKey.values.joined() {
-                waiter.continuation.resume(returning: false)
+                waiter.continuation.resume(returning: .discarded)
             }
         }
         return states.compactMap(\.task)
@@ -7491,5 +9427,270 @@ actor WorkspaceCodemapBindingEngine {
             publishedArtifactLookupMissReason: publishedArtifactLookupMissReason,
             invalidationReason: invalidationReason
         ))
+        #if DEBUG
+            if kind.rawValue.hasPrefix("graphIndex"), let rootEpoch {
+                recordGraphIndexDebugEvent(
+                    kind: kind,
+                    rootEpoch: rootEpoch,
+                    phase: graphIndexPhase,
+                    numericValue: numericValue,
+                    retryAfterMilliseconds: retryAfterMilliseconds,
+                    reason: graphIndexDebugReason(kind)
+                )
+            }
+        #endif
     }
+
+    #if DEBUG
+        private func graphIndexCursorFingerprint(
+            _ cursor: WorkspaceCodemapGraphIndexCatalogCursor
+        ) -> String {
+            var hash: UInt64 = 14_695_981_039_346_656_037
+            for byte in cursor.standardizedRelativePath.utf8 {
+                hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+            }
+            for byte in cursor.fileID.uuidString.utf8 {
+                hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+            }
+            return String(format: "%016llx", hash)
+        }
+
+        private func recordGraphIndexDebugEvent(
+            kind: WorkspaceCodemapBindingEngineHookKind,
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            jobID: UUID? = nil,
+            phase: WorkspaceCodemapGraphIndexPhase? = nil,
+            numericValue: UInt64 = 0,
+            retryAfterMilliseconds: UInt64? = nil,
+            reason: WorkspaceCodemapGraphIndexDebugReason? = nil
+        ) {
+            let now = uptimeNanoseconds()
+            let job = graphIndexJobs[rootEpoch]
+            let cursor = job?.cursor ?? job?.lastProcessedCursor
+            let orderedQueue = graphIndexAdmissionQueue.sorted { left, right in
+                let leftAdmission = graphIndexRootLastAdmission[left.rootEpoch] ?? 0
+                let rightAdmission = graphIndexRootLastAdmission[right.rootEpoch] ?? 0
+                if leftAdmission != rightAdmission { return leftAdmission < rightAdmission }
+                if left.enqueueOrdinal != right.enqueueOrdinal {
+                    return left.enqueueOrdinal < right.enqueueOrdinal
+                }
+                return rootEpochPrecedes(left.rootEpoch, right.rootEpoch)
+            }
+            let queuePosition = job.map { current in
+                orderedQueue.firstIndex { $0.jobID == current.id }.map { $0 + 1 }
+            } ?? nil
+            debugGraphIndexEventRing.append(WorkspaceCodemapGraphIndexDebugEventDraft(
+                uptimeNanoseconds: now,
+                kind: kind,
+                rootEpoch: rootEpoch,
+                jobID: jobID ?? job?.id,
+                phase: phase ?? job?.phase,
+                workerPresent: job.map { $0.task != nil },
+                isQueuedForAdmission: job?.isQueuedForAdmission,
+                queuePosition: queuePosition,
+                isActiveBatch: job?.isActiveBatch,
+                drainingBatchCount: drainingGraphIndexRootEpochs.values.count(where: {
+                    $0 == rootEpoch
+                }),
+                admissionWaitAgeMilliseconds: job?.admissionWaitStartUptimeNanoseconds.map {
+                    now >= $0 ? (now - $0) / 1_000_000 : 0
+                },
+                phaseAgeMilliseconds: job.map {
+                    now >= $0.phaseEnteredUptimeNanoseconds
+                        ? (now - $0.phaseEnteredUptimeNanoseconds) / 1_000_000
+                        : 0
+                },
+                lastProgressAgeMilliseconds: job.map {
+                    now >= $0.lastProgressUptimeNanoseconds
+                        ? (now - $0.lastProgressUptimeNanoseconds) / 1_000_000
+                        : 0
+                },
+                pageOrdinal: job?.progress.catalogPageCount,
+                cursorFingerprint: cursor.map(graphIndexCursorFingerprint),
+                numericValue: numericValue,
+                projectedSupportedCandidateTotal: job?.lastProjectedSupportedCandidateTotal,
+                processedCandidateCount: job?.progress.counts.processedCandidateCount,
+                candidateCount: job?.inBatchProgress?.candidateCount,
+                completedCandidateCount: job?.inBatchProgress?.resolvedCandidateCount,
+                retryAttempt: job?.retryAttempt,
+                retryAfterMilliseconds: retryAfterMilliseconds ?? job?.retry?.retryAfterMilliseconds,
+                reason: reason,
+                manifestFailureReason: nil,
+                manifestFailureOperation: nil,
+                currentAuthorityGeneration: nil,
+                observedPredecessorAuthorityGeneration: nil,
+                manifestAttemptStartedUptimeNanoseconds: nil,
+                manifestAttemptCompletedUptimeNanoseconds: nil,
+                manifestAttemptDurationNanoseconds: nil,
+                manifestMeasurementOrigin: nil,
+                manifestMeasurementRetryKind: nil,
+                manifestMutationByteCount: nil,
+                manifestStoreAttempt: nil
+            ))
+        }
+
+        private func recordManifestWriteDebugEvent(
+            kind: WorkspaceCodemapBindingEngineHookKind,
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            currentAuthorityGeneration: UInt64,
+            observedPredecessorAuthorityGeneration: UInt64?,
+            attemptStartedUptimeNanoseconds: UInt64,
+            attemptCompletedUptimeNanoseconds: UInt64,
+            failure: WorkspaceCodemapManifestFailureDiagnostic?
+        ) {
+            if let failure {
+                var counts = debugManifestFailureCountsByRootEpoch[rootEpoch] ?? [:]
+                counts[failure.reason] = addingSaturating(counts[failure.reason] ?? 0, 1)
+                debugManifestFailureCountsByRootEpoch[rootEpoch] = counts
+                debugLastManifestFailureByRootEpoch[rootEpoch] = failure
+            }
+            debugGraphIndexEventRing.append(WorkspaceCodemapGraphIndexDebugEventDraft(
+                uptimeNanoseconds: attemptCompletedUptimeNanoseconds,
+                kind: kind,
+                rootEpoch: rootEpoch,
+                jobID: graphIndexJobs[rootEpoch]?.id,
+                phase: graphIndexJobs[rootEpoch]?.phase,
+                workerPresent: graphIndexJobs[rootEpoch].map { $0.task != nil },
+                isQueuedForAdmission: graphIndexJobs[rootEpoch]?.isQueuedForAdmission,
+                queuePosition: nil,
+                isActiveBatch: graphIndexJobs[rootEpoch]?.isActiveBatch,
+                drainingBatchCount: nil,
+                admissionWaitAgeMilliseconds: nil,
+                phaseAgeMilliseconds: nil,
+                lastProgressAgeMilliseconds: nil,
+                pageOrdinal: graphIndexJobs[rootEpoch]?.progress.catalogPageCount,
+                cursorFingerprint: nil,
+                numericValue: 1,
+                projectedSupportedCandidateTotal:
+                graphIndexJobs[rootEpoch]?.lastProjectedSupportedCandidateTotal,
+                processedCandidateCount: graphIndexJobs[rootEpoch]?.progress.counts.processedCandidateCount,
+                candidateCount: graphIndexJobs[rootEpoch]?.inBatchProgress?.candidateCount,
+                completedCandidateCount: graphIndexJobs[rootEpoch]?.inBatchProgress?.resolvedCandidateCount,
+                retryAttempt: nil,
+                retryAfterMilliseconds: nil,
+                reason: nil,
+                manifestFailureReason: failure?.reason,
+                manifestFailureOperation: failure?.operation,
+                currentAuthorityGeneration: currentAuthorityGeneration,
+                observedPredecessorAuthorityGeneration: observedPredecessorAuthorityGeneration,
+                manifestAttemptStartedUptimeNanoseconds: attemptStartedUptimeNanoseconds,
+                manifestAttemptCompletedUptimeNanoseconds: attemptCompletedUptimeNanoseconds,
+                manifestAttemptDurationNanoseconds: elapsedNanoseconds(
+                    from: attemptStartedUptimeNanoseconds,
+                    to: attemptCompletedUptimeNanoseconds
+                ),
+                manifestMeasurementOrigin: nil,
+                manifestMeasurementRetryKind: nil,
+                manifestMutationByteCount: nil,
+                manifestStoreAttempt: nil
+            ))
+        }
+
+        private func recordManifestStoreAttemptDebugEvent(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            jobID: UUID?,
+            origin: WorkspaceCodemapManifestMeasurementOrigin,
+            retryKind: WorkspaceCodemapManifestMeasurementRetryKind,
+            mutationByteCount: UInt64,
+            attempt: CodeMapRootManifestDebugAttemptMetrics,
+            succeeded: Bool
+        ) {
+            if attempt.published {
+                switch origin {
+                case .page:
+                    addToCounter(
+                        \.graphIndexPageManifestSnapshotRecordVolume,
+                        attempt.outputSnapshotRecordCount
+                    )
+                    addToCounter(
+                        \.graphIndexPageManifestSnapshotByteVolume,
+                        attempt.outputSnapshotEncodedByteCount
+                    )
+                case .seal:
+                    addToCounter(
+                        \.graphIndexSealManifestSnapshotRecordVolume,
+                        attempt.outputSnapshotRecordCount
+                    )
+                    addToCounter(
+                        \.graphIndexSealManifestSnapshotByteVolume,
+                        attempt.outputSnapshotEncodedByteCount
+                    )
+                case .adoption, .demand:
+                    break
+                }
+            }
+            recordDebugManifestStoreAttempt(
+                rootEpoch: rootEpoch,
+                jobID: jobID,
+                origin: origin,
+                retryKind: retryKind,
+                mutationByteCount: mutationByteCount,
+                attempt: attempt,
+                succeeded: succeeded
+            )
+            let job = graphIndexJobs[rootEpoch]
+            debugGraphIndexEventRing.append(WorkspaceCodemapGraphIndexDebugEventDraft(
+                uptimeNanoseconds: attempt.completedUptimeNanoseconds,
+                kind: .manifestStoreAttempt,
+                rootEpoch: rootEpoch,
+                jobID: jobID ?? job?.id,
+                phase: job?.phase,
+                workerPresent: job.map { $0.task != nil },
+                isQueuedForAdmission: job?.isQueuedForAdmission,
+                queuePosition: nil,
+                isActiveBatch: job?.isActiveBatch,
+                drainingBatchCount: nil,
+                admissionWaitAgeMilliseconds: nil,
+                phaseAgeMilliseconds: nil,
+                lastProgressAgeMilliseconds: nil,
+                pageOrdinal: job?.progress.catalogPageCount,
+                cursorFingerprint: nil,
+                numericValue: 1,
+                projectedSupportedCandidateTotal: job?.lastProjectedSupportedCandidateTotal,
+                processedCandidateCount: job?.progress.counts.processedCandidateCount,
+                candidateCount: job?.inBatchProgress?.candidateCount,
+                completedCandidateCount: job?.inBatchProgress?.resolvedCandidateCount,
+                retryAttempt: nil,
+                retryAfterMilliseconds: nil,
+                reason: nil,
+                manifestFailureReason: nil,
+                manifestFailureOperation: nil,
+                currentAuthorityGeneration: nil,
+                observedPredecessorAuthorityGeneration: nil,
+                manifestAttemptStartedUptimeNanoseconds: attempt.startedUptimeNanoseconds,
+                manifestAttemptCompletedUptimeNanoseconds: attempt.completedUptimeNanoseconds,
+                manifestAttemptDurationNanoseconds: attempt.totalDurationNanoseconds,
+                manifestMeasurementOrigin: origin,
+                manifestMeasurementRetryKind: retryKind,
+                manifestMutationByteCount: mutationByteCount,
+                manifestStoreAttempt: attempt
+            ))
+        }
+
+        private func elapsedNanoseconds(from start: UInt64, to end: UInt64) -> UInt64 {
+            end >= start ? end - start : 0
+        }
+
+        private func graphIndexDebugReason(
+            _ kind: WorkspaceCodemapBindingEngineHookKind
+        ) -> WorkspaceCodemapGraphIndexDebugReason? {
+            switch kind {
+            case .graphIndexRunScheduled: .scheduled
+            case .graphIndexBatchQueued: .queued
+            case .graphIndexBatchStarted: .admitted
+            case .graphIndexRetry: .retry
+            case .graphIndexRootOvertake: .rootOvertake
+            case .graphIndexExplicitOvertake: .explicitOvertake
+            case .graphIndexCoverageCancelled, .graphIndexBatchCancelled: .cancelled
+            case .graphIndexCoverageSuperseded: .superseded
+            case .graphIndexBudget: .budgetLimited
+            case .graphIndexCoverageComplete: .complete
+            case .graphIndexPhaseEntered: .phaseEntered
+            case .graphIndexPageAccepted: .pageAccepted
+            case .graphIndexCheckpointed: .checkpointed
+            case .graphIndexWorkerFinished: .workerFinished
+            default: nil
+            }
+        }
+    #endif
 }
