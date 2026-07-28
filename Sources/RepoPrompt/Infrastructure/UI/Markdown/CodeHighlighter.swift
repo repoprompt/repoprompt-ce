@@ -54,8 +54,8 @@ enum CodeHighlighter {
 
     // MARK: ‑ Internal cache -----------------------------------------------------
 
-    /// Holds lazily-compiled regexes.  The array is rebuilt only when the user
-    /// toggles dark/light mode (because colours change).
+    /// Holds separate, lazily initialized regex caches for light and dark appearances.
+    /// Appearance changes select between the caches rather than rebuilding either array.
     private enum Cached {
         /// Light-mode colours follow the same ordering as `rawSpecs`.
         /// Initialized once, thread-safely, via Swift's static let guarantee.
@@ -65,7 +65,8 @@ enum CodeHighlighter {
         /// Initialized once, thread-safely, via Swift's static let guarantee.
         private static let darkCache: [(NSRegularExpression, NSColor)] = buildCache(dark: true)
 
-        /// Return the correct cache (always pre-built; no lazy init needed).
+        /// Return the correct cache; Swift initializes each static let lazily,
+        /// thread-safely, and exactly once.
         static func compiled(darkMode: Bool) -> [(NSRegularExpression, NSColor)] {
             darkMode ? darkCache : lightCache
         }
