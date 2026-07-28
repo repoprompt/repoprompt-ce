@@ -35,9 +35,23 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             entries: [alpha, zeta],
             nextCursor: endCursor,
             isEnd: false,
-            supportedCandidateCountThroughPage: 2
+            supportedCandidateCountThroughPage: 2,
+            projectedSupportedCandidateTotal: 385
         ).get()
         XCTAssertEqual(page.nextCursor, endCursor)
+        XCTAssertEqual(page.projectedSupportedCandidateTotal, 385)
+        XCTAssertEqual(
+            WorkspaceCodemapGraphIndexCatalogPage.validated(
+                request: request,
+                token: token,
+                entries: [alpha, zeta],
+                nextCursor: endCursor,
+                isEnd: false,
+                supportedCandidateCountThroughPage: 2,
+                projectedSupportedCandidateTotal: 1
+            ),
+            .failure(.supportedCandidateCountMismatch)
+        )
         XCTAssertEqual(
             page.pathByteCount,
             UInt64(alpha.identity.standardizedRelativePath.utf8.count + zeta.identity.standardizedRelativePath.utf8.count)
@@ -50,7 +64,8 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
                 entries: [zeta, alpha],
                 nextCursor: nil,
                 isEnd: true,
-                supportedCandidateCountThroughPage: 2
+                supportedCandidateCountThroughPage: 2,
+                projectedSupportedCandidateTotal: 2
             ),
             .failure(.nonCanonicalOrder)
         )
@@ -61,7 +76,8 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
                 entries: [alpha, alpha],
                 nextCursor: nil,
                 isEnd: true,
-                supportedCandidateCountThroughPage: 2
+                supportedCandidateCountThroughPage: 2,
+                projectedSupportedCandidateTotal: 2
             ),
             .failure(.duplicateFileID(alpha.identity.fileID))
         )
@@ -126,10 +142,27 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
     func testCatalogCoverageAllowsPartialQueriesButCompleteRequiresNoPendingSlots() throws {
         let rootEpoch = makeRootEpoch(seed: 5)
         let watermark = makeCatalogToken(rootEpoch: rootEpoch)
+        XCTAssertEqual(
+            WorkspaceCodemapGraphCatalogCoverage.validated(
+                rootEpoch: rootEpoch,
+                catalogWatermark: nil,
+                enumerationState: .notStarted,
+                isCatalogSealed: true,
+                supportedCount: 0,
+                classifiedCount: 0,
+                pendingCount: 0,
+                contributedCount: 0,
+                emptyCount: 0,
+                terminalArtifactCount: 0,
+                terminalExcludedCount: 0
+            ),
+            .failure(.catalogSealWithoutWatermark)
+        )
         let partial = try WorkspaceCodemapGraphCatalogCoverage.validated(
             rootEpoch: rootEpoch,
             catalogWatermark: watermark,
             enumerationState: .partial,
+            isCatalogSealed: false,
             supportedCount: 3,
             classifiedCount: 2,
             pendingCount: 1,
@@ -138,14 +171,49 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             terminalArtifactCount: 1,
             terminalExcludedCount: 0
         ).get()
+        XCTAssertFalse(partial.isCatalogSealed)
         XCTAssertFalse(partial.isComplete)
         XCTAssertEqual(partial.terminalCount, 1)
+
+        let sealedPartial = try WorkspaceCodemapGraphCatalogCoverage.validated(
+            rootEpoch: rootEpoch,
+            catalogWatermark: watermark,
+            enumerationState: .partial,
+            isCatalogSealed: true,
+            supportedCount: 3,
+            classifiedCount: 2,
+            pendingCount: 1,
+            contributedCount: 1,
+            emptyCount: 0,
+            terminalArtifactCount: 1,
+            terminalExcludedCount: 0
+        ).get()
+        XCTAssertTrue(sealedPartial.isCatalogSealed)
+        XCTAssertFalse(sealedPartial.isComplete)
 
         XCTAssertEqual(
             WorkspaceCodemapGraphCatalogCoverage.validated(
                 rootEpoch: rootEpoch,
                 catalogWatermark: watermark,
                 enumerationState: .complete,
+                isCatalogSealed: false,
+                supportedCount: 2,
+                classifiedCount: 2,
+                pendingCount: 0,
+                contributedCount: 1,
+                emptyCount: 0,
+                terminalArtifactCount: 1,
+                terminalExcludedCount: 0
+            ),
+            .failure(.completeWithoutCatalogSeal)
+        )
+
+        XCTAssertEqual(
+            WorkspaceCodemapGraphCatalogCoverage.validated(
+                rootEpoch: rootEpoch,
+                catalogWatermark: watermark,
+                enumerationState: .complete,
+                isCatalogSealed: true,
                 supportedCount: 3,
                 classifiedCount: 2,
                 pendingCount: 1,
@@ -160,6 +228,7 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             rootEpoch: rootEpoch,
             catalogWatermark: watermark,
             enumerationState: .complete,
+            isCatalogSealed: true,
             supportedCount: 2,
             classifiedCount: 2,
             pendingCount: 0,
@@ -168,6 +237,7 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             terminalArtifactCount: 1,
             terminalExcludedCount: 0
         ).get()
+        XCTAssertTrue(complete.isCatalogSealed)
         XCTAssertTrue(complete.isComplete)
     }
 
@@ -190,6 +260,7 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             rootEpoch: rootEpoch,
             catalogWatermark: makeCatalogToken(rootEpoch: rootEpoch),
             enumerationState: .partial,
+            isCatalogSealed: true,
             supportedCount: 2,
             classifiedCount: 0,
             pendingCount: 2,
@@ -212,18 +283,17 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             "Sources/Zeta.swift"
         ])
 
-        XCTAssertEqual(
-            try WorkspaceCodemapGraphCheckpoint.validated(
-                rootEpoch: rootEpoch,
-                repositoryAuthority: makeRepositoryAuthority(),
-                generation: .init(rawValue: 11),
-                schemaVersion: CodeMapSelectionGraphContribution.currentSchemaVersion,
-                policyVersion: CodeMapSelectionGraphContribution.currentPolicyVersion,
-                slots: [alpha],
-                coverage: coverage
-            ),
-            .failure(.coverageCountMismatch)
-        )
+        let partialCheckpoint = try WorkspaceCodemapGraphCheckpoint.validated(
+            rootEpoch: rootEpoch,
+            repositoryAuthority: makeRepositoryAuthority(),
+            generation: .init(rawValue: 11),
+            schemaVersion: CodeMapSelectionGraphContribution.currentSchemaVersion,
+            policyVersion: CodeMapSelectionGraphContribution.currentPolicyVersion,
+            slots: [alpha],
+            coverage: coverage
+        ).get()
+        XCTAssertEqual(partialCheckpoint.slots.map(\.standardizedRelativePath), ["Sources/Alpha.swift"])
+        XCTAssertEqual(partialCheckpoint.coverage.pendingCount, 2)
     }
 
     func testRemovalFenceAndPullContractsKeepDestructiveChangesExplicit() throws {

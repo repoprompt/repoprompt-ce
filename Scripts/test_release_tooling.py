@@ -207,22 +207,54 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
         self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
         self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
-        self.assertEqual(source.count("list-bundle-mach-o-paths --arch all"), 1)
+        self.assertEqual(source.count("list-bundle-signing-plan --arch all"), 1)
+        self.assertNotIn("list-bundle-mach-o-paths", source)
         self.assertEqual(source.count('--signed-team-identifier "$SIGNING_TEAM_ID"'), 1)
         self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
+        self.assertIn('CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"', source)
+        self.assertIn('plutil -lint "$CODEX_V8_ENTITLEMENTS"', source)
+        for line in source.splitlines():
+            if 'sign_path "$CODEX_BUNDLE' in line:
+                self.assertNotIn("--preserve-metadata", line)
 
         sparkle_sign = source.index('sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"')
-        enumerate_codex = source.index("list-bundle-mach-o-paths --arch all")
-        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path"')
+        enumerate_codex = source.index("list-bundle-signing-plan --arch all")
+        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTITLEMENTS"')
+        codex_sign_unprofiled = source.index('sign_path "$CODEX_BUNDLE/$relative_path"\n', codex_sign + 1)
         mcp_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"')
         app_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"')
         outer_sign = source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"')
         self.assertLess(sparkle_sign, enumerate_codex)
         self.assertLess(enumerate_codex, codex_sign)
-        self.assertLess(codex_sign, mcp_sign)
+        self.assertLess(codex_sign, codex_sign_unprofiled)
+        self.assertLess(codex_sign_unprofiled, mcp_sign)
         self.assertLess(mcp_sign, app_sign)
         self.assertLess(app_sign, outer_sign)
         self.assertNotIn('sign_path "$CODEX_BUNDLE"', source)
+
+    def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
+        v8_profile = {
+            "com.apple.security.cs.allow-jit": True,
+            "com.apple.security.cs.allow-unsigned-executable-memory": True,
+        }
+        plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "CodexV8JIT.entitlements").read_bytes())
+        self.assertEqual(plist, v8_profile)
+
+        manifest = json.loads(
+            (SCRIPT_DIR.parent / "Vendor" / "Codex" / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertEqual(
+            manifest["releaseSigningEntitlements"],
+            {
+                "bin/codex": v8_profile,
+                "bin/codex-code-mode-host": v8_profile,
+                "codex-path/rg": {},
+                "codex-resources/zsh/bin/zsh": {},
+            },
+        )
+        for policy in manifest["signedExecutables"]:
+            self.assertEqual(policy["entitlements"], v8_profile, policy["path"])
 
         for release_script_name in (
             "release.sh",
@@ -2850,15 +2882,18 @@ sys.stdout.write(str(status))
         ).stdout.strip()
 
         expected_title = "Tip build 1.2.3 · v9.8.7 · commit 0123456789ab"
-        expected_release_notes_link = "https://example.invalid/tip/details"
-
         def write_appcast(
             enclosure_signature: str,
             *,
             marketing_version: str = "9.8.7",
             title: str = expected_title,
-            release_notes_link: str = expected_release_notes_link,
+            release_notes_link: str | None = None,
         ) -> None:
+            release_notes_xml = (
+                f"      <sparkle:releaseNotesLink>{release_notes_link}</sparkle:releaseNotesLink>\n"
+                if release_notes_link is not None
+                else ""
+            )
             appcast.write_text(
                 f"""<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
@@ -2867,8 +2902,7 @@ sys.stdout.write(str(status))
       <title>{title}</title>
       <sparkle:version>1.2.3</sparkle:version>
       <sparkle:shortVersionString>{marketing_version}</sparkle:shortVersionString>
-      <sparkle:releaseNotesLink>{release_notes_link}</sparkle:releaseNotesLink>
-      <enclosure url="https://example.invalid/tip/{archive.name}"
+{release_notes_xml}      <enclosure url="https://example.invalid/tip/{archive.name}"
                  length="{archive.stat().st_size}"
                  sparkle:edSignature="{enclosure_signature}" />
     </item>
@@ -2886,7 +2920,6 @@ sys.stdout.write(str(status))
                 "TIP_COMMIT": "0123456789abcdef" * 2 + "01234567",
                 "TIP_SHORT_SHA": "0123456789ab",
                 "TIP_BUILD_NUMBER": "1.2.3",
-                "TIP_RELEASE_URL": expected_release_notes_link,
                 "TIP_DOWNLOAD_URL_PREFIX": "https://example.invalid/tip/",
                 "SPARKLE_PRIVATE_KEY": private_key,
                 "VALIDATOR_APP_BUNDLE": str(app_bundle),
@@ -2943,12 +2976,12 @@ validate_generated_tip_appcast""",
         self.assertNotEqual(wrong_title.returncode, 0)
         self.assertIn("Tip appcast presentation title mismatch: Wrong tip title", wrong_title.stderr)
 
-        write_appcast(signature, release_notes_link="https://example.invalid/tip/wrong-details")
-        wrong_release_notes_link = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(wrong_release_notes_link.returncode, 0)
+        write_appcast(signature, release_notes_link="https://example.invalid/tip/details")
+        embedded_release_page = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(embedded_release_page.returncode, 0)
         self.assertIn(
-            "Tip appcast release notes link mismatch: https://example.invalid/tip/wrong-details",
-            wrong_release_notes_link.stderr,
+            "tip appcast item must not contain sparkle:releaseNotesLink",
+            embedded_release_page.stderr,
         )
 
         write_appcast("")
@@ -2966,6 +2999,8 @@ validate_generated_tip_appcast""",
   <channel><item><title>Version 9.8.7</title>
     <sparkle:version>29.8.52</sparkle:version>
     <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+    <sparkle:releaseNotesLink>https://github.com/example/release</sparkle:releaseNotesLink>
+    <description>Embedded release content</description>
   </item></channel>
 </rss>
 """,
@@ -2979,7 +3014,6 @@ APPCAST="$2"
 MARKETING_VERSION="9.8.7"
 TIP_BUILD_NUMBER="29.8.52"
 TIP_SHORT_SHA="abc1234def56"
-TIP_RELEASE_URL="https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/tag/tip-abc1234def56"
 label_generated_tip_appcast""",
             "tip-appcast-label",
             str(SCRIPT_DIR / "main_tip_release.sh"),
@@ -2999,10 +3033,8 @@ label_generated_tip_appcast""",
             item.findtext(f"{{{sparkle}}}version"),
         )
         self.assertEqual(item.findtext("title"), "Tip build 29.8.52 · v9.8.7 · commit abc1234def56")
-        self.assertEqual(
-            item.findtext(f"{{{sparkle}}}releaseNotesLink"),
-            "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/tag/tip-abc1234def56",
-        )
+        self.assertIsNone(item.find(f"{{{sparkle}}}releaseNotesLink"))
+        self.assertIsNone(item.find("description"))
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent

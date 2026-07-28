@@ -143,40 +143,148 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
 
     func testCoverageAndPendingUpdatesDriveProgressAndStatus() throws {
         let rootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
-        let coverage = try XCTUnwrap(try? WorkspaceCodemapGraphCatalogCoverage.validated(
+        let watermark = WorkspaceCodemapGraphIndexCatalogToken(
             rootEpoch: rootEpoch,
-            catalogWatermark: WorkspaceCodemapGraphIndexCatalogToken(
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: 1,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        func coverage(isCatalogSealed: Bool) throws -> WorkspaceCodemapGraphCatalogCoverage {
+            try WorkspaceCodemapGraphCatalogCoverage.validated(
                 rootEpoch: rootEpoch,
-                topologyGeneration: 1,
-                appliedIndexGeneration: 1,
-                catalogGeneration: 1,
-                ingressGeneration: 1,
-                graphIndexInvalidationGeneration: 1
-            ),
-            enumerationState: .partial,
-            supportedCount: 10,
-            classifiedCount: 6,
-            pendingCount: 4,
-            contributedCount: 6,
-            emptyCount: 0,
-            terminalArtifactCount: 0,
-            terminalExcludedCount: 0
-        ).get())
-        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot(
+                catalogWatermark: watermark,
+                enumerationState: .partial,
+                isCatalogSealed: isCatalogSealed,
+                supportedCount: 10,
+                classifiedCount: 6,
+                pendingCount: 4,
+                contributedCount: 6,
+                emptyCount: 0,
+                terminalArtifactCount: 0,
+                terminalExcludedCount: 0
+            ).get()
+        }
+        let preSeal = try AgentWorkspaceCodemapPresentation.make(snapshot(
             rootEpoch: rootEpoch,
             availability: .updating,
-            coverage: coverage,
+            coverage: coverage(isCatalogSealed: false),
             updatesPending: true,
             graphRevision: 12
         ))
+        let sealed = try AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .updating,
+            coverage: coverage(isCatalogSealed: true),
+            updatesPending: true,
+            graphRevision: 13
+        ))
 
-        XCTAssertEqual(presentation.state, .updating)
-        XCTAssertEqual(presentation.classifiedCount, 6)
-        XCTAssertNil(presentation.supportedCount)
-        XCTAssertEqual(presentation.pendingCount, 4)
-        XCTAssertNil(presentation.percentageText)
-        XCTAssertEqual(presentation.statusText, "Updating…")
-        XCTAssertTrue(presentation.tooltip.contains("pending updates"))
+        XCTAssertEqual(preSeal.state, .updating)
+        XCTAssertFalse(preSeal.isCatalogSealed)
+        XCTAssertEqual(preSeal.classifiedCount, 6)
+        XCTAssertNil(preSeal.supportedCount)
+        XCTAssertEqual(preSeal.pendingCount, 4)
+        XCTAssertNil(preSeal.percentageText)
+        XCTAssertEqual(preSeal.statusText, "Updating 6 files…")
+
+        XCTAssertTrue(sealed.isCatalogSealed)
+        XCTAssertEqual(sealed.supportedCount, 10)
+        XCTAssertEqual(sealed.percentageText, "60%")
+        XCTAssertEqual(sealed.statusText, "Updating 60%")
+
+        let preSealSummary = AgentWorkspaceCodemapSummary.make([sealed, preSeal])
+        XCTAssertEqual(preSealSummary.state, .indexing)
+        XCTAssertEqual(preSealSummary.classifiedCount, 12)
+        XCTAssertNil(preSealSummary.supportedCount)
+        XCTAssertNil(preSealSummary.progressFraction)
+        XCTAssertEqual(preSealSummary.label, "Code Map")
+        XCTAssertTrue(preSealSummary.showsIndeterminateProgress)
+        XCTAssertEqual(preSealSummary.detailText, "Updating — discovering files…")
+        XCTAssertEqual(
+            preSealSummary.preSealProgressText,
+            "12 files indexed so far while repository catalogs are discovered."
+        )
+        XCTAssertEqual(
+            preSealSummary.accessibilityValue,
+            "Updating — discovering files… 12 files indexed so far while repository catalogs are discovered."
+        )
+
+        let sealedSummary = AgentWorkspaceCodemapSummary.make([sealed, sealed])
+        XCTAssertEqual(sealedSummary.supportedCount, 20)
+        XCTAssertEqual(sealedSummary.progressPercentage, 60)
+        XCTAssertFalse(sealedSummary.showsIndeterminateProgress)
+        XCTAssertEqual(sealedSummary.accessibilityValue, "12 of 20 files indexed, 60 percent")
+
+        let pausedPreSeal = try AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .updating,
+            suspended: true,
+            coverage: coverage(isCatalogSealed: false)
+        ))
+        let excludedUnavailable = try AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .unavailable,
+            coverage: coverage(isCatalogSealed: false)
+        ))
+        let excludedSummary = AgentWorkspaceCodemapSummary.make([
+            sealed,
+            pausedPreSeal,
+            excludedUnavailable
+        ])
+        XCTAssertEqual(excludedSummary.supportedCount, 10)
+        XCTAssertEqual(excludedSummary.progressPercentage, 60)
+        XCTAssertEqual(excludedSummary.pausedRootCount, 1)
+
+        let overflow = AgentWorkspaceCodemapPresentation(
+            state: .indexing,
+            isCatalogSealed: true,
+            classifiedCount: .max,
+            supportedCount: .max,
+            pendingCount: 0,
+            updatesPending: false,
+            graphRevision: nil
+        )
+        let overflowSummary = AgentWorkspaceCodemapSummary.make([overflow, sealed])
+        XCTAssertNil(overflowSummary.classifiedCount)
+        XCTAssertNil(overflowSummary.supportedCount)
+        XCTAssertNil(overflowSummary.progressFraction)
+
+        let preparing = AgentWorkspaceCodemapPresentation.make(snapshot(availability: .indexing))
+        XCTAssertEqual(preparing.statusText, "Indexing — discovering files…")
+        let preparingSummary = AgentWorkspaceCodemapSummary.make([preparing])
+        XCTAssertTrue(preparingSummary.showsIndeterminateProgress)
+        XCTAssertEqual(preparingSummary.detailText, "Indexing — discovering files…")
+        XCTAssertEqual(preparingSummary.preSealProgressText, "Discovering repository catalogs…")
+
+        let singleFile = AgentWorkspaceCodemapPresentation(
+            state: .indexing,
+            isCatalogSealed: false,
+            classifiedCount: 1,
+            supportedCount: nil,
+            pendingCount: 0,
+            updatesPending: false,
+            graphRevision: nil
+        )
+        XCTAssertEqual(singleFile.statusText, "Indexing 1 file…")
+        XCTAssertEqual(
+            AgentWorkspaceCodemapSummary.make([singleFile]).preSealProgressText,
+            "1 file indexed so far while repository catalogs are discovered."
+        )
+
+        let ready = AgentWorkspaceCodemapPresentation(
+            state: .ready,
+            isCatalogSealed: true,
+            classifiedCount: 10,
+            supportedCount: 10,
+            pendingCount: 0,
+            updatesPending: false,
+            graphRevision: 14
+        )
+        let mixedSummary = AgentWorkspaceCodemapSummary.make([ready, pausedPreSeal])
+        XCTAssertEqual(mixedSummary.state, .mixed)
+        XCTAssertNil(mixedSummary.progressFraction)
     }
 
     func testCodemapStatusNotificationsCoalesceRootRowResnapshots() async {

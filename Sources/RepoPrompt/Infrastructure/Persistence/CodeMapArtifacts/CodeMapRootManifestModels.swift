@@ -553,6 +553,28 @@ struct CodeMapRootManifestRecord: Hashable {
         self.construction = construction
     }
 
+    func restampedVerifiedAuthority(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority
+    ) throws -> Self {
+        guard isVerifiedForPublication else {
+            throw CodeMapRootManifestModelError.corruptRecord
+        }
+        return try Self(
+            namespace: namespace,
+            repositoryRelativePath: repositoryRelativePath,
+            locatorIdentity: locatorIdentity,
+            artifactKey: artifactKey,
+            gitMode: gitMode,
+            outcome: outcome,
+            contributionEnvelope: contributionEnvelope,
+            legacyContributionIdentity: legacyContributionIdentity,
+            authority: authority,
+            bindingGeneration: bindingGeneration,
+            construction: .verifiedAssociation
+        )
+    }
+
     fileprivate static func decodeCanonical(
         from reader: inout CodeMapRootManifestReader,
         namespace: CodeMapRootManifestNamespace,

@@ -629,6 +629,124 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertFalse(session.items.contains { $0.kind == .error })
     }
 
+    func testSilentCompositeWaitCorrelatesToAuthoritativeCommandAndLaterCompletes() async throws {
+        let itemID = "call_composite_wait_1"
+        let eventParser = CodexNativeSessionController(
+            client: CodexAppServerClient(),
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePaths: .uniform(nil)
+        )
+        let started = try XCTUnwrap(eventParser.test_parseToolLifecycleEvent(
+            method: "item/started",
+            params: [
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": [
+                    "type": "dynamicToolCall",
+                    "id": itemID,
+                    "name": "wait",
+                    "arguments": ["cell_id": "1", "yield_time_ms": 320_000]
+                ]
+            ]
+        ))
+        let invocationID = try XCTUnwrap(started.invocationID)
+        XCTAssertEqual(started.kind, "call")
+        XCTAssertEqual(started.name, "wait")
+
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [[
+                        "id": "turn",
+                        "status": "inProgress",
+                        "itemsView": "full",
+                        "items": [[
+                            "id": itemID,
+                            "type": "commandExecution",
+                            "status": "inProgress",
+                            "processId": "cell:1"
+                        ]]
+                    ]]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+        let toolItem = try XCTUnwrap(snapshot.activeToolItems.first)
+        XCTAssertEqual(toolItem.itemID, itemID)
+        XCTAssertEqual(toolItem.invocationID, invocationID)
+        XCTAssertEqual(toolItem.kind, .commandExecution)
+
+        let controller = LivenessFakeCodexController(
+            snapshot: snapshot.runtimeStatus,
+            activeTurnIDs: snapshot.activeTurnIDs,
+            activeToolItems: snapshot.activeToolItems,
+            hasAuthoritativeActiveTurnItems: snapshot.hasAuthoritativeActiveTurnItems
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        let argsJSON = try XCTUnwrap(started.argsJSON)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: started.name, invocationID: invocationID, argsJSON: argsJSON),
+            session: session
+        )
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.keys.first?.invocationID, invocationID)
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
+
+        try await waitUntil {
+            controller.readSnapshotCountSync() >= 5
+        }
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().allSatisfy(\.self))
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        let completed = try XCTUnwrap(eventParser.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: [
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": [
+                    "type": "dynamicToolCall",
+                    "id": itemID,
+                    "name": "wait",
+                    "arguments": ["cell_id": "1", "yield_time_ms": 320_000],
+                    "result": ["status": "completed", "cell_id": "1"]
+                ]
+            ]
+        ))
+        XCTAssertEqual(completed.kind, "result")
+        XCTAssertEqual(completed.invocationID, invocationID)
+        try await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: completed.name,
+                invocationID: completed.invocationID,
+                argsJSON: completed.argsJSON,
+                resultJSON: XCTUnwrap(completed.resultJSON),
+                isError: completed.isError
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertEqual(session.items.first(where: { $0.toolInvocationID == invocationID })?.kind, .toolResult)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+    }
+
     func testTerminalCommandSnapshotWithoutRunIDClearsStaleSpanAndFailsBoundedly() async throws {
         let invocationID = UUID()
         let toolItem = makeCommandToolItem(
@@ -673,6 +791,56 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(controller.shutdownCountSync(), 0)
         XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
         XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testTerminalTurnFinalizesPersistedRunningCompositeExecResult() async throws {
+        let invocationID = UUID()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let argsJSON = #"{"cmd":"sleep 420"}"#
+        let runningResultJSON = #"{"type":"commandExecution","status":"running","processId":"cell:1"}"#
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "exec", invocationID: invocationID, argsJSON: argsJSON),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "exec",
+                invocationID: invocationID,
+                argsJSON: argsJSON,
+                resultJSON: runningResultJSON,
+                isError: false
+            ),
+            session: session
+        )
+
+        let persistedRunningItem = try XCTUnwrap(session.items.first(where: { $0.toolInvocationID == invocationID }))
+        XCTAssertEqual(persistedRunningItem.kind, .toolResult)
+        XCTAssertEqual(persistedRunningItem.toolName, "exec")
+        XCTAssertTrue(BashToolResultParser.parseLivenessMetadata(raw: persistedRunningItem.toolResultJSON).isRunning)
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        let finalizedItem = try XCTUnwrap(session.items.first(where: { $0.id == persistedRunningItem.id }))
+        let resultData = try XCTUnwrap(finalizedItem.toolResultJSON?.data(using: .utf8))
+        let resultObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: resultData) as? [String: Any]
+        )
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(finalizedItem.toolName, "exec")
+        XCTAssertEqual(finalizedItem.toolInvocationID, invocationID)
+        XCTAssertEqual(resultObject["type"] as? String, "commandExecution")
+        XCTAssertEqual(resultObject["status"] as? String, "completed")
+        XCTAssertEqual(resultObject["exitCode"] as? Int, 0)
+        XCTAssertFalse(BashToolResultParser.parseLivenessMetadata(raw: finalizedItem.toolResultJSON).isRunning)
+        XCTAssertEqual(finalizedItem.toolIsError, false)
     }
 
     func testUnrelatedInProgressCommandDoesNotCorroborateLocalSpan() async {

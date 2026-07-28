@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "version": "0.145.0",
   "tag": "rust-v0.145.0",
   "releaseURL": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
@@ -147,6 +147,18 @@
     "codex-path/rg",
     "codex-resources/zsh/bin/zsh"
   ],
+  "releaseSigningEntitlements": {
+    "bin/codex": {
+      "com.apple.security.cs.allow-jit": true,
+      "com.apple.security.cs.allow-unsigned-executable-memory": true
+    },
+    "bin/codex-code-mode-host": {
+      "com.apple.security.cs.allow-jit": true,
+      "com.apple.security.cs.allow-unsigned-executable-memory": true
+    },
+    "codex-path/rg": {},
+    "codex-resources/zsh/bin/zsh": {}
+  },
   "signedExecutables": [
     {
       "path": "bin/codex",
@@ -154,7 +166,11 @@
       "teamIdentifier": "2DC432GLL2",
       "authority": "Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)",
       "requiresHardenedRuntime": true,
-      "requiresTimestamp": true
+      "requiresTimestamp": true,
+      "entitlements": {
+        "com.apple.security.cs.allow-jit": true,
+        "com.apple.security.cs.allow-unsigned-executable-memory": true
+      }
     },
     {
       "path": "bin/codex-code-mode-host",
@@ -162,7 +178,11 @@
       "teamIdentifier": "2DC432GLL2",
       "authority": "Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)",
       "requiresHardenedRuntime": true,
-      "requiresTimestamp": true
+      "requiresTimestamp": true,
+      "entitlements": {
+        "com.apple.security.cs.allow-jit": true,
+        "com.apple.security.cs.allow-unsigned-executable-memory": true
+      }
     }
   ]
 }

@@ -196,6 +196,8 @@ actor WorkspaceFileContextStore {
         case superseded
         case retryScheduled
         case retryStarted
+        case retryExhausted
+        case prioritizeNow
         case repositoryAuthorityDetached
     }
 
@@ -445,6 +447,13 @@ actor WorkspaceFileContextStore {
         let retryAttempt: Int
         var phase: WorkspaceCodemapGraphIndexLaunchPhase
         var task: Task<Void, Never>?
+        let createdUptimeNanoseconds: UInt64
+        var phaseEnteredUptimeNanoseconds: UInt64
+    }
+
+    private struct CodemapGraphIndexRetryExhaustion {
+        let attempt: Int
+        let uptimeNanoseconds: UInt64
     }
 
     private struct CodemapGraphIndexBuildRetry {
@@ -1280,6 +1289,33 @@ actor WorkspaceFileContextStore {
             }
         }
 
+        func debugCodemapGraphIndexStoreEvents(
+            rootID: UUID? = nil,
+            sinceOrdinal: UInt64?,
+            limit: Int
+        ) -> CodemapGraphStatusStoreEventPage {
+            let rootEvents = codemapGraphIndexBuildStoreEvents.filter { event in
+                rootID.map { event.rootEpoch.rootID == $0 } ?? true
+            }
+            let events = Array(rootEvents.lazy.filter { event in
+                sinceOrdinal.map { event.ordinal > $0 } ?? true
+            }.prefix(min(max(0, limit), 1024)).map { event in
+                CodemapGraphStatusStoreEventSnapshot(
+                    ordinal: event.ordinal,
+                    rootEpoch: event.rootEpoch,
+                    kind: event.kind.rawValue,
+                    launchPhase: CodemapFullLoadDebugSupport.launchPhaseName(event.launchPhase),
+                    uptimeNanoseconds: event.uptimeNanoseconds
+                )
+            })
+            return CodemapGraphStatusStoreEventPage(
+                firstOrdinal: rootEvents.first?.ordinal ?? 0,
+                lastOrdinal: rootEvents.last?.ordinal ?? 0,
+                nextOrdinal: events.last?.ordinal,
+                events: events
+            )
+        }
+
         func codemapGraphIndexBuildLaunchPhaseForTesting(
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> WorkspaceCodemapGraphIndexLaunchPhase? {
@@ -1295,6 +1331,14 @@ actor WorkspaceFileContextStore {
         ) -> (attempt: Int, deadlineNanoseconds: UInt64)? {
             codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch].map {
                 (attempt: $0.attempt, deadlineNanoseconds: $0.deadlineNanoseconds)
+            }
+        }
+
+        func codemapGraphIndexRetryExhaustionForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (attempt: Int, uptimeNanoseconds: UInt64)? {
+            codemapGraphIndexRetryExhaustionByRootEpoch[rootEpoch].map {
+                (attempt: $0.attempt, uptimeNanoseconds: $0.uptimeNanoseconds)
             }
         }
 
@@ -1382,6 +1426,172 @@ actor WorkspaceFileContextStore {
             let graph: WorkspaceCodemapGraphIncrementalAccounting?
             let accounting: WorkspaceCodemapBindingEngineAccounting?
             let queueWaitMilliseconds: [UInt64]
+        }
+
+        func debugCodemapGraphStatusSnapshot(
+            rootID: UUID? = nil,
+            includeEvents: Bool = false,
+            sinceStoreOrdinal: UInt64? = nil,
+            sinceEngineOrdinal: UInt64? = nil,
+            eventLimit: Int = 256
+        ) async -> CodemapGraphStatusSnapshot {
+            let captures = rootsForPathLookup(scope: .visibleWorkspace)
+                .filter { root in rootID.map { $0 == root.id } ?? true }
+                .sorted { $0.id.uuidString < $1.id.uuidString }
+                .compactMap { root -> (
+                    rootEpoch: WorkspaceCodemapRootEpoch,
+                    rootKind: WorkspaceRootKind,
+                    catalogGeneration: UInt64,
+                    ingressGeneration: UInt64,
+                    eligibilityFlightPresent: Bool,
+                    launch: CodemapGraphStatusLaunchSnapshot?,
+                    engine: WorkspaceCodemapBindingEngine?
+                )? in
+                    guard let state = rootStatesByID[root.id] else { return nil }
+                    let rootEpoch = WorkspaceCodemapRootEpoch(
+                        rootID: root.id,
+                        rootLifetimeID: state.lifetimeID
+                    )
+                    let session = codemapSessionsByRootEpoch[rootEpoch]
+                    let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]
+                    let retry = codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch]
+                    let exhaustion = codemapGraphIndexRetryExhaustionByRootEpoch[rootEpoch]
+                    let authority = session?.authority
+                        ?? launch?.authority
+                        ?? codemapEligibilityFlightsByRootEpoch[rootEpoch]?.authority
+                        ?? codemapCompletedEligibilityByRootEpoch[rootEpoch]?.authority
+                        ?? retry?.authority
+                    let launchSnapshot = launch.map {
+                        CodemapGraphStatusLaunchSnapshot(
+                            id: $0.id,
+                            phase: $0.phase,
+                            retryAttempt: $0.retryAttempt,
+                            taskPresent: $0.task != nil,
+                            createdUptimeNanoseconds: $0.createdUptimeNanoseconds,
+                            phaseEnteredUptimeNanoseconds: $0.phaseEnteredUptimeNanoseconds,
+                            retry: retry.map {
+                                CodemapGraphStatusRetrySnapshot(
+                                    attempt: $0.attempt,
+                                    deadlineUptimeNanoseconds: $0.deadlineNanoseconds
+                                )
+                            },
+                            retryExhaustion: exhaustion.map {
+                                CodemapGraphStatusRetryExhaustionSnapshot(
+                                    attempt: $0.attempt,
+                                    uptimeNanoseconds: $0.uptimeNanoseconds
+                                )
+                            }
+                        )
+                    }
+                    return (
+                        rootEpoch: rootEpoch,
+                        rootKind: root.kind,
+                        catalogGeneration: authority?.catalogGeneration
+                            ?? catalogGenerationsByRootID[root.id]
+                            ?? 0,
+                        ingressGeneration: authority?.ingressGeneration
+                            ?? codemapAuthorityGenerationsByRootEpoch[rootEpoch]
+                            ?? 0,
+                        eligibilityFlightPresent: codemapEligibilityFlightsByRootEpoch[rootEpoch] != nil,
+                        launch: launchSnapshot,
+                        engine: session?.engine
+                    )
+                }
+
+            var accountingByEngine: [ObjectIdentifier: WorkspaceCodemapBindingEngineAccounting] = [:]
+            var roots: [CodemapGraphStatusRootSnapshot] = []
+            for capture in captures {
+                let accounting: WorkspaceCodemapBindingEngineAccounting?
+                let admission: CodemapGraphStatusAdmissionSnapshot?
+                let manifest: CodemapGraphStatusManifestSnapshot?
+                let engineEvents: WorkspaceCodemapGraphIndexDebugEventPage?
+                if let engine = capture.engine {
+                    let identity = ObjectIdentifier(engine)
+                    if let existing = accountingByEngine[identity] {
+                        accounting = existing
+                    } else {
+                        let observed = await engine.accounting()
+                        accountingByEngine[identity] = observed
+                        accounting = observed
+                    }
+                    let observedAdmission = await engine.debugGraphIndexAdmissionSnapshot(
+                        rootEpoch: capture.rootEpoch
+                    )
+                    admission = CodemapGraphStatusAdmissionSnapshot(
+                        metrics: observedAdmission.metrics,
+                        queueWaitMilliseconds: observedAdmission.queueWaitMilliseconds
+                    )
+                    let observedManifest = await engine.debugManifestFailureSnapshot(
+                        rootEpoch: capture.rootEpoch
+                    )
+                    let observedManifestMeasurements = await engine.debugManifestMeasurementSnapshot(
+                        rootEpoch: capture.rootEpoch
+                    )
+                    manifest = CodemapGraphStatusManifestSnapshot(
+                        failureCounts: observedManifest.counts,
+                        lastFailure: observedManifest.lastFailure,
+                        measurements: observedManifestMeasurements
+                    )
+                    engineEvents = includeEvents
+                        ? await engine.debugGraphIndexEvents(
+                            rootID: capture.rootEpoch.rootID,
+                            sinceOrdinal: sinceEngineOrdinal,
+                            limit: eventLimit
+                        )
+                        : nil
+                } else {
+                    accounting = nil
+                    admission = nil
+                    manifest = nil
+                    engineEvents = nil
+                }
+                let milestones = codemapGraphIndexBuildStoreEvents
+                    .filter { $0.rootEpoch == capture.rootEpoch }
+                    .map {
+                        CodemapGraphStatusStoreEventSnapshot(
+                            ordinal: $0.ordinal,
+                            rootEpoch: $0.rootEpoch,
+                            kind: $0.kind.rawValue,
+                            launchPhase: CodemapFullLoadDebugSupport.launchPhaseName($0.launchPhase),
+                            uptimeNanoseconds: $0.uptimeNanoseconds
+                        )
+                    }
+                roots.append(CodemapGraphStatusRootSnapshot(
+                    rootEpoch: capture.rootEpoch,
+                    catalogGeneration: capture.catalogGeneration,
+                    ingressGeneration: capture.ingressGeneration,
+                    rootKind: capture.rootKind,
+                    eligibilityFlightPresent: capture.eligibilityFlightPresent,
+                    launch: capture.launch,
+                    job: accounting?.graphIndexRoots.first { $0.rootEpoch == capture.rootEpoch },
+                    admission: admission,
+                    manifest: manifest,
+                    milestones: milestones,
+                    engineEvents: engineEvents
+                ))
+            }
+            let accountings = Array(accountingByEngine.values)
+            return CodemapGraphStatusSnapshot(
+                sampledUptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds(),
+                roots: roots,
+                storeEvents: includeEvents
+                    ? debugCodemapGraphIndexStoreEvents(
+                        rootID: rootID,
+                        sinceOrdinal: sinceStoreOrdinal,
+                        limit: eventLimit
+                    )
+                    : nil,
+                graphIndexJobCount: accountings.reduce(0) { $0 + $1.graphIndexJobCount },
+                queuedGraphIndexBatchCount: accountings.reduce(0) {
+                    $0 + $1.queuedGraphIndexBatchCount
+                },
+                activeGraphIndexBatchCount: accountings.reduce(0) {
+                    $0 + $1.activeGraphIndexBatchCount
+                },
+                drainingGraphIndexTaskCount: accountings.reduce(0) {
+                    $0 + $1.drainingGraphIndexTaskCount
+                }
+            )
         }
 
         func debugCodemapFullLoadAggregateSnapshot(
@@ -2557,6 +2767,9 @@ actor WorkspaceFileContextStore {
     ] = [:]
     private var codemapGraphIndexBuildRetriesByRootEpoch: [
         WorkspaceCodemapRootEpoch: CodemapGraphIndexBuildRetry
+    ] = [:]
+    private var codemapGraphIndexRetryExhaustionByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapGraphIndexRetryExhaustion
     ] = [:]
     private var terminalNonGitCodemapCacheByEpoch: [
         WorkspaceCodemapRootEpoch: TerminalNonGitCodemapCacheEntry
@@ -9679,6 +9892,38 @@ actor WorkspaceFileContextStore {
         return .changed
     }
 
+    func prioritizeCodemapGraphIndexNow(
+        rootID: UUID
+    ) async -> WorkspaceCodemapGraphIndexPrioritizeDisposition {
+        guard let state = rootStatesByID[rootID] else { return .unavailable }
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+        guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch) else { return .unavailable }
+        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
+        codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
+        recordCodemapGraphIndexBuildStoreEvent(
+            .prioritizeNow,
+            rootEpoch: rootEpoch,
+            phase: codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase ?? .notScheduled
+        )
+        if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
+            let disposition = await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
+            publishCodemapRootStatusesIfChanged()
+            return disposition
+        }
+        if let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] {
+            switch launch.phase {
+            case .transientRetry, .retryExhausted, .cancelled, .superseded:
+                codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(forKey: rootEpoch)
+            case .notScheduled, .eligibilityQueued, .setupJoining, .engineScheduling,
+                 .handedOff, .terminalNonGit:
+                return .promoted
+            }
+        }
+        scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
+        publishCodemapRootStatusesIfChanged()
+        return codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] == nil ? .unavailable : .scheduled
+    }
+
     private func removeCodemapRootStatusContinuation(_ id: UUID) {
         codemapRootStatusContinuations.removeValue(forKey: id)
     }
@@ -9711,6 +9956,7 @@ actor WorkspaceFileContextStore {
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
         let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = switch launchPhase {
         case .terminalNonGit: .notGitRepository
+        case .retryExhausted: .retryExhausted
         default: nil
         }
         let availability: WorkspaceCodemapRootAvailability = if accounting?.revocationReason != nil {
@@ -9721,7 +9967,7 @@ actor WorkspaceFileContextStore {
             switch launchPhase {
             case .eligibilityQueued, .setupJoining, .engineScheduling, .handedOff, .transientRetry:
                 .indexing
-            case .terminalNonGit:
+            case .terminalNonGit, .retryExhausted:
                 .unavailable
             case .notScheduled, .cancelled, .superseded, nil:
                 .notInitialized
@@ -11931,7 +12177,7 @@ actor WorkspaceFileContextStore {
                 rootEpoch: rootEpoch,
                 kind: kind,
                 launchPhase: phase,
-                uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+                uptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
             ))
             if codemapGraphIndexBuildStoreEvents.count > 2048 {
                 codemapGraphIndexBuildStoreEvents.removeFirst(
@@ -11971,25 +12217,29 @@ actor WorkspaceFileContextStore {
             case .cancelled, .superseded, .transientRetry:
                 break
             case .notScheduled, .eligibilityQueued, .setupJoining, .engineScheduling,
-                 .handedOff, .terminalNonGit:
+                 .handedOff, .terminalNonGit, .retryExhausted:
                 return
             }
         }
 
         let launchID = UUID()
+        let createdUptimeNanoseconds = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
         codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] = CodemapGraphIndexBuildLaunch(
             id: launchID,
             authority: authority,
             retryAttempt: retryAttempt,
             phase: .eligibilityQueued,
-            task: nil
+            task: nil,
+            createdUptimeNanoseconds: createdUptimeNanoseconds,
+            phaseEnteredUptimeNanoseconds: createdUptimeNanoseconds
         )
         recordCodemapGraphIndexBuildStoreEvent(
             .scheduled,
             rootEpoch: rootEpoch,
             phase: .eligibilityQueued
         )
-        let task = Task<Void, Never>(priority: .background) { [weak self] in
+        let task = Task<Void, Never>(priority: .utility) { [weak self] in
             guard let self else { return }
             await runCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
@@ -12392,13 +12642,16 @@ actor WorkspaceFileContextStore {
     private func updateCodemapGraphIndexBuildLaunchPhase(
         _ phase: WorkspaceCodemapGraphIndexLaunchPhase,
         launchID: UUID,
-        authority: CodemapRootAuthority
+        authority: CodemapRootAuthority,
+        uptimeNanoseconds: UInt64? = nil
     ) {
         guard var launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
               launch.authority == authority
         else { return }
         launch.phase = phase
+        launch.phaseEnteredUptimeNanoseconds = uptimeNanoseconds
+            ?? codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
         codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch] = launch
         publishCodemapRootStatusesIfChanged()
     }
@@ -12413,6 +12666,8 @@ actor WorkspaceFileContextStore {
               launch.authority == authority
         else { return }
         launch.phase = phase
+        launch.task = nil
+        launch.phaseEnteredUptimeNanoseconds = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
         codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch] = launch
         publishCodemapRootStatusesIfChanged()
         if phase == .cancelled || phase == .superseded {
@@ -12444,14 +12699,33 @@ actor WorkspaceFileContextStore {
               codemapGraphIndexBuildRetriesByRootEpoch[authority.rootEpoch] == nil
         else { return }
         let attempt = launch.retryAttempt + 1
-        guard attempt <= codemapGraphIndexBuildRetryPolicy.maximumRetryCount else { return }
+        guard attempt <= codemapGraphIndexBuildRetryPolicy.maximumRetryCount else {
+            let exhaustionUptimeNanoseconds = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+            let exhausted = CodemapGraphIndexRetryExhaustion(
+                attempt: attempt,
+                uptimeNanoseconds: exhaustionUptimeNanoseconds
+            )
+            codemapGraphIndexRetryExhaustionByRootEpoch[authority.rootEpoch] = exhausted
+            updateCodemapGraphIndexBuildLaunchPhase(
+                .retryExhausted,
+                launchID: launchID,
+                authority: authority,
+                uptimeNanoseconds: exhaustionUptimeNanoseconds
+            )
+            recordCodemapGraphIndexBuildStoreEvent(
+                .retryExhausted,
+                rootEpoch: authority.rootEpoch,
+                phase: .retryExhausted
+            )
+            return
+        }
         let delay = codemapGraphIndexBuildRetryPolicy.backoffNanoseconds(forAttempt: attempt)
         let now = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
         let (candidateDeadline, overflow) = now.addingReportingOverflow(delay)
         let deadline = overflow ? UInt64.max : candidateDeadline
         let retryID = UUID()
         let sleep = codemapGraphIndexBuildRetryPolicy.sleep
-        let task = Task<Void, Never>(priority: .background) { [weak self] in
+        let task = Task<Void, Never>(priority: .utility) { [weak self] in
             do {
                 try await sleep(delay)
             } catch {
@@ -14543,7 +14817,9 @@ actor WorkspaceFileContextStore {
                 fileID: $0.identity.fileID
             )
         }
-        guard let supportedCandidateCountThroughPage = UInt64(exactly: nextIndex) else {
+        guard let supportedCandidateCountThroughPage = UInt64(exactly: nextIndex),
+              let projectedSupportedCandidateTotal = UInt64(exactly: current.shard.projectionFiles.count)
+        else {
             return .unavailable(.catalogUnavailable)
         }
         switch WorkspaceCodemapGraphIndexCatalogPage.validated(
@@ -14552,7 +14828,8 @@ actor WorkspaceFileContextStore {
             entries: entries,
             nextCursor: nextCursor,
             isEnd: isEnd,
-            supportedCandidateCountThroughPage: supportedCandidateCountThroughPage
+            supportedCandidateCountThroughPage: supportedCandidateCountThroughPage,
+            projectedSupportedCandidateTotal: projectedSupportedCandidateTotal
         ) {
         case let .success(page):
             return .page(page)
@@ -15411,6 +15688,7 @@ actor WorkspaceFileContextStore {
     private func cancelCodemapGraphIndexBuildLaunchForInvalidation(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> Task<Void, Never>? {
+        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
         codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
         guard let launch = codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(
             forKey: rootEpoch
@@ -15430,6 +15708,7 @@ actor WorkspaceFileContextStore {
         graphInvalidationReason: WorkspaceCodemapGraphRevocationReason =
             .repositoryAuthorityChanged
     ) -> CodemapCleanupFlight? {
+        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
         let launch = codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(forKey: rootEpoch)
         launch?.task?.cancel()
         if launch != nil {

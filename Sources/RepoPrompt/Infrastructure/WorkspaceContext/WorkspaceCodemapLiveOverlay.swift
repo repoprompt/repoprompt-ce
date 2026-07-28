@@ -101,6 +101,8 @@ actor WorkspaceCodemapLiveOverlay {
         var retainedGraphSlotsByFileID: [UUID: WorkspaceCodemapGraphSlot]
         var manifestGraphSlotsByRelativePath: [String: WorkspaceCodemapGraphSlot]
         var graphCatalogToken: WorkspaceCodemapGraphIndexCatalogToken?
+        var graphProjectedSupportedCandidateTotal: UInt64?
+        var graphCatalogSealed: Bool
         var graphEnumerationFinished: Bool
         var graphReconciliationPriorIndexSlotsByFileID: [UUID: WorkspaceCodemapGraphSlot]?
         var graphReconciliationSeenIndexFileIDs: Set<UUID>
@@ -206,6 +208,7 @@ actor WorkspaceCodemapLiveOverlay {
             rootEpoch: capability.rootEpoch,
             catalogWatermark: nil,
             enumerationState: .notStarted,
+            isCatalogSealed: false,
             supportedCount: 0,
             classifiedCount: 0,
             pendingCount: 0,
@@ -232,6 +235,8 @@ actor WorkspaceCodemapLiveOverlay {
             retainedGraphSlotsByFileID: [:],
             manifestGraphSlotsByRelativePath: [:],
             graphCatalogToken: nil,
+            graphProjectedSupportedCandidateTotal: nil,
+            graphCatalogSealed: false,
             graphEnumerationFinished: false,
             graphReconciliationPriorIndexSlotsByFileID: nil,
             graphReconciliationSeenIndexFileIDs: [],
@@ -1343,13 +1348,15 @@ actor WorkspaceCodemapLiveOverlay {
     }
 
     /// Publishes current graph-index classifications into the root-local ledger. Repeated
-    /// publication is idempotent; a captured enumeration is complete only after every
-    /// supported slot is classified.
+    /// publication is idempotent. Catalog sealing fixes the authoritative denominator, while
+    /// enumeration completion remains reserved for fully classified coverage.
     @discardableResult
     func publishGraphIndexSlots(
         rootEpoch: WorkspaceCodemapRootEpoch,
         catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
         slots: [WorkspaceCodemapGraphSlot],
+        projectedSupportedCandidateTotal: UInt64? = nil,
+        catalogSealed: Bool = false,
         enumerationFinished: Bool = false,
         reconciliationFence: (@Sendable (
             Set<UUID>,
@@ -1375,9 +1382,22 @@ actor WorkspaceCodemapLiveOverlay {
                 catalogToken.ingressGeneration >= current.ingressGeneration &&
                 catalogToken.graphIndexInvalidationGeneration > current.graphIndexInvalidationGeneration
             guard isSyntheticBootstrap || isMonotonicReplacement else { return false }
+            root.graphProjectedSupportedCandidateTotal = nil
+            root.graphCatalogSealed = false
             root.graphEnumerationFinished = false
         }
         root.graphCatalogToken = catalogToken
+        if let projectedSupportedCandidateTotal {
+            guard projectedSupportedCandidateTotal >= UInt64(slots.count),
+                  root.graphProjectedSupportedCandidateTotal == nil ||
+                  root.graphProjectedSupportedCandidateTotal == projectedSupportedCandidateTotal
+            else { return false }
+            root.graphProjectedSupportedCandidateTotal = projectedSupportedCandidateTotal
+            root.graphCatalogSealed = true
+        }
+        if catalogSealed || enumerationFinished {
+            root.graphCatalogSealed = true
+        }
         // Enumeration completion is published only after any destructive safety fences derived
         // from this authoritative pass have completed.
         if !enumerationFinished {
@@ -1513,11 +1533,13 @@ actor WorkspaceCodemapLiveOverlay {
             root.graphReconciliationPriorIndexSlotsByFileID = root.graphIndexSlotsByFileID
             root.graphReconciliationSeenIndexFileIDs.removeAll(keepingCapacity: true)
         }
+        root.graphProjectedSupportedCandidateTotal = nil
+        root.graphCatalogSealed = false
         root.graphEnumerationFinished = false
         root.floorGeneration = root.contributionGeneration
         root.changedFileIDsSinceFloor.removeAll(keepingCapacity: true)
         root.graphRemovalsByFileID.removeAll(keepingCapacity: true)
-        yieldGraphChange(&root)
+        advanceGraphCoverageAuthorityGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         return true
     }
@@ -2041,6 +2063,46 @@ actor WorkspaceCodemapLiveOverlay {
         return true
     }
 
+    /// Publishes an authority-only coverage transition without walking or reconciling graph slots.
+    private func advanceGraphCoverageAuthorityGeneration(
+        _ root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        let coverage = root.graphCoverage
+        let enumerationState: WorkspaceCodemapGraphCatalogEnumerationState = if root.graphCatalogToken == nil {
+            .notStarted
+        } else if root.graphEnumerationFinished, coverage.pendingCount == 0 {
+            .complete
+        } else {
+            .partial
+        }
+        guard case let .success(updatedCoverage) = WorkspaceCodemapGraphCatalogCoverage.validated(
+            rootEpoch: rootEpoch,
+            catalogWatermark: root.graphCatalogToken,
+            enumerationState: enumerationState,
+            isCatalogSealed: root.graphCatalogSealed,
+            supportedCount: coverage.supportedCount,
+            classifiedCount: coverage.classifiedCount,
+            pendingCount: coverage.pendingCount,
+            contributedCount: coverage.contributedCount,
+            emptyCount: coverage.emptyCount,
+            terminalArtifactCount: coverage.terminalArtifactCount,
+            terminalExcludedCount: coverage.terminalExcludedCount
+        ) else {
+            revokeGraph(&root, rootEpoch: rootEpoch, reason: .accountingOverflow)
+            return
+        }
+        guard updatedCoverage != coverage else { return }
+        root.graphCoverage = updatedCoverage
+        let (next, overflow) = root.contributionGeneration.rawValue.addingReportingOverflow(1)
+        guard !overflow else {
+            failClosedGenerationExhaustion(&root, rootEpoch: rootEpoch)
+            return
+        }
+        root.contributionGeneration = .init(rawValue: next)
+        yieldGraphChange(&root)
+    }
+
     private func advanceContributionGeneration(
         _ root: inout RootState,
         rootEpoch: WorkspaceCodemapRootEpoch,
@@ -2300,10 +2362,17 @@ actor WorkspaceCodemapLiveOverlay {
                 graphIndexInvalidationGeneration: 0
             )
         }
+        let coverageSlots = if root.graphReconciliationPriorIndexSlotsByFileID == nil {
+            root.graphSlotsByFileID
+        } else {
+            root.graphSlotsByFileID.filter { root.graphReconciliationSeenIndexFileIDs.contains($0.key) }
+        }
         guard let coverage = coverageForSlots(
-            root.graphSlotsByFileID,
+            coverageSlots,
             rootEpoch: rootEpoch,
             token: root.graphCatalogToken,
+            projectedSupportedCandidateTotal: root.graphProjectedSupportedCandidateTotal,
+            isCatalogSealed: root.graphCatalogSealed,
             enumerationFinished: root.graphEnumerationFinished
         ) else { return false }
         root.graphCoverage = coverage
@@ -2314,6 +2383,8 @@ actor WorkspaceCodemapLiveOverlay {
         _ slots: [UUID: WorkspaceCodemapGraphSlot],
         rootEpoch: WorkspaceCodemapRootEpoch,
         token: WorkspaceCodemapGraphIndexCatalogToken?,
+        projectedSupportedCandidateTotal: UInt64?,
+        isCatalogSealed: Bool,
         enumerationFinished: Bool
     ) -> WorkspaceCodemapGraphCatalogCoverage? {
         var pending: UInt64 = 0
@@ -2330,8 +2401,17 @@ actor WorkspaceCodemapLiveOverlay {
             case .terminalExcluded: terminalExcluded += 1
             }
         }
-        let classified = contributed + empty + terminalArtifact + terminalExcluded
-        let supported = classified + pending
+        let (classifiedArtifacts, classifiedArtifactsOverflow) = contributed.addingReportingOverflow(empty)
+        let (classifiedTerminals, classifiedTerminalsOverflow) = terminalArtifact.addingReportingOverflow(terminalExcluded)
+        let (classified, classifiedOverflow) = classifiedArtifacts.addingReportingOverflow(classifiedTerminals)
+        guard !classifiedArtifactsOverflow, !classifiedTerminalsOverflow, !classifiedOverflow else { return nil }
+        let observedSupported: UInt64
+        let (sum, observedSupportedOverflow) = classified.addingReportingOverflow(pending)
+        guard !observedSupportedOverflow else { return nil }
+        observedSupported = sum
+        let supported = projectedSupportedCandidateTotal ?? observedSupported
+        guard supported >= observedSupported, supported >= classified else { return nil }
+        pending = supported - classified
         let enumerationState: WorkspaceCodemapGraphCatalogEnumerationState = if token == nil {
             .notStarted
         } else if enumerationFinished, pending == 0 {
@@ -2343,6 +2423,7 @@ actor WorkspaceCodemapLiveOverlay {
             rootEpoch: rootEpoch,
             catalogWatermark: token,
             enumerationState: enumerationState,
+            isCatalogSealed: isCatalogSealed,
             supportedCount: supported,
             classifiedCount: classified,
             pendingCount: pending,

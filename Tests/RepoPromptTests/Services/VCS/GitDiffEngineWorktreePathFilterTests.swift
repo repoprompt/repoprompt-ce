@@ -3,6 +3,61 @@ import Foundation
 import XCTest
 
 final class GitDiffEngineWorktreePathFilterTests: XCTestCase {
+    func testAbsolutePathOutsideLinkedWorktreeReturnsEmptyWithoutWholeCheckoutFallback() async throws {
+        let fixture = try LinkedWorktreeDiffFixture()
+        defer { fixture.cleanup() }
+        let engine = GitDiffEngine(vcsService: VCSService(), gitService: GitService())
+        let outsidePath = fixture.repo.appendingPathComponent(fixture.relativePath).path
+
+        let filtered = try await engine.buildSnapshotInputs(
+            compare: .uncommitted(base: "HEAD"),
+            pathspecs: [outsidePath],
+            repoURL: fixture.worktree,
+            contextLines: 3,
+            detectRenames: false,
+            generateDiffText: true
+        )
+
+        XCTAssertEqual(filtered.scope, .selected)
+        XCTAssertEqual(filtered.requestedPaths, [])
+        XCTAssertTrue(filtered.changedFiles.isEmpty)
+        XCTAssertEqual(filtered.summary.files, 0)
+        XCTAssertNil(filtered.diffText)
+    }
+
+    func testAbsoluteMetacharacterPathIsLiteralWhileRelativePathspecKeepsGitGlobSemantics() async throws {
+        let fixture = try LinkedWorktreeDiffFixture()
+        defer { fixture.cleanup() }
+        let literalPath = "pages/[slug].tsx"
+        let globMatchPath = "pages/s.tsx"
+        try fixture.writeUntracked(literalPath, contents: "literal route\n")
+        try fixture.writeUntracked(globMatchPath, contents: "glob route\n")
+        let engine = GitDiffEngine(vcsService: VCSService(), gitService: GitService())
+
+        let absoluteFiltered = try await engine.buildSnapshotInputs(
+            compare: .uncommitted(base: "HEAD"),
+            pathspecs: [fixture.worktree.appendingPathComponent(literalPath).path],
+            repoURL: fixture.worktree,
+            contextLines: 3,
+            detectRenames: false,
+            generateDiffText: true
+        )
+        XCTAssertEqual(absoluteFiltered.requestedPaths, [literalPath])
+        XCTAssertEqual(absoluteFiltered.changedFiles.map(\.path), [literalPath])
+        XCTAssertTrue(absoluteFiltered.diffText?.contains(literalPath) == true)
+        XCTAssertFalse(absoluteFiltered.diffText?.contains(globMatchPath) == true)
+
+        let relativeGlobFiltered = try await engine.buildSnapshotInputs(
+            compare: .uncommitted(base: "HEAD"),
+            pathspecs: [literalPath],
+            repoURL: fixture.worktree,
+            contextLines: 3,
+            detectRenames: false,
+            generateDiffText: false
+        )
+        XCTAssertEqual(relativeGlobFiltered.changedFiles.map(\.path), [literalPath, globMatchPath])
+    }
+
     func testAbsolutePathFilterInLinkedWorktreeMatchesUnfilteredDiff() async throws {
         let fixture = try LinkedWorktreeDiffFixture()
         defer { fixture.cleanup() }
@@ -68,6 +123,12 @@ private struct LinkedWorktreeDiffFixture {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: sandbox)
+    }
+
+    func writeUntracked(_ relativePath: String, contents: String) throws {
+        let url = worktree.appendingPathComponent(relativePath)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try contents.write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func runGit(_ arguments: [String], cwd: URL) throws {

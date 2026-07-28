@@ -3,6 +3,44 @@ import Foundation
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStoreCodemapSeamTestSupport {
+    func testGraphCatalogFirstPageExposesImmutableProjectedTotalFromStore() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Alpha.swift": SwiftFixtureSource.emptyStruct("Alpha"),
+                "Sources/Beta.swift": SwiftFixtureSource.emptyStruct("Beta")
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let store = fixture.makeStore(codemapGraphIndexBuildLaunchPolicy: .disabled)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let alpha = try XCTUnwrap(files.first {
+            $0.standardizedRelativePath == "Sources/Alpha.swift"
+        })
+        let demand = try await readyArtifactDemand(store: store, forFileID: alpha.id)
+        let catalog = fixture.registry.makeBindingCatalogClient()
+        let page = try await graphIndexPage(catalog.readGraphIndexCatalogPage(
+            WorkspaceCodemapGraphIndexCatalogPageRequest(
+                rootEpoch: demand.ticket.rootEpoch,
+                token: nil,
+                cursor: nil,
+                maximumEntryCount: 1,
+                maximumPathByteCount: 1024
+            )
+        ))
+
+        XCTAssertEqual(page.entries.count, 1)
+        XCTAssertEqual(page.supportedCandidateCountThroughPage, 1)
+        XCTAssertEqual(page.projectedSupportedCandidateTotal, 2)
+        XCTAssertFalse(page.isEnd)
+    }
+
     func testPublisherIngressAppliesCatalogWhileCorrelatedCodemapInvalidationIsStalled() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(

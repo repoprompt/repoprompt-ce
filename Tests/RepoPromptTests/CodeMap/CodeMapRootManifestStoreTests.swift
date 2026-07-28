@@ -1469,6 +1469,34 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         XCTAssertEqual(persisted.lastAccessEpochSeconds, 120)
         XCTAssertEqual(persisted.manifestGeneration, 2)
         XCTAssertEqual(persisted.records, [addedRecord, fixture.record])
+
+        #if DEBUG
+            let debugMetrics = await store.debugPublicationMetrics(namespace: fixture.namespace)
+            XCTAssertEqual(debugMetrics.attemptCount, 2)
+            XCTAssertEqual(debugMetrics.successfulAttemptCount, 2)
+            XCTAssertEqual(debugMetrics.publicationCount, 2)
+            XCTAssertEqual(debugMetrics.inputSnapshotRecordVolume, 1)
+            XCTAssertEqual(debugMetrics.mutationCountVolume, 3)
+            XCTAssertEqual(debugMetrics.snapshotRecordVolume, 3)
+            XCTAssertGreaterThan(debugMetrics.inputSnapshotByteVolume, 0)
+            XCTAssertEqual(debugMetrics.decodedByteVolume, debugMetrics.inputSnapshotByteVolume)
+            XCTAssertGreaterThan(debugMetrics.snapshotByteVolume, debugMetrics.inputSnapshotByteVolume)
+            let lastAttempt = try XCTUnwrap(debugMetrics.lastAttempt)
+            XCTAssertTrue(lastAttempt.succeeded)
+            XCTAssertTrue(lastAttempt.published)
+            XCTAssertEqual(lastAttempt.inputSnapshotRecordCount, 1)
+            XCTAssertEqual(lastAttempt.mutationCount, 2)
+            XCTAssertEqual(lastAttempt.outputSnapshotRecordCount, 2)
+            XCTAssertGreaterThan(lastAttempt.outputSnapshotEncodedByteCount, 0)
+            XCTAssertGreaterThanOrEqual(
+                lastAttempt.totalDurationNanoseconds,
+                lastAttempt.atomicReplaceDurationNanoseconds
+            )
+            XCTAssertGreaterThanOrEqual(
+                lastAttempt.totalDurationNanoseconds,
+                lastAttempt.manifestDirectorySyncDurationNanoseconds
+            )
+        #endif
     }
 
     func testAuthorityMutationBelowAccessRefreshThresholdStillRewrites() async throws {
