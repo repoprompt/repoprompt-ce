@@ -115,8 +115,6 @@ import XCTest
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
             XCTAssertTrue(switchResult.didSwitch)
-            await manager.waitUntilPostSwitchGitDataLoadComplete()
-
             manager.markWorkspaceDirty()
             manager.resetWorkspaceSaveDiagnosticsForTesting()
 
@@ -133,14 +131,14 @@ import XCTest
 
             let diagnostics = manager.workspaceSaveDiagnosticsForTesting(workspaceID: workspace.id)
             XCTAssertEqual(diagnostics.attemptCount, 2)
+            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: manager.workspaceFileURL(for: workspace)
+            )
+            XCTAssertEqual(saved.currentPromptText, "newer state")
             XCTAssertEqual(
                 manager.debugLastSavedVersionForWorkspace(workspace.id),
                 manager.debugStateVersionForWorkspace(workspace.id)
             )
-            let workspaceFileURL = manager.workspaceFileURL(for: workspace)
-            XCTAssertTrue(FileManager.default.fileExists(atPath: workspaceFileURL.path))
-            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceFileURL)
-            XCTAssertEqual(saved.currentPromptText, "newer state")
         }
 
         func testPreparationFailureDoesNotAdvanceLastSavedVersion() async throws {

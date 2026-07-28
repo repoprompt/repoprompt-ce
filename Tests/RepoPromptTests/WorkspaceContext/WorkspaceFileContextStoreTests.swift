@@ -3416,11 +3416,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
             await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
-            let capturedWatermarkRecorder = CapturedWatcherWatermarkRecorder(expectedRootID: rootID)
-            await store.setAppliedIngressDidCaptureWatermarksHandler { captured in
-                guard let capturedWatermark = captured[rootID] else { return }
-                await capturedWatermarkRecorder.record(rootID: rootID, watermark: capturedWatermark)
-            }
+            let baselineWatcherWatermark = try await store.acceptedWatcherWatermarkForTesting(rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == rootID else { return }
@@ -3431,11 +3427,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
             }
             await flushGate.waitUntilStarted()
-            let recordedWatermark = await capturedWatermarkRecorder.snapshot()
-            let firstCapturedWatcherWatermark = try XCTUnwrap(
-                recordedWatermark,
-                "First scoped barrier started without recording its captured watcher watermark"
-            )
 
             try write("first", to: firstAddedURL)
             let firstAcceptedPayload = try await store.acceptWatcherPayloadForTesting(
@@ -3491,7 +3482,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(statsWhileBlocked.coalescedSuccessorCount, 1)
             XCTAssertEqual(flightCountWhileBlocked, 2)
             XCTAssertEqual(flushStartCountWhileBlocked, 1)
-            XCTAssertEqual(active.targetWatcherWatermark, firstCapturedWatcherWatermark)
+            XCTAssertEqual(active.targetWatcherWatermark, baselineWatcherWatermark.rawValue)
             XCTAssertGreaterThanOrEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
             XCTAssertEqual(pending.targetServicePublicationSequence, acceptedServicePublicationSequence)
             XCTAssertEqual(pending.ageMilliseconds, 175)
@@ -3512,7 +3503,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(settledFlushStartCount, 2)
             XCTAssertEqual(
                 firstSamples.first?.acceptedWatcherWatermark,
-                firstCapturedWatcherWatermark
+                baselineWatcherWatermark.rawValue
             )
             XCTAssertGreaterThanOrEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
@@ -3526,7 +3517,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 thirdSample.appliedServicePublicationSequence,
                 acceptedServicePublicationSequence
             )
-            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
             await store.setScopedIngressBarrierWillFlushHandler(nil)
             await store.stopWatchingRoot(id: rootID)
         }
