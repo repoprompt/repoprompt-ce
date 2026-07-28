@@ -403,10 +403,9 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             expectedGroupLabel
         )
         let collapsedAgentOptions = CodexAgentModeCoordinator.test_collapseCodexModelOptions(agentOptions)
-        XCTAssertEqual(
-            collapsedAgentOptions.first { $0.rawValue == "gpt-5.6-sol-ultrafast" }?.displayName,
-            expectedGroupLabel
-        )
+        let collapsedUltrafast = collapsedAgentOptions.first { $0.rawValue == "gpt-5.6-sol-ultrafast" }
+        XCTAssertEqual(collapsedUltrafast?.displayName, expectedGroupLabel)
+        XCTAssertEqual(collapsedUltrafast?.defaultReasoningEffort, .high)
 
         let ultrafastSpecifier = CodexModelSpecifier(raw: ultrafastHigh.id)
         XCTAssertEqual(ultrafastSpecifier.baseModel, "gpt-5.6-sol")

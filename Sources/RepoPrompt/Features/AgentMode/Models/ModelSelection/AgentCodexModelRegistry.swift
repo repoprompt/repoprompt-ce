@@ -159,7 +159,9 @@ final class AgentCodexModelRegistry {
                 displayName: model.displayName,
                 description: model.description,
                 isPlaceholderDefault: false,
-                isProviderDefault: model.isDefault
+                isProviderDefault: model.isDefault,
+                defaultReasoningEffort: model.serviceTier == CodexServiceTierVariantCatalog.ultrafastServiceTier
+                    && model.isReasoningDefault ? model.reasoningEffort : nil
             )
         }
         options.append(contentsOf: mapped)

@@ -75,6 +75,7 @@ struct CodexDynamicModelOption: Hashable {
     let displayName: String
     let description: String
     let isDefault: Bool
+    let isReasoningDefault: Bool
     let baseID: String
     let reasoningEffort: CodexReasoningEffort?
     let serviceTier: String?
@@ -135,6 +136,7 @@ enum CodexDynamicModelMapper {
                         displayName: baseName,
                         description: baseDescription,
                         isDefault: record.isDefault,
+                        isReasoningDefault: false,
                         baseID: baseID,
                         reasoningEffort: nil,
                         serviceTier: nil
@@ -155,6 +157,7 @@ enum CodexDynamicModelMapper {
                         displayName: "\(baseName) \(effortEntry.effort.displayName)",
                         description: optionDescription,
                         isDefault: record.isDefault && effortEntry.isDefault,
+                        isReasoningDefault: effortEntry.isDefault,
                         baseID: baseID,
                         reasoningEffort: effortEntry.effort,
                         serviceTier: nil
@@ -226,6 +229,7 @@ enum CodexDynamicModelMapper {
                 displayName: displayName,
                 description: description,
                 isDefault: false,
+                isReasoningDefault: baseOption.isReasoningDefault,
                 baseID: baseOption.baseID,
                 reasoningEffort: baseOption.reasoningEffort,
                 serviceTier: CodexServiceTierVariantCatalog.ultrafastServiceTier
