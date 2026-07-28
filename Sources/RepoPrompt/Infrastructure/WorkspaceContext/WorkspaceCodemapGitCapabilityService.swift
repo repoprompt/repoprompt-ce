@@ -782,6 +782,32 @@ actor WorkspaceCodemapGitCapabilityService {
                 try Task.checkCancellation()
             }
 
+            var postPathFingerprints = [GitBlobLStatFingerprint?](
+                repeating: nil,
+                count: candidates.count
+            )
+            for index in candidates.indices {
+                guard let path = candidatePaths[index],
+                      let prePathFingerprint = prePathFingerprints[index]
+                else { continue }
+                do {
+                    let postPathFingerprint = try pathFingerprintClient.fingerprint(
+                        capability.repositoryLayout.workTreeRoot,
+                        path
+                    )
+                    #if DEBUG
+                        await hooks.afterSourcePathFingerprintCapture()
+                    #endif
+                    guard postPathFingerprint == prePathFingerprint,
+                          postPathFingerprint.isRegularFile
+                    else { continue }
+                    postPathFingerprints[index] = postPathFingerprint
+                } catch {
+                    continue
+                }
+                try Task.checkCancellation()
+            }
+
             let postRepository = try await captureAuthority(
                 loadedRoot: loadedRoot,
                 expectedLayout: capability.repositoryLayout,
@@ -798,33 +824,23 @@ actor WorkspaceCodemapGitCapabilityService {
             for index in candidates.indices {
                 guard let path = candidatePaths[index],
                       let prePathFingerprint = prePathFingerprints[index],
+                      let postPathFingerprint = postPathFingerprints[index],
                       let attributeGeneration = postAttributeGenerations[index]
                 else { continue }
-                do {
-                    let postPathFingerprint = try pathFingerprintClient.fingerprint(
-                        capability.repositoryLayout.workTreeRoot,
-                        path
-                    )
-                    guard postPathFingerprint == prePathFingerprint,
-                          postPathFingerprint.isRegularFile
-                    else { continue }
-                    let candidate = candidates[index]
-                    authorities[index] = WorkspaceCodemapSourceAuthorityToken.issue(
-                        capability: capability,
-                        observedRootEpoch: observedRootEpoch,
-                        observedRepositoryAuthority: observedRepositoryAuthority,
-                        candidateRepositoryRelativePath: path,
-                        acceptedPrePathFingerprint: prePathFingerprint,
-                        acceptedPostPathFingerprint: postPathFingerprint,
-                        candidateAttributeGeneration: attributeGeneration,
-                        observedPathGeneration: candidate.observedPathGeneration,
-                        currentPathGeneration: candidate.currentPathGeneration,
-                        observedIngressGeneration: candidate.observedIngressGeneration,
-                        currentIngressGeneration: candidate.currentIngressGeneration
-                    )
-                } catch {
-                    continue
-                }
+                let candidate = candidates[index]
+                authorities[index] = WorkspaceCodemapSourceAuthorityToken.issue(
+                    capability: capability,
+                    observedRootEpoch: observedRootEpoch,
+                    observedRepositoryAuthority: observedRepositoryAuthority,
+                    candidateRepositoryRelativePath: path,
+                    acceptedPrePathFingerprint: prePathFingerprint,
+                    acceptedPostPathFingerprint: postPathFingerprint,
+                    candidateAttributeGeneration: attributeGeneration,
+                    observedPathGeneration: candidate.observedPathGeneration,
+                    currentPathGeneration: candidate.currentPathGeneration,
+                    observedIngressGeneration: candidate.observedIngressGeneration,
+                    currentIngressGeneration: candidate.currentIngressGeneration
+                )
                 try Task.checkCancellation()
             }
             guard !Task.isCancelled,

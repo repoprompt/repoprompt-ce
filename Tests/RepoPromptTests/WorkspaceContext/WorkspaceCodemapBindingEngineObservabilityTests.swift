@@ -95,7 +95,7 @@
             XCTAssertTrue(events.contains { $0.reason == WorkspaceCodemapGraphIndexDebugReason.pageAccepted })
             XCTAssertTrue(events.contains { $0.reason == WorkspaceCodemapGraphIndexDebugReason.checkpointed })
             XCTAssertTrue(events.contains { $0.reason == WorkspaceCodemapGraphIndexDebugReason.complete })
-            XCTAssertTrue(events.contains { $0.reason == WorkspaceCodemapGraphIndexDebugReason.workerFinished })
+            XCTAssertTrue(events.contains { $0.reason == WorkspaceCodemapGraphIndexDebugReason.workerComplete })
             XCTAssertEqual(events.map(\.ordinal), events.map(\.ordinal).sorted())
         }
 
@@ -191,26 +191,110 @@
                 await fixture.engine.debugGraphIndexJobSnapshot(rootEpoch: fixture.rootEpoch)?
                     .isQueuedForAdmission == true
             }
+            let originalJobSnapshot = await fixture.engine.debugGraphIndexJobSnapshot(
+                rootEpoch: fixture.rootEpoch
+            )
+            let originalJob = try XCTUnwrap(originalJobSnapshot)
+            await fixture.engine.debugSimulateGraphIndexWorkerExitForTesting(
+                rootEpoch: fixture.rootEpoch,
+                reason: .admissionUnavailable
+            )
+            let installed = await fixture.engine.debugInstallNonCooperativeGraphIndexWorkerForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertTrue(installed)
+            await fixture.engine.debugSetGraphIndexLastProgressForTesting(
+                rootEpoch: fixture.rootEpoch,
+                uptimeNanoseconds: 1
+            )
 
             for expectedRecoveryCount in 1 ... 2 {
-                await fixture.engine.debugSimulateGraphIndexWorkerExitForTesting(
-                    rootEpoch: fixture.rootEpoch,
-                    reason: .admissionUnavailable
-                )
-                await fixture.engine.debugSetGraphIndexLastProgressForTesting(
-                    rootEpoch: fixture.rootEpoch,
-                    uptimeNanoseconds: 1
-                )
                 let watchdogDisposition = await fixture.engine.debugEvaluateGraphIndexWatchdogForTesting(
                     rootEpoch: fixture.rootEpoch,
                     nowUptimeNanoseconds: 60_000_000_001
                 )
-                XCTAssertEqual(watchdogDisposition, .restarted)
-                let recoveredSnapshot = await fixture.engine.debugGraphIndexJobSnapshot(
+                XCTAssertEqual(watchdogDisposition, .restartRequested)
+                let recoveryState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
                     rootEpoch: fixture.rootEpoch
                 )
-                XCTAssertEqual(recoveredSnapshot?.workerRecoveryCount, UInt64(expectedRecoveryCount))
+                let recovery = try XCTUnwrap(recoveryState)
+                XCTAssertEqual(recovery.count, UInt64(expectedRecoveryCount))
+                XCTAssertFalse(recovery.exhausted)
+                XCTAssertTrue(recovery.workerPresent)
+                XCTAssertTrue(recovery.watchdogArmed)
             }
+
+            let exhaustedDisposition = await fixture.engine.debugEvaluateGraphIndexWatchdogForTesting(
+                rootEpoch: fixture.rootEpoch,
+                nowUptimeNanoseconds: 60_000_000_001
+            )
+            XCTAssertEqual(exhaustedDisposition, .exhausted)
+            let observedExhaustedSnapshot = await fixture.engine.debugGraphIndexJobSnapshot(
+                rootEpoch: fixture.rootEpoch
+            )
+            let exhaustedSnapshot = try XCTUnwrap(observedExhaustedSnapshot)
+            XCTAssertTrue(exhaustedSnapshot.workerPresent)
+            XCTAssertEqual(exhaustedSnapshot.workerRecoveryCount, 2)
+            XCTAssertEqual(exhaustedSnapshot.lastWorkerCompletionReason, .watchdogRecoveryExhausted)
+            let exhaustedRecoveryState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            let exhaustedRecovery = try XCTUnwrap(exhaustedRecoveryState)
+            XCTAssertTrue(exhaustedRecovery.exhausted)
+            XCTAssertFalse(exhaustedRecovery.watchdogArmed)
+
+            let quarantinedSchedule = await fixture.engine.scheduleGraphIndex(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertEqual(quarantinedSchedule, .handedOff)
+            let quarantinedPrioritize = await fixture.engine.prioritizeGraphIndexNow(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertEqual(quarantinedPrioritize, .unavailable)
+            let quarantinedRecoveryState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            let quarantinedRecovery = try XCTUnwrap(quarantinedRecoveryState)
+            XCTAssertEqual(quarantinedRecovery.count, 2)
+            XCTAssertTrue(quarantinedRecovery.exhausted)
+            XCTAssertTrue(quarantinedRecovery.workerPresent)
+
+            let drainRequested = await fixture.engine.debugDrainNonCooperativeGraphIndexWorkerForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertTrue(drainRequested)
+            try await AsyncTestWait.waitUntil("exhausted graph worker drain", timeout: 5) {
+                await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
+                    rootEpoch: fixture.rootEpoch
+                )?.workerPresent == false
+            }
+            let drainedSchedule = await fixture.engine.scheduleGraphIndex(rootEpoch: fixture.rootEpoch)
+            XCTAssertEqual(drainedSchedule, .handedOff)
+            let drainedRecoveryState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            let drainedRecovery = try XCTUnwrap(drainedRecoveryState)
+            XCTAssertEqual(drainedRecovery.count, 2)
+            XCTAssertTrue(drainedRecovery.exhausted)
+            XCTAssertFalse(drainedRecovery.workerPresent)
+
+            let restartDisposition = await fixture.engine.prioritizeGraphIndexNow(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertEqual(restartDisposition, .restarted)
+            let restartedJobSnapshot = await fixture.engine.debugGraphIndexJobSnapshot(
+                rootEpoch: fixture.rootEpoch
+            )
+            let restartedJob = try XCTUnwrap(restartedJobSnapshot)
+            XCTAssertEqual(restartedJob.jobID, originalJob.jobID)
+            XCTAssertEqual(restartedJob.checkpointPresent, originalJob.checkpointPresent)
+            XCTAssertTrue(restartedJob.workerPresent)
+            let resetRecoveryState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            let resetRecovery = try XCTUnwrap(resetRecoveryState)
+            XCTAssertEqual(resetRecovery.count, 1)
+            XCTAssertFalse(resetRecovery.exhausted)
 
             await fixture.engine.debugSimulateGraphIndexWorkerExitForTesting(
                 rootEpoch: fixture.rootEpoch,
@@ -220,18 +304,48 @@
                 rootEpoch: fixture.rootEpoch,
                 uptimeNanoseconds: 1
             )
-            let exhaustedDisposition = await fixture.engine.debugEvaluateGraphIndexWatchdogForTesting(
+            let maximumRecoveryDisposition = await fixture.engine.debugEvaluateGraphIndexWatchdogForTesting(
                 rootEpoch: fixture.rootEpoch,
                 nowUptimeNanoseconds: 60_000_000_001
             )
-            XCTAssertEqual(exhaustedDisposition, .exhausted)
-            let exhaustedSnapshot = await fixture.engine.debugGraphIndexJobSnapshot(
+            XCTAssertEqual(maximumRecoveryDisposition, .restarted)
+            let runningAtMaximumState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
                 rootEpoch: fixture.rootEpoch
             )
-            let exhausted = try XCTUnwrap(exhaustedSnapshot)
-            XCTAssertFalse(exhausted.workerPresent)
-            XCTAssertEqual(exhausted.workerRecoveryCount, 2)
-            XCTAssertEqual(exhausted.lastWorkerCompletionReason, .watchdogRecoveryExhausted)
+            let runningAtMaximum = try XCTUnwrap(runningAtMaximumState)
+            XCTAssertEqual(runningAtMaximum.count, 2)
+            XCTAssertFalse(runningAtMaximum.exhausted)
+            XCTAssertTrue(runningAtMaximum.workerPresent)
+            let runningAtMaximumPrioritize = await fixture.engine.prioritizeGraphIndexNow(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertEqual(runningAtMaximumPrioritize, .promoted)
+
+            await fixture.engine.debugSimulateGraphIndexWorkerExitForTesting(
+                rootEpoch: fixture.rootEpoch,
+                reason: .admissionUnavailable
+            )
+            let deadAtMaximumSchedule = await fixture.engine.scheduleGraphIndex(rootEpoch: fixture.rootEpoch)
+            XCTAssertEqual(deadAtMaximumSchedule, .handedOff)
+            let deadAtMaximumState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            let deadAtMaximum = try XCTUnwrap(deadAtMaximumState)
+            XCTAssertEqual(deadAtMaximum.count, 2)
+            XCTAssertFalse(deadAtMaximum.exhausted)
+            XCTAssertFalse(deadAtMaximum.workerPresent)
+
+            let deadAtMaximumPrioritize = await fixture.engine.prioritizeGraphIndexNow(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertEqual(deadAtMaximumPrioritize, .restarted)
+            let resetAtMaximumState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            let resetAtMaximum = try XCTUnwrap(resetAtMaximumState)
+            XCTAssertEqual(resetAtMaximum.count, 1)
+            XCTAssertFalse(resetAtMaximum.exhausted)
+            XCTAssertTrue(resetAtMaximum.workerPresent)
             _ = await fixture.engine.debugReleaseGraphIndexAdmissionHold(
                 hold.holdID,
                 rootEpoch: fixture.rootEpoch
@@ -680,6 +794,15 @@
             XCTAssertEqual(counters.graphIndexSealManifestSubmissions, 1)
             XCTAssertEqual(counters.graphIndexSealManifestWaits, 1)
             XCTAssertEqual(counters.graphIndexSealManifestWrites, 1)
+            let retainedManifestSnapshot = await fixture.engine.debugGraphIndexManifestRetentionForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            let retainedManifest = try XCTUnwrap(retainedManifestSnapshot)
+            XCTAssertEqual(retainedManifest.stageCount, 0)
+            XCTAssertEqual(retainedManifest.cachedRecordCount, 0)
+            XCTAssertEqual(retainedManifest.stagedRecordCount, 0)
+            XCTAssertEqual(retainedManifest.stagedByteCount, 0)
+            XCTAssertEqual(retainedManifest.globalStagedByteCount, 0)
 
             let observedJob = await fixture.engine.debugGraphIndexJobSnapshot(
                 rootEpoch: fixture.rootEpoch
