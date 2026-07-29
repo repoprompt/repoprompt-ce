@@ -25,6 +25,30 @@ extension AgentModeViewModel {
         }
     }
 
+    func submitCodexHookReviewDecision(
+        tabID: UUID,
+        requestID: UUID,
+        decision: AgentCodexHookReviewDecision
+    ) async throws {
+        guard let session = sessions[tabID],
+              let currentRequest = session.pendingCodexHookReview
+        else {
+            throw AgentCodexHookReviewResolutionError.noPendingReview
+        }
+        guard currentRequest.id == requestID else {
+            throw AgentCodexHookReviewResolutionError.staleRequest(currentID: currentRequest.id)
+        }
+        try await codexCoordinator.resolveCodexHookReview(
+            session: session,
+            requestID: requestID,
+            decision: decision
+        )
+    }
+
+    func isCodexHookApprovalStrictModeEnabled() -> Bool {
+        codexCoordinator.isCodexHookApprovalStrictModeEnabled()
+    }
+
     func submitMCPElicitationResponse(
         tabID: UUID,
         requestID: UUID,

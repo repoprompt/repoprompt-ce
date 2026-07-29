@@ -86,6 +86,8 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
         expected = {
             ("ClientRequest.json", "initialize"),
             ("ClientRequest.json", "model/list"),
+            ("ClientRequest.json", "hooks/list"),
+            ("ClientRequest.json", "config/batchWrite"),
             ("ClientRequest.json", "thread/start"),
             ("ClientRequest.json", "thread/resume"),
             ("ClientRequest.json", "thread/read"),
@@ -124,7 +126,7 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             ("ServerRequest.json", "item/fileChange/requestApproval"),
         }
 
-        self.assertEqual(len(checks), 38)
+        self.assertEqual(len(checks), 40)
         self.assertEqual({(check["union"], check["method"]) for check in checks}, expected)
 
     def test_bundle_validation_accepts_declared_fields_nested_paths_and_enum(self) -> None:

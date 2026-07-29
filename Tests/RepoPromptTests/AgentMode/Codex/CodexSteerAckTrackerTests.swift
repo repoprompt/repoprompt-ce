@@ -552,7 +552,7 @@ private enum AckTrackerTestError: LocalizedError {
     }
 }
 
-private final class AckTrackerCodexController: CodexSessionControlling {
+private final class AckTrackerCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     private let gate: AckTrackerSteerGate
     private let steerResult: Result<CodexTurnSteerReceipt, Error>?
     private(set) var hasActiveThread = true
@@ -615,6 +615,7 @@ private final class AckTrackerCodexController: CodexSessionControlling {
     }
 
     func compactThread() async throws {}
+
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil
     }

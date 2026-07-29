@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-private enum StableUserInteractionIdentity {
+enum StableUserInteractionIdentity {
     static func uuid(from seed: String) -> UUID {
         let digest = Array(SHA256.hash(data: Data(seed.utf8)))
         let bytes: uuid_t = (

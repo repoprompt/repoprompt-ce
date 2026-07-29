@@ -1725,6 +1725,11 @@ struct AgentRunMCPToolService {
     }
 
     #if DEBUG
+        func test_decodeSnapshot(from value: Value) -> AgentRunMCPSnapshot? {
+            guard let object = value.objectValue else { return nil }
+            return snapshot(from: object)
+        }
+
         static func test_decoratedMultiWaitInterruptValue(
             sessionIDs: [UUID],
             representativeSnapshot: AgentRunMCPSnapshot? = nil,
@@ -2129,7 +2134,28 @@ struct AgentRunMCPToolService {
         let session = object["session"]?.objectValue
         let agent = object["agent"]?.objectValue
         let runID = object["run_id"]?.stringValue.flatMap(UUID.init(uuidString:))
-        let interaction = object["interaction"]?.objectValue.flatMap(interaction(from:))
+        let interaction: AgentRunMCPSnapshot.Interaction?
+        if let rawInteraction = object["interaction"] {
+            guard let interactionObject = rawInteraction.objectValue,
+                  let decodedInteraction = self.interaction(from: interactionObject)
+            else {
+                return nil
+            }
+            interaction = decodedInteraction
+        } else {
+            interaction = nil
+        }
+        let hookGate: AgentRunMCPSnapshot.HookGate?
+        if let rawHookGate = object["hook_gate"] {
+            guard let hookGateObject = rawHookGate.objectValue,
+                  let decodedHookGate = self.hookGate(from: hookGateObject)
+            else {
+                return nil
+            }
+            hookGate = decodedHookGate
+        } else {
+            hookGate = nil
+        }
         let updatedAt = object["updated_at"]?.stringValue.flatMap(Self.timestampFormatter.date(from:)) ?? Date()
         let tabID = (session?["context_id"] ?? session?["tab_id"])?.stringValue.flatMap(UUID.init(uuidString:))
         let parentSessionID = session?["parent_session_id"]?.stringValue.flatMap(UUID.init(uuidString:))
@@ -2149,12 +2175,39 @@ struct AgentRunMCPToolService {
             statusText: object["status_text"]?.stringValue,
             latestAssistantPreview: object["assistant_text"]?.stringValue,
             interaction: interaction,
+            hookGate: hookGate,
             transcriptItemCount: object["transcript_item_count"]?.intValue ?? 0,
             updatedAt: updatedAt,
             parentSessionID: parentSessionID,
             failureReason: failureReason,
             worktreeBindings: worktreeBindings,
             activeWorktreeMerges: activeWorktreeMerges
+        )
+    }
+
+    private func hookGate(from object: [String: Value]) -> AgentRunMCPSnapshot.HookGate? {
+        guard let statusRaw = object["status"]?.stringValue,
+              let status = AgentRunMCPSnapshot.HookGate.Status(rawValue: statusRaw),
+              let approvedHookCount = object["approved_hook_count"]?.intValue,
+              let resolvedAtRaw = object["resolved_at"]?.stringValue,
+              let resolvedAt = Self.timestampFormatter.date(from: resolvedAtRaw)
+        else {
+            return nil
+        }
+        let skippedHookCount: Int?
+        if let rawSkippedHookCount = object["skipped_hook_count"] {
+            guard let decodedSkippedHookCount = rawSkippedHookCount.intValue else {
+                return nil
+            }
+            skippedHookCount = decodedSkippedHookCount
+        } else {
+            skippedHookCount = nil
+        }
+        return .init(
+            status: status,
+            approvedHookCount: approvedHookCount,
+            skippedHookCount: skippedHookCount,
+            resolvedAt: resolvedAt
         )
     }
 
@@ -2270,8 +2323,12 @@ struct AgentRunMCPToolService {
                 id: id,
                 header: fieldObject["header"]?.stringValue,
                 prompt: prompt,
+                context: fieldObject["context"]?.stringValue,
                 isSecret: fieldObject["is_secret"]?.boolValue == true,
                 allowsOther: fieldObject["allows_other"]?.boolValue == true,
+                allowsMultiple: fieldObject["allows_multiple"]?.boolValue,
+                allowsCustom: fieldObject["allows_custom"]?.boolValue,
+                emitAllowsOther: fieldObject.keys.contains("allows_other"),
                 options: fieldOptions
             )
         } ?? []
@@ -2376,13 +2433,21 @@ struct AgentRunMCPToolService {
         let flat: [String: [String]]
         let structured: [String: AgentAskUserAnswer]
         let hasStructuredObjects: Bool
+        let valueShapes: [String: AgentModeViewModel.MCPInteractionResponsePayload.AnswerValueShape]
+        let hasNormalizedFieldNames: Bool
     }
 
     private func parseResponsePayload(args: [String: Value]) throws -> AgentModeViewModel.MCPInteractionResponsePayload {
         let parsedAnswers: ParsedAnswers = if let rawAnswers = args["answers"] {
             try parseAnswers(rawAnswers)
         } else {
-            ParsedAnswers(flat: [:], structured: [:], hasStructuredObjects: false)
+            ParsedAnswers(
+                flat: [:],
+                structured: [:],
+                hasStructuredObjects: false,
+                valueShapes: [:],
+                hasNormalizedFieldNames: false
+            )
         }
 
         let responseArgument: AgentModeViewModel.MCPInteractionResponsePayload.ResponseArgument = switch args["response"] {
@@ -2411,18 +2476,19 @@ struct AgentRunMCPToolService {
         if explicitSkip, responseRaw != nil, !responseIsSkipSentinel {
             throw MCPError.invalidParams("skip cannot be combined with response.")
         }
-        let containsDecisionArgument = args.keys.contains("decision")
-
         let content = try parseAgentJSONObject(args["content"], name: "content")
         let meta = try parseAgentJSONObject(args["meta"] ?? args["_meta"], name: "meta")
 
+        let routingArgumentNames = Set(["op", "session_id", "interaction_id"])
         return AgentModeViewModel.MCPInteractionResponsePayload(
+            suppliedArgumentNames: Set(args.keys).subtracting(routingArgumentNames),
             text: responseRaw,
             skip: isSkip,
             explicitSkip: explicitSkip,
             responseArgument: responseArgument,
-            containsDecisionArgument: containsDecisionArgument,
             amendment: normalizedString(args["amendment"]),
+            answerValueShapesByQuestionID: parsedAnswers.valueShapes,
+            hasNormalizedAnswerFieldNames: parsedAnswers.hasNormalizedFieldNames,
             answersByQuestionID: parsedAnswers.flat,
             askUserAnswersByQuestionID: parsedAnswers.structured,
             hasStructuredAnswerObjects: parsedAnswers.hasStructuredObjects,
@@ -2472,20 +2538,38 @@ struct AgentRunMCPToolService {
         var flat = [String: [String]]()
         var structured = [String: AgentAskUserAnswer]()
         var hasStructuredObjects = false
+        var valueShapes = [String: AgentModeViewModel.MCPInteractionResponsePayload.AnswerValueShape]()
+        var hasNormalizedFieldNames = false
         for entry in object {
             let questionID = entry.key.trimmingCharacters(in: .whitespacesAndNewlines)
+            hasNormalizedFieldNames = hasNormalizedFieldNames || questionID != entry.key
             guard !questionID.isEmpty else {
                 throw MCPError.invalidParams("answers cannot contain an empty question ID.")
             }
 
-            if entry.value.objectValue != nil {
+            let valueShape: AgentModeViewModel.MCPInteractionResponsePayload.AnswerValueShape
+            if entry.value.stringValue != nil {
+                valueShape = .scalarString
+            } else if entry.value.arrayValue != nil {
+                valueShape = .stringArray
+            } else if entry.value.objectValue != nil {
+                valueShape = .structuredObject
                 hasStructuredObjects = true
+            } else {
+                throw MCPError.invalidParams("answers['\(questionID)'] must be a string, array of strings, or object.")
             }
             let parsed = try parseAnswerValue(entry.value, questionID: questionID)
+            valueShapes[questionID] = valueShape
             flat[questionID] = parsed.answers
             structured[questionID] = parsed
         }
-        return ParsedAnswers(flat: flat, structured: structured, hasStructuredObjects: hasStructuredObjects)
+        return ParsedAnswers(
+            flat: flat,
+            structured: structured,
+            hasStructuredObjects: hasStructuredObjects,
+            valueShapes: valueShapes,
+            hasNormalizedFieldNames: hasNormalizedFieldNames
+        )
     }
 
     private func parseAnswerValue(_ value: Value, questionID: String) throws -> AgentAskUserAnswer {
