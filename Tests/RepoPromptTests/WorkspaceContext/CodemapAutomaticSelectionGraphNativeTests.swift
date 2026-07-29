@@ -61,8 +61,8 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let seed = try XCTUnwrap(files.first {
             $0.standardizedRelativePath == "Sources/Seed.swift"
         })
-        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: seed.id))
-        _ = try await readyResult(settledResult(store: store, ticket: ticket))
+        let initialDemand = try await readyArtifactDemand(store: store, forFileID: seed.id)
+        let ticket = initialDemand.ticket
 
         await store.setCodemapPathInvalidationStageHandlerForTesting { epoch, _, stage in
             guard epoch == ticket.rootEpoch, stage == .rootMutationFence else { return }
