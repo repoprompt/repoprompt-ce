@@ -33,8 +33,20 @@ struct AgentCodexHookReviewRequest: Identifiable, Hashable {
         case writeFailed
         case verificationFailed
 
-        var allowsApprovalDecision: Bool {
+        var allowsTrustDecision: Bool {
             self == .reviewRequired || self == .writeFailed || self == .verificationFailed
+        }
+
+        var allowsContinueWithoutHooks: Bool {
+            allowsTrustDecision || self == .discoveryFailed
+        }
+
+        var allowsDiscoveryRetry: Bool {
+            self == .discoveryFailed
+        }
+
+        var isResolving: Bool {
+            self == .discovering || self == .submitting
         }
     }
 
@@ -127,7 +139,7 @@ struct AgentCodexHookGateAudit: Equatable {
 
     let status: Status
     let approvedCount: Int
-    let skippedCount: Int
+    let skippedCount: Int?
     let resolvedAt: Date
     let interactionID: UUID
 }

@@ -5122,6 +5122,7 @@ final class AgentModeViewModel: ObservableObject {
             statusText: resolvedStatusText,
             latestAssistantPreview: mcpResolvedAssistantPreview(session: session, status: status),
             interaction: interaction,
+            hookGate: session.codexHookGateAudit.map { AgentRunMCPSnapshot.HookGate(audit: $0) },
             transcriptItemCount: transcriptItemCount,
             updatedAt: Date(),
             parentSessionID: session.parentSessionID,
@@ -5165,7 +5166,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func mcpCanonicalApprovalResponse(from payload: MCPInteractionResponsePayload) throws -> String {
-        if payload.containsDecisionArgument {
+        if payload.containsArgument("decision") {
             throw MCPError.invalidParams(
                 "decision is not a supported field for agent_run op=respond. For approval interactions, use the top-level scalar response field, for example response=\"accept\". No response was applied."
             )
@@ -5191,7 +5192,152 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    private enum MCPCodexHookAction: String {
+        case approveSelected = "approve_selected"
+        case trustAll = "trust_all"
+        case continueWithoutHooks = "continue_without_hooks"
+        case retry
+
+        var option: AgentRunMCPSnapshot.Interaction.Option {
+            switch self {
+            case .approveSelected:
+                .init(label: rawValue, description: "Trust only the hook_keys answer and continue")
+            case .trustAll:
+                .init(label: rawValue, description: "Trust every hook shown and continue")
+            case .continueWithoutHooks:
+                .init(
+                    label: rawValue,
+                    description: "Continue this Codex session without enabling the shown project hooks"
+                )
+            case .retry:
+                .init(label: rawValue, description: "Retry project-hook discovery")
+            }
+        }
+    }
+
+    private func mcpCodexHookDecisionOptions(
+        for request: AgentCodexHookReviewRequest,
+        strictModeEnabled: Bool
+    ) -> [AgentRunMCPSnapshot.Interaction.Option] {
+        var actions = [MCPCodexHookAction]()
+        if request.phase.allowsTrustDecision {
+            actions.append(contentsOf: [.approveSelected, .trustAll])
+        }
+        if request.phase.allowsDiscoveryRetry {
+            actions.append(.retry)
+        }
+        if request.phase.allowsContinueWithoutHooks, !strictModeEnabled {
+            actions.append(.continueWithoutHooks)
+        }
+        return actions.map(\.option)
+    }
+
+    private func mcpCodexHookInteraction(
+        for request: AgentCodexHookReviewRequest,
+        strictModeEnabled: Bool
+    ) -> AgentRunMCPSnapshot.Interaction {
+        var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
+            .init(label: "Execution Directory", value: request.executionCWD, isCode: true),
+            .init(label: "Phase", value: request.phase.rawValue, isCode: false)
+        ]
+        if let errorMessage = request.errorMessage, !errorMessage.isEmpty {
+            details.append(.init(label: "Error", value: errorMessage, isCode: false))
+        }
+        for warning in request.warnings {
+            details.append(.init(label: "Warning", value: warning, isCode: false))
+        }
+        for (index, hook) in request.hooks.enumerated() {
+            let prefix = "Hook \(index + 1)"
+            details.append(.init(label: "\(prefix) Key", value: hook.key, isCode: true))
+            details.append(.init(label: "\(prefix) Event", value: hook.eventName, isCode: false))
+            details.append(.init(label: "\(prefix) Source", value: hook.sourcePath, isCode: true))
+            details.append(.init(label: "\(prefix) Enabled", value: hook.enabled ? "true" : "false", isCode: false))
+            details.append(.init(label: "\(prefix) Trust", value: hook.trustStatus.rawValue, isCode: false))
+            details.append(.init(label: "\(prefix) Current Hash", value: hook.currentHash, isCode: true))
+            if let command = hook.commandOrHandler, !command.isEmpty {
+                details.append(.init(label: "\(prefix) Command / Handler", value: command, isCode: true))
+            }
+        }
+        let fields: [AgentRunMCPSnapshot.Interaction.Field] = if request.hooks.isEmpty {
+            []
+        } else {
+            [
+                .init(
+                    id: "hook_keys",
+                    prompt: "Hooks to approve",
+                    context: "Provide exact hook keys only when response is approve_selected.",
+                    isSecret: false,
+                    allowsOther: false,
+                    allowsMultiple: true,
+                    allowsCustom: false,
+                    emitAllowsOther: false,
+                    options: request.hooks.map { hook in
+                        .init(
+                            label: hook.key,
+                            description: "\(hook.eventName) · \(hook.sourcePath) · \(hook.trustStatus.rawValue)"
+                        )
+                    }
+                )
+            ]
+        }
+        return .init(
+            id: request.id,
+            kind: .hookApproval,
+            responseType: .decision,
+            title: "Project Hook Approval",
+            prompt: "The initial Codex turn is blocked pending project-hook trust.",
+            context: "Execution directory: \(request.executionCWD)",
+            allowsMultiple: nil,
+            options: mcpCodexHookDecisionOptions(for: request, strictModeEnabled: strictModeEnabled),
+            fields: fields,
+            details: details
+        )
+    }
+
+    private func mcpCanonicalCodexHookResponse(from payload: MCPInteractionResponsePayload) throws -> String {
+        if payload.containsArgument("decision")
+            || payload.containsArgument("skip")
+            || payload.containsArgument("amendment")
+            || payload.containsArgument("content")
+            || payload.containsArgument("meta")
+            || payload.containsArgument("_meta")
+        {
+            throw MCPError.invalidParams(
+                "Hook approval accepts only response and flat string-array answers. decision, skip, amendment, content, and _meta are not supported. No response was applied."
+            )
+        }
+        if payload.hasStructuredAnswerObjects {
+            throw MCPError.invalidParams(
+                "Hook approval answers must use flat string arrays; structured answer objects are not supported. No response was applied."
+            )
+        }
+        switch payload.responseArgument {
+        case .missing:
+            throw MCPError.invalidParams(
+                "response is required for hook approval interactions. No response was applied."
+            )
+        case .nonScalar:
+            throw MCPError.invalidParams(
+                "response must be a non-empty top-level scalar string for hook approval interactions. No response was applied."
+            )
+        case let .scalar(response):
+            let canonical = response.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !canonical.isEmpty else {
+                throw MCPError.invalidParams(
+                    "response must be a non-empty top-level scalar string for hook approval interactions. No response was applied."
+                )
+            }
+            return canonical
+        }
+    }
+
     private func mcpPendingInteraction(for session: TabSession) -> AgentRunMCPSnapshot.Interaction? {
+        if let request = session.pendingCodexHookReview {
+            return mcpCodexHookInteraction(
+                for: request,
+                strictModeEnabled: codexCoordinator.isCodexHookApprovalStrictModeEnabled()
+            )
+        }
         if let review = session.pendingWorktreeMergeReview {
             var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
                 .init(label: "Operation ID", value: review.operationID, isCode: false),
@@ -7275,6 +7421,97 @@ final class AgentModeViewModel: ObservableObject {
             }
             let response = AgentRequestUserInputResponse(answersByQuestionID: answers)
             submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: response)
+            handleObservedMCPStateChange(for: session)
+            return nil
+        case .hookApproval:
+            guard let request = session.pendingCodexHookReview,
+                  request.id == interactionID
+            else {
+                throw MCPError.invalidParams("The pending hook approval no longer matches interaction_id.")
+            }
+            guard !request.phase.isResolving else {
+                throw MCPError.invalidParams(AgentCodexHookReviewResolutionError.busy.localizedDescription)
+            }
+            let rawDecision = try mcpCanonicalCodexHookResponse(from: payload)
+            guard let action = MCPCodexHookAction(rawValue: rawDecision) else {
+                throw MCPError.invalidParams(
+                    "response must use one of the canonical decisions advertised by the current hook_approval interaction."
+                )
+            }
+            var allowedArgumentNames = Set(["response"])
+            if action == .approveSelected {
+                allowedArgumentNames.insert("answers")
+            }
+            guard payload.suppliedArgumentNames.isSubset(of: allowedArgumentNames) else {
+                throw MCPError.invalidParams(
+                    "Hook approval received an unsupported top-level argument. No response was applied."
+                )
+            }
+            let decision: AgentCodexHookReviewDecision
+            switch action {
+            case .approveSelected:
+                guard request.phase.allowsTrustDecision else {
+                    throw MCPError.invalidParams(AgentCodexHookReviewResolutionError.invalidDecision.localizedDescription)
+                }
+                guard payload.containsArgument("answers"),
+                      !payload.hasNormalizedAnswerFieldNames,
+                      payload.answerValueShapesByQuestionID == ["hook_keys": .stringArray],
+                      let hookKeys = payload.answersByQuestionID["hook_keys"],
+                      !hookKeys.isEmpty,
+                      Set(hookKeys.map(CodexHookUTF8Identity.init)).count == hookKeys.count
+                else {
+                    throw MCPError.invalidParams(
+                        "approve_selected requires exactly answers={\"hook_keys\": [\"<exact key>\", ...]} with one or more unique hook keys."
+                    )
+                }
+                let availableKeys = Set(request.hooks.map { CodexHookUTF8Identity($0.key) })
+                guard hookKeys.allSatisfy({ availableKeys.contains(CodexHookUTF8Identity($0)) }) else {
+                    throw MCPError.invalidParams(
+                        "approve_selected contains a hook key that is not part of the current interaction. Poll for the latest hook approval snapshot."
+                    )
+                }
+                decision = .approveSelected(hookKeys: hookKeys)
+            case .trustAll:
+                guard request.phase.allowsTrustDecision else {
+                    throw MCPError.invalidParams(AgentCodexHookReviewResolutionError.invalidDecision.localizedDescription)
+                }
+                guard !payload.containsArgument("answers") else {
+                    throw MCPError.invalidParams("trust_all requires the answers argument to be absent.")
+                }
+                decision = .approveAll
+            case .continueWithoutHooks:
+                guard request.phase.allowsContinueWithoutHooks else {
+                    throw MCPError.invalidParams(AgentCodexHookReviewResolutionError.invalidDecision.localizedDescription)
+                }
+                guard !payload.containsArgument("answers") else {
+                    throw MCPError.invalidParams("continue_without_hooks requires the answers argument to be absent.")
+                }
+                guard !codexCoordinator.isCodexHookApprovalStrictModeEnabled() else {
+                    throw MCPError.invalidParams(
+                        AgentCodexHookReviewResolutionError.strictModeRequiresApproval.localizedDescription
+                    )
+                }
+                decision = .continueWithoutHooks
+            case .retry:
+                guard request.phase.allowsDiscoveryRetry else {
+                    throw MCPError.invalidParams(AgentCodexHookReviewResolutionError.invalidDecision.localizedDescription)
+                }
+                guard !payload.containsArgument("answers") else {
+                    throw MCPError.invalidParams("retry requires the answers argument to be absent.")
+                }
+                decision = .retryDiscovery
+            }
+            do {
+                try await codexCoordinator.resolveCodexHookReview(
+                    session: session,
+                    requestID: request.id,
+                    decision: decision
+                )
+            } catch let error as AgentCodexHookReviewResolutionError {
+                throw MCPError.invalidParams(error.localizedDescription)
+            } catch {
+                throw MCPError.invalidParams("The hook approval operation could not be completed. Review the current interaction and retry.")
+            }
             handleObservedMCPStateChange(for: session)
             return nil
         case .approval:
@@ -15704,6 +15941,11 @@ final class AgentModeViewModel: ObservableObject {
     func pendingApproval(for tabID: UUID?) -> AgentApprovalRequest? {
         guard let tabID, let session = sessions[tabID] else { return nil }
         return session.uiPendingApproval
+    }
+
+    func pendingCodexHookReview(for tabID: UUID?) -> AgentCodexHookReviewRequest? {
+        guard let tabID, let session = sessions[tabID] else { return nil }
+        return session.uiPendingCodexHookReview
     }
 
     func pendingPermissionsRequest(for tabID: UUID?) -> AgentPermissionsRequest? {

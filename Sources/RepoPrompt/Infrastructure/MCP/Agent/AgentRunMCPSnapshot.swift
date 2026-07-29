@@ -118,6 +118,7 @@ struct AgentRunMCPSnapshot: Equatable {
             case question
             case userInput = "user_input"
             case approval
+            case hookApproval = "hook_approval"
             case mcpElicitation = "mcp_elicitation"
         }
 
@@ -259,6 +260,51 @@ struct AgentRunMCPSnapshot: Equatable {
         }
     }
 
+    struct HookGate: Equatable {
+        enum Status: String, Equatable {
+            case approvedAll = "approved_all"
+            case approvedSelected = "approved_selected"
+            case continuedWithoutHooks = "continued_without_hooks"
+            case resolvedExternally = "resolved_externally"
+        }
+
+        let status: Status
+        let approvedHookCount: Int
+        let skippedHookCount: Int?
+        let resolvedAt: Date
+
+        init(audit: AgentCodexHookGateAudit) {
+            status = switch audit.status {
+            case .approvedAll: .approvedAll
+            case .approvedSelected: .approvedSelected
+            case .continuedWithoutHooks: .continuedWithoutHooks
+            case .resolvedExternally: .resolvedExternally
+            }
+            approvedHookCount = audit.approvedCount
+            skippedHookCount = audit.skippedCount
+            resolvedAt = audit.resolvedAt
+        }
+
+        init(status: Status, approvedHookCount: Int, skippedHookCount: Int?, resolvedAt: Date) {
+            self.status = status
+            self.approvedHookCount = approvedHookCount
+            self.skippedHookCount = skippedHookCount
+            self.resolvedAt = resolvedAt
+        }
+
+        func asObject() -> [String: Value] {
+            var object: [String: Value] = [
+                "status": .string(status.rawValue),
+                "approved_hook_count": .int(approvedHookCount),
+                "resolved_at": .string(AgentMCPToolHelpers.timestampFormatter.string(from: resolvedAt))
+            ]
+            if let skippedHookCount {
+                object["skipped_hook_count"] = .int(skippedHookCount)
+            }
+            return object
+        }
+    }
+
     // MARK: - Failure reason classification
 
     enum FailureReason: String, Equatable {
@@ -315,6 +361,7 @@ struct AgentRunMCPSnapshot: Equatable {
     /// `output` once the run reaches a terminal state.
     let latestAssistantPreview: String?
     let interaction: Interaction?
+    let hookGate: HookGate?
     let transcriptItemCount: Int
     let updatedAt: Date
     let parentSessionID: UUID?
@@ -335,6 +382,7 @@ struct AgentRunMCPSnapshot: Equatable {
         statusText: String?,
         latestAssistantPreview: String?,
         interaction: Interaction?,
+        hookGate: HookGate? = nil,
         transcriptItemCount: Int,
         updatedAt: Date,
         parentSessionID: UUID?,
@@ -354,6 +402,7 @@ struct AgentRunMCPSnapshot: Equatable {
         self.statusText = statusText
         self.latestAssistantPreview = latestAssistantPreview
         self.interaction = interaction
+        self.hookGate = hookGate
         self.transcriptItemCount = transcriptItemCount
         self.updatedAt = updatedAt
         self.parentSessionID = parentSessionID
@@ -389,6 +438,9 @@ struct AgentRunMCPSnapshot: Equatable {
         if let interaction {
             obj["interaction"] = .object(interaction.asObject())
             obj["interaction_id"] = .string(interaction.id.uuidString)
+        }
+        if let hookGate {
+            obj["hook_gate"] = .object(hookGate.asObject())
         }
 
         if let failureReason {
@@ -533,6 +585,8 @@ extension AgentRunMCPSnapshot.Interaction.Kind {
         switch self {
         case .approval:
             "approval needed"
+        case .hookApproval:
+            "project hook approval"
         case .question:
             "question"
         case .instruction:
