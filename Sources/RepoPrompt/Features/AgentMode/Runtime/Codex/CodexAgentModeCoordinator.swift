@@ -951,6 +951,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard selected.count == hookKeys.count else {
                 throw AgentCodexHookReviewResolutionError.invalidSelection
             }
+            let allUnresolvedKeys = Set(request.hooks.map { CodexHookUTF8Identity($0.key) })
+            guard !isCodexHookApprovalStrictModeEnabled() || requestedKeys == allUnresolvedKeys else {
+                throw AgentCodexHookReviewResolutionError.strictModeRequiresApproval
+            }
             try await submitCodexHookApproval(
                 session: session,
                 request: request,
@@ -1015,6 +1019,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     request: request,
                     phase: .verificationFailed,
                     errorMessage: CodexHookTrustError.postWriteVerificationFailed(latest: verified).localizedDescription
+                )
+                return
+            }
+            let approvedIdentities = Set(candidates.map(\.selectionIdentity))
+            let expectedSkippedIdentities = Set(request.trustCandidates.map(\.selectionIdentity))
+                .subtracting(approvedIdentities)
+            let verifiedUnresolvedIdentities = Set(verified.unresolvedProjectHooks.map(\.selectionIdentity))
+            guard verifiedUnresolvedIdentities.isSubset(of: expectedSkippedIdentities) else {
+                applyCodexHookInventoryRefresh(
+                    verified,
+                    session: session,
+                    priorRequest: request,
+                    binding: binding
                 )
                 return
             }

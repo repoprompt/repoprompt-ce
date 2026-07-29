@@ -88,6 +88,29 @@ final class AgentRunMCPToolServiceHookApprovalTests: XCTestCase {
         }
     }
 
+    func testStrictModeRejectsApproveSelectedSubsetWithoutMutation() async throws {
+        let fixture = try await HookApprovalMCPFixture.make()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        let secondHookKey = "SECOND_PRIVATE_HOOK_KEY"
+        let request = try fixture.installReview(
+            phase: .reviewRequired,
+            hookKeys: [HookApprovalMCPFixture.hookKey, secondHookKey]
+        )
+        fixture.setStrictMode(true)
+
+        let message = await fixture.invalidRespondMessage(
+            requestID: request.id,
+            payload: [
+                "response": .string("approve_selected"),
+                "answers": .object(["hook_keys": .array([.string(HookApprovalMCPFixture.hookKey)])])
+            ]
+        )
+
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("strict mode"), message)
+        XCTAssertEqual(fixture.session.pendingCodexHookReview?.id, request.id)
+        XCTAssertTrue(fixture.controller.trustCalls.isEmpty)
+    }
+
     func testDiscoveryRetryToZeroSurfacesResolvedExternallyAudit() async throws {
         let fixture = try await HookApprovalMCPFixture.make()
         addTeardownBlock { @MainActor in await fixture.cleanup() }
@@ -387,14 +410,17 @@ private final class HookApprovalMCPFixture {
     }
 
     @discardableResult
-    func installReview(phase: AgentCodexHookReviewRequest.Phase) throws -> AgentCodexHookReviewRequest {
+    func installReview(
+        phase: AgentCodexHookReviewRequest.Phase,
+        hookKeys: [String] = [HookApprovalMCPFixture.hookKey]
+    ) throws -> AgentCodexHookReviewRequest {
         let hooks: [AgentCodexHookReviewHook]
         let fingerprint: String?
         if phase == .discoveryFailed || phase == .discovering {
             hooks = []
             fingerprint = nil
         } else {
-            let inventory = try unresolvedInventory()
+            let inventory = try unresolvedInventory(hookKeys: hookKeys)
             hooks = inventory.unresolvedProjectHooks.map(AgentCodexHookReviewHook.init)
             fingerprint = inventory.fingerprint
         }
@@ -465,8 +491,19 @@ private final class HookApprovalMCPFixture {
         }
     }
 
-    func unresolvedInventory() throws -> CodexHookInventory {
-        try CodexHookInventory(executionCWD: "/repo", hooks: [hook(status: .untrusted)])
+    func unresolvedInventory(
+        hookKeys: [String] = [HookApprovalMCPFixture.hookKey]
+    ) throws -> CodexHookInventory {
+        try CodexHookInventory(
+            executionCWD: "/repo",
+            hooks: hookKeys.map { key in
+                try hook(
+                    key: key,
+                    currentHash: key == Self.hookKey ? Self.currentHash : "hash-\(key)",
+                    status: .untrusted
+                )
+            }
+        )
     }
 
     func trustedInventory() throws -> CodexHookInventory {
@@ -478,13 +515,17 @@ private final class HookApprovalMCPFixture {
         await context.cleanup()
     }
 
-    private func hook(status: CodexHookTrustStatus) throws -> CodexHookMetadata {
+    private func hook(
+        key: String = HookApprovalMCPFixture.hookKey,
+        currentHash: String = HookApprovalMCPFixture.currentHash,
+        status: CodexHookTrustStatus
+    ) throws -> CodexHookMetadata {
         try CodexHookMetadata(
             eventName: "PreToolUse",
             source: "project",
             sourcePath: Self.sourcePath,
-            key: Self.hookKey,
-            currentHash: Self.currentHash,
+            key: key,
+            currentHash: currentHash,
             enabled: true,
             handlerType: "command",
             trustStatus: status,

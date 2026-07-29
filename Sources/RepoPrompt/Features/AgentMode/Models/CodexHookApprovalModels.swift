@@ -168,7 +168,7 @@ enum AgentCodexHookReviewResolutionError: Error, LocalizedError, Equatable {
         case .staleController:
             "The Codex controller binding changed. Start the turn again to review the current project hooks."
         case .strictModeRequiresApproval:
-            "Continue Without Hooks is disabled by the Codex hook approval strict mode setting. Approve the project hooks to continue."
+            "Codex hook approval strict mode requires approving every project hook in the current review before continuing."
         }
     }
 }

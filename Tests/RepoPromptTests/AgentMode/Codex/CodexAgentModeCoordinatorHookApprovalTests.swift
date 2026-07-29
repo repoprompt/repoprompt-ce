@@ -124,6 +124,53 @@ final class CodexAgentModeCoordinatorHookApprovalTests: XCTestCase {
         XCTAssertEqual(outcome, .sent)
     }
 
+    func testStrictModeRejectsPartialApproveSelectedButAllowsAllKeys() async throws {
+        let alpha = try hook(key: "alpha")
+        let beta = try hook(key: "beta")
+        let initial = try inventory(hooks: [alpha, beta])
+        let verified = try inventory(hooks: [
+            hook(key: "alpha", status: .trusted),
+            hook(key: "beta", status: .trusted)
+        ])
+        let settings = HookApprovalFakeSettingsProvider(enabled: false)
+        let controller = HookApprovalFakeCodexController(
+            listResults: [.success(initial)],
+            trustResults: [.success(verified)]
+        )
+        let (viewModel, session) = makeSession(controller: controller, settings: settings)
+        let sendTask = Task { await self.send(on: viewModel, session: session) }
+        let request = try await waitForRequest(session)
+
+        settings.enabled = true
+        do {
+            try await viewModel.test_codexCoordinator.resolveCodexHookReview(
+                session: session,
+                requestID: request.id,
+                decision: .approveSelected(hookKeys: ["alpha"])
+            )
+            XCTFail("Expected strict-mode rejection")
+        } catch let error as AgentCodexHookReviewResolutionError {
+            XCTAssertEqual(error, .strictModeRequiresApproval)
+            XCTAssertTrue(error.localizedDescription.localizedCaseInsensitiveContains("strict mode"))
+        }
+        XCTAssertEqual(session.pendingCodexHookReview?.id, request.id)
+        XCTAssertNotNil(session.codexHookReviewContinuation)
+        XCTAssertEqual(controller.startCount, 0)
+        XCTAssertTrue(controller.trustCalls.isEmpty)
+
+        try await viewModel.test_codexCoordinator.resolveCodexHookReview(
+            session: session,
+            requestID: request.id,
+            decision: .approveSelected(hookKeys: ["alpha", "beta"])
+        )
+        await assertOutcome(sendTask, equals: .sent)
+        XCTAssertEqual(controller.trustCalls.count, 1)
+        XCTAssertEqual(Set(controller.trustCalls[0].candidates.map(\.key)), Set(["alpha", "beta"]))
+        XCTAssertEqual(session.codexHookGateAudit?.status, .approvedSelected)
+        XCTAssertEqual(session.codexHookGateAudit?.approvedCount, 2)
+        XCTAssertEqual(session.codexHookGateAudit?.skippedCount, 0)
+    }
+
     func testDiscoveryFailureCarriesCwdErrorAndRetryToZeroResolvesExternally() async throws {
         let controller = try HookApprovalFakeCodexController(
             listResults: [
@@ -197,6 +244,48 @@ final class CodexAgentModeCoordinatorHookApprovalTests: XCTestCase {
         XCTAssertEqual(outcome, .sent)
         XCTAssertEqual(session.codexHookGateAudit?.status, .resolvedExternally)
         XCTAssertEqual(controller.startCount, 1)
+    }
+
+    func testPostWriteInventoryDriftPublishesReplacementAndKeepsTurnSuspended() async throws {
+        let initial = try inventory(hooks: [hook(key: "alpha")])
+        let postWriteDrift = try inventory(hooks: [
+            hook(key: "alpha", status: .trusted),
+            hook(key: "beta")
+        ])
+        let fullyVerified = try inventory(hooks: [
+            hook(key: "alpha", status: .trusted),
+            hook(key: "beta", status: .trusted)
+        ])
+        let controller = HookApprovalFakeCodexController(
+            listResults: [.success(initial)],
+            trustResults: [.success(postWriteDrift), .success(fullyVerified)]
+        )
+        let (viewModel, session) = makeSession(controller: controller)
+        let sendTask = Task { await self.send(on: viewModel, session: session) }
+        let firstRequest = try await waitForRequest(session)
+
+        try await viewModel.test_codexCoordinator.resolveCodexHookReview(
+            session: session,
+            requestID: firstRequest.id,
+            decision: .approveAll
+        )
+
+        let replacement = try XCTUnwrap(session.pendingCodexHookReview)
+        XCTAssertNotEqual(replacement.id, firstRequest.id)
+        XCTAssertEqual(replacement.hooks.map(\.key), ["beta"])
+        XCTAssertNotNil(session.codexHookReviewContinuation)
+        XCTAssertNil(session.codexHookGateAudit)
+        XCTAssertEqual(controller.startCount, 0)
+
+        try await viewModel.test_codexCoordinator.resolveCodexHookReview(
+            session: session,
+            requestID: replacement.id,
+            decision: .approveAll
+        )
+        await assertOutcome(sendTask, equals: .sent)
+        XCTAssertEqual(controller.startCount, 1)
+        XCTAssertEqual(controller.trustCalls.count, 2)
+        XCTAssertEqual(session.codexHookGateAudit?.status, .approvedAll)
     }
 
     func testControllerReplacementCancelsSuspendedFirstTurnExactlyOnce() async throws {
