@@ -1,6 +1,45 @@
 import Combine
 import SwiftUI
 
+enum CodexHookApprovalWorkspaceSetting: CaseIterable, Hashable {
+    case appDefault
+    case alwaysRequireApproval
+    case dontRequireApproval
+
+    init(workspaceOverride: Bool?) {
+        switch workspaceOverride {
+        case true:
+            self = .alwaysRequireApproval
+        case false:
+            self = .dontRequireApproval
+        case nil:
+            self = .appDefault
+        }
+    }
+
+    var workspaceOverride: Bool? {
+        switch self {
+        case .appDefault:
+            nil
+        case .alwaysRequireApproval:
+            true
+        case .dontRequireApproval:
+            false
+        }
+    }
+
+    func label(globalStrictModeEnabled: Bool) -> String {
+        switch self {
+        case .appDefault:
+            "App default (currently: \(globalStrictModeEnabled ? "required" : "not required"))"
+        case .alwaysRequireApproval:
+            "Always require approval"
+        case .dontRequireApproval:
+            "Don't require approval"
+        }
+    }
+}
+
 /// Consolidated settings view for Agent Mode — the "Overview" tab.
 ///
 /// Model choices (Oracle, Context Builder Agent, Agent Role Defaults) are now
@@ -191,8 +230,16 @@ struct AgentModeGeneralSettingsView: View {
                 Toggle("Require Codex project-hook approval", isOn: codexHookApprovalStrictModeBinding)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
                 if workspaceID != nil {
-                    Toggle("Override for this workspace", isOn: codexHookApprovalUsesWorkspaceOverrideBinding)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    Picker("In this workspace:", selection: codexHookApprovalWorkspaceSettingBinding) {
+                        ForEach(CodexHookApprovalWorkspaceSetting.allCases, id: \.self) { setting in
+                            Text(setting.label(
+                                globalStrictModeEnabled: globalSettings.globalCodexHookApprovalStrictModeEnabled()
+                            ))
+                            .tag(setting)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 }
                 Text("When enabled, Continue Without Hooks is unavailable. Codex first turns remain blocked until the displayed project hooks are approved or become trusted externally.")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
@@ -206,28 +253,27 @@ struct AgentModeGeneralSettingsView: View {
 
     private var codexHookApprovalStrictModeBinding: Binding<Bool> {
         Binding(
-            get: { globalSettings.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID) },
-            set: { enabled in
-                globalSettings.setCodexHookApprovalStrictModeEnabled(
-                    enabled,
-                    workspaceID: workspaceID
-                )
-            }
+            get: { globalSettings.globalCodexHookApprovalStrictModeEnabled() },
+            set: { globalSettings.setGlobalCodexHookApprovalStrictModeEnabled($0) }
         )
     }
 
-    private var codexHookApprovalUsesWorkspaceOverrideBinding: Binding<Bool> {
+    private var codexHookApprovalWorkspaceSettingBinding: Binding<CodexHookApprovalWorkspaceSetting> {
         Binding(
             get: {
-                guard let workspaceID else { return false }
-                return globalSettings.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID) != nil
+                guard let workspaceID else { return .appDefault }
+                return CodexHookApprovalWorkspaceSetting(
+                    workspaceOverride: globalSettings.codexHookApprovalStrictModeWorkspaceOverride(
+                        workspaceID: workspaceID
+                    )
+                )
             },
-            set: { useOverride in
+            set: { setting in
                 guard let workspaceID else { return }
-                let override = useOverride
-                    ? globalSettings.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID)
-                    : nil
-                globalSettings.setCodexHookApprovalStrictModeOverride(override, for: workspaceID)
+                globalSettings.setCodexHookApprovalStrictModeOverride(
+                    setting.workspaceOverride,
+                    for: workspaceID
+                )
             }
         )
     }

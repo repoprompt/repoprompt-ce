@@ -77,11 +77,36 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         let workspaceID = UUID()
 
         XCTAssertFalse(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+        XCTAssertEqual(
+            CodexHookApprovalWorkspaceSetting(
+                workspaceOverride: store.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID)
+            ),
+            .appDefault
+        )
+
         store.setGlobalCodexHookApprovalStrictModeEnabled(true)
         XCTAssertTrue(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
-        store.setCodexHookApprovalStrictModeOverride(false, for: workspaceID)
-        XCTAssertFalse(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+        XCTAssertNil(store.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID))
 
+        for (setting, expectedEffectiveValue) in [
+            (CodexHookApprovalWorkspaceSetting.dontRequireApproval, false),
+            (.alwaysRequireApproval, true),
+            (.appDefault, true)
+        ] {
+            store.setCodexHookApprovalStrictModeOverride(setting.workspaceOverride, for: workspaceID)
+            XCTAssertEqual(
+                CodexHookApprovalWorkspaceSetting(
+                    workspaceOverride: store.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID)
+                ),
+                setting
+            )
+            XCTAssertEqual(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID), expectedEffectiveValue)
+        }
+
+        store.setCodexHookApprovalStrictModeOverride(
+            CodexHookApprovalWorkspaceSetting.dontRequireApproval.workspaceOverride,
+            for: workspaceID
+        )
         let reloaded = GlobalSettingsStore(
             defaults: defaults,
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)

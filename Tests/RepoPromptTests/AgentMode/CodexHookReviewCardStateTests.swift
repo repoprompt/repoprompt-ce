@@ -38,17 +38,39 @@ final class CodexHookReviewCardStateTests: XCTestCase {
         var state = CodexHookReviewCardState(interactionID: UUID())
         var isStrictModeEnabled = false
         XCTAssertTrue(!isStrictModeEnabled)
+        XCTAssertEqual(
+            CodexHookApprovalWorkspaceSetting.allCases.map {
+                $0.label(globalStrictModeEnabled: isStrictModeEnabled)
+            },
+            [
+                "App default (currently: not required)",
+                "Always require approval",
+                "Don't require approval"
+            ]
+        )
         state.isContinueConfirmationPresented = true
 
         isStrictModeEnabled = true
         state.strictModeDidChange(isEnabled: isStrictModeEnabled)
 
         XCTAssertFalse(!isStrictModeEnabled)
+        XCTAssertEqual(
+            CodexHookApprovalWorkspaceSetting.appDefault.label(
+                globalStrictModeEnabled: isStrictModeEnabled
+            ),
+            "App default (currently: required)"
+        )
         XCTAssertFalse(state.isContinueConfirmationPresented)
 
         isStrictModeEnabled = false
         state.strictModeDidChange(isEnabled: isStrictModeEnabled)
 
         XCTAssertTrue(!isStrictModeEnabled)
+        XCTAssertEqual(
+            CodexHookApprovalWorkspaceSetting.appDefault.label(
+                globalStrictModeEnabled: isStrictModeEnabled
+            ),
+            "App default (currently: not required)"
+        )
     }
 }
