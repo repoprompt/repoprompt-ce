@@ -196,19 +196,11 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         let unrelated = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Unrelated.swift" })
 
-        let sourceSeed = await store.requestCodemapArtifact(
+        _ = try await readyArtifactDemand(
+            store: store,
             forFileID: source.id,
             priority: .background
         )
-        let sourceReady: WorkspaceCodemapArtifactDemandResult = switch sourceSeed {
-        case let .pending(ticket):
-            try await settledResult(store: store, ticket: ticket)
-        default:
-            sourceSeed
-        }
-        guard case .ready = sourceReady else {
-            return XCTFail("Expected the source artifact to be ready before graph-native selection.")
-        }
         let automaticDemandTicketOffset = fixture.demandedTickets.values.count
 
         _ = try await awaitCodemapGraphsReady(store: store, rootIDs: [loaded.id])
