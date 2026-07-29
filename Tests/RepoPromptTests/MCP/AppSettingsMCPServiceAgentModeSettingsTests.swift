@@ -60,6 +60,58 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
     }
 
+    func testHandoffInstructionsRemainOutsideAppSettingsCatalog() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        let service = AppSettingsMCPService(store: store)
+        let candidateKey = "agent_mode.handoff_instructions"
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"),
+            "group": .string("agent_mode"),
+            "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let keys = settings.compactMap { $0.objectValue?["key"]?.stringValue }
+        XCTAssertFalse(keys.contains(candidateKey))
+        XCTAssertFalse(keys.contains { $0.localizedCaseInsensitiveContains("handoff") })
+
+        for arguments: [String: Value] in [
+            [
+                "op": .string("get"),
+                "key": .string(candidateKey)
+            ],
+            [
+                "op": .string("set"),
+                "key": .string(candidateKey),
+                "value": .string("Must remain local")
+            ]
+        ] {
+            do {
+                _ = try await service.handleForTesting(arguments)
+                XCTFail("Expected \(candidateKey) to remain outside the app_settings catalog")
+            } catch {
+                XCTAssertTrue(
+                    String(describing: error).contains("Unknown or unavailable app setting key '\(candidateKey)'."),
+                    String(describing: error)
+                )
+            }
+        }
+
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), "")
+    }
+
     func testModelSyncClearsAndEnablesPreserveDurableInvariant() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)

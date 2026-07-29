@@ -788,6 +788,122 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(reloaded.showDatesInMessageTimestamps())
     }
 
+    func testAgentSessionHandoffInstructionsDefaultsEmptyWithoutMaterializing() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        let before = try Data(contentsOf: fileURL)
+
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), "")
+        XCTAssertNil(try GlobalSettingsFileStore(fileURL: fileURL).load().scalarPreferences?.agentMode?.agentSessionHandoffInstructions)
+        XCTAssertEqual(try Data(contentsOf: fileURL), before)
+    }
+
+    func testAgentSessionHandoffInstructionsSavesAndReloadsVerbatim() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let instructions = "  Leading whitespace\n\nTrailing whitespace  \n"
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(instructions))
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), instructions)
+        XCTAssertEqual(try makeStore(at: fileURL).agentSessionHandoffInstructions(), instructions)
+    }
+
+    func testAgentSessionHandoffInstructionsClearRemovesOptionalField() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions("Saved default"))
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(""))
+
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), "")
+        XCTAssertNil(try GlobalSettingsFileStore(fileURL: fileURL).load().scalarPreferences?.agentMode?.agentSessionHandoffInstructions)
+    }
+
+    func testAgentSessionHandoffInstructionsNoOpClearDoesNotRewriteFile() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        let before = try Data(contentsOf: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(""))
+        XCTAssertEqual(try Data(contentsOf: fileURL), before)
+    }
+
+    func testAgentSessionHandoffInstructionsPreservesAgentModeSiblings() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let siblings = GlobalScalarPreferences.AgentModeSettings(
+            proEditAgentMode: true,
+            proEditAgentKind: "codexExec",
+            proEditAgentModel: "gpt-test",
+            proEditAgentModeMigrated: true,
+            agentAutoExpandToolCards: false,
+            maxBackgroundAgentComposeTabs: 9,
+            showBuiltInWorkflowCleanupGuidance: false,
+            codexGoalSupportEnabled: true,
+            codexReasoningSummariesEnabled: false,
+            providerConversationCleanupAction: "delete",
+            restrictMCPAgentDiscoveryToRoleLabels: true
+        )
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: siblings)
+        ))
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions("Saved default"))
+        XCTAssertEqual(
+            try fileStore.load().scalarPreferences?.agentMode,
+            GlobalScalarPreferences.AgentModeSettings(
+                proEditAgentMode: true,
+                proEditAgentKind: "codexExec",
+                proEditAgentModel: "gpt-test",
+                proEditAgentModeMigrated: true,
+                agentAutoExpandToolCards: false,
+                maxBackgroundAgentComposeTabs: 9,
+                showBuiltInWorkflowCleanupGuidance: false,
+                codexGoalSupportEnabled: true,
+                codexReasoningSummariesEnabled: false,
+                providerConversationCleanupAction: "delete",
+                restrictMCPAgentDiscoveryToRoleLabels: true,
+                agentSessionHandoffInstructions: "Saved default"
+            )
+        )
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(""))
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.agentMode, siblings)
+    }
+
+    func testAgentSessionHandoffInstructionsSetterEnforcesCharacterLimitWithoutMutation() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        let maximum = AgentSessionHandoffInstructionsPolicy.maximumCharacterCount
+        let accepted = String(repeating: "a", count: maximum)
+        let rejected = accepted + "b"
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(accepted))
+        XCTAssertEqual(try makeStore(at: fileURL).agentSessionHandoffInstructions(), accepted)
+        let beforeRejectedWrite = try Data(contentsOf: fileURL)
+
+        XCTAssertFalse(store.setAgentSessionHandoffInstructions(rejected))
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), accepted)
+        XCTAssertEqual(try Data(contentsOf: fileURL), beforeRejectedWrite)
+        XCTAssertEqual(
+            try GlobalSettingsFileStore(fileURL: fileURL).load().scalarPreferences?.agentMode?.agentSessionHandoffInstructions,
+            accepted
+        )
+    }
+
     // MARK: - Cross-window observability & persistence-block recovery
 
     private func makeStore(at fileURL: URL) throws -> GlobalSettingsStore {
@@ -883,7 +999,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temp) }
         let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let versionFourJSON = #"{"schemaVersion":4,"updatedAt":"2026-06-27T13:11:41Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"agentModelsSettingsByWorkspaceID":{"workspace-1":{"selectedAgentRaw":"claudeCode"}},"globalDefaults":{"discoverAgentRaw":"claudeCode","discoverModelsByAgent":{"claudeCode":"haiku"}},"scalarPreferences":{"ui":{"appearanceMode":"dark"},"modelSelection":{"planningModel":"haiku"}}}"#
+        let versionFourJSON = #"{"schemaVersion":4,"updatedAt":"2026-06-27T13:11:41Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"agentModelsSettingsByWorkspaceID":{"workspace-1":{"selectedAgentRaw":"claudeCode"}},"globalDefaults":{"discoverAgentRaw":"claudeCode","discoverModelsByAgent":{"claudeCode":"haiku"}},"scalarPreferences":{"ui":{"appearanceMode":"dark"},"modelSelection":{"planningModel":"haiku"},"agentMode":{"agentSessionHandoffInstructions":"  Imported verbatim  "}}}"#
         try Data(versionFourJSON.utf8).write(to: fileURL)
 
         let store = try makeStore(at: fileURL)
@@ -895,6 +1011,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(store.globalContextBuilderAgentSelection().agentRaw, "claudeCode")
         XCTAssertEqual(store.globalContextBuilderAgentSelection().modelRaw, "haiku")
         XCTAssertEqual(store.planningModelRaw(), "haiku")
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), "  Imported verbatim  ")
 
         let persisted = try String(contentsOf: fileURL, encoding: .utf8)
         XCTAssertTrue(persisted.contains(#""schemaVersion" : 4"#))
@@ -1098,6 +1215,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(
             try JSONSerialization.data(withJSONObject: actual, options: [.sortedKeys]),
             try JSONSerialization.data(withJSONObject: expected, options: [.sortedKeys])
+        )
+        XCTAssertEqual(
+            loaded.scalarPreferences?.agentMode?.agentSessionHandoffInstructions,
+            "  Preserve raw instructions  "
         )
 
         var rollbackWriter = try FrozenV1028GlobalSettingsDocument.load(from: fileURL)
@@ -2413,6 +2534,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
           "scalarPreferences": {
             "ui": {"appearanceMode": "Dark", "showTooltips": true},
             "promptPackaging": {"modelTemperature": 0.25},
+            "agentMode": {"agentSessionHandoffInstructions": "  Preserve raw instructions  "},
             "unknownGroup": {"future": "preserve"}
           },
           "unknownRoot": {"preserve": 42}

@@ -271,7 +271,8 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
                     entries: [],
                     nextCursor: nil,
                     isEnd: true,
-                    supportedCandidateCountThroughPage: 0
+                    supportedCandidateCountThroughPage: 0,
+                    projectedSupportedCandidateTotal: 0
                 ) {
                 case let .success(page):
                     return .page(page)

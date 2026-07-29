@@ -62,6 +62,11 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPWindowToolName.history
             ], caseLabel)
 
+            let detachAndSettleToolNames: Set<String> = [
+                MCPWindowToolName.getCodeStructure,
+                MCPWindowToolName.readFile,
+                MCPWindowToolName.getFileTree
+            ]
             for toolName in names(for: .bounded) {
                 guard case let .bounded(deadline, cancellationGrace, cleanupDisposition) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
                     return XCTFail(caseLabel + ": Expected bounded contract for \(toolName)")
@@ -70,7 +75,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, caseLabel + ": " + toolName)
                 XCTAssertEqual(
                     cleanupDisposition,
-                    toolName == MCPWindowToolName.getCodeStructure ? .detachAndSettle : .forceDisconnect,
+                    detachAndSettleToolNames.contains(toolName) ? .detachAndSettle : .forceDisconnect,
                     caseLabel + ": " + toolName
                 )
             }

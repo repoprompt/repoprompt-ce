@@ -1018,6 +1018,7 @@ private struct GraphFixture {
             rootEpoch: rootEpoch,
             catalogWatermark: catalogToken,
             enumerationState: complete ? .complete : .partial,
+            isCatalogSealed: complete,
             supportedCount: UInt64(slots.count),
             classifiedCount: UInt64(slots.count) - pending,
             pendingCount: pending,

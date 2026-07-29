@@ -627,6 +627,156 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         XCTAssertNotNil(authority)
         XCTAssertEqual(recorder.snapshot(), .init(callCount: 2, allPathsMatched: true))
 
+        let unaffectedPaths = ["Sources/Alpha.swift", "Sources/Beta.swift"]
+        for unaffectedPath in unaffectedPaths {
+            try fixture.write("let value = true\n", to: unaffectedPath, at: root)
+        }
+        let batchMutation = SourcePathMutation(url: candidateURL)
+        let batchService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { await batchMutation.mutateOnce() }
+            )
+        )
+        let batchCapability = try await capability(
+            batchService.resolve(root: request(for: root, seed: 52))
+        )
+        let capturesBeforeBatch = await batchService.snapshotForTesting().authorityCaptureCount
+        let batchAuthorities = await batchService.makeSourceAuthorities(
+            capability: batchCapability,
+            observedRootEpoch: batchCapability.rootEpoch,
+            observedRepositoryAuthority: batchCapability.repositoryAuthority,
+            candidates: ([path] + unaffectedPaths).map {
+                WorkspaceCodemapSourceAuthorityRequest(
+                    candidateRepositoryRelativePath: $0,
+                    observedPathGeneration: 1,
+                    currentPathGeneration: 1,
+                    observedIngressGeneration: 1,
+                    currentIngressGeneration: 1
+                )
+            }
+        )
+        let capturesAfterBatch = await batchService.snapshotForTesting().authorityCaptureCount
+        XCTAssertEqual(capturesAfterBatch - capturesBeforeBatch, 2)
+        XCTAssertNil(batchAuthorities[0])
+        XCTAssertNotNil(batchAuthorities[1])
+        XCTAssertNotNil(batchAuthorities[2])
+
+        let postPathRoot = try fixture.makeRepository(named: "post-path-authority")
+        try fixture.write("let value = true\n", to: path, at: postPathRoot)
+        let postPathMutation = AuthorityFileMutationOnInvocation(
+            url: postPathRoot.appendingPathComponent(".git/index"),
+            targetInvocation: 2
+        )
+        let postPathService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: {
+                    await postPathMutation.mutateOnTargetInvocation()
+                }
+            )
+        )
+        let postPathCapability = try await capability(
+            postPathService.resolve(root: request(for: postPathRoot, seed: 53))
+        )
+        let postPathCapturesBefore = await postPathService.snapshotForTesting().authorityCaptureCount
+        let postPathAuthorities = await postPathService.makeSourceAuthorities(
+            capability: postPathCapability,
+            observedRootEpoch: postPathCapability.rootEpoch,
+            observedRepositoryAuthority: postPathCapability.repositoryAuthority,
+            candidates: [WorkspaceCodemapSourceAuthorityRequest(
+                candidateRepositoryRelativePath: path,
+                observedPathGeneration: 1,
+                currentPathGeneration: 1,
+                observedIngressGeneration: 1,
+                currentIngressGeneration: 1
+            )]
+        )
+        let postPathCapturesAfter = await postPathService.snapshotForTesting().authorityCaptureCount
+        XCTAssertEqual(postPathCapturesAfter - postPathCapturesBefore, 2)
+        let postPathFingerprintCaptureCount = await postPathMutation.invocationCount()
+        XCTAssertEqual(postPathFingerprintCaptureCount, 2)
+        XCTAssertNil(postPathAuthorities[0])
+
+        for (offset, evidenceKind) in ["index", "config", "ref"].enumerated() {
+            let mutationRoot = try fixture.makeRepository(named: "authority-\(evidenceKind)")
+            try fixture.write("let a = true\n", to: "Sources/A.swift", at: mutationRoot)
+            try fixture.write("let b = true\n", to: "Sources/B.swift", at: mutationRoot)
+            let mutationURL: URL
+            switch evidenceKind {
+            case "index":
+                mutationURL = mutationRoot.appendingPathComponent(".git/index")
+            case "config":
+                mutationURL = mutationRoot.appendingPathComponent(".git/config")
+            default:
+                let head = try String(contentsOf: mutationRoot.appendingPathComponent(".git/HEAD"))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                mutationURL = mutationRoot.appendingPathComponent(".git/\(head.dropFirst("ref: ".count))")
+            }
+            let authorityMutation = AuthorityFileMutation(url: mutationURL)
+            let mutationService = WorkspaceCodemapGitCapabilityService(
+                namespaceSalt: namespaceSalt,
+                hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                    afterFirstAuthorityCapture: { await authorityMutation.mutateIfArmed() }
+                )
+            )
+            let mutationCapability = try await capability(
+                mutationService.resolve(root: request(for: mutationRoot, seed: UInt8(54 + offset)))
+            )
+            await authorityMutation.arm()
+            let mutationCapturesBefore = await mutationService.snapshotForTesting().authorityCaptureCount
+            let mutationAuthorities = await mutationService.makeSourceAuthorities(
+                capability: mutationCapability,
+                observedRootEpoch: mutationCapability.rootEpoch,
+                observedRepositoryAuthority: mutationCapability.repositoryAuthority,
+                candidates: ["Sources/A.swift", "Sources/B.swift"].map {
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: $0,
+                        observedPathGeneration: 1,
+                        currentPathGeneration: 1,
+                        observedIngressGeneration: 1,
+                        currentIngressGeneration: 1
+                    )
+                }
+            )
+            let mutationCapturesAfter = await mutationService.snapshotForTesting().authorityCaptureCount
+            XCTAssertEqual(mutationCapturesAfter - mutationCapturesBefore, 2)
+            XCTAssertTrue(mutationAuthorities.allSatisfy { $0 == nil })
+        }
+
+        let cancellationGate = AuthorityBatchCancellationGate()
+        let cancellationService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterFirstAuthorityCapture: { await cancellationGate.pauseIfArmed() }
+            )
+        )
+        let cancellationCapability = try await capability(
+            cancellationService.resolve(root: request(for: root, seed: 58))
+        )
+        await cancellationGate.arm()
+        let cancellationTask = Task {
+            await cancellationService.makeSourceAuthorities(
+                capability: cancellationCapability,
+                observedRootEpoch: cancellationCapability.rootEpoch,
+                observedRepositoryAuthority: cancellationCapability.repositoryAuthority,
+                candidates: unaffectedPaths.map {
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: $0,
+                        observedPathGeneration: 1,
+                        currentPathGeneration: 1,
+                        observedIngressGeneration: 1,
+                        currentIngressGeneration: 1
+                    )
+                }
+            )
+        }
+        await cancellationGate.waitUntilPaused()
+        cancellationTask.cancel()
+        await cancellationGate.resume()
+        let cancelledAuthorities = await cancellationTask.value
+        XCTAssertTrue(cancelledAuthorities.allSatisfy { $0 == nil })
+
         let symlinkTarget = root.appendingPathComponent("Sources/Target.swift")
         try "let target = true\n".write(to: symlinkTarget, atomically: true, encoding: .utf8)
         try FileManager.default.removeItem(at: candidateURL)
@@ -1126,6 +1276,85 @@ private final class ExactPathFingerprintRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Snapshot(callCount: callCount, allPathsMatched: allPathsMatched)
+    }
+}
+
+private actor AuthorityFileMutationOnInvocation {
+    private let url: URL
+    private let targetInvocation: Int
+    private var invocations = 0
+
+    init(url: URL, targetInvocation: Int) {
+        self.url = url
+        self.targetInvocation = targetInvocation
+    }
+
+    func mutateOnTargetInvocation() {
+        invocations += 1
+        guard invocations == targetInvocation else { return }
+        let data = (try? Data(contentsOf: url)) ?? Data()
+        try? (data + Data("\n# post-path authority mutation\n".utf8)).write(to: url, options: .atomic)
+    }
+
+    func invocationCount() -> Int {
+        invocations
+    }
+}
+
+private actor AuthorityFileMutation {
+    private let url: URL
+    private var armed = false
+    private var didMutate = false
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    func arm() {
+        armed = true
+    }
+
+    func mutateIfArmed() {
+        guard armed, !didMutate else { return }
+        didMutate = true
+        let data = (try? Data(contentsOf: url)) ?? Data()
+        try? (data + Data("\n# authority mutation\n".utf8)).write(to: url, options: .atomic)
+    }
+}
+
+private actor AuthorityBatchCancellationGate {
+    private var armed = false
+    private var paused = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+
+    func arm() {
+        armed = true
+    }
+
+    func pauseIfArmed() async {
+        guard armed else { return }
+        paused = true
+        let waiters = pauseWaiters
+        pauseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            resumeContinuation = continuation
+        }
+    }
+
+    func waitUntilPaused() async {
+        if paused { return }
+        await withCheckedContinuation { continuation in
+            pauseWaiters.append(continuation)
+        }
+    }
+
+    func resume() {
+        resumeContinuation?.resume()
+        resumeContinuation = nil
     }
 }
 

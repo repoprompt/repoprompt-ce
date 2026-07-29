@@ -30,6 +30,13 @@ struct AgentModeGeneralSettingsView: View {
     /// without relying on @AppStorage for sensitive policy keys.
     @State private var subagentPolicyRevision = 0
 
+    @State private var handoffInstructionsDraft = ""
+    @State private var handoffInstructionsBaseline = ""
+    @State private var handoffInstructionsLastObservedStoredValue = ""
+    @State private var handoffInstructionsHaveExternalConflict = false
+    @State private var handoffInstructionsAreInitialized = false
+    @State private var handoffInstructionsExternalUpdateTick = 0
+
     // Observes GlobalSettingsStore so the workflow summary reflects cleanup-guidance
     // changes made on the Agent Workflows page or through the `app_settings` MCP tool.
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
@@ -53,6 +60,15 @@ struct AgentModeGeneralSettingsView: View {
             }
             .padding(fontPreset.scaledClamped(20, max: 28))
             .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .onAppear {
+            initializeHandoffInstructionsDraft()
+        }
+        .onChange(of: globalSettings.agentSessionHandoffInstructions()) { _, newValue in
+            reconcileHandoffInstructionsStoreChange(newValue)
+        }
+        .onDisappear {
+            handoffInstructionsAreInitialized = false
         }
         .onReceive(
             NotificationCenter.default
@@ -109,6 +125,8 @@ struct AgentModeGeneralSettingsView: View {
 
             providerCleanupActionCard
 
+            handoffInstructionsCard
+
             agentPermissionsCard
 
             linkRow(
@@ -156,6 +174,162 @@ struct AgentModeGeneralSettingsView: View {
             get: { globalSettings.providerConversationCleanupAction() },
             set: { globalSettings.setProviderConversationCleanupAction($0) }
         )
+    }
+
+    // MARK: - Handoff Instructions
+
+    private var handoffInstructionsCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "doc.on.clipboard")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(8, max: 12)) {
+                Text("Handoff Instructions")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Text("This app-wide text is appended by the titlebar’s Handoff action.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                TextKitView(
+                    text: $handoffInstructionsDraft,
+                    wrapLines: true,
+                    externalUpdateTick: handoffInstructionsExternalUpdateTick
+                )
+                .frame(height: fontPreset.scaledClamped(150, max: 190))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                )
+                .accessibilityLabel("Handoff instructions")
+
+                Text(handoffInstructionsValidationMessage)
+                    .font(fontPreset.captionFont)
+                    .foregroundColor(handoffInstructionsAreValid ? .secondary : .red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(handoffInstructionsValidationMessage)
+
+                if handoffInstructionsHaveExternalConflict {
+                    Text("The saved default changed elsewhere. Saving will replace the newer saved value.")
+                        .font(fontPreset.captionFont)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if globalSettings.persistenceBlockReason != nil {
+                    Label(
+                        "Changes are active for this launch, but global settings cannot be saved. Use the existing global settings recovery warning to restore persistence.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(fontPreset.captionFont)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityElement(children: .combine)
+                }
+
+                HStack(spacing: fontPreset.scaledClamped(8, max: 12)) {
+                    Button("Save") {
+                        saveHandoffInstructions()
+                    }
+                    .disabled(!handoffInstructionsCanSave)
+
+                    Button("Clear Saved Instructions", role: .destructive) {
+                        clearHandoffInstructions()
+                    }
+                    .disabled(!handoffInstructionsCanClear)
+                }
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var handoffInstructionsValidation: AgentSessionHandoffInstructionsPolicy.Validation {
+        AgentSessionHandoffInstructionsPolicy.validation(of: handoffInstructionsDraft)
+    }
+
+    private var handoffInstructionsAreValid: Bool {
+        if case .valid = handoffInstructionsValidation {
+            return true
+        }
+        return false
+    }
+
+    private var handoffInstructionsValidationMessage: String {
+        switch handoffInstructionsValidation {
+        case let .valid(count):
+            "\(count.formatted()) / \(AgentSessionHandoffInstructionsPolicy.maximumCharacterCount.formatted()) characters"
+        case let .tooLong(count, maximum):
+            "\(count.formatted()) / \(maximum.formatted()) characters — shorten the instructions before saving."
+        }
+    }
+
+    private var handoffInstructionsCanSave: Bool {
+        handoffInstructionsAreInitialized
+            && handoffInstructionsDraft != handoffInstructionsBaseline
+            && handoffInstructionsAreValid
+    }
+
+    private var handoffInstructionsCanClear: Bool {
+        handoffInstructionsAreInitialized
+            && (!handoffInstructionsDraft.isEmpty || !handoffInstructionsLastObservedStoredValue.isEmpty)
+    }
+
+    private func initializeHandoffInstructionsDraft() {
+        let storedValue = globalSettings.agentSessionHandoffInstructions()
+        handoffInstructionsDraft = storedValue
+        handoffInstructionsBaseline = storedValue
+        handoffInstructionsLastObservedStoredValue = storedValue
+        handoffInstructionsHaveExternalConflict = false
+        handoffInstructionsAreInitialized = true
+        handoffInstructionsExternalUpdateTick &+= 1
+    }
+
+    private func reconcileHandoffInstructionsStoreChange(_ storedValue: String) {
+        guard handoffInstructionsAreInitialized,
+              storedValue != handoffInstructionsLastObservedStoredValue
+        else { return }
+
+        handoffInstructionsLastObservedStoredValue = storedValue
+
+        if storedValue == handoffInstructionsDraft {
+            handoffInstructionsBaseline = storedValue
+            handoffInstructionsHaveExternalConflict = false
+            handoffInstructionsExternalUpdateTick &+= 1
+        } else if handoffInstructionsDraft == handoffInstructionsBaseline {
+            handoffInstructionsDraft = storedValue
+            handoffInstructionsBaseline = storedValue
+            handoffInstructionsHaveExternalConflict = false
+            handoffInstructionsExternalUpdateTick &+= 1
+        } else {
+            handoffInstructionsHaveExternalConflict = true
+        }
+    }
+
+    private func saveHandoffInstructions() {
+        guard handoffInstructionsCanSave,
+              globalSettings.setAgentSessionHandoffInstructions(handoffInstructionsDraft)
+        else { return }
+
+        handoffInstructionsBaseline = handoffInstructionsDraft
+        handoffInstructionsLastObservedStoredValue = handoffInstructionsDraft
+        handoffInstructionsHaveExternalConflict = false
+    }
+
+    private func clearHandoffInstructions() {
+        guard handoffInstructionsCanClear,
+              globalSettings.setAgentSessionHandoffInstructions("")
+        else { return }
+
+        handoffInstructionsDraft = ""
+        handoffInstructionsBaseline = ""
+        handoffInstructionsLastObservedStoredValue = ""
+        handoffInstructionsHaveExternalConflict = false
+        handoffInstructionsExternalUpdateTick &+= 1
     }
 
     // MARK: - Agent Workflows row

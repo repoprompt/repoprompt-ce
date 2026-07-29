@@ -125,6 +125,8 @@ import MCP
                 #endif
             case "codemap_full_load":
                 return await debugCodemapFullLoadPayload(op: op, arguments: arguments)
+            case "codemap_graph_status":
+                return await debugCodemapGraphStatusPayload(op: op, arguments: arguments)
             case "mcp_read_search_capture_begin":
                 #if DEBUG
                     return debugMCPReadSearchCaptureBeginPayload(op: op, arguments: arguments)

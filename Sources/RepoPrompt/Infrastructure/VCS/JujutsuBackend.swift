@@ -286,19 +286,21 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         compare: GitDiffCompareSpec,
         includeUntrackedWhenApplicable: Bool,
         detectRenames: Bool,
+        paths: [String]?,
         at repoURL: URL
     ) async throws -> [VCSUncommittedFile] {
+        if let paths, paths.isEmpty { return [] }
         // jj has no untracked concept; ignore includeUntrackedWhenApplicable.
         // jj rename detection differs; ignore detectRenames.
         let normalized = normalizeCompareSpecWithWarning(compare).spec
         let refs = try resolveDiffRefs(for: normalized, repoURL: repoURL)
 
         // 1) Summary for statuses (M/A/D/R/C etc)
-        let summaryText = try await jjDiffSummary(from: refs.from, to: refs.to, repoURL: repoURL, paths: nil)
+        let summaryText = try await jjDiffSummary(from: refs.from, to: refs.to, repoURL: repoURL, paths: paths)
         var entries = parseJjDiffSummary(summaryText)
 
         // 2) Stat for insertions/deletions (best-effort parse)
-        let statText = try await jjDiffStat(from: refs.from, to: refs.to, repoURL: repoURL, paths: nil)
+        let statText = try await jjDiffStat(from: refs.from, to: refs.to, repoURL: repoURL, paths: paths)
         let statMap = parseJjDiffStat(statText)
 
         // Merge
@@ -316,7 +318,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
         // If stat parsing failed entirely, fall back to scanning a git-format diff for accurate counts.
         if !entries.isEmpty, statMap.isEmpty {
-            let diffText = try await jjDiffGit(from: refs.from, to: refs.to, repoURL: repoURL, contextLines: 0, paths: nil)
+            let diffText = try await jjDiffGit(from: refs.from, to: refs.to, repoURL: repoURL, contextLines: 0, paths: paths)
             let counts = computeAddDelByFileFromUnifiedDiff(diffText)
             for i in entries.indices {
                 let path = entries[i].path

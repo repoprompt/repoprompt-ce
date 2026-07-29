@@ -79,11 +79,17 @@ enum MCPToolExecutionContractCatalog {
             cleanupDisposition: .forceDisconnect
         )
         var result = Dictionary(uniqueKeysWithValues: orderedAdvertisedToolNames.map { ($0, bounded) })
-        result[MCPWindowToolName.getCodeStructure] = .bounded(
-            deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
-            cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
-            cleanupDisposition: .detachAndSettle
-        )
+        for toolName in [
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.readFile,
+            MCPWindowToolName.getFileTree
+        ] {
+            result[toolName] = .bounded(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle
+            )
+        }
 
         for toolName in [
             MCPWindowToolName.oracleUtils,
