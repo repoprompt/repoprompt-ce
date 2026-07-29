@@ -1,6 +1,6 @@
 import AppKit
 import Markdown
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class EnhancedMarkdownBareURLTests: XCTestCase {
