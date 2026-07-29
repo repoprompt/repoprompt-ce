@@ -6896,9 +6896,29 @@ class WorkspaceManagerViewModel: ObservableObject {
     actor WorkspaceDiskWriter {
         // MARK: internal model
 
+        private struct WorkspacePayloadIdentity: Equatable {
+            let workspaceID: UUID
+            let dateModified: Date
+        }
+
+        private struct WorkspacePayloadHeader: Decodable {
+            let id: UUID
+            let dateModified: Date
+
+            var identity: WorkspacePayloadIdentity {
+                WorkspacePayloadIdentity(workspaceID: id, dateModified: dateModified)
+            }
+        }
+
+        private struct DecodeWork: Equatable {
+            var identityPayloadCount = 0
+            var fullWorkspacePayloadCount = 0
+        }
+
         private struct Pending {
             var newestData: Data
             var newestMetadata: WorkspaceSavePayloadMetadata?
+            var newestIdentity: WorkspacePayloadIdentity?
             var newestLifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
             var task: Task<Void, Never>?
         }
@@ -6915,6 +6935,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             let selectionKey: WorkspaceTabSelectionKey?
             let effectiveSelectionRevision: UInt64
             let shouldWrite: Bool
+            let decodeWork: DecodeWork
         }
 
         private var pendingByURL: [URL: Pending] = [:]
@@ -6923,6 +6944,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var lastWrittenSelectionRevisionByWorkspaceTab: [WorkspaceTabSelectionKey: UInt64] = [:]
         #if DEBUG
             private var atomicWriteGateForTesting: (@Sendable () async -> Void)?
+            private var decodeWorkForTesting = DecodeWork()
         #endif
 
         // MARK: public API
@@ -6941,6 +6963,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
             WorkspaceSaveTracer.event("workspaceSave.enqueue", metadata: metadata, url: url)
             recordLatestSelectionIfNeeded(metadata)
+            let identity = Self.payloadIdentity(metadata: metadata, data: data)
+            #if DEBUG
+                if metadata == nil, identity != nil {
+                    decodeWorkForTesting.identityPayloadCount &+= 1
+                }
+            #endif
 
             if var pending = pendingByURL[url] {
                 let decision: String
@@ -6950,15 +6978,22 @@ class WorkspaceManagerViewModel: ObservableObject {
                 {
                     pending.newestData = data
                     pending.newestMetadata = metadata
+                    pending.newestIdentity = identity
                     pending.newestLifecycleCorrelation = lifecycleCorrelation ?? pending.newestLifecycleCorrelation
                     decision = "replacedExistingNewerSelectionRevision"
-                } else if Self.shouldKeepExistingWorkspacePayload(existing: pending.newestData, incoming: data, url: url) {
+                } else if Self.shouldKeepExistingWorkspacePayload(
+                    existing: pending.newestIdentity,
+                    incoming: identity,
+                    incomingMetadata: metadata,
+                    url: url
+                ) {
                     decision = "keptExistingNewerDate"
                     WorkspaceSaveTracer.event("workspaceSave.coalesce", metadata: metadata, url: url, extra: ["decision": decision])
                     return
                 } else {
                     pending.newestData = data
                     pending.newestMetadata = metadata
+                    pending.newestIdentity = identity
                     pending.newestLifecycleCorrelation = lifecycleCorrelation ?? pending.newestLifecycleCorrelation
                     decision = "storedAsNewest"
                 }
@@ -6970,6 +7005,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             pendingByURL[url] = Pending(
                 newestData: data,
                 newestMetadata: metadata,
+                newestIdentity: identity,
                 newestLifecycleCorrelation: lifecycleCorrelation,
                 task: nil
             )
@@ -7037,6 +7073,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                 atomicWriteGateForTesting = gate
             }
 
+            func decodeWorkSnapshotForTesting() -> (identityPayloadCount: Int, fullWorkspacePayloadCount: Int) {
+                (
+                    decodeWorkForTesting.identityPayloadCount,
+                    decodeWorkForTesting.fullWorkspacePayloadCount
+                )
+            }
+
             func removeAllForTesting() {
                 for (_, pending) in pendingByURL {
                     pending.task?.cancel()
@@ -7045,6 +7088,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 latestSelectionByWorkspaceTab.removeAll()
                 lastWrittenSelectionRevisionByWorkspaceTab.removeAll()
                 atomicWriteGateForTesting = nil
+                decodeWorkForTesting = DecodeWork()
                 let allWaiters = waitersByURL.values.flatMap(\.self)
                 waitersByURL.removeAll()
                 for waiter in allWaiters {
@@ -7055,8 +7099,38 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // MARK: private helpers
 
-        private static func decodedWorkspacePayload(_ data: Data) -> WorkspaceModel? {
+        private static func payloadIdentity(
+            metadata: WorkspaceSavePayloadMetadata?,
+            data: Data
+        ) -> WorkspacePayloadIdentity? {
+            if let metadata {
+                return WorkspacePayloadIdentity(
+                    workspaceID: metadata.workspaceID,
+                    dateModified: metadata.workspaceDateModified
+                )
+            }
+            return decodedWorkspacePayloadIdentity(data)
+        }
+
+        private static func decodedWorkspacePayloadIdentity(_ data: Data) -> WorkspacePayloadIdentity? {
             guard !data.isEmpty else { return nil }
+            return try? JSONDecoder().decode(WorkspacePayloadHeader.self, from: data).identity
+        }
+
+        private static func decodedWorkspacePayloadIdentity(
+            _ data: Data,
+            decodeWork: inout DecodeWork
+        ) -> WorkspacePayloadIdentity? {
+            decodeWork.identityPayloadCount &+= 1
+            return decodedWorkspacePayloadIdentity(data)
+        }
+
+        private static func decodedWorkspacePayload(
+            _ data: Data,
+            decodeWork: inout DecodeWork
+        ) -> WorkspaceModel? {
+            guard !data.isEmpty else { return nil }
+            decodeWork.fullWorkspacePayloadCount &+= 1
             return try? JSONDecoder().decode(WorkspaceModel.self, from: data)
         }
 
@@ -7076,11 +7150,16 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
 
-        private static func shouldKeepExistingWorkspacePayload(existing: Data, incoming: Data, url: URL) -> Bool {
-            guard let existingWorkspace = decodedWorkspacePayload(existing),
-                  let incomingWorkspace = decodedWorkspacePayload(incoming),
-                  existingWorkspace.id == incomingWorkspace.id,
-                  existingWorkspace.dateModified > incomingWorkspace.dateModified
+        private static func shouldKeepExistingWorkspacePayload(
+            existing: WorkspacePayloadIdentity?,
+            incoming: WorkspacePayloadIdentity?,
+            incomingMetadata: WorkspaceSavePayloadMetadata?,
+            url: URL
+        ) -> Bool {
+            guard let existing,
+                  let incoming,
+                  existing.workspaceID == incoming.workspaceID,
+                  existing.dateModified > incoming.dateModified
             else {
                 return false
             }
@@ -7088,8 +7167,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 WorkspaceRestorePerfLog.event(
                     "workspaceDiskWriter.skipStaleCoalescedPayload",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(incomingWorkspace.id),
-                        "workspaceName": incomingWorkspace.name,
+                        "workspaceID": WorkspaceRestorePerfLog.shortID(incoming.workspaceID),
+                        "workspaceName": incomingMetadata?.workspaceName ?? "unknown",
                         "url": url.lastPathComponent
                     ]
                 )
@@ -7099,40 +7178,69 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         private static func effectivePayloadForWrite(
             payload: Data,
+            incomingIdentity: WorkspacePayloadIdentity?,
             url: URL,
             metadata: WorkspaceSavePayloadMetadata?,
             latestRecord: LatestSelectionRecord?,
             lastWrittenRevision: UInt64
         ) -> EffectiveWritePayload {
-            guard let metadata,
-                  let incomingWorkspace = decodedWorkspacePayload(payload),
-                  incomingWorkspace.id == metadata.workspaceID
-            else {
-                let shouldWrite = !shouldSkipStaleWorkspaceDiskWrite(payload: payload, url: url, metadata: metadata)
-                return EffectiveWritePayload(data: payload, metadata: metadata, selectionKey: metadata?.selectionKey, effectiveSelectionRevision: metadata?.activeSelectionRevision ?? 0, shouldWrite: shouldWrite)
+            var decodeWork = DecodeWork()
+            func result(
+                data: Data,
+                metadata: WorkspaceSavePayloadMetadata?,
+                selectionKey: WorkspaceTabSelectionKey?,
+                effectiveSelectionRevision: UInt64,
+                shouldWrite: Bool
+            ) -> EffectiveWritePayload {
+                EffectiveWritePayload(
+                    data: data,
+                    metadata: metadata,
+                    selectionKey: selectionKey,
+                    effectiveSelectionRevision: effectiveSelectionRevision,
+                    shouldWrite: shouldWrite,
+                    decodeWork: decodeWork
+                )
             }
 
-            let key = metadata.selectionKey
-            let incomingRevision = metadata.activeSelectionRevision
+            guard let incomingIdentity else {
+                return result(
+                    data: payload,
+                    metadata: metadata,
+                    selectionKey: metadata?.selectionKey,
+                    effectiveSelectionRevision: metadata?.activeSelectionRevision ?? 0,
+                    shouldWrite: true
+                )
+            }
+
+            let key = metadata?.selectionKey
+            let incomingRevision = metadata?.activeSelectionRevision ?? 0
             let latestRevision = latestRecord?.revision ?? incomingRevision
-            let latestSelection = latestRecord?.selection ?? metadata.activeSelection
+            let latestSelection = latestRecord?.selection ?? metadata?.activeSelection
             let latestMetadata = latestRecord?.metadata ?? metadata
-            let diskWorkspace: WorkspaceModel? = if FileManager.default.fileExists(atPath: url.path),
-                                                    let diskData = try? Data(contentsOf: url),
-                                                    let decoded = decodedWorkspacePayload(diskData),
-                                                    decoded.id == incomingWorkspace.id
-            {
-                decoded
-            } else {
-                nil
+            let diskData = FileManager.default.fileExists(atPath: url.path)
+                ? try? Data(contentsOf: url)
+                : nil
+            let diskIdentity = diskData.flatMap {
+                decodedWorkspacePayloadIdentity($0, decodeWork: &decodeWork)
             }
 
-            if let diskWorkspace, diskWorkspace.dateModified > incomingWorkspace.dateModified {
-                if latestRevision > lastWrittenRevision,
+            if let diskData,
+               let diskIdentity,
+               diskIdentity.workspaceID == incomingIdentity.workspaceID,
+               diskIdentity.dateModified > incomingIdentity.dateModified
+            {
+                if let metadata,
+                   latestRevision > lastWrittenRevision,
                    let latestSelection,
-                   let activeTabID = metadata.activeTabID
+                   let activeTabID = metadata.activeTabID,
+                   let diskWorkspace = decodedWorkspacePayload(diskData, decodeWork: &decodeWork),
+                   diskWorkspace.id == incomingIdentity.workspaceID
                 {
-                    let applied = WorkspaceManagerViewModel.workspaceByApplyingSelection(latestSelection, toActiveTab: activeTabID, in: diskWorkspace)
+                    let applied = WorkspaceManagerViewModel.workspaceByApplyingSelection(
+                        latestSelection,
+                        toActiveTab: activeTabID,
+                        in: diskWorkspace
+                    )
                     if applied.applied {
                         var merged = applied.workspace
                         merged.dateModified = Date()
@@ -7144,22 +7252,41 @@ class WorkspaceManagerViewModel: ObservableObject {
                                 extra: [
                                     "latestSelectionRevision": "\(latestRevision)",
                                     "lastWrittenSelectionRevision": "\(lastWrittenRevision)",
-                                    "latestPayloadID": latestMetadata.payloadID.uuidString
+                                    "latestPayloadID": latestMetadata?.payloadID.uuidString ?? "none"
                                 ]
                             )
-                            return EffectiveWritePayload(data: encoded, metadata: latestMetadata, selectionKey: key, effectiveSelectionRevision: latestRevision, shouldWrite: true)
+                            return result(
+                                data: encoded,
+                                metadata: latestMetadata,
+                                selectionKey: key,
+                                effectiveSelectionRevision: latestRevision,
+                                shouldWrite: true
+                            )
                         }
                     }
                 }
                 WorkspaceSaveTracer.event("workspaceSave.write.skipStaleDiskPayload", metadata: metadata, url: url)
-                return EffectiveWritePayload(data: payload, metadata: metadata, selectionKey: key, effectiveSelectionRevision: incomingRevision, shouldWrite: false)
+                return result(
+                    data: payload,
+                    metadata: metadata,
+                    selectionKey: key,
+                    effectiveSelectionRevision: incomingRevision,
+                    shouldWrite: false
+                )
             }
 
-            if latestRevision > incomingRevision,
+            if let metadata,
+               latestRevision > incomingRevision,
                let latestSelection,
-               let activeTabID = metadata.activeTabID
+               let activeTabID = metadata.activeTabID,
+               let incomingWorkspace = decodedWorkspacePayload(payload, decodeWork: &decodeWork),
+               incomingWorkspace.id == incomingIdentity.workspaceID
             {
-                let applied = WorkspaceManagerViewModel.workspaceByApplyingSelection(latestSelection, toActiveTab: activeTabID, in: incomingWorkspace)
+                let applied = WorkspaceManagerViewModel.workspaceByApplyingSelection(
+                    latestSelection,
+                    toActiveTab: activeTabID,
+                    in: incomingWorkspace
+                )
                 if applied.applied,
                    let encoded = try? JSONEncoder().encode(applied.workspace)
                 {
@@ -7170,37 +7297,37 @@ class WorkspaceManagerViewModel: ObservableObject {
                         extra: [
                             "incomingSelectionRevision": "\(incomingRevision)",
                             "latestSelectionRevision": "\(latestRevision)",
-                            "latestPayloadID": latestMetadata.payloadID.uuidString
+                            "latestPayloadID": latestMetadata?.payloadID.uuidString ?? "none"
                         ]
                     )
-                    return EffectiveWritePayload(data: encoded, metadata: latestMetadata, selectionKey: key, effectiveSelectionRevision: latestRevision, shouldWrite: true)
+                    return result(
+                        data: encoded,
+                        metadata: latestMetadata,
+                        selectionKey: key,
+                        effectiveSelectionRevision: latestRevision,
+                        shouldWrite: true
+                    )
                 }
             }
 
-            return EffectiveWritePayload(data: payload, metadata: metadata, selectionKey: key, effectiveSelectionRevision: incomingRevision, shouldWrite: true)
-        }
-
-        private static func shouldSkipStaleWorkspaceDiskWrite(payload: Data, url: URL, metadata: WorkspaceSavePayloadMetadata?) -> Bool {
-            guard FileManager.default.fileExists(atPath: url.path),
-                  let incomingWorkspace = decodedWorkspacePayload(payload),
-                  let diskData = try? Data(contentsOf: url),
-                  let diskWorkspace = decodedWorkspacePayload(diskData),
-                  diskWorkspace.id == incomingWorkspace.id,
-                  diskWorkspace.dateModified > incomingWorkspace.dateModified
-            else {
-                return false
-            }
-            WorkspaceSaveTracer.event("workspaceSave.write.skipStaleDiskPayload", metadata: metadata, url: url)
-            return true
+            return result(
+                data: payload,
+                metadata: metadata,
+                selectionKey: key,
+                effectiveSelectionRevision: incomingRevision,
+                shouldWrite: true
+            )
         }
 
         private func runNext(for url: URL) {
             guard var slot = pendingByURL[url] else { return }
             let payload = slot.newestData
             let metadata = slot.newestMetadata
+            let incomingIdentity = slot.newestIdentity
             let lifecycleCorrelation = slot.newestLifecycleCorrelation
             slot.newestData = Data()
             slot.newestMetadata = nil
+            slot.newestIdentity = nil
             slot.newestLifecycleCorrelation = nil
             pendingByURL[url] = slot
             let latestRecord = metadata?.selectionKey.flatMap { latestSelectionByWorkspaceTab[$0] }
@@ -7212,6 +7339,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             let task = Task.detached(priority: .utility) { [weak self] in
                 let effective = Self.effectivePayloadForWrite(
                     payload: payload,
+                    incomingIdentity: incomingIdentity,
                     url: url,
                     metadata: metadata,
                     latestRecord: latestRecord,
@@ -7259,6 +7387,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         private func writerFinished(for url: URL, effective: EffectiveWritePayload, writeSucceeded: Bool) {
+            #if DEBUG
+                decodeWorkForTesting.identityPayloadCount &+= effective.decodeWork.identityPayloadCount
+                decodeWorkForTesting.fullWorkspacePayloadCount &+= effective.decodeWork.fullWorkspacePayloadCount
+            #endif
             if writeSucceeded,
                let key = effective.selectionKey,
                effective.effectiveSelectionRevision > 0

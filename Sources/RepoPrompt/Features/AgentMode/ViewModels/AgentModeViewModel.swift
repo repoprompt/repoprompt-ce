@@ -635,6 +635,8 @@ final class AgentModeViewModel: ObservableObject {
     /// revisions when sidebar-visible content has not changed. Nil before the
     /// first forced refresh so the initial request always publishes.
     var lastSidebarContentFingerprint: AgentSessionSidebarContentFingerprint?
+    var sidebarSessionRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
+    var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
     private var lastKnownWorkspaceSnapshot: WorkspaceModel?
     var tabDraftText: [UUID: String] = [:]
     private var cancellables = Set<AnyCancellable>()
@@ -644,6 +646,8 @@ final class AgentModeViewModel: ObservableObject {
         private var test_currentTabIDOverride: UUID?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
+        private var test_persistentBindingResolutionSnapshotBuildCount = 0
+        var test_sidebarListProjectionBuildCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
@@ -784,6 +788,20 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_bindingResolution(sessionID: UUID) -> PersistentBindingResolution {
             persistentBindingResolution(for: sessionID)
+        }
+
+        func test_worktreeBindingStates(
+            forAgentSessionIDs sessionIDs: Set<UUID>
+        ) -> [UUID: AgentSessionWorktreeBindingState] {
+            worktreeBindingStates(forAgentSessionIDs: sessionIDs)
+        }
+
+        func test_resetPersistentBindingResolutionSnapshotBuildCount() {
+            test_persistentBindingResolutionSnapshotBuildCount = 0
+        }
+
+        var test_persistentBindingResolutionBuildCount: Int {
+            test_persistentBindingResolutionSnapshotBuildCount
         }
 
         func test_bindingTransitionToken(for session: TabSession) -> PersistentBindingTransitionToken {
@@ -3603,47 +3621,73 @@ final class AgentModeViewModel: ObservableObject {
         )?.sessionID
     }
 
-    private func persistentBindingResolution(for sessionID: UUID) -> PersistentBindingResolution {
-        var authoritativeCandidates = Set<UUID>()
-        var conflictingTabIDs = Set<UUID>()
-        let liveClaims = Dictionary(uniqueKeysWithValues: sessions.values.compactMap { session in
+    private func makePersistentBindingResolutionSnapshot() -> PersistentBindingResolutionSnapshot {
+        #if DEBUG
+            test_persistentBindingResolutionSnapshotBuildCount &+= 1
+        #endif
+        let liveClaimsByTabID = Dictionary(uniqueKeysWithValues: sessions.values.compactMap { session in
             session.activeAgentSessionID.map { (session.tabID, $0) }
         })
-        var workspaceClaims: [UUID: Set<UUID>] = [:]
+        var workspaceClaimsByTabID: [UUID: Set<UUID>] = [:]
+        var composeTabIDs = Set<UUID>()
 
         let workspaces = workspaceManager?.workspaces ?? lastKnownWorkspaceSnapshot.map { [$0] } ?? []
         for workspace in workspaces {
             for tab in workspace.composeTabs {
+                if workspaceManager != nil {
+                    composeTabIDs.insert(tab.id)
+                }
                 if let claimedSessionID = tab.activeAgentSessionID {
-                    workspaceClaims[tab.id, default: []].insert(claimedSessionID)
+                    workspaceClaimsByTabID[tab.id, default: []].insert(claimedSessionID)
                 }
             }
             for stashed in workspace.stashedTabs {
                 if let claimedSessionID = stashed.tab.activeAgentSessionID {
-                    workspaceClaims[stashed.tab.id, default: []].insert(claimedSessionID)
+                    workspaceClaimsByTabID[stashed.tab.id, default: []].insert(claimedSessionID)
                 }
             }
         }
 
-        for (tabID, liveSessionID) in liveClaims {
-            if liveSessionID == sessionID {
-                authoritativeCandidates.insert(tabID)
+        var claimedTabIDsBySessionID: [UUID: Set<UUID>] = [:]
+        var conflictingTabIDsBySessionID: [UUID: Set<UUID>] = [:]
+        for (tabID, sessionID) in liveClaimsByTabID {
+            claimedTabIDsBySessionID[sessionID, default: []].insert(tabID)
+        }
+        for (tabID, persistedClaims) in workspaceClaimsByTabID {
+            for sessionID in persistedClaims {
+                claimedTabIDsBySessionID[sessionID, default: []].insert(tabID)
             }
-            if let persistedClaims = workspaceClaims[tabID],
-               persistedClaims.contains(where: { $0 != liveSessionID }),
-               liveSessionID == sessionID || persistedClaims.contains(sessionID)
+            if persistedClaims.count > 1 {
+                for sessionID in persistedClaims {
+                    conflictingTabIDsBySessionID[sessionID, default: []].insert(tabID)
+                }
+            }
+            if let liveSessionID = liveClaimsByTabID[tabID],
+               persistedClaims.contains(where: { $0 != liveSessionID })
             {
-                conflictingTabIDs.insert(tabID)
+                conflictingTabIDsBySessionID[liveSessionID, default: []].insert(tabID)
+                for sessionID in persistedClaims {
+                    conflictingTabIDsBySessionID[sessionID, default: []].insert(tabID)
+                }
             }
         }
-        for (tabID, persistedClaims) in workspaceClaims {
-            if persistedClaims.contains(sessionID) {
-                authoritativeCandidates.insert(tabID)
-            }
-            if persistedClaims.count > 1, persistedClaims.contains(sessionID) {
-                conflictingTabIDs.insert(tabID)
-            }
-        }
+
+        return PersistentBindingResolutionSnapshot(
+            liveClaimsByTabID: liveClaimsByTabID,
+            workspaceClaimsByTabID: workspaceClaimsByTabID,
+            claimedTabIDsBySessionID: claimedTabIDsBySessionID,
+            conflictingTabIDsBySessionID: conflictingTabIDsBySessionID,
+            indexedTabIDBySessionID: ownerValidatedSessionIndex.mapValues(\.tabID),
+            composeTabIDs: composeTabIDs
+        )
+    }
+
+    private func persistentBindingResolution(
+        for sessionID: UUID,
+        using snapshot: PersistentBindingResolutionSnapshot
+    ) -> PersistentBindingResolution {
+        let authoritativeCandidates = snapshot.claimedTabIDsBySessionID[sessionID] ?? []
+        let conflictingTabIDs = snapshot.conflictingTabIDsBySessionID[sessionID] ?? []
 
         if !conflictingTabIDs.isEmpty || authoritativeCandidates.count > 1 {
             let candidates = authoritativeCandidates.union(conflictingTabIDs).sorted { $0.uuidString < $1.uuidString }
@@ -3662,14 +3706,21 @@ final class AgentModeViewModel: ObservableObject {
         if let tabID = authoritativeCandidates.first {
             return .unique(tabID: tabID)
         }
-        if let indexedTabID = ownerValidatedSessionIndex[sessionID]?.tabID,
-           workspaceManager?.composeTab(with: indexedTabID) != nil,
-           liveClaims[indexedTabID] == nil,
-           workspaceClaims[indexedTabID]?.isEmpty != false
+        if let indexedTabID = snapshot.indexedTabIDBySessionID[sessionID],
+           snapshot.composeTabIDs.contains(indexedTabID),
+           snapshot.liveClaimsByTabID[indexedTabID] == nil,
+           snapshot.workspaceClaimsByTabID[indexedTabID]?.isEmpty != false
         {
             return .unique(tabID: indexedTabID)
         }
         return .notFound
+    }
+
+    private func persistentBindingResolution(for sessionID: UUID) -> PersistentBindingResolution {
+        persistentBindingResolution(
+            for: sessionID,
+            using: makePersistentBindingResolutionSnapshot()
+        )
     }
 
     private func ambiguousAgentSessionError() -> MCPError {
@@ -5689,26 +5740,56 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
-    func worktreeBindingState(
+    private func worktreeBindingState(
         forAgentSessionID sessionID: UUID,
-        tabID: UUID? = nil
+        tabID: UUID?,
+        resolutionSnapshot: PersistentBindingResolutionSnapshot
     ) -> AgentSessionWorktreeBindingState {
-        do {
-            if let live = try authoritativeLiveSession(for: sessionID) {
+        switch persistentBindingResolution(for: sessionID, using: resolutionSnapshot) {
+        case let .unique(authoritativeTabID):
+            if let live = sessions[authoritativeTabID], live.activeAgentSessionID == sessionID {
                 return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
             }
-        } catch {
-            return .unavailable
-        }
-        if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
-            return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
-        }
-        switch persistentBindingResolution(for: sessionID) {
-        case .unique:
+            // Retain the scalar API's explicit-tab compatibility for a unique
+            // persisted claim whose live session has not yet joined the map.
+            if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
+                return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
+            }
             return .unhydrated
         case .notFound, .ambiguous:
             return .unavailable
         }
+    }
+
+    func worktreeBindingState(
+        forAgentSessionID sessionID: UUID,
+        tabID: UUID? = nil
+    ) -> AgentSessionWorktreeBindingState {
+        worktreeBindingState(
+            forAgentSessionID: sessionID,
+            tabID: tabID,
+            resolutionSnapshot: makePersistentBindingResolutionSnapshot()
+        )
+    }
+
+    /// Resolves a set of session IDs against one immutable authority snapshot.
+    /// Callers that project many tabs must use this instead of repeating the
+    /// scalar lookup, which would rebuild live and persisted claims per session.
+    func worktreeBindingStates(
+        forAgentSessionIDs sessionIDs: Set<UUID>
+    ) -> [UUID: AgentSessionWorktreeBindingState] {
+        guard !sessionIDs.isEmpty else { return [:] }
+        let snapshot = makePersistentBindingResolutionSnapshot()
+        return Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
+            (
+                sessionID,
+                worktreeBindingState(
+                    forAgentSessionID: sessionID,
+                    tabID: nil,
+                    resolutionSnapshot: snapshot
+                )
+            )
+        })
     }
 
     func worktreeBindings(forAgentSessionID sessionID: UUID, tabID: UUID? = nil) -> [AgentSessionWorktreeBinding] {
