@@ -894,7 +894,8 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.codexControllerFeatureState = .init(
             computerUseEnabled: false,
             goalSupportEnabled: CodexGoalSupport.isEnabled,
-            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
         )
         return (viewModel, session)
     }
@@ -942,7 +943,8 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.codexControllerFeatureState = .init(
             computerUseEnabled: false,
             goalSupportEnabled: CodexGoalSupport.isEnabled,
-            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
         )
         return (viewModel, session, sessionID)
     }

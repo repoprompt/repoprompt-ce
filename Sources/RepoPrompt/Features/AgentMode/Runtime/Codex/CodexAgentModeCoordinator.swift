@@ -4378,6 +4378,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if previous.reasoningSummariesEnabled != desired.reasoningSummariesEnabled {
             return desired.reasoningSummariesEnabled ? "reasoning-summaries-enabled" : "reasoning-summaries-disabled"
         }
+        if previous.memoriesEnabled != desired.memoriesEnabled {
+            return desired.memoriesEnabled ? "memories-enabled" : "memories-disabled"
+        }
         return "feature-state-unknown"
     }
 
@@ -4759,6 +4762,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         let wantsGoalSupport = CodexGoalSupport.isEnabled
         let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
+        let wantsMemories = CodexMemories.isEnabled
         let codexComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
         if !codexComputerUseFeatureEnabled {
             session.pendingCodexComputerUseActivation = nil
@@ -4767,7 +4771,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         var desiredFeatureState = AgentModeViewModel.TabSession.CodexControllerFeatureState(
             computerUseEnabled: wantsComputerUse,
             goalSupportEnabled: wantsGoalSupport,
-            reasoningSummariesEnabled: wantsReasoningSummaries
+            reasoningSummariesEnabled: wantsReasoningSummaries,
+            memoriesEnabled: wantsMemories
         )
         if let existingController = session.codexController,
            session.codexControllerFeatureState != desiredFeatureState
@@ -4856,7 +4861,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let refreshedFeatureState = AgentModeViewModel.TabSession.CodexControllerFeatureState(
                 computerUseEnabled: refreshedWantsComputerUse,
                 goalSupportEnabled: CodexGoalSupport.isEnabled,
-                reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+                reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+                memoriesEnabled: CodexMemories.isEnabled
             )
 
             if let existingController = session.codexController,

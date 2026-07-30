@@ -2971,7 +2971,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.codexControllerFeatureState = .init(
             computerUseEnabled: false,
             goalSupportEnabled: CodexGoalSupport.isEnabled,
-            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
         )
         return session
     }

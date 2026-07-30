@@ -69,25 +69,27 @@ differences:
    declares it; `threadId` is the current resume authority.
 4. `ThreadGoalGetResponse.goal` is optional, while RPCE treated an omitted key as an invalid
    response instead of “no goal.”
-5. **Revalidated 2026-07-26 for Codex 0.145.0:** The bundled source initializes `memory_mode` to
-   `Disabled` for both fresh and resumed threads when `memories.generate_memories=false`, making
-   RPCE's start/resume config initialization the authority. RPCE therefore does not call
-   `thread/memoryMode/set`; recheck this initialization behavior before each bundled Codex runtime
-   bump.
+5. **Corrected after upstream protocol review:** Fresh `thread/start` config initializes memory
+   eligibility, but resume config does not reconcile an existing stored thread's persisted mode. RPCE
+   therefore calls experimental `thread/memoryMode/set` with `enabled` or `disabled` before
+   `thread/resume` so resumed startup observes the requested mode. It does not issue a redundant
+   post-start request. The 0.145.0 runtime floor and `experimentalApi` initialization capability make
+   resume reconciliation a required contract rather than an optional compatibility fallback.
 6. The generated `goal.status` enum includes `blocked` and `usageLimited`, while RPCE previously
    rejected both as invalid responses. The same six-value enum is also declared for
    `thread/goal/set`, so accepting those cases does not create an outbound schema violation.
 
 ## 0.145.0 rotation findings (2026-07-26)
 
-The verified bundled 0.145.0 CLI passes the existing bounded projection without code or contract-path
-changes. A full generated-bundle comparison with verified 0.144.6 schemas showed additive upstream
-evolution, including optional `runtimeWorkspaceRoots` on `thread/start` and `turn/start`, backwards
-pagination cursors on `thread/resume`, audio input/tool-output variants, and new app, environment, and
-thread-search methods. None removes or changes a field RPCE sends or consumes. The exact tagged source
-also retains `[features.code_mode].direct_only_tool_namespaces` as direct model exposure and initializes
-new and resumed thread persistence to `Disabled` when `memories.generate_memories=false`; no routing,
-reconnect, memory-mode, or per-version compatibility change is required.
+The verified bundled 0.145.0 CLI passes the bounded projection. A full generated-bundle comparison
+with verified 0.144.6 schemas showed additive upstream evolution, including optional
+`runtimeWorkspaceRoots` on `thread/start` and `turn/start`, backwards pagination cursors on
+`thread/resume`, audio input/tool-output variants, and new app, environment, and thread-search methods.
+None removes or changes a field RPCE sends or consumes. The exact tagged source also retains
+`[features.code_mode].direct_only_tool_namespaces` as direct model exposure. Subsequent protocol review
+confirmed that existing thread memory eligibility must be reconciled through experimental
+`thread/memoryMode/set`; resume config keys alone are insufficient for stored threads, while fresh
+thread eligibility is initialized by `thread/start` config.
 
 The contract still generates experimental schemas because RPCE validates `initialize.capabilities.experimentalApi`.
 
