@@ -43,7 +43,9 @@ enum AsyncTestWait {
         var delay = max(1, min(initialDelayNanoseconds, maximumDelay))
 
         while true {
-            if try await condition() { return }
+            if try await condition() {
+                return
+            }
             let now = clock.now
             guard now < deadline else {
                 throw AsyncTestConditionTimeout(description: description, timeout: timeout)

@@ -8,7 +8,9 @@ struct BashResultCard: View {
     @Environment(\.agentLiveBashExecutionByItemID) private var liveBashExecutionByItemID
 
     private func status(for parsedResult: BashToolResultParser.ParsedResult) -> ToolCardStatus {
-        if parsedResult.isRunning { return .running }
+        if parsedResult.isRunning {
+            return .running
+        }
         return ToolResultStatusResolver.resolve(
             toolIsError: item.toolIsError,
             raw: item.toolResultJSON,
@@ -38,7 +40,9 @@ struct BashResultCard: View {
         if parsedResult.isSummaryOnly, output?.isEmpty != false {
             return false
         }
-        if parsedResult.isRunning { return true }
+        if parsedResult.isRunning {
+            return true
+        }
         return output?.isEmpty == false
     }
 

@@ -98,7 +98,9 @@ struct ExecutableFileIdentity: Equatable {
             }
 
             let parent = (directoryPath as NSString).deletingLastPathComponent
-            if parent == directoryPath || parent.isEmpty { break }
+            if parent == directoryPath || parent.isEmpty {
+                break
+            }
             directoryPath = parent
         }
     }

@@ -144,10 +144,14 @@ enum CLISymlinkManagerUserSpace {
                 if renamex_np(temporaryURL.path, destinationURL.path, UInt32(RENAME_EXCL)) == 0 {
                     return true
                 }
-                if errno == EEXIST || errno == ENOENT { continue }
+                if errno == EEXIST || errno == ENOENT {
+                    continue
+                }
             case .managedCurrent, .managedStale:
                 if renamex_np(temporaryURL.path, destinationURL.path, UInt32(RENAME_SWAP)) != 0 {
-                    if errno == ENOENT { continue }
+                    if errno == ENOENT {
+                        continue
+                    }
                     break
                 }
                 let displaced = ManagedCLIPathPolicy.classifySymlink(

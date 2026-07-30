@@ -1318,7 +1318,9 @@ enum AgentToolResultPersistencePolicy {
               !value.contains("+++"),
               !value.contains("---")
         else { return nil }
-        if lowered == "no changes" { return value }
+        if lowered == "no changes" {
+            return value
+        }
         let pattern = #"^(?:[0-9]+ repos?: )?[0-9]+ files? \(\+[0-9]+ -[0-9]+\)$"#
         let range = NSRange(value.startIndex ..< value.endIndex, in: value)
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
@@ -1382,7 +1384,9 @@ enum AgentToolResultPersistencePolicy {
 
     private static func smallStorageSummaryText(_ text: String?) -> String? {
         guard let text = trimmedStorageString(text) else { return nil }
-        if text.count <= 240 { return text }
+        if text.count <= 240 {
+            return text
+        }
         let prefix = text.prefix(237).trimmingCharacters(in: .whitespacesAndNewlines)
         return prefix.isEmpty ? nil : prefix + "…"
     }
@@ -1776,8 +1780,12 @@ enum AgentToolResultPersistencePolicy {
         diffLimit: Int
     ) -> [String: Any]? {
         var summary: [String: Any] = [:]
-        if let type, !type.isEmpty { summary["type"] = type }
-        if let path, !path.isEmpty { summary["path"] = path }
+        if let type, !type.isEmpty {
+            summary["type"] = type
+        }
+        if let path, !path.isEmpty {
+            summary["path"] = path
+        }
         if let oldTextTruncated = boolValue(entry, keys: ["oldText_truncated", "old_text_truncated", "oldTextTruncated"]) {
             summary["oldText_truncated"] = oldTextTruncated
         }
@@ -1822,8 +1830,12 @@ enum AgentToolResultPersistencePolicy {
         path: String?
     ) -> [String: Any]? {
         var summary: [String: Any] = [:]
-        if let type, !type.isEmpty { summary["type"] = type }
-        if let path, !path.isEmpty { summary["path"] = path }
+        if let type, !type.isEmpty {
+            summary["type"] = type
+        }
+        if let path, !path.isEmpty {
+            summary["path"] = path
+        }
         for key in ["text", "content", "output", "oldText", "newText"] {
             copyCursorACPStringMetrics(from: entry, key: key, into: &summary)
         }
@@ -2062,21 +2074,35 @@ enum AgentToolResultPersistencePolicy {
             if let agents = rawObject["agents"] as? [[String: Any]] {
                 object["agents"] = agents.prefix(10).map { agent in
                     var summary: [String: Any] = [:]
-                    if let name = smallStringValue(agent, keys: ["name", "id"]) { summary["name"] = name }
-                    if let available = boolValue(agent, keys: ["available"]) { summary["available"] = available }
+                    if let name = smallStringValue(agent, keys: ["name", "id"]) {
+                        summary["name"] = name
+                    }
+                    if let available = boolValue(agent, keys: ["available"]) {
+                        summary["available"] = available
+                    }
                     return summary
                 }
             }
             if let sessions = rawObject["sessions"] as? [[String: Any]] {
                 object["sessions"] = sessions.prefix(10).map { session in
                     var summary: [String: Any] = [:]
-                    if let name = smallStringValue(session, keys: ["name"]) { summary["name"] = name }
-                    if let state = smallStringValue(session, keys: ["state"]) { summary["state"] = state }
+                    if let name = smallStringValue(session, keys: ["name"]) {
+                        summary["name"] = name
+                    }
+                    if let state = smallStringValue(session, keys: ["state"]) {
+                        summary["state"] = state
+                    }
                     if let agent = session["agent"] as? [String: Any] {
                         var agentSummary: [String: Any] = [:]
-                        if let id = smallStringValue(agent, keys: ["id"]) { agentSummary["id"] = id }
-                        if let name = smallStringValue(agent, keys: ["name"]) { agentSummary["name"] = name }
-                        if !agentSummary.isEmpty { summary["agent"] = agentSummary }
+                        if let id = smallStringValue(agent, keys: ["id"]) {
+                            agentSummary["id"] = id
+                        }
+                        if let name = smallStringValue(agent, keys: ["name"]) {
+                            agentSummary["name"] = name
+                        }
+                        if !agentSummary.isEmpty {
+                            summary["agent"] = agentSummary
+                        }
                     } else if let agent = smallStringValue(session, keys: ["agent"]) {
                         summary["agent"] = agent
                     }
@@ -2107,7 +2133,9 @@ enum AgentToolResultPersistencePolicy {
             if let workflows = rawObject["workflows"] as? [[String: Any]] {
                 object["workflows"] = workflows.prefix(10).map { workflow in
                     var summary: [String: Any] = [:]
-                    if let name = smallStringValue(workflow, keys: ["name", "id"]) { summary["name"] = name }
+                    if let name = smallStringValue(workflow, keys: ["name", "id"]) {
+                        summary["name"] = name
+                    }
                     return summary
                 }
             }

@@ -117,8 +117,12 @@ final class FileSystemSeededInventoryManifest: @unchecked Sendable {
             let target = Data(relativePath.utf8)
             for record in testingRecords ?? [] {
                 let bytes = Data(record.relativePath.utf8)
-                if target.lexicographicallyPrecedes(bytes) { return nil }
-                if bytes == target { return record.isDirectory }
+                if target.lexicographicallyPrecedes(bytes) {
+                    return nil
+                }
+                if bytes == target {
+                    return record.isDirectory
+                }
             }
             return nil
         }
@@ -141,7 +145,9 @@ final class FileSystemSeededInventoryManifest: @unchecked Sendable {
             startingAtValidatedRecordOffset: checkpoint.recordOffset
         )
         while let record = try reader.next() {
-            if target.lexicographicallyPrecedes(record.relativePathBytes) { return nil }
+            if target.lexicographicallyPrecedes(record.relativePathBytes) {
+                return nil
+            }
             guard target == record.relativePathBytes else { continue }
             switch record.disposition {
             case .ordinaryFile: return false
@@ -171,7 +177,11 @@ final class FileSystemSeededInventoryManifest: @unchecked Sendable {
                     throw FileSystemSeedReplayError.invalidSeedInventoryPath(path)
                 }
                 previous = path
-                if record.isDirectory { folders += 1 } else { files += 1 }
+                if record.isDirectory {
+                    folders += 1
+                } else {
+                    files += 1
+                }
                 peak = max(peak, path.utf8.count * 2)
             }
             planManifest = nil

@@ -363,7 +363,9 @@ import XCTest
         func requireNestedConnectionID(
             timeout: Duration = synchronizationTimeout
         ) async throws -> UUID {
-            if let nestedConnectionID { return nestedConnectionID }
+            if let nestedConnectionID {
+                return nestedConnectionID
+            }
 
             let waiterID = UUID()
             let timeoutTask = Task {

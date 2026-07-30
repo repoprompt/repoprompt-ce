@@ -201,9 +201,15 @@
             }
 
             var name: String {
-                if forceFullCrawl { return "forcedFullCrawl" }
-                if serve { return "diffSeedServing" }
-                if observe { return "diffSeedObservation" }
+                if forceFullCrawl {
+                    return "forcedFullCrawl"
+                }
+                if serve {
+                    return "diffSeedServing"
+                }
+                if observe {
+                    return "diffSeedObservation"
+                }
                 return "fullCrawl"
             }
         }

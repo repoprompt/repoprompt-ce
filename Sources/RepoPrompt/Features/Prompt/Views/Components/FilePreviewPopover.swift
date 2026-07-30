@@ -1,3 +1,4 @@
+import SwiftTreeSitter
 import SwiftUI
 
 struct FilePreviewPopover: View {
@@ -8,10 +9,11 @@ struct FilePreviewPopover: View {
     @Binding var showPreview: Bool
 
     @State private var previewContent: String = "Loading..."
+    @State private var previewHighlightRanges: [NamedRange]? = nil
     @State private var loadingTask: Task<Void, Never>? = nil // Task handle
     @State private var showSlicesOnly: Bool = true // Default to showing slices if available
     @State private var viewRefreshID = UUID() // Force view refresh
-    @State private var previewMode: FilePreviewMode = .plainText
+    @State private var previewMode: FilePreviewMode = .syntaxHighlighted
     @State private var statusMessage: String? = nil
     @State private var codemapLogicalPath: String? = nil
 
@@ -81,8 +83,8 @@ struct FilePreviewPopover: View {
         case .disabled:
             // Show disabled state with message
             disabledPreviewView
-        case .plainText:
-            // Show plain-text content
+        case .plainText, .syntaxHighlighted:
+            // Show content (plain or highlighted based on available ranges)
             if previewContent != "Loading..." {
                 textPreviewView
             } else {
@@ -112,14 +114,28 @@ struct FilePreviewPopover: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    @ViewBuilder
     private var textPreviewView: some View {
-        TextKitView(
-            text: $previewContent,
-            isEditable: false,
-            isSpellCheckEnabled: false,
-            useMonospacedFont: true
-        )
-        .id(viewRefreshID)
+        // Only use syntax highlighting if mode allows and ranges are available
+        if previewMode == .syntaxHighlighted,
+           let ranges = previewHighlightRanges, !ranges.isEmpty
+        {
+            HighlightedTextKitView(
+                text: $previewContent,
+                highlightRanges: ranges,
+                isEditable: false // Previews are read-only
+            )
+            .id(viewRefreshID)
+        } else {
+            // Plain text view - safer for large SVGs
+            TextKitView(
+                text: $previewContent,
+                isEditable: false, // Previews are read-only
+                isSpellCheckEnabled: false,
+                useMonospacedFont: true // Ensure monospaced font for code
+            )
+            .id(viewRefreshID)
+        }
     }
 
     private func reloadPreview() {
@@ -146,7 +162,8 @@ struct FilePreviewPopover: View {
                         previewContent = "Codemap preview was revoked because the workspace or selection changed."
                         statusMessage = "Preview revoked"
                     }
-                    previewMode = .plainText
+                    previewHighlightRanges = nil
+                    previewMode = .syntaxHighlighted
                     viewRefreshID = UUID()
                 }
                 return
@@ -154,7 +171,19 @@ struct FilePreviewPopover: View {
 
             // Load the full content first
             let fullContent = await file.latestContent ?? "Error loading file content"
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
+
+            // Trigger syntax highlighting only when snapshot mode needs it
+            let previewSnapshot = await MainActor.run { file.previewSnapshot }
+            let shouldLoadHighlight = (previewSnapshot?.mode ?? .syntaxHighlighted) == .syntaxHighlighted
+            if shouldLoadHighlight {
+                _ = await file.latestNamedRanges
+                if Task.isCancelled {
+                    return
+                }
+            }
 
             // Decide whether to show slices or full content
             let shouldShowSlices = showSlicesOnly && fileSlices != nil && !(fileSlices?.isEmpty ?? true)
@@ -162,7 +191,7 @@ struct FilePreviewPopover: View {
             if shouldShowSlices, let slices = fileSlices {
                 // Get SVG safety info from previewSnapshot first
                 let snapshot = await MainActor.run { file.previewSnapshot }
-                let svgMode = snapshot?.mode ?? .plainText
+                let svgMode = snapshot?.mode ?? .syntaxHighlighted
 
                 // For disabled SVGs, don't render slices at all - use snapshot message
                 if svgMode == .disabled {
@@ -170,6 +199,7 @@ struct FilePreviewPopover: View {
                         await MainActor.run {
                             previewMode = .disabled
                             previewContent = snapshot?.previewText ?? "[SVG preview disabled for safety]"
+                            previewHighlightRanges = nil
                             statusMessage = snapshot?.statusMessage
                             viewRefreshID = UUID()
                         }
@@ -183,9 +213,17 @@ struct FilePreviewPopover: View {
                 // Format slices with line ranges and descriptions (matching prompt format)
                 let formattedContent = formatSlicesForDisplay(segments: assembly.segments, fileName: file.name)
 
+                // For plainText SVGs, show content but without syntax highlighting
+                let formattedRanges: [NamedRange]? = if svgMode == .syntaxHighlighted, let ext = file.fileExtension {
+                    try? SyntaxManager.shared.highlight(content: formattedContent, fileExtension: ext)
+                } else {
+                    nil
+                }
+
                 if !Task.isCancelled {
                     await MainActor.run {
                         previewContent = formattedContent
+                        previewHighlightRanges = formattedRanges
                         previewMode = svgMode
                         statusMessage = snapshot?.statusMessage
                         viewRefreshID = UUID()
@@ -201,6 +239,7 @@ struct FilePreviewPopover: View {
                         await MainActor.run {
                             previewMode = snapshot.mode
                             previewContent = snapshot.previewText
+                            previewHighlightRanges = snapshot.namedRanges
                             statusMessage = snapshot.statusMessage
                             viewRefreshID = UUID()
                         }
@@ -208,11 +247,13 @@ struct FilePreviewPopover: View {
                 } else {
                     // Fallback to legacy behavior if no snapshot available
                     let loadedPreviewContent = await MainActor.run { file.previewContent ?? fullContent }
+                    let loadedPreviewRanges = await MainActor.run { file.previewNamedRanges }
 
                     if !Task.isCancelled {
                         await MainActor.run {
-                            previewMode = .plainText
+                            previewMode = .syntaxHighlighted
                             previewContent = loadedPreviewContent
+                            previewHighlightRanges = loadedPreviewRanges
                             statusMessage = nil
                             viewRefreshID = UUID()
                         }

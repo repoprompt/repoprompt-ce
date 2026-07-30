@@ -49,7 +49,9 @@ struct PromptAssemblyBuilder {
         for section in order where !disabled.contains(section) {
             guard let snip = snippets[section], snip.isEmpty == false else { continue }
             out += snip
-            if !snip.hasSuffix("\n") { out += "\n" }
+            if !snip.hasSuffix("\n") {
+                out += "\n"
+            }
         }
         return out
     }

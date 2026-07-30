@@ -1,4 +1,25 @@
+import Darwin
 import Foundation
+
+#if DEBUG
+    struct AgentRuntimeProcessSnapshot: Equatable {
+        let pid: pid_t
+        let appearsAlive: Bool
+
+        static func appearsAlive(pid: pid_t) -> Bool {
+            var info = siginfo_t()
+            let waitResult = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+            if waitResult == 0, info.si_pid == pid {
+                return false
+            }
+            let pidState = Darwin.kill(pid, 0)
+            if pidState == -1, errno == ESRCH {
+                return false
+            }
+            return true
+        }
+    }
+#endif
 
 /// Core Agent Mode contract for native CLI runtimes that keep an interactive
 /// process/session alive across turns.
@@ -29,6 +50,10 @@ protocol NativeAgentRuntimeControlling: Actor {
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
+
+    #if DEBUG
+        func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot?
+    #endif
 }
 
 extension NativeAgentRuntimeControlling {

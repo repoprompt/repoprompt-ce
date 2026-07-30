@@ -37,7 +37,9 @@ public enum BestEffortStderrWriter {
                     offset += written
                     continue
                 }
-                if written < 0, errno == EINTR { continue }
+                if written < 0, errno == EINTR {
+                    continue
+                }
                 return false
             }
             return true
@@ -67,7 +69,9 @@ public enum BestEffortStderrWriter {
             return false
         }
         defer {
-            if lockedStandardError { funlockfile(stderr) }
+            if lockedStandardError {
+                funlockfile(stderr)
+            }
         }
 
         let originalFlags = fcntl(descriptor, F_GETFL)

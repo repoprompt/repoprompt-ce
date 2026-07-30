@@ -66,14 +66,22 @@ struct SelectedFilesGrid: View {
         }
 
         return computed.sorted { lhs, rhs in
-            if lhs.1 != rhs.1 { return lhs.1.rawValue < rhs.1.rawValue }
+            if lhs.1 != rhs.1 {
+                return lhs.1.rawValue < rhs.1.rawValue
+            }
             let leftName = lhs.0.file.nameSortKey
             let rightName = rhs.0.file.nameSortKey
-            if leftName != rightName { return leftName < rightName }
-            if lhs.0.file.name != rhs.0.file.name { return lhs.0.file.name < rhs.0.file.name }
+            if leftName != rightName {
+                return leftName < rightName
+            }
+            if lhs.0.file.name != rhs.0.file.name {
+                return lhs.0.file.name < rhs.0.file.name
+            }
             let leftPath = lhs.0.file.uniqueRelativePathSortKey
             let rightPath = rhs.0.file.uniqueRelativePathSortKey
-            if leftPath != rightPath { return leftPath < rightPath }
+            if leftPath != rightPath {
+                return leftPath < rightPath
+            }
             return lhs.0.file.uniqueRelativePath < rhs.0.file.uniqueRelativePath
         }
     }
@@ -261,7 +269,9 @@ private struct PromptFileTagRow: View {
         let unique = entry.file.uniqueRelativePath
         if let lastSlash = unique.lastIndex(of: "/") {
             let directory = String(unique[..<lastSlash])
-            if !directory.isEmpty { return directory }
+            if !directory.isEmpty {
+                return directory
+            }
         }
         let root = entry.file.rootFolderName
         return root.isEmpty ? nil : root

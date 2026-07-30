@@ -95,9 +95,13 @@ extension FileSystemService {
                 continue
             }
 
-            if byte == 0 { return false }
+            if byte == 0 {
+                return false
+            }
             if byte == 47 {
-                if previousWasSlash { return false }
+                if previousWasSlash {
+                    return false
+                }
                 if currentComponentOnlyDots, currentComponentDotCount == 1 || currentComponentDotCount == 2 {
                     return false
                 }
@@ -133,7 +137,9 @@ extension FileSystemService {
     @inline(__always)
     func hasDirectoryPrefix(_ path: String, _ base: String) -> Bool {
         guard path.hasPrefix(base) else { return false }
-        if path.count == base.count { return true }
+        if path.count == base.count {
+            return true
+        }
         let idx = path.index(path.startIndex, offsetBy: base.count)
         return path[idx] == "/"
     }
@@ -165,13 +171,19 @@ extension FileSystemService {
 
     @inline(__always)
     func isRepoPromptTempPath(_ relPath: String) -> Bool {
-        if relPath.hasPrefix(".repoprompt.tmp.") { return true }
+        if relPath.hasPrefix(".repoprompt.tmp.") {
+            return true
+        }
         return relPath.contains("/.repoprompt.tmp.")
     }
 
     func isGitMetadataPath(_ relPath: String) -> Bool {
-        if relPath.isEmpty { return false }
-        if relPath == ".git" { return true }
+        if relPath.isEmpty {
+            return false
+        }
+        if relPath == ".git" {
+            return true
+        }
         return relPath.hasPrefix(".git/")
     }
 
@@ -179,7 +191,9 @@ extension FileSystemService {
     @inline(__always)
     static func hasDirectoryPrefix(_ path: String, _ base: String) -> Bool {
         guard path.hasPrefix(base) else { return false }
-        if path.count == base.count { return true }
+        if path.count == base.count {
+            return true
+        }
         let idx = path.index(path.startIndex, offsetBy: base.count)
         return path[idx] == "/"
     }
@@ -202,7 +216,9 @@ extension URL {
         let basePath = (base.path as NSString).standardizingPath
         let filePath = (path as NSString).standardizingPath
 
-        if filePath == basePath { return "" }
+        if filePath == basePath {
+            return ""
+        }
 
         let prefix: String = if basePath == "/" {
             "/"

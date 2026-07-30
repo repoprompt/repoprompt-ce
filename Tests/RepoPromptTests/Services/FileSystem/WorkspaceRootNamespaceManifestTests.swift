@@ -133,7 +133,9 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
         let rawNameBytes: [UInt8] = [0x72, 0x61, 0x77, 0x2D, 0x80]
         let createdRawFile = try createRawFile(named: rawNameBytes, in: root)
         defer {
-            if createdRawFile { removeRawFile(named: rawNameBytes, from: root) }
+            if createdRawFile {
+                removeRawFile(named: rawNameBytes, from: root)
+            }
         }
         try FileManager.default.createSymbolicLink(
             atPath: root.appendingPathComponent("dangling-link").path,
@@ -828,7 +830,9 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
                 batch.removeAll(keepingCapacity: true)
             }
         }
-        if !batch.isEmpty { try await writer.append(contentsOf: batch) }
+        if !batch.isEmpty {
+            try await writer.append(contentsOf: batch)
+        }
         let lease = try await writer.finish()
 
         XCTAssertEqual(lease.footer.recordCount, UInt64(configuredCount))
@@ -1025,7 +1029,9 @@ private struct NamespaceManifestMaliciousSpillFormat: SpillBackedSortedArtifactF
     }
 
     func ordering(_ lhs: Data, _ rhs: Data) -> SpillBackedSortedArtifactOrdering {
-        if lhs == rhs { return .same }
+        if lhs == rhs {
+            return .same
+        }
         return lhs.lexicographicallyPrecedes(rhs) ? .ascending : .descending
     }
 

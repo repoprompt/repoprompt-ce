@@ -151,8 +151,12 @@ enum CodexDynamicModelMapper {
             if lhs.isDefault != rhs.isDefault {
                 return lhs.isDefault && !rhs.isDefault
             }
-            if AIModel.codexBaseModelPrecedes(leftBase, rightBase) { return true }
-            if AIModel.codexBaseModelPrecedes(rightBase, leftBase) { return false }
+            if AIModel.codexBaseModelPrecedes(leftBase, rightBase) {
+                return true
+            }
+            if AIModel.codexBaseModelPrecedes(rightBase, leftBase) {
+                return false
+            }
             return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
     }
@@ -280,19 +284,45 @@ enum CodexDynamicModelMapper {
 
     private static func formatLabelToken(_ value: String) -> String {
         let lower = value.lowercased()
-        if lower == "gpt" { return "GPT" }
-        if lower == "cli" { return "CLI" }
-        if lower == "codex" { return "Codex" }
-        if lower == "openai" { return "OpenAI" }
-        if lower == "xhigh" { return "XHigh" }
-        if lower == "ultra" { return "Ultra" }
-        if lower == "low" { return "Low" }
-        if lower == "medium" { return "Medium" }
-        if lower == "high" { return "High" }
-        if lower == "minimal" { return "Minimal" }
-        if lower == "none" { return "None" }
-        if isONumberToken(lower) { return lower.uppercased() }
-        if isVersionToken(value) { return value }
+        if lower == "gpt" {
+            return "GPT"
+        }
+        if lower == "cli" {
+            return "CLI"
+        }
+        if lower == "codex" {
+            return "Codex"
+        }
+        if lower == "openai" {
+            return "OpenAI"
+        }
+        if lower == "xhigh" {
+            return "XHigh"
+        }
+        if lower == "ultra" {
+            return "Ultra"
+        }
+        if lower == "low" {
+            return "Low"
+        }
+        if lower == "medium" {
+            return "Medium"
+        }
+        if lower == "high" {
+            return "High"
+        }
+        if lower == "minimal" {
+            return "Minimal"
+        }
+        if lower == "none" {
+            return "None"
+        }
+        if isONumberToken(lower) {
+            return lower.uppercased()
+        }
+        if isVersionToken(value) {
+            return value
+        }
         return lower.capitalized
     }
 

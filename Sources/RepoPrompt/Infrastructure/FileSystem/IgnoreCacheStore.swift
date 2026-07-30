@@ -299,7 +299,9 @@ struct IgnoreCacheStore {
         ignoreRules: IgnoreRules
     ) -> Bool {
         let key = PathKey(path: relPath, isDirectory: isDirectory)
-        if let cached = ignoreCheckCache[key] { return cached }
+        if let cached = ignoreCheckCache[key] {
+            return cached
+        }
 
         let ignored = ignoreRules.isIgnored(
             relativePath: relPath,

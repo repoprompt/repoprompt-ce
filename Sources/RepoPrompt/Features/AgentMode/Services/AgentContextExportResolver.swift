@@ -294,8 +294,12 @@ enum AgentContextExportResolver {
     }
 
     private static func selectionNeedsResolution(_ selection: StoredSelection, codeMapUsage: CodeMapUsage) -> Bool {
-        if !selection.selectedPaths.isEmpty { return true }
-        if selection.slices.contains(where: { !$0.value.isEmpty }) { return true }
+        if !selection.selectedPaths.isEmpty {
+            return true
+        }
+        if selection.slices.contains(where: { !$0.value.isEmpty }) {
+            return true
+        }
         switch codeMapUsage {
         case .auto:
             return !selection.manualCodemapPaths.isEmpty
@@ -1568,14 +1572,18 @@ enum AgentContextExportResolver {
     }
 
     private static func rowSort(_ lhs: AgentContextExportRow, _ rhs: AgentContextExportRow) -> Bool {
-        if lhs.kind != rhs.kind { return lhs.kind.rawValue < rhs.kind.rawValue }
+        if lhs.kind != rhs.kind {
+            return lhs.kind.rawValue < rhs.kind.rawValue
+        }
         if lhs.displayName != rhs.displayName {
             return lhs.displayName.utf8.lexicographicallyPrecedes(rhs.displayName.utf8)
         }
         if lhs.displayPath != rhs.displayPath {
             return lhs.displayPath.utf8.lexicographicallyPrecedes(rhs.displayPath.utf8)
         }
-        if lhs.rootID != rhs.rootID { return lhs.rootID.uuidString < rhs.rootID.uuidString }
+        if lhs.rootID != rhs.rootID {
+            return lhs.rootID.uuidString < rhs.rootID.uuidString
+        }
         return lhs.id.fileID.uuidString < rhs.id.fileID.uuidString
     }
 
@@ -1617,7 +1625,9 @@ enum AgentContextExportResolver {
         if expanded.hasPrefix("/") {
             let standardized = StandardizedPath.absolute(expanded)
             guard standardized == root.standardizedFullPath || StandardizedPath.isDescendant(standardized, of: root.standardizedFullPath) else { return nil }
-            if standardized == root.standardizedFullPath { return "" }
+            if standardized == root.standardizedFullPath {
+                return ""
+            }
             return StandardizedPath.relative(String(standardized.dropFirst(root.standardizedFullPath.count + 1)))
         }
         return StandardizedPath.relative(expanded)
@@ -1630,7 +1640,9 @@ enum AgentContextExportResolver {
         profile: PathLocateProfile,
         rootScope: WorkspaceLookupRootScope
     ) async -> WorkspacePathLookupResult? {
-        if let result = batchedResults[path] { return result }
+        if let result = batchedResults[path] {
+            return result
+        }
         return await store.lookupPath(path, profile: profile, rootScope: rootScope)
     }
 
@@ -1650,7 +1662,9 @@ enum AgentContextExportResolver {
             location.absolutePath
         ]
         for key in candidateKeys {
-            if let ranges = slices[key] { return ranges }
+            if let ranges = slices[key] {
+                return ranges
+            }
         }
         return nil
     }

@@ -146,14 +146,18 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
     // MARK: - Read (clone from persistent store on first access)
 
     func copySettings(for workspaceID: UUID) -> CopyGlobalSettings {
-        if let s = copyOverlays[workspaceID] { return s }
+        if let s = copyOverlays[workspaceID] {
+            return s
+        }
         let base = store.copySettings(for: workspaceID)
         copyOverlays[workspaceID] = base
         return base
     }
 
     func chatSettings(for workspaceID: UUID) -> ChatGlobalSettings {
-        if let s = chatOverlays[workspaceID] { return s }
+        if let s = chatOverlays[workspaceID] {
+            return s
+        }
         let base = store.chatSettings(for: workspaceID)
         chatOverlays[workspaceID] = base
         return base
@@ -368,8 +372,12 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
     /// Commits all settings for a specific workspace to the global store,
     /// making them the default for that workspace across all windows.
     func commitWorkspace(_ workspaceID: UUID) {
-        if let s = copyOverlays[workspaceID] { store.updateCopySettings(s) }
-        if let s = chatOverlays[workspaceID] { store.updateChatSettings(s) }
+        if let s = copyOverlays[workspaceID] {
+            store.updateCopySettings(s)
+        }
+        if let s = chatOverlays[workspaceID] {
+            store.updateChatSettings(s)
+        }
     }
 
     /// Commits all workspace settings that have been modified in this window

@@ -160,7 +160,9 @@ enum ContextBuilderFollowUpFinalizationMonitor {
             }
             group.addTask {
                 for await event in activityEvents {
-                    if Task.isCancelled { return .cancelled }
+                    if Task.isCancelled {
+                        return .cancelled
+                    }
                     let update = await state.record(event, at: clock())
                     if update.shouldTransitionToFinalization {
                         await reportPhase?(.messageFinalization)

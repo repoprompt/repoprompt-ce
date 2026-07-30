@@ -183,7 +183,9 @@ final class ToolAvailabilityStore: ObservableObject {
                 changed = true
             }
         }
-        if changed { save() } // only persist when needed
+        if changed {
+            save()
+        } // only persist when needed
     }
 
     private func save() {

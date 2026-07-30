@@ -14,8 +14,12 @@ struct SettingsChatPresetPickerPopover<Preview: View>: View {
         allPresets.filter { preset in
             !preset.name.hasPrefix("MCP")
         }.sorted { first, second in
-            if first.name == "Manual" { return false }
-            if second.name == "Manual" { return true }
+            if first.name == "Manual" {
+                return false
+            }
+            if second.name == "Manual" {
+                return true
+            }
             return allPresets.firstIndex(where: { $0.id == first.id })! <
                 allPresets.firstIndex(where: { $0.id == second.id })!
         }
@@ -85,7 +89,9 @@ struct SettingsChatPresetPickerPopover<Preview: View>: View {
                 .equatable()
                 .contentShape(Rectangle())
                 .onHover { hovering in
-                    if hovering { hoveredId = preset.id }
+                    if hovering {
+                        hoveredId = preset.id
+                    }
                 }
                 .onTapGesture {
                     onSelect(preset)

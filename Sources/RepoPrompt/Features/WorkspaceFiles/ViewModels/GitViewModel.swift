@@ -245,9 +245,13 @@ final class GitViewModel: ObservableObject {
         )
 
         resolvedStateTask = Task.detached(priority: .userInitiated) { [input, generation, rootPath, selectedRootPath] in
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
             let output = Self.buildResolvedState(input: input)
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
 
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -449,7 +453,9 @@ final class GitViewModel: ObservableObject {
                 }
                 guard !Task.isCancelled else { break }
                 guard let request = self?.beginPeriodicGitContextRefresh() else {
-                    if self == nil { break }
+                    if self == nil {
+                        break
+                    }
                     continue
                 }
                 let detections = await refreshGitContexts(request.rootPaths)

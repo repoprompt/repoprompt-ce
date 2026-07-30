@@ -96,7 +96,9 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
             // gone. Process termination below does not depend on `self`.
             if let delegate = self?.delegate {
                 for target in targets {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled {
+                        break
+                    }
                     await delegate.teardownMCPControlForDiscardedSession(
                         target.session,
                         cleanupSessionStore: true,
@@ -115,7 +117,9 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
             // Process termination must run even if the provider is deallocated.
             // Coordinators were captured before the yield.
             for target in targets {
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    break
+                }
                 await Self.disposeDetachedTarget(
                     target,
                     codexCoordinator: codexCoordinator,
@@ -225,15 +229,23 @@ extension AgentModeViewModel.TabSession {
         }
     }
 
-    func teardownACPControllerIfPresent() async {
+    func detachACPControllerForShutdown() -> ACPAgentSessionController? {
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
         pendingACPSteeringInstructions.removeAll()
-        guard let controller = acpController else { return }
+        guard let controller = acpController else { return nil }
         acpController = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: self)
-        await controller.cancelPrompt()
-        await controller.shutdown()
+        return controller
+    }
+
+    func teardownACPControllerIfPresent() async {
+        guard let controller = detachACPControllerForShutdown() else { return }
+        let shutdownTask = Task { @MainActor in
+            await controller.cancelPrompt()
+            await controller.shutdown()
+        }
+        await shutdownTask.value
     }
 }
 

@@ -26,9 +26,15 @@ enum CursorACPEventNormalizer {
     }
 
     private static func hasMeaningfulPlaceholderPayload(_ payload: [String: Any]) -> Bool {
-        if let rawInput = payload["rawInput"], valueIsMeaningful(rawInput) { return true }
-        if let rawOutput = payload["rawOutput"], rawOutputIsMeaningful(rawOutput) { return true }
-        if let content = payload["content"], valueIsMeaningful(content) { return true }
+        if let rawInput = payload["rawInput"], valueIsMeaningful(rawInput) {
+            return true
+        }
+        if let rawOutput = payload["rawOutput"], rawOutputIsMeaningful(rawOutput) {
+            return true
+        }
+        if let content = payload["content"], valueIsMeaningful(content) {
+            return true
+        }
         return false
     }
 
@@ -82,7 +88,9 @@ enum CursorACPEventNormalizer {
 
     private static func rawOutputIsMeaningful(_ value: Any) -> Bool {
         if let object = value as? [String: Any] {
-            if rawOutputIndicatesFailure(object) { return true }
+            if rawOutputIndicatesFailure(object) {
+                return true
+            }
             let meaningfulKeys = object.keys.filter { key in
                 let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 return normalized != "success" && normalized != "status"
@@ -122,9 +130,15 @@ enum CursorACPEventNormalizer {
     }
 
     private static func intValue(_ value: Any?) -> Int? {
-        if let value = value as? Int { return value }
-        if let value = value as? NSNumber { return value.intValue }
-        if let value = value as? String { return Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if let value = value as? Int {
+            return value
+        }
+        if let value = value as? NSNumber {
+            return value.intValue
+        }
+        if let value = value as? String {
+            return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
         return nil
     }
 

@@ -1051,7 +1051,9 @@ private struct ProvidersStepView: View {
 
                 Button(action: {
                     var userInfo: [String: Any] = [:]
-                    if let id = windowID { userInfo["windowID"] = id }
+                    if let id = windowID {
+                        userInfo["windowID"] = id
+                    }
                     NotificationCenter.default.post(name: .showRecommendationWizard, object: nil, userInfo: userInfo)
                 }) {
                     HStack(spacing: 4) {
@@ -1383,8 +1385,12 @@ private struct CompactProviderRow: View {
     }
 
     private var statusColor: Color {
-        if isConnected { return .green }
-        if errorText != nil { return .orange }
+        if isConnected {
+            return .green
+        }
+        if errorText != nil {
+            return .orange
+        }
         return .gray.opacity(0.5)
     }
 }

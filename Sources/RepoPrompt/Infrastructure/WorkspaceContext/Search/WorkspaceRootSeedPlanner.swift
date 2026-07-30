@@ -667,10 +667,18 @@ actor WorkspaceRootSeedPlanner {
                 if baseAtPath != nil {
                     base = try nextBase(baseReader)
                 }
-                if deltaAtPath != nil { delta = try nextDelta(treeReader, prefix: prefix) }
-                if indexAtPath != nil { index = try nextIndex(indexReader, prefix: prefix) }
-                if statusAtPath != nil { status = try nextStatus(statusReader, prefix: prefix) }
-                if namespaceAtPath != nil { namespaceRecord = try namespaceReader.next() }
+                if deltaAtPath != nil {
+                    delta = try nextDelta(treeReader, prefix: prefix)
+                }
+                if indexAtPath != nil {
+                    index = try nextIndex(indexReader, prefix: prefix)
+                }
+                if statusAtPath != nil {
+                    status = try nextStatus(statusReader, prefix: prefix)
+                }
+                if namespaceAtPath != nil {
+                    namespaceRecord = try namespaceReader.next()
+                }
             }
 
             guard baseReader.validationState == .verified,
@@ -1122,8 +1130,12 @@ actor WorkspaceRootSeedPlanner {
     private static func fallbackReason(for error: Error) -> WorkspaceRootSeedFallbackReason {
         if let failure = error as? PlanningFailure,
            case let .fallback(reason) = failure
-        { return reason }
-        if error is CancellationError { return .cancellation }
+        {
+            return reason
+        }
+        if error is CancellationError {
+            return .cancellation
+        }
         if let error = error as? WorkspaceRootTargetEvidenceCoordinatorError {
             return switch error {
             case .waiterDeadlineExceeded: .evidenceWaitDeadlineExceeded

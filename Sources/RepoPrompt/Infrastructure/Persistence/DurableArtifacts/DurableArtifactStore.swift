@@ -278,7 +278,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
         admittedByteUpperBound: UInt64,
         records: (DurableArtifactObjectWriter) throws -> Void
     ) throws -> DurableArtifactPublicationResult {
-        if familyIsDisabled(family) { return .familyDisabled }
+        if familyIsDisabled(family) {
+            return .familyDisabled
+        }
         guard UInt64(canonicalIdentity.count) <= framingPolicy.maximumIdentityByteCount else {
             throw DurableArtifactStoreError.invalidFraming
         }
@@ -299,7 +301,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
         )
         guard let maintenance else { return .busy }
         defer { maintenance.close() }
-        if let reason = try admissionFailure(for: admittedByteUpperBound) { return .notAdmitted(reason) }
+        if let reason = try admissionFailure(for: admittedByteUpperBound) {
+            return .notAdmitted(reason)
+        }
 
         let temporaryName = ".tmp.\(hooks.token())"
         let temporary = try DurableArtifactSecureIO.createExclusiveFile(parent: layout.work, name: temporaryName)
@@ -461,7 +465,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                       ) == installed.1
                 else { throw DurableArtifactStoreError.insecureEntry }
             } catch let error as DurableArtifactStoreError {
-                if case .simulatedCrash = error { throw error }
+                if case .simulatedCrash = error {
+                    throw error
+                }
                 let restorationError: Error?
                 do {
                     try restoreDescriptorAfterFailedPostCheck(
@@ -476,7 +482,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                     restorationError = error
                 }
                 try disable(family, collisionDigest: id.digest)
-                if let restorationError { throw restorationError }
+                if let restorationError {
+                    throw restorationError
+                }
                 throw error
             }
             try hooks.crash(.afterObjectRename)
@@ -484,7 +492,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
             try hooks.crash(.afterObjectDirectorySync)
             return .published(id: id, byteCount: UInt64(installed.1.size))
         } catch let error as DurableArtifactStoreError {
-            if case .simulatedCrash = error { preserveTemporary = true }
+            if case .simulatedCrash = error {
+                preserveTemporary = true
+            }
             if case let .ioFailure(_, code) = error, code == ENOSPC || code == EDQUOT {
                 return .notAdmitted(.noSpace)
             }
@@ -498,7 +508,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
     }
 
     func openObject(_ expectation: DurableArtifactObjectExpectation) throws -> DurableArtifactOpenResult {
-        if familyIsDisabled(expectation.id.family) { return .familyDisabled }
+        if familyIsDisabled(expectation.id.family) {
+            return .familyDisabled
+        }
         guard let objectParent = try objectDirectory(for: expectation.id, create: false) else { return .missing }
         let lockParent = try objectLockDirectory(for: expectation.id, create: true)!
         let layoutLock = try DurableArtifactSecureIO.lockDescriptor(
@@ -561,7 +573,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
             opened.0.close()
             objectLock.close()
             layoutLock.close()
-            if error as? DurableArtifactStoreError == .identityMismatch { return .missing }
+            if error as? DurableArtifactStoreError == .identityMismatch {
+                return .missing
+            }
             if (error as? DurableArtifactStoreError)?.isAuthenticatedCorruption == true {
                 return try quarantineCorruptObject(expectation.id) ? .corruptQuarantined : .corruptBusy
             }
@@ -570,7 +584,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
     }
 
     func loadCatalog(for family: DurableArtifactFamily) throws -> DurableArtifactCatalogReadResult {
-        if familyIsDisabled(family) { return .familyDisabled }
+        if familyIsDisabled(family) {
+            return .familyDisabled
+        }
         let layoutLock = try DurableArtifactSecureIO.lockDescriptor(
             parent: layout.root,
             name: ".layout.lock",
@@ -612,8 +628,12 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
         target: DurableArtifactObjectID?,
         admittedByteUpperBound: UInt64
     ) throws -> DurableArtifactCatalogCASResult {
-        if familyIsDisabled(family) { return .familyDisabled }
-        if let target, target.family != family { throw DurableArtifactStoreError.identityMismatch }
+        if familyIsDisabled(family) {
+            return .familyDisabled
+        }
+        if let target, target.family != family {
+            throw DurableArtifactStoreError.identityMismatch
+        }
         let layoutLock = try DurableArtifactSecureIO.lockDescriptor(
             parent: layout.root,
             name: ".layout.lock",
@@ -694,13 +714,17 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
             }
             return .deleted
         }
-        if current?.target == target, let current { return .unchanged(current) }
+        if current?.target == target, let current {
+            return .unchanged(current)
+        }
         let body = try catalogBody(family: family, target: target, predecessor: expectedRevision)
         let revision = try transformedDigest(Data(SHA256.hash(data: body)))
         var file = body
         file.append(revision.bytes)
         guard UInt64(file.count) <= admittedByteUpperBound else { return .notAdmitted(.declaredBoundExceeded) }
-        if let reason = try admissionFailure(for: admittedByteUpperBound) { return .notAdmitted(reason) }
+        if let reason = try admissionFailure(for: admittedByteUpperBound) {
+            return .notAdmitted(reason)
+        }
         let temporaryName = ".catalog.tmp.\(hooks.token())"
         let temporary = try DurableArtifactSecureIO.createExclusiveFile(parent: layout.work, name: temporaryName)
         var identity: DurableArtifactFileIdentity? = try DurableArtifactSecureIO.validateRegularFile(
@@ -777,7 +801,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                         operation: "catalog-directory-swap-sync"
                     )
                 } catch let error as DurableArtifactStoreError {
-                    if case .simulatedCrash = error { throw error }
+                    if case .simulatedCrash = error {
+                        throw error
+                    }
                     let restorationError: Error?
                     do {
                         try restoreDescriptorAfterFailedPostCheck(
@@ -792,7 +818,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                         restorationError = error
                     }
                     try disable(family, collisionDigest: target.digest)
-                    if let restorationError { throw restorationError }
+                    if let restorationError {
+                        throw restorationError
+                    }
                     throw error
                 }
             } else {
@@ -818,7 +846,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                         operation: "catalog-directory-publish-sync"
                     )
                 } catch let error as DurableArtifactStoreError {
-                    if case .simulatedCrash = error { throw error }
+                    if case .simulatedCrash = error {
+                        throw error
+                    }
                     try retireUntrustedPathIfPresent(
                         parent: layout.catalogs,
                         name: catalogName,
@@ -840,7 +870,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                 predecessorRevision: expectedRevision
             ))
         } catch let error as DurableArtifactStoreError {
-            if case .simulatedCrash = error { preserve = true }
+            if case .simulatedCrash = error {
+                preserve = true
+            }
             if case let .ioFailure(_, code) = error, code == ENOSPC || code == EDQUOT {
                 return .notAdmitted(.noSpace)
             }
@@ -1095,10 +1127,14 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
     func admissionFailure(for upperBound: UInt64) throws -> DurableArtifactAdmissionReason? {
         let used = try managedByteCount()
         let (quotaTotal, quotaOverflow) = used.addingReportingOverflow(upperBound)
-        if quotaOverflow || quotaTotal > diskPolicy.quotaBytes { return .quota }
+        if quotaOverflow || quotaTotal > diskPolicy.quotaBytes {
+            return .quota
+        }
         let available = try DurableArtifactSecureIO.availableBytes(layout.version)
         let (required, reserveOverflow) = diskPolicy.minimumFreeReserveBytes.addingReportingOverflow(upperBound)
-        if reserveOverflow || available < required { return .minimumFreeReserve }
+        if reserveOverflow || available < required {
+            return .minimumFreeReserve
+        }
         return nil
     }
 
@@ -1126,7 +1162,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
                       value.linkCount == 1, value.device == directory.identity.device, value.size >= 0
                 else { throw DurableArtifactStoreError.insecureEntry }
                 let (next, overflow) = total.addingReportingOverflow(UInt64(value.size))
-                if overflow { throw DurableArtifactStoreError.framingOverflow }
+                if overflow {
+                    throw DurableArtifactStoreError.framingOverflow
+                }
                 total = next
             }
         }
@@ -1144,7 +1182,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
             let count = min(framingPolicy.ioBufferByteCount, Int(lhsSize - offset))
             let left = try DurableArtifactSecureIO.preadExactly(lhs, offset: offset, count: count)
             let right = try DurableArtifactSecureIO.preadExactly(rhs, offset: offset, count: count)
-            if left != right { return false }
+            if left != right {
+                return false
+            }
             offset += off_t(count)
         }
         return true
@@ -1207,7 +1247,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
         Self.disabledRegistry.lock.lock()
         let processDisabled = Self.disabledRegistry.families.contains(disabledKey(family))
         Self.disabledRegistry.lock.unlock()
-        if processDisabled { return true }
+        if processDisabled {
+            return true
+        }
 
         var status = stat()
         if fstatat(
@@ -1241,7 +1283,9 @@ final class LocalDurableArtifactStore: DurableArtifactStore, @unchecked Sendable
         do {
             marker = try DurableArtifactSecureIO.createExclusiveFile(parent: layout.disabled, name: name)
         } catch let error as DurableArtifactStoreError {
-            if case let .ioFailure(_, code) = error, code == EEXIST { return }
+            if case let .ioFailure(_, code) = error, code == EEXIST {
+                return
+            }
             throw error
         }
         defer { marker.close() }
@@ -1327,7 +1371,9 @@ final class DurableArtifactObjectWriter {
         try writeAuthenticated(frame.data)
         let (nextCount, countOverflow) = recordCount.addingReportingOverflow(1)
         let (nextPayload, payloadOverflow) = payloadByteCount.addingReportingOverflow(UInt64(canonicalBytes.count))
-        if countOverflow || payloadOverflow { throw DurableArtifactStoreError.framingOverflow }
+        if countOverflow || payloadOverflow {
+            throw DurableArtifactStoreError.framingOverflow
+        }
         recordCount = nextCount
         payloadByteCount = nextPayload
         previousRecord = canonicalBytes
@@ -1391,7 +1437,9 @@ enum DurableArtifactObjectFrame {
             }
             let data = try DurableArtifactSecureIO.preadExactly(descriptor, offset: offset, count: count)
             offset = nextOffset
-            if authenticated { hasher.update(data: data) }
+            if authenticated {
+                hasher.update(data: data)
+            }
             return data
         }
         var fixed = try DurableArtifactBinaryReader(data: read(28))
@@ -1421,7 +1469,9 @@ enum DurableArtifactObjectFrame {
         var payloadBytes: UInt64 = 0
         while true {
             let tag = try read(1, authenticated: false)
-            if tag[0] == 0xFF { break }
+            if tag[0] == 0xFF {
+                break
+            }
             guard tag[0] == 1 else { throw DurableArtifactStoreError.invalidFraming }
             hasher.update(data: tag)
             var lengthReader = try DurableArtifactBinaryReader(data: read(8))
@@ -1435,7 +1485,9 @@ enum DurableArtifactObjectFrame {
             }
             let (nextCount, countOverflow) = recordCount.addingReportingOverflow(1)
             let (nextPayload, payloadOverflow) = payloadBytes.addingReportingOverflow(length)
-            if countOverflow || payloadOverflow { throw DurableArtifactStoreError.framingOverflow }
+            if countOverflow || payloadOverflow {
+                throw DurableArtifactStoreError.framingOverflow
+            }
             recordCount = nextCount
             payloadBytes = nextPayload
             previous = record

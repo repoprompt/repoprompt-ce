@@ -1,15 +1,19 @@
 import AppKit
 import Combine
 import Foundation
+import Neon
+import SwiftTreeSitter
 
 // MARK: - SVG-Safe Preview Types
 
 /// Determines how a file should be previewed based on safety and performance considerations.
 enum FilePreviewMode {
-    /// Preview is disabled because the file is too risky to display.
+    /// Preview is disabled - file is too risky to display (e.g., extremely large SVG).
     case disabled
-    /// Preview is rendered as plain text.
+    /// Plain text preview without syntax highlighting - safer for large or complex files.
     case plainText
+    /// Full syntax-highlighted preview - default for normal files.
+    case syntaxHighlighted
 }
 
 enum FileContentFreshnessPolicy {
@@ -37,6 +41,7 @@ struct FilePreviewSnapshot {
     let lineCount: Int
     let byteCount: Int
     let previewText: String
+    let namedRanges: [NamedRange]?
 
     /// User-facing message explaining any preview limitations.
     var statusMessage: String? {
@@ -163,33 +168,6 @@ enum FileViewModelContentProviderError: Error {
     case providerUnavailable
 }
 
-@MainActor
-struct DefaultApplicationOpener {
-    private let handler: @MainActor (URL) async -> Bool
-
-    init(open: @escaping @MainActor (URL) async -> Bool) {
-        handler = open
-    }
-
-    func open(_ url: URL) async -> Bool {
-        await handler(url)
-    }
-
-    static let system = DefaultApplicationOpener { url in
-        await withCheckedContinuation { continuation in
-            let configuration = NSWorkspace.OpenConfiguration()
-            NSWorkspace.shared.open(url, configuration: configuration) { application, error in
-                if let error {
-                    print("Unable to open file: \(url.path): \(error)")
-                } else if application == nil {
-                    print("Unable to open file: \(url.path): no application was returned")
-                }
-                continuation.resume(returning: error == nil && application != nil)
-            }
-        }
-    }
-}
-
 class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Equatable, Hashable {
     // MARK: - Identity & paths
 
@@ -221,6 +199,8 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
     /// Preview content, limited for performance (lines/bytes).
     @Published private(set) var previewContent: String?
+    /// Syntax ranges corresponding to the preview content.
+    @Published private(set) var previewNamedRanges: [NamedRange]?
 
     /// SVG-safe preview snapshot with mode, truncation info, and content.
     /// Views should use this instead of directly accessing previewContent for SVG-aware rendering.
@@ -240,7 +220,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         func joinOrStart(
             make: @escaping @Sendable (_ gen: UInt64) -> Task<String?, Never>
         ) -> Task<String?, Never> {
-            if let t = task { return t }
+            if let t = task {
+                return t
+            }
             generation &+= 1
             let gen = generation
             let t = make(gen)
@@ -313,6 +295,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
     /// Cached line counts for quick UI access
     @Published private(set) var contentLineCount: Int? = nil
+
+    /// Cached syntax tokens for highlighting (loaded on demand)
+    private var cachedNamedRanges: [NamedRange]?
 
     // MARK: - Off-main content mirror (for zero MainActor hop reads)
 
@@ -499,6 +484,14 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         }
     }
 
+    /// Getter that returns valid named ranges. If they’re not cached yet, it loads them.
+    var latestNamedRanges: [NamedRange]? {
+        get async {
+            await loadSyntaxHighlighting()
+            return await MainActor.run { self.cachedNamedRanges }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────
     // MARK: - DEBUG aid: fallback-return telemetry (lightweight)
 
@@ -569,6 +562,7 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         isChecked = false
         loadingState = .notLoaded
         cachedContent = nil
+        cachedNamedRanges = nil
         self.hierarchyLevel = hierarchyLevel
         self.fileSystemService = fileSystemService
         if let contentProvider {
@@ -585,6 +579,7 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
         // Preview
         previewContent = nil
+        previewNamedRanges = nil
 
         // Extension
         let ext = (file.name as NSString).pathExtension
@@ -624,6 +619,7 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         isChecked = false
         loadingState = .notLoaded
         cachedContent = nil
+        cachedNamedRanges = nil
         self.hierarchyLevel = hierarchyLevel
         self.fileSystemService = fileSystemService
         if let contentProvider {
@@ -640,6 +636,7 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
         // Preview
         previewContent = nil
+        previewNamedRanges = nil
 
         // Extension
         let ext = (file.name as NSString).pathExtension
@@ -677,11 +674,13 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         guard forceInvalidation || modificationDate != newDate else { return }
         modificationDate = newDate
 
-        // Invalidate UI-visible state (but keep cachedContent as a fallback)
+        // Invalidate UI-visible caches (but keep cachedContent as a fallback)
+        cachedNamedRanges = nil
         lastLoadedDate = nil
         loadingState = .notLoaded
         error = nil
         previewContent = nil
+        previewNamedRanges = nil
         contentLineCount = nil // ensure line count refreshes after next load
 
         // Cancel ongoing work
@@ -755,7 +754,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
             let (mtime, lastLoaded, _) = await stateCache.snapshot()
             let fresh = lastLoaded.map { $0 >= mtime } ?? false
             let content = await contentStore.get()
-            if fresh, let content { return content }
+            if fresh, let content {
+                return content
+            }
         }
 
         // Atomically start or join the loader
@@ -808,13 +809,17 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
                     return stored
                 }
                 let fallback = await getCachedContentFallback()
-                if fallback != nil { logFallback("service unavailable → cachedContent") }
+                if fallback != nil {
+                    logFallback("service unavailable → cachedContent")
+                }
                 return fallback
             }
 
             do {
                 let (contentOpt, diskDate) = try await provider.loadContentWithDate()
-                if Task.isCancelled { return await contentStore.get() }
+                if Task.isCancelled {
+                    return await contentStore.get()
+                }
 
                 // Detect staleness during read
                 let (currentMTime, _, currentVersion) = await stateCache.snapshot()
@@ -836,7 +841,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
                     return stored
                 }
                 let fallback = await getCachedContentFallback()
-                if fallback != nil { logFallback("cancellation → cachedContent") }
+                if fallback != nil {
+                    logFallback("cancellation → cachedContent")
+                }
                 return fallback
             } catch {
                 // Surface the error to UI and allow retry on next call
@@ -851,7 +858,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
                     return stored
                 }
                 let fallback = await getCachedContentFallback()
-                if fallback != nil { logFallback("error → cachedContent") }
+                if fallback != nil {
+                    logFallback("error → cachedContent")
+                }
                 return fallback
             }
         }
@@ -861,6 +870,56 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
             return stored
         }
         return await getCachedContentFallback()
+    }
+
+    // MARK: - Syntax Highlighting (off-main safe)
+
+    /// Asynchronously loads the syntax highlighting tokens on demand,
+    /// caching the result in the view model. Also updates preview ranges.
+    func loadSyntaxHighlighting() async {
+        guard let ext = fileExtension else { return }
+
+        // Only compute if not cached
+        let alreadyCached = await MainActor.run { self.cachedNamedRanges != nil }
+        if alreadyCached {
+            return
+        }
+
+        // Read content off-main to avoid MainActor hops
+        guard let content = await contentStore.get() else { return }
+
+        do {
+            let tokens = try SyntaxManager.shared.highlight(content: content, fileExtension: ext)
+            await MainActor.run {
+                self.cachedNamedRanges = tokens
+                let preview = self.previewContent
+                self.previewNamedRanges = self.filterRangesForContent(tokens, content: preview)
+
+                // Update previewSnapshot with the new syntax ranges
+                // so file preview popovers get highlighting.
+                // Skip SVGs entirely - they use plainText/disabled modes for safety.
+                if let snapshot = self.previewSnapshot,
+                   snapshot.mode == .syntaxHighlighted,
+                   !snapshot.isSvg
+                {
+                    self.previewSnapshot = FilePreviewSnapshot(
+                        mode: snapshot.mode,
+                        isSvg: snapshot.isSvg,
+                        wasTruncatedByLines: snapshot.wasTruncatedByLines,
+                        wasTruncatedByBytes: snapshot.wasTruncatedByBytes,
+                        lineCount: snapshot.lineCount,
+                        byteCount: snapshot.byteCount,
+                        previewText: snapshot.previewText,
+                        namedRanges: self.previewNamedRanges
+                    )
+                }
+            }
+        } catch {
+            print("Error parsing content for syntax tokens: \(error)")
+            await MainActor.run {
+                self.previewNamedRanges = nil
+            }
+        }
     }
 
     // MARK: - Internal content updates (MainActor)
@@ -886,13 +945,15 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
             byteSize: byteCount,
             lineCount: lineCount,
             maxPreviewLines: Self.maxPreviewLines,
-            wasTruncatedByBytes: truncation.wasTruncatedByBytes
+            wasTruncatedByBytes: truncation.wasTruncatedByBytes,
+            namedRanges: nil
         )
         let previewArtifacts = PreviewArtifacts(snapshot: snapshot, lineCount: lineCount)
 
         await updateContentInternal(
             resolvedContent,
             modificationDate,
+            tokens: nil,
             previewArtifacts: previewArtifacts
         )
         return resolvedContent
@@ -902,9 +963,11 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
     private func updateContentInternal(
         _ newContent: String,
         _ modificationDate: Date,
+        tokens: [NamedRange]?,
         previewArtifacts: PreviewArtifacts
     ) async {
         cachedContent = newContent
+        cachedNamedRanges = tokens // will be nil on load; re-tokenize on demand
         loadingState = .loaded
         lastLoadedDate = modificationDate
         // Keep the UI-facing timestamp in sync with disk mtime so future setModificationDate(newDate)
@@ -913,6 +976,7 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
         // Preview (use precomputed to avoid main-thread work)
         previewContent = previewArtifacts.snapshot.previewText
+        previewNamedRanges = filterRangesForContent(cachedNamedRanges, content: previewContent)
         contentLineCount = previewArtifacts.lineCount
         previewSnapshot = previewArtifacts.snapshot
 
@@ -933,7 +997,8 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         byteSize: Int,
         lineCount: Int,
         maxPreviewLines: Int,
-        wasTruncatedByBytes: Bool
+        wasTruncatedByBytes: Bool,
+        namedRanges: [NamedRange]?
     ) -> FilePreviewSnapshot {
         let ext = ((relativePath as NSString).pathExtension).lowercased()
         let isSvg = ext == "svg" || ext == "svgz"
@@ -946,23 +1011,29 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
 
         let mode: FilePreviewMode
         let finalPreviewText: String
+        let finalNamedRanges: [NamedRange]?
 
         // Disable preview for any file over 5MB
         if byteSize > Self.disabledPreviewThresholdBytes {
             mode = .disabled
             finalPreviewText = "[Preview disabled - file too large (\(byteSize / 1_000_000) MB)]"
+            finalNamedRanges = nil
         } else if isSvg {
-            // Avoid CoreSVG rendering and bound pathological lines.
+            // All SVGs use plain text - no syntax highlighting to avoid CoreSVG issues
             if hasExtremelyLongLines {
                 mode = .plainText
                 finalPreviewText = Self.truncateLongLines(previewText, maxLength: Self.maxSafeLineLength)
+                finalNamedRanges = nil
             } else {
                 mode = .plainText
                 finalPreviewText = previewText
+                finalNamedRanges = nil
             }
         } else {
-            mode = .plainText
+            // Non-SVG files use normal syntax highlighting
+            mode = .syntaxHighlighted
             finalPreviewText = previewText
+            finalNamedRanges = namedRanges
         }
 
         return FilePreviewSnapshot(
@@ -972,7 +1043,8 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
             wasTruncatedByBytes: wasTruncatedByBytes,
             lineCount: lineCount,
             byteCount: byteSize,
-            previewText: finalPreviewText
+            previewText: finalPreviewText,
+            namedRanges: finalNamedRanges
         )
     }
 
@@ -988,7 +1060,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
             contentLineCount = Self.countLinesCapped(newContent, cap: Self.maxPreviewLines + 1)
         } else {
             // Evict memory-only caches
+            cachedNamedRanges = nil
             previewContent = nil
+            previewNamedRanges = nil
             previewSnapshot = nil
             contentLineCount = nil
             // Intentionally do not touch loadingState / lastLoadedDate here
@@ -1017,9 +1091,12 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         }
     }
 
-    func openInDefaultApp(using opener: DefaultApplicationOpener = .system) async -> Bool {
+    func openInDefaultApp() {
         let fileURL = URL(fileURLWithPath: standardizedFullPath)
-        return await opener.open(fileURL)
+        let opened = NSWorkspace.shared.open(fileURL)
+        if !opened {
+            print("Unable to open file: \(standardizedFullPath)")
+        }
     }
 
     func copyContentsToPasteboard() {
@@ -1158,9 +1235,15 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         let cutIndex = safeStringIndex(cutUTF8, in: content)
 
         let lineEnding: String = {
-            if crlfCount >= lfCount, crlfCount >= crCount, crlfCount > 0 { return "\r\n" }
-            if lfCount >= crCount, lfCount > 0 { return "\n" }
-            if crCount > 0 { return "\r" }
+            if crlfCount >= lfCount, crlfCount >= crCount, crlfCount > 0 {
+                return "\r\n"
+            }
+            if lfCount >= crCount, lfCount > 0 {
+                return "\n"
+            }
+            if crCount > 0 {
+                return "\r"
+            }
             return "\n"
         }()
 
@@ -1208,7 +1291,9 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
             let b = utf8[i]
             if b == 0x0A { // '\n'
                 count += 1
-                if count >= cap { return cap }
+                if count >= cap {
+                    return cap
+                }
                 let next = utf8.index(after: i)
                 endedWithLineEnding = (next == end)
                 i = next
@@ -1217,14 +1302,18 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
                 let n1 = utf8.index(after: i)
                 if n1 < end, utf8[n1] == 0x0A {
                     count += 1
-                    if count >= cap { return cap }
+                    if count >= cap {
+                        return cap
+                    }
                     let next = utf8.index(after: n1)
                     endedWithLineEnding = (next == end)
                     i = next
                     continue
                 } else {
                     count += 1
-                    if count >= cap { return cap }
+                    if count >= cap {
+                        return cap
+                    }
                     endedWithLineEnding = (n1 == end)
                     i = n1
                     continue
@@ -1319,6 +1408,16 @@ class FileViewModel: ObservableObject, Identifiable, FileSystemItemViewModel, Eq
         }
 
         return result
+    }
+
+    /// Helper to filter syntax ranges to only include those within the bounds of the given content length.
+    private func filterRangesForContent(_ ranges: [NamedRange]?, content: String?) -> [NamedRange]? {
+        guard let ranges, let content else { return nil }
+        let contentLength = content.utf16.count // Use UTF16 count for NSRange compatibility
+        return ranges.filter { range in
+            let rangeEnd = range.range.location + range.range.length
+            return rangeEnd <= contentLength
+        }
     }
 
     // MARK: - Equatable / Hashable

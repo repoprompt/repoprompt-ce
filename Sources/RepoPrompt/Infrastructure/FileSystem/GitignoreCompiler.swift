@@ -535,7 +535,9 @@ public enum GitignoreCompiler {
         var variants: [[String]] = [[]]
 
         for part in components {
-            if part.isEmpty { continue }
+            if part.isEmpty {
+                continue
+            }
             guard let expansions = expandLiteralComponent(part) else {
                 return nil
             }

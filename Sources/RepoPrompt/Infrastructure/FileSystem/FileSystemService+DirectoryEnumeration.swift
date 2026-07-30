@@ -43,8 +43,12 @@ extension FileSystemService {
             let name = entry.name
 
             // Skip control directories
-            if name == ".git" { continue }
-            if Self.isRepoPromptTempFilename(name) { continue }
+            if name == ".git" {
+                continue
+            }
+            if Self.isRepoPromptTempFilename(name) {
+                continue
+            }
 
             let childRel = relFolder.isEmpty ? name : "\(relFolder)/\(name)"
             let isDirEntry = entry.isDir
@@ -340,7 +344,9 @@ extension FileSystemService {
         for entry in scanResult.entries {
             let name = entry.name
             // Never traverse or track .git, regardless of rules.
-            if name == ".git" { continue }
+            if name == ".git" {
+                continue
+            }
 
             let childRel = folderRelPath.isEmpty ? name : "\(folderRelPath)/\(name)"
             let comps = pathCompsCache.components(for: childRel)
@@ -461,7 +467,9 @@ extension FileSystemService {
         for previous in visitedItems {
             if let currentType = reconciledItems[previous.key], currentType == previous.value {
                 remainingItems.removeValue(forKey: previous.key)
-                if !currentType { retainedFiles.append(previous.key) }
+                if !currentType {
+                    retainedFiles.append(previous.key)
+                }
             } else {
                 removedItems.append((previous.key, previous.value))
             }
@@ -752,7 +760,9 @@ extension FileSystemService {
         func contains(_ needle: DirID) -> Bool {
             var node: DirChain? = self
             while let current = node {
-                if current.id == needle { return true }
+                if current.id == needle {
+                    return true
+                }
                 node = current.parent
             }
             return false
@@ -822,8 +832,12 @@ extension FileSystemService {
 
         for entry in scanResult.entries {
             let name = entry.name
-            if name == ".git" { continue }
-            if Self.isRepoPromptTempFilename(name) { continue }
+            if name == ".git" {
+                continue
+            }
+            if Self.isRepoPromptTempFilename(name) {
+                continue
+            }
             let relativePath = context.relPath.isEmpty ? name : "\(context.relPath)/\(name)"
             let relativePathBytes = Self.joinRelativePathBytes(
                 base: context.relPathBytes,
@@ -862,7 +876,9 @@ extension FileSystemService {
                 continue
             }
 
-            if entry.isSym, skipSymlinks { continue }
+            if entry.isSym, skipSymlinks {
+                continue
+            }
 
             if isDirEntry {
                 folders.append(
@@ -996,7 +1012,9 @@ extension FileSystemService {
         @inline(__always)
         func flush(force: Bool = false) {
             guard !chunkFolders.isEmpty || !chunkFiles.isEmpty else { return }
-            if !force, (chunkFolders.count + chunkFiles.count) < chunkSize { return }
+            if !force, (chunkFolders.count + chunkFiles.count) < chunkSize {
+                return
+            }
             let newlyCounted = pendingFileCount
             totalFilesSeen += newlyCounted
             let chunk = FSPreparedChunk(folders: chunkFolders, files: chunkFiles)
@@ -1113,8 +1131,12 @@ extension FileSystemService {
 
                 for url in children {
                     let name = url.lastPathComponent
-                    if name == "." || name == ".." { continue }
-                    if Self.isRepoPromptTempFilename(name) { continue }
+                    if name == "." || name == ".." {
+                        continue
+                    }
+                    if Self.isRepoPromptTempFilename(name) {
+                        continue
+                    }
 
                     var isDirFlag: ObjCBool = false
                     _ = fs.fileExists(atPath: url.path, isDirectory: &isDirFlag)
@@ -1360,8 +1382,12 @@ extension FileSystemService {
     }
 
     static func joinRelativePaths(base: String, child: String) -> String {
-        if base.isEmpty { return child }
-        if child.isEmpty { return base }
+        if base.isEmpty {
+            return child
+        }
+        if child.isEmpty {
+            return base
+        }
         return base + "/" + child
     }
 

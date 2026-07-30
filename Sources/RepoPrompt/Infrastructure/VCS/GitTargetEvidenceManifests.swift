@@ -484,9 +484,13 @@ enum GitTargetEvidenceManifestCodec {
                 guard let base = buffer.baseAddress else { return -1 }
                 return Darwin.read(descriptor, base.advanced(by: offset), count - offset)
             }
-            if amount > 0 { offset += amount }
-            else if amount == 0 { throw GitTargetEvidenceManifestError.corrupt("truncated file") }
-            else if errno != EINTR { throw GitTargetEvidenceManifestError.io(operation: "read", code: errno) }
+            if amount > 0 {
+                offset += amount
+            } else if amount == 0 {
+                throw GitTargetEvidenceManifestError.corrupt("truncated file")
+            } else if errno != EINTR {
+                throw GitTargetEvidenceManifestError.io(operation: "read", code: errno)
+            }
         }
         return data
     }
@@ -515,17 +519,23 @@ enum GitTargetEvidenceManifestCodec {
 
     static func appendOptional(_ value: Data?, to data: inout Data) {
         data.append(value == nil ? 0 : 1)
-        if let value { append(value, to: &data) }
+        if let value {
+            append(value, to: &data)
+        }
     }
 
     static func appendOptional(_ value: UInt8?, to data: inout Data) {
         data.append(value == nil ? 0 : 1)
-        if let value { data.append(value) }
+        if let value {
+            data.append(value)
+        }
     }
 
     static func appendOptional(_ value: UInt16?, to data: inout Data) {
         data.append(value == nil ? 0 : 1)
-        if let value { append(value, to: &data) }
+        if let value {
+            append(value, to: &data)
+        }
     }
 
     private static func appendFileSystemIdentity(
@@ -801,7 +811,9 @@ struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
         guard pathOrder == .same else { return pathOrder }
         let lhsOrder = operationOrder(lhs.status)
         let rhsOrder = operationOrder(rhs.status)
-        if lhsOrder == rhsOrder { return .same }
+        if lhsOrder == rhsOrder {
+            return .same
+        }
         return lhsOrder < rhsOrder ? .ascending : .descending
     }
 
@@ -862,7 +874,9 @@ struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
     ) -> SpillBackedSortedArtifactOrdering {
         let pathOrder = compare(lhs.repositoryRelativePathBytes, rhs.repositoryRelativePathBytes)
         guard pathOrder == .same else { return pathOrder }
-        if lhs.stage == rhs.stage { return .same }
+        if lhs.stage == rhs.stage {
+            return .same
+        }
         return lhs.stage < rhs.stage ? .ascending : .descending
     }
 
@@ -1037,7 +1051,9 @@ struct GitTargetStatusRecordCodec: GitTargetEvidenceRecordCodec {
 }
 
 private func compare(_ lhs: Data, _ rhs: Data) -> SpillBackedSortedArtifactOrdering {
-    if lhs == rhs { return .same }
+    if lhs == rhs {
+        return .same
+    }
     return lhs.lexicographicallyPrecedes(rhs) ? .ascending : .descending
 }
 
@@ -1162,7 +1178,9 @@ final class GitTargetEvidenceManifestReader<Codec: GitTargetEvidenceRecordCodec>
             else { throw GitTargetEvidenceManifestError.corrupt("footer mismatch") }
             var trailing: UInt8 = 0
             let trailingCount = Darwin.read(descriptor, &trailing, 1)
-            if trailingCount < 0 { throw GitTargetEvidenceManifestError.io(operation: "trailing-read", code: errno) }
+            if trailingCount < 0 {
+                throw GitTargetEvidenceManifestError.io(operation: "trailing-read", code: errno)
+            }
             guard trailingCount == 0 else { throw GitTargetEvidenceManifestError.corrupt("trailing bytes") }
             try retainedLease.validateOpenDescriptor(descriptor)
             footer = parsed

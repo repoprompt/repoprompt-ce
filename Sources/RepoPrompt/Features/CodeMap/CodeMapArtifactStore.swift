@@ -482,7 +482,9 @@ actor CodeMapArtifactStore {
 
         mutating func popMinimum() -> CodeMapArtifactCatalogRecord? {
             guard !values.isEmpty else { return nil }
-            if values.count == 1 { return values.removeLast() }
+            if values.count == 1 {
+                return values.removeLast()
+            }
             let result = values[0]
             values[0] = values.removeLast()
             var index = 0
@@ -534,7 +536,9 @@ actor CodeMapArtifactStore {
 
         mutating func popMinimum() -> PendingSweep? {
             guard !values.isEmpty else { return nil }
-            if values.count == 1 { return values.removeLast() }
+            if values.count == 1 {
+                return values.removeLast()
+            }
             let result = values[0]
             values[0] = values.removeLast()
             var index = 0
@@ -543,7 +547,9 @@ actor CodeMapArtifactStore {
                 guard left < values.count else { break }
                 let right = left + 1
                 var child = left
-                if right < values.count, Self.less(values[right], values[left]) { child = right }
+                if right < values.count, Self.less(values[right], values[left]) {
+                    child = right
+                }
                 guard Self.less(values[child], values[index]) else { break }
                 values.swapAt(child, index)
                 index = child
@@ -913,14 +919,18 @@ actor CodeMapArtifactStore {
             guard remainingWriteBytes >= UInt64(policy.maximumMetadataRecordByteCount),
                   remainingReadBytes >= UInt64(policy.maximumMetadataRecordByteCount)
             else {
-                if pendingTouchSet.insert(digest).inserted { pendingTouchOrder.append(digest) }
+                if pendingTouchSet.insert(digest).inserted {
+                    pendingTouchOrder.append(digest)
+                }
                 break
             }
             let metrics = flushTouch(digest)
             remainingWriteBytes = subtractingFloor(remainingWriteBytes, metrics.writtenByteCount)
             remainingReadBytes = subtractingFloor(remainingReadBytes, metrics.metadataReadByteCount)
             completed += 1
-            if metrics.failed { break }
+            if metrics.failed {
+                break
+            }
         }
         return completed
     }
@@ -996,8 +1006,12 @@ actor CodeMapArtifactStore {
         guard stepBudget > 0, stepBudget <= policy.maximumGCStepBudget else {
             throw CodeMapArtifactCatalogError.boundedScanExceeded
         }
-        if maintenanceCycle == nil { maintenanceCycle = makeMaintenanceCycle(collect: collect) }
-        if collect { maintenanceCycle?.collect = true }
+        if maintenanceCycle == nil {
+            maintenanceCycle = makeMaintenanceCycle(collect: collect)
+        }
+        if collect {
+            maintenanceCycle?.collect = true
+        }
         guard var cycle = maintenanceCycle else { throw CodeMapArtifactCatalogError.invalidMetadata }
         var remaining = stepBudget
         var metadataBytesRemaining = UInt64(policy.maximumCatalogScanByteCount)
@@ -1032,7 +1046,9 @@ actor CodeMapArtifactStore {
                     metrics.metadataReadByteCount
                 )
                 charge(&cycle, &remaining, &progress)
-                if metrics.failed { break maintenanceLoop }
+                if metrics.failed {
+                    break maintenanceLoop
+                }
 
             case .reconcileCatalog:
                 guard writeBytesRemaining >= UInt64(policy.maximumMetadataRecordByteCount) else {
@@ -1050,7 +1066,9 @@ actor CodeMapArtifactStore {
                 case .complete:
                     cycle.phase = .reconcileArtifacts
                 case let .needsMoreBytes(required, chargeEntry):
-                    if chargeEntry { chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress) }
+                    if chargeEntry {
+                        chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress)
+                    }
                     guard required <= UInt64(policy.maximumCatalogScanByteCount) else {
                         throw CodeMapArtifactCatalogError.boundedScanExceeded
                     }
@@ -1077,7 +1095,9 @@ actor CodeMapArtifactStore {
                         progress.writtenBytes = addingSaturating(progress.writtenBytes, writtenBytes)
                     case let .temporary(removed):
                         incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
-                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
+                        if removed {
+                            incrementSaturating(&reconciliation.scan.removedTemporaryCount)
+                        }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -1110,7 +1130,9 @@ actor CodeMapArtifactStore {
                 case .complete:
                     cycle.phase = .reconcileMissingMetadata
                 case let .needsMoreBytes(required, chargeEntry):
-                    if chargeEntry { chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress) }
+                    if chargeEntry {
+                        chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress)
+                    }
                     guard required <= policy.maximumArtifactReconciliationByteCount else {
                         throw CodeMapArtifactCatalogError.boundedScanExceeded
                     }
@@ -1155,7 +1177,9 @@ actor CodeMapArtifactStore {
                         )
                     case let .temporary(removed):
                         incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
-                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
+                        if removed {
+                            incrementSaturating(&reconciliation.scan.removedTemporaryCount)
+                        }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -1262,7 +1286,9 @@ actor CodeMapArtifactStore {
                 }
                 let digest = cycle.reconciliation.selectionOrder[cycle.selectionOffset]
                 cycle.selectionOffset += 1
-                if let record = records[digest] { cycle.heap.insert(record) }
+                if let record = records[digest] {
+                    cycle.heap.insert(record)
+                }
                 incrementSaturating(&progress.selected)
                 charge(&cycle, &remaining, &progress)
 
@@ -1391,7 +1417,9 @@ actor CodeMapArtifactStore {
                 case .complete:
                     cycle.phase = .quarantineArtifacts
                 case let .needsMoreBytes(required, chargeEntry):
-                    if chargeEntry { chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress) }
+                    if chargeEntry {
+                        chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress)
+                    }
                     guard required <= UInt64(policy.maximumCatalogScanByteCount) else {
                         throw CodeMapArtifactCatalogError.boundedScanExceeded
                     }
@@ -1429,7 +1457,9 @@ actor CodeMapArtifactStore {
                         incrementSaturating(&reconciliation.scan.quarantineOrphanCount)
                     case let .temporary(removed):
                         incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
-                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
+                        if removed {
+                            incrementSaturating(&reconciliation.scan.removedTemporaryCount)
+                        }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -1538,7 +1568,9 @@ actor CodeMapArtifactStore {
                     maintenanceCycle = nil
                     return makeProgress(cycle: cycle, progress: progress, continuation: nil)
                 case let .needsMoreBytes(_, chargeEntry):
-                    if chargeEntry { chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress) }
+                    if chargeEntry {
+                        chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress)
+                    }
                     throw CodeMapArtifactCatalogError.boundedScanExceeded
                 case let .visit(visit, chargeEntry):
                     chargeVisit(
@@ -1566,7 +1598,9 @@ actor CodeMapArtifactStore {
                         }
                     case let .temporary(removed):
                         incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
-                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
+                        if removed {
+                            incrementSaturating(&reconciliation.scan.removedTemporaryCount)
+                        }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -1707,7 +1741,9 @@ actor CodeMapArtifactStore {
                         hasArtifact: true
                     )
                 }
-                if mutation == .completed { removeRecord(digest: candidate.digest, localMutation: false) }
+                if mutation == .completed {
+                    removeRecord(digest: candidate.digest, localMutation: false)
+                }
             } else if try catalog.quarantineOrphanArtifact(
                 candidate,
                 fileStore: fileStore,
@@ -1916,21 +1952,29 @@ actor CodeMapArtifactStore {
     private func setRecord(_ record: CodeMapArtifactCatalogRecord, localMutation: Bool) {
         let digest = record.digest
         guard records[digest] != nil || records.count < policy.maximumCatalogRecordCount else { return }
-        if let old = records[digest] { removeAccounting(old) }
+        if let old = records[digest] {
+            removeAccounting(old)
+        }
         records[digest] = record
         addAccounting(record)
         if recordOrderSet.insert(digest).inserted {
             compactMaintenanceIndexesIfNeeded()
             recordOrder.append(digest)
         }
-        if localMutation { markMutation(digest) }
+        if localMutation {
+            markMutation(digest)
+        }
     }
 
     private func removeRecord(digest: String, localMutation: Bool) {
         let removed = records.removeValue(forKey: digest)
-        if let removed { removeAccounting(removed) }
+        if let removed {
+            removeAccounting(removed)
+        }
         recordOrderSet.remove(digest)
-        if localMutation, removed != nil { markMutation(digest) }
+        if localMutation, removed != nil {
+            markMutation(digest)
+        }
         compactMaintenanceIndexesIfNeeded()
     }
 
@@ -2031,13 +2075,17 @@ actor CodeMapArtifactStore {
     ) -> Bool {
         if record.outcomeClass == .positive {
             let quotaBytes = addingSaturating(livePositiveBytes, privateDeletionBytes)
-            if quotaBytes >= policy.hardQuotaBytes { return true }
+            if quotaBytes >= policy.hardQuotaBytes {
+                return true
+            }
             guard quotaBytes > policy.softQuotaBytes,
                   now >= policy.unreferencedGraceSeconds
             else { return false }
             return record.lastAccessEpochSeconds <= now - policy.unreferencedGraceSeconds
         }
-        if liveNegativeBytes > policy.negativeQuotaBytes { return true }
+        if liveNegativeBytes > policy.negativeQuotaBytes {
+            return true
+        }
         guard now >= policy.negativeMaximumAgeSeconds else { return false }
         return record.lastAccessEpochSeconds <= now - policy.negativeMaximumAgeSeconds
     }
@@ -2112,7 +2160,9 @@ actor CodeMapArtifactStore {
         record.lastAccessEpochSeconds = max(record.creationEpochSeconds, clock.nowEpochSeconds())
         record.lastAccessSequence = takeSequence()
         setRecord(record, localMutation: true)
-        if pendingTouchSet.insert(digest).inserted { pendingTouchOrder.append(digest) }
+        if pendingTouchSet.insert(digest).inserted {
+            pendingTouchOrder.append(digest)
+        }
     }
 
     private func dequeueTouch() -> String? {
@@ -2150,7 +2200,9 @@ actor CodeMapArtifactStore {
             metrics.metadataReadByteCount = UInt64(policy.maximumMetadataRecordByteCount)
             metrics.writtenByteCount = UInt64(policy.maximumMetadataRecordByteCount)
             metrics.failed = true
-            if pendingTouchSet.insert(digest).inserted { pendingTouchOrder.append(digest) }
+            if pendingTouchSet.insert(digest).inserted {
+                pendingTouchOrder.append(digest)
+            }
         }
         return metrics
     }
@@ -2186,7 +2238,9 @@ actor CodeMapArtifactStore {
         remaining: inout Int,
         progress: inout CallProgress
     ) {
-        if chargeEntry { chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress) }
+        if chargeEntry {
+            chargeDeferredVisit(cycle: &cycle, remaining: &remaining, progress: &progress)
+        }
         progress.readBytes = addingSaturating(progress.readBytes, visit.readByteCount)
     }
 

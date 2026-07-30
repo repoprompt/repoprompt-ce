@@ -319,7 +319,9 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if predicate() { return }
+            if predicate() {
+                return
+            }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for asynchronous Codex submission")

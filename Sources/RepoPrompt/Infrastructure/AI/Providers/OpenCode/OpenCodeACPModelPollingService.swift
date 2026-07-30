@@ -104,7 +104,9 @@ actor OpenCodeACPModelPollingService {
     }
 
     func latestSnapshot() async -> Snapshot? {
-        if let latest { return latest }
+        if let latest {
+            return latest
+        }
         return await registrySnapshotAfterWarmingStore()
     }
 

@@ -272,7 +272,9 @@ enum CodeMapRepositoryNamespaceSaltStore {
             name,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
-        if descriptor < 0, errno == ENOENT { return nil }
+        if descriptor < 0, errno == ENOENT {
+            return nil
+        }
         guard descriptor >= 0 else { throw ioError("salt-open") }
         defer { Darwin.close(descriptor) }
 
@@ -297,7 +299,9 @@ enum CodeMapRepositoryNamespaceSaltStore {
                 )
             }
             guard count > 0 else {
-                if count < 0, errno == EINTR { continue }
+                if count < 0, errno == EINTR {
+                    continue
+                }
                 throw count == 0
                     ? CodeMapRepositoryNamespaceSaltStoreError.insecureStorage
                     : ioError("salt-read")
@@ -319,7 +323,9 @@ enum CodeMapRepositoryNamespaceSaltStore {
                 )
             }
             guard count > 0 else {
-                if count < 0, errno == EINTR { continue }
+                if count < 0, errno == EINTR {
+                    continue
+                }
                 throw ioError("salt-write")
             }
             offset += count
@@ -333,7 +339,9 @@ enum CodeMapRepositoryNamespaceSaltStore {
         hooks: CodeMapRepositoryNamespaceSaltStoreHooks
     ) throws {
         while hooks.synchronize(descriptor, operation) != 0 {
-            if errno == EINTR { continue }
+            if errno == EINTR {
+                continue
+            }
             throw ioError(name)
         }
     }

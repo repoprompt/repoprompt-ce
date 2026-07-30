@@ -318,15 +318,21 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
         let events = await finishAndReadEvents(from: controller)
         XCTAssertEqual(events.count(where: {
-            if case .canonicalAssistantDelta = $0 { return true }
+            if case .canonicalAssistantDelta = $0 {
+                return true
+            }
             return false
         }), 1)
         XCTAssertEqual(events.count(where: {
-            if case .assistantCompleted = $0 { return true }
+            if case .assistantCompleted = $0 {
+                return true
+            }
             return false
         }), 1)
         XCTAssertFalse(events.contains {
-            if case .assistantDelta = $0 { return true }
+            if case .assistantDelta = $0 {
+                return true
+            }
             return false
         })
     }
@@ -361,7 +367,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
         let events = await finishAndReadEvents(from: controller)
         XCTAssertEqual(events.count(where: {
-            if case .assistantCompleted = $0 { return true }
+            if case .assistantCompleted = $0 {
+                return true
+            }
             return false
         }), 1)
         let scopedLegacyDeltas = events.compactMap { event -> (String, CodexNativeSessionController.ItemScope)? in
@@ -414,7 +422,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             ]
         )
         XCTAssertFalse(events.contains {
-            if case .assistantDelta = $0 { return true }
+            if case .assistantDelta = $0 {
+                return true
+            }
             return false
         })
     }
@@ -457,7 +467,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
         let events = await finishAndReadEvents(from: controller)
         XCTAssertEqual(events.count(where: {
-            if case .reasoningDelta = $0 { return true }
+            if case .reasoningDelta = $0 {
+                return true
+            }
             return false
         }), 1)
         let completions = events.compactMap { event -> CodexNativeSessionController.ReasoningCompletionPayload? in
@@ -574,7 +586,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
         let events = await finishAndReadEvents(from: controller)
         XCTAssertEqual(events.count(where: {
-            if case .contextCompacted = $0 { return true }
+            if case .contextCompacted = $0 {
+                return true
+            }
             return false
         }), 2)
 
@@ -604,7 +618,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         )
         let reverseEvents = await finishAndReadEvents(from: reverseController)
         XCTAssertEqual(reverseEvents.count(where: {
-            if case .contextCompacted = $0 { return true }
+            if case .contextCompacted = $0 {
+                return true
+            }
             return false
         }), 2)
     }
@@ -695,27 +711,39 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
         let events = await finishAndReadEvents(from: controller)
         XCTAssertEqual(events.count(where: {
-            if case .toolCall = $0 { return true }
+            if case .toolCall = $0 {
+                return true
+            }
             return false
         }), 1)
         XCTAssertEqual(events.count(where: {
-            if case .toolResult = $0 { return true }
+            if case .toolResult = $0 {
+                return true
+            }
             return false
         }), 1)
         XCTAssertEqual(events.count(where: {
-            if case .canonicalAssistantDelta = $0 { return true }
+            if case .canonicalAssistantDelta = $0 {
+                return true
+            }
             return false
         }), 1)
         XCTAssertFalse(events.contains {
-            if case .commandExecutionRunning = $0 { return true }
+            if case .commandExecutionRunning = $0 {
+                return true
+            }
             return false
         })
         XCTAssertFalse(events.contains {
-            if case .tokenUsage = $0 { return true }
+            if case .tokenUsage = $0 {
+                return true
+            }
             return false
         })
         XCTAssertFalse(events.contains {
-            if case .livenessActivity = $0 { return true }
+            if case .livenessActivity = $0 {
+                return true
+            }
             return false
         })
         XCTAssertTrue(CodexNativeSessionController.test_isItemLifecycleNotificationMethod("item/started"))
@@ -799,7 +827,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
         let events = await finishAndReadEvents(from: controller)
         XCTAssertFalse(events.contains {
-            if case .errorNotification = $0 { return true }
+            if case .errorNotification = $0 {
+                return true
+            }
             return false
         })
         let completions: [(
@@ -933,7 +963,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         })
         XCTAssertLessThan(failedCompletionIndex, transportIndex)
         XCTAssertEqual(events.count(where: {
-            if case .turnCompleted(_, .failed, _) = $0 { return true }
+            if case .turnCompleted(_, .failed, _) = $0 {
+                return true
+            }
             return false
         }), 1)
     }

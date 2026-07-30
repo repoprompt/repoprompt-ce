@@ -521,7 +521,9 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                 ? .unsupportedFutureSchema(onDiskVersion: schemaVersion, supportedVersion: supportedVersion)
                 : nil
         }
-        if normalizedLineage != nil { return .incompatibleSchema }
+        if normalizedLineage != nil {
+            return .incompatibleSchema
+        }
 
         // COMPATIBILITY INVARIANT — do not simplify this to `schemaVersion > supportedVersion`.
         // Numeric schema versions above the inherited v1/v2 CE baseline are ambiguous without a

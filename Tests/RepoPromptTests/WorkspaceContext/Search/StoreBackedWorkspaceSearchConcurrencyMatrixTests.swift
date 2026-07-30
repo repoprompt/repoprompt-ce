@@ -334,7 +334,9 @@ import XCTest
             let deadline = clock.now.advanced(by: timeout)
             while clock.now < deadline {
                 let snapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
-                if snapshot.isIdle { return snapshot }
+                if snapshot.isIdle {
+                    return snapshot
+                }
                 try? await Task.sleep(for: .milliseconds(5))
             }
             return await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()

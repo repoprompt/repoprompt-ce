@@ -58,16 +58,24 @@ enum CodeHighlighter {
     /// toggles dark/light mode (because colours change).
     private enum Cached {
         /// Light-mode colours follow the same ordering as `rawSpecs`.
-        /// Initialized once, thread-safely, via Swift's static let guarantee.
-        private static let lightCache: [(NSRegularExpression, NSColor)] = buildCache(dark: false)
+        private static var lightCache: [(NSRegularExpression, NSColor)] = []
 
         /// Dark-mode colours follow the same ordering as `rawSpecs`.
-        /// Initialized once, thread-safely, via Swift's static let guarantee.
-        private static let darkCache: [(NSRegularExpression, NSColor)] = buildCache(dark: true)
+        private static var darkCache: [(NSRegularExpression, NSColor)] = []
 
-        /// Return the correct cache (always pre-built; no lazy init needed).
+        /// Return the correct cache; build it the first time it is requested.
         static func compiled(darkMode: Bool) -> [(NSRegularExpression, NSColor)] {
-            darkMode ? darkCache : lightCache
+            if darkMode {
+                if darkCache.isEmpty {
+                    darkCache = buildCache(dark: true)
+                }
+                return darkCache
+            } else {
+                if lightCache.isEmpty {
+                    lightCache = buildCache(dark: false)
+                }
+                return lightCache
+            }
         }
 
         /// Build either the dark- or light-mode cache.
@@ -261,7 +269,9 @@ enum CodeHighlighter {
         var examined = 0
         var angleCount = 0
         for scalar in s.unicodeScalars {
-            if examined >= sampleLimit { break }
+            if examined >= sampleLimit {
+                break
+            }
             examined &+= 1
             if scalar.value == 60 || scalar.value == 62 {
                 angleCount &+= 1
@@ -281,7 +291,9 @@ enum CodeHighlighter {
             let endExclusive = min(start + chunkSizeUTF16, len)
             ranges.append(NSRange(location: start, length: endExclusive - start))
 
-            if endExclusive == len { break }
+            if endExclusive == len {
+                break
+            }
             start = max(endExclusive - chunkOverlapUTF16, start + 1)
         }
         return ranges
@@ -305,16 +317,12 @@ enum CodeHighlighter {
     }
 
     private static func isDarkMode() -> Bool {
-        // NSApp appearance must be queried on main thread. Unit-test processes
-        // can exercise the highlighter without creating NSApp; default to the
-        // light palette there rather than crashing while rendering a code block.
+        // NSApp appearance must be queried on main thread.
         if Thread.isMainThread {
-            guard let app = NSApp else { return false }
-            return app.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         } else {
-            return DispatchQueue.main.sync {
-                guard let app = NSApp else { return false }
-                return app.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            DispatchQueue.main.sync {
+                NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             }
         }
     }

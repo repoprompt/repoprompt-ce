@@ -1104,7 +1104,9 @@ actor InteractiveMCPClientSession {
         guard result.isError == true else { return false }
         let needle = "Tool not found: \(toolName)"
         return result.content.contains { block in
-            if case let .text(t, _, _) = block { return t.contains(needle) }
+            if case let .text(t, _, _) = block {
+                return t.contains(needle)
+            }
             return false
         }
     }
@@ -1293,7 +1295,9 @@ actor InteractiveMCPClientSession {
 
     private func decodeBindContextResponse(from result: CallTool.Result) throws -> BindContextResponse {
         guard let text = result.content.compactMap({
-            if case let .text(text, _, _) = $0 { return text }
+            if case let .text(text, _, _) = $0 {
+                return text
+            }
             return nil
         }).first else {
             throw InteractiveSessionError.handshakeFailed(reason: "bind_context returned no text payload")
@@ -1449,11 +1453,15 @@ actor InteractiveMCPClientSession {
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw InteractiveSessionError.pollFailed(errno: errno)
             }
 
-            if pollResult == 0 { continue }
+            if pollResult == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
                 throw InteractiveSessionError.connectionReset
@@ -1461,7 +1469,9 @@ actor InteractiveMCPClientSession {
 
             let bytesRead = Darwin.read(fd, readBuffer, 4096)
             if bytesRead <= 0 {
-                if bytesRead < 0, errno == EAGAIN || errno == EINTR { continue }
+                if bytesRead < 0, errno == EAGAIN || errno == EINTR {
+                    continue
+                }
                 throw InteractiveSessionError.serverClosed
             }
 

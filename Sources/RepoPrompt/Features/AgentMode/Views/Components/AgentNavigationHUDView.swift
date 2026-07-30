@@ -458,7 +458,9 @@ private struct AgentNavigationHUDRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovered in
-            if hovered { onHover() }
+            if hovered {
+                onHover()
+            }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
@@ -494,19 +496,33 @@ private struct AgentNavigationHUDRow: View {
 
     private var relativeActivityLabel: String {
         let seconds = max(0, now.timeIntervalSince(item.latestActivityAt))
-        if seconds < 60 { return "now" }
-        if seconds < 60 * 60 { return "\(Int(seconds / 60))m" }
-        if seconds < 24 * 60 * 60 { return "\(Int(seconds / 3600))h" }
-        if seconds < 7 * 24 * 60 * 60 { return "\(Int(seconds / 86400))d" }
+        if seconds < 60 {
+            return "now"
+        }
+        if seconds < 60 * 60 {
+            return "\(Int(seconds / 60))m"
+        }
+        if seconds < 24 * 60 * 60 {
+            return "\(Int(seconds / 3600))h"
+        }
+        if seconds < 7 * 24 * 60 * 60 {
+            return "\(Int(seconds / 86400))d"
+        }
         return DateFormatter.localizedString(from: item.latestActivityAt, dateStyle: .short, timeStyle: .none)
     }
 
     private var accessibilityLabel: String {
         var parts = [item.title]
-        if item.isActiveTab { parts.append("current") }
-        if !item.accessibilityStatusText.isEmpty { parts.append(item.accessibilityStatusText) }
+        if item.isActiveTab {
+            parts.append("current")
+        }
+        if !item.accessibilityStatusText.isEmpty {
+            parts.append(item.accessibilityStatusText)
+        }
         parts.append("workspace \(item.workspaceTitle)")
-        if item.windowTitle != item.workspaceTitle { parts.append("window \(item.windowTitle)") }
+        if item.windowTitle != item.workspaceTitle {
+            parts.append("window \(item.windowTitle)")
+        }
         parts.append("active \(relativeActivityLabel) ago")
         return parts.joined(separator: ", ")
     }
@@ -625,13 +641,19 @@ private struct AgentNavigationHUDStatusPlate: View {
     }
 
     private var dotColor: Color {
-        if selected { return .white }
-        if item.runState == .running { return runningAccentColor }
+        if selected {
+            return .white
+        }
+        if item.runState == .running {
+            return runningAccentColor
+        }
         return .secondary
     }
 
     private var dotOpacity: Double {
-        if selected || item.runState == .running { return 1 }
+        if selected || item.runState == .running {
+            return 1
+        }
         return 0.45
     }
 }
@@ -690,17 +712,23 @@ private struct AgentNavigationHUDSubagentChip: View {
     }
 
     private var foregroundStyle: Color {
-        if selected { return Color.white.opacity(0.9) }
+        if selected {
+            return Color.white.opacity(0.9)
+        }
         return attention ? Color.orange : Color.secondary
     }
 
     private var backgroundStyle: Color {
-        if selected { return Color.white.opacity(0.18) }
+        if selected {
+            return Color.white.opacity(0.18)
+        }
         return attention ? Color.orange.opacity(0.16) : Color(NSColor.systemGray).opacity(0.16)
     }
 
     private var borderStyle: Color {
-        if selected { return Color.white.opacity(0.28) }
+        if selected {
+            return Color.white.opacity(0.28)
+        }
         return attention ? Color.orange.opacity(0.45) : Color.clear
     }
 }

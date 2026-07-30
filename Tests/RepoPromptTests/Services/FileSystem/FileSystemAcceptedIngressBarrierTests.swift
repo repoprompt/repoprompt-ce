@@ -352,7 +352,9 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
             while mailbox.takeNextAcceptedPayload() != nil {}
         }
         for _ in 0 ..< 100 {
-            if await drainCount.value() > 0 { break }
+            if await drainCount.value() > 0 {
+                break
+            }
             await Task.yield()
         }
         let resumedDrainCount = await drainCount.value()

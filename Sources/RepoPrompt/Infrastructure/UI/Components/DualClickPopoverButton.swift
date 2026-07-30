@@ -109,17 +109,16 @@ struct DualActionButton<Content: View>: View {
 
     // MARK: - Backgrounds
 
+    @ViewBuilder
     private var backgroundForState: some View {
-        Group {
-            if !isEnabled {
-                disabledBackground
-            } else if isPressed {
-                pressedBackground
-            } else if isHovering {
-                hoverBackground
-            } else {
-                normalBackground
-            }
+        if !isEnabled {
+            disabledBackground
+        } else if isPressed {
+            pressedBackground
+        } else if isHovering {
+            hoverBackground
+        } else {
+            normalBackground
         }
     }
 

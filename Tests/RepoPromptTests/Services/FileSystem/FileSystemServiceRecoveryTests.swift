@@ -708,7 +708,9 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
                 startWaiters.removeAll { $0.target <= startCount }
                 readyWaiters.forEach { $0.continuation.resume() }
 
-                if releasesAllBatches { return }
+                if releasesAllBatches {
+                    return
+                }
                 if releasePermits > 0 {
                     releasePermits -= 1
                     return

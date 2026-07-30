@@ -8,7 +8,9 @@ struct PromptResultCard: View {
 
     private func compactIdentifier(_ value: String?) -> String? {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
-        if value.count <= 24 { return value }
+        if value.count <= 24 {
+            return value
+        }
         return String(value.prefix(8)) + "…" + String(value.suffix(6))
     }
 
@@ -110,7 +112,9 @@ struct PromptResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
             switch dto.op.lowercased() {
             case "get", "set", "append", "clear", "export", "list_presets", "select_preset":
@@ -151,7 +155,9 @@ struct PromptResultCard: View {
                     let copyPreset = resolvedExportPreset ?? fallbackPreset
                     let displayedPresetName = {
                         let trimmed = exportReply.copyPreset?.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if trimmed?.isEmpty == false { return trimmed! }
+                        if trimmed?.isEmpty == false {
+                            return trimmed!
+                        }
                         return copyPreset?.name ?? promptManager.currentCopyPreset().name
                     }()
                     let copyAction: (() -> Void)? = copyPreset.map { preset in

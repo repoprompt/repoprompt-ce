@@ -47,8 +47,12 @@ struct WorkspaceRootByteExactPathKey: Hashable, Comparable {
     }
 
     func isSameOrDescendant(of ancestor: Self) -> Bool {
-        if ancestor.bytes.isEmpty { return true }
-        if bytes == ancestor.bytes { return true }
+        if ancestor.bytes.isEmpty {
+            return true
+        }
+        if bytes == ancestor.bytes {
+            return true
+        }
         return bytes.starts(with: ancestor.bytes + [UInt8(ascii: "/")])
     }
 }
@@ -65,7 +69,9 @@ struct WorkspaceRootByteExactPathSet: Equatable {
         for path in paths {
             let key = WorkspaceRootByteExactPathKey(path)
             if valuesByKey[key] != nil {
-                if rejectExactDuplicates { return nil }
+                if rejectExactDuplicates {
+                    return nil
+                }
                 continue
             }
             if let existing = canonicalRepresentatives[path], existing != key {

@@ -28,7 +28,9 @@ public extension Value {
     /// Returns nil if the string isn't valid JSON or isn't an object.
     static func objectFromJSONString(_ json: String) -> [String: Value]? {
         guard let val = fromJSONString(json) else { return nil }
-        if case let .object(obj) = val { return obj }
+        if case let .object(obj) = val {
+            return obj
+        }
         return nil
     }
 }

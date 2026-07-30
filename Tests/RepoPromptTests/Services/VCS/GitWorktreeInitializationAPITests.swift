@@ -109,7 +109,9 @@ final class GitWorktreeInitializationAPITests: XCTestCase {
             try await slowGit.listTree(tree, in: layout, prefix: prefix)
         }
         for _ in 0 ..< 1000 {
-            if await admission.snapshot().activeLeaseCount == 1 { break }
+            if await admission.snapshot().activeLeaseCount == 1 {
+                break
+            }
             try await Task.sleep(for: .milliseconds(1))
         }
         cancellable.cancel()
@@ -695,7 +697,9 @@ final class GitWorktreeInitializationAPITests: XCTestCase {
                 )
             }
             for _ in 0 ..< 1000 {
-                if await admission.snapshot().activeLeaseCount == 1 { break }
+                if await admission.snapshot().activeLeaseCount == 1 {
+                    break
+                }
                 try await Task.sleep(for: .milliseconds(1))
             }
             cancellable.cancel()

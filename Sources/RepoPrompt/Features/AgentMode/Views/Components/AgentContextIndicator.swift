@@ -46,8 +46,12 @@ struct AgentContextIndicator: View {
 
     private var warningColor: Color {
         guard let used = contextUsedPercent else { return .secondary }
-        if used > 90 { return .red }
-        if used > 75 { return .orange }
+        if used > 90 {
+            return .red
+        }
+        if used > 75 {
+            return .orange
+        }
         return .secondary
     }
 

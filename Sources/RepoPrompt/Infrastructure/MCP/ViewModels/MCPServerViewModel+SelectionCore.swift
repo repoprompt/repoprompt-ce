@@ -408,9 +408,15 @@ extension MCPServerViewModel {
                     sawTerminalUnmapped = sawTerminalUnmapped || terminal
                 }
             }
-            if sawTerminalUnmapped { return .unmapped }
-            if sawPending { return .pending }
-            if sawUnmapped { return .unmapped }
+            if sawTerminalUnmapped {
+                return .unmapped
+            }
+            if sawPending {
+                return .pending
+            }
+            if sawUnmapped {
+                return .unmapped
+            }
 
             if presentationCoverageIsIncomplete(presentation.coverage) || !issues.isEmpty {
                 return .pending

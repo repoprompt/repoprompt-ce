@@ -40,12 +40,16 @@ struct PreparedFileSystemDelta {
     let absolutePath: String
 
     var isFolderAdded: Bool {
-        if case .folderAdded = delta { return true }
+        if case .folderAdded = delta {
+            return true
+        }
         return false
     }
 
     var isFolderRemoved: Bool {
-        if case .folderRemoved = delta { return true }
+        if case .folderRemoved = delta {
+            return true
+        }
         return false
     }
 }
@@ -199,7 +203,9 @@ enum FileSystemDeltaPreparation {
         }
 
         let removedFolders = chosen.compactMap { pair -> String? in
-            if case .folderRemoved = pair.delta { return pair.rel }
+            if case .folderRemoved = pair.delta {
+                return pair.rel
+            }
             return nil
         }
 

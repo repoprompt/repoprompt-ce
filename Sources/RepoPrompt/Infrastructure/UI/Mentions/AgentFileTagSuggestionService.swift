@@ -349,7 +349,9 @@ final class AgentFileTagSuggestionService {
                     )
                 ))
             }
-            if suggestions.count >= maxResults { break }
+            if suggestions.count >= maxResults {
+                break
+            }
         }
         return suggestions
     }

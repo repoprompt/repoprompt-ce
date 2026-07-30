@@ -25,7 +25,9 @@ struct ApplyEditsResultCard: View {
         }
         guard toolResultHasPayload(item), !toolResultIsSummaryOnly(item) else { return false }
         if let dto {
-            if dto.requiresUserApproval == true { return true }
+            if dto.requiresUserApproval == true {
+                return true
+            }
         }
         let status = ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
         return status != .failure
@@ -66,8 +68,12 @@ struct ApplyEditsResultCard: View {
 
     private static func resolvedDisplayDiff(from dto: ToolResultDTOs.EditSummary?) -> String? {
         guard let dto else { return nil }
-        if let diff = dto.cardUnifiedDiff, !diff.isEmpty { return diff }
-        if let diff = dto.unifiedDiff, !diff.isEmpty { return diff }
+        if let diff = dto.cardUnifiedDiff, !diff.isEmpty {
+            return diff
+        }
+        if let diff = dto.unifiedDiff, !diff.isEmpty {
+            return diff
+        }
         return nil
     }
 
@@ -117,7 +123,9 @@ struct ApplyEditsResultCard: View {
     }
 
     private func resolvedStatus(from dto: ToolResultDTOs.EditSummary?) -> ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
             switch dto.status.lowercased() {
             case "success": return .success

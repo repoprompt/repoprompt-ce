@@ -906,7 +906,9 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 repliesCompleted.fulfill()
             }
             await fulfillment(of: [repliesCompleted], timeout: 1)
-            if let replyError { throw replyError }
+            if let replyError {
+                throw replyError
+            }
             let resolvedSelectionReply = try XCTUnwrap(selectionReply)
             let resolvedWorkspaceReply = try XCTUnwrap(workspaceReply)
 
@@ -995,7 +997,9 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 remainingCompleted.fulfill()
             }
             await fulfillment(of: [remainingCompleted], timeout: 1)
-            if let replyError { throw replyError }
+            if let replyError {
+                throw replyError
+            }
             let resolvedFirstReply = try XCTUnwrap(firstReply)
             let resolvedSecondReply = try XCTUnwrap(secondReply)
             let resolvedWorkspaceReply = try XCTUnwrap(workspaceReply)

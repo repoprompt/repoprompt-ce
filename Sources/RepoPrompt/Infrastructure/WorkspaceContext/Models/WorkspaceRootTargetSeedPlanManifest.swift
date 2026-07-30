@@ -492,9 +492,13 @@ private enum WorkspaceRootTargetSeedPlanCodec {
             guard let base = raw.baseAddress else { return }
             while offset < count {
                 let amount = Darwin.read(descriptor, base.advanced(by: offset), count - offset)
-                if amount > 0 { offset += amount }
-                else if amount == 0 { throw WorkspaceRootTargetSeedPlanManifestError.corrupt("truncated file") }
-                else if errno != EINTR { throw WorkspaceRootTargetSeedPlanManifestError.io(operation: "read", code: errno) }
+                if amount > 0 {
+                    offset += amount
+                } else if amount == 0 {
+                    throw WorkspaceRootTargetSeedPlanManifestError.corrupt("truncated file")
+                } else if errno != EINTR {
+                    throw WorkspaceRootTargetSeedPlanManifestError.io(operation: "read", code: errno)
+                }
             }
         }
         return data
@@ -522,12 +526,16 @@ private enum WorkspaceRootTargetSeedPlanCodec {
 
     static func appendOptional(_ value: UInt64?, to data: inout Data) {
         data.append(value == nil ? 0 : 1)
-        if let value { append(value, to: &data) }
+        if let value {
+            append(value, to: &data)
+        }
     }
 
     static func appendOptional(_ value: Data?, to data: inout Data) {
         data.append(value == nil ? 0 : 1)
-        if let value { append(value, to: &data) }
+        if let value {
+            append(value, to: &data)
+        }
     }
 
     fileprivate struct ByteCursor {
@@ -647,7 +655,9 @@ private struct WorkspaceRootTargetSeedPlanSpillFormat: SpillBackedSortedArtifact
     }
 
     func ordering(_ lhs: Record, _ rhs: Record) -> SpillBackedSortedArtifactOrdering {
-        if lhs.relativePathBytes == rhs.relativePathBytes { return .same }
+        if lhs.relativePathBytes == rhs.relativePathBytes {
+            return .same
+        }
         return lhs.relativePathBytes.lexicographicallyPrecedes(rhs.relativePathBytes) ? .ascending : .descending
     }
 
@@ -947,7 +957,9 @@ final class WorkspaceRootTargetSeedPlanManifestReader: @unchecked Sendable {
             guard parsed == expected else { throw WorkspaceRootTargetSeedPlanManifestError.corrupt("footer mismatch") }
             var trailing: UInt8 = 0
             let trailingCount = Darwin.read(descriptor, &trailing, 1)
-            if trailingCount < 0 { throw WorkspaceRootTargetSeedPlanManifestError.io(operation: "trailing-read", code: errno) }
+            if trailingCount < 0 {
+                throw WorkspaceRootTargetSeedPlanManifestError.io(operation: "trailing-read", code: errno)
+            }
             guard trailingCount == 0 else { throw WorkspaceRootTargetSeedPlanManifestError.corrupt("trailing bytes") }
             try retainedLease.validateOpenDescriptor(descriptor)
             footer = parsed

@@ -132,7 +132,9 @@ package enum CodeMapAPIContentFormatter {
 
         func formatPropertyLine(_ name: String, typeName: String?) -> String {
             guard let typeName, !typeName.isEmpty else { return name }
-            if name.contains(":") { return name }
+            if name.contains(":") {
+                return name
+            }
             return "\(name): \(typeName)"
         }
 

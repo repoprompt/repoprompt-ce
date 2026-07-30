@@ -32,18 +32,36 @@ enum TopLevelScanner {
         for i in input.indices {
             let c = input[i]
             switch c {
-            case "<": if track.contains(.angle) { angle += 1 }
-            case ">": if track.contains(.angle) { angle = max(0, angle - 1) }
-            case "(": if track.contains(.paren) { paren += 1 }
-            case ")": if track.contains(.paren) { paren = max(0, paren - 1) }
-            case "{": if track.contains(.brace) { brace += 1 }
-            case "}": if track.contains(.brace) { brace = max(0, brace - 1) }
-            case "[": if track.contains(.square) { square += 1 }
-            case "]": if track.contains(.square) { square = max(0, square - 1) }
+            case "<": if track.contains(.angle) {
+                    angle += 1
+                }
+            case ">": if track.contains(.angle) {
+                    angle = max(0, angle - 1)
+                }
+            case "(": if track.contains(.paren) {
+                    paren += 1
+                }
+            case ")": if track.contains(.paren) {
+                    paren = max(0, paren - 1)
+                }
+            case "{": if track.contains(.brace) {
+                    brace += 1
+                }
+            case "}": if track.contains(.brace) {
+                    brace = max(0, brace - 1)
+                }
+            case "[": if track.contains(.square) {
+                    square += 1
+                }
+            case "]": if track.contains(.square) {
+                    square = max(0, square - 1)
+                }
             case separator:
                 if angle == 0, paren == 0, brace == 0, square == 0 {
                     let range = start ..< i
-                    if !range.isEmpty { results.append(range) }
+                    if !range.isEmpty {
+                        results.append(range)
+                    }
                     start = input.index(after: i)
                 }
             default:
@@ -52,7 +70,9 @@ enum TopLevelScanner {
         }
 
         let remainder = start ..< input.endIndex
-        if !remainder.isEmpty { results.append(remainder) }
+        if !remainder.isEmpty {
+            results.append(remainder)
+        }
         return results
     }
 
@@ -71,26 +91,46 @@ enum TopLevelScanner {
         for i in input.indices {
             let c = input[i]
             switch c {
-            case "<": if track.contains(.angle) { angle += 1 }
-            case ">": if track.contains(.angle) { angle = max(0, angle - 1) }
-            case "(": if track.contains(.paren) { paren += 1 }
-            case ")": if track.contains(.paren) { paren = max(0, paren - 1) }
-            case "{": if track.contains(.brace) { brace += 1 }
-            case "}": if track.contains(.brace) { brace = max(0, brace - 1) }
-            case "[": if track.contains(.square) { square += 1 }
-            case "]": if track.contains(.square) { square = max(0, square - 1) }
+            case "<": if track.contains(.angle) {
+                    angle += 1
+                }
+            case ">": if track.contains(.angle) {
+                    angle = max(0, angle - 1)
+                }
+            case "(": if track.contains(.paren) {
+                    paren += 1
+                }
+            case ")": if track.contains(.paren) {
+                    paren = max(0, paren - 1)
+                }
+            case "{": if track.contains(.brace) {
+                    brace += 1
+                }
+            case "}": if track.contains(.brace) {
+                    brace = max(0, brace - 1)
+                }
+            case "[": if track.contains(.square) {
+                    square += 1
+                }
+            case "]": if track.contains(.square) {
+                    square = max(0, square - 1)
+                }
             default: break
             }
 
             if operators.contains(c), angle == 0, paren == 0, brace == 0, square == 0 {
                 let range = start ..< i
-                if !range.isEmpty { results.append(range) }
+                if !range.isEmpty {
+                    results.append(range)
+                }
                 start = input.index(after: i)
             }
         }
 
         let remainder = start ..< input.endIndex
-        if !remainder.isEmpty { results.append(remainder) }
+        if !remainder.isEmpty {
+            results.append(remainder)
+        }
         return results
     }
 
@@ -109,14 +149,30 @@ enum TopLevelScanner {
                 return input.index(input.startIndex, offsetBy: i)
             }
             switch c {
-            case "<": if track.contains(.angle) { angle += 1 }
-            case ">": if track.contains(.angle) { angle = max(0, angle - 1) }
-            case "(": if track.contains(.paren) { paren += 1 }
-            case ")": if track.contains(.paren) { paren = max(0, paren - 1) }
-            case "{": if track.contains(.brace) { brace += 1 }
-            case "}": if track.contains(.brace) { brace = max(0, brace - 1) }
-            case "[": if track.contains(.square) { square += 1 }
-            case "]": if track.contains(.square) { square = max(0, square - 1) }
+            case "<": if track.contains(.angle) {
+                    angle += 1
+                }
+            case ">": if track.contains(.angle) {
+                    angle = max(0, angle - 1)
+                }
+            case "(": if track.contains(.paren) {
+                    paren += 1
+                }
+            case ")": if track.contains(.paren) {
+                    paren = max(0, paren - 1)
+                }
+            case "{": if track.contains(.brace) {
+                    brace += 1
+                }
+            case "}": if track.contains(.brace) {
+                    brace = max(0, brace - 1)
+                }
+            case "[": if track.contains(.square) {
+                    square += 1
+                }
+            case "]": if track.contains(.square) {
+                    square = max(0, square - 1)
+                }
             default:
                 break
             }
@@ -140,14 +196,30 @@ enum TopLevelScanner {
         while i < input.endIndex {
             let c = input[i]
             switch c {
-            case "<": if track.contains(.angle) { angle += 1 }
-            case ">": if track.contains(.angle) { angle = max(0, angle - 1) }
-            case "(": if track.contains(.paren) { paren += 1 }
-            case ")": if track.contains(.paren) { paren = max(0, paren - 1) }
-            case "{": if track.contains(.brace) { brace += 1 }
-            case "}": if track.contains(.brace) { brace = max(0, brace - 1) }
-            case "[": if track.contains(.square) { square += 1 }
-            case "]": if track.contains(.square) { square = max(0, square - 1) }
+            case "<": if track.contains(.angle) {
+                    angle += 1
+                }
+            case ">": if track.contains(.angle) {
+                    angle = max(0, angle - 1)
+                }
+            case "(": if track.contains(.paren) {
+                    paren += 1
+                }
+            case ")": if track.contains(.paren) {
+                    paren = max(0, paren - 1)
+                }
+            case "{": if track.contains(.brace) {
+                    brace += 1
+                }
+            case "}": if track.contains(.brace) {
+                    brace = max(0, brace - 1)
+                }
+            case "[": if track.contains(.square) {
+                    square += 1
+                }
+            case "]": if track.contains(.square) {
+                    square = max(0, square - 1)
+                }
             default:
                 break
             }

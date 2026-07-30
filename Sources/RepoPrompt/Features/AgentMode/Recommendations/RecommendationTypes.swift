@@ -244,10 +244,18 @@ struct RecommendationSet {
     /// Number of recommendations that need action (not already satisfied and not muted).
     var actionableUnsatisfiedCount: Int {
         var count = 0
-        if let chat = chatModel, !chat.alreadySatisfied, !chat.isMuted { count += 1 }
-        if let cb = contextBuilder, !cb.alreadySatisfied, !cb.isMuted { count += 1 }
-        if let mcp = mcpPresetExposure, !mcp.alreadySatisfied, !mcp.isMuted { count += 1 }
-        if let agentDefaults = mcpAgentDefaults, !agentDefaults.alreadySatisfied, !agentDefaults.isMuted { count += 1 }
+        if let chat = chatModel, !chat.alreadySatisfied, !chat.isMuted {
+            count += 1
+        }
+        if let cb = contextBuilder, !cb.alreadySatisfied, !cb.isMuted {
+            count += 1
+        }
+        if let mcp = mcpPresetExposure, !mcp.alreadySatisfied, !mcp.isMuted {
+            count += 1
+        }
+        if let agentDefaults = mcpAgentDefaults, !agentDefaults.alreadySatisfied, !agentDefaults.isMuted {
+            count += 1
+        }
         return count
     }
 
@@ -258,10 +266,18 @@ struct RecommendationSet {
 
     /// Returns true if any recommendation is muted but differs from recommended.
     var hasMutedDifferences: Bool {
-        if let chat = chatModel, chat.isMuted, !chat.alreadySatisfied { return true }
-        if let cb = contextBuilder, cb.isMuted, !cb.alreadySatisfied { return true }
-        if let mcp = mcpPresetExposure, mcp.isMuted, !mcp.alreadySatisfied { return true }
-        if let agentDefaults = mcpAgentDefaults, agentDefaults.isMuted, !agentDefaults.alreadySatisfied { return true }
+        if let chat = chatModel, chat.isMuted, !chat.alreadySatisfied {
+            return true
+        }
+        if let cb = contextBuilder, cb.isMuted, !cb.alreadySatisfied {
+            return true
+        }
+        if let mcp = mcpPresetExposure, mcp.isMuted, !mcp.alreadySatisfied {
+            return true
+        }
+        if let agentDefaults = mcpAgentDefaults, agentDefaults.isMuted, !agentDefaults.alreadySatisfied {
+            return true
+        }
         return false
     }
 }

@@ -78,7 +78,9 @@ enum OutputSink {
 
     /// Returns true if currently redirecting to a file.
     var isRedirecting: Bool {
-        if case .file = self { return true }
+        if case .file = self {
+            return true
+        }
         return false
     }
 }

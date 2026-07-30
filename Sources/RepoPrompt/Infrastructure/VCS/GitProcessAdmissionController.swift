@@ -302,7 +302,9 @@ actor GitProcessAdmissionController {
         if let index = deadlineEligible.min(by: { lhs, rhs in
             let left = waiters[lhs]
             let right = waiters[rhs]
-            if left.deadline != right.deadline { return left.deadline! < right.deadline! }
+            if left.deadline != right.deadline {
+                return left.deadline! < right.deadline!
+            }
             if left.priority.rawValue != right.priority.rawValue {
                 return left.priority.rawValue < right.priority.rawValue
             }

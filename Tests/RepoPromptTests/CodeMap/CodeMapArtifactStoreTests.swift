@@ -499,7 +499,13 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         XCTAssertEqual(leases.count, 4)
         XCTAssertEqual(rejections.count, 60)
         XCTAssertTrue(rejections.allSatisfy { $0 == .busy(.activeLeaseCountLimit) })
-        XCTAssertFalse(attempts.contains { if case .unexpected = $0 { true } else { false } })
+        XCTAssertFalse(attempts.contains {
+            if case .unexpected = $0 {
+                true
+            } else {
+                false
+            }
+        })
         var accounting = await store.accounting()
         XCTAssertEqual(accounting.activeLeaseCount, 4)
         XCTAssertEqual(accounting.activeLeaseBytes, handle.containerByteCount * 4)
@@ -1408,7 +1414,9 @@ final class CodeMapArtifactStoreTests: XCTestCase {
                 epochSeconds: 100
             ) {
             case let .visit(visit, _):
-                if case .boundary = visit { continue }
+                if case .boundary = visit {
+                    continue
+                }
                 observedVisit = visit
             case let .needsMoreBytes(required, _):
                 return XCTFail("Replacement size escaped admitted descriptor: \(required)")
@@ -1675,7 +1683,9 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         for _ in 0 ..< maximumCalls {
             let progress = try await store.refreshAccounting(stepBudget: stepBudget)
             result.append(progress)
-            if progress.isComplete { return result }
+            if progress.isComplete {
+                return result
+            }
         }
         XCTFail("Reconciliation did not complete")
         throw CodeMapArtifactCatalogError.boundedScanExceeded
@@ -1690,7 +1700,9 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         for _ in 0 ..< maximumCalls {
             let progress = try await store.runGC(stepBudget: stepBudget)
             result.append(progress)
-            if progress.isComplete { return result }
+            if progress.isComplete {
+                return result
+            }
         }
         XCTFail("GC did not complete")
         throw CodeMapArtifactCatalogError.boundedScanExceeded

@@ -519,11 +519,15 @@ final class WindowRoutingService: Service {
             throw MCPError.invalidParams("Unknown workspace name '\(name)'. \(availableWorkspaceSuggestion(diskWorkspaces, includeHidden: includeHidden))")
 
         case .hide:
-            if visibleMatches.count == 1 { return visibleMatches[0] }
+            if visibleMatches.count == 1 {
+                return visibleMatches[0]
+            }
             if visibleMatches.count > 1 {
                 throw MCPError.invalidParams(ambiguousWorkspaceMessage(name: name, matches: visibleMatches))
             }
-            if hiddenMatches.count == 1 { return hiddenMatches[0] }
+            if hiddenMatches.count == 1 {
+                return hiddenMatches[0]
+            }
             if hiddenMatches.count > 1 {
                 throw MCPError.invalidParams(ambiguousWorkspaceMessage(name: name, matches: hiddenMatches))
             }
@@ -751,9 +755,15 @@ final class WindowRoutingService: Service {
         let tabName: String?
 
         var matchKind: MatchKind? {
-            if contextID != nil { return .contextID }
-            if !workingDirs.isEmpty { return .workingDirs }
-            if windowID != nil { return .windowID }
+            if contextID != nil {
+                return .contextID
+            }
+            if !workingDirs.isEmpty {
+                return .workingDirs
+            }
+            if windowID != nil {
+                return .windowID
+            }
             return nil
         }
     }

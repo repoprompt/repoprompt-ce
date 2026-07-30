@@ -278,7 +278,9 @@ actor CLIEnvironmentCache {
         for candidate in fallbackPathCandidates {
             let expanded = expandTilde(candidate, home: home)
             guard !expanded.isEmpty else { continue }
-            if !FileManager.default.fileExists(atPath: expanded) { continue }
+            if !FileManager.default.fileExists(atPath: expanded) {
+                continue
+            }
             if !seen.contains(expanded) {
                 appendComponent(expanded)
                 appendedFallback = true

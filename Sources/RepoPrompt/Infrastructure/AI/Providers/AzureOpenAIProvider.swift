@@ -670,7 +670,9 @@ final class AzureOpenAIProvider: AIProvider {
                     var completionTokens: Int?
 
                     for try await event in stream {
-                        if Task.isCancelled { break }
+                        if Task.isCancelled {
+                            break
+                        }
                         switch event {
                         case let .outputTextDelta(delta):
                             if !delta.delta.isEmpty {
@@ -782,7 +784,9 @@ final class AzureOpenAIProvider: AIProvider {
                     var completionTokens: Int?
 
                     for try await chunk in stream {
-                        if Task.isCancelled { break }
+                        if Task.isCancelled {
+                            break
+                        }
 
                         if let usage = chunk.usage {
                             promptTokens = usage.promptTokens

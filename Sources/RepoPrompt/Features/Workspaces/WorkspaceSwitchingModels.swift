@@ -7,7 +7,9 @@ enum WorkspaceSwitchResult: Equatable {
     case blocked(String)
 
     var didSwitch: Bool {
-        if case .switched = self { return true }
+        if case .switched = self {
+            return true
+        }
         return false
     }
 

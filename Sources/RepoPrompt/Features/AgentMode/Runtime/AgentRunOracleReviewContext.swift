@@ -215,7 +215,9 @@ struct DelegatedAgentRunOracleReviewContext: Equatable {
     }
 
     var unavailableReason: AgentRunOracleReviewUnavailableReason? {
-        if let validationFailure = target.validationFailure { return validationFailure }
+        if let validationFailure = target.validationFailure {
+            return validationFailure
+        }
         guard case let .unavailable(source) = source else { return nil }
         return source.reason
     }

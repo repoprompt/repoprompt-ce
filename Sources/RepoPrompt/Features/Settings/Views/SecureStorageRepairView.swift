@@ -163,14 +163,22 @@ struct SecureStorageRepairView: View {
     private var replacementConfirmationPresented: Binding<Bool> {
         Binding(
             get: { replacementAccount != nil },
-            set: { if !$0 { replacementAccount = nil } }
+            set: {
+                if !$0 {
+                    replacementAccount = nil
+                }
+            }
         )
     }
 
     private var deletionConfirmationPresented: Binding<Bool> {
         Binding(
             get: { deletionAccount != nil },
-            set: { if !$0 { deletionAccount = nil } }
+            set: {
+                if !$0 {
+                    deletionAccount = nil
+                }
+            }
         )
     }
 

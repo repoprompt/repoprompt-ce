@@ -37,8 +37,12 @@ enum FileTreeCardPresentationBuilder {
         let isFallbackMessage = dto.note != nil
         let wasTruncated = dto.wasTruncated == true
         let status: ToolCardStatus = {
-            if isFallbackMessage || wasTruncated { return .warning }
-            if !dto.tree.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .success }
+            if isFallbackMessage || wasTruncated {
+                return .warning
+            }
+            if !dto.tree.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .success
+            }
             return .neutral
         }()
 
@@ -200,13 +204,11 @@ struct CodeStructureResultCard: View {
         if let stored = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON) {
             return stored.detailText
         }
-        guard let dto else { return nil }
-        let messages = (dto.issues + dto.roots.flatMap(\.issues)).map(\.message)
-        guard !messages.isEmpty else { return nil }
-        let visible = messages.prefix(2)
-        var parts = Array(visible)
-        if messages.count > visible.count {
-            parts.append("(+\(messages.count - visible.count) more)")
+        guard let paths = dto?.issues.compactMap(\.path), !paths.isEmpty else { return nil }
+        let visible = paths.prefix(2).map { shortenPath($0) }
+        var parts = visible
+        if paths.count > visible.count {
+            parts.append("(+\(paths.count - visible.count) more)")
         }
         return parts.joined(separator: " • ")
     }
@@ -216,30 +218,32 @@ struct CodeStructureResultCard: View {
             return stored.subtitle ?? ""
         }
         if let dto {
-            return "\(dto.summary.nodes) nodes • \(dto.roots.count) roots • \(dto.status.rawValue)"
+            return "\(dto.summary.returnedFiles) files • \(dto.status)"
         }
-        if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON),
-           let count = args.paths?.count,
-           count > 0
-        {
-            return "\(count) path\(count == 1 ? "" : "s")"
-        }
-        if ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON) != nil {
-            return "selection"
+        if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON) {
+            if args.scope == "selected" {
+                return "selected"
+            }
+            if let count = args.paths?.count, count > 0 {
+                return "\(count) path\(count == 1 ? "" : "s")"
+            }
         }
         return ""
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let storedStatus = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON)?.status {
             return storedStatus
         }
         if let dto {
             return switch dto.status {
-            case .ok: .success
-            case .partial, .pending: .warning
-            case .unavailable: .failure
+            case "ready": .success
+            case "partial", "pending", "budget": .warning
+            case "unavailable", "stale": .failure
+            default: .neutral
             }
         }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
@@ -304,7 +308,9 @@ struct ManageSelectionResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let status = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON)?.status {
             return status
         }
@@ -347,13 +353,27 @@ struct WorkspaceContextResultCard: View {
         }
         guard let dto else { return nil }
         var sections: [String] = []
-        if !dto.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { sections.append("prompt") }
-        if dto.selection != nil { sections.append("selection") }
-        if dto.fileTree != nil { sections.append("file tree") }
-        if dto.codeStructure != nil { sections.append("code structure") }
-        if dto.fileBlocks?.isEmpty == false { sections.append("file blocks") }
-        if dto.copyPreset != nil { sections.append("copy preset") }
-        if dto.copyPresets?.isEmpty == false { sections.append("presets") }
+        if !dto.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            sections.append("prompt")
+        }
+        if dto.selection != nil {
+            sections.append("selection")
+        }
+        if dto.fileTree != nil {
+            sections.append("file tree")
+        }
+        if dto.codeStructure != nil {
+            sections.append("code structure")
+        }
+        if dto.fileBlocks?.isEmpty == false {
+            sections.append("file blocks")
+        }
+        if dto.copyPreset != nil {
+            sections.append("copy preset")
+        }
+        if dto.copyPresets?.isEmpty == false {
+            sections.append("presets")
+        }
         guard !sections.isEmpty else { return nil }
         let visible = Array(sections.prefix(3))
         if sections.count > visible.count {
@@ -378,11 +398,15 @@ struct WorkspaceContextResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let status = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON)?.status {
             return status
         }
-        if dto != nil { return .success }
+        if dto != nil {
+            return .success
+        }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }
 

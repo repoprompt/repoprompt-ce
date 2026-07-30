@@ -206,8 +206,12 @@
 
         var reliability: String {
             guard let coefficientOfVariation else { return "unavailable" }
-            if coefficientOfVariation <= 0.10 { return "high" }
-            if coefficientOfVariation <= 0.20 { return "moderate" }
+            if coefficientOfVariation <= 0.10 {
+                return "high"
+            }
+            if coefficientOfVariation <= 0.20 {
+                return "moderate"
+            }
             return "low"
         }
 
@@ -325,8 +329,11 @@
                     ordinal: isWarmup ? 0 : sampleIndex,
                     phase: isWarmup ? "warmup-excluded" : "measured"
                 )
-                if isWarmup { warmup = sample }
-                else { measured.append(sample) }
+                if isWarmup {
+                    warmup = sample
+                } else {
+                    measured.append(sample)
+                }
             }
             guard let warmup else { throw WorkspaceCodeMapPhase5BenchmarkError.invalid("missing warmup") }
             return WorkspaceCodeMapPhase5BenchmarkAggregate(warmup: warmup, measured: measured)
@@ -669,7 +676,9 @@
             let runtime = try CodeMapArtifactRuntime(
                 rootURL: root,
                 builder: CodeMapArtifactBuilderClient(build: { _, _, _ in
-                    if await failure.take() { throw WorkspaceCodeMapPhase5BenchmarkError.transient }
+                    if await failure.take() {
+                        throw WorkspaceCodeMapPhase5BenchmarkError.transient
+                    }
                     return .readyNoSymbols
                 }),
                 coordinatorHooks: .init { _ in }
@@ -929,7 +938,9 @@
             _ predicate: @escaping @Sendable () async -> Bool
         ) async throws {
             for _ in 0 ..< 10000 {
-                if await predicate() { return }
+                if await predicate() {
+                    return
+                }
                 await Task.yield()
             }
             throw WorkspaceCodeMapPhase5BenchmarkError.invalid("condition not reached")

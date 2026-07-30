@@ -46,7 +46,8 @@ struct ToolCallChipsFlow: View {
             var result: [String] = []
             for name in toolNames {
                 let key = name.lowercased()
-                if !seen.contains(key) { seen.insert(key)
+                if !seen.contains(key) {
+                    seen.insert(key)
                     result.append(name)
                 }
             }
@@ -56,7 +57,9 @@ struct ToolCallChipsFlow: View {
             unique = result
         } else {
             unique = toolNames.filter { let k = $0.lowercased()
-                if seen.contains(k) { return false }
+                if seen.contains(k) {
+                    return false
+                }
                 seen.insert(k)
                 return true
             }

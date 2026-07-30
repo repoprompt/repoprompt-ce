@@ -64,8 +64,12 @@ struct AgentOracleLatestPopoverRoute: Equatable {
     }
 
     private static func uuid(from value: Any?) -> UUID? {
-        if let value = value as? UUID { return value }
-        if let value = value as? String { return UUID(uuidString: value) }
+        if let value = value as? UUID {
+            return value
+        }
+        if let value = value as? String {
+            return UUID(uuidString: value)
+        }
         return nil
     }
 }
@@ -122,13 +126,19 @@ struct AgentOraclePopoverRoute: Equatable {
     }
 
     private static func uuid(from value: Any?) -> UUID? {
-        if let value = value as? UUID { return value }
-        if let value = value as? String { return UUID(uuidString: value) }
+        if let value = value as? UUID {
+            return value
+        }
+        if let value = value as? String {
+            return UUID(uuidString: value)
+        }
         return nil
     }
 
     private static func chatID(from value: Any?) -> String? {
-        if let value = value as? UUID { return value.uuidString }
+        if let value = value as? UUID {
+            return value.uuidString
+        }
         return nonEmptyChatID(value as? String)
     }
 

@@ -137,7 +137,9 @@ enum CodeMapExtractor {
         private(set) var estimatedTokens: Int = 0
         private var s: String = ""
         init(reserve: Int = 0) {
-            if reserve > 0 { s.reserveCapacity(reserve) }
+            if reserve > 0 {
+                s.reserveCapacity(reserve)
+            }
         }
 
         @inline(__always) mutating func appendLine(_ line: String) {
@@ -183,7 +185,9 @@ enum CodeMapExtractor {
         usedSelectedMarker: inout Bool,
         tokenBudget: Int?
     ) -> BuildOutcome {
-        if Task.isCancelled { return .tooLarge }
+        if Task.isCancelled {
+            return .tooLarge
+        }
         let m = settings.mode.lowercased()
         // Precompute selectedFolderIDs once to avoid escaping the thunk
         let selectedFolderIDsSet = fetchSelectedFolderIDs()
@@ -197,19 +201,27 @@ enum CodeMapExtractor {
             isLast: Bool,
             visited: inout Set<UUID>
         ) -> Bool {
-            if Task.isCancelled { return true }
-            if let budget = tokenBudget, sb.estimatedTokens >= budget { return true }
+            if Task.isCancelled {
+                return true
+            }
+            if let budget = tokenBudget, sb.estimatedTokens >= budget {
+                return true
+            }
 
             switch child {
             case let .file(fi):
                 let marked = selectedFileIDs.contains(fi.id)
                 let hasMap = settings.showCodeMapMarkers && codeMapIDs.contains(fi.id)
-                if marked { usedSelectedMarker = true }
+                if marked {
+                    usedSelectedMarker = true
+                }
                 sb.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(fi.name)\(marked ? selectedMark : "")\(hasMap ? codeMapMark : "")")
                 return false
 
             case let .folder(fo):
-                if !visited.insert(fo.id).inserted { return false }
+                if !visited.insert(fo.id).inserted {
+                    return false
+                }
                 sb.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(fo.name)")
                 let nextPrefix = basePrefix + (isLast ? "    " : "│   ")
 
@@ -244,8 +256,12 @@ enum CodeMapExtractor {
         }
 
         for (idx, root) in roots.enumerated() {
-            if Task.isCancelled { return .tooLarge }
-            if let budget = tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
+            if Task.isCancelled {
+                return .tooLarge
+            }
+            if let budget = tokenBudget, sb.estimatedTokens >= budget {
+                return .tooLarge
+            }
 
             // Root line with project context derived from the actual root being rendered.
             let rootIdentity = FileTreeRenderedRootIdentity(root: root)
@@ -301,17 +317,23 @@ enum CodeMapExtractor {
                             default:
                                 true
                             }
-                            if includeFolder { folders.append(fo) }
+                            if includeFolder {
+                                folders.append(fo)
+                            }
                         case let .file(fi):
                             // In folders-only mode, still surface selected files
                             if m == "folders" {
-                                if selectedFileIDs.contains(fi.id) { files.append(fi) }
+                                if selectedFileIDs.contains(fi.id) {
+                                    files.append(fi)
+                                }
                             } else {
                                 let includeFile: Bool = {
                                     switch m {
                                     case "auto":
                                         // Rely on RepoPrompt visibility; filter by extension only
-                                        if let ext = fi.fileExtension?.lowercased(), badExt.contains(ext) { return false }
+                                        if let ext = fi.fileExtension?.lowercased(), badExt.contains(ext) {
+                                            return false
+                                        }
                                         return true
                                     case "full":
                                         return true
@@ -319,7 +341,9 @@ enum CodeMapExtractor {
                                         return true
                                     }
                                 }()
-                                if includeFile { files.append(fi) }
+                                if includeFile {
+                                    files.append(fi)
+                                }
                             }
                         }
                     }
@@ -348,10 +372,14 @@ enum CodeMapExtractor {
                 let isLast = !hasOther && (i == selectedOnly.count - 1)
                 switch ch {
                 case let .file(f):
-                    if let budget = tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
+                    if let budget = tokenBudget, sb.estimatedTokens >= budget {
+                        return .tooLarge
+                    }
                     let marked = selectedFileIDs.contains(f.id)
                     let hasMap = settings.showCodeMapMarkers && codeMapIDs.contains(f.id)
-                    if marked { usedSelectedMarker = true }
+                    if marked {
+                        usedSelectedMarker = true
+                    }
                     sb.appendLine("\(childBasePrefix)\(isLast ? "└── " : "├── ")\(f.name)\(marked ? selectedMark : "")\(hasMap ? codeMapMark : "")")
                 case .folder:
                     if emitSelectedOnlyLocal(child: ch, basePrefix: childBasePrefix, isLast: isLast, visited: &visited) {
@@ -365,7 +393,9 @@ enum CodeMapExtractor {
                 sb.appendLine(ellPrefix + "...")
             }
 
-            if idx < roots.count - 1 { sb.appendLine("") } // blank line between roots
+            if idx < roots.count - 1 {
+                sb.appendLine("")
+            } // blank line between roots
         }
 
         return .ok
@@ -496,7 +526,9 @@ enum CodeMapExtractor {
         isExplicitSubtree: Bool = false,
         showCodeMapMarkers: Bool = true
     ) -> String {
-        if option == .none { return "" }
+        if option == .none {
+            return ""
+        }
         let mode = switch option {
         case .none: "none"
         case .selected: "selected"
@@ -539,19 +571,31 @@ enum CodeMapExtractor {
 
         @discardableResult
         func dfs(_ folder: FolderViewModel) -> Bool {
-            if Task.isCancelled { return false }
-            if !visited.insert(folder.id).inserted { return false }
+            if Task.isCancelled {
+                return false
+            }
+            if !visited.insert(folder.id).inserted {
+                return false
+            }
             var contains = false
             for child in folder.children {
-                if Task.isCancelled { return false }
+                if Task.isCancelled {
+                    return false
+                }
                 switch child {
                 case let .file(file):
-                    if selectedFileIDs.contains(file.id) { contains = true }
+                    if selectedFileIDs.contains(file.id) {
+                        contains = true
+                    }
                 case let .folder(subfolder):
-                    if dfs(subfolder) { contains = true }
+                    if dfs(subfolder) {
+                        contains = true
+                    }
                 }
             }
-            if contains { result.insert(folder.id) }
+            if contains {
+                result.insert(folder.id)
+            }
             return contains
         }
 
@@ -567,12 +611,18 @@ enum CodeMapExtractor {
         var visited = Set<UUID>()
         var stack = [folder]
         while let current = stack.popLast() {
-            if Task.isCancelled { return false }
-            if !visited.insert(current.id).inserted { continue }
+            if Task.isCancelled {
+                return false
+            }
+            if !visited.insert(current.id).inserted {
+                continue
+            }
             for child in current.children {
                 switch child {
                 case let .file(file):
-                    if selectedFileIDs.contains(file.id) { return true }
+                    if selectedFileIDs.contains(file.id) {
+                        return true
+                    }
                 case let .folder(sub):
                     stack.append(sub)
                 }
@@ -622,7 +672,9 @@ enum CodeMapExtractor {
         showCodeMapMarkers: Bool = true
     ) -> String {
         guard !subsetFullPaths.isEmpty, !roots.isEmpty else { return "" }
-        if Task.isCancelled { return "" }
+        if Task.isCancelled {
+            return ""
+        }
 
         let matchingRoots = roots.sorted { $0.standardizedRootFullPath.count > $1.standardizedRootFullPath.count }
         var rootNodes: [String: SubsetNode] = [:]
@@ -640,14 +692,18 @@ enum CodeMapExtractor {
         }
 
         for rawPath in subsetFullPaths {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
             let stdPath = StandardizedPath.absolute(rawPath)
             guard let root = matchingRoots.first(where: {
                 stdPath == $0.standardizedRootFullPath || stdPath.hasPrefix($0.standardizedRootFullPath + "/")
             }) else { continue }
 
             let rootFull = root.standardizedRootFullPath
-            if stdPath == rootFull { continue }
+            if stdPath == rootFull {
+                continue
+            }
             let needsSlash = stdPath.hasPrefix(rootFull + "/")
             let startIdx = stdPath.index(stdPath.startIndex, offsetBy: rootFull.count + (needsSlash ? 1 : 0))
             let rel = String(stdPath[startIdx...])
@@ -672,7 +728,9 @@ enum CodeMapExtractor {
             _ node: SubsetNode,
             basePrefix: String
         ) {
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
             let folderNames = node.folders.keys.sorted()
             let fileNames = node.files.keys.sorted()
             let totalCount = folderNames.count + fileNames.count
@@ -692,15 +750,21 @@ enum CodeMapExtractor {
                 let fullPath = node.files[name] ?? ""
                 let marked = selectedMarkAll
                 let hasMap = showCodeMapMarkers && !fullPath.isEmpty && standardizedCodeMapPaths.contains(fullPath)
-                if marked { usedSelected = true }
-                if hasMap { usedCodeMap = true }
+                if marked {
+                    usedSelected = true
+                }
+                if hasMap {
+                    usedCodeMap = true
+                }
                 sb.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(name)\(marked ? selectedMark : "")\(hasMap ? codeMapMark : "")")
             }
         }
 
         let rootsWithContent = roots.filter { rootNodes[$0.standardizedRootFullPath] != nil }
         for (idx, root) in rootsWithContent.enumerated() {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
             let rootLabel: String = if filePathDisplay == .full {
                 root.standardizedRootFullPath
             } else {
@@ -722,8 +786,12 @@ enum CodeMapExtractor {
         var text = sb.result
         if includeLegend, usedSelected || usedCodeMap {
             var legends: [String] = []
-            if usedSelected { legends.append(selectedLegend) }
-            if usedCodeMap { legends.append(codeMapLegend) }
+            if usedSelected {
+                legends.append(selectedLegend)
+            }
+            if usedCodeMap {
+                legends.append(codeMapLegend)
+            }
             text += "\n\n" + legends.joined(separator: "\n")
         }
         return text
@@ -753,7 +821,9 @@ enum CodeMapExtractor {
         showCodeMapMarkers: Bool = true
     ) -> String {
         guard !rootFolders.isEmpty else { return "" }
-        if Task.isCancelled { return "" }
+        if Task.isCancelled {
+            return ""
+        }
 
         // Filter roots if requested to include only those that contain selected files.
         let effectiveRoots: [FolderViewModel] = onlyIncludeRootsWithSelectedFiles
@@ -761,7 +831,9 @@ enum CodeMapExtractor {
             : rootFolders
 
         guard !effectiveRoots.isEmpty else { return "" }
-        if Task.isCancelled { return "" }
+        if Task.isCancelled {
+            return ""
+        }
 
         let normalizedMode = mode.lowercased()
         let shouldApplyMCPBudget = isMCPContext
@@ -774,7 +846,9 @@ enum CodeMapExtractor {
         var _selectedFolderIDs: Set<UUID>? = nil
         @inline(__always)
         func selectedFolderIDs() -> Set<UUID> {
-            if let s = _selectedFolderIDs { return s }
+            if let s = _selectedFolderIDs {
+                return s
+            }
             guard !selectedFileIDs.isEmpty else { _selectedFolderIDs = []
                 return []
             }
@@ -793,7 +867,8 @@ enum CodeMapExtractor {
             var remaining = tokenBudget
 
             for (idx, root) in effectiveRoots.enumerated() {
-                if Task.isCancelled { hitBudget = true
+                if Task.isCancelled {
+                    hitBudget = true
                     break
                 }
                 if let rem = remaining, rem <= 0 {
@@ -829,7 +904,9 @@ enum CodeMapExtractor {
 
                 if truncated {
                     hitBudget = true
-                    if remaining != nil { remaining = 0 }
+                    if remaining != nil {
+                        remaining = 0
+                    }
                     break
                 }
 
@@ -874,8 +951,12 @@ enum CodeMapExtractor {
                 if includeLegend {
                     if used || usedCM {
                         var legends: [String] = []
-                        if used { legends.append(selectedLegend) }
-                        if usedCM { legends.append(codeMapLegend) }
+                        if used {
+                            legends.append(selectedLegend)
+                        }
+                        if usedCM {
+                            legends.append(codeMapLegend)
+                        }
                         text += "\n\n" + legends.joined(separator: "\n")
                         if text.contains("\n...") {
                             text += "\n\n… indicates additional items hidden."
@@ -894,13 +975,19 @@ enum CodeMapExtractor {
                 return text
             } else {
                 let (tree, usedSel, truncated) = buildOnce(mode: mode, depthLimit: userMaxDepth, tokenBudget: tokenBudget)
-                if tree.isEmpty { return tree }
+                if tree.isEmpty {
+                    return tree
+                }
                 var text = tree
                 let usedCM = showCodeMapMarkers && text.contains(codeMapMark)
                 if includeLegend, usedSel || usedCM {
                     var legends: [String] = []
-                    if usedSel { legends.append(selectedLegend) }
-                    if usedCM { legends.append(codeMapLegend) }
+                    if usedSel {
+                        legends.append(selectedLegend)
+                    }
+                    if usedCM {
+                        legends.append(codeMapLegend)
+                    }
                     text += "\n\n" + legends.joined(separator: "\n")
                 }
                 var didTruncate = truncated
@@ -926,12 +1013,16 @@ enum CodeMapExtractor {
                 case .fullUnlimited:
                     return ("full", userMaxDepth)
                 case .fullDepth3:
-                    if let userDepth = userMaxDepth { return ("full", min(3, userDepth)) }
+                    if let userDepth = userMaxDepth {
+                        return ("full", min(3, userDepth))
+                    }
                     return ("full", 3)
                 case .foldersUnlimited:
                     return ("folders", userMaxDepth)
                 case .foldersDepth3:
-                    if let userDepth = userMaxDepth { return ("folders", min(3, userDepth)) }
+                    if let userDepth = userMaxDepth {
+                        return ("folders", min(3, userDepth))
+                    }
                     return ("folders", 3)
                 case .selectedOnly:
                     // Show only the selected files (and their ancestor folders)
@@ -970,7 +1061,9 @@ enum CodeMapExtractor {
                     // Precompute code-map IDs for all effective roots in this pass when markers are enabled.
                     let codeMapIDs = ctx.settings.showCodeMapMarkers ? collectCodeMapIDs(from: effectiveRoots) : []
                     for (idx, root) in effectiveRoots.enumerated() {
-                        if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
+                        if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget {
+                            return .tooLarge
+                        }
                         /// Use the same emitter as in generateFileTreeWithDepth by defining a minimal local version
                         /// Local visible-children (no hidden-file flag; rely on RepoPrompt visibility)
                         func localVisibleChildren(of folder: FolderViewModel, mode: String, selectedFileIDs: Set<UUID>, cache: inout [VCCacheKey: [FileSystemItemType]]) -> [FileSystemItemType] {
@@ -982,7 +1075,9 @@ enum CodeMapExtractor {
                             default: 1
                             }
                             let key = VCCacheKey(folderID: folder.id, mode: modeKey)
-                            if let cached = cache[key] { return cached }
+                            if let cached = cache[key] {
+                                return cached
+                            }
                             var folders: [FolderViewModel] = []
                             var files: [FileViewModel] = []
                             for child in folder.children {
@@ -997,17 +1092,23 @@ enum CodeMapExtractor {
                                     default:
                                         true
                                     }
-                                    if includeFolder { folders.append(fo) }
+                                    if includeFolder {
+                                        folders.append(fo)
+                                    }
                                 case let .file(fi):
                                     if m == "folders" {
                                         // Keep selected files visible in folders-only
-                                        if selectedFileIDs.contains(fi.id) { files.append(fi) }
+                                        if selectedFileIDs.contains(fi.id) {
+                                            files.append(fi)
+                                        }
                                     } else {
                                         let includeFile: Bool = {
                                             switch m {
                                             case "auto":
                                                 // Rely on RepoPrompt visibility; filter by extension only
-                                                if let ext = fi.fileExtension?.lowercased(), badExt.contains(ext) { return false }
+                                                if let ext = fi.fileExtension?.lowercased(), badExt.contains(ext) {
+                                                    return false
+                                                }
                                                 return true
                                             case "full":
                                                 return true
@@ -1015,7 +1116,9 @@ enum CodeMapExtractor {
                                                 return true
                                             }
                                         }()
-                                        if includeFile { files.append(fi) }
+                                        if includeFile {
+                                            files.append(fi)
+                                        }
                                     }
                                 }
                             }
@@ -1036,16 +1139,22 @@ enum CodeMapExtractor {
                             sb: inout StringBuilder,
                             visited: inout Set<UUID>
                         ) -> BuildOutcome {
-                            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
+                            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget {
+                                return .tooLarge
+                            }
                             switch child {
                             case let .file(fi):
                                 let marked = ctx.selectedFileIDs.contains(fi.id)
                                 let hasMap = ctx.settings.showCodeMapMarkers && codeMapIDs.contains(fi.id)
-                                if marked { ctx.usedSelectedMarker = true }
+                                if marked {
+                                    ctx.usedSelectedMarker = true
+                                }
                                 sb.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(fi.name)\(marked ? selectedMark : "")\(hasMap ? codeMapMark : "")")
                                 return .ok
                             case let .folder(fo):
-                                if !visited.insert(fo.id).inserted { return .ok }
+                                if !visited.insert(fo.id).inserted {
+                                    return .ok
+                                }
                                 sb.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(fo.name)")
                                 let nextPrefix = basePrefix + (isLast ? "    " : "│   ")
                                 let selectedFolderIDs = ctx.getSelectedFolderIDs()
@@ -1085,14 +1194,22 @@ enum CodeMapExtractor {
                             sb: inout StringBuilder,
                             visited: inout Set<UUID>
                         ) -> BuildOutcome {
-                            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
-                            if !visited.insert(folder.id).inserted { return .ok }
+                            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget {
+                                return .tooLarge
+                            }
+                            if !visited.insert(folder.id).inserted {
+                                return .ok
+                            }
                             let m = ctx.settings.mode.lowercased()
 
                             let includeFolder: Bool = {
-                                if m == "selected" { return isRoot || ctx.getSelectedFolderIDs().contains(folder.id) }
+                                if m == "selected" {
+                                    return isRoot || ctx.getSelectedFolderIDs().contains(folder.id)
+                                }
                                 if m == "auto" {
-                                    if isRoot { return true }
+                                    if isRoot {
+                                        return true
+                                    }
                                     // No hidden-file filtering; rely on RepoPrompt visibility
                                     return !badDirs.contains(folder.name.lowercased())
                                 }
@@ -1193,9 +1310,17 @@ enum CodeMapExtractor {
                                 for it in items {
                                     switch it {
                                     case let .folder(fo):
-                                        if selFolderIDs.contains(fo.id) { selFolders.append(it) } else { otherFolders.append(it) }
+                                        if selFolderIDs.contains(fo.id) {
+                                            selFolders.append(it)
+                                        } else {
+                                            otherFolders.append(it)
+                                        }
                                     case let .file(fi):
-                                        if ctx.selectedFileIDs.contains(fi.id) { selFiles.append(it) } else { otherFiles.append(it) }
+                                        if ctx.selectedFileIDs.contains(fi.id) {
+                                            selFiles.append(it)
+                                        } else {
+                                            otherFiles.append(it)
+                                        }
                                     }
                                 }
                                 let prioritized = selFolders + otherFolders + selFiles + otherFiles
@@ -1204,7 +1329,9 @@ enum CodeMapExtractor {
                                 }
                                 let selectedCount = (selFolders.count + selFiles.count)
                                 let allowed = max(cap, selectedCount)
-                                if prioritized.count <= allowed { return (prioritized, 0) }
+                                if prioritized.count <= allowed {
+                                    return (prioritized, 0)
+                                }
                                 return (Array(prioritized.prefix(allowed)), prioritized.count - allowed)
                             }
                             let capResult = prioritizeAndCap(wouldInclude, ctx: &ctx)
@@ -1218,10 +1345,14 @@ enum CodeMapExtractor {
                                         return .tooLarge
                                     }
                                 case let .file(fi):
-                                    if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
+                                    if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget {
+                                        return .tooLarge
+                                    }
                                     let marked = ctx.selectedFileIDs.contains(fi.id)
                                     let hasMap = ctx.settings.showCodeMapMarkers && codeMapIDs.contains(fi.id)
-                                    if marked { ctx.usedSelectedMarker = true }
+                                    if marked {
+                                        ctx.usedSelectedMarker = true
+                                    }
                                     sb.appendLine("\(childPrefixBase)\(childIsLast ? "└── " : "├── ")\(fi.name)\(marked ? selectedMark : "")\(hasMap ? codeMapMark : "")")
                                 }
                             }
@@ -1231,7 +1362,9 @@ enum CodeMapExtractor {
                         if case .tooLarge = localEmit(root, depth: 0, prefix: "", isRoot: true, isLast: true, ctx: &ctx, sb: &sb, visited: &visited) {
                             return .tooLarge
                         }
-                        if idx < effectiveRoots.count - 1 { sb.appendLine("") }
+                        if idx < effectiveRoots.count - 1 {
+                            sb.appendLine("")
+                        }
                     }
                     used = ctx.usedSelectedMarker
                     return .ok
@@ -1247,22 +1380,34 @@ enum CodeMapExtractor {
                     case .fullUnlimited:
                         break
                     case .fullDepth3:
-                        if let d = depthCap { noteParts.append("depth cap \(d)") }
+                        if let d = depthCap {
+                            noteParts.append("depth cap \(d)")
+                        }
                     case .foldersUnlimited:
                         noteParts.append("directory-only view")
-                        if !selectedFileIDs.isEmpty { noteParts.append("selected files shown") }
+                        if !selectedFileIDs.isEmpty {
+                            noteParts.append("selected files shown")
+                        }
                     case .foldersDepth3:
                         noteParts.append("directory-only view")
-                        if let d = depthCap { noteParts.append("depth cap \(d)") }
-                        if !selectedFileIDs.isEmpty { noteParts.append("selected files shown") }
+                        if let d = depthCap {
+                            noteParts.append("depth cap \(d)")
+                        }
+                        if !selectedFileIDs.isEmpty {
+                            noteParts.append("selected files shown")
+                        }
                     case .selectedOnly:
                         noteParts.append("selected-only view")
                     }
                     // Render legends first (preserve original styling)
                     if includeLegend, used || usedCM {
                         var legends: [String] = []
-                        if used { legends.append(selectedLegend) }
-                        if usedCM { legends.append(codeMapLegend) }
+                        if used {
+                            legends.append(selectedLegend)
+                        }
+                        if usedCM {
+                            legends.append(codeMapLegend)
+                        }
                         text += "\n\n" + legends.joined(separator: "\n")
                     }
                     // Render a separate, clear note line if present
@@ -1298,7 +1443,9 @@ enum CodeMapExtractor {
         badDirs: Set<String>,
         showCodeMapMarkers: Bool
     ) -> (String, Bool, Bool) {
-        if Task.isCancelled { return ("", false, false) }
+        if Task.isCancelled {
+            return ("", false, false)
+        }
         var usedSelectedMarker = false
         // Precompute code-map IDs for this subtree when markers are enabled.
         let codeMapIDs = showCodeMapMarkers ? collectCodeMapIDs(from: [rootFolder]) : []
@@ -1313,7 +1460,9 @@ enum CodeMapExtractor {
             selectedFileIDs: Set<UUID>,
             cache: inout [VCCacheKey: [FileSystemItemType]]
         ) -> [FileSystemItemType] {
-            if Task.isCancelled { return [] }
+            if Task.isCancelled {
+                return []
+            }
             let m = mode.lowercased()
             let modeKey: UInt8 = switch m {
             case "auto": 0
@@ -1322,13 +1471,17 @@ enum CodeMapExtractor {
             default: 1
             }
             let key = VCCacheKey(folderID: folder.id, mode: modeKey)
-            if let cached = cache[key] { return cached }
+            if let cached = cache[key] {
+                return cached
+            }
 
             var folders: [FolderViewModel] = []
             var files: [FileViewModel] = []
 
             for child in folder.children {
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    break
+                }
                 switch child {
                 case let .folder(fo):
                     let includeFolder: Bool = switch m {
@@ -1340,17 +1493,23 @@ enum CodeMapExtractor {
                     default:
                         true
                     }
-                    if includeFolder { folders.append(fo) }
+                    if includeFolder {
+                        folders.append(fo)
+                    }
                 case let .file(fi):
                     if m == "folders" {
                         // Keep selected files visible even in folders-only mode
-                        if selectedFileIDs.contains(fi.id) { files.append(fi) }
+                        if selectedFileIDs.contains(fi.id) {
+                            files.append(fi)
+                        }
                     } else {
                         let includeFile: Bool = {
                             switch m {
                             case "auto":
                                 // Rely on RepoPrompt visibility; filter by extension only
-                                if let ext = fi.fileExtension?.lowercased(), badExt.contains(ext) { return false }
+                                if let ext = fi.fileExtension?.lowercased(), badExt.contains(ext) {
+                                    return false
+                                }
                                 return true
                             case "full":
                                 return true
@@ -1358,7 +1517,9 @@ enum CodeMapExtractor {
                                 return true
                             }
                         }()
-                        if includeFile { files.append(fi) }
+                        if includeFile {
+                            files.append(fi)
+                        }
                     }
                 }
             }
@@ -1383,19 +1544,27 @@ enum CodeMapExtractor {
             sb: inout StringBuilder,
             visited: inout Set<UUID>
         ) -> BuildOutcome {
-            if Task.isCancelled { return .tooLarge }
-            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
+            if Task.isCancelled {
+                return .tooLarge
+            }
+            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget {
+                return .tooLarge
+            }
 
             switch child {
             case let .file(fi):
                 let marked = ctx.selectedFileIDs.contains(fi.id)
                 let hasMap = ctx.settings.showCodeMapMarkers && codeMapIDs.contains(fi.id)
-                if marked { ctx.usedSelectedMarker = true }
+                if marked {
+                    ctx.usedSelectedMarker = true
+                }
                 sb.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(fi.name)\(marked ? selectedMark : "")\(hasMap ? codeMapMark : "")")
                 return .ok
 
             case let .folder(fo):
-                if !visited.insert(fo.id).inserted { return .ok }
+                if !visited.insert(fo.id).inserted {
+                    return .ok
+                }
                 sb.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(fo.name)")
                 let nextPrefix = basePrefix + (isLast ? "    " : "│   ")
 
@@ -1437,17 +1606,27 @@ enum CodeMapExtractor {
             sb: inout StringBuilder,
             visited: inout Set<UUID>
         ) -> BuildOutcome {
-            if Task.isCancelled { return .tooLarge }
-            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
-            if !visited.insert(folder.id).inserted { return .ok }
+            if Task.isCancelled {
+                return .tooLarge
+            }
+            if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget {
+                return .tooLarge
+            }
+            if !visited.insert(folder.id).inserted {
+                return .ok
+            }
 
             let m = ctx.settings.mode.lowercased()
 
             // Folder inclusion rules
             let includeFolder: Bool = {
-                if m == "selected" { return isRoot || ctx.getSelectedFolderIDs().contains(folder.id) }
+                if m == "selected" {
+                    return isRoot || ctx.getSelectedFolderIDs().contains(folder.id)
+                }
                 if m == "auto" {
-                    if isRoot { return true }
+                    if isRoot {
+                        return true
+                    }
                     // No hidden-file filtering; rely on RepoPrompt visibility
                     return !badDirs.contains(folder.name.lowercased())
                 }
@@ -1568,9 +1747,17 @@ enum CodeMapExtractor {
                 for it in items {
                     switch it {
                     case let .folder(fo):
-                        if selFolderIDs.contains(fo.id) { selFolders.append(it) } else { otherFolders.append(it) }
+                        if selFolderIDs.contains(fo.id) {
+                            selFolders.append(it)
+                        } else {
+                            otherFolders.append(it)
+                        }
                     case let .file(fi):
-                        if selectedFileIDs.contains(fi.id) { selFiles.append(it) } else { otherFiles.append(it) }
+                        if selectedFileIDs.contains(fi.id) {
+                            selFiles.append(it)
+                        } else {
+                            otherFiles.append(it)
+                        }
                     }
                 }
                 let prioritized = selFolders + otherFolders + selFiles + otherFiles
@@ -1579,7 +1766,9 @@ enum CodeMapExtractor {
                 }
                 let selectedCount = (selFolders.count + selFiles.count)
                 let allowed = max(cap, selectedCount)
-                if prioritized.count <= allowed { return (prioritized, 0) }
+                if prioritized.count <= allowed {
+                    return (prioritized, 0)
+                }
                 return (Array(prioritized.prefix(allowed)), prioritized.count - allowed)
             }
             let capResult = prioritizeAndCap(wouldInclude, ctx: &ctx)
@@ -1593,10 +1782,14 @@ enum CodeMapExtractor {
                         return .tooLarge
                     }
                 case let .file(fi):
-                    if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget { return .tooLarge }
+                    if let budget = ctx.tokenBudget, sb.estimatedTokens >= budget {
+                        return .tooLarge
+                    }
                     let marked = ctx.selectedFileIDs.contains(fi.id)
                     let hasMap = ctx.settings.showCodeMapMarkers && codeMapIDs.contains(fi.id)
-                    if marked { ctx.usedSelectedMarker = true }
+                    if marked {
+                        ctx.usedSelectedMarker = true
+                    }
                     sb.appendLine("\(childPrefixBase)\(childIsLast ? "└── " : "├── ")\(fi.name)\(marked ? selectedMark : "")\(hasMap ? codeMapMark : "")")
                 }
             }
@@ -1748,18 +1941,28 @@ enum CodeMapExtractor {
             .sorted { $0.standardizedFullPath.count > $1.standardizedFullPath.count }
 
         for root in candidateRoots {
-            if root.standardizedFullPath == targetPath { return (root, root) }
+            if root.standardizedFullPath == targetPath {
+                return (root, root)
+            }
             var stack = [FolderViewModel]()
             var visited = Set<UUID>()
             visited.insert(root.id)
             for child in root.children {
-                if case let .folder(f) = child { stack.append(f) }
+                if case let .folder(f) = child {
+                    stack.append(f)
+                }
             }
             while let f = stack.popLast() {
-                if !visited.insert(f.id).inserted { continue }
-                if f.standardizedFullPath == targetPath { return (f, root) }
+                if !visited.insert(f.id).inserted {
+                    continue
+                }
+                if f.standardizedFullPath == targetPath {
+                    return (f, root)
+                }
                 for child in f.children {
-                    if case let .folder(sub) = child { stack.append(sub) }
+                    if case let .folder(sub) = child {
+                        stack.append(sub)
+                    }
                 }
             }
         }
@@ -1779,7 +1982,9 @@ enum CodeMapExtractor {
         isExplicitSubtree: Bool = false,
         showCodeMapMarkers: Bool = true
     ) -> String {
-        if option == .none { return "" }
+        if option == .none {
+            return ""
+        }
 
         // Preserve legacy behavior: no explicit depth cap and includeHidden = true.
         return generateFileTreeForRoots(

@@ -369,10 +369,14 @@ extension AgentModeViewModel {
         case .idle:
             return
         case let .reserved(storedID, attachments):
-            if let reservationID, reservationID != storedID { return }
+            if let reservationID, reservationID != storedID {
+                return
+            }
             session.attachmentTurnState = .consumed(reservationID: storedID, attachments: attachments)
         case let .consumed(storedID, _):
-            if let reservationID, reservationID != storedID { return }
+            if let reservationID, reservationID != storedID {
+                return
+            }
             return
         }
     }
@@ -412,7 +416,9 @@ extension AgentModeViewModel {
             return
         case let .reserved(storedID, storedAttachments),
              let .consumed(storedID, storedAttachments):
-            if let reservationID, reservationID != storedID { return }
+            if let reservationID, reservationID != storedID {
+                return
+            }
             attachments = storedAttachments
         }
 

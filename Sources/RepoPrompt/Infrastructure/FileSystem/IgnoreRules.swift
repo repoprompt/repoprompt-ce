@@ -12,7 +12,9 @@ enum IgnoreRulePolicy {
     case nonGitRoot
 
     var enforcesGitIgnoreFloor: Bool {
-        if case .gitRoot = self { return true }
+        if case .gitRoot = self {
+            return true
+        }
         return false
     }
 
@@ -137,7 +139,9 @@ final class IgnoreRules {
                 isDirectory: isDirectory,
                 authority: .mandatoryGit
             )
-            if gitOutcome == .ignore { return .ignore }
+            if gitOutcome == .ignore {
+                return .ignore
+            }
             if let secondaryOutcome = matchOutcome(
                 relativePathComponents: repositoryComponents,
                 isDirectory: isDirectory,
@@ -349,7 +353,9 @@ struct IgnoreRulesSnapshot {
                 relativePathComponents: repositoryComponents,
                 isDirectory: isDirectory
             )
-            if gitOutcome == .ignore { return .ignore }
+            if gitOutcome == .ignore {
+                return .ignore
+            }
             return Self.matchOutcome(
                 in: secondaryLayers,
                 relativePathComponents: repositoryComponents,

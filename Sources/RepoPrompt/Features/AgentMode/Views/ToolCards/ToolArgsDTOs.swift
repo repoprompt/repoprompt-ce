@@ -33,8 +33,12 @@ enum ToolArgsDTOs {
         let filter: Filter?
 
         var scopePaths: [String] {
-            if let paths = filter?.paths, !paths.isEmpty { return paths }
-            if let path, !path.isEmpty { return [path] }
+            if let paths = filter?.paths, !paths.isEmpty {
+                return paths
+            }
+            if let path, !path.isEmpty {
+                return [path]
+            }
             return []
         }
     }

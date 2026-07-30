@@ -143,7 +143,9 @@ private actor MCPConnectionStopRace {
     }
 
     func wait() async -> MCPConnectionStopRaceOutcome {
-        if let outcome { return outcome }
+        if let outcome {
+            return outcome
+        }
         return await withCheckedContinuation { continuation in
             waiters.append(continuation)
         }
@@ -6063,7 +6065,9 @@ actor ServerNetworkManager {
         }
         // Fallback scan in case mapping got out of sync.
         for (id, mgr) in connections {
-            if mgr.isFilesystemBacked || connectionsBeingRemoved.contains(id) { continue }
+            if mgr.isFilesystemBacked || connectionsBeingRemoved.contains(id) {
+                continue
+            }
             let stored = capabilityTokenByConnection[id] ?? mgr.capabilityToken
             if stored == token {
                 bindSessionToken(token, to: id)
@@ -6628,8 +6632,11 @@ actor ServerNetworkManager {
         if let clientID = clientIDByConnection[id] {
             var set = activeConnectionsByClient[clientID] ?? []
             set.remove(id)
-            if set.isEmpty { activeConnectionsByClient.removeValue(forKey: clientID) }
-            else { activeConnectionsByClient[clientID] = set }
+            if set.isEmpty {
+                activeConnectionsByClient.removeValue(forKey: clientID)
+            } else {
+                activeConnectionsByClient[clientID] = set
+            }
             clientIDByConnection.removeValue(forKey: id)
         }
         // Clean up routing metadata before any bounded drain wait so the disconnected
@@ -6819,7 +6826,9 @@ actor ServerNetworkManager {
             if !shouldAdvertiseCanonicalBindingParams {
                 required.removeAll { value in
                     guard let stringValue = value.stringValue else { return false }
-                    if stringValue == "context_id" { return !shouldKeepContextID }
+                    if stringValue == "context_id" {
+                        return !shouldKeepContextID
+                    }
                     return stringValue == "working_dirs"
                 }
             }
@@ -6861,7 +6870,9 @@ actor ServerNetworkManager {
         args: [String: Value]
     ) -> [String: Value] {
         // Priority 1: explicit window_id in args -> keep unchanged
-        if args["window_id"] != nil { return args }
+        if args["window_id"] != nil {
+            return args
+        }
 
         // Priority 2: _windowID routing + schema has window_id -> inject
         guard let windowID = routingWindowID,
@@ -7345,7 +7356,9 @@ actor ServerNetworkManager {
             guard var queue = pendingPoliciesByClient[key] else { continue }
             for index in queue.indices {
                 guard queue[index].runID == runID else { continue }
-                if let windowID, queue[index].windowID != windowID { continue }
+                if let windowID, queue[index].windowID != windowID {
+                    continue
+                }
                 matchedCount += 1
                 if !queue[index].requiresExpectedAgentPID {
                     queue[index].requiresExpectedAgentPID = true
@@ -8303,10 +8316,14 @@ actor ServerNetworkManager {
                         guard !excludeConnectionIDs.contains(entry.id) else { return false }
                         guard MCPClientIdentity.matches(entry.clientName, clientName) else { return false }
                         guard debugSessionFingerprint(forToken: entry.sessionKey) == fingerprint else { return false }
-                        if requireReady, entry.state != .ready { return false }
+                        if requireReady, entry.state != .ready {
+                            return false
+                        }
                         return true
                     }
-                    if found != nil { break }
+                    if found != nil {
+                        break
+                    }
                     try? await Task.sleep(for: .milliseconds(pollMS))
                 } while Date() < deadline
 
@@ -9482,7 +9499,9 @@ actor ServerNetworkManager {
                 }
             }
             .sorted { lhs, rhs in
-                if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+                if lhs.sequence != rhs.sequence {
+                    return lhs.sequence < rhs.sequence
+                }
                 return lhs.scopeID.uuidString < rhs.scopeID.uuidString
             }
         }
@@ -9577,7 +9596,9 @@ actor ServerNetworkManager {
                             toolName: tool.name,
                             taskLabelKind: policy.taskLabelKind,
                             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                        ) { continue }
+                        ) {
+                            continue
+                        }
 
                         guard seenNames.insert(tool.name).inserted else { continue }
                         names.append(tool.name)
@@ -12462,8 +12483,12 @@ actor ServerNetworkManager {
                                     // App-wide coordination tools have a single owning service. Avoid probing
                                     // unrelated window-scoped services for their tool lists during startup,
                                     // because some of those lists hop through UI/window state.
-                                    if toolName == "bind_context", !(service is WindowRoutingService) { continue }
-                                    if toolName == AppSettingsMCPService.toolName, !(service is AppSettingsMCPService) { continue }
+                                    if toolName == "bind_context", !(service is WindowRoutingService) {
+                                        continue
+                                    }
+                                    if toolName == AppSettingsMCPService.toolName, !(service is AppSettingsMCPService) {
+                                        continue
+                                    }
 
                                     let wsSvc = service as? WindowScopedService
 
@@ -12970,8 +12995,12 @@ actor ServerNetworkManager {
                     )
                 }
             }.sorted { lhs, rhs in
-                if lhs.sequence != rhs.sequence { return lhs.sequence > rhs.sequence }
-                if lhs.windowID != rhs.windowID { return lhs.windowID < rhs.windowID }
+                if lhs.sequence != rhs.sequence {
+                    return lhs.sequence > rhs.sequence
+                }
+                if lhs.windowID != rhs.windowID {
+                    return lhs.windowID < rhs.windowID
+                }
                 return lhs.toolName < rhs.toolName
             }
 
@@ -13223,7 +13252,9 @@ actor ServerNetworkManager {
                 }
                 pruneDeadSlots(for: clientID)
                 effectiveSet = effectiveActiveConnectionIDs(for: clientID)
-                if effectiveSet.count < maxConnectionsPerClient { break }
+                if effectiveSet.count < maxConnectionsPerClient {
+                    break
+                }
 
                 let evictionResult = await evictLeastValuable(
                     for: clientID,
@@ -13233,7 +13264,9 @@ actor ServerNetworkManager {
                     return false
                 }
                 effectiveSet = effectiveActiveConnectionIDs(for: clientID)
-                if effectiveSet.count < maxConnectionsPerClient { break }
+                if effectiveSet.count < maxConnectionsPerClient {
+                    break
+                }
 
                 switch evictionResult {
                 case .evicted, .capacityChanged:
@@ -13283,8 +13316,11 @@ actor ServerNetworkManager {
         if let clientID = clientIDByConnection[connectionID] {
             var set = activeConnectionsByClient[clientID] ?? []
             set.remove(connectionID)
-            if set.isEmpty { activeConnectionsByClient.removeValue(forKey: clientID) }
-            else { activeConnectionsByClient[clientID] = set }
+            if set.isEmpty {
+                activeConnectionsByClient.removeValue(forKey: clientID)
+            } else {
+                activeConnectionsByClient[clientID] = set
+            }
             clientIDByConnection.removeValue(forKey: connectionID)
         }
     }
@@ -13500,7 +13536,9 @@ actor ServerNetworkManager {
     func recordToolCall(for connectionID: UUID, toolName: String) {
         // Hidden coordination calls should not appear in dashboards/histories.
         let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
-        if canonicalToolName == "set_status" || canonicalToolName == "bind_context" { return }
+        if canonicalToolName == "set_status" || canonicalToolName == "bind_context" {
+            return
+        }
 
         // If this connection dropped out of the active sets (e.g., after transport toggles),
         // re-associate it now that we have a live tool call.
@@ -13884,15 +13922,24 @@ actor ServerNetworkManager {
         guard var set = activeConnectionsByClient[clientID] else { return }
         let live = Set(connections.keys)
         set = set.filter { live.contains($0) }
-        if set.isEmpty { activeConnectionsByClient.removeValue(forKey: clientID) }
-        else { activeConnectionsByClient[clientID] = set }
+        if set.isEmpty {
+            activeConnectionsByClient.removeValue(forKey: clientID)
+        } else {
+            activeConnectionsByClient[clientID] = set
+        }
     }
 
     /// Connection is evictable if it has no in-flight calls and does not own an active tool.
     private func isEvictable(_ id: UUID) async -> Bool {
-        if connectionsBeingRemoved.contains(id) { return false }
-        if let limiters = callLimiters[id], await limiters.hasInFlightCalls() { return false }
-        if hasActiveToolScopes(ownedBy: id) { return false }
+        if connectionsBeingRemoved.contains(id) {
+            return false
+        }
+        if let limiters = callLimiters[id], await limiters.hasInFlightCalls() {
+            return false
+        }
+        if hasActiveToolScopes(ownedBy: id) {
+            return false
+        }
         return true
     }
 
@@ -14062,9 +14109,15 @@ actor ServerNetworkManager {
 
     /// Sort ascending by value (least valuable first)
     private func isLessValuable(_ a: EvictionCandidate, than b: EvictionCandidate) -> Bool {
-        if a.everCalled != b.everCalled { return a.everCalled == false }
-        if a.idleSeconds != b.idleSeconds { return a.idleSeconds > b.idleSeconds }
-        if a.totalCalls != b.totalCalls { return a.totalCalls < b.totalCalls }
+        if a.everCalled != b.everCalled {
+            return a.everCalled == false
+        }
+        if a.idleSeconds != b.idleSeconds {
+            return a.idleSeconds > b.idleSeconds
+        }
+        if a.totalCalls != b.totalCalls {
+            return a.totalCalls < b.totalCalls
+        }
         return a.createdAt < b.createdAt
     }
 

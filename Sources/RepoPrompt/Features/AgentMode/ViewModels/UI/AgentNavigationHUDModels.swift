@@ -94,13 +94,17 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
     }
 
     var effectiveStatusState: AgentSessionRunState? {
-        if runState == .running { return .running }
+        if runState == .running {
+            return .running
+        }
         return attentionState ?? runState
     }
 
     var isUnseenAttention: Bool {
         guard let attentionState else { return false }
-        if runState == .running { return false }
+        if runState == .running {
+            return false
+        }
         return Self.isAttentionEligible(attentionState)
     }
 
@@ -114,11 +118,21 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
 
     var accessibilityStatusText: String {
         var parts: [String] = []
-        if let statusLabel { parts.append(statusLabel) }
-        if isArchived { parts.append("Archived") }
-        if isMCPControlled { parts.append("MCP controlled") }
-        if let worktreeLabel { parts.append("worktree \(worktreeLabel)") }
-        if let mergeLabel { parts.append("merge ready to \(mergeLabel)") }
+        if let statusLabel {
+            parts.append(statusLabel)
+        }
+        if isArchived {
+            parts.append("Archived")
+        }
+        if isMCPControlled {
+            parts.append("MCP controlled")
+        }
+        if let worktreeLabel {
+            parts.append("worktree \(worktreeLabel)")
+        }
+        if let mergeLabel {
+            parts.append("merge ready to \(mergeLabel)")
+        }
         return parts.joined(separator: ", ")
     }
 
@@ -333,8 +347,12 @@ enum AgentNavigationHUDSnapshotBuilder {
     }
 
     private static func isIncludedInAllAgentsHUD(_ item: AgentNavigationHUDItem, now: Date) -> Bool {
-        if item.runState?.isActive == true { return true }
-        if item.attentionState != nil { return true }
+        if item.runState?.isActive == true {
+            return true
+        }
+        if item.attentionState != nil {
+            return true
+        }
         return item.latestActivityAt >= now.addingTimeInterval(-24 * 60 * 60)
     }
 

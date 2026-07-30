@@ -1229,7 +1229,9 @@
                     await store.awaitAppliedIngress(rootRefs: [WorkspaceRootRef(id: rootID, name: rootName, fullPath: rootPath)])
                 }
                 for _ in 0 ..< 1000 {
-                    if await store.scopedIngressBarrierStatsForTesting(rootID: record.id).successorCount == 1 { break }
+                    if await store.scopedIngressBarrierStatsForTesting(rootID: record.id).successorCount == 1 {
+                        break
+                    }
                     await Task.yield()
                 }
 
@@ -1922,7 +1924,9 @@
             attempts: Int = 200
         ) async throws {
             for _ in 0 ..< attempts {
-                if await gate.hasStarted() { return }
+                if await gate.hasStarted() {
+                    return
+                }
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
             throw MCPDiagnosticsTimeoutError(label: label)
@@ -1933,7 +1937,9 @@
             attempts: Int = 200
         ) async -> Bool {
             for _ in 0 ..< attempts {
-                if await store.scopedIngressBarrierFlightCountForTesting() == 0 { return true }
+                if await store.scopedIngressBarrierFlightCountForTesting() == 0 {
+                    return true
+                }
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
             return await store.scopedIngressBarrierFlightCountForTesting() == 0
@@ -2013,7 +2019,9 @@
             func waitUntil(
                 _ predicate: @escaping @Sendable (Snapshot) -> Bool
             ) async -> Snapshot {
-                if let latest, predicate(latest) { return latest }
+                if let latest, predicate(latest) {
+                    return latest
+                }
                 return await withCheckedContinuation { continuation in
                     waiter = (predicate, continuation)
                 }
@@ -2231,7 +2239,9 @@
             line: UInt = #line
         ) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in
-                if case let .text(text, _, _) = content { return text }
+                if case let .text(text, _, _) = content {
+                    return text
+                }
                 return nil
             }.joined()
             let message = caseLabel ?? ""

@@ -212,18 +212,24 @@ class AnthropicProvider: AIProvider {
             baseModelName = String(modelName.dropLast("-thinking-max".count))
             isThinkingMode = true
             thinkingBudget = 32000
-            if maxTokens == nil { overrideMaxTokens = 64000 }
+            if maxTokens == nil {
+                overrideMaxTokens = 64000
+            }
         } else if modelName.hasSuffix("-thinking") {
             baseModelName = String(modelName.dropLast("-thinking".count))
             isThinkingMode = true
             // Check if it's Opus thinking (different budget)
             if modelName.contains("opus") {
                 thinkingBudget = 16000
-                if maxTokens == nil { overrideMaxTokens = 32000 }
+                if maxTokens == nil {
+                    overrideMaxTokens = 32000
+                }
             } else {
                 // Sonnet thinking
                 thinkingBudget = 16000
-                if maxTokens == nil { overrideMaxTokens = 64000 }
+                if maxTokens == nil {
+                    overrideMaxTokens = 64000
+                }
             }
         } else {
             baseModelName = modelName

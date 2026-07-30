@@ -250,7 +250,8 @@ struct PathMatchIndexes {
         // Quick ASCII probe: if all bytes < 0x80, skip folding entirely
         var isASCII = true
         for b in s.utf8 {
-            if b >= 0x80 { isASCII = false
+            if b >= 0x80 {
+                isASCII = false
                 break
             }
         }

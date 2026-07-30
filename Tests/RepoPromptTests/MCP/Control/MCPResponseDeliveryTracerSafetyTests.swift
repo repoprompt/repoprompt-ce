@@ -231,15 +231,23 @@ private extension MCPResponseDeliveryTracerSafetyTests {
             let result = payload.withUnsafeBytes { bytes in
                 write(fd, bytes.baseAddress, bytes.count)
             }
-            if result > 0 { continue }
-            if result < 0, errno == EINTR { continue }
-            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
+            if result > 0 {
+                continue
+            }
+            if result < 0, errno == EINTR {
+                continue
+            }
+            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 
     func closeIfOpen(_ fd: Int32) {
-        if fd >= 0 { close(fd) }
+        if fd >= 0 {
+            close(fd)
+        }
     }
 
     func makeBrokenPipeWriteEnd() throws -> Int32 {

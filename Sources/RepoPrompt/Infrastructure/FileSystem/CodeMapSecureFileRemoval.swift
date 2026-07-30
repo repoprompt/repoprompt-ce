@@ -57,12 +57,16 @@ enum CodeMapSecureFileRemoval {
             ownsDescriptor = false
         } else {
             descriptor = openat(parentDescriptor, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-            if descriptor < 0, errno == ENOENT { return false }
+            if descriptor < 0, errno == ENOENT {
+                return false
+            }
             guard descriptor >= 0 else { throw ioError("open") }
             ownsDescriptor = true
         }
         defer {
-            if ownsDescriptor { Darwin.close(descriptor) }
+            if ownsDescriptor {
+                Darwin.close(descriptor)
+            }
         }
 
         let expected = try fileIdentity(descriptor)
@@ -85,7 +89,9 @@ enum CodeMapSecureFileRemoval {
                 privateName = candidate
                 break
             }
-            if errno == ENOENT { return false }
+            if errno == ENOENT {
+                return false
+            }
             guard errno == EEXIST else { throw ioError("private-rename") }
         }
         guard let privateName else {
@@ -104,7 +110,9 @@ enum CodeMapSecureFileRemoval {
             throw CodeMapSecureFileRemovalError.insecureEntry
         }
         guard unlinkat(parentDescriptor, privateName, 0) == 0 else {
-            if errno == ENOENT { return false }
+            if errno == ENOENT {
+                return false
+            }
             throw ioError("private-unlink")
         }
         try synchronize(parentDescriptor, hook: hooks?.directorySynchronize)

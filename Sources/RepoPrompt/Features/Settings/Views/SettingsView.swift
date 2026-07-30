@@ -57,7 +57,9 @@ struct SettingsView: View {
         return SettingsTab.allCases
             .filter { !Self.legacyAliasTabs.contains($0) }
             .filter { tab in
-                if tab.title.lowercased().contains(searchLower) { return true }
+                if tab.title.lowercased().contains(searchLower) {
+                    return true
+                }
                 return tab.searchTags.contains { tag in
                     tag.lowercased().contains(searchLower)
                 }
@@ -128,11 +130,15 @@ struct SettingsView: View {
     private var sidebarSelection: Binding<SettingsTab?> {
         Binding(
             get: {
-                if Self.legacyAliasTabs.contains(selectedTab) { return .workflowPresets }
+                if Self.legacyAliasTabs.contains(selectedTab) {
+                    return .workflowPresets
+                }
                 return selectedTab
             },
             set: { newValue in
-                if let newValue { selectedTab = newValue }
+                if let newValue {
+                    selectedTab = newValue
+                }
             }
         )
     }

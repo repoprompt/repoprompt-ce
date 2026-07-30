@@ -1420,8 +1420,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let acceptedBeforeRead = fixture.window.mcpServer
                 .debugReadFileAutoSelectionContextSnapshot(for: target)?.acceptedIntentCount ?? 0
             var arguments: [String: Any] = ["path": path]
-            if let startLine { arguments["start_line"] = startLine }
-            if let limit { arguments["limit"] = limit }
+            if let startLine {
+                arguments["start_line"] = startLine
+            }
+            if let limit {
+                arguments["limit"] = limit
+            }
             let response = try await fixture.socketClient.request(
                 id: id,
                 method: "tools/call",
@@ -1446,7 +1450,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             while ContinuousClock.now < deadline {
                 let accepted = fixture.window.mcpServer
                     .debugReadFileAutoSelectionContextSnapshot(for: target)?.acceptedIntentCount ?? 0
-                if accepted >= minimum { return true }
+                if accepted >= minimum {
+                    return true
+                }
                 try? await Task.sleep(for: .milliseconds(10))
             }
             let accepted = fixture.window.mcpServer
@@ -2558,7 +2564,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         func waitUntilMarked(_ signal: PersistentAsyncSignal, timeout: Duration) async -> Bool {
             let deadline = ContinuousClock.now + timeout
             while ContinuousClock.now < deadline {
-                if await signal.isMarked() { return true }
+                if await signal.isMarked() {
+                    return true
+                }
                 try? await Task.sleep(for: .milliseconds(10))
             }
             return await signal.isMarked()
@@ -2638,7 +2646,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
         static func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in
-                if case let .text(text, _, _) = content { return text }
+                if case let .text(text, _, _) = content {
+                    return text
+                }
                 return nil
             }.joined()
             let data = try XCTUnwrap(text.data(using: .utf8))
@@ -2760,7 +2770,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 .appendingPathComponent("GeneratedOracleExportFileWriterTests.swift")
             let logical = try String(contentsOf: targetURL, encoding: .utf8)
             var lines = logical.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            if lines.last == "" { lines.removeLast() }
+            if lines.last == "" {
+                lines.removeLast()
+            }
             guard lines.count >= 175 else { throw ClientFixtureError.liveFixtureTooShort(lines.count) }
             return (logical, lines.prefix(175).joined(separator: "\n") + "\n")
         }
@@ -3502,7 +3514,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     $0 as AnyObject === routingService as AnyObject
                 }
                 let names = await routingService.tools.map(\.name)
-                if registered, names.contains(MCPGlobalToolName.bindContext) { break }
+                if registered, names.contains(MCPGlobalToolName.bindContext) {
+                    break
+                }
                 try await Task.sleep(for: .milliseconds(10))
             }
             if peerCatalogService == nil {
@@ -4167,7 +4181,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             isCancelled: () -> Bool
         ) throws -> String {
             while true {
-                if isCancelled() { throw CancellationError() }
+                if isCancelled() {
+                    throw CancellationError()
+                }
                 let line = try readLine(deadline: deadline, isCancelled: isCancelled)
                 let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
                 guard let object else { throw ClientError.invalidResponse }
@@ -4203,14 +4219,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     written += result
                     continue
                 }
-                if result < 0, errno == EINTR { continue }
+                if result < 0, errno == EINTR {
+                    continue
+                }
                 throw ClientError.posix(operation: "write", code: errno)
             }
         }
 
         private func readLine(deadline: Date, isCancelled: () -> Bool) throws -> Data {
             while true {
-                if isCancelled() { throw CancellationError() }
+                if isCancelled() {
+                    throw CancellationError()
+                }
                 if let newline = buffer.firstIndex(of: 0x0A) {
                     let line = Data(buffer[..<newline])
                     buffer.removeSubrange(buffer.startIndex ... newline)
@@ -4219,11 +4239,17 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 guard fd >= 0 else { throw ClientError.closed }
                 var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
                 let remainingMilliseconds = Int32(deadline.timeIntervalSinceNow * 1000)
-                if remainingMilliseconds <= 0 { throw ClientError.timedOut }
+                if remainingMilliseconds <= 0 {
+                    throw ClientError.timedOut
+                }
                 let pollResult = Darwin.poll(&descriptor, 1, min(100, remainingMilliseconds))
-                if pollResult == 0 { continue }
+                if pollResult == 0 {
+                    continue
+                }
                 if pollResult < 0 {
-                    if errno == EINTR { continue }
+                    if errno == EINTR {
+                        continue
+                    }
                     throw ClientError.posix(operation: "poll", code: errno)
                 }
                 if descriptor.revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0,
@@ -4240,8 +4266,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     buffer.append(contentsOf: bytes.prefix(readCount))
                     continue
                 }
-                if readCount == 0 { throw ClientError.closed }
-                if errno == EINTR { continue }
+                if readCount == 0 {
+                    throw ClientError.closed
+                }
+                if errno == EINTR {
+                    continue
+                }
                 throw ClientError.posix(operation: "read", code: errno)
             }
         }

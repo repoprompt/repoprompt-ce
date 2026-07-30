@@ -463,7 +463,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             covered += Int(interval.end.timeIntervalSince(interval.start))
             if index > 0 {
                 let gap = Int(interval.start.timeIntervalSince(merged[index - 1].end))
-                if gap > 0, gap <= thresholdSeconds { activeGaps += gap }
+                if gap > 0, gap <= thresholdSeconds {
+                    activeGaps += gap
+                }
             }
         }
         return max(0, covered + activeGaps)
@@ -482,7 +484,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         for turn in turns {
             let start = turn.startedAt
             let end = turn.completedAt ?? turn.lastActivityAt ?? start
-            if end >= start { intervals.append((start, end)) }
+            if end >= start {
+                intervals.append((start, end))
+            }
         }
         let merged = mergedIntervals(intervals)
         guard !merged.isEmpty else { return (0, []) }
@@ -493,7 +497,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             coveredSeconds += Int(interval.end.timeIntervalSince(interval.start))
             if index > 0 {
                 let gap = Int(interval.start.timeIntervalSince(merged[index - 1].end))
-                if gap > 0 { gapSeconds.append(gap) }
+                if gap > 0 {
+                    gapSeconds.append(gap)
+                }
             }
         }
         return (max(0, coveredSeconds), gapSeconds)

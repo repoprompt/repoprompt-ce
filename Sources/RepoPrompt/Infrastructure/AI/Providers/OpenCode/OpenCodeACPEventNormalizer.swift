@@ -126,7 +126,9 @@ enum OpenCodeACPEventNormalizer {
         isTerminal: Bool,
         isFailure: Bool
     ) -> Bool {
-        if isRepoPromptTool { return false }
+        if isRepoPromptTool {
+            return false
+        }
 
         switch toolProfile {
         case .headless, .noTools:
@@ -181,8 +183,12 @@ enum OpenCodeACPEventNormalizer {
             return true
         }
         let normalized = title.lowercased()
-        if ["tool", "other", "resource", "resources"].contains(normalized) { return true }
-        if title.count > 120 { return true }
+        if ["tool", "other", "resource", "resources"].contains(normalized) {
+            return true
+        }
+        if title.count > 120 {
+            return true
+        }
         if normalized.hasPrefix("{")
             || normalized.hasPrefix("[")
             || normalized.hasPrefix("@@")
@@ -291,14 +297,22 @@ enum OpenCodeACPEventNormalizer {
     }
 
     private static func intValue(_ value: Any?) -> Int? {
-        if let value = value as? Int { return value }
-        if let value = value as? NSNumber { return value.intValue }
-        if let value = value as? String { return Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if let value = value as? Int {
+            return value
+        }
+        if let value = value as? NSNumber {
+            return value.intValue
+        }
+        if let value = value as? String {
+            return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
         return nil
     }
 
     private static func valueIsMeaningful(_ value: Any) -> Bool {
-        if value is NSNull { return false }
+        if value is NSNull {
+            return false
+        }
         if let string = value as? String {
             return !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
@@ -312,7 +326,9 @@ enum OpenCodeACPEventNormalizer {
     }
 
     private static func dictionaryPayload(from value: Any?) -> [String: Any] {
-        if let object = value as? [String: Any] { return object }
+        if let object = value as? [String: Any] {
+            return object
+        }
         guard let string = value as? String,
               let data = string.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]

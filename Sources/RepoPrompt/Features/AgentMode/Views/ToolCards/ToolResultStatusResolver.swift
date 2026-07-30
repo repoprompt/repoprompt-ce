@@ -3,15 +3,21 @@ import Foundation
 enum ToolResultStatusResolver {
     static func resolve(toolIsError: Bool?, raw: String?, fallback: ToolCardStatus) -> ToolCardStatus {
         guard let object = ToolRawJSON.object(from: raw) else {
-            if toolIsError == true { return .failure }
-            if toolIsError == false { return .success }
+            if toolIsError == true {
+                return .failure
+            }
+            if toolIsError == false {
+                return .success
+            }
             return fallback
         }
 
         if let commandOverride = commandExecutionOverride(object) {
             return commandOverride
         }
-        if toolIsError == true { return .failure }
+        if toolIsError == true {
+            return .failure
+        }
         if let inferred = inferStructuredStatus(from: object) {
             return inferred
         }
@@ -41,8 +47,12 @@ enum ToolResultStatusResolver {
                     break
                 }
             }
-            if sawWarning { return .warning }
-            if sawSuccess { return .success }
+            if sawWarning {
+                return .warning
+            }
+            if sawSuccess {
+                return .success
+            }
             return nil
         case let text as String:
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -86,8 +96,12 @@ enum ToolResultStatusResolver {
             ?? ToolRawJSON.int(object, key: "exit_code")
             ?? ToolRawJSON.int(object, key: "code")
         {
-            if exitCode == 0 { return .success }
-            if exitCode > 0 { return .failure }
+            if exitCode == 0 {
+                return .success
+            }
+            if exitCode > 0 {
+                return .failure
+            }
         }
 
         if let errors = object["errors"] as? [Any], !errors.isEmpty {

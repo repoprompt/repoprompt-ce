@@ -172,7 +172,9 @@ enum JSTSSignatureExtractor {
             case "<":
                 angleDepth += 1
             case ">":
-                if angleDepth > 0 { angleDepth -= 1 }
+                if angleDepth > 0 {
+                    angleDepth -= 1
+                }
             case "(":
                 parenDepth += 1
             case ")":
@@ -187,7 +189,9 @@ enum JSTSSignatureExtractor {
             case "[":
                 bracketDepth += 1
             case "]":
-                if bracketDepth > 0 { bracketDepth -= 1 }
+                if bracketDepth > 0 {
+                    bracketDepth -= 1
+                }
             case "{":
                 let isTopLevel = (parenDepth == 0 && angleDepth == 0 && bracketDepth == 0 && braceDepth == 0)
                 if inReturnType {
@@ -378,19 +382,27 @@ enum JSTSSignatureExtractor {
             case "<":
                 angleDepth += 1
             case ">":
-                if angleDepth > 0 { angleDepth -= 1 }
+                if angleDepth > 0 {
+                    angleDepth -= 1
+                }
             case "(":
                 parenDepth += 1
             case ")":
-                if parenDepth > 0 { parenDepth -= 1 }
+                if parenDepth > 0 {
+                    parenDepth -= 1
+                }
             case "[":
                 bracketDepth += 1
             case "]":
-                if bracketDepth > 0 { bracketDepth -= 1 }
+                if bracketDepth > 0 {
+                    bracketDepth -= 1
+                }
             case "{":
                 braceDepth += 1
             case "}":
-                if braceDepth > 0 { braceDepth -= 1 }
+                if braceDepth > 0 {
+                    braceDepth -= 1
+                }
             case ";":
                 if angleDepth == 0, parenDepth == 0, bracketDepth == 0, braceDepth == 0 {
                     return String(line[..<i]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -410,7 +422,9 @@ enum JSTSSignatureExtractor {
     static func extractVariableSignature(from line: String) -> String {
         let normalized = normalizeSingleLine(line)
         let trimmed = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("type ") { return trimmed }
+        if trimmed.hasPrefix("type ") {
+            return trimmed
+        }
 
         var probe = trimmed
         let prefixes = ["export default ", "export ", "declare "]

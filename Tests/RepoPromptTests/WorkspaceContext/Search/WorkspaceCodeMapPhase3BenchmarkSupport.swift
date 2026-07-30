@@ -119,8 +119,12 @@
 
         var reliability: String {
             guard let coefficientOfVariation else { return "unavailable" }
-            if coefficientOfVariation <= 0.10 { return "high" }
-            if coefficientOfVariation <= 0.20 { return "moderate" }
+            if coefficientOfVariation <= 0.10 {
+                return "high"
+            }
+            if coefficientOfVariation <= 0.20 {
+                return "moderate"
+            }
             return "low"
         }
     }
@@ -201,7 +205,9 @@
         }
 
         func arriveAndWait() async {
-            if released { return }
+            if released {
+                return
+            }
             arrivalCount += 1
             if arrivalCount == target {
                 released = true
@@ -232,8 +238,11 @@
                     ordinal: isWarmup ? 0 : sampleIndex,
                     phase: isWarmup ? "warmup-excluded" : "measured"
                 )
-                if isWarmup { warmup = sample }
-                else { measured.append(sample) }
+                if isWarmup {
+                    warmup = sample
+                } else {
+                    measured.append(sample)
+                }
             }
             guard let warmup else {
                 throw CodeMapArtifactCatalogError.invalidMetadata
@@ -589,7 +598,9 @@
             for _ in 0 ..< 100_000 {
                 let progress = try await store.refreshAccounting(stepBudget: stepBudget)
                 pages.append(progress)
-                if progress.isComplete { return pages }
+                if progress.isComplete {
+                    return pages
+                }
             }
             throw CodeMapArtifactCatalogError.boundedScanExceeded
         }
@@ -602,7 +613,9 @@
             for _ in 0 ..< 100_000 {
                 let progress = try await store.runGC(stepBudget: stepBudget)
                 pages.append(progress)
-                if progress.isComplete { return pages }
+                if progress.isComplete {
+                    return pages
+                }
             }
             throw CodeMapArtifactCatalogError.boundedScanExceeded
         }

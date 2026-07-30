@@ -583,7 +583,9 @@ actor ContentReadAsyncLimiter {
         if let aged = eligibleWaiters.min(by: { lhs, rhs in
             let lhsAged = elapsedNanoseconds(since: lhs.value.enqueuedAtUptimeNanoseconds, now: now) >= agePromotionNanoseconds
             let rhsAged = elapsedNanoseconds(since: rhs.value.enqueuedAtUptimeNanoseconds, now: now) >= agePromotionNanoseconds
-            if lhsAged != rhsAged { return lhsAged && !rhsAged }
+            if lhsAged != rhsAged {
+                return lhsAged && !rhsAged
+            }
             return lhs.value.enqueueOrdinal < rhs.value.enqueueOrdinal
         }), elapsedNanoseconds(since: aged.value.enqueuedAtUptimeNanoseconds, now: now) >= agePromotionNanoseconds {
             return aged.key
@@ -646,7 +648,9 @@ actor ContentReadAsyncLimiter {
             case (_, nil):
                 return false
             case let (lhsGrant?, rhsGrant?):
-                if lhsGrant != rhsGrant { return lhsGrant < rhsGrant }
+                if lhsGrant != rhsGrant {
+                    return lhsGrant < rhsGrant
+                }
                 return lhs.state.enqueueOrdinal < rhs.state.enqueueOrdinal
             }
         }?.id
@@ -899,7 +903,9 @@ extension FileSystemService {
         workloadClass: ContentReadWorkloadClass = .unspecified
     ) async throws -> FileContentPrefix? {
         guard maximumBytes > 0 else { return FileContentPrefix(content: "", truncated: true) }
-        if Self.hasAlwaysBinaryExtension(relativePath) { return nil }
+        if Self.hasAlwaysBinaryExtension(relativePath) {
+            return nil
+        }
         let request = try makeContentReadRequest(
             cacheKey: relativePath,
             chunkSize: min(maximumBytes + 1, 1_048_576),
@@ -1667,7 +1673,9 @@ extension FileSystemService {
             try await runContentReadChunkHook(request)
             let next = try handle.read(upToCount: request.chunkSize) ?? Data()
             try Task.checkCancellation()
-            if next.isEmpty { break }
+            if next.isEmpty {
+                break
+            }
             let observedByteCount = Int64(fullData.count) + Int64(next.count)
             if observedByteCount > request.fileSizeLimit {
                 return try validateOpenContentHandle(
@@ -1729,8 +1737,12 @@ extension FileSystemService {
         }
         let url = URL(fileURLWithPath: standardizedAbsolutePath)
         if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-            if values.isSymbolicLink == true { throw FileSystemError.invalidRelativePath }
-            if values.isRegularFile == false { throw FileSystemError.invalidRelativePath }
+            if values.isSymbolicLink == true {
+                throw FileSystemError.invalidRelativePath
+            }
+            if values.isRegularFile == false {
+                throw FileSystemError.invalidRelativePath
+            }
         }
         if request.skipSymlinks, pathContainsSymlinkComponent(request.relativePath, rootURL: URL(fileURLWithPath: request.standardizedRootPath)) {
             throw FileSystemError.invalidRelativePath
@@ -1758,7 +1770,9 @@ extension FileSystemService {
             try await runContentReadChunkHook(request)
             let next = try handle.read(upToCount: request.chunkSize) ?? Data()
             try Task.checkCancellation()
-            if next.isEmpty { break }
+            if next.isEmpty {
+                break
+            }
             let observedByteCount = Int64(data.count) + Int64(next.count)
             if observedByteCount > request.fileSizeLimit {
                 return .tooLarge(observedByteCount: observedByteCount)
@@ -1889,7 +1903,9 @@ extension FileSystemService {
             if !skipProbe, let handle = try? FileHandle(forReadingFrom: url) {
                 let probe = try handle.read(upToCount: 8192) ?? Data()
                 try? handle.close()
-                if Self.isProbablyBinary(probe) { return nil }
+                if Self.isProbablyBinary(probe) {
+                    return nil
+                }
             }
             if fileSize < 2_000_000 {
                 let detected = try readDataAndDetectEncoding(request.absolutePath)
@@ -1922,14 +1938,18 @@ extension FileSystemService {
             fullData.reserveCapacity(Int(fileSize))
             let detector = CharacterEncodingDetector()
             let initialData = try handle.read(upToCount: request.chunkSize) ?? Data()
-            if !skipProbe, Self.isProbablyBinary(initialData) { return nil }
+            if !skipProbe, Self.isProbablyBinary(initialData) {
+                return nil
+            }
             fullData.append(initialData)
             _ = detector.analyzeNextChunk(initialData)
             try Task.checkCancellation()
 
             while true {
                 let next = try handle.read(upToCount: request.chunkSize) ?? Data()
-                if next.isEmpty { break }
+                if next.isEmpty {
+                    break
+                }
                 fullData.append(next)
                 _ = detector.analyzeNextChunk(next)
                 if fullData.count > 100_000_000 {
@@ -1954,7 +1974,9 @@ extension FileSystemService {
     /// Attempt to decode with all post‑UTF‑8 fall‑backs, including region‑specific ones.
     func tryDecodeWithFallbackEncodings(_ data: Data) -> String? {
         for enc in Self.orderedFallbackEncodings + Self.regionSpecificEncodings {
-            if let s = String(data: data, encoding: enc) { return s }
+            if let s = String(data: data, encoding: enc) {
+                return s
+            }
         }
         return nil
     }
@@ -2012,10 +2034,14 @@ extension FileSystemService {
     /// Example approach if you want a standalone data-based detection
     func detectFileEncodingFromData(_ data: Data) async throws -> String.Encoding {
         // 1) BOM check
-        if let bom = Self.detectBOMEncoding(in: data) { return bom }
+        if let bom = Self.detectBOMEncoding(in: data) {
+            return bom
+        }
 
         // 2) UTF‑8 strict
-        if String(data: data, encoding: .utf8) != nil { return .utf8 }
+        if String(data: data, encoding: .utf8) != nil {
+            return .utf8
+        }
 
         // 3–4) CP‑1252 / Mac Roman
         for enc in Self.orderedFallbackEncodings where String(data: data, encoding: enc) != nil {
@@ -2054,7 +2080,9 @@ extension FileSystemService {
         let sample = data.prefix(sampleSize)
 
         // Immediate NUL check
-        if sample.contains(0) { return true }
+        if sample.contains(0) {
+            return true
+        }
 
         var ctrl = 0
         var printableOrUtf8 = 0
@@ -2161,11 +2189,21 @@ extension FileSystemService {
     /// Detect a Unicode BOM and return the matching encoding, or `nil`.
     static func detectBOMEncoding(in data: Data) -> String.Encoding? {
         guard data.count >= 2 else { return nil }
-        if data.starts(with: [0xEF, 0xBB, 0xBF]) { return .utf8 } // UTF‑8 BOM
-        if data.starts(with: [0x00, 0x00, 0xFE, 0xFF]) { return .utf32BigEndian }
-        if data.starts(with: [0xFF, 0xFE, 0x00, 0x00]) { return .utf32LittleEndian }
-        if data.starts(with: [0xFE, 0xFF]) { return .utf16BigEndian }
-        if data.starts(with: [0xFF, 0xFE]) { return .utf16LittleEndian }
+        if data.starts(with: [0xEF, 0xBB, 0xBF]) {
+            return .utf8
+        } // UTF‑8 BOM
+        if data.starts(with: [0x00, 0x00, 0xFE, 0xFF]) {
+            return .utf32BigEndian
+        }
+        if data.starts(with: [0xFF, 0xFE, 0x00, 0x00]) {
+            return .utf32LittleEndian
+        }
+        if data.starts(with: [0xFE, 0xFF]) {
+            return .utf16BigEndian
+        }
+        if data.starts(with: [0xFF, 0xFE]) {
+            return .utf16LittleEndian
+        }
         return nil
     }
 

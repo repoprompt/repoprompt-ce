@@ -27,7 +27,9 @@ public enum JSONRPCBridgeID: Hashable, Codable, Sendable, CustomStringConvertibl
     }
 
     public static func parseFaultSelector(_ raw: String) -> JSONRPCBridgeID? {
-        if raw == "null" { return .null }
+        if raw == "null" {
+            return .null
+        }
         if raw.hasPrefix("number:"), let value = Int64(raw.dropFirst("number:".count)) {
             return .number(value)
         }
@@ -39,8 +41,12 @@ public enum JSONRPCBridgeID: Hashable, Codable, Sendable, CustomStringConvertibl
 
     public static func parseJSONValue(_ value: Any?) -> JSONRPCBridgeID? {
         guard let value else { return nil }
-        if value is NSNull { return .null }
-        if let value = value as? String { return .string(value) }
+        if value is NSNull {
+            return .null
+        }
+        if let value = value as? String {
+            return .string(value)
+        }
         guard let number = value as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID()
         else {
@@ -255,25 +261,63 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
 
     public var description: String {
         var fields = ["layer=\(layer)", "phase=\(phase)"]
-        if let connectionID { fields.append("connection_id=\(connectionID)") }
-        if let connectionGeneration { fields.append("generation=\(connectionGeneration)") }
-        if let direction { fields.append("direction=\(direction.rawValue)") }
-        if let id { fields.append("id=\(id)") }
-        if let method { fields.append("method=\(method)") }
-        if let tool { fields.append("tool=\(tool)") }
-        if let invocationID { fields.append("invocation_id=\(invocationID)") }
-        if let lifecycleState { fields.append("state=\(lifecycleState)") }
-        if let requestOrdinal { fields.append("ordinal=\(requestOrdinal)") }
-        if let framedByteCount { fields.append("bytes=\(framedByteCount)") }
-        if let framedSHA256 { fields.append("sha256=\(framedSHA256)") }
-        if let activeRequestCount { fields.append("active=\(activeRequestCount)") }
-        if let responseInDeliveryCount { fields.append("in_delivery=\(responseInDeliveryCount)") }
-        if let terminalReason { fields.append("terminal_reason=\(terminalReason)") }
-        if let providerActive { fields.append("provider_active=\(providerActive)") }
-        if let networkScopeActive { fields.append("network_scope_active=\(networkScopeActive)") }
-        if let permitActive { fields.append("permit_active=\(permitActive)") }
-        if let publicationPending { fields.append("publication_pending=\(publicationPending)") }
-        if let terminalBarrier { fields.append("terminal_barrier=\(terminalBarrier)") }
+        if let connectionID {
+            fields.append("connection_id=\(connectionID)")
+        }
+        if let connectionGeneration {
+            fields.append("generation=\(connectionGeneration)")
+        }
+        if let direction {
+            fields.append("direction=\(direction.rawValue)")
+        }
+        if let id {
+            fields.append("id=\(id)")
+        }
+        if let method {
+            fields.append("method=\(method)")
+        }
+        if let tool {
+            fields.append("tool=\(tool)")
+        }
+        if let invocationID {
+            fields.append("invocation_id=\(invocationID)")
+        }
+        if let lifecycleState {
+            fields.append("state=\(lifecycleState)")
+        }
+        if let requestOrdinal {
+            fields.append("ordinal=\(requestOrdinal)")
+        }
+        if let framedByteCount {
+            fields.append("bytes=\(framedByteCount)")
+        }
+        if let framedSHA256 {
+            fields.append("sha256=\(framedSHA256)")
+        }
+        if let activeRequestCount {
+            fields.append("active=\(activeRequestCount)")
+        }
+        if let responseInDeliveryCount {
+            fields.append("in_delivery=\(responseInDeliveryCount)")
+        }
+        if let terminalReason {
+            fields.append("terminal_reason=\(terminalReason)")
+        }
+        if let providerActive {
+            fields.append("provider_active=\(providerActive)")
+        }
+        if let networkScopeActive {
+            fields.append("network_scope_active=\(networkScopeActive)")
+        }
+        if let permitActive {
+            fields.append("permit_active=\(permitActive)")
+        }
+        if let publicationPending {
+            fields.append("publication_pending=\(publicationPending)")
+        }
+        if let terminalBarrier {
+            fields.append("terminal_barrier=\(terminalBarrier)")
+        }
         if let appInvocationID = requestIdentity?.appInvocationID, invocationID == nil {
             fields.append("app_invocation_id=\(appInvocationID)")
         }
@@ -432,10 +476,18 @@ public struct JSONRPCBridgeFaultRule: Equatable, Sendable {
     public func matches(_ prepared: JSONRPCBridgePreparedFrame) -> Bool {
         guard prepared.direction == direction else { return false }
         return prepared.messages.contains { message in
-            if let id, message.id != id { return false }
-            if let method, message.method != method { return false }
-            if let tool, message.tool != tool { return false }
-            if let requestOrdinal, message.requestOrdinal != requestOrdinal { return false }
+            if let id, message.id != id {
+                return false
+            }
+            if let method, message.method != method {
+                return false
+            }
+            if let tool, message.tool != tool {
+                return false
+            }
+            if let requestOrdinal, message.requestOrdinal != requestOrdinal {
+                return false
+            }
             return id != nil || method != nil || tool != nil || requestOrdinal != nil
         }
     }
@@ -610,7 +662,9 @@ public actor JSONRPCBridgeLedger {
         }
 
         var isResponseInDelivery: Bool {
-            if case .responseInDelivery = self { return true }
+            if case .responseInDelivery = self {
+                return true
+            }
             return false
         }
 

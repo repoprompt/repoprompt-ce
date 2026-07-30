@@ -10,7 +10,9 @@ enum WorkspaceFileTreePresentationRenderer {
     static func render(_ snapshot: WorkspaceFileTreePresentationSnapshot) -> String {
         guard snapshot.mode.lowercased() != "none" else { return "" }
         guard !snapshot.roots.isEmpty else { return "" }
-        if Task.isCancelled { return "" }
+        if Task.isCancelled {
+            return ""
+        }
 
         let effectiveRoots = snapshot.onlyIncludeRootsWithSelectedFiles
             ? snapshot.roots.filter { snapshotFolderContainsSelectedFile($0, selectedFileIDs: snapshot.selectedFileIDs) }
@@ -19,7 +21,9 @@ enum WorkspaceFileTreePresentationRenderer {
 
         var cachedSelectedFolderIDs: Set<UUID>? = nil
         func selectedFolderIDs() -> Set<UUID> {
-            if let cachedSelectedFolderIDs { return cachedSelectedFolderIDs }
+            if let cachedSelectedFolderIDs {
+                return cachedSelectedFolderIDs
+            }
             guard !snapshot.selectedFileIDs.isEmpty else {
                 cachedSelectedFolderIDs = []
                 return []
@@ -203,8 +207,12 @@ private func finalizeSnapshotTree(
     guard usedSelectedMarker || usedCodeMapMarker else { return tree }
 
     var legends: [String] = []
-    if usedSelectedMarker { legends.append(snapshotSelectedLegend) }
-    if usedCodeMapMarker { legends.append(snapshotCodeMapLegend) }
+    if usedSelectedMarker {
+        legends.append(snapshotSelectedLegend)
+    }
+    if usedCodeMapMarker {
+        legends.append(snapshotCodeMapLegend)
+    }
     return tree + "\n\n" + legends.joined(separator: "\n")
 }
 
@@ -229,7 +237,9 @@ private func visibleChildren(
     var files: [FileTreeNodeSnapshot] = []
 
     for child in folder.children {
-        if Task.isCancelled { break }
+        if Task.isCancelled {
+            break
+        }
         switch child {
         case let .folder(subfolder):
             let includeFolder: Bool = switch normalizedMode {
@@ -330,12 +340,16 @@ private func snapshotFolderIDsContainingSelectedFiles(
 
     @discardableResult
     func dfs(_ folder: FileTreeFolderSnapshot) -> Bool {
-        if Task.isCancelled { return false }
+        if Task.isCancelled {
+            return false
+        }
         guard visited.insert(folder.id).inserted else { return false }
 
         var contains = false
         for child in folder.children {
-            if Task.isCancelled { return false }
+            if Task.isCancelled {
+                return false
+            }
             switch child {
             case let .file(file):
                 if selectedFileIDs.contains(file.id) {
@@ -366,7 +380,9 @@ private func snapshotFolderContainsSelectedFile(
     var stack = [folder]
 
     while let current = stack.popLast() {
-        if Task.isCancelled { return false }
+        if Task.isCancelled {
+            return false
+        }
         guard visited.insert(current.id).inserted else { continue }
 
         for child in current.children {
@@ -406,13 +422,19 @@ private func generateFileTreeSnapshotWithDepth(
         builder: inout SnapshotStringBuilder,
         visited: inout Set<UUID>
     ) -> Bool {
-        if Task.isCancelled { return true }
-        if let tokenBudget, builder.estimatedTokens >= tokenBudget { return true }
+        if Task.isCancelled {
+            return true
+        }
+        if let tokenBudget, builder.estimatedTokens >= tokenBudget {
+            return true
+        }
 
         switch node {
         case let .file(file):
             let marked = selectedFileIDs.contains(file.id)
-            if marked { usedSelectedMarker = true }
+            if marked {
+                usedSelectedMarker = true
+            }
             let hasCodeMap = showCodeMapMarkers && codeMapIDs.contains(file.id)
             builder.appendLine("\(basePrefix)\(isLast ? "└── " : "├── ")\(file.name)\(marked ? snapshotSelectedMark : "")\(hasCodeMap ? snapshotCodeMapMark : "")")
             return false
@@ -449,8 +471,12 @@ private func generateFileTreeSnapshotWithDepth(
         builder: inout SnapshotStringBuilder,
         visited: inout Set<UUID>
     ) -> Bool {
-        if Task.isCancelled { return true }
-        if let tokenBudget, builder.estimatedTokens >= tokenBudget { return true }
+        if Task.isCancelled {
+            return true
+        }
+        if let tokenBudget, builder.estimatedTokens >= tokenBudget {
+            return true
+        }
         guard visited.insert(folder.id).inserted else { return false }
 
         let includeFolder: Bool = {
@@ -526,9 +552,13 @@ private func generateFileTreeSnapshotWithDepth(
                     return true
                 }
             case let .file(file):
-                if let tokenBudget, builder.estimatedTokens >= tokenBudget { return true }
+                if let tokenBudget, builder.estimatedTokens >= tokenBudget {
+                    return true
+                }
                 let marked = selectedFileIDs.contains(file.id)
-                if marked { usedSelectedMarker = true }
+                if marked {
+                    usedSelectedMarker = true
+                }
                 let hasCodeMap = showCodeMapMarkers && codeMapIDs.contains(file.id)
                 builder.appendLine("\(childPrefixBase)\(childIsLast ? "└── " : "├── ")\(file.name)\(marked ? snapshotSelectedMark : "")\(hasCodeMap ? snapshotCodeMapMark : "")")
             }
@@ -557,11 +587,15 @@ private func collectCodeMapIDs(from roots: [FileTreeFolderSnapshot]) -> Set<UUID
     var stack = roots
 
     while let folder = stack.popLast() {
-        if Task.isCancelled { break }
+        if Task.isCancelled {
+            break
+        }
         guard visited.insert(folder.id).inserted else { continue }
 
         for child in folder.children {
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
             switch child {
             case let .file(file):
                 if file.hasCodeMap {

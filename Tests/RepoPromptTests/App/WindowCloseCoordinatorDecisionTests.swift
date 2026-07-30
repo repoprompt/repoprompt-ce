@@ -569,7 +569,9 @@ private final class GitContextRefreshGate: @unchecked Sendable {
     }
 
     func waitUntilCancellationObserved(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
-        if observedCancellation { return }
+        if observedCancellation {
+            return
+        }
         do {
             try await AsyncTestWait.waitUntil(
                 "git context refresh cancellation observed",
@@ -713,6 +715,10 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
         stopCallCount += 1
         failPendingRequestsAsStopped()
         publishRequestObservation()
+    }
+
+    func currentProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot? {
+        nil
     }
 
     private func cancelRequest(_ requestID: UUID) {

@@ -335,17 +335,23 @@ final class HistoryIntegrationTests: XCTestCase {
     // MARK: - Helpers
 
     private func listReply(_ reply: HistoryToolReply) throws -> HistoryListSessionsReply {
-        if case let .listSessions(dto) = reply { return dto }
+        if case let .listSessions(dto) = reply {
+            return dto
+        }
         return try XCTUnwrap(nil as HistoryListSessionsReply?, "expected .listSessions reply, got \(reply)")
     }
 
     private func searchReply(_ reply: HistoryToolReply) throws -> HistorySearchReply {
-        if case let .search(dto) = reply { return dto }
+        if case let .search(dto) = reply {
+            return dto
+        }
         return try XCTUnwrap(nil as HistorySearchReply?, "expected .search reply, got \(reply)")
     }
 
     private func timeReply(_ reply: HistoryToolReply) throws -> HistoryTimeReply {
-        if case let .time(dto) = reply { return dto }
+        if case let .time(dto) = reply {
+            return dto
+        }
         return try XCTUnwrap(nil as HistoryTimeReply?, "expected .time reply, got \(reply)")
     }
 

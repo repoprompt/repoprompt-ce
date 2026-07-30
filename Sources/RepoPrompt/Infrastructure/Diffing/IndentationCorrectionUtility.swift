@@ -352,7 +352,9 @@ class IndentCorrectionUtility {
         oldBlock: IndentCache
     ) -> Double {
         let count = min(snippet.indentLevels.count, oldBlock.indentLevels.count)
-        if count == 0 { return Double.infinity }
+        if count == 0 {
+            return Double.infinity
+        }
         var sumAbsDiff = 0
         for i in 0 ..< count {
             sumAbsDiff += abs(snippet.indentLevels[i] - oldBlock.indentLevels[i])
@@ -471,11 +473,15 @@ class IndentCorrectionUtility {
     private static func computeBlockDeltaForRemainder(
         linePairs: [(oldIndent: Int, searchIndent: Int)]
     ) -> Int? {
-        if linePairs.count < 2 { return nil }
+        if linePairs.count < 2 {
+            return nil
+        }
         let tail = Array(linePairs.dropFirst(1))
         let rawDeltas = tail.map { $0.oldIndent - $0.searchIndent }
         let filtered = filterOutliers(deltas: rawDeltas)
-        if filtered.isEmpty { return nil }
+        if filtered.isEmpty {
+            return nil
+        }
 
         let medianDiff = computeMedian(of: filtered)
         if abs(medianDiff) > MAX_SHIFT {
@@ -614,7 +620,9 @@ class IndentCorrectionUtility {
 
         for delta in adjustedDeltas {
             let candidate = snippetCache.rawLines.map { applyIndentDelta($0, delta: delta) }
-            if !isValidIndentCandidate(candidate) { continue }
+            if !isValidIndentCandidate(candidate) {
+                continue
+            }
             let score = evaluateSnippetIndentScore(candidate, originalIndentCount: Set(snippetCache.indentLevels).count)
             if score < bestScore {
                 bestScore = score
@@ -670,15 +678,21 @@ class IndentCorrectionUtility {
     ) -> String {
         // Extract current tag + content
         let content = String.removeIndentationTag(line)
-        if content.isEmpty { return line }
+        if content.isEmpty {
+            return line
+        }
 
         // Count leaked prefix indentation **in the content** (tabs & spaces).
         var leakedTabs = 0
         var leakedSpaces = 0
         for ch in content {
-            if ch == "\t" { leakedTabs += 1 }
-            else if ch == " " { leakedSpaces += 1 }
-            else { break }
+            if ch == "\t" {
+                leakedTabs += 1
+            } else if ch == " " {
+                leakedSpaces += 1
+            } else {
+                break
+            }
         }
 
         if leakedTabs == 0, leakedSpaces == 0 {
@@ -722,7 +736,9 @@ class IndentCorrectionUtility {
         searchCache: IndentCache
     ) -> [(oldIndent: Int, searchIndent: Int)] {
         let count = min(oldCache.rawLines.count, searchCache.rawLines.count)
-        if count == 0 { return [] }
+        if count == 0 {
+            return []
+        }
 
         let step = max(count / max(1, IndentationConfig.maxLinePairs), 1)
         var pairs: [(Int, Int)] = []
@@ -766,7 +782,9 @@ class IndentCorrectionUtility {
     private static func computeMedian(of values: [Int]) -> Int {
         let sortedVals = values.sorted()
         let c = sortedVals.count
-        if c == 0 { return 0 }
+        if c == 0 {
+            return 0
+        }
         if c % 2 == 1 {
             return sortedVals[c / 2]
         } else {
@@ -779,7 +797,9 @@ class IndentCorrectionUtility {
     private static func computeMedianDouble(of values: [Double]) -> Double {
         let sortedVals = values.sorted()
         let c = sortedVals.count
-        if c == 0 { return 0.0 }
+        if c == 0 {
+            return 0.0
+        }
         if c % 2 == 1 {
             return sortedVals[c / 2]
         } else {
@@ -841,14 +861,20 @@ class IndentCorrectionUtility {
         let orig = adjacentDiffs(original.indentLevels)
         let now = adjacentDiffs(transformed.indentLevels)
         let m = min(orig.count, now.count)
-        if m == 0 { return true } // nothing to compare
+        if m == 0 {
+            return true
+        } // nothing to compare
 
         var flips = 0
         var largeChanges = 0
 
         @inline(__always) func sign(_ v: Int) -> Int {
-            if v > 0 { return 1 }
-            if v < 0 { return -1 }
+            if v > 0 {
+                return 1
+            }
+            if v < 0 {
+                return -1
+            }
             return 0
         }
 
@@ -864,8 +890,12 @@ class IndentCorrectionUtility {
         }
 
         let flipRatio = Double(flips) / Double(m)
-        if flipRatio > flipsTolerance { return false }
-        if largeChanges > 0 { return false }
+        if flipRatio > flipsTolerance {
+            return false
+        }
+        if largeChanges > 0 {
+            return false
+        }
         return true
     }
 

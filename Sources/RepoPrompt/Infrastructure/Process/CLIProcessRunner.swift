@@ -16,7 +16,9 @@ private actor GateReleaseCoordinator {
     private var released = false
 
     func markReleased() -> Bool {
-        if released { return false }
+        if released {
+            return false
+        }
         released = true
         return true
     }
@@ -37,7 +39,11 @@ private actor ResolvedCommandCache {
     }
 
     func invalidate(_ command: String? = nil) {
-        if let command { map.removeValue(forKey: command) } else { map.removeAll() }
+        if let command {
+            map.removeValue(forKey: command)
+        } else {
+            map.removeAll()
+        }
     }
 }
 

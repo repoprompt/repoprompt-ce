@@ -277,22 +277,30 @@ struct AgentRunMCPSnapshot: Equatable {
         }
 
         static func classify(status: Status, statusText: String?) -> FailureReason? {
-            if status == .cancelled { return .cancelled }
+            if status == .cancelled {
+                return .cancelled
+            }
             guard status == .failed else { return nil }
             guard let text = statusText?.lowercased(), !text.isEmpty else { return .agentError }
 
             let cancelPatterns = ["cancelled", "canceled", "interrupted", "aborted"]
-            if cancelPatterns.contains(where: { text.contains($0) }) { return .cancelled }
+            if cancelPatterns.contains(where: { text.contains($0) }) {
+                return .cancelled
+            }
 
             let timeoutPatterns = ["timed out", "timeout", "deadline exceeded", "took too long"]
-            if timeoutPatterns.contains(where: { text.contains($0) }) { return .timeout }
+            if timeoutPatterns.contains(where: { text.contains($0) }) {
+                return .timeout
+            }
 
             let crashPatterns = [
                 "process not running", "transport closed", "connection closed",
                 "broken pipe", "crashed", "crash", "exited unexpectedly",
                 "terminated unexpectedly", "protocol error", "decode error", "spawn failed"
             ]
-            if crashPatterns.contains(where: { text.contains($0) }) { return .processCrash }
+            if crashPatterns.contains(where: { text.contains($0) }) {
+                return .processCrash
+            }
 
             return .agentError
         }

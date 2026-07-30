@@ -76,7 +76,9 @@ enum WorkspaceCodemapPresentationIntentResolver {
         let orderedFiles = requestedFiles.sorted { lhs, rhs in
             let lhsRoot = rootsByID[lhs.rootID]?.standardizedFullPath ?? ""
             let rhsRoot = rootsByID[rhs.rootID]?.standardizedFullPath ?? ""
-            if lhsRoot != rhsRoot { return lhsRoot.utf8.lexicographicallyPrecedes(rhsRoot.utf8) }
+            if lhsRoot != rhsRoot {
+                return lhsRoot.utf8.lexicographicallyPrecedes(rhsRoot.utf8)
+            }
             if lhs.standardizedRelativePath != rhs.standardizedRelativePath {
                 return lhs.standardizedRelativePath.utf8.lexicographicallyPrecedes(
                     rhs.standardizedRelativePath.utf8

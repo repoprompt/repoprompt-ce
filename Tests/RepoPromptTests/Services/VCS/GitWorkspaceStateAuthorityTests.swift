@@ -365,7 +365,9 @@ final class GitWorkspaceStateAuthorityTests: XCTestCase {
         _ predicate: @escaping () async -> Bool
     ) async throws {
         for _ in 0 ..< 1000 {
-            if await predicate() { return }
+            if await predicate() {
+                return
+            }
             try await Task.sleep(for: .milliseconds(1))
         }
         XCTFail("Timed out waiting for authority invalidation", file: file, line: line)

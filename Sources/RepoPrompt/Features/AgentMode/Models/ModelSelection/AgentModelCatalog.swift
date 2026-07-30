@@ -628,9 +628,15 @@ enum AgentModelCatalog {
                 .split(separator: " ")
                 .map { token -> String in
                     let lower = token.lowercased()
-                    if lower == "gpt" { return "GPT" }
-                    if lower == "codex" { return "Codex" }
-                    if lower == "xhigh" { return "XHigh" }
+                    if lower == "gpt" {
+                        return "GPT"
+                    }
+                    if lower == "codex" {
+                        return "Codex"
+                    }
+                    if lower == "xhigh" {
+                        return "XHigh"
+                    }
                     if lower.range(of: "^[0-9]+(\\.[0-9]+)*$", options: .regularExpression) != nil {
                         return String(token)
                     }
@@ -728,8 +734,12 @@ enum AgentModelCatalog {
                 options: sortedOptions.map(\.option)
             )
         }.sorted { lhs, rhs in
-            if AIModel.codexBaseModelPrecedes(lhs.baseModelID, rhs.baseModelID) { return true }
-            if AIModel.codexBaseModelPrecedes(rhs.baseModelID, lhs.baseModelID) { return false }
+            if AIModel.codexBaseModelPrecedes(lhs.baseModelID, rhs.baseModelID) {
+                return true
+            }
+            if AIModel.codexBaseModelPrecedes(rhs.baseModelID, lhs.baseModelID) {
+                return false
+            }
             let displayComparison = ModelPickerStringOrdering.compare(
                 lhs.displayName,
                 rhs.displayName,
@@ -1303,7 +1313,9 @@ enum AgentModelCatalog {
 
     private static func normalizedOpenCodeBaseLabel(_ value: String, fallback: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return trimmed }
+        if !trimmed.isEmpty {
+            return trimmed
+        }
         return fallback.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

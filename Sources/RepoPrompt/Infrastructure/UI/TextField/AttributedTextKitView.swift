@@ -90,7 +90,9 @@ struct AttributedTextKitView: NSViewRepresentable {
                   let textView = notification.object as? NSTextView
             else { return }
             // NEW: ignore delegate echo during programmatic updates
-            if isApplyingExternalWrite { return }
+            if isApplyingExternalWrite {
+                return
+            }
 
             let newText = textView.string
             let isEmpty = newText.isEmpty
@@ -175,7 +177,9 @@ struct AttributedTextKitView: NSViewRepresentable {
 
             // Prefer explicit kind if supplied, otherwise infer from models.
             let isFolder: Bool = {
-                if let k = kind { return k == .folder }
+                if let k = kind {
+                    return k == .folder
+                }
                 return fm.findFolderByRelativePath(path) != nil
             }()
 
@@ -403,7 +407,9 @@ struct AttributedTextKitView: NSViewRepresentable {
         let shouldForce = context.coordinator.lastAppliedTick != externalUpdateTick
 
         if textView.string != text {
-            if textView.hasMarkedText() { return }
+            if textView.hasMarkedText() {
+                return
+            }
             if wasFirstResponder, !shouldForce {
                 // Do not overwrite while the user is typing; delegate writes to binding.
             } else {
@@ -552,7 +558,9 @@ struct AttributedTextKitView: NSViewRepresentable {
             // Background work – regex only (no AppKit calls!)
             // -----------------------------------------------
             let matches = await Self.tokenRegex.matches(in: plainString, range: fullRange)
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
 
             // Extract ranges & raw paths; keeps memory minimal
             var spans: [(NSRange, String)] = []
@@ -594,7 +602,9 @@ struct AttributedTextKitView: NSViewRepresentable {
 
                     // Resolve kind only once per distinct path
                     let resolvedKind: MentionKind? = {
-                        if let cached = kindCache[rawPath] { return cached }
+                        if let cached = kindCache[rawPath] {
+                            return cached
+                        }
                         var kind: MentionKind? = nil
                         if fm.findFolderByRelativePath(rawPath) != nil {
                             kind = .folder

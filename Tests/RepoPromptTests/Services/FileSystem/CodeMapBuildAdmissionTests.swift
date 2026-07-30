@@ -173,7 +173,9 @@ final class CodeMapBuildAdmissionTests: XCTestCase {
             var waited: UInt64 = 0
             while waited < timeoutNanoseconds {
                 let snapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
-                if predicate(snapshot) { return snapshot }
+                if predicate(snapshot) {
+                    return snapshot
+                }
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }
@@ -189,7 +191,9 @@ final class CodeMapBuildAdmissionTests: XCTestCase {
             var waited: UInt64 = 0
             while waited < timeoutNanoseconds {
                 let snapshot = await limiter.snapshotForTesting()
-                if predicate(snapshot) { return snapshot }
+                if predicate(snapshot) {
+                    return snapshot
+                }
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }

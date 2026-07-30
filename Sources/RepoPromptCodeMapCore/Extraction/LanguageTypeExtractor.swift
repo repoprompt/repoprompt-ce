@@ -27,9 +27,6 @@ import Foundation
 /// The main static struct that holds all regex patterns and
 /// top-level “matchAny…” methods for variables & functions.
 enum LanguageTypeExtractor {
-    // SAFETY: These immutable standard-library Regex values are initialized once
-    // and used only through nonmutating matching. Their type-erased outputs do
-    // not currently carry Sendable conformance.
     // MARK: - Swift Patterns
 
     /// Now allows optional `<...>` generics right after function name.
@@ -87,7 +84,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - C# Patterns
 
-    nonisolated(unsafe) static let cSharpVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cSharpVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected|internal)?\s*
@@ -98,7 +95,7 @@ enum LanguageTypeExtractor {
     \s+(\**[A-Za-z_]\w*)
     """#)
 
-    nonisolated(unsafe) static let cSharpFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cSharpFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected|internal)?\s*
@@ -113,7 +110,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - Java
 
-    nonisolated(unsafe) static let javaVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let javaVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected)?\s*
@@ -124,7 +121,7 @@ enum LanguageTypeExtractor {
     \s+([A-Za-z_]\w*)
     """#)
 
-    nonisolated(unsafe) static let javaFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let javaFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected)?\s*
@@ -137,9 +134,56 @@ enum LanguageTypeExtractor {
     \)
     """#)
 
+    // MARK: - Dart
+
+    static let dartVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    (?xm)
+    ^
+    (?:
+     (?:final|const)\s+
+     ([A-Za-z_]\w*(?:<[^>]+>)?\??)
+     \s+([A-Za-z_]\w*)
+     |
+     ([A-Za-z_]\w*(?:<[^>]+>)?\??)
+     \s+([A-Za-z_]\w*)
+    )
+    """#)
+
+    static let dartFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    (?xm)
+    ^\s*
+    (?:
+    	([A-Za-z_][A-Za-z0-9_<>,\?\s]*?)   # group(1) => return type
+    	\s+
+    )?
+    ([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?) # group(2) => function or named constructor
+    \s*\(
+    	([^)]*)?                       # group(3) => (partial) parameter list, may span lines
+    .*$
+    """#)
+
+    static let dartFactoryRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    (?xm)
+    ^\s*
+    factory\s+
+    ([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)   # group(1) => factory name
+    \s*\(
+       ([^)]*)
+    \)
+    """#)
+
+    static let dartGetterSetterRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    (?xm)
+    ^\s*
+    (?:([A-Za-z_][A-Za-z0-9_<>\?]+)\s+)?   # group(1) => optional return type
+    (get|set)\s+
+    ([A-Za-z_]\w*)                          # group(3) => name
+    (?:\s*\(([^)]*)\))?                   # group(4) => optional params (setter)
+    """#)
+
     // MARK: - C
 
-    nonisolated(unsafe) static let cVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:extern|static|register)?\s*
@@ -149,7 +193,7 @@ enum LanguageTypeExtractor {
     \s+([A-Za-z_]\w*)
     """#)
 
-    nonisolated(unsafe) static let cFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:extern|static)?\s*
@@ -164,7 +208,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - C++ (leading-return + trailing-return)
 
-    nonisolated(unsafe) static let cppVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cppVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:extern|static|register|thread_local)?\s*
@@ -176,7 +220,7 @@ enum LanguageTypeExtractor {
     \s+([A-Za-z_]\w*)
     """#)
 
-    nonisolated(unsafe) static let cppFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cppFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:template\s*<[^>]*>\s*)?
@@ -189,7 +233,7 @@ enum LanguageTypeExtractor {
     \)
     """#)
 
-    nonisolated(unsafe) static let cppConstructorRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cppConstructorRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^\s*
     (?:template\s*<[^>]*>\s*)?
@@ -200,7 +244,7 @@ enum LanguageTypeExtractor {
     \)
     """#)
 
-    nonisolated(unsafe) static let cppTrailingReturnFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let cppTrailingReturnFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:template\s*<[^>]*>\s*)?
@@ -219,12 +263,12 @@ enum LanguageTypeExtractor {
 
     /// Python variable: `name: Type`
     /// Output: (wholeMatch, varName, typeName)
-    nonisolated(unsafe) static let pythonVariableRegex: Regex<(Substring, Substring, Substring)> =
+    static let pythonVariableRegex: Regex<(Substring, Substring, Substring)> =
         #/^([A-Za-z_]\w*)\s*:\s*([A-Za-z_][A-Za-z0-9_\.\[\]\|]*)/#
 
     /// Python function: `(async )?def name(params)( -> returnType)?:`
     /// Output: (wholeMatch, funcName, paramList, returnType?)
-    nonisolated(unsafe) static let pythonFunctionRegex: Regex<(Substring, Substring, Substring, Substring?)> =
+    static let pythonFunctionRegex: Regex<(Substring, Substring, Substring, Substring?)> =
         #/^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)(?:\s*->\s*([A-Za-z_][A-Za-z0-9_\.\[\]\|\,\(\)\{\}\s]*))?\s*:.*$/#
 
     // MARK: - JavaScript/TypeScript (basic patterns)
@@ -389,7 +433,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - Go
 
-    nonisolated(unsafe) static let goVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let goVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:var|const)\s+
@@ -400,7 +444,7 @@ enum LanguageTypeExtractor {
     (?:\s*=\s*[^;]+)?
     """#)
 
-    nonisolated(unsafe) static let goFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let goFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     func\s+
@@ -419,7 +463,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - Rust
 
-    nonisolated(unsafe) static let rustVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let rustVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     let\s+(?:mut\s+)?
@@ -430,7 +474,7 @@ enum LanguageTypeExtractor {
     (?:\s*=\s*[^;]+)?
     """#)
 
-    nonisolated(unsafe) static let rustFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    static let rustFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?
@@ -450,23 +494,23 @@ enum LanguageTypeExtractor {
 
     /// C-style parameter decorators to remove (out, ref, in, const, etc.)
     /// Output: (wholeMatch, decorator)
-    private nonisolated(unsafe) static let cStyleDecoratorRegex: Regex<(Substring, Substring)> = #/\b(out|ref|in|const|volatile|mutable|inout|__owned|__borrowed)\b/#
+    private static let cStyleDecoratorRegex: Regex<(Substring, Substring)> = #/\b(out|ref|in|const|volatile|mutable|inout|__owned|__borrowed)\b/#
 
     /// Match last whitespace-separated word (for separating type from name)
     /// Output: wholeMatch only
-    private nonisolated(unsafe) static let lastWordSeparatorRegex: Regex<Substring> = #/\s+[^\s]+$/#
+    private static let lastWordSeparatorRegex: Regex<Substring> = #/\s+[^\s]+$/#
 
     /// Swift parameter decorators to remove (inout, __owned, etc.)
     /// Output: (wholeMatch, decorator)
-    private nonisolated(unsafe) static let swiftDecoratorRegex: Regex<(Substring, Substring)> = #/\b(inout|__owned|__shared|__borrowed)\b/#
+    private static let swiftDecoratorRegex: Regex<(Substring, Substring)> = #/\b(inout|__owned|__shared|__borrowed)\b/#
 
     /// Rust parameter decorators to remove (mut, ref)
     /// Output: (wholeMatch, decorator)
-    private nonisolated(unsafe) static let rustDecoratorRegex: Regex<(Substring, Substring)> = #/\b(mut|ref)\b/#
+    private static let rustDecoratorRegex: Regex<(Substring, Substring)> = #/\b(mut|ref)\b/#
 
     /// Multiple whitespace to normalize to single space
     /// Output: wholeMatch only
-    private nonisolated(unsafe) static let multiWhitespaceRegex: Regex<Substring> = #/\s+/#
+    private static let multiWhitespaceRegex: Regex<Substring> = #/\s+/#
 
     private static func normalizeWhitespaceRun(_ text: String) -> String {
         var out = ""
@@ -495,7 +539,7 @@ enum LanguageTypeExtractor {
     static func matchAnyVariableLine(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerformanceCollector? = nil
+        stats: CodeMapPerfStats? = nil
     ) -> [String: String]? {
         stats?.lteMatchAnyVariableCalls += 1
         let start = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
@@ -620,6 +664,20 @@ enum LanguageTypeExtractor {
             }
             return nil
 
+        case .dart:
+            if let m = line.firstMatch(of: dartVariableRegex) {
+                // group(1,2) or group(3,4)
+                if let type = capture(m, at: 1), let name = capture(m, at: 2) {
+                    return ["type": type, "name": name]
+                } else if m.output.count >= 5,
+                          let type = capture(m, at: 3),
+                          let name = capture(m, at: 4)
+                {
+                    return ["type": type, "name": name]
+                }
+            }
+            return nil
+
         case .python:
             if let m = line.firstMatch(of: pythonVariableRegex) {
                 // Typed regex: (wholeMatch, varName, typeName)
@@ -704,9 +762,15 @@ enum LanguageTypeExtractor {
 
         func asDictionary(language: LanguageType) -> [String: String] {
             var dict: [String: String] = [:]
-            if let name, !name.isEmpty { dict["name"] = name }
-            if let paramList, !paramList.isEmpty { dict["paramList"] = paramList }
-            if let returnType, !returnType.isEmpty { dict["returnType"] = returnType }
+            if let name, !name.isEmpty {
+                dict["name"] = name
+            }
+            if let paramList, !paramList.isEmpty {
+                dict["paramList"] = paramList
+            }
+            if let returnType, !returnType.isEmpty {
+                dict["returnType"] = returnType
+            }
             if let parameterTypes, !parameterTypes.isEmpty {
                 let joined = parameterTypes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.joined(separator: ", ")
                 dict["parameterTypes"] = joined
@@ -873,10 +937,14 @@ enum LanguageTypeExtractor {
         var i = startIndex
         while i < text.endIndex {
             let ch = text[i]
-            if ch == "(" { depth += 1 }
+            if ch == "(" {
+                depth += 1
+            }
             if ch == ")" {
                 depth -= 1
-                if depth == 0 { return i }
+                if depth == 0 {
+                    return i
+                }
             }
             i = text.index(after: i)
         }
@@ -888,10 +956,14 @@ enum LanguageTypeExtractor {
         var i = startIndex
         while i < text.endIndex {
             let ch = text[i]
-            if ch == "{" { depth += 1 }
+            if ch == "{" {
+                depth += 1
+            }
             if ch == "}" {
                 depth -= 1
-                if depth == 0 { return i }
+                if depth == 0 {
+                    return i
+                }
             }
             i = text.index(after: i)
         }
@@ -927,7 +999,7 @@ enum LanguageTypeExtractor {
         normalizeWhitespaceRun(line)
     }
 
-    fileprivate static func extractTSReturnType(from signature: String, stats: CodeMapPerformanceCollector? = nil) -> String? {
+    fileprivate static func extractTSReturnType(from signature: String, stats: CodeMapPerfStats? = nil) -> String? {
         let trimmed = normalizeTSLine(signature)
         guard !trimmed.isEmpty else { return nil }
         let hasFunctionKeyword = trimmed.range(of: #"\bfunction\b"#, options: .regularExpression) != nil
@@ -970,8 +1042,12 @@ enum LanguageTypeExtractor {
         let eqIndex = firstTopLevelAssignmentEquals(in: trimmed, startingAt: typeStart)
         let semiIndex = firstTopLevelIndex(of: ";", in: trimmed, startingAt: typeStart)
         var endIndex = trimmed.endIndex
-        if let eqIndex, eqIndex < endIndex { endIndex = eqIndex }
-        if let semiIndex, semiIndex < endIndex { endIndex = semiIndex }
+        if let eqIndex, eqIndex < endIndex {
+            endIndex = eqIndex
+        }
+        if let semiIndex, semiIndex < endIndex {
+            endIndex = semiIndex
+        }
         return trimTSType(trimmed[typeStart ..< endIndex])
     }
 
@@ -1031,7 +1107,7 @@ enum LanguageTypeExtractor {
     static func matchAnyFunctionLineParsed(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerformanceCollector? = nil
+        stats: CodeMapPerfStats? = nil
     ) -> FunctionLineMatch? {
         stats?.lteMatchAnyFunctionCalls += 1
         let start = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
@@ -1236,7 +1312,7 @@ enum LanguageTypeExtractor {
     static func matchAnyFunctionLine(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerformanceCollector? = nil
+        stats: CodeMapPerfStats? = nil
     ) -> [String: String]? {
         if !(language == .ts || language == .tsx) {
             stats?.lteMatchAnyFunctionCalls += 1
@@ -1303,6 +1379,53 @@ enum LanguageTypeExtractor {
                     indices: (1, 2, 3)
                 )
                 return extracted.thenParseParameters(language: language)
+            }
+            return nil
+
+        case .dart:
+            if let m = line.firstMatch(of: dartGetterSetterRegex) {
+                var result = [String: String]()
+                if let val = capture(m, at: 1) {
+                    result["returnType"] = val
+                }
+                if let val = capture(m, at: 3) {
+                    result["name"] = val
+                }
+                if let val = capture(m, at: 4) {
+                    result["paramList"] = val
+                }
+                return result.thenParseParameters(language: language)
+            }
+            if let m = line.firstMatch(of: dartFactoryRegex) {
+                var result = [String: String]()
+                if let val = capture(m, at: 1) {
+                    result["name"] = val.split(separator: ".").last.map(String.init) ?? val
+                }
+                if let val = capture(m, at: 2) {
+                    result["paramList"] = val
+                }
+                return result.thenParseParameters(language: language)
+            }
+            if let m = line.firstMatch(of: dartFunctionRegex) {
+                var result = [String: String]()
+
+                // returnType in group(1)
+                if let val = capture(m, at: 1) {
+                    result["returnType"] = val
+                }
+
+                // function name in group(2)
+                if let val = capture(m, at: 2) {
+                    result["name"] = val
+                }
+
+                // parameter list in group(3)
+                if let val = capture(m, at: 3) {
+                    result["paramList"] = val
+                }
+
+                // Then parse paramList into parameterTypes
+                return result.thenParseParameters(language: language)
             }
             return nil
 
@@ -1608,7 +1731,9 @@ enum LanguageTypeExtractor {
         var results = [String]()
 
         for chunk in chunks {
-            if chunk.isEmpty { continue }
+            if chunk.isEmpty {
+                continue
+            }
             // skip varargs
             if chunk.contains("...") {
                 results.append("varargs")
@@ -1642,7 +1767,9 @@ enum LanguageTypeExtractor {
         var results = [String]()
 
         for chunk in chunks {
-            if chunk.isEmpty { continue }
+            if chunk.isEmpty {
+                continue
+            }
             var cleanChunk = chunk
 
             // Remove possible modifiers
@@ -1681,6 +1808,181 @@ enum LanguageTypeExtractor {
         }
 
         return results
+    }
+
+    fileprivate static func parseDartParameterList(_ paramList: String) -> [String] {
+        let chunks = splitDartParameters(paramList)
+        var results = [String]()
+
+        for chunk in chunks {
+            var cleaned = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            if cleaned.isEmpty {
+                continue
+            }
+
+            while cleaned.hasPrefix("{") || cleaned.hasPrefix("[") {
+                cleaned.removeFirst()
+                cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            while cleaned.hasSuffix("}") || cleaned.hasSuffix("]") {
+                cleaned.removeLast()
+                cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            let modifiers = ["required", "final", "const", "covariant", "late"]
+            var trimmed = cleaned
+            var foundModifier = true
+            while foundModifier {
+                foundModifier = false
+                for mod in modifiers {
+                    if trimmed.hasPrefix("\(mod) ") {
+                        trimmed = trimmed.dropFirst(mod.count + 1).trimmingCharacters(in: .whitespaces)
+                        foundModifier = true
+                        break
+                    }
+                }
+            }
+
+            let withoutDefault = splitDartDefault(trimmed)
+            let withoutDefaultTrimmed = withoutDefault.trimmingCharacters(in: .whitespacesAndNewlines)
+            if withoutDefaultTrimmed.hasPrefix("this.") || withoutDefaultTrimmed.hasPrefix("super.") {
+                results.append("untyped")
+                continue
+            }
+
+            let tokens = splitTopLevelTokens(withoutDefaultTrimmed)
+            if tokens.count >= 2 {
+                let typePart = tokens.dropLast().joined(separator: " ")
+                if !typePart.isEmpty {
+                    results.append(typePart)
+                } else {
+                    results.append("untyped")
+                }
+            } else if tokens.count == 1 {
+                results.append("untyped")
+            }
+        }
+
+        return results.filter { !$0.isEmpty }
+    }
+
+    fileprivate static func splitDartParameters(_ paramList: String) -> [String] {
+        var results: [String] = []
+        var current = ""
+        var parenDepth = 0
+        var bracketDepth = 0
+        var braceDepth = 0
+        var angleDepth = 0
+        var inString: Character? = nil
+        var escaped = false
+
+        for ch in paramList {
+            if let stringDelimiter = inString {
+                current.append(ch)
+                if escaped {
+                    escaped = false
+                } else if ch == "\\" {
+                    escaped = true
+                } else if ch == stringDelimiter {
+                    inString = nil
+                }
+                continue
+            }
+
+            if ch == "\"" || ch == "'" {
+                inString = ch
+                current.append(ch)
+                continue
+            }
+
+            switch ch {
+            case "(":
+                parenDepth += 1
+            case ")":
+                parenDepth = max(0, parenDepth - 1)
+            case "[":
+                bracketDepth += 1
+            case "]":
+                bracketDepth = max(0, bracketDepth - 1)
+            case "{":
+                braceDepth += 1
+            case "}":
+                braceDepth = max(0, braceDepth - 1)
+            case "<":
+                angleDepth += 1
+            case ">":
+                angleDepth = max(0, angleDepth - 1)
+            case ",":
+                if parenDepth == 0, bracketDepth == 0, braceDepth == 0, angleDepth == 0 {
+                    results.append(current)
+                    current = ""
+                    continue
+                }
+            default:
+                break
+            }
+            current.append(ch)
+        }
+
+        if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            results.append(current)
+        }
+        return results
+    }
+
+    fileprivate static func splitDartDefault(_ param: String) -> String {
+        var parenDepth = 0
+        var bracketDepth = 0
+        var braceDepth = 0
+        var angleDepth = 0
+        var inString: Character? = nil
+        var escaped = false
+
+        for (idx, ch) in param.enumerated() {
+            if let stringDelimiter = inString {
+                if escaped {
+                    escaped = false
+                } else if ch == "\\" {
+                    escaped = true
+                } else if ch == stringDelimiter {
+                    inString = nil
+                }
+                continue
+            }
+
+            if ch == "\"" || ch == "'" {
+                inString = ch
+                continue
+            }
+
+            switch ch {
+            case "(":
+                parenDepth += 1
+            case ")":
+                parenDepth = max(0, parenDepth - 1)
+            case "[":
+                bracketDepth += 1
+            case "]":
+                bracketDepth = max(0, bracketDepth - 1)
+            case "{":
+                braceDepth += 1
+            case "}":
+                braceDepth = max(0, braceDepth - 1)
+            case "<":
+                angleDepth += 1
+            case ">":
+                angleDepth = max(0, angleDepth - 1)
+            case "=":
+                if parenDepth == 0, bracketDepth == 0, braceDepth == 0, angleDepth == 0 {
+                    let cutoff = param.index(param.startIndex, offsetBy: idx)
+                    return String(param[..<cutoff]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            default:
+                break
+            }
+        }
+
+        return param
     }
 
     fileprivate static func splitTopLevelTokens(_ text: String) -> [String] {
@@ -1836,7 +2138,7 @@ extension LanguageTypeExtractor {
             LanguageTypeExtractor.extractTSTypeAliasRHS(from: line)
         }
 
-        static func extractReturnType(from signature: String, stats: CodeMapPerformanceCollector? = nil) -> String? {
+        static func extractReturnType(from signature: String, stats: CodeMapPerfStats? = nil) -> String? {
             LanguageTypeExtractor.extractTSReturnType(from: signature, stats: stats)
         }
 
@@ -1867,6 +2169,9 @@ private extension [String: String] {
                 result["parameterTypes"] = paramTypes.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", ")
             case .ts, .tsx:
                 let paramTypes = LanguageTypeExtractor.parseTSParameterList(trimmedList)
+                result["parameterTypes"] = paramTypes.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", ")
+            case .dart:
+                let paramTypes = LanguageTypeExtractor.parseDartParameterList(trimmedList)
                 result["parameterTypes"] = paramTypes.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", ")
             default:
                 let paramTypes = LanguageTypeExtractor.parseCStyleParameterList(trimmedList)

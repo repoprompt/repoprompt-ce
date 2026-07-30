@@ -602,7 +602,9 @@ actor GitWorktreeMutationCoordinator {
 
     #if DEBUG
         func waitForQueuedWaiterForTesting(key: String) async {
-            if waitersByKey[key]?.isEmpty == false { return }
+            if waitersByKey[key]?.isEmpty == false {
+                return
+            }
             await withCheckedContinuation { continuation in
                 queuedWaiterObservationContinuationsByKey[key, default: []].append(continuation)
             }

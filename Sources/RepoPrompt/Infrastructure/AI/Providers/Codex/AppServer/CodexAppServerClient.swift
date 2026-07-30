@@ -103,7 +103,7 @@ actor CodexAppServerClient {
             else {
                 return message
             }
-            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if REPOPROMPT_CODEX_EXECUTABLE is set, update or remove that explicit override."
+            return "\(message) Update the installed Codex CLI and try again; it rejected RepoPrompt's required \(method) request shape."
         }
     }
 
@@ -132,23 +132,22 @@ actor CodexAppServerClient {
         let commandName: String
         let additionalPathHints: [String]
         let enableDebugLogging: Bool
-        private(set) var requestTimeout: TimeInterval?
-        /// Launch directory for the Codex app-server process. Distinct from the thread/turn
-        /// execution cwd, which the controller sends per request.
+        let requestTimeout: TimeInterval?
+        /// Working directory for the Codex app-server process.
         /// When nil, falls back to temp directory via CLIProcessConfiguration default.
-        private(set) var processLaunchDirectory: String?
-        private(set) var processFeaturePolicy: CodexOverrides.FeaturePolicy
+        let workingDirectory: String?
+        let processFeaturePolicy: CodexOverrides.FeaturePolicy
         /// Process-level `model_reasoning_summary` override for app-server launch.
         /// Nil preserves Codex CLI process defaults; pass a value only for an intentional process override.
         /// Agent Mode should prefer per-thread config instead of process launch config.
-        private(set) var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
+        let processModelReasoningSummary: CodexOverrides.ReasoningSummary?
 
         init(
             commandName: String = CLILaunchProfiles.codex.commandName,
             additionalPathHints: [String] = CLILaunchProfiles.codex.supplementalSearchPaths,
             enableDebugLogging: Bool = false,
             requestTimeout: TimeInterval? = nil,
-            processLaunchDirectory: String? = nil,
+            workingDirectory: String? = nil,
             processFeaturePolicy: CodexOverrides.FeaturePolicy = .defaultDisabled,
             processModelReasoningSummary: CodexOverrides.ReasoningSummary? = nil
         ) {
@@ -156,25 +155,9 @@ actor CodexAppServerClient {
             self.additionalPathHints = additionalPathHints
             self.enableDebugLogging = enableDebugLogging
             self.requestTimeout = requestTimeout
-            self.processLaunchDirectory = processLaunchDirectory
+            self.workingDirectory = workingDirectory
             self.processFeaturePolicy = processFeaturePolicy
             self.processModelReasoningSummary = processModelReasoningSummary
-        }
-
-        mutating func replaceRequestTimeout(_ timeout: TimeInterval?) {
-            requestTimeout = timeout
-        }
-
-        mutating func replaceProcessLaunchDirectory(_ path: String?) {
-            processLaunchDirectory = path
-        }
-
-        mutating func replaceProcessLaunchPolicy(
-            featurePolicy: CodexOverrides.FeaturePolicy,
-            modelReasoningSummary: CodexOverrides.ReasoningSummary?
-        ) {
-            processFeaturePolicy = featurePolicy
-            processModelReasoningSummary = modelReasoningSummary
         }
     }
 
@@ -183,19 +166,8 @@ actor CodexAppServerClient {
         let params: [String: CodexJSONValue]
     }
 
-    struct ProcessExitEvidence: Equatable {
-        let executablePath: String
-        let launchDirectory: String
-        let pid: pid_t
-        let status: ProcessExitStatus
-        let stderrTail: Data
-        let stderrWasTruncated: Bool
-        let stderrWasSettled: Bool
-    }
-
     enum ClientError: Error, LocalizedError {
         case processNotRunning
-        case processExited(ProcessExitEvidence)
         case invalidResponse
         case jsonDecodeFailed
         case requestFailed(RequestFailure)
@@ -207,8 +179,6 @@ actor CodexAppServerClient {
             switch self {
             case .processNotRunning:
                 "Codex app-server process is not running."
-            case let .processExited(evidence):
-                Self.processExitDescription(evidence)
             case .invalidResponse:
                 "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
@@ -223,25 +193,6 @@ actor CodexAppServerClient {
                 message
             }
         }
-
-        private static func processExitDescription(_ evidence: ProcessExitEvidence) -> String {
-            let outcome = switch evidence.status {
-            case let .exited(code):
-                "exited with status \(code)"
-            case let .uncaughtSignal(signal):
-                "terminated from signal \(signal)"
-            }
-            var description = "Codex app-server \(outcome) while running \(evidence.executablePath) in \(evidence.launchDirectory)."
-            if !evidence.stderrTail.isEmpty {
-                let stderr = String(decoding: evidence.stderrTail, as: UTF8.self)
-                let suffix = evidence.stderrWasTruncated ? " (tail truncated)" : ""
-                description += " stderr\(suffix): \(stderr)"
-            }
-            if !evidence.stderrWasSettled {
-                description += " Stderr capture did not settle after bounded process-family cleanup."
-            }
-            return description
-        }
     }
 
     enum TransportTerminationReason: Equatable {
@@ -252,7 +203,6 @@ actor CodexAppServerClient {
         case livenessCheckFailed(method: String?)
         case decodeRecoveryBudgetExceeded(generation: UInt64)
         case readSourceSetupFailed(stream: String, errno: Int32?)
-        case observedProcessExit(status: ProcessExitStatus)
     }
 
     struct ExpectedAgentPIDRegistration: Equatable {
@@ -285,28 +235,9 @@ actor CodexAppServerClient {
         let transportGeneration: UInt64
     }
 
-    private struct ExitObservation {
-        let observer: ChildProcessExitObserver
-        let executablePath: String
-        let launchDirectory: String
-        let stderrCapture: CodexProcessStderrCapture
-    }
-
-    private struct ActiveTransport {
-        let generation: UInt64
-        let process: SpawnedProcess
-        let exitObservation: ExitObservation?
-    }
-
-    private struct PreparedRuntimeLaunchContext {
-        let environment: [String: String]
-        let resolution: CodexProviderHelpers.CodexExecutableResolution
-    }
-
     private struct TerminatingTransport {
-        let activeTransport: ActiveTransport?
+        let process: SpawnedProcess?
         let expectedAgentPIDToClear: RegisteredExpectedAgentPID?
-        let processFamilyCleanupWasCompleted: Bool
     }
 
     static func isTimeoutError(_ error: Error) -> Bool {
@@ -356,7 +287,7 @@ actor CodexAppServerClient {
 
     private static func shouldPoisonTransportOnTimeout(method: String) -> Bool {
         switch method {
-        case "initialize", "thread/start", "thread/resume":
+        case "thread/start", "thread/resume":
             true
         default:
             false
@@ -364,7 +295,7 @@ actor CodexAppServerClient {
     }
 
     private var config = Config()
-    private var activeTransport: ActiveTransport?
+    private var process: SpawnedProcess?
     private var stdoutChunkChannel: FileHandleChunkChannel?
     private var stderrChunkChannel: FileHandleChunkChannel?
     private var stdoutConsumerTask: Task<Void, Never>?
@@ -380,8 +311,6 @@ actor CodexAppServerClient {
     private var stdoutTail = Data()
     private var didTerminateTransport = false
     private var lastTransportTerminationReason: TransportTerminationReason?
-    private var lastTransportFailure: ClientError?
-    private var transportTerminationTask: (generation: UInt64, task: Task<Void, Never>)?
     /// Per-transport decode-recovery attempts, used to cap CPU spent on malformed lines.
     private var decodeRecoveryAttemptsByGeneration: [UInt64: Int] = [:]
     /// Monotonic counter incremented each time a new process is started.
@@ -389,26 +318,13 @@ actor CodexAppServerClient {
     /// to the correct transport instance — prevents a stale task from killing a
     /// newly started process.
     private var transportGeneration: UInt64 = 0
-    /// Actor-confined authority for startup work. Explicit or emergency shutdown
-    /// revokes every invocation that began before the shutdown request.
-    private var startupAuthorityEpoch: UInt64 = 0
     private var startupTask: (id: UUID, task: Task<Void, Error>)?
     private var expectedAgentPIDRegistration: ExpectedAgentPIDRegistration?
     private var registeredExpectedAgentPID: RegisteredExpectedAgentPID?
-    private var preparedRuntimeLaunchContext: PreparedRuntimeLaunchContext?
     private static let maxDecodeRecoveryAttemptsPerGeneration = 128
-    private static let stderrTailLimit = 8 * 1024
-    private static let exitDiagnosticSettlementWindow: TimeInterval = 0.25
     private let writeFrameHandler: @Sendable (Int32, Data) throws -> Void
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
-    private let processSpawnPreparation: @Sendable () async throws -> Void
-    private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
-    private let provisionsRepoPromptMCPOnStart: Bool
-    private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
-    #if DEBUG
-        private var terminalObserverJoinCount = 0
-    #endif
 
     deinit {
         emergencyTerminateTransportForDeinit()
@@ -421,76 +337,28 @@ actor CodexAppServerClient {
         livenessProbe: @escaping @Sendable (SpawnedProcess) -> Bool = { process in
             CodexAppServerClient.defaultProcessAppearsAlive(process)
         },
-        processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
-        processEnvironmentBuilder: @escaping @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult = {
-            await ProcessEnvironmentBuilder.build($0)
-        },
-        provisionsRepoPromptMCPOnStart: Bool = true,
-        processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
-            ChildProcessExitObserver(pid: $0)
-        },
         expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager
     ) {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
-        self.processSpawnPreparation = processSpawnPreparation
-        self.processEnvironmentBuilder = processEnvironmentBuilder
-        self.provisionsRepoPromptMCPOnStart = provisionsRepoPromptMCPOnStart
-        self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
+    }
+
+    struct ProcessSnapshot: Equatable {
+        let pid: pid_t
+        let appearsAlive: Bool
+    }
+
+    func currentProcessSnapshot() -> ProcessSnapshot? {
+        guard let process else { return nil }
+        return ProcessSnapshot(
+            pid: process.pid,
+            appearsAlive: livenessProbe(process)
+        )
     }
 
     func updateConfig(_ config: Config) {
         self.config = config
-        preparedRuntimeLaunchContext = nil
-    }
-
-    /// Updates only the default JSON-RPC request deadline. Unlike whole-config replacement,
-    /// this does not invalidate the already prepared runtime launch context.
-    func updateDefaultRequestTimeout(_ timeout: TimeInterval?) {
-        config.replaceRequestTimeout(timeout)
-    }
-
-    /// Resolves the process environment and Codex runtime once for this client lifetime.
-    /// Native Agent Mode calls this before MCP provisioning, then `startIfNeeded()` reuses
-    /// the same captured launch context instead of consulting a second environment snapshot.
-    func prepareRuntimeForLaunch() async throws -> CodexRuntimeAuthority.Runtime {
-        if let runtime = preparedRuntimeLaunchContext?.resolution.runtime {
-            return runtime
-        }
-
-        let environmentResult = await processEnvironmentBuilder(
-            ProcessEnvironmentRequest(
-                purpose: .codexAppServer,
-                enableDebugLogging: config.enableDebugLogging
-            )
-        )
-        var environment = environmentResult.environment
-        let resolution = CodexProviderHelpers.resolveCodexExecutable(
-            commandName: config.commandName,
-            environment: environment,
-            additionalPathHints: config.additionalPathHints,
-            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
-        )
-        guard resolution.status == .available else {
-            throw ClientError.executableUnavailable(resolution.userMessage)
-        }
-        guard let runtime = resolution.runtime else {
-            throw ClientError.executableUnavailable("RepoPrompt could not start Codex: runtime resolution completed without runtime metadata.")
-        }
-        do {
-            try runtime.prepareState()
-        } catch {
-            throw ClientError.executableUnavailable(
-                "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
-            )
-        }
-        environment.merge(resolution.environmentOverrides) { _, ownedValue in ownedValue }
-        preparedRuntimeLaunchContext = PreparedRuntimeLaunchContext(
-            environment: environment,
-            resolution: resolution
-        )
-        return runtime
     }
 
     func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
@@ -499,11 +367,11 @@ actor CodexAppServerClient {
             await clearRegisteredExpectedAgentPIDIfNeeded()
             return
         }
-        guard let activeTransport else {
+        guard let process else {
             await clearRegisteredExpectedAgentPIDIfNeeded()
             return
         }
-        await registerExpectedAgentPIDIfNeeded(for: activeTransport.process.pid)
+        await registerExpectedAgentPIDIfNeeded(for: process.pid)
     }
 
     func clearExpectedAgentPIDRegistration() async {
@@ -512,11 +380,7 @@ actor CodexAppServerClient {
     }
 
     private func registerExpectedAgentPIDIfNeeded(for pid: pid_t) async {
-        guard !didTerminateTransport,
-              let registration = expectedAgentPIDRegistration
-        else {
-            return
-        }
+        guard let registration = expectedAgentPIDRegistration else { return }
         let target = RegisteredExpectedAgentPID(
             pid: pid,
             clientName: registration.clientName,
@@ -524,10 +388,10 @@ actor CodexAppServerClient {
         )
         guard registeredExpectedAgentPID != target else { return }
         await clearRegisteredExpectedAgentPIDIfNeeded()
-        guard expectedAgentPIDRegistration == registration, activeTransport?.process.pid == pid else { return }
+        guard expectedAgentPIDRegistration == registration, process?.pid == pid else { return }
         registeredExpectedAgentPID = target
         await expectedAgentPIDRegistrar.register(target.pid, target.clientName, target.runID)
-        guard expectedAgentPIDRegistration == registration, activeTransport?.process.pid == pid else {
+        guard expectedAgentPIDRegistration == registration, process?.pid == pid else {
             if registeredExpectedAgentPID == target {
                 registeredExpectedAgentPID = nil
             }
@@ -547,12 +411,20 @@ actor CodexAppServerClient {
         return registered
     }
 
-    /// Updates the process launch directory for the next process start.
+    /// Updates the working directory for the next process start.
     /// Must be called before `startIfNeeded()` to take effect.
-    func updateProcessLaunchDirectory(_ path: String?) {
+    func updateWorkingDirectory(_ path: String?) {
         let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = (trimmed?.isEmpty == false) ? trimmed : nil
-        config.replaceProcessLaunchDirectory(normalized)
+        config = Config(
+            commandName: config.commandName,
+            additionalPathHints: config.additionalPathHints,
+            enableDebugLogging: config.enableDebugLogging,
+            requestTimeout: config.requestTimeout,
+            workingDirectory: normalized,
+            processFeaturePolicy: config.processFeaturePolicy,
+            processModelReasoningSummary: config.processModelReasoningSummary
+        )
     }
 
     func updateProcessFeaturePolicy(_ featurePolicy: CodexOverrides.FeaturePolicy) async {
@@ -569,11 +441,16 @@ actor CodexAppServerClient {
         guard featurePolicy != config.processFeaturePolicy
             || modelReasoningSummary != config.processModelReasoningSummary
         else { return }
-        config.replaceProcessLaunchPolicy(
-            featurePolicy: featurePolicy,
-            modelReasoningSummary: modelReasoningSummary
+        config = Config(
+            commandName: config.commandName,
+            additionalPathHints: config.additionalPathHints,
+            enableDebugLogging: config.enableDebugLogging,
+            requestTimeout: config.requestTimeout,
+            workingDirectory: config.workingDirectory,
+            processFeaturePolicy: featurePolicy,
+            processModelReasoningSummary: modelReasoningSummary
         )
-        if activeTransport != nil {
+        if process != nil {
             await terminateTransport(flushStdout: true, reason: .explicitStop)
         }
     }
@@ -599,34 +476,27 @@ actor CodexAppServerClient {
     }
 
     func startIfNeeded() async throws {
-        let authority = startupAuthorityEpoch
-        if let termination = transportTerminationTask,
-           termination.generation == transportGeneration
-        {
-            await termination.task.value
-            try ensureStartupAuthority(authority)
-        }
         if let existingStartupTask = startupTask?.task {
             return try await existingStartupTask.value
         }
-        if let activeTransport {
-            let appearsAlive = livenessProbe(activeTransport.process)
+        if let process {
+            let appearsAlive = livenessProbe(process)
             if isInitialized, appearsAlive {
                 return
             }
             if !appearsAlive {
-                await settleObservationalTermination(
-                    generation: activeTransport.generation,
-                    flushStdout: false,
-                    fallbackReason: .livenessCheckFailed(method: nil)
+                scheduleTransportCleanup(
+                    invalidateTransport(
+                        flushStdout: false,
+                        requestFailure: .processNotRunning,
+                        reason: .livenessCheckFailed(method: nil)
+                    )
                 )
-                try ensureStartupAuthority(authority)
             }
         }
-        try ensureStartupAuthority(authority)
         let startupID = UUID()
         let task = Task<Void, Error> {
-            try await self.performStartupIfNeeded(startupAuthority: authority)
+            try await self.performStartupIfNeeded()
         }
         startupTask = (id: startupID, task: task)
         do {
@@ -643,15 +513,8 @@ actor CodexAppServerClient {
     }
 
     func stop() async {
-        startupAuthorityEpoch &+= 1
         startupTask?.task.cancel()
         startupTask = nil
-        if let termination = transportTerminationTask,
-           termination.generation == transportGeneration
-        {
-            await termination.task.value
-            return
-        }
         await terminateTransport(flushStdout: true, reason: .explicitStop)
     }
 
@@ -681,118 +544,30 @@ actor CodexAppServerClient {
         requestFailure: ClientError = .processNotRunning,
         reason: TransportTerminationReason
     ) async {
-        let task = beginTransportTermination(
-            flushStdout: flushStdout,
-            expectedGeneration: expectedGeneration,
-            requestFailure: requestFailure,
-            reason: reason
-        )
-        await task?.value
-    }
-
-    @discardableResult
-    private func beginTransportTermination(
-        flushStdout: Bool,
-        expectedGeneration: UInt64? = nil,
-        requestFailure: ClientError,
-        reason: TransportTerminationReason
-    ) -> Task<Void, Never>? {
-        if let expectedGeneration, expectedGeneration != transportGeneration { return nil }
-        let generation = transportGeneration
-        return installTransportTermination(
-            generation: generation,
-            reason: reason,
-            captureAfterClaim: { lastTransportFailure = requestFailure },
-            operation: { client, _ in
-                await client.completeTransportTermination(
-                    generation: generation,
-                    flushStdout: flushStdout,
-                    requestFailure: requestFailure
-                )
-            }
-        )
-    }
-
-    private func beginObservedProcessExitTermination(
-        status: ProcessExitStatus,
-        observer: ChildProcessExitObserver,
-        generation: UInt64
-    ) -> Task<Void, Never>? {
-        guard let activeTransport,
-              activeTransport.generation == generation,
-              activeTransport.exitObservation?.observer === observer,
-              activeTransport.process.pid == observer.pid
-        else {
-            return nil
-        }
-        return installTransportTermination(
-            generation: generation,
-            reason: .observedProcessExit(status: status),
-            captureAfterClaim: { takeRegisteredExpectedAgentPIDForDeferredClear() },
-            operation: { client, expectedAgentPIDToClear in
-                await client.completeObservedProcessExitTermination(
-                    status: status,
-                    observer: observer,
-                    generation: generation,
-                    expectedAgentPIDToClear: expectedAgentPIDToClear
-                )
-            }
-        )
-    }
-
-    /// Shared first-claim arbitration for every transport-termination origin:
-    /// same-generation task reuse, the terminal-cause claim, post-claim state
-    /// capture, and termination-task publication happen identically here so a
-    /// new termination cause cannot skip or reorder any step of the protocol.
-    private func installTransportTermination<ClaimContext: Sendable>(
-        generation: UInt64,
-        reason: TransportTerminationReason,
-        captureAfterClaim: () -> ClaimContext,
-        operation: @escaping @Sendable (CodexAppServerClient, ClaimContext) async -> Void
-    ) -> Task<Void, Never>? {
-        if let existing = transportTerminationTask,
-           existing.generation == generation
-        {
-            return existing.task
-        }
-        guard claimTransportTermination(reason: reason) else { return nil }
-        let claimContext = captureAfterClaim()
-        let task = Task { [weak self] in
-            guard let self else { return }
-            await operation(self, claimContext)
-        }
-        transportTerminationTask = (generation: generation, task: task)
-        return task
-    }
-
-    private func claimTransportTermination(reason: TransportTerminationReason) -> Bool {
-        guard !didTerminateTransport else { return false }
-        didTerminateTransport = true
-        isInitialized = false
-        lastTransportTerminationReason = reason
-        return true
-    }
-
-    private func completeTransportTermination(
-        generation: UInt64,
-        flushStdout: Bool,
-        requestFailure: ClientError
-    ) async {
-        guard generation == transportGeneration else { return }
-        defer { retireTransportTermination(generation: generation) }
         await finishTransportTermination(
-            invalidateClaimedTransport(
+            invalidateTransport(
                 flushStdout: flushStdout,
-                requestFailure: requestFailure
+                expectedGeneration: expectedGeneration,
+                requestFailure: requestFailure,
+                reason: reason
             )
         )
     }
 
-    private func invalidateClaimedTransport(
+    private func invalidateTransport(
         flushStdout: Bool,
+        expectedGeneration: UInt64? = nil,
         requestFailure: ClientError,
-        processFamilyCleanupWasCompleted: Bool = false
-    ) -> TerminatingTransport {
+        reason: TransportTerminationReason
+    ) -> TerminatingTransport? {
+        if let expected = expectedGeneration, expected != transportGeneration {
+            return nil
+        }
+        guard !didTerminateTransport else { return nil }
+        didTerminateTransport = true
+        lastTransportTerminationReason = reason
+
+        // 1. Flush remaining stdout lines before tearing down.
         if flushStdout {
             var remainingLines: [Data] = []
             stdoutFramer.flush { lineData in
@@ -803,16 +578,17 @@ actor CodexAppServerClient {
             }
         }
 
+        // 2. Tear down chunk channels and consumer tasks.
         stdoutChunkChannel?.finish()
         stderrChunkChannel?.finish()
         stdoutConsumerTask?.cancel()
         stderrConsumerTask?.cancel()
-        activeTransport?.exitObservation?.stderrCapture.finish()
         stdoutChunkChannel = nil
         stderrChunkChannel = nil
         stdoutConsumerTask = nil
         stderrConsumerTask = nil
 
+        // 3. Cancel all timeout tasks and fail all pending requests.
         for task in timeoutTasks.values {
             task.cancel()
         }
@@ -824,6 +600,7 @@ actor CodexAppServerClient {
             continuation.resume(throwing: requestFailure)
         }
 
+        // 4. Finish all notification and serverRequest subscriber streams.
         let notifContinuations = notificationContinuations
         notificationContinuations.removeAll()
         for continuation in notifContinuations.values {
@@ -836,166 +613,34 @@ actor CodexAppServerClient {
             continuation.finish()
         }
 
-        let terminatingTransport = TerminatingTransport(
-            activeTransport: activeTransport,
-            expectedAgentPIDToClear: takeRegisteredExpectedAgentPIDForDeferredClear(),
-            processFamilyCleanupWasCompleted: processFamilyCleanupWasCompleted
-        )
-        activeTransport = nil
+        // 5. Snapshot and nil process BEFORE the await to prevent actor re-entrancy
+        // issues: other calls (startIfNeeded, request, subscribe*) that interleave
+        // during ProcessTermination.terminateAndReap will see process==nil and
+        // correctly fail/bail out.
+        let terminatingProcess = process
+        let expectedAgentPIDToClear = takeRegisteredExpectedAgentPIDForDeferredClear()
+        process = nil
+        isInitialized = false
 
+        // 6. Reset framer state for potential future restart.
         stdoutFramer = LineFramer()
         stdoutTail.removeAll(keepingCapacity: false)
         decodeRecoveryAttemptsByGeneration.removeValue(forKey: transportGeneration)
-        return terminatingTransport
-    }
 
-    private func settleObservationalTermination(
-        generation: UInt64,
-        flushStdout: Bool,
-        fallbackReason: TransportTerminationReason
-    ) async {
-        guard generation == transportGeneration else { return }
-        if let existing = transportTerminationTask,
-           existing.generation == generation
-        {
-            await existing.task.value
-            return
-        }
-        if let activeTransport,
-           activeTransport.generation == generation,
-           let observer = activeTransport.exitObservation?.observer
-        {
-            if let outcome = await observer.wait(timeout: Self.exitDiagnosticSettlementWindow) {
-                await handleObservedProcessExit(
-                    outcome,
-                    observer: observer,
-                    generation: generation
-                )
-                return
-            }
-
-            // A terminal root can race the bounded diagnostic wait without
-            // making a reused-PID signal safe. Join the sole observer so its
-            // typed exit survives; waitid remains non-destructive.
-            if ProcessTermination.childIsTerminalOrAlreadyReaped(activeTransport.process.pid) {
-                #if DEBUG
-                    terminalObserverJoinCount += 1
-                #endif
-                if let outcome = await observer.wait() {
-                    await handleObservedProcessExit(
-                        outcome,
-                        observer: observer,
-                        generation: generation
-                    )
-                    return
-                }
-            }
-        }
-        await terminateTransport(
-            flushStdout: flushStdout,
-            expectedGeneration: generation,
-            reason: fallbackReason
+        return TerminatingTransport(
+            process: terminatingProcess,
+            expectedAgentPIDToClear: expectedAgentPIDToClear
         )
     }
 
-    private func handleObservedProcessExit(
-        _ outcome: ChildProcessExitObserver.Outcome,
-        observer: ChildProcessExitObserver,
-        generation: UInt64
-    ) async {
-        guard let activeTransport,
-              activeTransport.generation == generation,
-              activeTransport.exitObservation?.observer === observer,
-              activeTransport.process.pid == observer.pid
-        else {
-            return
+    private func scheduleTransportCleanup(_ terminatingTransport: TerminatingTransport?) {
+        guard let terminatingTransport else { return }
+        Task {
+            await self.finishTransportTermination(terminatingTransport)
         }
-        let task: Task<Void, Never>? = switch outcome {
-        case let .exited(status):
-            beginObservedProcessExitTermination(
-                status: status,
-                observer: observer,
-                generation: generation
-            )
-        case .failed:
-            beginTransportTermination(
-                flushStdout: true,
-                expectedGeneration: generation,
-                requestFailure: .processNotRunning,
-                reason: .livenessCheckFailed(method: nil)
-            )
-        }
-        await task?.value
-    }
-
-    private func completeObservedProcessExitTermination(
-        status: ProcessExitStatus,
-        observer: ChildProcessExitObserver,
-        generation: UInt64,
-        expectedAgentPIDToClear: RegisteredExpectedAgentPID?
-    ) async {
-        defer { retireTransportTermination(generation: generation) }
-        if let expectedAgentPIDToClear {
-            await expectedAgentPIDRegistrar.clear(
-                expectedAgentPIDToClear.pid,
-                expectedAgentPIDToClear.clientName,
-                expectedAgentPIDToClear.runID
-            )
-        }
-        guard let transport = activeTransport,
-              transport.generation == generation,
-              let exitObservation = transport.exitObservation,
-              exitObservation.observer === observer,
-              transport.process.pid == observer.pid
-        else {
-            return
-        }
-        let logger: (String) -> Void = config.enableDebugLogging
-            ? { print("[CodexAppServer] \($0)") }
-            : { _ in }
-        await ProcessTermination.terminateObservedProcessFamily(
-            observer: observer,
-            processGroupID: transport.process.processGroupID,
-            logger: logger
-        )
-        let stderrWasSettled = await exitObservation.stderrCapture.waitUntilFinished(
-            timeout: Self.exitDiagnosticSettlementWindow
-        )
-        guard let currentTransport = activeTransport,
-              currentTransport.generation == generation,
-              currentTransport.exitObservation?.observer === observer,
-              currentTransport.process.pid == observer.pid
-        else {
-            return
-        }
-
-        let stderr = exitObservation.stderrCapture.snapshot()
-        let evidence = ProcessExitEvidence(
-            executablePath: exitObservation.executablePath,
-            launchDirectory: exitObservation.launchDirectory,
-            pid: observer.pid,
-            status: status,
-            stderrTail: stderr.bytes,
-            stderrWasTruncated: stderr.wasTruncated,
-            stderrWasSettled: stderrWasSettled
-        )
-        lastTransportFailure = .processExited(evidence)
-        await finishTransportTermination(
-            invalidateClaimedTransport(
-                flushStdout: true,
-                requestFailure: .processExited(evidence),
-                processFamilyCleanupWasCompleted: true
-            )
-        )
-    }
-
-    private func retireTransportTermination(generation: UInt64) {
-        guard transportTerminationTask?.generation == generation else { return }
-        transportTerminationTask = nil
     }
 
     private func emergencyTerminateTransportForDeinit() {
-        startupAuthorityEpoch &+= 1
         startupTask?.task.cancel()
         startupTask = nil
         stdoutChunkChannel?.finish()
@@ -1036,25 +681,15 @@ actor CodexAppServerClient {
                 )
             }
         }
-        guard let activeTransport else { return }
-        self.activeTransport = nil
-        activeTransport.exitObservation?.stderrCapture.finish()
-        let process = activeTransport.process
+        guard let process else { return }
+        self.process = nil
         process.stdout.readabilityHandler = nil
         process.stderr.readabilityHandler = nil
         process.stdin?.closeFile()
+        let pid = process.pid
+        let processGroupID = process.processGroupID
         Task.detached {
-            if let observer = activeTransport.exitObservation?.observer {
-                await ProcessTermination.terminateObservedProcessFamily(
-                    observer: observer,
-                    processGroupID: process.processGroupID
-                )
-            } else {
-                _ = await ProcessTermination.terminateAndReap(
-                    pid: process.pid,
-                    processGroupID: process.processGroupID
-                )
-            }
+            _ = await ProcessTermination.terminateAndReap(pid: pid, processGroupID: processGroupID)
         }
     }
 
@@ -1067,36 +702,27 @@ actor CodexAppServerClient {
                 expectedAgentPIDToClear.runID
             )
         }
-        guard let activeTransport = terminatingTransport.activeTransport else { return }
-        let process = activeTransport.process
+        guard let process = terminatingTransport.process else { return }
         process.stdout.readabilityHandler = nil
         process.stderr.readabilityHandler = nil
         process.stdin?.closeFile()
-        let logger: (String) -> Void = config.enableDebugLogging
-            ? { print("[CodexAppServer] \($0)") }
-            : { _ in }
-        if terminatingTransport.processFamilyCleanupWasCompleted {
-            return
-        }
-        if let observer = activeTransport.exitObservation?.observer {
-            await ProcessTermination.terminateObservedProcessFamily(
-                observer: observer,
-                processGroupID: process.processGroupID,
-                logger: logger
-            )
-        } else {
-            _ = await ProcessTermination.terminateAndReap(
-                pid: process.pid,
-                processGroupID: process.processGroupID,
-                logger: logger
-            )
-        }
+        let pid = process.pid
+        _ = await ProcessTermination.terminateAndReap(
+            pid: pid,
+            processGroupID: process.processGroupID,
+            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : { _ in }
+        )
     }
 
     private static func defaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
         // Use a non-destructive child-state check so exited/zombie children do not
         // look healthy, while leaving final reap/cleanup to the normal teardown path.
-        if ProcessTermination.childIsTerminalOrAlreadyReaped(process.pid) {
+        var info = siginfo_t()
+        let waitResult = Darwin.waitid(P_PID, id_t(process.pid), &info, WEXITED | WNOHANG | WNOWAIT)
+        if waitResult == 0, info.si_pid == process.pid {
+            return false
+        }
+        if waitResult == -1, errno == ECHILD {
             return false
         }
 
@@ -1128,11 +754,9 @@ actor CodexAppServerClient {
         useDefaultTimeout: Bool
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
-        guard let activeTransport, !didTerminateTransport else {
-            throw lastTransportFailure ?? ClientError.processNotRunning
-        }
+        guard process != nil else { throw ClientError.processNotRunning }
         let requestID = makeRequestID()
-        let generation = activeTransport.generation
+        let generation = transportGeneration
         let deadline = timeout ?? (useDefaultTimeout ? config.requestTimeout : nil)
         var payload: [String: Any] = [
             "method": method,
@@ -1167,9 +791,7 @@ actor CodexAppServerClient {
     }
 
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) throws {
-        guard activeTransport != nil, !didTerminateTransport else {
-            throw lastTransportFailure ?? ClientError.processNotRunning
-        }
+        guard process != nil else { throw ClientError.processNotRunning }
         let payload: [String: Any] = [
             "id": id.jsonValue,
             "result": result
@@ -1183,9 +805,7 @@ actor CodexAppServerClient {
         message: String,
         data: [String: Any]? = nil
     ) throws {
-        guard activeTransport != nil, !didTerminateTransport else {
-            throw lastTransportFailure ?? ClientError.processNotRunning
-        }
+        guard process != nil else { throw ClientError.processNotRunning }
         var errorObject: [String: Any] = [
             "code": code,
             "message": message
@@ -1201,9 +821,7 @@ actor CodexAppServerClient {
     }
 
     func notify(method: String, params: [String: Any]?) throws {
-        guard activeTransport != nil, !didTerminateTransport else {
-            throw lastTransportFailure ?? ClientError.processNotRunning
-        }
+        guard process != nil else { throw ClientError.processNotRunning }
         var payload: [String: Any] = [
             "method": method
         ]
@@ -1219,7 +837,7 @@ actor CodexAppServerClient {
             return try await fetchModelPages(limit: limit)
         } catch let error as ClientError {
             switch error {
-            case .processNotRunning, .processExited, .transportWriteFailed, .transportReadSetupFailed:
+            case .processNotRunning, .transportWriteFailed, .transportReadSetupFailed:
                 return try await fetchModelPages(limit: limit)
             default:
                 throw error
@@ -1316,64 +934,29 @@ actor CodexAppServerClient {
         isInitialized = true
     }
 
-    private func ensureStartupAuthority(_ authority: UInt64) throws {
-        guard authority == startupAuthorityEpoch else {
-            throw CancellationError()
+    private func performStartupIfNeeded() async throws {
+        if process == nil {
+            try await startProcess()
         }
+        try await initializeIfNeeded()
     }
 
-    private func performStartupIfNeeded(startupAuthority: UInt64) async throws {
-        do {
-            try ensureStartupAuthority(startupAuthority)
-            if activeTransport == nil {
-                try await startProcess(startupAuthority: startupAuthority)
-            }
-            try ensureStartupAuthority(startupAuthority)
-            try await initializeIfNeeded()
-        } catch is CancellationError {
-            if let termination = transportTerminationTask,
-               termination.generation == transportGeneration
-            {
-                await termination.task.value
-                throw lastTransportFailure ?? ClientError.processNotRunning
-            }
-            throw CancellationError()
-        }
-    }
-
-    private static func executableUnavailableSpawnError(
-        _ error: ProcessLauncherError
-    ) -> ClientError? {
-        let failure = error.processLaunchFailure
-        guard failure.domain == NSPOSIXErrorDomain else { return nil }
-        return switch failure.code {
-        case Int(ENOENT):
-            .executableUnavailable(
-                "RepoPrompt could not start Codex: the selected runtime could not be started. Reinstall RepoPrompt CE or configure a valid explicit override."
+    private func startProcess() async throws {
+        let environmentResult = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(
+                purpose: .codexAppServer,
+                enableDebugLogging: config.enableDebugLogging
             )
-        case Int(EACCES):
-            .executableUnavailable(
-                "RepoPrompt could not start Codex: permission was denied when starting the selected runtime. Reinstall RepoPrompt CE or configure a valid explicit override."
-            )
-        default:
-            nil
-        }
-    }
-
-    private func startProcess(startupAuthority: UInt64) async throws {
-        let runtime = try await prepareRuntimeForLaunch()
-        guard let launchContext = preparedRuntimeLaunchContext else {
-            throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
-        }
-        let environment = launchContext.environment
-        let resolution = launchContext.resolution
-        if provisionsRepoPromptMCPOnStart {
-            let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
-            guard provisioning.success else {
-                throw ClientError.executableUnavailable(
-                    provisioning.errorMessage ?? "RepoPrompt could not prepare its owned Codex configuration."
-                )
-            }
+        )
+        let environment = environmentResult.environment
+        let resolution = CodexProviderHelpers.resolveCodexExecutable(
+            commandName: config.commandName,
+            environment: environment,
+            additionalPathHints: config.additionalPathHints,
+            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
+        )
+        guard resolution.status == .available else {
+            throw ClientError.executableUnavailable(resolution.userMessage)
         }
         let processOverrides = CodexOverrides.cliConfigArgs(
             toolPolicy: .init(
@@ -1383,84 +966,34 @@ actor CodexAppServerClient {
             featurePolicy: config.processFeaturePolicy
         )
         let args = processOverrides + ["app-server"]
-        let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
-            config.processLaunchDirectory
+        let spawned = try ProcessLauncher.spawn(
+            command: resolution.resolvedCommand,
+            arguments: args,
+            environment: environment,
+            workingDirectory: config.workingDirectory
         )
-        let spawned: SpawnedProcess
-        do {
-            try await processSpawnPreparation()
-            try Task.checkCancellation()
-            try ensureStartupAuthority(startupAuthority)
-            spawned = try ProcessLauncher.spawn(
-                command: resolution.resolvedCommand,
-                arguments: args,
-                environment: environment,
-                workingDirectory: launchDirectory
-            )
-        } catch let error as ProcessLauncherError {
-            guard let mappedError = Self.executableUnavailableSpawnError(error) else {
-                throw error
-            }
-            throw mappedError
-        }
-
-        // The observer is installed before reader setup or PID registration so
-        // every successful spawn immediately has one cancellation-independent reaper.
-        transportGeneration &+= 1
-        let generation = transportGeneration
-        let exitObserver = processExitObserverFactory(spawned.pid)
-        let capture = CodexProcessStderrCapture(byteLimit: Self.stderrTailLimit)
-
         stdoutFramer = LineFramer()
         stdoutTail.removeAll(keepingCapacity: false)
         didTerminateTransport = false
-        lastTransportTerminationReason = nil
-        lastTransportFailure = nil
-        transportTerminationTask = nil
-        decodeRecoveryAttemptsByGeneration[generation] = 0
-        activeTransport = ActiveTransport(
-            generation: generation,
-            process: spawned,
-            exitObservation: ExitObservation(
-                observer: exitObserver,
-                executablePath: resolution.resolvedCommand,
-                launchDirectory: launchDirectory,
-                stderrCapture: capture
-            )
-        )
-
-        Task.detached { [weak self] in
-            guard let outcome = await exitObserver.wait() else { return }
-            await self?.handleObservedProcessExit(
-                outcome,
-                observer: exitObserver,
-                generation: generation
-            )
-        }
+        transportGeneration &+= 1
+        decodeRecoveryAttemptsByGeneration[transportGeneration] = 0
+        process = spawned
         do {
-            try startStdoutReader(spawned.stdout, generation: generation)
-            try startStderrReader(spawned.stderr, capture: capture)
+            try startStdoutReader(spawned.stdout)
+            try startStderrReader(spawned.stderr)
         } catch {
             let clientError = Self.transportReadSetupError(stream: "process pipe", error: error)
-            let task = beginTransportTermination(
+            let terminatingTransport = invalidateTransport(
                 flushStdout: false,
                 requestFailure: clientError,
                 reason: .readSourceSetupFailed(stream: "process pipe", errno: Self.errnoValue(from: error))
             )
-            await task?.value
-            throw lastTransportFailure ?? clientError
+            await finishTransportTermination(terminatingTransport)
+            throw clientError
         }
         await registerExpectedAgentPIDIfNeeded(for: spawned.pid)
-        guard activeTransport?.process.pid == spawned.pid,
-              activeTransport?.generation == generation,
-              !didTerminateTransport
-        else {
-            if let termination = transportTerminationTask,
-               termination.generation == generation
-            {
-                await termination.task.value
-            }
-            throw lastTransportFailure ?? ClientError.processNotRunning
+        guard process?.pid == spawned.pid, !didTerminateTransport else {
+            throw ClientError.processNotRunning
         }
     }
 
@@ -1474,7 +1007,7 @@ actor CodexAppServerClient {
     /// Related:
     /// - FileHandleChunkChannel (FIFO ordering primitive)
     /// - ClaudeNativeProcessSessionController.startStdoutReader (reference implementation)
-    private func startStdoutReader(_ handle: FileHandle, generation: UInt64) throws {
+    private func startStdoutReader(_ handle: FileHandle) throws {
         try ReadSourceFDPreflight.validateOpenFD(handle.fileDescriptor, label: "Codex app-server stdout")
         stdoutConsumerTask?.cancel()
         stdoutConsumerTask = nil
@@ -1489,10 +1022,11 @@ actor CodexAppServerClient {
                 channel.yield(data)
             }
         }
+        let generation = transportGeneration
         stdoutConsumerTask = Task { [weak self] in
             for await chunk in channel.stream {
                 guard let self else { break }
-                await handleStdoutChunk(chunk, generation: generation)
+                await handleStdoutChunk(chunk)
             }
             // Stream ended — could be genuine EOF or cancellation/finish from teardown.
             // Only trigger teardown on genuine EOF (not cancellation), and scope to
@@ -1504,7 +1038,7 @@ actor CodexAppServerClient {
     }
 
     /// Sets up a FIFO channel + single consumer task for stderr.
-    private func startStderrReader(_ handle: FileHandle, capture: CodexProcessStderrCapture) throws {
+    private func startStderrReader(_ handle: FileHandle) throws {
         try ReadSourceFDPreflight.validateOpenFD(handle.fileDescriptor, label: "Codex app-server stderr")
         stderrConsumerTask?.cancel()
         stderrConsumerTask = nil
@@ -1520,19 +1054,20 @@ actor CodexAppServerClient {
                 channel.yield(data)
             }
         }
-        stderrConsumerTask = Task {
-            defer { capture.finish() }
+        stderrConsumerTask = Task { [weak self] in
             for await chunk in channel.stream {
-                capture.append(chunk)
-                if enableDebugLogging, !chunk.isEmpty {
-                    print("[CodexAppServer][stderr] \(String(decoding: chunk, as: UTF8.self))")
+                guard self != nil else { break }
+                if enableDebugLogging,
+                   let line = String(data: chunk, encoding: .utf8),
+                   !line.isEmpty
+                {
+                    print("[CodexAppServer][stderr] \(line)")
                 }
             }
         }
     }
 
-    private func handleStdoutChunk(_ data: Data, generation: UInt64) async {
-        guard activeTransport?.generation == generation, !didTerminateTransport else { return }
+    private func handleStdoutChunk(_ data: Data) async {
         appendTail(&stdoutTail, chunk: data, limit: 128 * 1024)
         stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
             handleStdoutFramerDiagnostic(diagnostic)
@@ -1545,10 +1080,10 @@ actor CodexAppServerClient {
     /// Delegates to `terminateTransport` for authoritative cleanup, scoped to the
     /// transport generation that created the consumer task.
     private func handleStdoutEOF(generation: UInt64) async {
-        await settleObservationalTermination(
-            generation: generation,
+        await terminateTransport(
             flushStdout: true,
-            fallbackReason: .stdoutEOF
+            expectedGeneration: generation,
+            reason: .stdoutEOF
         )
     }
 
@@ -1907,10 +1442,7 @@ actor CodexAppServerClient {
     /// Related:
     /// - ClaudeNativeProcessSessionController.sendLine (reference atomic write pattern)
     private func sendJSONLine(_ payload: [String: Any], method: String?) throws {
-        guard let activeTransport, !didTerminateTransport else {
-            throw lastTransportFailure ?? ClientError.processNotRunning
-        }
-        let process = activeTransport.process
+        guard let process else { throw ClientError.processNotRunning }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
         if config.enableDebugLogging {
             if let line = String(data: data, encoding: .utf8) {
@@ -1922,7 +1454,7 @@ actor CodexAppServerClient {
         }
         var frame = data
         frame.append(0x0A)
-        let generation = activeTransport.generation
+        let generation = transportGeneration
         do {
             try writeFrameHandler(stdinDescriptor, frame)
         } catch let error as FDWriteError {
@@ -1930,11 +1462,13 @@ actor CodexAppServerClient {
                 message: transportWriteFailureMessage(method: method, errno: error.errnoValue),
                 errno: error.errnoValue
             )
-            beginTransportTermination(
-                flushStdout: false,
-                expectedGeneration: generation,
-                requestFailure: failure,
-                reason: .stdinWrite(method: method, errno: error.errnoValue)
+            scheduleTransportCleanup(
+                invalidateTransport(
+                    flushStdout: false,
+                    expectedGeneration: generation,
+                    requestFailure: failure,
+                    reason: .stdinWrite(method: method, errno: error.errnoValue)
+                )
             )
             throw failure
         } catch {
@@ -1942,11 +1476,13 @@ actor CodexAppServerClient {
                 message: transportWriteFailureMessage(method: method, errno: nil),
                 errno: nil
             )
-            beginTransportTermination(
-                flushStdout: false,
-                expectedGeneration: generation,
-                requestFailure: failure,
-                reason: .stdinWrite(method: method, errno: nil)
+            scheduleTransportCleanup(
+                invalidateTransport(
+                    flushStdout: false,
+                    expectedGeneration: generation,
+                    requestFailure: failure,
+                    reason: .stdinWrite(method: method, errno: nil)
+                )
             )
             throw failure
         }
@@ -2010,12 +1546,13 @@ actor CodexAppServerClient {
         if let metadata,
            Self.shouldPoisonTransportOnTimeout(method: metadata.method)
         {
-            beginTransportTermination(
+            let terminatingTransport = invalidateTransport(
                 flushStdout: false,
                 expectedGeneration: metadata.transportGeneration,
                 requestFailure: .processNotRunning,
                 reason: .timeout(method: metadata.method, requestID: id)
             )
+            scheduleTransportCleanup(terminatingTransport)
         }
         continuation.resume(throwing: ClientError.requestFailed(.init(
             method: metadata?.method ?? "<unknown>",
@@ -2061,11 +1598,11 @@ actor CodexAppServerClient {
 
     #if DEBUG
         func debugProcessID() -> pid_t? {
-            activeTransport?.process.pid
+            process?.pid
         }
 
         func debugIsProcessRunning() -> Bool {
-            activeTransport != nil && !didTerminateTransport
+            process != nil
         }
 
         func debugNextRequestID() -> Int {
@@ -2080,28 +1617,8 @@ actor CodexAppServerClient {
             lastTransportTerminationReason
         }
 
-        func debugProcessExitObserver() -> ChildProcessExitObserver? {
-            activeTransport?.exitObservation?.observer
-        }
-
-        func debugDeliverObservedProcessExit(
-            _ outcome: ChildProcessExitObserver.Outcome,
-            observer: ChildProcessExitObserver,
-            generation: UInt64
-        ) async {
-            await handleObservedProcessExit(
-                outcome,
-                observer: observer,
-                generation: generation
-            )
-        }
-
         static func debugDefaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
             defaultProcessAppearsAlive(process)
-        }
-
-        func debugTerminalObserverJoinCount() -> Int {
-            terminalObserverJoinCount
         }
 
         func debugDecodeRecoveryAttempts(generation: UInt64? = nil) -> Int {
@@ -2129,24 +1646,18 @@ actor CodexAppServerClient {
             let stdinPipe = Pipe()
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()
-            transportGeneration &+= 1
-            activeTransport = ActiveTransport(
-                generation: transportGeneration,
-                process: SpawnedProcess(
-                    pid: pid_t.max,
-                    processGroupID: nil,
-                    stdin: stdinPipe.fileHandleForWriting,
-                    stdinDescriptor: stdinPipe.fileHandleForWriting.fileDescriptor,
-                    stdout: stdoutPipe.fileHandleForReading,
-                    stderr: stderrPipe.fileHandleForReading
-                ),
-                exitObservation: nil
+            process = SpawnedProcess(
+                pid: pid_t.max,
+                processGroupID: nil,
+                stdin: stdinPipe.fileHandleForWriting,
+                stdinDescriptor: stdinPipe.fileHandleForWriting.fileDescriptor,
+                stdout: stdoutPipe.fileHandleForReading,
+                stderr: stderrPipe.fileHandleForReading
             )
             isInitialized = true
             didTerminateTransport = false
             lastTransportTerminationReason = nil
-            lastTransportFailure = nil
-            transportTerminationTask = nil
+            transportGeneration &+= 1
             decodeRecoveryAttemptsByGeneration[transportGeneration] = 0
         }
 

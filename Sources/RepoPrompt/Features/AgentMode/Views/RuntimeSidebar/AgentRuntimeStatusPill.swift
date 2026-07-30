@@ -32,8 +32,12 @@ struct AgentRuntimeStatusPill: View {
     }
 
     private var mode: PillMode {
-        if isContextBuilderRunning { return .contextBuilder }
-        if isOracleStreaming { return .oracle }
+        if isContextBuilderRunning {
+            return .contextBuilder
+        }
+        if isOracleStreaming {
+            return .oracle
+        }
         return .idle
     }
 

@@ -45,7 +45,9 @@ struct WorkspaceRootNamespaceRecord: Equatable {
 
     var hierarchy: Int {
         relativePathBytes.reduce(into: 0) { count, byte in
-            if byte == UInt8(ascii: "/") { count += 1 }
+            if byte == UInt8(ascii: "/") {
+                count += 1
+            }
         }
     }
 

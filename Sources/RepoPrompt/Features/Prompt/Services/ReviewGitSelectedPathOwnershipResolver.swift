@@ -120,9 +120,15 @@ struct ReviewGitSelectedPathOwnershipResolver {
             if lhs.baseDisplayLabel != rhs.baseDisplayLabel {
                 return lhs.baseDisplayLabel < rhs.baseDisplayLabel
             }
-            if lhs.repoKey != rhs.repoKey { return lhs.repoKey < rhs.repoKey }
-            if lhs.repositoryID != rhs.repositoryID { return lhs.repositoryID < rhs.repositoryID }
-            if lhs.worktreeID != rhs.worktreeID { return lhs.worktreeID < rhs.worktreeID }
+            if lhs.repoKey != rhs.repoKey {
+                return lhs.repoKey < rhs.repoKey
+            }
+            if lhs.repositoryID != rhs.repositoryID {
+                return lhs.repositoryID < rhs.repositoryID
+            }
+            if lhs.worktreeID != rhs.worktreeID {
+                return lhs.worktreeID < rhs.worktreeID
+            }
             return lhs.rootPath < rhs.rootPath
         }
         let labelCounts = Dictionary(grouping: sortedGroups, by: \.baseDisplayLabel).mapValues(\.count)

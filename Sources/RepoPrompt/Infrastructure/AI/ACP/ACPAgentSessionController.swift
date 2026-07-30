@@ -328,6 +328,16 @@ actor ACPAgentSessionController {
         state == .sessionOpen && process != nil && sessionID != nil
     }
 
+    #if DEBUG
+        func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot? {
+            guard let process else { return nil }
+            return AgentRuntimeProcessSnapshot(
+                pid: process.pid,
+                appearsAlive: AgentRuntimeProcessSnapshot.appearsAlive(pid: process.pid)
+            )
+        }
+    #endif
+
     func isCompatibleWith(request: ACPRunRequest) -> Bool {
         guard let providerID = request.agentKind.acpProviderID,
               provider.providerID == providerID,
@@ -2553,7 +2563,9 @@ actor ACPAgentSessionController {
         case let value as Int:
             return .int(value)
         case let value as NSNumber:
-            if CFGetTypeID(value) == CFBooleanGetTypeID() { return nil }
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                return nil
+            }
             let doubleValue = value.doubleValue
             if floor(doubleValue) == doubleValue {
                 return .int(value.intValue)

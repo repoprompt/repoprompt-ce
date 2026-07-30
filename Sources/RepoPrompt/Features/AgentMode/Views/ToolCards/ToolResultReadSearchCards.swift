@@ -29,8 +29,12 @@ struct ReadFileResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
-        if let dto, !dto.content.isEmpty || dto.totalLines > 0 { return .success }
+        if item.toolIsError == true {
+            return .failure
+        }
+        if let dto, !dto.content.isEmpty || dto.totalLines > 0 {
+            return .success
+        }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }
 
@@ -113,11 +117,19 @@ struct FileSearchResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
-            if dto.errorMessage != nil { return .failure }
-            if dto.limitHit || (dto.sizeLimitHit ?? false) { return .warning }
-            if dto.totalMatches > 0 { return .success }
+            if dto.errorMessage != nil {
+                return .failure
+            }
+            if dto.limitHit || (dto.sizeLimitHit ?? false) {
+                return .warning
+            }
+            if dto.totalMatches > 0 {
+                return .success
+            }
             return .neutral
         }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
@@ -222,7 +234,9 @@ enum NativeToolCardPresentationBuilder {
         let storedName = summaryToolNameKey(renderSummary.toolName)
         let currentName = summaryToolNameKey(normalizedToolName)
         guard storedName == currentName else { return false }
-        if currentName == "search" { return true }
+        if currentName == "search" {
+            return true
+        }
         return AgentToolCardRenderSummaryBuilder.isSafeNativeFallbackToolName(currentName)
     }
 
@@ -232,8 +246,12 @@ enum NativeToolCardPresentationBuilder {
     }
 
     private static func statusWord(for item: AgentChatItem) -> String {
-        if item.toolIsError == true { return "failed" }
-        if item.toolIsError == false { return "success" }
+        if item.toolIsError == true {
+            return "failed"
+        }
+        if item.toolIsError == false {
+            return "success"
+        }
         guard let object = ToolRawJSON.object(from: item.toolResultJSON) else { return "unknown" }
         for key in ["status", "state", "outcome", "result"] {
             if let value = ToolRawJSON.string(object, key: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
@@ -296,7 +314,9 @@ struct FileActionResultCard: View {
     }
 
     private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true {
+            return .failure
+        }
         if let dto {
             switch dto.status.lowercased() {
             case "ok", "success": return .success

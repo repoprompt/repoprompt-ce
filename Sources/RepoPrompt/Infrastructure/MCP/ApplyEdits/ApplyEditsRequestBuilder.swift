@@ -261,7 +261,9 @@ struct ApplyEditsRequestBuilder {
         for key in pathArgKeys {
             if let value = args[key]?.stringValue {
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
             }
         }
         return nil

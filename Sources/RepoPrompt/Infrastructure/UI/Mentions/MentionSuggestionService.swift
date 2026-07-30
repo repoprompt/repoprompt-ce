@@ -142,7 +142,9 @@ final class MentionSuggestionService {
                 matching: searchQuery,
                 into: &collected
             )
-            if collected.count >= maxResults { break }
+            if collected.count >= maxResults {
+                break
+            }
         }
 
         // Prepend matching Selected-file rows when browsing at repo root
@@ -162,7 +164,9 @@ final class MentionSuggestionService {
             // Merge & deduplicate by relativePath while preserving order
             var seen = Set<String>()
             let merged = (selectedMatches + collected).filter { row in
-                if seen.contains(row.relativePath) { return false }
+                if seen.contains(row.relativePath) {
+                    return false
+                }
                 seen.insert(row.relativePath)
                 return true
             }
@@ -210,13 +214,17 @@ final class MentionSuggestionService {
                     kind: .folder
                 )
             )
-            if rows.count >= limit { return rows }
+            if rows.count >= limit {
+                return rows
+            }
         }
         for file in folder.files where rows.count < limit {
             rows.append(
                 suggestion(for: file)
             )
-            if rows.count >= limit { break }
+            if rows.count >= limit {
+                break
+            }
         }
         return rows
     }
@@ -273,7 +281,9 @@ final class MentionSuggestionService {
                     kind: .folder
                 )
             )
-            if results.count >= maxResults { return }
+            if results.count >= maxResults {
+                return
+            }
         }
 
         // (2) Files
@@ -282,7 +292,9 @@ final class MentionSuggestionService {
                 results.append(
                     suggestion(for: file)
                 )
-                if results.count >= maxResults { return }
+                if results.count >= maxResults {
+                    return
+                }
             }
         }
 

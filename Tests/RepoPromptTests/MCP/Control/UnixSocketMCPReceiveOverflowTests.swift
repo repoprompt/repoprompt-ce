@@ -253,7 +253,9 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
                 Darwin.write(fd, buffer.baseAddress, buffer.count)
             }
             if written < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             guard written > 0 else {
@@ -283,7 +285,9 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if await condition() { return true }
+            if await condition() {
+                return true
+            }
             try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
         }
         return await condition()

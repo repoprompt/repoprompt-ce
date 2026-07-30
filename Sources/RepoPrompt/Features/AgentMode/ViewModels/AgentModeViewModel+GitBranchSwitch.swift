@@ -92,16 +92,22 @@ extension AgentModeViewModel {
         isPrimaryRoot: Bool,
         didUpdateMatchingWorktreeBinding: Bool
     ) -> Bool {
-        if didUpdateMatchingWorktreeBinding { return true }
+        if didUpdateMatchingWorktreeBinding {
+            return true
+        }
         let candidateIdentities = Set(switchedCheckoutCandidatePaths.compactMap(CheckoutPathIdentity.init))
         guard !candidateIdentities.isEmpty else { return false }
         guard !worktreeBindings.isEmpty else { return isPrimaryRoot }
 
         let boundWorktreeIdentities = Set(worktreeBindings.compactMap { CheckoutPathIdentity($0.worktreeRootPath) })
-        if !candidateIdentities.isDisjoint(with: boundWorktreeIdentities) { return true }
+        if !candidateIdentities.isDisjoint(with: boundWorktreeIdentities) {
+            return true
+        }
 
         let boundLogicalIdentities = Set(worktreeBindings.compactMap { CheckoutPathIdentity($0.logicalRootPath) })
-        if !candidateIdentities.isDisjoint(with: boundLogicalIdentities) { return false }
+        if !candidateIdentities.isDisjoint(with: boundLogicalIdentities) {
+            return false
+        }
 
         return isPrimaryRoot
     }

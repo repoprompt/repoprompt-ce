@@ -32,7 +32,9 @@ final class TestSecureStorageBackend: SecureKeyValueStorageBackend, @unchecked S
         try withLock {
             let account = try account(for: key)
             calls.append(Call(operation: .save, account: account, accessMode: accessMode))
-            if let error = saveErrors[account] { throw error }
+            if let error = saveErrors[account] {
+                throw error
+            }
             values[key] = savedValueOverride ?? value
         }
     }
@@ -41,7 +43,9 @@ final class TestSecureStorageBackend: SecureKeyValueStorageBackend, @unchecked S
         try withLock {
             let account = try account(for: key)
             calls.append(Call(operation: .get, account: account, accessMode: accessMode))
-            if let error = getErrors[account] { throw error }
+            if let error = getErrors[account] {
+                throw error
+            }
             guard let value = values[key] else { throw KeychainService.KeychainError.itemNotFound }
             return value
         }
@@ -51,7 +55,9 @@ final class TestSecureStorageBackend: SecureKeyValueStorageBackend, @unchecked S
         try withLock {
             let account = try account(for: key)
             calls.append(Call(operation: .delete, account: account, accessMode: accessMode))
-            if let error = deleteErrors[account] { throw error }
+            if let error = deleteErrors[account] {
+                throw error
+            }
             values.removeValue(forKey: key)
         }
     }

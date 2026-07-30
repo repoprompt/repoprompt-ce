@@ -332,7 +332,9 @@ class DiffGenerationUtility {
                     break // No more matches found
                 }
 
-                if localMatch == -1 { break }
+                if localMatch == -1 {
+                    break
+                }
 
                 // Convert to absolute indices in original file
                 let globalMatch = localMatch + currentStartLine
@@ -398,7 +400,9 @@ class DiffGenerationUtility {
             lineIndexMap: sliceIndexMap,
             mcpAmbiguityCheck: mcpAmbiguityCheck
         )
-        if localMatch == -1 { throw DiffGenerationError.noMatchFound }
+        if localMatch == -1 {
+            throw DiffGenerationError.noMatchFound
+        }
 
         // Convert to absolute indices
         let globalMatch = localMatch + searchStartLine
@@ -756,7 +760,9 @@ class DiffGenerationUtility {
 
         for i in start ... end where i != initialMatch {
             let upper = i + selector.count
-            if upper > content.count { break }
+            if upper > content.count {
+                break
+            }
 
             let contentSlice = Array(content[i ..< upper])
             let score = calculateRefinedMatchScore(selector: selector, content: contentSlice)
@@ -915,7 +921,9 @@ class DiffGenerationUtility {
         s = collapseSeparatorRuns(s)
 
         // 5. Cap to 150 chars to bound fuzzy-match CPU.
-        if s.count > 150 { s = String(s.prefix(150)) }
+        if s.count > 150 {
+            s = String(s.prefix(150))
+        }
 
         // 6. Strip *one* trailing delimiter token.
         for tok in ["->", "=>", ":=", "=", ":"] where s.hasSuffix(tok) {
@@ -1293,7 +1301,9 @@ class DiffGenerationUtility {
             let sKey = selector[0].removedTagsHigh
             var seen = 0
             for (k, pos) in lineIndex {
-                if seen >= maxKeys { break }
+                if seen >= maxKeys {
+                    break
+                }
                 seen += 1
                 let coeff = sKey.diceCoefficient(against: k)
                 if enableDetailedLogging {
@@ -1308,7 +1318,9 @@ class DiffGenerationUtility {
             if enableDetailedLogging {
                 print("  🔍 Fuzzy probe added \(starts.count) candidate(s)")
             }
-            if starts.isEmpty { return nil } // nothing at all found
+            if starts.isEmpty {
+                return nil
+            } // nothing at all found
         }
 
         // ── Optional second-line intersection -----------------------------------
@@ -1328,7 +1340,9 @@ class DiffGenerationUtility {
                 second = collected
             }
             let inter = starts.filter { second.contains($0) }
-            if !inter.isEmpty { starts = inter }
+            if !inter.isEmpty {
+                starts = inter
+            }
 
             // keep fuzzyScoreMap in-sync with surviving candidates
             fuzzyScoreMap = fuzzyScoreMap.filter { starts.contains($0.key) }
@@ -1344,7 +1358,9 @@ class DiffGenerationUtility {
         var best: (idx: Int, score: Int) = (-1, 0)
 
         for s in starts {
-            if s + selCount > content.count { continue }
+            if s + selCount > content.count {
+                continue
+            }
 
             // Head run
             var head = 0
@@ -1360,7 +1376,9 @@ class DiffGenerationUtility {
                 for o in 0 ..< tailLen {
                     let selIdx = selCount - tailLen + o
                     let fileIdx = s + selIdx
-                    if content[fileIdx].removedTagsHigh == selector[selIdx].removedTagsHigh { tail += 1 }
+                    if content[fileIdx].removedTagsHigh == selector[selIdx].removedTagsHigh {
+                        tail += 1
+                    }
                 }
             }
 
@@ -1380,7 +1398,9 @@ class DiffGenerationUtility {
 
             if passes, score > best.score {
                 best = (s, score)
-                if score == selCount { break } // perfect anchor
+                if score == selCount {
+                    break
+                } // perfect anchor
             }
         }
 
@@ -1454,7 +1474,9 @@ class DiffGenerationUtility {
             let sKey = selector[0].removedTagsHigh
             var seen = 0
             for (k, pos) in lineIndex {
-                if seen >= maxKeys { break }
+                if seen >= maxKeys {
+                    break
+                }
                 seen += 1
                 let coeff = sKey.diceCoefficient(against: k)
                 guard coeff >= fuzzyThresh else { continue }
@@ -1463,7 +1485,9 @@ class DiffGenerationUtility {
                     fuzzyScoreMap[p] = max(fuzzyScoreMap[p] ?? 0, coeff)
                 }
             }
-            if starts.isEmpty { return nil }
+            if starts.isEmpty {
+                return nil
+            }
         }
 
         // ── Optional second-line intersection -----------------------------------
@@ -1482,7 +1506,9 @@ class DiffGenerationUtility {
                 second = collected
             }
             let inter = starts.filter { second.contains($0) }
-            if !inter.isEmpty { starts = inter }
+            if !inter.isEmpty {
+                starts = inter
+            }
             fuzzyScoreMap = fuzzyScoreMap.filter { starts.contains($0.key) }
         }
 
@@ -1492,7 +1518,9 @@ class DiffGenerationUtility {
         var validMatches: [(idx: Int, score: Int)] = []
 
         for s in starts {
-            if s + selCount > content.count { continue }
+            if s + selCount > content.count {
+                continue
+            }
 
             // Head run
             var head = 0
@@ -1508,7 +1536,9 @@ class DiffGenerationUtility {
                 for o in 0 ..< tailLen {
                     let selIdx = selCount - tailLen + o
                     let fileIdx = s + selIdx
-                    if content[fileIdx].removedTagsHigh == selector[selIdx].removedTagsHigh { tail += 1 }
+                    if content[fileIdx].removedTagsHigh == selector[selIdx].removedTagsHigh {
+                        tail += 1
+                    }
                 }
             }
 

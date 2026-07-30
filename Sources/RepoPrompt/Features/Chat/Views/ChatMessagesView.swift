@@ -175,7 +175,9 @@ struct ChatMessagesView: View {
             }
             .id(refreshToken)
             .transaction { txn in
-                if didChatChange { txn.disablesAnimations = true }
+                if didChatChange {
+                    txn.disablesAnimations = true
+                }
             }
             .onScrollPhaseChange { _, newPhase in
                 if newPhase == .interacting {
@@ -190,7 +192,9 @@ struct ChatMessagesView: View {
             }
             .id(refreshToken)
             .transaction { txn in
-                if didChatChange { txn.disablesAnimations = true }
+                if didChatChange {
+                    txn.disablesAnimations = true
+                }
             }
         }
     }

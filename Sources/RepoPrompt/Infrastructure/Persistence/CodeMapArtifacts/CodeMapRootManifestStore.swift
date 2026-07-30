@@ -1,6 +1,5 @@
 import Darwin
 import Foundation
-import OSLog
 
 enum CodeMapRootManifestStoreError: Error, Equatable {
     case invalidRoot
@@ -53,8 +52,6 @@ struct CodeMapRootManifestStorePolicy: Equatable {
     let maximumQuarantineCount: Int
     let maintenanceEntryLimit: Int
     let minimumAccessRefreshIntervalSeconds: UInt64
-    let regenerationBaseBackoffSeconds: UInt64
-    let maximumDecodedManifestCacheByteCount: UInt64
 
     static let `default` = CodeMapRootManifestStorePolicy(
         maximumRecordCountPerManifest: 100_000,
@@ -63,9 +60,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         maximumStoreByteCount: 256 * 1024 * 1024,
         maximumQuarantineCount: 64,
         maintenanceEntryLimit: 4096,
-        minimumAccessRefreshIntervalSeconds: 60,
-        regenerationBaseBackoffSeconds: 30,
-        maximumDecodedManifestCacheByteCount: 64 * 1024 * 1024
+        minimumAccessRefreshIntervalSeconds: 60
     )
 
     init(
@@ -75,9 +70,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         maximumStoreByteCount: UInt64,
         maximumQuarantineCount: Int,
         maintenanceEntryLimit: Int,
-        minimumAccessRefreshIntervalSeconds: UInt64 = 60,
-        regenerationBaseBackoffSeconds: UInt64 = 30,
-        maximumDecodedManifestCacheByteCount: UInt64 = 64 * 1024 * 1024
+        minimumAccessRefreshIntervalSeconds: UInt64 = 60
     ) {
         precondition(maximumRecordCountPerManifest > 0)
         precondition(maximumManifestByteCount > 0)
@@ -85,8 +78,6 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         precondition(maximumStoreByteCount >= maximumManifestByteCount)
         precondition(maximumQuarantineCount > 0)
         precondition(maintenanceEntryLimit > maximumManifestCount)
-        precondition(regenerationBaseBackoffSeconds > 0)
-        precondition(maximumDecodedManifestCacheByteCount > 0)
         self.maximumRecordCountPerManifest = maximumRecordCountPerManifest
         self.maximumManifestByteCount = maximumManifestByteCount
         self.maximumManifestCount = maximumManifestCount
@@ -94,8 +85,6 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         self.maximumQuarantineCount = maximumQuarantineCount
         self.maintenanceEntryLimit = maintenanceEntryLimit
         self.minimumAccessRefreshIntervalSeconds = minimumAccessRefreshIntervalSeconds
-        self.regenerationBaseBackoffSeconds = regenerationBaseBackoffSeconds
-        self.maximumDecodedManifestCacheByteCount = maximumDecodedManifestCacheByteCount
     }
 }
 
@@ -106,11 +95,7 @@ struct CodeMapRootManifestStoreHooks {
     var afterPublishRename: @Sendable () -> Void
     var beforeMaintenanceLock: @Sendable () async -> Void
     var beforeTerminalAuthorityCheck: @Sendable (CodeMapRootManifestStoreTerminalOperation) -> Void
-    var onManifestScanInspection: @Sendable (String) -> Void
-    var scanStarted: @Sendable () -> Void
-    var committedMaintenanceRetrySleep: @Sendable (UInt64) async -> Void
     var faultAction: @Sendable (CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction
-    var waitForRegenerationBackpressure: @Sendable (UInt64) async throws -> Void
 
     init(
         afterReadAdmission: @escaping @Sendable () async -> Void = {},
@@ -120,17 +105,8 @@ struct CodeMapRootManifestStoreHooks {
         beforeMaintenanceLock: @escaping @Sendable () async -> Void = {},
         beforeTerminalAuthorityCheck: @escaping @Sendable (CodeMapRootManifestStoreTerminalOperation) ->
             Void = { _ in },
-        onManifestScanInspection: @escaping @Sendable (String) -> Void = { _ in },
-        scanStarted: @escaping @Sendable () -> Void = {},
-        committedMaintenanceRetrySleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
-            try? await Task.sleep(nanoseconds: nanoseconds)
-        },
         faultAction: @escaping @Sendable (CodeMapRootManifestStoreFaultPoint) ->
-            CodeMapRootManifestStoreFaultAction = { _ in .proceed },
-        waitForRegenerationBackpressure: @escaping @Sendable (UInt64) async throws -> Void = { seconds in
-            let (nanoseconds, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
-            try await Task.sleep(nanoseconds: overflow ? UInt64.max : nanoseconds)
-        }
+            CodeMapRootManifestStoreFaultAction = { _ in .proceed }
     ) {
         self.afterReadAdmission = afterReadAdmission
         self.afterWriteShardAdmission = afterWriteShardAdmission
@@ -138,11 +114,7 @@ struct CodeMapRootManifestStoreHooks {
         self.afterPublishRename = afterPublishRename
         self.beforeMaintenanceLock = beforeMaintenanceLock
         self.beforeTerminalAuthorityCheck = beforeTerminalAuthorityCheck
-        self.onManifestScanInspection = onManifestScanInspection
-        self.scanStarted = scanStarted
-        self.committedMaintenanceRetrySleep = committedMaintenanceRetrySleep
         self.faultAction = faultAction
-        self.waitForRegenerationBackpressure = waitForRegenerationBackpressure
     }
 
     static let none = CodeMapRootManifestStoreHooks()
@@ -159,59 +131,6 @@ enum CodeMapRootManifestWriteResult: Equatable {
     case replaced(manifestGeneration: UInt64)
     case unchanged(manifestGeneration: UInt64)
 }
-
-#if DEBUG
-    private enum CodeMapRootManifestDebugOperationContext {
-        @TaskLocal static var operationID: UUID?
-    }
-
-    struct CodeMapRootManifestDebugAttemptMetrics: Hashable {
-        let ordinal: UInt64
-        let startedUptimeNanoseconds: UInt64
-        var completedUptimeNanoseconds: UInt64 = 0
-        var succeeded = false
-        var published = false
-        var inputSnapshotRecordCount: UInt64 = 0
-        var inputSnapshotEncodedByteCount: UInt64 = 0
-        var decodedByteCount: UInt64 = 0
-        var mutationCount: UInt64 = 0
-        var outputSnapshotRecordCount: UInt64 = 0
-        var outputSnapshotEncodedByteCount: UInt64 = 0
-        var loadReadDecodeDurationNanoseconds: UInt64 = 0
-        var mergeDurationNanoseconds: UInt64 = 0
-        var sortDurationNanoseconds: UInt64 = 0
-        var encodeDurationNanoseconds: UInt64 = 0
-        var temporaryWriteDurationNanoseconds: UInt64 = 0
-        var temporaryFileSyncDurationNanoseconds: UInt64 = 0
-        var atomicReplaceDurationNanoseconds: UInt64 = 0
-        var manifestDirectorySyncDurationNanoseconds: UInt64 = 0
-        var readbackDecodeDurationNanoseconds: UInt64 = 0
-        var totalDurationNanoseconds: UInt64 = 0
-    }
-
-    struct CodeMapRootManifestDebugPublicationMetrics: Equatable {
-        var attemptCount: UInt64 = 0
-        var successfulAttemptCount: UInt64 = 0
-        var publicationCount: UInt64 = 0
-        var inputSnapshotRecordVolume: UInt64 = 0
-        var inputSnapshotByteVolume: UInt64 = 0
-        var decodedByteVolume: UInt64 = 0
-        var mutationCountVolume: UInt64 = 0
-        var snapshotRecordVolume: UInt64 = 0
-        var snapshotByteVolume: UInt64 = 0
-        var loadReadDecodeDurationNanoseconds: UInt64 = 0
-        var mergeDurationNanoseconds: UInt64 = 0
-        var sortDurationNanoseconds: UInt64 = 0
-        var encodeDurationNanoseconds: UInt64 = 0
-        var temporaryWriteDurationNanoseconds: UInt64 = 0
-        var temporaryFileSyncDurationNanoseconds: UInt64 = 0
-        var atomicReplaceDurationNanoseconds: UInt64 = 0
-        var manifestDirectorySyncDurationNanoseconds: UInt64 = 0
-        var readbackDecodeDurationNanoseconds: UInt64 = 0
-        var totalDurationNanoseconds: UInt64 = 0
-        var lastAttempt: CodeMapRootManifestDebugAttemptMetrics?
-    }
-#endif
 
 struct CodeMapRootManifestAccounting: Equatable {
     let manifestCount: Int
@@ -232,89 +151,9 @@ struct CodeMapRootManifestMaintenanceResult: Equatable {
     let accounting: CodeMapRootManifestAccounting
 }
 
-struct CodeMapRootManifestDecodeFailureAccounting: Equatable {
-    let counts: [CodeMapRootManifestDecodeFailure: UInt64]
-    let regenerationBackpressureCount: UInt64
-
-    var totalCount: UInt64 {
-        counts.values.reduce(0) { partial, count in
-            let (sum, overflow) = partial.addingReportingOverflow(count)
-            return overflow ? .max : sum
-        }
-    }
-}
-
-struct CodeMapRootManifestMaintenanceStatus: Equatable {
-    let hasPendingCommittedWork: Bool
-    let attempt: Int
-    let isScheduled: Bool
-    let isExhausted: Bool
-}
-
 private enum ManifestAuthorityReplacementPolicy {
     case unconstrained
     case exactPredecessor(CodeMapRootManifestAuthority?)
-}
-
-private struct ManifestRegenerationFailureState {
-    var authority: CodeMapRootManifestAuthority?
-    var failureCount: UInt64
-    var blockedUntilEpochSeconds: UInt64
-}
-
-private struct ManifestCommittedMaintenanceWork: Equatable {
-    let namespace: CodeMapRootManifestNamespace
-    let authority: CodeMapRootManifestAuthority
-    let manifestGeneration: UInt64
-    let committedIdentity: ManifestFileIdentity
-}
-
-private enum ManifestCommittedMaintenanceDebt {
-    case idle
-    case pending(work: ManifestCommittedMaintenanceWork, attempt: Int)
-    case scheduled(
-        work: ManifestCommittedMaintenanceWork,
-        attempt: Int,
-        task: Task<Void, Never>
-    )
-    case running(work: ManifestCommittedMaintenanceWork, attempt: Int)
-    case exhausted(work: ManifestCommittedMaintenanceWork, attempt: Int)
-
-    var work: ManifestCommittedMaintenanceWork? {
-        switch self {
-        case .idle:
-            nil
-        case let .pending(work, _), let .scheduled(work, _, _), let .running(work, _),
-             let .exhausted(work, _):
-            work
-        }
-    }
-
-    var attempt: Int {
-        switch self {
-        case .idle:
-            0
-        case let .pending(_, attempt), let .scheduled(_, attempt, _), let .running(_, attempt),
-             let .exhausted(_, attempt):
-            attempt
-        }
-    }
-
-    var isScheduled: Bool {
-        if case .scheduled = self {
-            true
-        } else {
-            false
-        }
-    }
-
-    var isExhausted: Bool {
-        if case .exhausted = self {
-            true
-        } else {
-            false
-        }
-    }
 }
 
 /// Inert, Git-only root-manifest persistence.
@@ -323,16 +162,8 @@ private enum ManifestCommittedMaintenanceDebt {
 /// complete authority generation or the new complete authority generation. No workspace consumer
 /// consults this store until the later binding-engine slice.
 actor CodeMapRootManifestStore {
-    private static let logger = Logger(
-        subsystem: "com.repoprompt.codemap",
-        category: "manifest-maintenance"
-    )
     private static let directoryMode = mode_t(0o700)
     private static let fileMode = mode_t(0o600)
-    private static let regenerationFailureThreshold: UInt64 = 2
-    private static let regenerationMaximumBackoffExponent: UInt64 = 4
-    private static let committedMaintenanceMaximumRetryCount = 3
-    private static let committedMaintenanceRetryBaseNanoseconds: UInt64 = 250_000_000
 
     nonisolated let rootURL: URL
     private let policy: CodeMapRootManifestStorePolicy
@@ -347,23 +178,6 @@ actor CodeMapRootManifestStore {
     ] = [:]
     private var pendingAccessRefreshes: [String: ManifestPendingAccessRefresh] = [:]
     private var accessRefreshTask: Task<Void, Never>?
-    private var decodeFailureCounts: [CodeMapRootManifestDecodeFailure: UInt64] = [:]
-    private var regenerationFailures: [String: ManifestRegenerationFailureState] = [:]
-    private var regenerationBackpressureCount: UInt64 = 0
-    private var decodedManifestCache: [ManifestCacheLocation: ManifestCachedSnapshot] = [:]
-    private var decodedManifestCacheOrder: [ManifestCacheLocation] = []
-    private var decodedManifestCacheByteCount: UInt64 = 0
-    private var committedMaintenanceDebt: ManifestCommittedMaintenanceDebt = .idle
-    #if DEBUG
-        private var debugPublicationMetricsByNamespace: [
-            CodeMapRootManifestNamespace: CodeMapRootManifestDebugPublicationMetrics
-        ] = [:]
-        private var nextDebugPublicationAttemptOrdinal: UInt64 = 0
-        private var debugPublicationAttemptsByOperationID: [
-            UUID: CodeMapRootManifestDebugAttemptMetrics
-        ] = [:]
-        private var debugPublicationAttemptOperationOrder: [UUID] = []
-    #endif
 
     init(
         rootURL: URL,
@@ -408,187 +222,6 @@ actor CodeMapRootManifestStore {
         activeWriterSessions.insert(token)
         return token
     }
-
-    #if DEBUG
-        func debugPublicationMetrics(
-            namespace: CodeMapRootManifestNamespace
-        ) -> CodeMapRootManifestDebugPublicationMetrics {
-            debugPublicationMetricsByNamespace[namespace] ?? CodeMapRootManifestDebugPublicationMetrics()
-        }
-
-        func takeDebugPublicationAttempt(
-            operationID: UUID
-        ) -> CodeMapRootManifestDebugAttemptMetrics? {
-            guard let attempt = debugPublicationAttemptsByOperationID.removeValue(forKey: operationID) else {
-                return nil
-            }
-            debugPublicationAttemptOperationOrder.removeAll { $0 == operationID }
-            return attempt
-        }
-
-        private func nextDebugPublicationAttempt(
-            mutationCount: UInt64,
-            startedUptimeNanoseconds: UInt64
-        ) -> CodeMapRootManifestDebugAttemptMetrics {
-            nextDebugPublicationAttemptOrdinal = debugAddingSaturating(
-                nextDebugPublicationAttemptOrdinal,
-                1
-            )
-            var attempt = CodeMapRootManifestDebugAttemptMetrics(
-                ordinal: nextDebugPublicationAttemptOrdinal,
-                startedUptimeNanoseconds: startedUptimeNanoseconds
-            )
-            attempt.mutationCount = mutationCount
-            return attempt
-        }
-
-        private func recordDebugPublicationAttempt(
-            _ attempt: CodeMapRootManifestDebugAttemptMetrics,
-            namespace: CodeMapRootManifestNamespace,
-            operationID: UUID?
-        ) {
-            var aggregate = debugPublicationMetricsByNamespace[namespace]
-                ?? CodeMapRootManifestDebugPublicationMetrics()
-            aggregate.attemptCount = debugAddingSaturating(aggregate.attemptCount, 1)
-            if attempt.succeeded {
-                aggregate.successfulAttemptCount = debugAddingSaturating(
-                    aggregate.successfulAttemptCount,
-                    1
-                )
-            }
-            if attempt.published {
-                aggregate.publicationCount = debugAddingSaturating(aggregate.publicationCount, 1)
-                aggregate.snapshotRecordVolume = debugAddingSaturating(
-                    aggregate.snapshotRecordVolume,
-                    attempt.outputSnapshotRecordCount
-                )
-                aggregate.snapshotByteVolume = debugAddingSaturating(
-                    aggregate.snapshotByteVolume,
-                    attempt.outputSnapshotEncodedByteCount
-                )
-            }
-            aggregate.inputSnapshotRecordVolume = debugAddingSaturating(
-                aggregate.inputSnapshotRecordVolume,
-                attempt.inputSnapshotRecordCount
-            )
-            aggregate.inputSnapshotByteVolume = debugAddingSaturating(
-                aggregate.inputSnapshotByteVolume,
-                attempt.inputSnapshotEncodedByteCount
-            )
-            aggregate.decodedByteVolume = debugAddingSaturating(
-                aggregate.decodedByteVolume,
-                attempt.decodedByteCount
-            )
-            aggregate.mutationCountVolume = debugAddingSaturating(
-                aggregate.mutationCountVolume,
-                attempt.mutationCount
-            )
-            aggregate.loadReadDecodeDurationNanoseconds = debugAddingSaturating(
-                aggregate.loadReadDecodeDurationNanoseconds,
-                attempt.loadReadDecodeDurationNanoseconds
-            )
-            aggregate.mergeDurationNanoseconds = debugAddingSaturating(
-                aggregate.mergeDurationNanoseconds,
-                attempt.mergeDurationNanoseconds
-            )
-            aggregate.sortDurationNanoseconds = debugAddingSaturating(
-                aggregate.sortDurationNanoseconds,
-                attempt.sortDurationNanoseconds
-            )
-            aggregate.encodeDurationNanoseconds = debugAddingSaturating(
-                aggregate.encodeDurationNanoseconds,
-                attempt.encodeDurationNanoseconds
-            )
-            aggregate.temporaryWriteDurationNanoseconds = debugAddingSaturating(
-                aggregate.temporaryWriteDurationNanoseconds,
-                attempt.temporaryWriteDurationNanoseconds
-            )
-            aggregate.temporaryFileSyncDurationNanoseconds = debugAddingSaturating(
-                aggregate.temporaryFileSyncDurationNanoseconds,
-                attempt.temporaryFileSyncDurationNanoseconds
-            )
-            aggregate.atomicReplaceDurationNanoseconds = debugAddingSaturating(
-                aggregate.atomicReplaceDurationNanoseconds,
-                attempt.atomicReplaceDurationNanoseconds
-            )
-            aggregate.manifestDirectorySyncDurationNanoseconds = debugAddingSaturating(
-                aggregate.manifestDirectorySyncDurationNanoseconds,
-                attempt.manifestDirectorySyncDurationNanoseconds
-            )
-            aggregate.readbackDecodeDurationNanoseconds = debugAddingSaturating(
-                aggregate.readbackDecodeDurationNanoseconds,
-                attempt.readbackDecodeDurationNanoseconds
-            )
-            aggregate.totalDurationNanoseconds = debugAddingSaturating(
-                aggregate.totalDurationNanoseconds,
-                attempt.totalDurationNanoseconds
-            )
-            aggregate.lastAttempt = attempt
-            debugPublicationMetricsByNamespace[namespace] = aggregate
-            if let operationID {
-                debugPublicationAttemptsByOperationID[operationID] = attempt
-                debugPublicationAttemptOperationOrder.append(operationID)
-                while debugPublicationAttemptOperationOrder.count > 512 {
-                    let evicted = debugPublicationAttemptOperationOrder.removeFirst()
-                    debugPublicationAttemptsByOperationID.removeValue(forKey: evicted)
-                }
-            }
-        }
-
-        private func debugAddingSaturating(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
-            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
-            return overflow ? .max : sum
-        }
-
-        private func debugElapsedNanoseconds(from start: UInt64, to end: UInt64) -> UInt64 {
-            end >= start ? end - start : 0
-        }
-    #endif
-
-    func decodeFailureAccounting() -> CodeMapRootManifestDecodeFailureAccounting {
-        CodeMapRootManifestDecodeFailureAccounting(
-            counts: decodeFailureCounts,
-            regenerationBackpressureCount: regenerationBackpressureCount
-        )
-    }
-
-    func maintenanceStatus() -> CodeMapRootManifestMaintenanceStatus {
-        CodeMapRootManifestMaintenanceStatus(
-            hasPendingCommittedWork: committedMaintenanceDebt.work != nil,
-            attempt: committedMaintenanceDebt.attempt,
-            isScheduled: committedMaintenanceDebt.isScheduled,
-            isExhausted: committedMaintenanceDebt.isExhausted
-        )
-    }
-
-    #if DEBUG
-        func decodedManifestCacheEntryCountForTesting() -> Int {
-            decodedManifestCache.count
-        }
-
-        func decodedManifestCacheByteCountForTesting() -> UInt64 {
-            decodedManifestCacheByteCount
-        }
-
-        func committedMaintenanceRetryStateForTesting() -> (
-            pendingCount: UInt64,
-            attempt: Int,
-            isScheduled: Bool
-        ) {
-            (
-                committedMaintenanceDebt.work == nil ? 0 : 1,
-                committedMaintenanceDebt.attempt,
-                committedMaintenanceDebt.isScheduled
-            )
-        }
-
-        func waitForCommittedMaintenanceRetryForTesting() async {
-            while true {
-                guard case let .scheduled(_, _, task) = committedMaintenanceDebt else { return }
-                await task.value
-            }
-        }
-    #endif
 
     func endManifestWriterSession(_ token: CodeMapRootManifestWriterSessionToken) {
         guard token.storeID == writerAuthorityStoreID else { return }
@@ -724,15 +357,6 @@ actor CodeMapRootManifestStore {
                 expectedNamespace: namespace,
                 filenameDigest: name
             )
-        } catch let failure as CodeMapRootManifestDecodeFailure {
-            recordDecodeFailure(failure)
-            recordRegenerationFailure(
-                failure: failure,
-                digest: namespace.storageDigestHex,
-                authority: currentAuthority
-            )
-            try await quarantineIfCurrent(layout: layout, shard: shard, name: name, descriptor: descriptor)
-            return .miss
         } catch {
             try await quarantineIfCurrent(layout: layout, shard: shard, name: name, descriptor: descriptor)
             return .miss
@@ -756,7 +380,6 @@ actor CodeMapRootManifestStore {
         guard snapshot.authority == currentAuthority else {
             return .stale(existingAuthority: snapshot.authority)
         }
-        clearRegenerationFailure(namespace: namespace, authority: currentAuthority)
         scheduleAccessRefresh(for: snapshot)
         return .hit(snapshot)
     }
@@ -917,31 +540,6 @@ actor CodeMapRootManifestStore {
         )
     }
 
-    #if DEBUG
-        func mergeCurrentManifestDebug(
-            namespace: CodeMapRootManifestNamespace,
-            authority: CodeMapRootManifestAuthority,
-            writerAuthority: CodeMapRootManifestWriterAuthorityToken,
-            replacingPreviouslyObservedAuthority predecessor: CodeMapRootManifestAuthority?,
-            upserting records: [CodeMapRootManifestRecord],
-            removing repositoryRelativePaths: Set<String>,
-            lastAccessEpochSeconds: UInt64,
-            operationID: UUID
-        ) async throws -> CodeMapRootManifestWriteResult {
-            try await CodeMapRootManifestDebugOperationContext.$operationID.withValue(operationID) {
-                try await mergeCurrentManifest(
-                    namespace: namespace,
-                    authority: authority,
-                    writerAuthority: writerAuthority,
-                    replacingPreviouslyObservedAuthority: predecessor,
-                    upserting: records,
-                    removing: repositoryRelativePaths,
-                    lastAccessEpochSeconds: lastAccessEpochSeconds
-                )
-            }
-        }
-    #endif
-
     private func publishCurrentManifest(
         namespace: CodeMapRootManifestNamespace,
         authority: CodeMapRootManifestAuthority,
@@ -953,33 +551,9 @@ actor CodeMapRootManifestStore {
         mergeExisting: Bool = false,
         removingRepositoryRelativePaths: Set<String> = []
     ) async throws -> CodeMapRootManifestWriteResult {
-        #if DEBUG
-            let debugAttemptStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-            let debugMutationCount = debugAddingSaturating(
-                UInt64(records.count),
-                UInt64(removingRepositoryRelativePaths.count)
-            )
-            var debugAttempt = nextDebugPublicationAttempt(
-                mutationCount: debugMutationCount,
-                startedUptimeNanoseconds: debugAttemptStartedUptimeNanoseconds
-            )
-            defer {
-                debugAttempt.completedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-                debugAttempt.totalDurationNanoseconds = debugElapsedNanoseconds(
-                    from: debugAttemptStartedUptimeNanoseconds,
-                    to: debugAttempt.completedUptimeNanoseconds
-                )
-                recordDebugPublicationAttempt(
-                    debugAttempt,
-                    namespace: namespace,
-                    operationID: CodeMapRootManifestDebugOperationContext.operationID
-                )
-            }
-        #endif
         guard namespace.isCurrent else {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
-        try await waitForRegenerationBackpressure(namespace: namespace, authority: authority)
         let layout = try Self.openLayout(rootURL: rootURL, create: false)
         await hooks.beforeMaintenanceLock()
         try Self.lock(lockAnchor.rawValue, operation: "manifest-anchor-lock")
@@ -1001,23 +575,7 @@ actor CodeMapRootManifestStore {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
         let name = namespace.storageDigestHex
-        #if DEBUG
-            let debugLoadStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        #endif
         let existing = try inspectExisting(shard: shard, namespace: namespace, name: name)
-        #if DEBUG
-            debugAttempt.loadReadDecodeDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugLoadStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-            debugAttempt.inputSnapshotRecordCount = UInt64(existing.snapshot?.records.count ?? 0)
-            debugAttempt.inputSnapshotEncodedByteCount = existing.identity.map {
-                $0.size > 0 ? UInt64($0.size) : 0
-            } ?? 0
-            debugAttempt.decodedByteCount = existing.snapshot == nil
-                ? 0
-                : debugAttempt.inputSnapshotEncodedByteCount
-        #endif
         if let expectedSnapshot {
             guard let current = existing.snapshot,
                   current.manifestGeneration == expectedSnapshot.manifestGeneration,
@@ -1039,13 +597,7 @@ actor CodeMapRootManifestStore {
             }
         }
         let sortedRecords: [CodeMapRootManifestRecord]
-        #if DEBUG
-            var debugSortStartedUptimeNanoseconds: UInt64 = 0
-        #endif
         if mergeExisting {
-            #if DEBUG
-                let debugMergeStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-            #endif
             var recordsByPath: [String: CodeMapRootManifestRecord] = [:]
             if let snapshot = existing.snapshot, snapshot.authority == authority {
                 recordsByPath = Dictionary(
@@ -1058,31 +610,14 @@ actor CodeMapRootManifestStore {
             for record in records {
                 recordsByPath[record.repositoryRelativePath] = record
             }
-            #if DEBUG
-                debugAttempt.mergeDurationNanoseconds = debugElapsedNanoseconds(
-                    from: debugMergeStartedUptimeNanoseconds,
-                    to: DispatchTime.now().uptimeNanoseconds
-                )
-                debugSortStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-            #endif
             sortedRecords = recordsByPath.values.sorted {
                 $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
             }
         } else {
-            #if DEBUG
-                debugSortStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-            #endif
             sortedRecords = records.sorted {
                 $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
             }
         }
-        #if DEBUG
-            debugAttempt.sortDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugSortStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-            debugAttempt.outputSnapshotRecordCount = UInt64(sortedRecords.count)
-        #endif
         guard sortedRecords.count <= policy.maximumRecordCountPerManifest,
               sortedRecords.count <= CodeMapRootManifestCodec.maximumRecordCount
         else {
@@ -1091,25 +626,14 @@ actor CodeMapRootManifestStore {
         let semanticUnchanged = existing.snapshot.map {
             $0.authority == authority && $0.records == sortedRecords
         } ?? false
-        let persistedAccessEpoch = existing.snapshot?.lastAccessEpochSeconds ?? 0
-        let candidateAccessEpoch = max(persistedAccessEpoch, lastAccessEpochSeconds)
-        let effectiveAccessEpoch = if semanticUnchanged,
-                                      candidateAccessEpoch > persistedAccessEpoch,
-                                      candidateAccessEpoch - persistedAccessEpoch <
-                                      policy.minimumAccessRefreshIntervalSeconds
-        {
-            persistedAccessEpoch
-        } else {
-            candidateAccessEpoch
-        }
+        let effectiveAccessEpoch = max(
+            existing.snapshot?.lastAccessEpochSeconds ?? 0,
+            lastAccessEpochSeconds
+        )
         if let current = existing.snapshot,
            semanticUnchanged,
            current.lastAccessEpochSeconds == effectiveAccessEpoch
         {
-            #if DEBUG
-                debugAttempt.succeeded = true
-                debugAttempt.outputSnapshotEncodedByteCount = debugAttempt.inputSnapshotEncodedByteCount
-            #endif
             return .unchanged(manifestGeneration: current.manifestGeneration)
         }
         let nextGeneration: UInt64 = if semanticUnchanged, let previous = existing.snapshot?.manifestGeneration {
@@ -1126,34 +650,18 @@ actor CodeMapRootManifestStore {
             lastAccessEpochSeconds: effectiveAccessEpoch,
             records: sortedRecords
         )
-        #if DEBUG
-            let debugEncodeStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        #endif
         let encoded = try CodeMapRootManifestCodec.encode(snapshot: snapshot)
-        #if DEBUG
-            debugAttempt.encodeDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugEncodeStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-            debugAttempt.outputSnapshotEncodedByteCount = UInt64(encoded.count)
-        #endif
         guard UInt64(encoded.count) <= policy.maximumManifestByteCount else {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
-        // Reconciliation is disk-derived maintenance; a proven no-growth access replacement can defer it.
-        let canSkipGlobalReconciliation = expectedSnapshot != nil &&
-            semanticUnchanged &&
-            existing.identity.map { UInt64(encoded.count) <= UInt64($0.size) } == true
 
-        if !canSkipGlobalReconciliation {
-            try reconcilePublicationLocked(
-                layout: layout,
-                protectingDigest: name,
-                incomingByteCount: UInt64(encoded.count),
-                replacedByteCount: existing.snapshot.flatMap { _ in existing.identity }
-                    .map { UInt64($0.size) } ?? 0
-            )
-        }
+        _ = try reconcileLocked(
+            layout: layout,
+            maximumEntries: nil,
+            protectingDigest: name,
+            incomingByteCount: UInt64(encoded.count),
+            replacedByteCount: existing.snapshot.flatMap { _ in existing.identity }.map { UInt64($0.size) } ?? 0
+        )
         guard Self.layoutIsCurrent(layout, rootURL: rootURL),
               Self.directoryIsCurrent(shard, parent: layout.manifests, name: namespace.shard)
         else {
@@ -1164,13 +672,6 @@ actor CodeMapRootManifestStore {
            !current.isSecureRegularFile(in: shard.identity.device, expectedMode: Self.fileMode)
         {
             throw CodeMapRootManifestStoreError.insecureLeaf
-        }
-        if canSkipGlobalReconciliation {
-            guard let admittedExistingIdentity = existing.identity,
-                  publicationExistingIdentity == admittedExistingIdentity
-            else {
-                throw CodeMapRootManifestStoreError.insecureLeaf
-            }
         }
 
         let temporaryName = ".tmp.\(getpid()).\(UUID().uuidString.lowercased())"
@@ -1195,30 +696,12 @@ actor CodeMapRootManifestStore {
             expectedMode: Self.fileMode
         )
         guard initial.size == 0 else { throw CodeMapRootManifestStoreError.insecureLeaf }
-        #if DEBUG
-            let debugTemporaryWriteStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        #endif
         try Self.writeAll(descriptor, data: encoded)
-        #if DEBUG
-            debugAttempt.temporaryWriteDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugTemporaryWriteStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-        #endif
         if hooks.faultAction(.afterTemporaryWrite) == .simulateProcessTermination {
             temporaryExists = false
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterTemporaryWrite)
         }
-        #if DEBUG
-            let debugTemporarySyncStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        #endif
         try Self.synchronize(descriptor, operation: "temporary-fsync")
-        #if DEBUG
-            debugAttempt.temporaryFileSyncDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugTemporarySyncStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-        #endif
         if hooks.faultAction(.afterTemporaryFileSync) == .simulateProcessTermination {
             temporaryExists = false
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterTemporaryFileSync)
@@ -1247,18 +730,9 @@ actor CodeMapRootManifestStore {
         } else if try Self.fileIdentityAt(parent: shard, name: name) != nil {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
-        #if DEBUG
-            let debugAtomicReplaceStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        #endif
         guard renameat(shard.rawValue, temporaryName, shard.rawValue, name) == 0 else {
             throw Self.ioError("manifest-publish")
         }
-        #if DEBUG
-            debugAttempt.atomicReplaceDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugAtomicReplaceStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-        #endif
         temporaryExists = false
         if hooks.faultAction(.afterManifestRename) == .simulateProcessTermination {
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterManifestRename)
@@ -1279,16 +753,7 @@ actor CodeMapRootManifestStore {
         guard completed.sameObject(as: published), published.size == completed.size else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
-        #if DEBUG
-            let debugDirectorySyncStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        #endif
         try Self.synchronize(shard.rawValue, operation: "manifest-directory-fsync")
-        #if DEBUG
-            debugAttempt.manifestDirectorySyncDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugDirectorySyncStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-        #endif
         if hooks.faultAction(.afterManifestDirectorySync) == .simulateProcessTermination {
             throw CodeMapRootManifestStoreError.simulatedProcessTermination(.afterManifestDirectorySync)
         }
@@ -1305,9 +770,6 @@ actor CodeMapRootManifestStore {
         else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
-        #if DEBUG
-            let debugReadbackStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        #endif
         let readBack = try Self.readExactly(descriptor, byteCount: encoded.count)
         guard try CodeMapRootManifestCodec.decode(
             readBack,
@@ -1316,31 +778,13 @@ actor CodeMapRootManifestStore {
         ) == snapshot else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
-        #if DEBUG
-            debugAttempt.readbackDecodeDurationNanoseconds = debugElapsedNanoseconds(
-                from: debugReadbackStartedUptimeNanoseconds,
-                to: DispatchTime.now().uptimeNanoseconds
-            )
-            debugAttempt.published = true
-        #endif
-        try cacheDecodedManifest(
-            at: ManifestCacheLocation(shard: namespace.shard, digest: name),
-            identity: committed,
-            snapshot: snapshot,
-            validatedContentChecksum: CodeMapRootManifestCodec.validatedContentChecksum(readBack)
+        _ = try reconcileLocked(
+            layout: layout,
+            maximumEntries: nil,
+            protectingDigest: name,
+            incomingByteCount: 0,
+            replacedByteCount: 0
         )
-        if !canSkipGlobalReconciliation {
-            try reconcileAfterCommittedPublication(
-                layout: layout,
-                shard: shard,
-                snapshot: snapshot,
-                protectingDigest: name,
-                committedIdentity: committed
-            )
-        }
-        #if DEBUG
-            debugAttempt.succeeded = true
-        #endif
         if semanticUnchanged {
             return .unchanged(manifestGeneration: nextGeneration)
         }
@@ -1405,17 +849,6 @@ actor CodeMapRootManifestStore {
         else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
-        if removed {
-            removeDecodedManifestCacheEntry(
-                at: ManifestCacheLocation(shard: namespace.shard, digest: name)
-            )
-        }
-        if removed {
-            regenerationFailures.removeValue(forKey: name)
-            #if DEBUG
-                debugPublicationMetricsByNamespace.removeValue(forKey: namespace)
-            #endif
-        }
         return removed
     }
 
@@ -1442,16 +875,6 @@ actor CodeMapRootManifestStore {
     }
 
     func maintain(maximumEntries: Int? = nil) async throws -> CodeMapRootManifestMaintenanceResult {
-        let result = try await performMaintenance(maximumEntries: maximumEntries)
-        if result.accounting.hasMore {
-            scheduleCommittedMaintenanceRetryIfNeeded()
-        } else {
-            clearCommittedMaintenanceDebt()
-        }
-        return result
-    }
-
-    private func performMaintenance(maximumEntries: Int?) async throws -> CodeMapRootManifestMaintenanceResult {
         let layout = try Self.openLayout(rootURL: rootURL, create: false)
         await hooks.beforeMaintenanceLock()
         try Self.lock(lockAnchor.rawValue, operation: "manifest-anchor-lock")
@@ -1461,19 +884,13 @@ actor CodeMapRootManifestStore {
         else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
-        let protectedWork = try currentCommittedMaintenanceProtection(layout: layout)
         let outcome = try reconcileLocked(
             layout: layout,
             maximumEntries: maximumEntries,
-            protectingDigest: protectedWork?.namespace.storageDigestHex,
+            protectingDigest: nil,
             incomingByteCount: 0,
             replacedByteCount: 0
         )
-        if let protectedWork,
-           try !committedMaintenanceWorkIsCurrent(protectedWork, layout: layout)
-        {
-            throw CodeMapRootManifestStoreError.insecureDirectory
-        }
         hooks.beforeTerminalAuthorityCheck(.maintenance)
         guard scanAuthorityIsCurrent(layout: layout, scan: outcome.terminalScan) else {
             throw CodeMapRootManifestStoreError.insecureDirectory
@@ -1510,13 +927,11 @@ actor CodeMapRootManifestStore {
             return (identity, nil)
         }
         let data = try Self.readExactly(descriptor, byteCount: Int(identity.size))
-        let snapshot = try? CodeMapRootManifestCodec.decodeStored(
+        let snapshot = try? CodeMapRootManifestCodec.decode(
             data,
+            expectedNamespace: namespace,
             filenameDigest: name
         )
-        guard snapshot?.namespace == namespace else {
-            return (identity, nil)
-        }
         return (identity, snapshot)
     }
 
@@ -1563,325 +978,6 @@ actor CodeMapRootManifestStore {
         else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
-        removeDecodedManifestCacheEntry(
-            at: ManifestCacheLocation(shard: String(name.prefix(2)), digest: name)
-        )
-    }
-
-    /// Publication needs authoritative quota/LRU accounting, but not the general cleanup work
-    /// performed by explicit maintenance. One immutable scan plus exact per-leaf revalidation is
-    /// sufficient while the cross-process anchor lock is held; corrupt/temp cleanup remains on the
-    /// maintenance path instead of multiplying every writer completion.
-    private func reconcilePublicationLocked(
-        layout: ManifestStoreLayout,
-        protectingDigest: String,
-        incomingByteCount: UInt64,
-        replacedByteCount: UInt64
-    ) throws {
-        let scan = try scanLocked(layout: layout, maximumEntries: nil, mutate: false)
-        hooks.beforeTerminalAuthorityCheck(.publicationQuota)
-        guard scanAuthorityIsCurrent(layout: layout, scan: scan) else {
-            throw CodeMapRootManifestStoreError.insecureDirectory
-        }
-        guard !scan.accounting.hasMore else {
-            throw CodeMapRootManifestStoreError.quotaExceeded
-        }
-
-        let evicted = try evictToQuotaLocked(
-            layout: layout,
-            scan: scan,
-            protectingDigest: protectingDigest,
-            incomingByteCount: incomingByteCount,
-            replacedByteCount: replacedByteCount
-        )
-        guard Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
-              Self.layoutIsCurrent(layout, rootURL: rootURL)
-        else {
-            throw CodeMapRootManifestStoreError.insecureDirectory
-        }
-        if evicted > 0 {
-            let terminalScan = try scanLocked(layout: layout, maximumEntries: nil, mutate: false)
-            guard scanAuthorityIsCurrent(layout: layout, scan: terminalScan) else {
-                throw CodeMapRootManifestStoreError.insecureDirectory
-            }
-            return
-        }
-    }
-
-    private func evictToQuotaLocked(
-        layout: ManifestStoreLayout,
-        scan: ManifestScanResult,
-        protectingDigest: String?,
-        incomingByteCount: UInt64,
-        replacedByteCount: UInt64
-    ) throws -> Int {
-        let pendingProtection = try currentCommittedMaintenanceProtection(layout: layout)
-        var protectedDigests = Set([protectingDigest].compactMap(\.self))
-        if let pendingProtection {
-            protectedDigests.insert(pendingProtection.namespace.storageDigestHex)
-        }
-        var projectedCount = try Self.adding(
-            scan.accounting.manifestCount,
-            replacedByteCount == 0 && incomingByteCount > 0 ? 1 : 0
-        )
-        var projectedBytes = scan.accounting.manifestByteCount
-        projectedBytes = projectedBytes >= replacedByteCount ? projectedBytes - replacedByteCount : 0
-        projectedBytes = try Self.adding(projectedBytes, incomingByteCount)
-
-        var evicted = 0
-        for entry in scan.validEntries.sorted(by: { lhs, rhs in
-            if lhs.lastAccessEpochSeconds != rhs.lastAccessEpochSeconds {
-                return lhs.lastAccessEpochSeconds < rhs.lastAccessEpochSeconds
-            }
-            if lhs.manifestGeneration != rhs.manifestGeneration {
-                return lhs.manifestGeneration < rhs.manifestGeneration
-            }
-            return lhs.digest < rhs.digest
-        }) where projectedCount > policy.maximumManifestCount || projectedBytes > policy.maximumStoreByteCount {
-            if protectedDigests.contains(entry.digest) {
-                continue
-            }
-            guard let shard = try Self.openOwnedDirectory(
-                parent: layout.manifests,
-                name: entry.shard,
-                create: false
-            ) else {
-                continue
-            }
-            let descriptor = openat(
-                shard.rawValue,
-                entry.digest,
-                O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
-            )
-            guard descriptor >= 0 else { continue }
-            defer { Darwin.close(descriptor) }
-            guard let current = try? Self.validatedFileIdentity(
-                descriptor,
-                parent: shard,
-                name: entry.digest,
-                expectedMode: Self.fileMode
-            ), current == entry.identity,
-            Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
-            Self.layoutIsCurrent(layout, rootURL: rootURL),
-            Self.directoryIsCurrent(shard, parent: layout.manifests, name: entry.shard)
-            else { continue }
-            if try Self.secureRemove(parent: shard, name: entry.digest, descriptor: descriptor) {
-                projectedCount -= 1
-                projectedBytes = projectedBytes >= entry.byteCount ? projectedBytes - entry.byteCount : 0
-                evicted = Self.addingSaturating(evicted, 1)
-                removeDecodedManifestCacheEntry(
-                    at: ManifestCacheLocation(shard: entry.shard, digest: entry.digest)
-                )
-            }
-        }
-        guard projectedCount <= policy.maximumManifestCount,
-              projectedBytes <= policy.maximumStoreByteCount
-        else {
-            throw CodeMapRootManifestStoreError.quotaExceeded
-        }
-        if let pendingProtection,
-           try !committedMaintenanceWorkIsCurrent(pendingProtection, layout: layout)
-        {
-            throw CodeMapRootManifestStoreError.insecureDirectory
-        }
-        return evicted
-    }
-
-    /// The rename, directory fsync, target identity, and canonical readback above already prove a
-    /// durable commit. This terminal pass detects unrelated same-UID mutations after the preflight
-    /// witness without turning a committed write into an apparent failure. The ordinary path is
-    /// one non-mutating scan whose unchanged leaves reuse the per-file decoded cache; full cleanup
-    /// is entered only when the terminal authority or quota proof is no longer current.
-    private func reconcileAfterCommittedPublication(
-        layout: ManifestStoreLayout,
-        shard: ManifestDirectoryDescriptor,
-        snapshot: CodeMapRootManifestSnapshot,
-        protectingDigest: String,
-        committedIdentity: ManifestFileIdentity
-    ) throws {
-        do {
-            let terminalScan = try scanLocked(layout: layout, maximumEntries: nil, mutate: false)
-            guard scanAuthorityIsCurrent(layout: layout, scan: terminalScan),
-                  !terminalScan.accounting.hasMore,
-                  terminalScan.accounting.manifestCount <= policy.maximumManifestCount,
-                  terminalScan.accounting.manifestByteCount <= policy.maximumStoreByteCount
-            else {
-                throw CodeMapRootManifestStoreError.insecureDirectory
-            }
-            clearCommittedMaintenanceDebt()
-        } catch {
-            do {
-                let outcome = try reconcileLocked(
-                    layout: layout,
-                    maximumEntries: nil,
-                    protectingDigest: protectingDigest,
-                    incomingByteCount: 0,
-                    replacedByteCount: 0
-                )
-                guard !outcome.terminalScan.accounting.hasMore else {
-                    throw CodeMapRootManifestStoreError.quotaExceeded
-                }
-                clearCommittedMaintenanceDebt()
-            } catch {
-                guard Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
-                      Self.layoutIsCurrent(layout, rootURL: rootURL),
-                      Self.directoryIsCurrent(
-                          shard,
-                          parent: layout.manifests,
-                          name: String(protectingDigest.prefix(2))
-                      ),
-                      try Self.fileIdentityAt(parent: shard, name: protectingDigest) == committedIdentity
-                else {
-                    throw CodeMapRootManifestStoreError.insecureDirectory
-                }
-                scheduleCommittedMaintenanceRetryIfNeeded(
-                    ManifestCommittedMaintenanceWork(
-                        namespace: snapshot.namespace,
-                        authority: snapshot.authority,
-                        manifestGeneration: snapshot.manifestGeneration,
-                        committedIdentity: committedIdentity
-                    )
-                )
-            }
-        }
-    }
-
-    private func scheduleCommittedMaintenanceRetryIfNeeded(
-        _ replacementWork: ManifestCommittedMaintenanceWork? = nil
-    ) {
-        if let replacementWork, committedMaintenanceDebt.work != replacementWork {
-            clearCommittedMaintenanceDebt()
-            committedMaintenanceDebt = .pending(work: replacementWork, attempt: 0)
-        }
-        guard let work = committedMaintenanceDebt.work else { return }
-        switch committedMaintenanceDebt {
-        case .scheduled, .running, .exhausted:
-            return
-        case .idle, .pending:
-            break
-        }
-        let previousAttempt = committedMaintenanceDebt.attempt
-        guard previousAttempt < Self.committedMaintenanceMaximumRetryCount else {
-            committedMaintenanceDebt = .exhausted(work: work, attempt: previousAttempt)
-            Self.logger.error(
-                "Committed manifest maintenance exhausted after \(previousAttempt, privacy: .public) attempts"
-            )
-            return
-        }
-        let attempt = previousAttempt + 1
-        let exponent = min(attempt - 1, 2)
-        let delay = Self.committedMaintenanceRetryBaseNanoseconds << exponent
-        let sleep = hooks.committedMaintenanceRetrySleep
-        let task = Task { [weak self] in
-            await sleep(delay)
-            guard !Task.isCancelled else { return }
-            await self?.runCommittedMaintenanceRetry(work: work, attempt: attempt)
-        }
-        committedMaintenanceDebt = .scheduled(work: work, attempt: attempt, task: task)
-    }
-
-    private func runCommittedMaintenanceRetry(
-        work: ManifestCommittedMaintenanceWork,
-        attempt: Int
-    ) async {
-        guard case let .scheduled(currentWork, currentAttempt, _) = committedMaintenanceDebt,
-              currentWork == work,
-              currentAttempt == attempt
-        else {
-            return
-        }
-        committedMaintenanceDebt = .running(work: work, attempt: attempt)
-        do {
-            let completed = try await performCommittedMaintenanceRetry(work)
-            guard case let .running(currentWork, currentAttempt) = committedMaintenanceDebt,
-                  currentWork == work,
-                  currentAttempt == attempt
-            else {
-                return
-            }
-            if completed {
-                clearCommittedMaintenanceDebt()
-            } else {
-                committedMaintenanceDebt = .pending(work: work, attempt: attempt)
-                scheduleCommittedMaintenanceRetryIfNeeded()
-            }
-        } catch {
-            guard case let .running(currentWork, currentAttempt) = committedMaintenanceDebt,
-                  currentWork == work,
-                  currentAttempt == attempt
-            else {
-                return
-            }
-            committedMaintenanceDebt = .pending(work: work, attempt: attempt)
-            scheduleCommittedMaintenanceRetryIfNeeded()
-        }
-    }
-
-    private func performCommittedMaintenanceRetry(
-        _ work: ManifestCommittedMaintenanceWork
-    ) async throws -> Bool {
-        let layout = try Self.openLayout(rootURL: rootURL, create: false)
-        await hooks.beforeMaintenanceLock()
-        try Self.lock(lockAnchor.rawValue, operation: "manifest-anchor-lock")
-        defer { Self.unlock(lockAnchor.rawValue) }
-        guard Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
-              Self.layoutIsCurrent(layout, rootURL: rootURL)
-        else {
-            throw CodeMapRootManifestStoreError.insecureDirectory
-        }
-        guard try committedMaintenanceWorkIsCurrent(work, layout: layout) else {
-            return true
-        }
-        let outcome = try reconcileLocked(
-            layout: layout,
-            maximumEntries: nil,
-            protectingDigest: work.namespace.storageDigestHex,
-            incomingByteCount: 0,
-            replacedByteCount: 0
-        )
-        guard try committedMaintenanceWorkIsCurrent(work, layout: layout) else {
-            throw CodeMapRootManifestStoreError.insecureDirectory
-        }
-        return !outcome.terminalScan.accounting.hasMore
-    }
-
-    private func currentCommittedMaintenanceProtection(
-        layout: ManifestStoreLayout
-    ) throws -> ManifestCommittedMaintenanceWork? {
-        guard let work = committedMaintenanceDebt.work else { return nil }
-        guard try committedMaintenanceWorkIsCurrent(work, layout: layout) else {
-            clearCommittedMaintenanceDebt()
-            return nil
-        }
-        return work
-    }
-
-    private func committedMaintenanceWorkIsCurrent(
-        _ work: ManifestCommittedMaintenanceWork,
-        layout: ManifestStoreLayout
-    ) throws -> Bool {
-        guard let shard = try Self.openOwnedDirectory(
-            parent: layout.manifests,
-            name: work.namespace.shard,
-            create: false
-        ) else {
-            return false
-        }
-        let existing = try inspectExisting(
-            shard: shard,
-            namespace: work.namespace,
-            name: work.namespace.storageDigestHex
-        )
-        return existing.identity == work.committedIdentity &&
-            existing.snapshot?.authority == work.authority &&
-            existing.snapshot?.manifestGeneration == work.manifestGeneration
-    }
-
-    private func clearCommittedMaintenanceDebt() {
-        if case let .scheduled(_, _, task) = committedMaintenanceDebt {
-            task.cancel()
-        }
-        committedMaintenanceDebt = .idle
     }
 
     private func reconcileLocked(
@@ -1916,13 +1012,56 @@ actor CodeMapRootManifestStore {
         {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
-        let evicted = try evictToQuotaLocked(
-            layout: layout,
-            scan: projectionScan,
-            protectingDigest: protectingDigest,
-            incomingByteCount: incomingByteCount,
-            replacedByteCount: replacedByteCount
+        var projectedCount = try Self.adding(
+            projectionScan.accounting.manifestCount,
+            replacedByteCount == 0 && incomingByteCount > 0 ? 1 : 0
         )
+        var projectedBytes = projectionScan.accounting.manifestByteCount
+        projectedBytes = projectedBytes >= replacedByteCount ? projectedBytes - replacedByteCount : 0
+        projectedBytes = try Self.adding(projectedBytes, incomingByteCount)
+
+        var evicted = 0
+        for entry in projectionScan.validEntries.sorted(by: { lhs, rhs in
+            if lhs.lastAccessEpochSeconds != rhs.lastAccessEpochSeconds {
+                return lhs.lastAccessEpochSeconds < rhs.lastAccessEpochSeconds
+            }
+            if lhs.manifestGeneration != rhs.manifestGeneration {
+                return lhs.manifestGeneration < rhs.manifestGeneration
+            }
+            return lhs.digest < rhs.digest
+        }) where projectedCount > policy.maximumManifestCount || projectedBytes > policy.maximumStoreByteCount {
+            if entry.digest == protectingDigest {
+                continue
+            }
+            guard let shard = try Self.openOwnedDirectory(
+                parent: layout.manifests,
+                name: entry.shard,
+                create: false
+            ) else { continue }
+            let descriptor = openat(shard.rawValue, entry.digest, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+            guard descriptor >= 0 else { continue }
+            defer { Darwin.close(descriptor) }
+            guard let current = try? Self.validatedFileIdentity(
+                descriptor,
+                parent: shard,
+                name: entry.digest,
+                expectedMode: Self.fileMode
+            ), current == entry.identity,
+            Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
+            Self.layoutIsCurrent(layout, rootURL: rootURL),
+            Self.directoryIsCurrent(shard, parent: layout.manifests, name: entry.shard)
+            else { continue }
+            if try Self.secureRemove(parent: shard, name: entry.digest, descriptor: descriptor) {
+                projectedCount -= 1
+                projectedBytes = projectedBytes >= entry.byteCount ? projectedBytes - entry.byteCount : 0
+                evicted = Self.addingSaturating(evicted, 1)
+            }
+        }
+        guard projectedCount <= policy.maximumManifestCount,
+              projectedBytes <= policy.maximumStoreByteCount
+        else {
+            throw CodeMapRootManifestStoreError.quotaExceeded
+        }
 
         let finalScan = evicted == 0
             ? projectionScan
@@ -2031,7 +1170,6 @@ actor CodeMapRootManifestStore {
         maximumEntries: Int?,
         mutate: Bool
     ) throws -> ManifestScanResult {
-        hooks.scanStarted()
         guard Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
               Self.layoutIsCurrent(layout, rootURL: rootURL)
         else {
@@ -2094,9 +1232,6 @@ actor CodeMapRootManifestStore {
                 guard Self.isCanonicalDigest(name) else { continue }
                 let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
                 guard descriptor >= 0 else { continue }
-                #if DEBUG
-                    hooks.onManifestScanInspection(name)
-                #endif
                 let inspection = inspectManifestDescriptor(
                     descriptor,
                     manifests: layout.manifests,
@@ -2129,9 +1264,6 @@ actor CodeMapRootManifestStore {
                         quarantine: layout.quarantine
                     ) {
                         result.quarantinedCorruptCount += 1
-                        removeDecodedManifestCacheEntry(
-                            at: ManifestCacheLocation(shard: shardName, digest: name)
-                        )
                     }
                 case .insecure:
                     break
@@ -2206,15 +1338,6 @@ actor CodeMapRootManifestStore {
         if remaining == 0 {
             result.hasMore = true
         }
-        if !result.hasMore {
-            let observedLocations = Set(result.validEntries.map {
-                ManifestCacheLocation(shard: $0.shard, digest: $0.digest)
-            })
-            let staleLocations = decodedManifestCache.keys.filter { !observedLocations.contains($0) }
-            for location in staleLocations {
-                removeDecodedManifestCacheEntry(at: location)
-            }
-        }
         result.manifestsMutation = try Self.directoryMutationIdentity(layout.manifests.rawValue)
         result.quarantineMutation = try Self.directoryMutationIdentity(layout.quarantine.rawValue)
         return result
@@ -2241,7 +1364,6 @@ actor CodeMapRootManifestStore {
                   identity.size <= off_t(CodeMapRootManifestCodec.maximumEncodedByteCount),
                   UInt64(identity.size) <= policy.maximumManifestByteCount
             else { return .corrupt }
-            let cacheLocation = ManifestCacheLocation(shard: shardName, digest: name)
             let data = try Self.readExactly(descriptor, byteCount: Int(identity.size))
             guard Self.directoryIsCurrent(shard, parent: manifests, name: shardName),
                   try Self.validatedFileIdentity(
@@ -2253,154 +1375,16 @@ actor CodeMapRootManifestStore {
             else {
                 return .insecure
             }
-            let validatedContentChecksum = try CodeMapRootManifestCodec.validatedContentChecksum(data)
-            if let cached = decodedManifestCache[cacheLocation],
-               cached.identity == identity,
-               cached.validatedContentChecksum == validatedContentChecksum
-            {
-                touchDecodedManifestCacheEntry(at: cacheLocation)
-                return .valid(cached.snapshot, identity)
-            }
             let snapshot = try CodeMapRootManifestCodec.decodeStored(data, filenameDigest: name)
             guard snapshot.namespace.shard == shardName,
                   snapshot.records.count <= policy.maximumRecordCountPerManifest
             else { return .corrupt }
-            cacheDecodedManifest(
-                at: cacheLocation,
-                identity: identity,
-                snapshot: snapshot,
-                validatedContentChecksum: validatedContentChecksum
-            )
             return .valid(snapshot, identity)
         } catch CodeMapRootManifestStoreError.insecureLeaf {
             return .insecure
-        } catch let failure as CodeMapRootManifestDecodeFailure {
-            recordDecodeFailure(failure)
-            recordRegenerationFailure(
-                failure: failure,
-                digest: name,
-                authority: nil
-            )
-            return .corrupt
         } catch {
             return .corrupt
         }
-    }
-
-    private func cacheDecodedManifest(
-        at location: ManifestCacheLocation,
-        identity: ManifestFileIdentity,
-        snapshot: CodeMapRootManifestSnapshot,
-        validatedContentChecksum: Data
-    ) {
-        guard identity.size >= 0 else { return }
-        let encodedByteCount = UInt64(identity.size)
-        removeDecodedManifestCacheEntry(at: location)
-        guard encodedByteCount <= policy.maximumDecodedManifestCacheByteCount else { return }
-
-        while decodedManifestCacheByteCount > policy.maximumDecodedManifestCacheByteCount - encodedByteCount {
-            guard let leastRecentlyUsed = decodedManifestCacheOrder.first else {
-                preconditionFailure("decoded manifest cache byte accounting lost its eviction order")
-            }
-            removeDecodedManifestCacheEntry(at: leastRecentlyUsed)
-        }
-        decodedManifestCache[location] = ManifestCachedSnapshot(
-            identity: identity,
-            snapshot: snapshot,
-            validatedContentChecksum: validatedContentChecksum,
-            encodedByteCount: encodedByteCount
-        )
-        decodedManifestCacheOrder.append(location)
-        decodedManifestCacheByteCount += encodedByteCount
-    }
-
-    private func touchDecodedManifestCacheEntry(at location: ManifestCacheLocation) {
-        guard decodedManifestCache[location] != nil else { return }
-        decodedManifestCacheOrder.removeAll { $0 == location }
-        decodedManifestCacheOrder.append(location)
-    }
-
-    private func removeDecodedManifestCacheEntry(at location: ManifestCacheLocation) {
-        guard let removed = decodedManifestCache.removeValue(forKey: location) else { return }
-        precondition(decodedManifestCacheByteCount >= removed.encodedByteCount)
-        decodedManifestCacheByteCount -= removed.encodedByteCount
-        decodedManifestCacheOrder.removeAll { $0 == location }
-    }
-
-    private func recordDecodeFailure(_ failure: CodeMapRootManifestDecodeFailure) {
-        let current = decodeFailureCounts[failure, default: 0]
-        decodeFailureCounts[failure] = current == .max ? .max : current + 1
-    }
-
-    private func recordRegenerationFailure(
-        failure: CodeMapRootManifestDecodeFailure,
-        digest: String,
-        authority: CodeMapRootManifestAuthority?
-    ) {
-        switch failure {
-        case .namespaceValidation, .namespaceDigestMismatch, .expectedNamespaceMismatch,
-             .authorityValidation, .orderingValidation, .contributionValidation,
-             .recordValidation, .trailingPayload, .nonCanonicalEncoding:
-            break
-        case .invalidEnvelope, .checksumMismatch, .invalidMagic, .unsupportedCodecVersion:
-            return
-        }
-        var state: ManifestRegenerationFailureState
-        if let existing = regenerationFailures[digest], authority == nil || existing.authority == authority || existing.authority == nil {
-            state = existing
-            if state.authority == nil, let authority {
-                state.authority = authority
-            }
-            state.failureCount = state.failureCount == .max ? .max : state.failureCount + 1
-        } else {
-            state = ManifestRegenerationFailureState(
-                authority: authority,
-                failureCount: 1,
-                blockedUntilEpochSeconds: 0
-            )
-        }
-        if state.failureCount >= Self.regenerationFailureThreshold {
-            let exponent = min(
-                state.failureCount - Self.regenerationFailureThreshold,
-                Self.regenerationMaximumBackoffExponent
-            )
-            let multiplier = UInt64(1) << exponent
-            let (candidateDelay, delayOverflow) = policy.regenerationBaseBackoffSeconds
-                .multipliedReportingOverflow(by: multiplier)
-            let delay = delayOverflow ? UInt64.max : candidateDelay
-            let now = accessEpochSeconds()
-            let (deadline, overflow) = now.addingReportingOverflow(delay)
-            state.blockedUntilEpochSeconds = max(
-                state.blockedUntilEpochSeconds,
-                overflow ? .max : deadline
-            )
-        }
-        regenerationFailures[digest] = state
-    }
-
-    private func waitForRegenerationBackpressure(
-        namespace: CodeMapRootManifestNamespace,
-        authority: CodeMapRootManifestAuthority
-    ) async throws {
-        let digest = namespace.storageDigestHex
-        while let state = regenerationFailures[digest], state.authority == authority || state.authority == nil {
-            let now = accessEpochSeconds()
-            guard now < state.blockedUntilEpochSeconds else { return }
-            regenerationBackpressureCount = regenerationBackpressureCount == .max
-                ? .max
-                : regenerationBackpressureCount + 1
-            try await hooks.waitForRegenerationBackpressure(state.blockedUntilEpochSeconds - now)
-            try Task.checkCancellation()
-        }
-    }
-
-    private func clearRegenerationFailure(
-        namespace: CodeMapRootManifestNamespace,
-        authority: CodeMapRootManifestAuthority
-    ) {
-        let digest = namespace.storageDigestHex
-        guard let state = regenerationFailures[digest], state.authority == nil || state.authority == authority else { return }
-        regenerationFailures.removeValue(forKey: digest)
     }
 
     private static func openLayout(rootURL: URL, create: Bool) throws -> ManifestStoreLayout {
@@ -2980,18 +1964,6 @@ private struct ManifestFileIdentity: Equatable {
             linkCount == 1 &&
             device == expectedDevice
     }
-}
-
-private struct ManifestCacheLocation: Hashable {
-    let shard: String
-    let digest: String
-}
-
-private struct ManifestCachedSnapshot {
-    let identity: ManifestFileIdentity
-    let snapshot: CodeMapRootManifestSnapshot
-    let validatedContentChecksum: Data
-    let encodedByteCount: UInt64
 }
 
 private struct ManifestMaintenanceEntry {

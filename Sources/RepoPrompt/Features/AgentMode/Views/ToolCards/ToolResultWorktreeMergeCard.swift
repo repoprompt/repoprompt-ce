@@ -77,8 +77,12 @@ enum WorktreeMergeCardPresentationBuilder {
     }
 
     private static func detailText(dto: ToolResultDTOs.ManageWorktreeReplyDTO.MergeDTO) -> String? {
-        if let error = dto.error, !error.isEmpty { return error }
-        if let stale = dto.staleReason, !stale.isEmpty { return stale }
+        if let error = dto.error, !error.isEmpty {
+            return error
+        }
+        if let stale = dto.staleReason, !stale.isEmpty {
+            return stale
+        }
         if let conflicts = dto.conflictFiles, !conflicts.isEmpty {
             return "\(conflicts.count) conflicted file\(conflicts.count == 1 ? "" : "s")"
         }

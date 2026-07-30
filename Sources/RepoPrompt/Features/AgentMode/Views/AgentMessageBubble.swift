@@ -33,7 +33,9 @@ private struct MessageFooterStrip: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            if isTrailing { Spacer(minLength: 0) }
+            if isTrailing {
+                Spacer(minLength: 0)
+            }
 
             if isTrailing {
                 elapsedStatusView
@@ -47,7 +49,9 @@ private struct MessageFooterStrip: View {
                 elapsedStatusView
             }
 
-            if !isTrailing { Spacer(minLength: 0) }
+            if !isTrailing {
+                Spacer(minLength: 0)
+            }
         }
         .padding(.horizontal, 4)
     }
@@ -1231,8 +1235,12 @@ private struct AskUserQuestionSummary {
     }
 
     var statusText: String? {
-        if skipped { return "Skipped" }
-        if timedOut { return "Timed out" }
+        if skipped {
+            return "Skipped"
+        }
+        if timedOut {
+            return "Timed out"
+        }
         return nil
     }
 }
@@ -1378,8 +1386,12 @@ private func displayAnswer(from answer: AskUserQuestionResult.Answer?, timedOut:
 }
 
 private func scalarDisplayAnswer(response: String?, skipped: Bool, timedOut: Bool) -> String {
-    if skipped { return "Skipped" }
-    if timedOut { return response ?? "Timed out" }
+    if skipped {
+        return "Skipped"
+    }
+    if timedOut {
+        return response ?? "Timed out"
+    }
     return response ?? "No response"
 }
 

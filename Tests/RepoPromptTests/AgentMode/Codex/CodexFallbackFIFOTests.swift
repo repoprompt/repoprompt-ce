@@ -1052,7 +1052,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
     ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if predicate() { return }
+            if predicate() {
+                return
+            }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for Codex fallback FIFO state")
@@ -1268,7 +1270,9 @@ private actor FallbackStartGate {
     func waitUntilWaiting(timeout: TimeInterval = 5) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if waiting { return true }
+            if waiting {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return waiting

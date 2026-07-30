@@ -378,7 +378,9 @@ final class WorkspaceProjectedPathSearchTests: XCTestCase {
             entries.append(makeEntry(path: "Mutable \(iteration) Å.swift", id: mutableID, root: root))
             entries.sort(by: WorkspaceFileContextStore.searchCatalogEntryPrecedes)
             var changedFileIDs: Set<UUID> = [mutableID]
-            if iteration == 0 { changedFileIDs.insert(deletedID) }
+            if iteration == 0 {
+                changedFileIDs.insert(deletedID)
+            }
             index = index.applyingPatch(
                 identity: identity(UInt64(iteration + 1)),
                 entries: entries,

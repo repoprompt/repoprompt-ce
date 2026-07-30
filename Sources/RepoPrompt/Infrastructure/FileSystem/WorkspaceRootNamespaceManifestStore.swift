@@ -105,7 +105,9 @@ struct WorkspaceRootNamespaceSpillFormat: SpillBackedSortedArtifactFormat {
         _ lhs: WorkspaceRootNamespaceRecord,
         _ rhs: WorkspaceRootNamespaceRecord
     ) -> SpillBackedSortedArtifactOrdering {
-        if lhs.relativePathBytes == rhs.relativePathBytes { return .same }
+        if lhs.relativePathBytes == rhs.relativePathBytes {
+            return .same
+        }
         return WorkspaceRootNamespaceManifestCodec.lexicallyPrecedes(
             lhs.relativePathBytes,
             rhs.relativePathBytes

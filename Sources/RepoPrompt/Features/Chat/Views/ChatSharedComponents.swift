@@ -122,7 +122,9 @@ private final class CancelSpinnerLayerView: NSView {
     func startAnimatingIfNeeded() {
         guard window != nil else { return }
         ensureArcLayerInstalled()
-        if arcLayer.animation(forKey: animationKey) != nil { return }
+        if arcLayer.animation(forKey: animationKey) != nil {
+            return
+        }
 
         let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
         rotation.fromValue = -CGFloat.pi / 2

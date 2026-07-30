@@ -620,7 +620,8 @@ struct AgentModeSidebarSessionBuilder {
             var cursor: UUID? = parentSID
             var hasCycle = false
             while let c = cursor {
-                if visited.contains(c) { hasCycle = true
+                if visited.contains(c) {
+                    hasCycle = true
                     break
                 }
                 visited.insert(c)

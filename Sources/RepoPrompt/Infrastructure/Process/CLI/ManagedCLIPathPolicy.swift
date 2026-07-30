@@ -122,7 +122,9 @@ enum ManagedCLIPathPolicy {
     }
 
     private static func resolvedDestination(_ destination: String, linkPath: String) -> String {
-        if destination.hasPrefix("/") { return standardized(destination) }
+        if destination.hasPrefix("/") {
+            return standardized(destination)
+        }
         let parent = URL(fileURLWithPath: linkPath).deletingLastPathComponent()
         return standardized(parent.appendingPathComponent(destination).path)
     }

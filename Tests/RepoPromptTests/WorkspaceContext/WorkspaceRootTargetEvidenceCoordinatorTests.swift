@@ -465,7 +465,9 @@ final class WorkspaceRootTargetEvidenceCoordinatorTests: XCTestCase {
         line: UInt = #line
     ) async {
         for _ in 0 ..< attempts {
-            if await predicate() { return }
+            if await predicate() {
+                return
+            }
             await Task.yield()
         }
         XCTFail("Condition did not become true", file: file, line: line)

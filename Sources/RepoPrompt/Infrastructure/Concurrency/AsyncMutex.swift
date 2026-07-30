@@ -11,7 +11,11 @@ actor AsyncMutex {
         guard acquired else {
             throw CancellationError()
         }
-        defer { if acquired { unlock() } }
+        defer {
+            if acquired {
+                unlock()
+            }
+        }
         return try await body()
     }
 

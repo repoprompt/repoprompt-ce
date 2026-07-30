@@ -222,7 +222,9 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             )
         )
         XCTAssertTrue(canonicalDenied.dispositions.allSatisfy {
-            if case .rejected = $0 { return true }
+            if case .rejected = $0 {
+                return true
+            }
             return false
         })
 

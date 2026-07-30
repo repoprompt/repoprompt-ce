@@ -27,9 +27,13 @@ enum AgentTranscriptToolVisibilityPolicy {
 
     static func pathSignal(fromPathLikeToolName raw: String?) -> String? {
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
-        if MCPIntegrationHelper.canonicalRepoPromptToolName(trimmed) != nil { return nil }
+        if MCPIntegrationHelper.canonicalRepoPromptToolName(trimmed) != nil {
+            return nil
+        }
         let normalized = normalizedToolNameForComparison(trimmed) ?? ""
-        if canonicalAlias(forNormalizedName: normalized) != nil { return nil }
+        if canonicalAlias(forNormalizedName: normalized) != nil {
+            return nil
+        }
         let candidate = trimmed.replacingOccurrences(of: "\\", with: "/")
         guard !candidate.hasPrefix("/"), !candidate.hasPrefix("~") else { return nil }
         guard !candidate.contains("://"), !candidate.contains(" ") else { return nil }
@@ -129,7 +133,9 @@ enum AgentTranscriptToolVisibilityPolicy {
     }
 
     private static func isMeaningfulError(row: AgentChatItem, execution: AgentTranscriptToolExecution?) -> Bool {
-        if row.toolIsError == true || execution?.toolIsError == true { return true }
+        if row.toolIsError == true || execution?.toolIsError == true {
+            return true
+        }
         switch execution?.status {
         case .failed, .cancelled, .warning:
             return true
@@ -138,7 +144,9 @@ enum AgentTranscriptToolVisibilityPolicy {
         }
         for raw in [row.toolResultJSON, execution?.resultJSON, row.text] {
             guard let object = ToolRawJSON.object(from: raw) else { continue }
-            if containsMeaningfulErrorField(object) { return true }
+            if containsMeaningfulErrorField(object) {
+                return true
+            }
         }
         return false
     }
@@ -152,7 +160,9 @@ enum AgentTranscriptToolVisibilityPolicy {
         case .args, .result, .text:
             break
         }
-        if trimmed == "{}" || trimmed == "[]" { return false }
+        if trimmed == "{}" || trimmed == "[]" {
+            return false
+        }
         if let object = ToolRawJSON.object(from: trimmed) {
             return hasMeaningfulObjectPayload(object, kind: kind)
         }
@@ -160,7 +170,9 @@ enum AgentTranscriptToolVisibilityPolicy {
     }
 
     private static func hasMeaningfulObjectPayload(_ object: [String: Any], kind: PayloadKind) -> Bool {
-        if containsMeaningfulErrorField(object) { return true }
+        if containsMeaningfulErrorField(object) {
+            return true
+        }
         let summaryOnly = ToolRawJSON.bool(object, key: "summary_only") ?? ToolRawJSON.bool(object, key: "summaryOnly") ?? false
         let allowedSummaryKeys: Set = [
             "exitcode", "original_char_count", "original_sha256", "processid", "redacted", "render_summary", "status",

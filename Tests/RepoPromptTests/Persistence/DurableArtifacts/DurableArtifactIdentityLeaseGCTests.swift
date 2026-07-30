@@ -195,7 +195,9 @@ final class DurableArtifactIdentityLeaseGCTests: XCTestCase {
                 parent: store.layout.catalogLocks,
                 name: lockName,
                 beforeLockBindingPublish: {
-                    if worker.action == "lock-binding-crash" { _exit(86) }
+                    if worker.action == "lock-binding-crash" {
+                        _exit(86)
+                    }
                     try DurableArtifactSubprocess.signal(worker.ready)
                     try DurableArtifactSubprocess.waitForSignal(worker.release)
                 }

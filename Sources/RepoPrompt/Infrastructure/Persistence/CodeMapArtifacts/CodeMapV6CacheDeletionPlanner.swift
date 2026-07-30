@@ -196,7 +196,9 @@ struct CodeMapV6CacheDeletionPlanner {
             while true {
                 errno = 0
                 guard let entry = readdir(directory) else {
-                    if errno != 0 { throw Self.ioError("cache-directory-read") }
+                    if errno != 0 {
+                        throw Self.ioError("cache-directory-read")
+                    }
                     break
                 }
                 let name = Self.directoryEntryName(entry)
@@ -317,7 +319,9 @@ struct CodeMapV6CacheDeletionPlanner {
                     off_t(offset)
                 )
             }
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR {
+                continue
+            }
             guard count > 0 else { throw Self.ioError("candidate-read") }
             offset += count
         }

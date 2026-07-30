@@ -297,8 +297,12 @@ import XCTest
                     await observerTailGate.release()
                     firstTask?.cancel()
                     secondTask?.cancel()
-                    if let firstTask { _ = try? await firstTask.value }
-                    if let secondTask { _ = try? await secondTask.value }
+                    if let firstTask {
+                        _ = try? await firstTask.value
+                    }
+                    if let secondTask {
+                        _ = try? await secondTask.value
+                    }
                     await manager.debugSetBeforeToolCompletionObserversForTesting(nil)
                     await manager.debugSetResolvedToolOperationOverride(
                         toolName: MCPWindowToolName.manageSelection,
@@ -478,8 +482,12 @@ import XCTest
                     await formattingTailGate.release()
                     firstTask?.cancel()
                     secondTask?.cancel()
-                    if let firstTask { _ = try? await firstTask.value }
-                    if let secondTask { _ = try? await secondTask.value }
+                    if let firstTask {
+                        _ = try? await firstTask.value
+                    }
+                    if let secondTask {
+                        _ = try? await secondTask.value
+                    }
                     await manager.debugSetBeforeToolResultFormattingForTesting(nil)
                     await manager.debugSetResolvedToolOperationOverride(
                         toolName: MCPGlobalToolName.appSettings,
@@ -1268,7 +1276,9 @@ import XCTest
                         let waiterCount = await manager.connectionLimiterSnapshotForTesting(
                             connectionID: createdEndpoint.connectionID
                         )?.waiterCount
-                        if waiterCount == 1 { break }
+                        if waiterCount == 1 {
+                            break
+                        }
                         await Task.yield()
                     }
                     let queuedLimiter = await manager.connectionLimiterSnapshotForTesting(
@@ -1440,9 +1450,15 @@ import XCTest
                     server.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
-                    if let manageTask { _ = try? await manageTask.value }
-                    if let queuedReadTask { _ = try? await queuedReadTask.value }
-                    if let endpoint { await Self.cleanupEndpoint(endpoint, manager: manager) }
+                    if let manageTask {
+                        _ = try? await manageTask.value
+                    }
+                    if let queuedReadTask {
+                        _ = try? await queuedReadTask.value
+                    }
+                    if let endpoint {
+                        await Self.cleanupEndpoint(endpoint, manager: manager)
+                    }
                     await fixture.cleanup()
                     throw error
                 }
@@ -1559,8 +1575,12 @@ import XCTest
                     await service.setCreateFileDataPreparationForTesting(nil)
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
-                    if let fileActionTask { _ = try? await fileActionTask.value }
-                    if let queuedReadTask { _ = try? await queuedReadTask.value }
+                    if let fileActionTask {
+                        _ = try? await fileActionTask.value
+                    }
+                    if let queuedReadTask {
+                        _ = try? await queuedReadTask.value
+                    }
                     await fixture.cleanup()
                     throw error
                 }
@@ -1807,8 +1827,12 @@ import XCTest
                     await service.setMutationIOWillBeginHandlerForTesting(nil)
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
-                    if let fileActionTask { _ = try? await fileActionTask.value }
-                    if let queuedReadTask { _ = try? await queuedReadTask.value }
+                    if let fileActionTask {
+                        _ = try? await fileActionTask.value
+                    }
+                    if let queuedReadTask {
+                        _ = try? await queuedReadTask.value
+                    }
                     await fixture.cleanup()
                     throw error
                 }
@@ -1915,7 +1939,9 @@ import XCTest
                 } catch {
                     await gate.release()
                     server.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
-                    if let endpoint { await Self.cleanupEndpoint(endpoint, manager: manager) }
+                    if let endpoint {
+                        await Self.cleanupEndpoint(endpoint, manager: manager)
+                    }
                     await fixture.cleanup()
                     throw error
                 }

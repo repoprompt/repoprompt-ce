@@ -3,6 +3,7 @@ import Foundation
 protocol CodexModelListingClient: Sendable {
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel]
     func stop() async
+    func currentProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot?
 }
 
 extension CodexAppServerClient: CodexModelListingClient {}
@@ -28,7 +29,8 @@ actor CodexModelPollingService {
     static let shared = CodexModelPollingService(
         client: CodexProviderHelpers.makeOwnedNonAgentAppServerClient(),
         stopClientOnShutdown: true,
-        stopClientWhenIdle: true
+        stopClientWhenIdle: true,
+        stopClientAfterRefresh: true
     )
 
     struct Snapshot: Equatable {
@@ -36,10 +38,20 @@ actor CodexModelPollingService {
         let fetchedAt: Date
     }
 
+    struct RuntimeSnapshot: Equatable {
+        let subscriberCount: Int
+        let isPolling: Bool
+        let hasInFlightRefresh: Bool
+        let isShutdown: Bool
+        let latestFetchedAt: Date?
+        let processSnapshot: CodexAppServerClient.ProcessSnapshot?
+    }
+
     private let client: any CodexModelListingClient
     private let intervalNanos: UInt64
     private let stopClientOnShutdown: Bool
     private let stopClientWhenIdle: Bool
+    private let stopClientAfterRefresh: Bool
 
     private var pollingTask: Task<Void, Never>?
     private var inFlightRefresh: Task<Void, Never>?
@@ -50,22 +62,36 @@ actor CodexModelPollingService {
     private var latest: Snapshot?
     private var isShutdown = false
     private var isStoppingClientForIdle = false
+    private var inFlightRefreshNeedsInterrupt = false
 
     init(
         client: any CodexModelListingClient,
         intervalNanos: UInt64 = 60_000_000_000,
         stopClientOnShutdown: Bool = false,
-        stopClientWhenIdle: Bool = false
+        stopClientWhenIdle: Bool = false,
+        stopClientAfterRefresh: Bool = false
     ) {
         self.client = client
         self.intervalNanos = intervalNanos
         self.stopClientOnShutdown = stopClientOnShutdown
         self.stopClientWhenIdle = stopClientWhenIdle
+        self.stopClientAfterRefresh = stopClientAfterRefresh
     }
 
     /// Returns the most recent snapshot if available (non-blocking).
     func latestSnapshot() -> Snapshot? {
         latest
+    }
+
+    func runtimeSnapshot() async -> RuntimeSnapshot {
+        await RuntimeSnapshot(
+            subscriberCount: continuations.count,
+            isPolling: pollingTask != nil,
+            hasInFlightRefresh: inFlightRefresh != nil,
+            isShutdown: isShutdown,
+            latestFetchedAt: latest?.fetchedAt,
+            processSnapshot: client.currentProcessSnapshot()
+        )
     }
 
     #if DEBUG
@@ -132,8 +158,17 @@ actor CodexModelPollingService {
         isShutdown = true
         pollingTask?.cancel()
         pollingTask = nil
-        inFlightRefresh?.cancel()
+        let shouldInterruptRefresh = inFlightRefresh != nil
+            && inFlightRefreshNeedsInterrupt
+            && stopClientOnShutdown
+        if shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
+        }
+        if let inFlightRefresh {
+            await inFlightRefresh.value
+        }
         inFlightRefresh = nil
+        inFlightRefreshNeedsInterrupt = false
         if finishSubscribers {
             let activeContinuations = continuations
             continuations.removeAll()
@@ -144,8 +179,8 @@ actor CodexModelPollingService {
                 continuation.finish()
             }
         }
-        if stopClientOnShutdown {
-            await client.stop()
+        if stopClientOnShutdown, !shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
         }
     }
 
@@ -176,11 +211,16 @@ actor CodexModelPollingService {
         guard !isStoppingClientForIdle else { return }
 
         isStoppingClientForIdle = true
+        let shouldInterruptRefresh = inFlightRefresh != nil && inFlightRefreshNeedsInterrupt
+        if shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
+        }
         if let inFlightRefresh {
-            inFlightRefresh.cancel()
             await inFlightRefresh.value
         }
-        await client.stop()
+        if !stopClientAfterRefresh, !shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
+        }
         isStoppingClientForIdle = false
 
         if !isShutdown, !continuations.isEmpty {
@@ -219,16 +259,38 @@ actor CodexModelPollingService {
             guard let self else { return }
             do {
                 let models = try await client.listModels(limit: 100)
-                guard !Task.isCancelled else { return }
                 let snapshot = Snapshot(models: models, fetchedAt: Date())
                 await applyRefreshResult(snapshot)
             } catch {
                 // Keep existing cache when refresh fails; callers fall back to static list when empty.
             }
+            let shouldStopClient = await finishRefreshRequest()
+            // Refresh and transport shutdown are one lifecycle operation. Keeping the stop in
+            // this task prevents refreshNow(), subscriber removal, and the next polling tick from
+            // observing a completed refresh while the app-server is still being stopped.
+            if shouldStopClient {
+                await client.stop()
+            }
         }
+        inFlightRefreshNeedsInterrupt = true
         inFlightRefresh = task
-        defer { inFlightRefresh = nil }
+        defer {
+            inFlightRefresh = nil
+            inFlightRefreshNeedsInterrupt = false
+        }
         await task.value
+    }
+
+    private func stopClientWithoutInheritingCancellation() async {
+        let stopTask = Task { [client] in
+            await client.stop()
+        }
+        await stopTask.value
+    }
+
+    private func finishRefreshRequest() -> Bool {
+        inFlightRefreshNeedsInterrupt = false
+        return stopClientAfterRefresh && !isStoppingClientForIdle && !isShutdown
     }
 
     private func applyRefreshResult(_ snapshot: Snapshot) {

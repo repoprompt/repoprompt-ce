@@ -168,7 +168,9 @@ actor GitWorkspaceMetadataMonitor {
             let isControl = [".gitignore", ".repo_ignore", ".cursorignore", ".gitattributes"]
                 .contains(components.last.map(String.init) ?? "")
                 && (isAtOrBelowPrefix || parentIsPrefixAncestor)
-            if isControl { return true }
+            if isControl {
+                return true
+            }
 
             let itemIsDirectory = flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0
             let itemIsSymlink = flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsSymlink) != 0

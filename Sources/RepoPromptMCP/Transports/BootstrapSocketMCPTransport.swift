@@ -265,7 +265,9 @@ public actor BootstrapSocketMCPTransport: Transport {
 
             if written < 0 {
                 let err = errno
-                if err == EINTR { continue }
+                if err == EINTR {
+                    continue
+                }
                 if err == EAGAIN || err == EWOULDBLOCK {
                     try waitForSocketWritable(
                         lastProgressAt: lastProgressAt,
@@ -320,13 +322,17 @@ public actor BootstrapSocketMCPTransport: Transport {
             let result = poll(&pfd, 1, pollTimeout)
 
             if result < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 let error = MCPError.transportError(Errno(rawValue: errno))
                 closeAfterSendFailure(error)
                 throw error
             }
 
-            if result == 0 { continue }
+            if result == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
                 closeAfterSendFailure(MCPError.connectionClosed)

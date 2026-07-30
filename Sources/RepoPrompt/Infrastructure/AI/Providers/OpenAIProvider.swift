@@ -106,7 +106,9 @@ class OpenAIProvider: AIProvider {
 
     private func shouldOmitMaxOutputTokens(for model: AIModel) -> Bool {
         // Respect explicit user configuration
-        if configuredMaxTokens != nil { return false }
+        if configuredMaxTokens != nil {
+            return false
+        }
         let baseModel = model.openAIServiceTierBase
         // Don't pass max_output_tokens for first-party OpenAI models — let the API handle defaults
         switch baseModel {
@@ -267,7 +269,9 @@ class OpenAIProvider: AIProvider {
 
                     for try await result in stream {
                         // Check cancellation to exit promptly when consumer stops reading
-                        if Task.isCancelled { break }
+                        if Task.isCancelled {
+                            break
+                        }
 
                         let content = result.choices?.first?.delta?.content ?? ""
                         let reasoning = result.choices?.first?.delta?.reasoningContent ?? ""
@@ -454,7 +458,9 @@ class OpenAIProvider: AIProvider {
         // Try the requested model first
         do {
             let response = try await callAppropriateCompletion(for: model, message: testMessage, nil)
-            if response.lowercased().contains("hello") { return true }
+            if response.lowercased().contains("hello") {
+                return true
+            }
         } catch {
             print("Initial model \(model.displayName) failed in testAPIKey: \(error)")
         }
@@ -465,7 +471,9 @@ class OpenAIProvider: AIProvider {
             do {
                 print("Falling back to \(fallback.displayName) in testAPIKey...")
                 let response = try await callAppropriateCompletion(for: fallback, message: testMessage, nil)
-                if response.lowercased().contains("hello") { return true }
+                if response.lowercased().contains("hello") {
+                    return true
+                }
             } catch {
                 print("Fallback model \(fallback.displayName) failed in testAPIKey: \(error)")
             }
@@ -484,7 +492,9 @@ class OpenAIProvider: AIProvider {
                     var completionTokens: Int?
 
                     for try await event in stream {
-                        if Task.isCancelled { break }
+                        if Task.isCancelled {
+                            break
+                        }
                         switch event {
                         case let .outputTextDelta(delta):
                             if !delta.delta.isEmpty {

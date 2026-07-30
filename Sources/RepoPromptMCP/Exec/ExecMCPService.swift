@@ -156,7 +156,9 @@ actor ExecMCPService: Service {
                 } catch {
                     fputs("Error: Failed to open output file '\(redirectPath!)': \(error)\n", stderr)
                     allSucceeded = false
-                    if options.failFast { break }
+                    if options.failFast {
+                        break
+                    }
                     continue
                 }
             }
@@ -182,7 +184,9 @@ actor ExecMCPService: Service {
 
             if !summary.succeeded {
                 allSucceeded = false
-                if options.failFast { break }
+                if options.failFast {
+                    break
+                }
             }
         }
 

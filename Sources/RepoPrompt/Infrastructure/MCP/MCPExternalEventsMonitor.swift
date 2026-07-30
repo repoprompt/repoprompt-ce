@@ -182,10 +182,14 @@ final class MCPExternalEventsMonitor: ObservableObject {
     /// Fuzzy match client names - handles cases like "Claude Desktop" (detected) vs "claude-ai" (protocol)
     private func clientNamesMatch(_ detected: String?, _ protocol: String) -> Bool {
         // Exact match
-        if detected == `protocol` { return true }
+        if detected == `protocol` {
+            return true
+        }
 
         // Both empty/nil
-        if (detected == nil || detected?.isEmpty == true) && `protocol`.isEmpty { return true }
+        if (detected == nil || detected?.isEmpty == true) && `protocol`.isEmpty {
+            return true
+        }
 
         guard let detected = detected?.lowercased() else { return false }
         let protocolLower = `protocol`.lowercased()
@@ -229,7 +233,9 @@ final class MCPExternalEventsMonitor: ObservableObject {
 
         // Skip if we've already processed this file
         let filename = latestFile.lastPathComponent
-        if filename == lastSeenFilename { return }
+        if filename == lastSeenFilename {
+            return
+        }
 
         do {
             let event = try loadEvent(from: latestFile)
