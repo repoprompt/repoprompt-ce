@@ -32,6 +32,25 @@ extension OracleViewModel {
         let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
     }
 
+    struct OracleSendLiveCallbacks {
+        var pairSessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)?
+        var laneFinished: (@MainActor @Sendable (OracleLane, OracleLaneOutcome) async -> Void)?
+        var primarySessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)?
+        var primaryProgress: (@MainActor @Sendable (String, String?) -> Void)?
+
+        init(
+            pairSessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)? = nil,
+            laneFinished: (@MainActor @Sendable (OracleLane, OracleLaneOutcome) async -> Void)? = nil,
+            primarySessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)? = nil,
+            primaryProgress: (@MainActor @Sendable (String, String?) -> Void)? = nil
+        ) {
+            self.pairSessionsResolved = pairSessionsResolved
+            self.laneFinished = laneFinished
+            self.primarySessionResolved = primarySessionResolved
+            self.primaryProgress = primaryProgress
+        }
+    }
+
     enum OracleSendPackagingProvenance: Equatable {
         case direct
         case delegated(delegationID: UUID)
@@ -207,7 +226,7 @@ extension OracleViewModel {
             let resolution = if let planningModelRawOverride {
                 PromptViewModel.mcpOraclePlanningModelResolution(
                     rawValue: planningModelRawOverride,
-                    isModelAvailable: { promptVM.mcpOracleIsProviderConfigured(for: $0) }
+                    isModelAvailable: { promptVM.isOracleModelInHydratedCatalog($0) }
                 )
             } else {
                 promptVM.mcpOraclePlanningModelResolution()
@@ -396,7 +415,9 @@ extension OracleViewModel {
                 GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: $0).planningModelRaw
             }
         )
-        return (selection.model, selection.chatPresetID, selection.mcpControlInfo)
+        let model = try OraclePairModelSelectionPolicy(promptVM: promptViewModel)
+            .requireAvailable(selection.model)
+        return (model, selection.chatPresetID, selection.mcpControlInfo)
     }
 
     /// Finds a built-in chat preset for the given mode
@@ -1093,23 +1114,8 @@ extension OracleViewModel {
         workspaceID: UUID?
     ) throws -> AIModel? {
         let profile = GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
-        guard let raw = profile.secondaryOracleModelRaw?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !raw.isEmpty
-        else {
-            return nil
-        }
-        guard let model = AIModel.fromModelName(raw) else {
-            throw ChatToolError.invalidParams(
-                "Secondary Oracle Model '\(raw)' is not a recognized Oracle model ID."
-            )
-        }
-        guard promptVM.mcpOracleIsProviderConfigured(for: model) else {
-            throw ChatToolError.invalidParams(
-                "Secondary Oracle Model '\(model.displayName)' is not available."
-            )
-        }
-        return model
+        return try OraclePairModelSelectionPolicy(promptVM: promptVM)
+            .resolveOptionalSecondary(raw: profile.secondaryOracleModelRaw)
     }
 
     @MainActor
@@ -1549,12 +1555,19 @@ extension OracleViewModel {
     func tool_chatSend(
         args: [String: Value],
         promptVM: PromptViewModel,
-        tabContext: OracleSendTabContext? = nil
+        tabContext: OracleSendTabContext? = nil,
+        liveCallbacks: OracleSendLiveCallbacks = OracleSendLiveCallbacks()
     ) async throws -> [String: Value] {
         let mode = try validatedOracleSendMode(args)
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
         guard let secondaryModel = try configuredSecondaryOracleModel(promptVM: promptVM, workspaceID: workspaceID) else {
-            return try await tool_singleChatSend(args: args, promptVM: promptVM, tabContext: tabContext)
+            return try await tool_singleChatSend(
+                args: args,
+                promptVM: promptVM,
+                tabContext: tabContext,
+                sessionResolved: liveCallbacks.primarySessionResolved,
+                onProgress: liveCallbacks.primaryProgress
+            )
         }
         guard let workspaceID,
               let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID,
@@ -1578,7 +1591,8 @@ extension OracleViewModel {
                     mode: mode,
                     secondaryModel: secondaryModel,
                     workspaceID: workspaceID,
-                    tabID: tabID
+                    tabID: tabID,
+                    liveCallbacks: liveCallbacks
                 )
             }
         } catch OraclePairClaimError.conflict {
@@ -1598,7 +1612,8 @@ extension OracleViewModel {
         mode: String,
         secondaryModel: AIModel,
         workspaceID: UUID,
-        tabID: UUID
+        tabID: UUID,
+        liveCallbacks: OracleSendLiveCallbacks
     ) async throws -> [String: Value] {
         _ = try resolvedOracleMessage(args: args, promptVM: promptVM, tabContext: tabContext)
         let primarySelection = try await selectModel(
@@ -1607,6 +1622,8 @@ extension OracleViewModel {
             allPresets: ModelPresetsManager.shared.allPresets(),
             promptVM: promptVM
         )
+        _ = try OraclePairModelSelectionPolicy(promptVM: promptVM)
+            .requireAvailable(primarySelection.model)
         let shouldActivatePrimary: Bool = if let tabContext {
             promptVM.activeComposeTabID == tabContext.tabID &&
                 !isSessionStreaming(workspaceManager.activeChatSessionID(forTabID: tabContext.tabID))
@@ -1623,6 +1640,7 @@ extension OracleViewModel {
             agentModeSessionID: tabContext?.agentModeSessionID,
             agentModeRunID: tabContext?.agentModeRunID
         )
+        try await liveCallbacks.pairSessionsResolved?(pair.primary.id, pair.secondary.id)
         pinSession(pair.primary.id)
         pinSession(pair.secondary.id)
         defer {
@@ -1634,6 +1652,8 @@ extension OracleViewModel {
         else {
             throw ChatToolError.internalError("Failed to load both Oracle pair transcripts.")
         }
+        setOracleLaneOutcome(nil, for: pair.primary.id)
+        setOracleLaneOutcome(nil, for: pair.secondary.id)
         var primaryArgs = args
         primaryArgs["chat_id"] = .string(pair.primary.shortID)
         primaryArgs["new_chat"] = .bool(false)
@@ -1657,7 +1677,8 @@ extension OracleViewModel {
                         tabContext: tabContext,
                         modelSelectionOverride: primarySelection,
                         activateInUI: shouldActivatePrimary,
-                        completionPolicy: .pairedLane(.primary)
+                        completionPolicy: .pairedLane(.primary),
+                        onProgress: liveCallbacks.primaryProgress
                     )
                     _ = try OraclePairCoordinator.validatedResponse(result["response"]?.stringValue, lane: .primary)
                     return result
@@ -1673,9 +1694,20 @@ extension OracleViewModel {
                     )
                     _ = try OraclePairCoordinator.validatedResponse(result["response"]?.stringValue, lane: .secondary)
                     return result
+                },
+                onLaneFinished: { lane, result in
+                    let sessionID = lane == .primary ? pair.primary.id : pair.secondary.id
+                    let outcome: OracleLaneOutcome = switch result {
+                    case .success: .completed
+                    case let .failure(failure): .failed(failure.message)
+                    }
+                    self.setOracleLaneOutcome(outcome, for: sessionID)
+                    await liveCallbacks.laneFinished?(lane, outcome)
                 }
             )
         } catch is CancellationError {
+            setOracleLaneOutcome(nil, for: pair.primary.id)
+            setOracleLaneOutcome(nil, for: pair.secondary.id)
             _ = try? await persistOraclePairHistories(
                 pairID: pair.pairID,
                 primarySessionID: pair.primary.id,
@@ -1726,7 +1758,9 @@ extension OracleViewModel {
         tabContext: OracleSendTabContext? = nil,
         modelSelectionOverride: ModelSelectionResult? = nil,
         activateInUI: Bool? = nil,
-        completionPolicy: OracleSingleSendCompletionPolicy = .legacy
+        completionPolicy: OracleSingleSendCompletionPolicy = .legacy,
+        sessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)? = nil,
+        onProgress: (@MainActor @Sendable (String, String?) -> Void)? = nil
     ) async throws -> [String: Value] {
         // ────────── 1. Validate & extract parameters ──────────
         let mode = try validatedOracleSendMode(args)
@@ -1749,7 +1783,8 @@ extension OracleViewModel {
                 promptVM: promptVM
             )
         }
-        let selectedModel = modelSelection.model
+        let selectedModel = try OraclePairModelSelectionPolicy(promptVM: promptVM)
+            .requireAvailable(modelSelection.model)
         let mcpControlledModel = modelSelection.mcpControlInfo
         let overrideModelName = selectedModel.displayName
         let overrideChatPresetName: String? = {
@@ -1778,6 +1813,7 @@ extension OracleViewModel {
             agentModeSessionID: tabContext?.agentModeSessionID,
             agentModeRunID: tabContext?.agentModeRunID
         )
+        try await sessionResolved?(chatID)
         pinSession(chatID)
         defer { unpinSession(chatID) }
 
@@ -1811,7 +1847,8 @@ extension OracleViewModel {
                 selectionOverride: selectionOverride,
                 lookupContextOverride: lookupContextOverride,
                 reviewGitContextOverride: reviewGitContextOverride,
-                persistencePolicy: persistencePolicy
+                persistencePolicy: persistencePolicy,
+                onProgress: onProgress
             )
         }
         let dispatch: ChatSendDispatch?
@@ -2266,7 +2303,8 @@ extension OracleViewModel {
                 allPresets: allPresets,
                 promptVM: promptViewModel
             )
-            model = modelSelection.model
+            model = try OraclePairModelSelectionPolicy(promptVM: promptViewModel)
+                .requireAvailable(modelSelection.model)
             chatPresetID = modelSelection.chatPresetID
         }
 

@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import enum MCP.Value
 import SwiftUI
 
 // AgentLogEntry and AgentLogEntryType are defined in Models/Agent/AgentLogModels.swift
@@ -304,9 +305,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         /// Task handle for this tab's background plan generation
         var backgroundPlanTask: Task<Void, Never>?
+        /// Serialized cancellation work that replacements await before starting new Oracle sessions.
+        var backgroundPlanCancellationTask: Task<Void, Never>?
+        /// Monotonic token preventing cancelled or replaced runs from publishing stale state.
+        var backgroundPlanGeneration: UInt64 = 0
 
-        /// Live Oracle chat session used by MCP follow-up streaming.
-        var followUpOracleSessionID: UUID?
+        /// Live Oracle lane sessions used by follow-up streaming.
+        var followUpOracleSessionIDs: Set<UUID> = []
 
         /// Per-tab auto-generate plan setting (loaded from tab config)
         var autoGeneratePlan: Bool = false
@@ -388,7 +393,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpControlToken = nil
             mcpWorkspaceID = nil
             mcpPlanningModelRaw = nil
-            followUpOracleSessionID = nil
+            backgroundPlanCancellationTask = nil
+            backgroundPlanGeneration = 0
+            followUpOracleSessionIDs = []
             pendingAskUser = nil
             askUserContinuation = nil
             pendingAskUserRunID = nil
@@ -453,6 +460,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 _ runID: UUID,
                 _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
             ) async -> Void)?
+            let cancelFollowUpOracleSession: (@MainActor @Sendable (_ sessionID: UUID) async -> Void)?
 
             init(
                 beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
@@ -468,7 +476,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 afterCommittedTabSnapshotCaptured: (@MainActor @Sendable (
                     _ runID: UUID,
                     _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
-                ) async -> Void)? = nil
+                ) async -> Void)? = nil,
+                cancelFollowUpOracleSession: (@MainActor @Sendable (_ sessionID: UUID) async -> Void)? = nil
             ) {
                 self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
                 self.providerEventDisposition = providerEventDisposition
@@ -479,6 +488,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.validateContextBuilderProviders = validateContextBuilderProviders
                 self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
                 self.afterCommittedTabSnapshotCaptured = afterCommittedTabSnapshotCaptured
+                self.cancelFollowUpOracleSession = cancelFollowUpOracleSession
             }
         }
 
@@ -498,6 +508,106 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         func replaceSessionForTesting(tabID: UUID) {
             sessions[tabID] = TabSession(tabID: tabID)
+        }
+
+        struct BackgroundPlanStateSnapshot: Equatable {
+            let generation: UInt64
+            let sessionIDs: Set<UUID>
+            let isGenerating: Bool
+            let response: String?
+            let reasoning: String?
+            let error: String?
+            let chatID: String?
+        }
+
+        @MainActor
+        func beginBackgroundPlanGenerationForTesting(tabID: UUID) -> UInt64 {
+            beginBackgroundPlanGeneration(for: session(for: tabID), using: oracleViewModel).generation
+        }
+
+        @MainActor
+        func publishFollowUpOracleSessionIDsForTesting(
+            _ sessionIDs: Set<UUID>,
+            primarySessionID: UUID,
+            tabID: UUID,
+            generation: UInt64
+        ) throws {
+            try publishFollowUpOracleSessionIDs(
+                sessionIDs,
+                primarySessionID: primarySessionID,
+                for: session(for: tabID),
+                generation: generation
+            )
+        }
+
+        @MainActor
+        func publishPrimaryProgressForTesting(
+            text: String,
+            reasoning: String?,
+            tabID: UUID,
+            generation: UInt64
+        ) {
+            publishPrimaryProgress(
+                text: text,
+                reasoning: reasoning,
+                for: session(for: tabID),
+                generation: generation
+            )
+        }
+
+        @MainActor
+        func publishLaneOutcomeForTesting(
+            lane: OracleLane,
+            outcome: OracleLaneOutcome,
+            tabID: UUID,
+            generation: UInt64
+        ) {
+            publishLaneOutcome(
+                lane: lane,
+                outcome: outcome,
+                for: session(for: tabID),
+                generation: generation
+            )
+        }
+
+        @MainActor
+        func publishFollowUpCompletionForTesting(
+            primaryChatID: String,
+            primaryResponse: String?,
+            failureSummary: String?,
+            tabID: UUID,
+            generation: UInt64
+        ) throws {
+            try publishFollowUpCompletion(
+                primaryChatID: primaryChatID,
+                primaryResponse: primaryResponse,
+                failureSummary: failureSummary,
+                for: session(for: tabID),
+                generation: generation
+            )
+        }
+
+        @MainActor
+        func backgroundPlanStateForTesting(tabID: UUID) -> BackgroundPlanStateSnapshot {
+            let state = session(for: tabID)
+            return BackgroundPlanStateSnapshot(
+                generation: state.backgroundPlanGeneration,
+                sessionIDs: state.followUpOracleSessionIDs,
+                isGenerating: state.isBackgroundPlanGenerating,
+                response: state.backgroundPlanResponseText,
+                reasoning: state.backgroundPlanReasoningText,
+                error: state.backgroundPlanError,
+                chatID: state.generatedPlanChatID
+            )
+        }
+
+        @MainActor
+        func waitForBackgroundPlanCancellationForTesting(tabID: UUID) async {
+            _ = await sessions[tabID]?.backgroundPlanCancellationTask?.value
+        }
+
+        func oraclePairFailureSummaryForTesting(from object: [String: Value]) -> String? {
+            oraclePairFailureSummary(from: object)
         }
 
         func retireStaleRunRecordForTesting(
@@ -734,6 +844,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @Published private(set) var mcpResponseType: String?
     /// Model name that will be used for MCP plan generation - synced from active TabSession
     @Published private(set) var mcpPlanModel: String?
+
+    /// Existing configured Secondary Oracle model used by paired follow-up generation.
+    var secondaryOracleModelRaw: String? {
+        promptManager.secondaryOracleModelRaw
+    }
 
     // MARK: - Clarifying Questions State
 
@@ -1488,16 +1603,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         for session in sessions.values where !session.isMCPControlledRun {
             cancelPendingQuestion(for: session)
+            session.backgroundPlanGeneration &+= 1
             session.backgroundPlanTask?.cancel()
             session.backgroundPlanTask = nil
-            if let oracleVM = oracleViewModel,
-               let followUpSessionID = session.followUpOracleSessionID
-            {
-                Task { @MainActor in
-                    await oracleVM.cancelStreaming(in: followUpSessionID)
-                }
-            }
-            session.followUpOracleSessionID = nil
+            let followUpSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+            _ = scheduleFollowUpOracleCancellation(
+                for: session,
+                sessionIDs: followUpSessionIDs,
+                using: oracleViewModel
+            )
         }
         sessions = sessions.filter(\.value.isMCPControlledRun)
         lastProcessedTabID = nil
@@ -1550,13 +1664,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             // 2. Cancel background plan generation for this tab
             if session.isBackgroundPlanGenerating {
                 debugLog("handleComposeTabsWillClose: cancelling background plan for tab \(tabID)")
+                session.backgroundPlanGeneration &+= 1
                 session.backgroundPlanTask?.cancel()
                 session.backgroundPlanTask = nil
                 session.isBackgroundPlanGenerating = false
-                if let followUpSessionID = session.followUpOracleSessionID {
-                    await oracleViewModel?.cancelStreaming(in: followUpSessionID)
-                }
-                session.followUpOracleSessionID = nil
+                let followUpSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+                _ = await scheduleFollowUpOracleCancellation(
+                    for: session,
+                    sessionIDs: followUpSessionIDs,
+                    using: oracleViewModel
+                )?.value
             }
 
             // 3. Logically cancel every registered run for the tab without waiting for teardown.
@@ -3058,13 +3175,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard let session = sessions[tabID] else { continue }
 
             if session.isBackgroundPlanGenerating {
+                session.backgroundPlanGeneration &+= 1
                 session.backgroundPlanTask?.cancel()
                 session.backgroundPlanTask = nil
                 session.isBackgroundPlanGenerating = false
-                if let followUpSessionID = session.followUpOracleSessionID {
-                    await oracleViewModel?.cancelStreaming(in: followUpSessionID)
-                }
-                session.followUpOracleSessionID = nil
+                let followUpSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+                _ = await scheduleFollowUpOracleCancellation(
+                    for: session,
+                    sessionIDs: followUpSessionIDs,
+                    using: oracleViewModel
+                )?.value
                 updateRuntimeBindings(from: session)
             }
 
@@ -4207,6 +4327,143 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         return (tabName?.isEmpty == false) ? tabName! : defaultName
     }
 
+    @MainActor
+    private func takeFollowUpOracleSessionIDs(from session: TabSession) -> Set<UUID> {
+        let sessionIDs = session.followUpOracleSessionIDs
+        session.followUpOracleSessionIDs = []
+        return sessionIDs
+    }
+
+    @MainActor
+    private func cancelFollowUpOracleSessions(
+        _ sessionIDs: Set<UUID>,
+        using oracleViewModel: OracleViewModel?
+    ) async {
+        for sessionID in sessionIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            #if DEBUG
+                if let cancel = runTestHooks?.cancelFollowUpOracleSession {
+                    await cancel(sessionID)
+                    continue
+                }
+            #endif
+            await oracleViewModel?.cancelStreaming(in: sessionID)
+        }
+    }
+
+    @MainActor
+    private func scheduleFollowUpOracleCancellation(
+        for session: TabSession,
+        sessionIDs: Set<UUID>,
+        using oracleViewModel: OracleViewModel?
+    ) -> Task<Void, Never>? {
+        let previous = session.backgroundPlanCancellationTask
+        guard !sessionIDs.isEmpty else { return previous }
+        let task = Task { @MainActor [weak self] in
+            _ = await previous?.value
+            guard let self else { return }
+            await cancelFollowUpOracleSessions(sessionIDs, using: oracleViewModel)
+        }
+        session.backgroundPlanCancellationTask = task
+        return task
+    }
+
+    @MainActor
+    private func beginBackgroundPlanGeneration(
+        for session: TabSession,
+        using oracleViewModel: OracleViewModel?
+    ) -> (generation: UInt64, cancellationTask: Task<Void, Never>?) {
+        session.backgroundPlanTask?.cancel()
+        let supersededSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+        let cancellationTask = scheduleFollowUpOracleCancellation(
+            for: session,
+            sessionIDs: supersededSessionIDs,
+            using: oracleViewModel
+        )
+        session.backgroundPlanGeneration &+= 1
+        session.generatedPlanChatID = nil
+        session.isBackgroundPlanGenerating = true
+        session.backgroundPlanError = nil
+        session.backgroundPlanResponseText = nil
+        session.backgroundPlanReasoningText = nil
+        clearPendingBackgroundPlanUIRefresh(for: session.tabID)
+        applyPlanPreview(to: session)
+        updateRuntimeBindings(from: session)
+        return (session.backgroundPlanGeneration, cancellationTask)
+    }
+
+    @MainActor
+    private func publishFollowUpOracleSessionIDs(
+        _ sessionIDs: Set<UUID>,
+        primarySessionID: UUID,
+        for session: TabSession,
+        generation: UInt64
+    ) throws {
+        guard session.backgroundPlanGeneration == generation else { throw CancellationError() }
+        session.followUpOracleSessionIDs = sessionIDs
+        session.generatedPlanChatID = primarySessionID.uuidString
+        updateRuntimeBindings(from: session)
+    }
+
+    @MainActor
+    private func publishPrimaryProgress(
+        text: String,
+        reasoning: String?,
+        for session: TabSession,
+        generation: UInt64
+    ) {
+        guard session.backgroundPlanGeneration == generation,
+              session.isBackgroundPlanGenerating else { return }
+        session.backgroundPlanResponseText = text
+        session.backgroundPlanReasoningText = reasoning
+        applyPlanPreview(to: session)
+        requestBackgroundPlanUIRefresh(for: session.tabID)
+    }
+
+    @MainActor
+    private func publishLaneOutcome(
+        lane: OracleLane,
+        outcome: OracleLaneOutcome,
+        for session: TabSession,
+        generation: UInt64
+    ) {
+        guard session.backgroundPlanGeneration == generation,
+              case let .failed(message) = outcome else { return }
+        let label = lane == .primary ? "Primary" : "Secondary"
+        session.backgroundPlanError = "\(label) Oracle failed: \(message)"
+        updateRuntimeBindings(from: session)
+    }
+
+    @MainActor
+    private func publishFollowUpCompletion(
+        primaryChatID: String,
+        primaryResponse: String?,
+        failureSummary: String?,
+        for session: TabSession,
+        generation: UInt64
+    ) throws {
+        guard session.backgroundPlanGeneration == generation else { throw CancellationError() }
+        session.generatedPlanChatID = primaryChatID
+        session.backgroundPlanResponseText = primaryResponse
+        session.backgroundPlanError = failureSummary
+        session.isBackgroundPlanGenerating = false
+        session.followUpOracleSessionIDs = []
+        clearPendingBackgroundPlanUIRefresh(for: session.tabID)
+        applyPlanPreview(to: session)
+        updateRuntimeBindings(from: session)
+    }
+
+    @MainActor
+    private func resetBackgroundPlanPresentation(for session: TabSession) {
+        session.isBackgroundPlanGenerating = false
+        session.backgroundPlanError = nil
+        session.backgroundPlanResponseText = nil
+        session.backgroundPlanReasoningText = nil
+        session.generatedPlanChatID = nil
+        clearPendingBackgroundPlanUIRefresh(for: session.tabID)
+        applyPlanPreview(to: session)
+        updateRuntimeBindings(from: session)
+    }
+
     /// Called when a tab's discovery run completes successfully.
     /// If auto-generate is enabled and the run is not MCP-controlled,
     /// start background plan generation for that tab.
@@ -4273,47 +4530,37 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         chatName: String = "Plan",
         mode: HeadlessMode = .plan
     ) {
-        // Session must exist - caller ensures tab is valid
         let session = session(for: tabID)
-
-        // Cancel any existing background plan task for THIS tab only
-        session.backgroundPlanTask?.cancel()
-
-        session.generatedPlanChatID = nil
-        session.isBackgroundPlanGenerating = true
-        session.backgroundPlanError = nil
-        session.backgroundPlanResponseText = nil
-        session.backgroundPlanReasoningText = nil
-        clearPendingBackgroundPlanUIRefresh(for: tabID)
-        applyPlanPreview(to: session)
-        updateRuntimeBindings(from: session)
+        let start = beginBackgroundPlanGeneration(for: session, using: oracleViewModel)
 
         session.backgroundPlanTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard let session = sessions[tabID] else { return }
+            _ = await start.cancellationTask?.value
+            guard !Task.isCancelled,
+                  let self,
+                  let session = sessions[tabID],
+                  session.backgroundPlanGeneration == start.generation else { return }
 
             do {
-                let reply = try await generatePlanFromDiscovery(
+                _ = try await generatePlanFromDiscovery(
                     tabID: tabID,
                     oracleViewModel: oracleViewModel,
                     chatName: chatName,
-                    mode: mode
+                    mode: mode,
+                    generation: start.generation
                 )
-                // generatedPlanChatID is set inside generatePlanFromDiscovery
-                session.isBackgroundPlanGenerating = false
-                if let response = reply.response, !response.isEmpty {
-                    session.backgroundPlanResponseText = response
-                }
-                clearPendingBackgroundPlanUIRefresh(for: tabID)
-                applyPlanPreview(to: session)
-                updateRuntimeBindings(from: session)
             } catch {
-                // Treat both outer Task cancellation and stream CancellationError as "user cancelled".
-                if Task.isCancelled || (error is CancellationError) {
+                guard session.backgroundPlanGeneration == start.generation else { return }
+                if Task.isCancelled || error is CancellationError {
                     session.backgroundPlanResponseText = nil
                     session.backgroundPlanReasoningText = nil
                     session.backgroundPlanError = nil
                 } else {
+                    let retainedSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+                    _ = scheduleFollowUpOracleCancellation(
+                        for: session,
+                        sessionIDs: retainedSessionIDs,
+                        using: oracleViewModel
+                    )
                     session.backgroundPlanError = error.asFriendlyString()
                 }
                 session.isBackgroundPlanGenerating = false
@@ -4322,8 +4569,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 updateRuntimeBindings(from: session)
             }
 
-            // Clear task reference when this run ends for any reason
-            session.backgroundPlanTask = nil
+            if session.backgroundPlanGeneration == start.generation {
+                session.backgroundPlanTask = nil
+            }
         }
     }
 
@@ -4334,29 +4582,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let targetTabID = tabID ?? currentTabID
         guard let targetTabID, let session = sessions[targetTabID] else { return }
 
-        // 1) Cancel the underlying follow-up stream in OracleViewModel
-        if let oracleVM = oracleViewModel {
-            if let followUpSessionID = session.followUpOracleSessionID {
-                Task { @MainActor in
-                    await oracleVM.cancelStreaming(in: followUpSessionID)
-                }
-            }
-        }
-
-        // 2) Cancel the wrapper task (so outer await stack unwinds)
+        let followUpSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+        _ = scheduleFollowUpOracleCancellation(
+            for: session,
+            sessionIDs: followUpSessionIDs,
+            using: oracleViewModel
+        )
+        session.backgroundPlanGeneration &+= 1
         session.backgroundPlanTask?.cancel()
         session.backgroundPlanTask = nil
-
-        // 3) Reset UI state on the tab
-        session.isBackgroundPlanGenerating = false
-        session.backgroundPlanError = nil
-        session.backgroundPlanResponseText = nil
-        session.backgroundPlanReasoningText = nil
-        session.generatedPlanChatID = nil
-        session.followUpOracleSessionID = nil
-        clearPendingBackgroundPlanUIRefresh(for: targetTabID)
-        applyPlanPreview(to: session)
-        updateRuntimeBindings(from: session)
+        resetBackgroundPlanPresentation(for: session)
     }
 
     /// Clear background plan state for a specific tab (e.g., when starting a new discovery run).
@@ -4462,6 +4697,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         return generatedPlanChatID
     }
 
+    @MainActor
+    func currentBackgroundPlanError(for tabID: UUID?) -> String? {
+        if let id = tabID {
+            return sessions[id]?.backgroundPlanError
+        }
+        return backgroundPlanError
+    }
+
     // MARK: - MCP Plan/Question Generation
 
     private func promptMode(for mode: HeadlessMode) -> PromptViewModel.PlanActMode {
@@ -4510,6 +4753,33 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
     }
 
+    private func oraclePairPrimaryResponse(from object: [String: Value]) -> String? {
+        guard let lanes = object["oracle_results"]?.objectValue,
+              let primary = lanes[OracleLane.primary.rawValue]?.objectValue
+        else {
+            return object["response"]?.stringValue
+        }
+        return primary["response"]?.stringValue
+            ?? primary["partial_response"]?.stringValue
+            ?? object["response"]?.stringValue
+    }
+
+    private func oraclePairFailureSummary(from object: [String: Value]) -> String? {
+        let lanes = object["oracle_results"]?.objectValue ?? [:]
+        let failures = [OracleLane.primary, .secondary].compactMap { lane -> String? in
+            guard let result = lanes[lane.rawValue]?.objectValue,
+                  result["status"]?.stringValue == "failed" else { return nil }
+            let message = result["error"]?.stringValue ?? "Unknown error"
+            let label = lane == .primary ? "Primary" : "Secondary"
+            return "\(label) Oracle failed: \(message)"
+        }
+        var warnings = failures
+        if let persistenceError = object["oracle_pair_history_persistence_error"]?.stringValue {
+            warnings.append("Oracle pair history persistence failed: \(persistenceError)")
+        }
+        return warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+    }
+
     /// Unified follow-up generator that always streams in a real chat session.
     /// Used by both MCP-triggered follow-ups and UI auto-generate follow-ups.
     @MainActor
@@ -4531,21 +4801,130 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         gitScopeOverride: GitInclusion? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
-        activityReporter: ContextBuilderMCPActivityReporter? = nil
+        activityReporter: ContextBuilderMCPActivityReporter? = nil,
+        generation: UInt64
     ) async throws -> ChatSendReply {
         let session = session(for: tabID)
-
-        // Set initial UI state
-        session.generatedPlanChatID = nil
-        session.isBackgroundPlanGenerating = true
-        session.backgroundPlanError = nil
-        session.backgroundPlanResponseText = nil
-        session.backgroundPlanReasoningText = nil
-        session.followUpOracleSessionID = nil
-        updateRuntimeBindings(from: session)
+        guard session.backgroundPlanGeneration == generation,
+              session.isBackgroundPlanGenerating else { throw CancellationError() }
 
         let modeName = mode.mcpModeName
         let promptMode = promptMode(for: mode)
+        let secondaryConfigured = !(promptManager.secondaryOracleModelRaw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+
+        if secondaryConfigured {
+            do {
+                await progressReporter?(.payloadPackaging)
+                let packaging = OracleViewModel.OracleSendPackagingContext(
+                    sourceTabID: tabID,
+                    sourceWorkspaceID: workspaceManager?.activeWorkspaceID,
+                    sourceSelectionRevision: 0,
+                    sourceAgentSessionID: agentModeSessionID,
+                    sourceAgentRunID: agentModeRunID,
+                    promptText: prompt,
+                    selection: selection,
+                    lookupContext: lookupContext,
+                    reviewGitContext: reviewGitContext,
+                    provenance: .direct
+                )
+                var primarySessionID: UUID?
+                let object = try await oracleViewModel.tool_chatSend(
+                    args: [
+                        "message": .string(prompt),
+                        "mode": .string(modeName),
+                        "model": .string(model.rawValue),
+                        "chat_name": .string(chatName),
+                        "new_chat": .bool(true)
+                    ],
+                    promptVM: promptManager,
+                    tabContext: OracleViewModel.OracleSendTabContext(
+                        tabID: tabID,
+                        workspaceID: workspaceManager?.activeWorkspaceID,
+                        origin: .compatibility,
+                        agentModeSessionID: agentModeSessionID,
+                        agentModeRunID: agentModeRunID,
+                        packaging: packaging
+                    ),
+                    liveCallbacks: OracleViewModel.OracleSendLiveCallbacks(
+                        pairSessionsResolved: { [weak self] primary, secondary in
+                            guard let self,
+                                  let session = sessions[tabID] else { throw CancellationError() }
+                            try publishFollowUpOracleSessionIDs(
+                                [primary, secondary],
+                                primarySessionID: primary,
+                                for: session,
+                                generation: generation
+                            )
+                            primarySessionID = primary
+                            await progressReporter?(.sessionCreationAndPersist)
+                            await progressReporter?(.messageSend)
+                            await progressReporter?(.streaming)
+                        },
+                        laneFinished: { [weak self] lane, outcome in
+                            guard let self, let session = sessions[tabID] else { return }
+                            publishLaneOutcome(
+                                lane: lane,
+                                outcome: outcome,
+                                for: session,
+                                generation: generation
+                            )
+                        },
+                        primaryProgress: { [weak self] text, reasoning in
+                            guard let self, let session = sessions[tabID] else { return }
+                            publishPrimaryProgress(
+                                text: text,
+                                reasoning: reasoning,
+                                for: session,
+                                generation: generation
+                            )
+                            onProgress?(text, reasoning)
+                        }
+                    )
+                )
+                guard let primarySessionID else { throw ChatToolError.internalError("Oracle pair did not publish a Primary session") }
+                let primaryChatID = object["primary_chat_id"]?.stringValue
+                    ?? object["chat_id"]?.stringValue
+                    ?? primarySessionID.uuidString
+                let primaryResponse = oraclePairPrimaryResponse(from: object)
+                let failureSummary = oraclePairFailureSummary(from: object)
+                try publishFollowUpCompletion(
+                    primaryChatID: primaryChatID,
+                    primaryResponse: primaryResponse,
+                    failureSummary: failureSummary,
+                    for: session,
+                    generation: generation
+                )
+                workspaceManager?.setActiveChatSessionID(primarySessionID, forTabID: tabID)
+                return ChatSendReply(
+                    chatId: primarySessionID,
+                    shortId: primaryChatID,
+                    mode: modeName,
+                    response: primaryResponse,
+                    errors: failureSummary.map { [$0] }
+                )
+            } catch {
+                guard session.backgroundPlanGeneration == generation else { throw error }
+                let retainedSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+                _ = scheduleFollowUpOracleCancellation(
+                    for: session,
+                    sessionIDs: retainedSessionIDs,
+                    using: oracleViewModel
+                )
+                session.isBackgroundPlanGenerating = false
+                session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
+                if error is CancellationError {
+                    session.backgroundPlanResponseText = nil
+                    session.backgroundPlanReasoningText = nil
+                    session.generatedPlanChatID = nil
+                }
+                clearPendingBackgroundPlanUIRefresh(for: tabID)
+                applyPlanPreview(to: session)
+                updateRuntimeBindings(from: session)
+                throw error
+            }
+        }
 
         let isFocusedTab = (promptManager.activeComposeTabID == tabID)
         let activeSessionID = oracleViewModel.workspaceManager.activeChatSessionID(forTabID: tabID) ?? oracleViewModel.currentSessionID
@@ -4555,7 +4934,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         var createdSessionID: UUID?
         do {
             try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
+            guard session.backgroundPlanGeneration == generation,
+                  session.isBackgroundPlanGenerating
+            else {
                 throw CancellationError()
             }
 
@@ -4575,7 +4956,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
 
             try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
+            guard session.backgroundPlanGeneration == generation,
+                  session.isBackgroundPlanGenerating
+            else {
                 throw CancellationError()
             }
 
@@ -4591,12 +4974,17 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             createdSessionID = createdSession.id
             oracleViewModel.pinSession(createdSession.id)
             defer { oracleViewModel.unpinSession(createdSession.id) }
-            session.followUpOracleSessionID = createdSession.id
-            session.generatedPlanChatID = createdSession.shortID
-            updateRuntimeBindings(from: session)
+            try publishFollowUpOracleSessionIDs(
+                [createdSession.id],
+                primarySessionID: createdSession.id,
+                for: session,
+                generation: generation
+            )
 
             try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
+            guard session.backgroundPlanGeneration == generation,
+                  session.isBackgroundPlanGenerating
+            else {
                 throw CancellationError()
             }
 
@@ -4607,7 +4995,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
 
             try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
+            guard session.backgroundPlanGeneration == generation,
+                  session.isBackgroundPlanGenerating
+            else {
                 throw CancellationError()
             }
 
@@ -4624,17 +5014,20 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 overrideAIMessage: aiMessage,
                 onProgress: { [weak self] text, reasoning in
                     guard let self,
-                          let session = sessions[tabID],
-                          session.isBackgroundPlanGenerating else { return }
-                    session.backgroundPlanResponseText = text
-                    session.backgroundPlanReasoningText = reasoning
-                    applyPlanPreview(to: session)
-                    requestBackgroundPlanUIRefresh(for: tabID)
+                          let session = sessions[tabID] else { return }
+                    publishPrimaryProgress(
+                        text: text,
+                        reasoning: reasoning,
+                        for: session,
+                        generation: generation
+                    )
                     onProgress?(text, reasoning)
                 }
             )
 
-            guard session.isBackgroundPlanGenerating else {
+            guard session.backgroundPlanGeneration == generation,
+                  session.isBackgroundPlanGenerating
+            else {
                 throw CancellationError()
             }
             await progressReporter?(.activeQueryAcquisition)
@@ -4649,7 +5042,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 progressReporter: progressReporter,
                 activityReporter: activityReporter
             )
-            guard session.isBackgroundPlanGenerating else {
+            guard session.backgroundPlanGeneration == generation,
+                  session.isBackgroundPlanGenerating
+            else {
                 throw CancellationError()
             }
 
@@ -4663,22 +5058,25 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 errors: nil
             )
 
-            session.isBackgroundPlanGenerating = false
-            session.followUpOracleSessionID = nil
-            session.generatedPlanChatID = reply.shortId
-            if let response = reply.response, !response.isEmpty {
-                session.backgroundPlanResponseText = response
-            }
-            clearPendingBackgroundPlanUIRefresh(for: tabID)
-            applyPlanPreview(to: session)
-            updateRuntimeBindings(from: session)
+            try publishFollowUpCompletion(
+                primaryChatID: reply.shortId,
+                primaryResponse: reply.response,
+                failureSummary: nil,
+                for: session,
+                generation: generation
+            )
             workspaceManager?.setActiveChatSessionID(reply.chatId, forTabID: tabID)
 
             return reply
         } catch {
-            if let createdSessionID {
-                await oracleViewModel.cancelStreaming(in: createdSessionID)
-            }
+            guard session.backgroundPlanGeneration == generation else { throw error }
+            let retainedSessionIDs = takeFollowUpOracleSessionIDs(from: session)
+            let cancellationIDs = createdSessionID.map { retainedSessionIDs.union([$0]) } ?? retainedSessionIDs
+            _ = scheduleFollowUpOracleCancellation(
+                for: session,
+                sessionIDs: cancellationIDs,
+                using: oracleViewModel
+            )
 
             if error is CancellationError {
                 session.backgroundPlanResponseText = nil
@@ -4689,7 +5087,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 session.backgroundPlanError = error.asFriendlyString()
             }
             session.isBackgroundPlanGenerating = false
-            session.followUpOracleSessionID = nil
             clearPendingBackgroundPlanUIRefresh(for: tabID)
             applyPlanPreview(to: session)
             updateRuntimeBindings(from: session)
@@ -4731,6 +5128,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
         #endif
 
+        let state = session(for: tabID)
+        let start = beginBackgroundPlanGeneration(for: state, using: oracleViewModel)
+        _ = await start.cancellationTask?.value
+        try Task.checkCancellation()
+        guard state.backgroundPlanGeneration == start.generation else { throw CancellationError() }
+
         let modeName = mode.mcpModeName
         await progressReporter?(.modelResolution)
         let modelSelection: (
@@ -4738,23 +5141,34 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             chatPresetID: UUID?,
             mcpControlInfo: String?
         )
-        #if DEBUG
-            if let resolver = runTestHooks?.resolveMCPFollowUpModel {
-                modelSelection = try await resolver(modeName)
-            } else {
+        do {
+            #if DEBUG
+                if let resolver = runTestHooks?.resolveMCPFollowUpModel {
+                    modelSelection = try await resolver(modeName)
+                } else {
+                    modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
+                        mode: modeName,
+                        workspaceID: identity.workspaceID,
+                        planningModelRawOverride: sessions[tabID]?.mcpPlanningModelRaw
+                    )
+                }
+            #else
                 modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
                     mode: modeName,
                     workspaceID: identity.workspaceID,
                     planningModelRawOverride: sessions[tabID]?.mcpPlanningModelRaw
                 )
-            }
-        #else
-            modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
-                mode: modeName,
-                workspaceID: identity.workspaceID,
-                planningModelRawOverride: sessions[tabID]?.mcpPlanningModelRaw
-            )
-        #endif
+            #endif
+        } catch {
+            guard state.backgroundPlanGeneration == start.generation else { throw error }
+            state.isBackgroundPlanGenerating = false
+            state.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
+            updateRuntimeBindings(from: state)
+            throw error
+        }
+        try Task.checkCancellation()
+        guard state.backgroundPlanGeneration == start.generation else { throw CancellationError() }
+
         let mcpSessionUIState: OracleViewModel.MCPSessionUIState? = {
             guard let mcpModelInfo = modelSelection.mcpControlInfo else { return nil }
             let overrideChatPresetName = modelSelection.chatPresetID
@@ -4767,12 +5181,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }()
 
         if workspaceManager?.activeWorkspaceID != identity.workspaceID {
-            let session = session(for: tabID)
-            session.isBackgroundPlanGenerating = true
-            session.backgroundPlanError = nil
-            session.backgroundPlanResponseText = nil
-            session.backgroundPlanReasoningText = nil
-            updateRuntimeBindings(from: session)
             do {
                 let reply = try await oracleViewModel.runHeadless(
                     prompt: prompt,
@@ -4790,23 +5198,37 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     agentModeSessionID: agentModeSessionID,
                     agentModeRunID: agentModeRunID,
                     onProgress: { [weak self] text, reasoning in
-                        guard let self, let session = sessions[tabID], session.isBackgroundPlanGenerating else { return }
-                        session.backgroundPlanResponseText = text
-                        session.backgroundPlanReasoningText = reasoning
+                        guard let self, let session = sessions[tabID] else { return }
+                        publishPrimaryProgress(
+                            text: text,
+                            reasoning: reasoning,
+                            for: session,
+                            generation: start.generation
+                        )
                     }
                 )
-                session.isBackgroundPlanGenerating = false
-                session.generatedPlanChatID = reply.shortId
-                session.backgroundPlanResponseText = reply.response
+                try publishFollowUpCompletion(
+                    primaryChatID: reply.shortId,
+                    primaryResponse: reply.response,
+                    failureSummary: nil,
+                    for: state,
+                    generation: start.generation
+                )
                 workspaceManager?.setActiveChatSessionID(reply.chatId, for: identity)
-                updateRuntimeBindings(from: session)
                 return reply
             } catch {
-                session.isBackgroundPlanGenerating = false
-                session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
-                session.backgroundPlanResponseText = nil
-                session.backgroundPlanReasoningText = nil
-                updateRuntimeBindings(from: session)
+                guard state.backgroundPlanGeneration == start.generation else { throw error }
+                let retainedSessionIDs = takeFollowUpOracleSessionIDs(from: state)
+                _ = scheduleFollowUpOracleCancellation(
+                    for: state,
+                    sessionIDs: retainedSessionIDs,
+                    using: oracleViewModel
+                )
+                state.isBackgroundPlanGenerating = false
+                state.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
+                state.backgroundPlanResponseText = nil
+                state.backgroundPlanReasoningText = nil
+                updateRuntimeBindings(from: state)
                 throw error
             }
         }
@@ -4828,7 +5250,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpSessionUIState: mcpSessionUIState,
             gitScopeOverride: gitScopeOverride,
             progressReporter: progressReporter,
-            activityReporter: activityReporter
+            activityReporter: activityReporter,
+            generation: start.generation
         )
     }
 
@@ -4935,6 +5358,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         oracleViewModel: OracleViewModel,
         chatName: String? = nil,
         mode: HeadlessMode = .plan,
+        generation: UInt64,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws -> ChatSendReply {
         // Get the tab's current state after Context Builder completed
@@ -4974,7 +5398,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             chatName: chatName ?? defaultChatName,
             model: promptManager.preferredAIModel,
             chatPresetID: nil,
-            onProgress: onProgress
+            onProgress: onProgress,
+            generation: generation
         )
     }
 

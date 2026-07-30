@@ -56,7 +56,8 @@ struct AgentModelsSettingsView: View {
             apiSettingsVM: apiSettingsVM,
             workspaceID: workspaceID,
             workspaceName: workspaceName,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            oracleModelAvailability: promptVM.isOracleModelInHydratedCatalog
         ))
     }
 
@@ -416,6 +417,12 @@ struct AgentModelsSettingsView: View {
             Text("Using: \(viewModel.currentSecondaryOracleModelName)")
                 .font(.caption)
                 .foregroundColor(.secondary)
+
+            if let validationError = viewModel.oracleModelValidationError {
+                Text(validationError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
         }
     }
 

@@ -22,6 +22,11 @@ struct OracleLaneFailure: Equatable {
     }
 }
 
+enum OracleLaneOutcome: Equatable {
+    case completed
+    case failed(String)
+}
+
 struct OracleLaneExecutionError: LocalizedError {
     let message: String
     let partialResponse: String?
@@ -99,6 +104,7 @@ enum OraclePairCoordinator {
     }
 
     typealias Operation<Success: Sendable> = @MainActor @Sendable () async throws -> Success
+    typealias Completion<Success: Sendable> = @MainActor @Sendable (OracleLane, LaneExecution<Success>) async -> Void
 
     static func validatedResponse(_ response: String?, lane: OracleLane) throws -> String {
         guard let response, !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -114,7 +120,8 @@ enum OraclePairCoordinator {
     @MainActor
     static func run<Success: Sendable>(
         primary: @escaping Operation<Success>,
-        secondary: @escaping Operation<Success>
+        secondary: @escaping Operation<Success>,
+        onLaneFinished: Completion<Success>? = nil
     ) async throws -> Result<Success> {
         try await withThrowingTaskGroup(
             of: (OracleLane, LaneExecution<Success>).self,
@@ -127,6 +134,7 @@ enum OraclePairCoordinator {
             var secondaryResult: LaneExecution<Success>?
             do {
                 for try await (lane, result) in group {
+                    await onLaneFinished?(lane, result)
                     switch lane {
                     case .primary: primaryResult = result
                     case .secondary: secondaryResult = result

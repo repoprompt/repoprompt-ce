@@ -32,6 +32,11 @@ struct ContextBuilderCallCard: View {
         return false
     }
 
+    private var planError: String? {
+        guard case let .error(message) = planStatusForTab else { return nil }
+        return message
+    }
+
     private var phase: ContextBuilderCardPhase {
         if isActiveCallCard, isRunningForTab {
             return .running
@@ -43,11 +48,14 @@ struct ContextBuilderCallCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
+        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, phase: phase)
     }
 
     private var summary: String {
-        contextBuilderCardSubtitle(
+        if phase == .completed, planError != nil {
+            return "completed with errors"
+        }
+        return contextBuilderCardSubtitle(
             contextBuilderAgentVM: contextBuilderAgentVM,
             fallbackStatus: nil,
             phase: phase
@@ -59,7 +67,7 @@ struct ContextBuilderCallCard: View {
         case .running, .generatingPlan:
             .running
         case .completed:
-            .success
+            planError == nil ? .success : .warning
         }
     }
 
@@ -116,25 +124,30 @@ struct ContextBuilderCallCard: View {
                     }
                 )
             case .completed:
-                Text("Context builder run completed.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                if let planError {
+                    Label(planError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                } else {
+                    Text("Context builder run completed.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .onAppear {
             performAgentToolCardExpansionStateUpdateWithoutAnimation {
-                isExpanded = phase == .running || phase == .generatingPlan
+                isExpanded = phase == .running || phase == .generatingPlan || planError != nil
             }
         }
         .onChange(of: phase) { _, newPhase in
-            switch newPhase {
-            case .running, .generatingPlan:
-                performAgentToolCardExpansionStateUpdateWithoutAnimation {
+            performAgentToolCardExpansionStateUpdateWithoutAnimation {
+                switch newPhase {
+                case .running, .generatingPlan:
                     isExpanded = true
-                }
-            case .completed:
-                performAgentToolCardExpansionStateUpdateWithoutAnimation {
-                    isExpanded = false
+                case .completed:
+                    isExpanded = planError != nil
                 }
             }
         }
@@ -188,32 +201,26 @@ struct ContextBuilderResultCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
+        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, phase: phase)
     }
 
     private var summary: String {
+        let resultStatus = contextBuilderResultStatus(for: dto)
         if isActiveResultCard {
             return contextBuilderCardSubtitle(
                 contextBuilderAgentVM: contextBuilderAgentVM,
-                fallbackStatus: dto?.status,
+                fallbackStatus: resultStatus,
                 phase: phase
             )
         }
-        return contextBuilderFinalStatusLabel(dto?.status)
+        return contextBuilderFinalStatusLabel(resultStatus)
     }
 
     private var status: ToolCardStatus {
         if phase == .running || phase == .generatingPlan { return .running }
         if item.toolIsError == true { return .failure }
-        if let dto {
-            switch dto.status?.lowercased() {
-            case "error": return .failure
-            case "partial", "warning": return .warning
-            case "running", "in_progress", "pending":
-                return .success
-            case "success", "completed": return .success
-            default: break
-            }
+        if let status = contextBuilderAggregateCardStatus(contextBuilderResultStatus(for: dto)) {
+            return status
         }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }
@@ -414,6 +421,10 @@ private struct ContextBuilderPlanProgressView: View {
         contextBuilderAgentVM.currentFollowUpOracleChatID(for: tabID)
     }
 
+    private var laneError: String? {
+        contextBuilderAgentVM.currentBackgroundPlanError(for: tabID)
+    }
+
     private func openOraclePreview() {
         guard let userInfo = contextBuilderOraclePopoverUserInfo(
             openContext: oracleOpenContext,
@@ -439,6 +450,13 @@ private struct ContextBuilderPlanProgressView: View {
                 }
 
                 Spacer()
+            }
+
+            if let laneError {
+                Label(laneError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
             }
 
             HStack(spacing: 8) {
@@ -472,7 +490,11 @@ private struct ContextBuilderCompletedSummaryView: View {
     let oracleOpenContext: AgentOracleOpenContext?
 
     private var followUpChatID: String? {
-        contextBuilderFollowUpChatID(for: dto)
+        contextBuilderFollowUpChatID(for: dto) ?? nonEmptyContextBuilderValue(oracleOpenContext?.chatID)
+    }
+
+    private var laneSummaries: [ContextBuilderOracleLaneSummary] {
+        contextBuilderOracleLaneSummaries(for: dto)
     }
 
     private var detailParts: [String] {
@@ -496,17 +518,18 @@ private struct ContextBuilderCompletedSummaryView: View {
         return selection
     }
 
-    private func openOraclePreview() {
+    private func openOraclePreview(chatID: String?, allowOpenContextFallback: Bool = true) {
         guard let userInfo = contextBuilderOraclePopoverUserInfo(
             openContext: oracleOpenContext,
-            chatID: followUpChatID
+            chatID: chatID,
+            allowOpenContextFallback: allowOpenContextFallback
         ) else { return }
         NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Context builder run completed.")
+            Text("Context builder run \(contextBuilderFinalStatusLabel(contextBuilderResultStatus(for: dto))).")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 
@@ -523,19 +546,59 @@ private struct ContextBuilderCompletedSummaryView: View {
                     .lineLimit(3)
             }
 
-            if let followUpChatID, !followUpChatID.isEmpty {
-                Text("Oracle chat: \(followUpChatID)")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
+            if laneSummaries.isEmpty {
+                if let followUpChatID, !followUpChatID.isEmpty {
+                    Text("Oracle chat: \(followUpChatID)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
 
-            Button("Open Oracle", action: openOraclePreview)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(contextBuilderOraclePopoverUserInfo(
-                    openContext: oracleOpenContext,
-                    chatID: followUpChatID
-                ) == nil)
+                Button("Open Oracle") { openOraclePreview(chatID: followUpChatID) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(contextBuilderOraclePopoverUserInfo(
+                        openContext: oracleOpenContext,
+                        chatID: followUpChatID
+                    ) == nil)
+            } else {
+                ForEach(laneSummaries, id: \.label) { lane in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(lane.label)
+                                .font(.system(size: 10, weight: .semibold))
+                            if let modelDisplayName = lane.modelDisplayName {
+                                Text(modelDisplayName)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                            }
+                            StatusBadge(text: lane.statusLabel, status: lane.cardStatus)
+                            Spacer()
+                            Button("Open \(lane.shortLabel)") {
+                                openOraclePreview(chatID: lane.chatID, allowOpenContextFallback: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(contextBuilderOraclePopoverUserInfo(
+                                openContext: oracleOpenContext,
+                                chatID: lane.chatID,
+                                allowOpenContextFallback: false
+                            ) == nil)
+                        }
+                        if let chatID = lane.chatID {
+                            Text(chatID)
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        if let error = lane.error {
+                            Text(error)
+                                .font(.system(size: 9))
+                                .foregroundStyle(.red)
+                                .lineLimit(2)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -546,25 +609,103 @@ private enum ContextBuilderCardPhase {
     case completed
 }
 
+struct ContextBuilderOracleLaneSummary: Equatable {
+    let lane: OracleLane
+    let status: String
+    let chatID: String?
+    let error: String?
+    let modelDisplayName: String?
+
+    var label: String {
+        lane == .primary ? "Primary Oracle" : "Secondary Oracle"
+    }
+
+    var shortLabel: String {
+        lane == .primary ? "Primary" : "Secondary"
+    }
+
+    var statusLabel: String {
+        status.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    var cardStatus: ToolCardStatus {
+        switch status.lowercased() {
+        case "completed", "success": .success
+        case "partial", "partial_failure", "warning": .warning
+        case "failed", "error": .failure
+        default: .neutral
+        }
+    }
+}
+
+func contextBuilderOracleLaneSummaries(
+    for dto: ToolResultDTOs.ContextBuilderDTO?
+) -> [ContextBuilderOracleLaneSummary] {
+    guard let dto else { return [] }
+    let responseType = dto.responseType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let chat = responseType == "review" ? (dto.review ?? dto.plan) : (dto.plan ?? dto.review)
+    guard let results = chat?.oracleResults else { return [] }
+    return [OracleLane.primary, .secondary].compactMap { lane in
+        guard let result = results[lane.rawValue] else { return nil }
+        return ContextBuilderOracleLaneSummary(
+            lane: lane,
+            status: nonEmptyContextBuilderValue(result.status) ?? "unknown",
+            chatID: nonEmptyContextBuilderValue(result.chatID),
+            error: nonEmptyContextBuilderValue(result.error),
+            modelDisplayName: nonEmptyContextBuilderValue(result.modelDisplayName)
+        )
+    }
+}
+
+func contextBuilderResultStatus(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
+    guard let dto else { return nil }
+    let responseType = dto.responseType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let followUp = responseType == "review" ? (dto.review ?? dto.plan) : (dto.plan ?? dto.review)
+    return nonEmptyContextBuilderValue(dto.overallStatus)
+        ?? nonEmptyContextBuilderValue(dto.oracleStatus)
+        ?? nonEmptyContextBuilderValue(followUp?.status)
+        ?? nonEmptyContextBuilderValue(dto.status)
+}
+
+func contextBuilderAggregateCardStatus(_ raw: String?) -> ToolCardStatus? {
+    guard let status = nonEmptyContextBuilderValue(raw)?.lowercased() else { return nil }
+    if status.hasPrefix("failed") { return .failure }
+    switch status {
+    case "error": return .failure
+    case "partial", "partial_failure", "warning": return .warning
+    case "running", "in_progress", "pending", "success", "completed": return .success
+    default: return nil
+    }
+}
+
 func contextBuilderOraclePopoverUserInfo(
     openContext: AgentOracleOpenContext?,
-    chatID: String?
+    chatID: String?,
+    allowOpenContextFallback: Bool = true
 ) -> [AnyHashable: Any]? {
-    AgentOracleToolRouting.operationPopoverUserInfo(
+    let resolvedChatID = nonEmptyContextBuilderValue(chatID)
+        ?? (allowOpenContextFallback ? nonEmptyContextBuilderValue(openContext?.chatID) : nil)
+    return AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
-        chatID: chatID
+        chatID: resolvedChatID
     )
 }
 
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
-    guard let dto,
-          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
-    else { return nil }
-    switch branch {
-    case .review:
-        return nonEmptyContextBuilderValue(dto.review?.chatID)
-    case .plan:
-        return nonEmptyContextBuilderValue(dto.plan?.chatID)
+    guard let dto else { return nil }
+    let planChatID = nonEmptyContextBuilderValue(dto.plan?.chatID)
+    let reviewChatID = nonEmptyContextBuilderValue(dto.review?.chatID)
+    let responseType = dto.responseType?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+
+    switch responseType {
+    case "review":
+        return reviewChatID ?? planChatID
+    case "plan", "question":
+        return planChatID ?? reviewChatID
+    default:
+        return planChatID ?? reviewChatID
     }
 }
 
@@ -595,16 +736,36 @@ private func cancelContextBuilderRun(
 }
 
 @MainActor
-private func contextBuilderCardDetailLine(contextBuilderAgentVM: ContextBuilderAgentViewModel) -> String? {
+private func contextBuilderCardDetailLine(
+    contextBuilderAgentVM: ContextBuilderAgentViewModel,
+    phase: ContextBuilderCardPhase
+) -> String? {
     var detail = "Context Builder: \(contextBuilderAgentVM.runModelDisplayName)"
     if let followUpType = nonEmptyContextBuilderValue(contextBuilderAgentVM.mcpResponseType) {
-        if let followUpModel = nonEmptyContextBuilderValue(contextBuilderAgentVM.mcpPlanModel) {
-            detail += " → \(followUpType): \(followUpModel)"
+        if let followUpModels = contextBuilderFollowUpModelDetail(
+            primaryDisplayName: contextBuilderAgentVM.mcpPlanModel,
+            secondaryRawModel: contextBuilderAgentVM.secondaryOracleModelRaw,
+            pairedGenerationActive: phase == .generatingPlan
+        ) {
+            detail += " → \(followUpType): \(followUpModels)"
         } else {
             detail += " → \(followUpType)"
         }
     }
     return detail
+}
+
+func contextBuilderFollowUpModelDetail(
+    primaryDisplayName: String?,
+    secondaryRawModel: String?,
+    pairedGenerationActive: Bool
+) -> String? {
+    guard let primary = nonEmptyContextBuilderValue(primaryDisplayName) else { return nil }
+    guard pairedGenerationActive,
+          let secondaryRaw = nonEmptyContextBuilderValue(secondaryRawModel)
+    else { return primary }
+    let secondary = AIModel.fromModelName(secondaryRaw)?.displayName ?? secondaryRaw
+    return "Primary: \(primary) • Secondary: \(secondary)"
 }
 
 @MainActor

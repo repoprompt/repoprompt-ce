@@ -2395,12 +2395,16 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         let apiSettings = makeAPISettingsViewModel()
         apiSettings.isOpenAIKeyValid = true
+        let availableOracleModels = [AIModel.codexCliGpt56SolHigh, AIModel.gpt54Pro]
         let viewModel = AgentModelsSettingsViewModel(
             apiSettingsVM: apiSettings,
             workspaceID: workspaceID,
             workspaceName: "Scoped test",
             settingsManager: manager,
-            settingsStore: engineStore
+            settingsStore: engineStore,
+            oracleModelAvailability: { model in
+                OraclePairModelSelectionPolicy.isExactCatalogMatch(model, in: availableOracleModels)
+            }
         )
 
         XCTAssertTrue(viewModel.isEditingWorkspaceSettings)
@@ -2422,6 +2426,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             "Scoped writes must route through the injected SettingsManaging boundary, not the engine/global store."
         )
         XCTAssertEqual(managerStore.globalAgentModelsProfile(), globalProfile)
+
+        viewModel.setSecondaryOracleModel(raw: AIModel.claude4Sonnet.rawValue)
+        XCTAssertNil(managerStore.workspaceAgentModelsProfile(for: workspaceID)?.secondaryOracleModelRaw)
+        XCTAssertNotNil(viewModel.oracleModelValidationError)
 
         viewModel.applyOracleRecommendation()
 

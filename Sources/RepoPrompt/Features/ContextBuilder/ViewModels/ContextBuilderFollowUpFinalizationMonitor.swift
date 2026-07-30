@@ -7,7 +7,7 @@ struct ContextBuilderFollowUpFinalizationConfiguration: Equatable {
 
     static let production = ContextBuilderFollowUpFinalizationConfiguration(
         overallTimeout: 4 * 60 * 60,
-        inactivityTimeout: 10 * 60,
+        inactivityTimeout: .infinity,
         checkInterval: 5
     )
 }

@@ -107,6 +107,18 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
 
     func testStrictOraclePlanningResolutionReturnsConfiguredModelOnlyWhenRawParsesAndIsAvailable() {
         let configuredModel = AIModel.codexCustom(name: "gpt-5.5-low")
+        XCTAssertTrue(
+            OraclePairModelSelectionPolicy.isExactCatalogMatch(
+                configuredModel,
+                in: [configuredModel]
+            )
+        )
+        XCTAssertFalse(
+            OraclePairModelSelectionPolicy.isExactCatalogMatch(
+                configuredModel,
+                in: [AIModel.codexCustom(name: "gpt-5.6")]
+            )
+        )
         let resolved = PromptViewModel.mcpOraclePlanningModelResolution(
             rawValue: "  \(configuredModel.rawValue)  ",
             isModelAvailable: { model in model == configuredModel }

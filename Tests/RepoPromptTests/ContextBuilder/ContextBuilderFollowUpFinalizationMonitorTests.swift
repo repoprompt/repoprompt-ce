@@ -4,6 +4,18 @@ import XCTest
 
 final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
     func testInjectedClockResetsInactivityOnlyForMeaningfulActivity() async {
+        let productionState = ContextBuilderFollowUpFinalizationState(startedAt: 0)
+        let formerInactivityDeadline = await productionState.timeoutSnapshot(
+            at: 10 * 60,
+            configuration: .production
+        )
+        XCTAssertNil(formerInactivityDeadline)
+        let overallDeadline = await productionState.timeoutSnapshot(
+            at: 4 * 60 * 60,
+            configuration: .production
+        )
+        XCTAssertEqual(overallDeadline?.kind, .overall)
+
         let configuration = ContextBuilderFollowUpFinalizationConfiguration(
             overallTimeout: 100,
             inactivityTimeout: 10,

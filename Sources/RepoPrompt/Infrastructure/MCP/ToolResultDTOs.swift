@@ -1081,6 +1081,30 @@ enum ToolResultDTOs {
 
     // MARK: - Chat Send
 
+    struct OracleLaneDTO: Codable, Equatable {
+        let status: String?
+        let chatID: String?
+        let mode: String?
+        let response: String?
+        let partialResponse: String?
+        let error: String?
+        let errors: [String]?
+        let modelRawID: String?
+        let modelDisplayName: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case status
+            case chatID = "chat_id"
+            case mode
+            case response
+            case partialResponse = "partial_response"
+            case error
+            case errors
+            case modelRawID = "model_raw_id"
+            case modelDisplayName = "model_display_name"
+        }
+    }
+
     struct ChatSendDTO: Codable, Equatable {
         struct Diff: Codable, Equatable {
             let path: String
@@ -1089,31 +1113,46 @@ enum ToolResultDTOs {
 
         let chatID: String?
         let mode: String?
+        let status: String?
         let response: String?
         let diffs: [Diff]?
         let errors: [String]?
+        let oracleResults: [String: OracleLaneDTO]?
 
         private enum CodingKeys: String, CodingKey {
             case chatID = "chat_id"
             case mode
+            case status
             case response
             case diffs
             case patches
             case errors
+            case oracleResults = "oracle_results"
         }
 
-        init(chatID: String?, mode: String?, response: String?, diffs: [Diff]?, errors: [String]?) {
+        init(
+            chatID: String?,
+            mode: String?,
+            response: String?,
+            diffs: [Diff]?,
+            errors: [String]?,
+            oracleResults: [String: OracleLaneDTO]? = nil,
+            status: String? = nil
+        ) {
             self.chatID = chatID
             self.mode = mode
+            self.status = status
             self.response = response
             self.diffs = diffs
             self.errors = errors
+            self.oracleResults = oracleResults
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             chatID = try container.decodeIfPresent(String.self, forKey: .chatID)
             mode = try container.decodeIfPresent(String.self, forKey: .mode)
+            status = try container.decodeIfPresent(String.self, forKey: .status)
             response = try container.decodeIfPresent(String.self, forKey: .response)
             if let decodedDiffs = try container.decodeIfPresent([Diff].self, forKey: .diffs) {
                 diffs = decodedDiffs
@@ -1121,15 +1160,18 @@ enum ToolResultDTOs {
                 diffs = try container.decodeIfPresent([Diff].self, forKey: .patches)
             }
             errors = try container.decodeIfPresent([String].self, forKey: .errors)
+            oracleResults = try container.decodeIfPresent([String: OracleLaneDTO].self, forKey: .oracleResults)
         }
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encodeIfPresent(chatID, forKey: .chatID)
             try container.encodeIfPresent(mode, forKey: .mode)
+            try container.encodeIfPresent(status, forKey: .status)
             try container.encodeIfPresent(response, forKey: .response)
             try container.encodeIfPresent(diffs, forKey: .diffs)
             try container.encodeIfPresent(errors, forKey: .errors)
+            try container.encodeIfPresent(oracleResults, forKey: .oracleResults)
         }
     }
 
@@ -1138,6 +1180,10 @@ enum ToolResultDTOs {
     struct ContextBuilderDTO: Codable, Equatable {
         let tabID: String?
         let status: String?
+        let discoveryStatus: String?
+        let discoveryError: String?
+        let oracleStatus: String?
+        let overallStatus: String?
         let prompt: String?
         let fileCount: Int?
         let totalTokens: Int?
@@ -1152,6 +1198,10 @@ enum ToolResultDTOs {
         private enum CodingKeys: String, CodingKey {
             case tabID = "context_id"
             case status
+            case discoveryStatus = "discovery_status"
+            case discoveryError = "discovery_error"
+            case oracleStatus = "oracle_status"
+            case overallStatus = "overall_status"
             case prompt
             case fileCount = "file_count"
             case totalTokens = "total_tokens"
@@ -1175,6 +1225,10 @@ enum ToolResultDTOs {
             tabID = try container.decodeIfPresent(String.self, forKey: .tabID)
                 ?? legacyContainer.decodeIfPresent(String.self, forKey: .tabID)
             status = try container.decodeIfPresent(String.self, forKey: .status)
+            discoveryStatus = try container.decodeIfPresent(String.self, forKey: .discoveryStatus)
+            discoveryError = try container.decodeIfPresent(String.self, forKey: .discoveryError)
+            oracleStatus = try container.decodeIfPresent(String.self, forKey: .oracleStatus)
+            overallStatus = try container.decodeIfPresent(String.self, forKey: .overallStatus)
             prompt = try container.decodeIfPresent(String.self, forKey: .prompt)
             fileCount = try container.decodeIfPresent(Int.self, forKey: .fileCount)
             totalTokens = try container.decodeIfPresent(Int.self, forKey: .totalTokens)

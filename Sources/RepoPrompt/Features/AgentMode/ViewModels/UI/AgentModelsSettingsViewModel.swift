@@ -29,6 +29,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     private let settingsManager: any SettingsManaging
     private let notificationCenter: NotificationCenter
     private let engine: AutoRecommendationEngine
+    private let oracleModelAvailability: @MainActor @Sendable (AIModel) -> Bool
 
     // MARK: - Published state
 
@@ -38,18 +39,30 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     @Published private(set) var profileSnapshot: AgentModelsSettingsProfile
     @Published private(set) var recommendations: RecommendationSet = .init()
     @Published private(set) var isApplyingAll: Bool = false
+    @Published private(set) var oracleModelValidationError: String?
     @Published var syncChatWithOracle: Bool {
         didSet {
             guard !isReloadingScopedState, oldValue != syncChatWithOracle else { return }
+            let canonicalPlanningRaw: String?
+            do {
+                canonicalPlanningRaw = syncChatWithOracle
+                    ? try validatedOracleRaw(profileSnapshot.planningModelRaw, slot: .primary)
+                    : profileSnapshot.planningModelRaw
+            } catch {
+                isReloadingScopedState = true
+                syncChatWithOracle = oldValue
+                isReloadingScopedState = false
+                oracleModelValidationError = error.localizedDescription
+                return
+            }
             updateSelectedProfile(reason: "agent_models.sync_toggle") { profile in
-                let planningModelRaw = profile.planningModelRaw?
+                let planningModelRaw = canonicalPlanningRaw?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let canEnableSync = planningModelRaw?.isEmpty == false
                 profile.syncChatModelWithOracle = syncChatWithOracle && canEnableSync
-                if profile.syncChatModelWithOracle,
-                   profile.preferredComposeModelRaw != profile.planningModelRaw
-                {
-                    profile.preferredComposeModelRaw = profile.planningModelRaw
+                if profile.syncChatModelWithOracle {
+                    profile.planningModelRaw = canonicalPlanningRaw
+                    profile.preferredComposeModelRaw = canonicalPlanningRaw
                 }
             }
         }
@@ -86,7 +99,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         settingsManager: (any SettingsManaging)? = nil,
         settingsStore: GlobalSettingsStore? = nil,
         defaults: UserDefaults = .standard,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        oracleModelAvailability: (@MainActor @Sendable (AIModel) -> Bool)? = nil
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let settingsManager = settingsManager ?? settingsStore
@@ -108,6 +122,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         self.settingsManager = settingsManager
         _ = defaults // Retained for initializer compatibility while storage lives in GlobalSettingsStore.
         self.notificationCenter = notificationCenter
+        self.oracleModelAvailability = oracleModelAvailability ?? { _ in false }
         engine = AutoRecommendationEngine(
             settingsStore: settingsStore,
             profileSettingsManager: settingsManager,
@@ -274,6 +289,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard self.workspaceID != workspaceID || self.workspaceName != workspaceName else { return }
         self.workspaceID = workspaceID
         self.workspaceName = workspaceName
+        oracleModelValidationError = nil
         reloadScopedState()
         refresh()
     }
@@ -347,33 +363,65 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     // MARK: - Oracle / Built-in Chat setters
 
     func setOracleModel(raw: String) {
-        updateSelectedProfile(reason: "agent_models.oracle_model") { profile in
-            profile.planningModelRaw = raw
-            guard profile.syncChatModelWithOracle else { return }
-            if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                profile.syncChatModelWithOracle = false
-            } else {
-                profile.preferredComposeModelRaw = raw
-            }
-        }
+        applyOracleModel(raw: raw, slot: .primary)
     }
 
     func setSecondaryOracleModel(raw: String) {
-        updateSelectedProfile(reason: "agent_models.secondary_oracle_model") { profile in
-            profile.secondaryOracleModelRaw = raw
-        }
+        applyOracleModel(raw: raw, slot: .secondary)
     }
 
     func setBuiltinChatModel(raw: String) {
+        let canonicalPrimaryRaw: String?
+        do {
+            canonicalPrimaryRaw = profileSnapshot.syncChatModelWithOracle
+                ? try validatedOracleRaw(raw, slot: .primary)
+                : nil
+        } catch {
+            oracleModelValidationError = error.localizedDescription
+            return
+        }
+        oracleModelValidationError = nil
         updateSelectedProfile(reason: "agent_models.builtin_chat_model") { profile in
             profile.preferredComposeModelRaw = raw
             guard profile.syncChatModelWithOracle else { return }
-            if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if canonicalPrimaryRaw == nil {
                 profile.syncChatModelWithOracle = false
             } else {
-                profile.planningModelRaw = raw
+                profile.planningModelRaw = canonicalPrimaryRaw
+                profile.preferredComposeModelRaw = canonicalPrimaryRaw
             }
         }
+    }
+
+    private func applyOracleModel(raw: String?, slot: OracleModelSlot) {
+        do {
+            let canonicalRaw = try validatedOracleRaw(raw, slot: slot)
+            oracleModelValidationError = nil
+            updateSelectedProfile(reason: "agent_models.\(slot.rawValue)_oracle_model") { profile in
+                switch slot {
+                case .primary:
+                    profile.planningModelRaw = canonicalRaw
+                    guard profile.syncChatModelWithOracle else { return }
+                    if canonicalRaw == nil {
+                        profile.syncChatModelWithOracle = false
+                    } else {
+                        profile.preferredComposeModelRaw = canonicalRaw
+                    }
+                case .secondary:
+                    profile.secondaryOracleModelRaw = canonicalRaw
+                }
+            }
+        } catch {
+            oracleModelValidationError = error.localizedDescription
+        }
+    }
+
+    private func validatedOracleRaw(_ raw: String?, slot: OracleModelSlot) throws -> String? {
+        try OraclePairModelSelectionPolicy.validatedCandidate(
+            slot: slot,
+            raw: raw,
+            isAvailable: { oracleModelAvailability($0) }
+        )
     }
 
     // MARK: - Copy Actions
@@ -404,9 +452,14 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             return
         }
 
+        guard let canonicalRaw = try? validatedOracleRaw(recommendedModelRaw, slot: .primary) else {
+            oracleModelValidationError = "The recommended Oracle model is not currently available."
+            return
+        }
+        oracleModelValidationError = nil
         updateSelectedProfile(reason: "agent_models.apply_oracle_recommendation") { profile in
-            profile.planningModelRaw = recommendedModelRaw
-            profile.preferredComposeModelRaw = recommendedModelRaw
+            profile.planningModelRaw = canonicalRaw
+            profile.preferredComposeModelRaw = canonicalRaw
         }
         postRecommendationsDidApply(reason: "agent_models.apply_oracle_recommendation")
     }
@@ -462,8 +515,13 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         if let chat = recommendations.chatModel,
            let recommendedModelRaw = engine.recommendedChatModelRaw(chat, backend: chat.defaultBackend)
         {
-            profile.planningModelRaw = recommendedModelRaw
-            profile.preferredComposeModelRaw = recommendedModelRaw
+            guard let canonicalRaw = try? validatedOracleRaw(recommendedModelRaw, slot: .primary) else {
+                oracleModelValidationError = "The recommended Oracle model is not currently available."
+                isApplyingAll = false
+                return
+            }
+            profile.planningModelRaw = canonicalRaw
+            profile.preferredComposeModelRaw = canonicalRaw
             didMutateProfile = true
         }
         if let cb = recommendations.contextBuilder {

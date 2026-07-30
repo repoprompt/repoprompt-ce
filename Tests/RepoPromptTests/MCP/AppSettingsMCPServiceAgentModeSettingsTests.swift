@@ -125,7 +125,13 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
 
         let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
         let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
-        let service = AppSettingsMCPService(store: store)
+        let availableModels = [AIModel.gpt54Pro, AIModel.claude4Sonnet]
+        let service = AppSettingsMCPService(
+            store: store,
+            oracleModelAvailability: { model in
+                OraclePairModelSelectionPolicy.isExactCatalogMatch(model, in: availableModels)
+            }
+        )
         let model = AIModel.gpt54Pro.rawValue
 
         func set(_ key: String, _ value: Value) async throws -> Value {
@@ -180,9 +186,16 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
         let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
         let notificationCenter = NotificationCenter()
-        let service = AppSettingsMCPService(store: store, notificationCenter: notificationCenter)
+        let availableModel = AIModel.claude4Sonnet
+        let service = AppSettingsMCPService(
+            store: store,
+            notificationCenter: notificationCenter,
+            oracleModelAvailability: { model in
+                OraclePairModelSelectionPolicy.isExactCatalogMatch(model, in: [availableModel])
+            }
+        )
         let key = "models.secondary_oracle_model"
-        let model = "custom-secondary-model"
+        let model = availableModel.rawValue
         var settingsNotifications: [Foundation.Notification] = []
         let settingsCancellable = NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
             .filter { ($0.object as? GlobalSettingsStore) === store }
@@ -192,6 +205,30 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         let recommendationCancellable = notificationCenter.publisher(for: .recommendationsDidApply)
             .sink { recommendationNotifications.append($0) }
         defer { recommendationCancellable.cancel() }
+
+        do {
+            _ = try await service.handleForTesting([
+                "op": .string("set"), "key": .string(key), "value": .string("custom-secondary-model")
+            ])
+            XCTFail("Expected an unknown Secondary Oracle model to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("not a recognized Oracle model ID"))
+        }
+        XCTAssertNil(store.secondaryOracleModelRaw())
+        XCTAssertTrue(settingsNotifications.isEmpty)
+
+        do {
+            _ = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string(key),
+                "value": .string(AIModel.gpt54Pro.rawValue)
+            ])
+            XCTFail("Expected an unavailable Secondary Oracle model to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("is not available"))
+        }
+        XCTAssertNil(store.secondaryOracleModelRaw())
+        XCTAssertTrue(settingsNotifications.isEmpty)
 
         let set = try await service.handleForTesting([
             "op": .string("set"), "key": .string(key), "value": .string(model)

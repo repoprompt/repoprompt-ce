@@ -385,12 +385,17 @@ enum ChatSessionScope: String, CaseIterable, Identifiable {
 class OracleViewModel: ObservableObject {
     @Published var messages: [AIChatMessage] = []
     @Published private(set) var streamingSessions: Set<UUID> = []
+    @Published private(set) var oracleLaneOutcomesBySessionID: [UUID: OracleLaneOutcome] = [:]
     @Published private(set) var messageStoreRevision: Int = 0
     @Published private(set) var currentQueryId: UUID?
     let oraclePairClaims = OraclePairClaimRegistry()
 
     /// Per-session stream state
     private var runStateBySession: [UUID: SessionRunState] = [:]
+
+    func setOracleLaneOutcome(_ outcome: OracleLaneOutcome?, for sessionID: UUID) {
+        oracleLaneOutcomesBySessionID[sessionID] = outcome
+    }
 
     /// Per-message routing
     private var sessionIDByMessageId: [UUID: UUID] = [:]

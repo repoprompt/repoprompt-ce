@@ -1,8 +1,26 @@
 import Foundation
 
-enum OracleLane: String, Codable {
+enum OracleLane: String, Codable, CaseIterable, Equatable {
     case primary
     case secondary
+}
+
+enum OracleLaneProvenance: String {
+    case explicit
+    case legacyAssumedPrimary = "legacy_assumed_primary"
+}
+
+struct OracleLaneResolution: Equatable {
+    let lane: OracleLane
+    let provenance: OracleLaneProvenance
+
+    static func resolve(lane: OracleLane?, pairID: UUID?) -> OracleLaneResolution? {
+        if let lane {
+            return OracleLaneResolution(lane: lane, provenance: .explicit)
+        }
+        guard pairID == nil else { return nil }
+        return OracleLaneResolution(lane: .primary, provenance: .legacyAssumedPrimary)
+    }
 }
 
 enum ChatSessionError: Error {

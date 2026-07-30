@@ -11,14 +11,21 @@ final class AppSettingsMCPService: Service {
 
     private let store: GlobalSettingsStore
     private let notificationCenter: NotificationCenter
+    private let oracleModelAvailability: @MainActor (AIModel) -> Bool
 
     @MainActor
     init(
         store: GlobalSettingsStore? = nil,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        oracleModelAvailability: @escaping @MainActor (AIModel) -> Bool = { model in
+            WindowStatesManager.shared.allWindows.contains {
+                $0.promptManager.isOracleModelInHydratedCatalog(model)
+            }
+        }
     ) {
         self.store = store ?? GlobalSettingsStore.shared
         self.notificationCenter = notificationCenter
+        self.oracleModelAvailability = oracleModelAvailability
     }
 
     var tools: [Tool] {
@@ -52,7 +59,7 @@ final class AppSettingsMCPService: Service {
                 - `{"op":"set","key":"file_system.global_ignore_defaults","value":"**/node_modules/\\n"}`
                 - `{"op":"options","key":"models.planning_model","agent":"codexExec"}`
 
-                Invalid or out-of-range values are rejected with no partial apply. Model-raw settings accept custom identifiers beyond what `options` returns.
+                Invalid or out-of-range values are rejected with no partial apply. Primary and Secondary Oracle models must be present in a hydrated model catalog; other model-raw settings may accept custom identifiers beyond what `options` returns.
                 """,
                 inputSchema: .object(
                     properties: [
@@ -177,11 +184,12 @@ final class AppSettingsMCPService: Service {
         let normalizedValue = try definition.validate(rawValue)
 
         let result = try await MainActor.run { () throws -> (oldValue: Value, newValue: Value, changed: Bool, applied: Bool, persistenceBlockReason: GlobalSettingsPersistenceBlockReason?) in
+            let validatedValue = try validatedCrossSettingValue(key: definition.key, value: normalizedValue)
             let oldValue = definition.read(store)
-            let changed = !Self.valuesEqual(oldValue, normalizedValue)
+            let changed = !Self.valuesEqual(oldValue, validatedValue)
             if changed {
-                try definition.write(store, normalizedValue)
-                definition.afterWrite?(store, normalizedValue, notificationCenter)
+                try definition.write(store, validatedValue)
+                definition.afterWrite?(store, validatedValue, notificationCenter)
             }
             let newValue = definition.read(store)
             definition.afterSet?(store, newValue, changed, notificationCenter)
@@ -203,6 +211,47 @@ final class AppSettingsMCPService: Service {
             response["persistence_warning"] = .string(Self.persistenceBlockWarning(reason))
         }
         return .object(response)
+    }
+
+    @MainActor
+    private func validatedCrossSettingValue(key: String, value: Value) throws -> Value {
+        let slot: OracleModelSlot?
+        switch key {
+        case "models.planning_model", "models.secondary_oracle_model":
+            slot = key == "models.planning_model" ? .primary : .secondary
+        case "models.preferred_compose_model" where store.syncChatModelWithOracle():
+            slot = .primary
+        case "models.sync_chat_model_with_oracle" where value.boolValue == true:
+            guard let raw = store.planningModelRaw()?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+            else {
+                return value
+            }
+            _ = try canonicalOracleRaw(raw, slot: .primary)
+            return value
+        default:
+            slot = nil
+        }
+
+        guard let slot else { return value }
+        guard let raw = value.stringValue else { return value }
+        return try .string(canonicalOracleRaw(raw, slot: slot))
+    }
+
+    @MainActor
+    private func canonicalOracleRaw(_ raw: String, slot: OracleModelSlot) throws -> String {
+        do {
+            guard let canonical = try OraclePairModelSelectionPolicy.validatedCandidate(
+                slot: slot,
+                raw: raw,
+                isAvailable: { oracleModelAvailability($0) }
+            ) else {
+                throw MCPError.invalidParams("\(slot.label) cannot be empty.")
+            }
+            return canonical
+        } catch let error as ChatToolError {
+            throw MCPError.invalidParams(error.message)
+        }
     }
 
     private func options(_ args: [String: Value]) async throws -> Value {
@@ -1458,8 +1507,12 @@ private enum AppSettingsMCPRegistry {
         let truncated = totalCount > clampedLimit
         let options = truncated ? Array(allCandidates.prefix(clampedLimit)) : allCandidates
 
+        let isOracleSetting = request.key == "models.planning_model" ||
+            request.key == "models.secondary_oracle_model"
         let notes = [
-            "These are current AIModel raw-value candidates; custom raw identifiers may still be accepted by app_settings op='set'.",
+            isOracleSetting
+                ? "Candidates are advisory; Oracle writes require an exact match in a live hydrated model catalog."
+                : "These are current AIModel raw-value candidates; custom raw identifiers may still be accepted by app_settings op='set'.",
             "Task labels such as explore/engineer/pair/design and agent compound IDs are not valid values for this setting."
         ]
 

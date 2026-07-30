@@ -323,30 +323,32 @@ class PromptViewModel: ObservableObject {
         rawValue: String,
         isModelAvailable: (AIModel) -> Bool
     ) -> MCPOraclePlanningModelResolution {
-        let trimmedRawValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedRawValue.isEmpty else {
-            return .unconfigured
+        switch OraclePairModelSelectionPolicy.resolveCandidate(
+            raw: rawValue,
+            isAvailable: isModelAvailable
+        ) {
+        case .absent:
+            .unconfigured
+        case let .resolved(model):
+            .configured(model)
+        case let .invalid(rawValue):
+            .invalid(rawValue: rawValue)
+        case let .unavailable(model):
+            .unavailable(model)
         }
-        guard let model = AIModel.fromModelName(trimmedRawValue) else {
-            return .invalid(rawValue: trimmedRawValue)
-        }
-        guard isModelAvailable(model) else {
-            return .unavailable(model)
-        }
-        return .configured(model)
     }
 
     func mcpOraclePlanningModelResolution() -> MCPOraclePlanningModelResolution {
         Self.mcpOraclePlanningModelResolution(
             rawValue: planningModelName,
             isModelAvailable: { [weak self] model in
-                self?.isProviderConfigured(for: model) ?? false
+                self?.isOracleModelInHydratedCatalog(model) ?? false
             }
         )
     }
 
-    func mcpOracleIsProviderConfigured(for model: AIModel) -> Bool {
-        isProviderConfigured(for: model)
+    func isOracleModelInHydratedCatalog(_ model: AIModel) -> Bool {
+        OraclePairModelSelectionPolicy.isExactCatalogMatch(model, in: availableModels)
     }
 
     nonisolated static func mcpOraclePlanningModelErrorMessage(
@@ -373,6 +375,10 @@ class PromptViewModel: ObservableObject {
         set {
             setPlanningModelRaw(newValue, markDirty: true, reason: "prompt.model_selection.planning")
         }
+    }
+
+    var secondaryOracleModelRaw: String? {
+        currentAgentModelsProfile().secondaryOracleModelRaw
     }
 
     private func setPreferredModelRaw(_ rawValue: String, markDirty: Bool, reason _: String? = nil) {
