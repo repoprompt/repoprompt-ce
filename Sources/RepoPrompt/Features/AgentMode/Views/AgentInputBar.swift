@@ -1276,7 +1276,7 @@ struct AgentComposerView: View, Equatable {
                             actions.applyCodexToolSettingMutation(.memories(enabled: newValue))
                         }
                     ))
-                    .hoverTooltip("Let Codex generate and reuse local memories across chats. Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.")
+                    .hoverTooltip("Let Codex generate and reuse local memories across Agent Mode chats. Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.")
                 } header: {
                     Text("Tools")
                 }

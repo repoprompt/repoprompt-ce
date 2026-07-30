@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPromptApp
 import XCTest
 
@@ -63,8 +64,40 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testNonAgentMemoriesStayDisabledAndStreamingStartsFreshWhenAgentModePreferenceIsEnabled() async throws {
+        let settings = GlobalSettingsStore.shared
+        let previousMemoriesEnabled = settings.codexMemoriesEnabled()
+        settings.setCodexMemoriesEnabled(true, commit: false)
+        defer {
+            settings.setCodexMemoriesEnabled(previousMemoriesEnabled, commit: false)
+        }
+        XCTAssertTrue(settings.codexMemoriesEnabled())
+
+        let startRecorder = ScriptedCodexProviderStartRecorder()
+        let provider = makeProvider(
+            events: [.turnCompleted(turnID: "turn", status: .completed)],
+            startRecorder: startRecorder
+        )
+        let overrides = provider.interactiveConfigOverrides(excludeServers: [])
+        for key in ["features.memories", "memories.generate_memories", "memories.use_memories"] {
+            XCTAssertEqual(overrides[key] as? Bool, false, key)
+        }
+
+        let stream = try await provider.streamMessage(
+            AIMessage(systemPrompt: "", userMessage: "prompt"),
+            model: .codexCustom(name: "test-model")
+        )
+        for try await _ in stream {}
+
+        let startSnapshot = await startRecorder.snapshot()
+        XCTAssertEqual(startSnapshot.callCount, 1)
+        XCTAssertTrue(startSnapshot.resumedThreadIDs.isEmpty)
+    }
+
     private func makeProvider(
-        events: [CodexNativeSessionController.Event]
+        events: [CodexNativeSessionController.Event],
+        startRecorder: ScriptedCodexProviderStartRecorder? = nil
     ) -> CodexCLIProvider {
         CodexCLIProvider(
             defaultRequestTimeout: 5,
@@ -72,7 +105,7 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
             maxRetries: 0,
             appServerReadyHook: {},
             sessionControllerFactory: { _, _ in
-                ScriptedCodexProviderController(events: events)
+                ScriptedCodexProviderController(events: events, startRecorder: startRecorder)
             }
         )
     }
@@ -80,8 +113,13 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
 
 private final class ScriptedCodexProviderController: CodexSessionControlling {
     let events: AsyncStream<CodexNativeSessionController.Event>
+    private let startRecorder: ScriptedCodexProviderStartRecorder?
 
-    init(events: [CodexNativeSessionController.Event]) {
+    init(
+        events: [CodexNativeSessionController.Event],
+        startRecorder: ScriptedCodexProviderStartRecorder? = nil
+    ) {
+        self.startRecorder = startRecorder
         self.events = AsyncStream { continuation in
             for event in events {
                 continuation.yield(event)
@@ -97,10 +135,13 @@ private final class ScriptedCodexProviderController: CodexSessionControlling {
     func ensureEventsStreamReady() {}
 
     func startOrResume(
-        existing _: CodexNativeSessionController.SessionRef?,
+        existing: CodexNativeSessionController.SessionRef?,
         baseInstructions _: String
     ) async throws -> CodexNativeSessionController.SessionRef {
-        .init(conversationID: "thread", rolloutPath: nil, model: nil, reasoningEffort: nil)
+        if let startRecorder {
+            await startRecorder.record(existing: existing)
+        }
+        return .init(conversationID: "thread", rolloutPath: nil, model: nil, reasoningEffort: nil)
     }
 
     func startUserTurn(
@@ -128,4 +169,20 @@ private final class ScriptedCodexProviderController: CodexSessionControlling {
     func cancelCurrentTurn() async {}
     func shutdown() async {}
     func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {}
+}
+
+private actor ScriptedCodexProviderStartRecorder {
+    private var callCount = 0
+    private var resumedThreadIDs: [String] = []
+
+    func record(existing: CodexNativeSessionController.SessionRef?) {
+        callCount += 1
+        if let existing {
+            resumedThreadIDs.append(existing.conversationID)
+        }
+    }
+
+    func snapshot() -> (callCount: Int, resumedThreadIDs: [String]) {
+        (callCount, resumedThreadIDs)
+    }
 }

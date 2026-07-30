@@ -218,7 +218,7 @@ struct CodexProviderToolsRuntimeSection: View {
 
             ProviderRuntimeToggleRow(
                 title: "Local Memories",
-                description: "Let Codex generate and reuse local memories across chats. Memories are stored under Codex home (normally ~/.codex/memories). Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.",
+                description: "Let Codex generate and reuse local memories across Agent Mode chats. Memories are stored under Codex home (normally ~/.codex/memories). Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.",
                 isOn: tools.memoriesEnabled,
                 onChange: { onApplyMutation(.memories(enabled: $0)) }
             )
