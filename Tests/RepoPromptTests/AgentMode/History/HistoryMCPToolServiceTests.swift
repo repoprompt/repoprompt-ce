@@ -1188,6 +1188,311 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.sessionID, fresh.id.uuidString)
     }
 
+    func testGetSession_directResolutionAvoidsInventoryScans() async throws {
+        let record = makeRecord(name: "Direct")
+        let scan = makeScanResult(records: [record])
+        mockScanner.directLookup = HistoryDirectSessionLookup(location: HistoryDirectSessionLocation(
+            record: record,
+            workspaceName: scan.workspaceName,
+            workspaceDir: scan.workspaceDir
+        ))
+        mockScanner.transcriptProvider = { _ in
+            AgentTranscript(turns: [AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000))])
+        }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "get_session", "session_id": .string(record.id.uuidString), "around_turn": .int(0)],
+            scanner: mockScanner
+        )
+
+        XCTAssertEqual(try getSessionReply(result).sessionID, record.id.uuidString)
+        XCTAssertEqual(mockScanner.locateSessionCallCount, 1)
+        XCTAssertEqual(mockScanner.scanCallCount, 0)
+        XCTAssertEqual(mockScanner.refreshingScanCallCount, 0)
+    }
+
+    func testGetSession_incompleteDirectLookupDoesNotRunFullFallback() async throws {
+        let diagnostic = HistoryScanDiagnostic(
+            kind: .elapsedTime,
+            limit: 20000,
+            consumed: 20000,
+            unit: .milliseconds,
+            phase: "direct_session_lookup"
+        )
+        mockScanner.directLookup = HistoryDirectSessionLookup(
+            location: nil,
+            diagnostics: [diagnostic],
+            isComplete: false
+        )
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "get_session", "session_id": .string(UUID().uuidString), "around_turn": .int(0)],
+            scanner: mockScanner
+        )
+
+        guard case let .error(error) = result else {
+            return XCTFail("Expected retryable incomplete lookup, got \(result)")
+        }
+        XCTAssertEqual(error.retryable, true)
+        XCTAssertEqual(error.scanTruncated, true)
+        XCTAssertEqual(error.scanDiagnostics, [diagnostic])
+        XCTAssertTrue(error.suggestion?.contains("same get_session") == true)
+        XCTAssertEqual(mockScanner.locateSessionCallCount, 1)
+        XCTAssertEqual(mockScanner.refreshingScanCallCount, 0)
+    }
+
+    func testGetSession_sharedDeadlineWithInsufficientFallbackTimeIsNotAuthoritativeNotFound() async throws {
+        let clock = ContinuousClock()
+        let start = clock.now
+        let now = HistoryTestNowProvider(instants: [start, start + .seconds(19)])
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "get_session", "session_id": .string(UUID().uuidString), "around_turn": .int(0)],
+            scanner: mockScanner,
+            budget: HistoryExecutionBudget(maxTurns: 100, maxElapsed: .seconds(20), yieldEveryTurns: 1),
+            nowProvider: { now.next() }
+        )
+
+        guard case let .error(error) = result else {
+            return XCTFail("Expected retryable deadline result, got \(result)")
+        }
+        XCTAssertEqual(error.retryable, true)
+        XCTAssertFalse(error.error.contains("No history session found"))
+        XCTAssertEqual(error.scanDiagnostics?.first?.phase, "get_session_refresh")
+        XCTAssertEqual(mockScanner.refreshingScanCallCount, 0)
+    }
+
+    func testGetSession_singleSnapshotRefreshDecisionCannotRaceIntoAuthoritativeNotFound() async throws {
+        let record = makeRecord(name: "Recovered at boundary")
+        mockScanner.refreshingScanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in
+            AgentTranscript(turns: [AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000))])
+        }
+        let clock = ContinuousClock()
+        let start = clock.now
+        // Under the old two-check implementation, +17s passed the first check and
+        // +20s failed the second, silently skipping refresh. One snapshot must refresh.
+        let now = HistoryTestNowProvider(instants: [
+            start,
+            start + .seconds(17),
+            start + .seconds(20)
+        ])
+
+        let result = try await HistoryMCPToolService.execute(
+            args: [
+                "op": "get_session",
+                "session_id": .string(record.id.uuidString),
+                "around_turn": .int(0)
+            ],
+            scanner: mockScanner,
+            budget: HistoryExecutionBudget(maxTurns: 100, maxElapsed: .seconds(20), yieldEveryTurns: 1),
+            nowProvider: { now.next() }
+        )
+
+        XCTAssertEqual(try getSessionReply(result).sessionID, record.id.uuidString)
+        XCTAssertEqual(mockScanner.refreshingScanCallCount, 1)
+    }
+
+    func testListSessions_failedStubEnrichmentPreservesStoredMetadataWithLowerBoundDiagnostics() async throws {
+        let first = makeRecord(name: "First stub")
+        let second = makeRecord(name: "Second stub")
+        mockScanner.scanResults = [makeScanResult(records: [first, second])]
+        mockScanner.transcriptProvider = { _ in
+            throw NSError(domain: "HistoryMCPToolServiceTests", code: 1)
+        }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: mockScanner
+        )
+        let dto = try listReply(result)
+
+        XCTAssertEqual(dto.totalSessions, 2)
+        XCTAssertEqual(dto.sessionsScanned, 0)
+        XCTAssertEqual(Set(dto.sessions.map(\.sessionName)), Set(["First stub", "Second stub"]))
+        XCTAssertTrue(dto.scanTruncated)
+        XCTAssertEqual(dto.scanDiagnostics?.map(\.kind), [.transcriptReadFailure])
+        XCTAssertEqual(dto.scanDiagnostics?.first?.count, 2)
+    }
+
+    func testListSessions_oversizedTranscriptPreservesStoredSessionMetadata() async throws {
+        let record = makeRecord(name: "Stored oversize")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        let diagnostic = HistoryScanDiagnostic(
+            kind: .transcriptFileBytes,
+            limit: 64,
+            consumed: 128,
+            unit: .bytes,
+            retryable: false,
+            phase: "transcript_read"
+        )
+        mockScanner.transcriptProvider = { _ in
+            throw HistorySessionScannerError.workBudgetExceeded(diagnostic)
+        }
+
+        let dto = try await listReply(HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: mockScanner
+        ))
+
+        XCTAssertEqual(dto.sessions.map(\.sessionName), ["Stored oversize"])
+        XCTAssertEqual(dto.sessionsScanned, 0)
+        XCTAssertEqual(dto.scanDiagnostics, [diagnostic])
+        XCTAssertTrue(dto.scanTruncated)
+    }
+
+    func testListSessions_repeatedReadFailuresAggregateDiagnosticsWithoutHidingSessions() async throws {
+        let records = (0 ..< 250).map { makeRecord(name: "Degraded \($0)") }
+        mockScanner.scanResults = [makeScanResult(records: records)]
+        mockScanner.transcriptProvider = { _ in
+            throw NSError(domain: "HistoryMCPToolServiceTests", code: 2)
+        }
+
+        let dto = try await listReply(HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "max_sessions_scanned": .int(250)],
+            scanner: mockScanner
+        ))
+
+        XCTAssertEqual(dto.sessionsScanned, 0)
+        XCTAssertEqual(dto.scanDiagnostics?.count, 1)
+        XCTAssertEqual(dto.scanDiagnostics?.first?.kind, .transcriptReadFailure)
+        XCTAssertEqual(dto.scanDiagnostics?.first?.count, 250)
+        XCTAssertEqual(dto.totalSessions, 250)
+    }
+
+    func testSearch_corruptTranscriptProducesTypedLowerBoundPartial() async throws {
+        let record = makeRecord(name: "Corrupt search")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { id in
+            throw HistorySessionScannerError.transcriptDecodingFailed(
+                sessionID: id,
+                underlying: "synthetic corruption"
+            )
+        }
+
+        let dto = try await searchReply(HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "needle"],
+            scanner: mockScanner
+        ))
+
+        XCTAssertEqual(dto.sessionsScanned, 0)
+        XCTAssertTrue(dto.scanTruncated)
+        XCTAssertEqual(dto.totalsAreLowerBounds, true)
+        XCTAssertEqual(dto.scanDiagnostics?.first?.kind, .transcriptReadFailure)
+        XCTAssertEqual(dto.scanDiagnostics?.first?.retryable, false)
+    }
+
+    func testTime_calendarCorruptTranscriptDisclosesIncompleteCoverage() async throws {
+        let record = makeRecord(name: "Corrupt calendar")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { id in
+            throw HistorySessionScannerError.transcriptDecodingFailed(
+                sessionID: id,
+                underlying: "synthetic corruption"
+            )
+        }
+
+        let dto = try await timeReply(HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day"],
+            scanner: mockScanner
+        ))
+
+        XCTAssertEqual(dto.sessionsScanned, 0)
+        XCTAssertTrue(dto.groups.isEmpty)
+        XCTAssertTrue(dto.scanTruncated)
+        XCTAssertEqual(dto.totalsAreLowerBounds, true)
+        XCTAssertEqual(dto.scanDiagnostics?.first?.kind, .transcriptReadFailure)
+        XCTAssertEqual(dto.scanDiagnostics?.first?.retryable, false)
+    }
+
+    func testListSessions_inventoryBudgetSurfacesTypedRetryableTruncation() async throws {
+        let diagnostic = HistoryScanDiagnostic(
+            kind: .workspaceCount,
+            limit: 5000,
+            consumed: 5000,
+            unit: .workspaces
+        )
+        mockScanner.inventoryDiagnostics = [diagnostic]
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: mockScanner
+        )
+        let dto = try listReply(result)
+
+        XCTAssertTrue(dto.scanTruncated)
+        XCTAssertEqual(dto.scanDiagnostics, [diagnostic])
+        XCTAssertEqual(dto.scanDiagnostics?.first?.retryable, true)
+    }
+
+    func testSearch_turnBudgetReturnsTypedPartialResults() async throws {
+        let record = makeRecord(name: "Budgeted")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        let turns = (0 ..< 5).map { index in
+            AgentTranscriptTurn(
+                summary: AgentTranscriptTurnSummary(
+                    requestText: "budget needle \(index)",
+                    conclusionText: nil,
+                    compactConclusionText: nil,
+                    middleSummaryText: nil,
+                    toolCount: 0,
+                    notableToolNames: [],
+                    keyPaths: [],
+                    compactedActivityCount: 0,
+                    hadWarning: false,
+                    hadError: false
+                ),
+                startedAt: Date(timeIntervalSince1970: TimeInterval(1000 + index))
+            )
+        }
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: turns) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "budget needle"],
+            scanner: mockScanner,
+            budget: HistoryExecutionBudget(maxTurns: 2, maxElapsed: .seconds(20), yieldEveryTurns: 1)
+        )
+        let dto = try searchReply(result)
+
+        XCTAssertEqual(dto.totalMatches, 2)
+        XCTAssertTrue(dto.scanTruncated)
+        XCTAssertEqual(dto.scanDiagnostics?.map(\.kind), [.turnCount])
+        XCTAssertEqual(dto.scanDiagnostics?.first?.consumed, 2)
+        XCTAssertEqual(dto.sessionsScanned, 0)
+        XCTAssertEqual(dto.totalsAreLowerBounds, true)
+    }
+
+    func testSearch_midTranscriptCancellationPropagates() async throws {
+        let record = makeRecord(name: "Cancellation")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        let probe = HistoryCancellationProbe()
+        mockScanner.transcriptProvider = { _ in
+            await probe.markStarted()
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            throw CancellationError()
+        }
+
+        let task = Task {
+            try await HistoryMCPToolService.execute(
+                args: ["op": "search", "query": "anything"],
+                scanner: mockScanner
+            )
+        }
+        while await !(probe.hasStarted) {
+            await Task.yield()
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation to propagate")
+        } catch is CancellationError {
+            // Expected: transcript-load cancellation must not be swallowed as a skipped session.
+        }
+    }
+
     // MARK: - role mapping
 
     func testSearch_roleMapping_toolExecution() async throws {
@@ -2143,6 +2448,32 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
 // MARK: - Mock Scanner
 
+private actor HistoryCancellationProbe {
+    private(set) var hasStarted = false
+
+    func markStarted() {
+        hasStarted = true
+    }
+}
+
+private final class HistoryTestNowProvider: @unchecked Sendable {
+    private let lock = NSLock()
+    private let instants: [ContinuousClock.Instant]
+    private var index = 0
+
+    init(instants: [ContinuousClock.Instant]) {
+        self.instants = instants
+    }
+
+    func next() -> ContinuousClock.Instant {
+        lock.withLock {
+            let instant = instants[min(index, instants.count - 1)]
+            index += 1
+            return instant
+        }
+    }
+}
+
 private struct FilterRequest: Equatable {
     let workspace: String?
     let agentKind: String?
@@ -2160,7 +2491,12 @@ private final class MockHistoryScanner: HistorySessionScanning {
     /// Per-session override for `transcriptDerivedFieldsAreStale`; nil → not stale.
     var transcriptStalenessProvider: ((UUID) -> Bool)?
     var filterRequests: [FilterRequest] = []
-    var transcriptProvider: ((UUID) throws -> AgentTranscript)?
+    var transcriptProvider: ((UUID) async throws -> AgentTranscript)?
+    var inventoryDiagnostics: [HistoryScanDiagnostic] = []
+    var directLookup: HistoryDirectSessionLookup?
+    var scanCallCount = 0
+    var refreshingScanCallCount = 0
+    var locateSessionCallCount = 0
 
     func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
         scanResults
@@ -2168,6 +2504,24 @@ private final class MockHistoryScanner: HistorySessionScanning {
 
     func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult] {
         refreshingScanResults ?? scanResults
+    }
+
+    func scanWorkspaces(matching _: String?) async throws -> HistoryInventoryScan {
+        scanCallCount += 1
+        return HistoryInventoryScan(workspaces: scanResults, diagnostics: inventoryDiagnostics)
+    }
+
+    func scanWorkspacesRefreshing(matching _: String?) async throws -> HistoryInventoryScan {
+        refreshingScanCallCount += 1
+        return HistoryInventoryScan(
+            workspaces: refreshingScanResults ?? scanResults,
+            diagnostics: inventoryDiagnostics
+        )
+    }
+
+    func locateSession(sessionID _: UUID) async throws -> HistoryDirectSessionLookup {
+        locateSessionCallCount += 1
+        return directLookup ?? HistoryDirectSessionLookup(location: nil)
     }
 
     func sessionsMatchingFilters(
@@ -2203,7 +2557,14 @@ private final class MockHistoryScanner: HistorySessionScanning {
         guard let provider = transcriptProvider else {
             return .empty
         }
-        return try provider(sessionID)
+        return try await provider(sessionID)
+    }
+
+    func loadSessionForHistory(sessionID: UUID, workspaceDir: URL) async throws -> HistoryLoadedSession {
+        try await HistoryLoadedSession(
+            name: nil,
+            transcript: loadTranscriptForSearch(sessionID: sessionID, workspaceDir: workspaceDir)
+        )
     }
 
     func transcriptDerivedFieldsAreStale(

@@ -688,7 +688,6 @@ final class CLIProcessRunner {
     func cancelAll() async {
         // Do not steal cleanup ownership from runStreaming; just request termination.
         let processes = await registry.current()
-        let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()
         for process in processes {
             // Stop further input and ask the child to exit. The waitpid cleanup will close stdout/stderr.
             process.stdin?.closeFile()
@@ -700,19 +699,17 @@ final class CLIProcessRunner {
             )
         }
         for process in processes {
-            // Give every child a chance to begin exiting before we await individual reaping.
-            do {
-                let (status, _) = try await Self.waitForTerminationAsync(
-                    pid: process.pid,
-                    processGroupID: process.processGroupID,
-                    timeout: timeout
-                ) { [weak self] message in
-                    self?.log(message)
-                }
-                log("Cancelled process \(process.pid) with status \(status)")
-            } catch {
-                log("Failed to wait for process \(process.pid): \(error)")
+            // The streaming wait task remains the sole waitpid owner. Escalate only through the
+            // process group so a promptly-exited root cannot leave TERM-ignoring descendants
+            // alive or race a second destructive reap.
+            guard let processGroupID = process.processGroupID else {
+                log("Cannot escalate process \(process.pid) cancellation without a process group")
+                continue
             }
+            await ProcessTermination.terminateProcessGroup(
+                processGroupID: processGroupID,
+                logger: { [weak self] message in self?.log(message) }
+            )
         }
     }
 
@@ -758,8 +755,9 @@ final class CLIProcessRunner {
         workingDirectory: String?
     ) -> CLIProcessRunnerError {
         switch error {
-        case let .pipeCreationFailed(pipe):
-            return .spawnFailed("Failed to create \(pipe) pipe for process startup")
+        case let .pipeCreationFailed(label, errnoValue):
+            let message = String(cString: strerror(errnoValue))
+            return .spawnFailed("Failed to create \(label) pipe for process startup: \(message)")
         case let .descriptorConfigurationFailed(label, fd, underlying):
             let message = String(cString: strerror(underlying.errnoValue))
             return .spawnFailed("Failed to configure \(label) pipe descriptor \(fd) for process startup: \(message)")
@@ -849,6 +847,10 @@ final class CLIProcessRunner {
             return (exitCode, timedOut)
         } catch let terminationError as ProcessTerminationError {
             switch terminationError {
+            case let .childOwnershipLost(pid):
+                throw CLIProcessRunnerError.waitFailed(
+                    "waitpid reported ECHILD for sole-reaper child \(pid)"
+                )
             case let .waitFailed(message):
                 throw CLIProcessRunnerError.waitFailed(message)
             }

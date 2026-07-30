@@ -462,6 +462,15 @@ public enum AIModel: Equatable, Hashable {
 
     private static let openAITierPrefix = "openai_tier__"
 
+    static func rawValueWithoutOpenAIServiceTier(_ rawValue: String) -> String {
+        let normalizedRawValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedRawValue.hasPrefix(openAITierPrefix) else { return rawValue }
+        let rest = String(normalizedRawValue.dropFirst(openAITierPrefix.count))
+        let parts = rest.components(separatedBy: "__")
+        guard parts.count >= 2 else { return rawValue }
+        return parts.dropFirst().joined(separator: "__")
+    }
+
     /// Returns the service tier override if this is a tier variant, nil otherwise
     var openAIServiceTierOverride: String? {
         if case let .openAIServiceTierVariant(_, tier) = self { return tier }
@@ -1179,6 +1188,9 @@ public enum AIModel: Equatable, Hashable {
                 let tier = parts[0]
                 let baseRaw = parts.dropFirst().joined(separator: "__")
                 if let base = AIModel.fromModelName(baseRaw) {
+                    if !UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants") {
+                        return base
+                    }
                     return .openAIServiceTierVariant(base: base, tier: tier)
                 }
             }
@@ -2406,46 +2418,6 @@ public enum AIModel: Equatable, Hashable {
             0.6
         default:
             nil
-        }
-    }
-
-    /// Resolves the actual temperature that will be used for this model,
-    /// taking into account overrides, explicit values, and model defaults.
-    /// Returns nil when the temperature is not determinable (e.g., API uses its own default).
-    /// - Parameters:
-    ///   - explicitTemperature: Optional explicit temperature (e.g., from benchmark settings)
-    ///   - includeOverrides: Whether per-model overrides should be considered (default: true)
-    /// - Returns: The resolved temperature value, or nil if unknown
-    func resolveTemperature(explicitTemperature: Double? = nil, includeOverrides: Bool = true) -> Double? {
-        // 1. Per-model override from settings
-        if includeOverrides,
-           let override = ModelOverridesSettings.shared.temperatureOverride(for: rawValue)
-        {
-            return override
-        }
-
-        // 2. Explicit temperature passed in (e.g., benchmark override)
-        if let explicit = explicitTemperature, explicit > 0.0 {
-            return explicit
-        }
-
-        // 3. Model-specific default
-        if let modelDefault = defaultTemperature {
-            return modelDefault
-        }
-
-        // 4. Provider-specific behavior when effectiveTemperature returns nil
-        switch providerType {
-        case .anthropic:
-            // AnthropicProvider explicitly sets temperature = 0 if not overridden (line 102 in AnthropicProvider.swift)
-            return 0.0
-        case .customProvider:
-            // CustomProviderConfiguration uses 0.3 as default (line 10 in CustomProviderConfiguration.swift)
-            return 0.3
-        case .openAI, .azure, .openRouter, .gemini, .deepseek, .fireworks, .grok, .groq, .zAI, .claudeCode, .codex, .ollama, .openCode, .cursor:
-            // These providers don't set temperature when nil - API uses its own default (typically 1.0)
-            // But we can't be certain what the API actually used
-            return nil
         }
     }
 }

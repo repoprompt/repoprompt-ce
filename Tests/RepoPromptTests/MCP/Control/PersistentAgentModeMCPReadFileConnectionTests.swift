@@ -490,6 +490,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 25).map { "middle-insert-\($0)" }, at: 3039)
             editedLines.removeSubrange(5064 ..< 5084)
             let physicalURL = try fixture.worktreeLargeFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -560,6 +561,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillCommitHandlerForTesting(nil)
                 Task { await staleCommitGate.release() }
             }
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let staleReplacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.stale-\(UUID().uuidString)")
             let staleReplacementText = try String(contentsOf: physicalURL, encoding: .utf8)
@@ -683,6 +685,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try Self.assertSuccessfulResponse(fullSet, id: 4)
 
             let physicalURL = try fixture.worktreeSearchCreatedFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             var originalLines = (1 ... 29).map { "search-line-\($0)" }
             originalLines[3] = "WATCHER_BEGIN_ANCHOR_9F3A7C"
             originalLines[14] = "WATCHER_MIDDLE_ANCHOR_9F3A7C"
@@ -753,6 +758,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 4).map { "top-insert-\($0)" }, at: 0)
             editedLines.insert(contentsOf: (1 ... 3).map { "middle-insert-\($0)" }, at: 13)
             editedLines.removeSubrange(26 ... 27)
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SearchCreated.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -884,23 +892,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 params: [
                     "name": MCPWindowToolName.getCodeStructure,
                     "arguments": [
-                        "scope": "paths",
                         "paths": [nonGitFile.path]
                     ]
                 ]
             )
             let structureText = try Self.readFileText(from: structureResponse, id: 15)
-            XCTAssertTrue(structureText.contains("- **Status**: `unavailable`"), structureText)
-            XCTAssertTrue(structureText.contains("`git_root_unavailable`"), structureText)
+            XCTAssertTrue(
+                structureText.contains("## Code Structure ❌ unavailable — requested root is unavailable"),
+                structureText
+            )
+            XCTAssertTrue(structureText.contains("- Resolve the reported root issue, then retry."), structureText)
+            XCTAssertFalse(structureText.contains("git_root_unavailable"), structureText)
             let work = MCPToolWorkCountDiagnostics.debugSnapshots().git
             XCTAssertEqual(work.count, 1)
             XCTAssertEqual(work.first?.operation, MCPWindowToolName.getCodeStructure)
             let gitCommands = work.first?.commands ?? []
-            XCTAssertEqual(work.first?.commandCount, 3, gitCommands.joined(separator: "\n"))
-            XCTAssertTrue(
-                gitCommands.contains { $0.contains("rev-parse --show-toplevel") },
-                gitCommands.joined(separator: "\n")
-            )
+            XCTAssertEqual(work.first?.commandCount, 0, gitCommands.joined(separator: "\n"))
+            XCTAssertTrue(gitCommands.isEmpty)
             XCTAssertEqual(work.first?.outcome, "success")
         }
 
@@ -3222,6 +3230,29 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
         }
 
+        func useOnlySyntheticWatcherIngressForInstalledWorktree(
+            qualifyCachedSearchContent: Bool = false
+        ) async throws {
+            let rootID = try installedWorktreeRootID
+            let store = window.workspaceFileContextStore
+            let maybeService = await store.fileSystemServiceForTesting(rootID: rootID)
+            let service = try XCTUnwrap(maybeService)
+            await service.stopWatchingForChanges()
+            let attachedPublisherIngress = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(
+                rootID: rootID
+            )
+            guard attachedPublisherIngress else {
+                throw ClientFixtureError.syntheticWatcherPublisherIngressUnavailable(rootID)
+            }
+            let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            guard !watcherIsActive else {
+                throw ClientFixtureError.syntheticWatcherStillActive(rootID)
+            }
+            if qualifyCachedSearchContent {
+                try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: rootID, true)
+            }
+        }
+
         var auxiliaryRootPath: String {
             get throws {
                 try XCTUnwrap(auxiliaryRootURL).path
@@ -3874,6 +3905,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
+        case syntheticWatcherPublisherIngressUnavailable(UUID)
+        case syntheticWatcherStillActive(UUID)
     }
 
     private struct RetainedConnectionSnapshot: Equatable {

@@ -574,6 +574,33 @@ enum AgentToolCardRenderSummaryBuilder {
 
     private static func codeStructureSummary(statusWord: String, rawObject: [String: Any]?, argsObject: [String: Any]?) -> AgentToolCardRenderSummary? {
         guard rawObject != nil || argsObject != nil else { return nil }
+
+        if let rawObject,
+           let summary = rawObject["summary"] as? [String: Any],
+           rawObject["roots"] is [[String: Any]]
+        {
+            let nodes = intValue(summary, keys: ["nodes"]) ?? 0
+            let files = intValue(summary, keys: ["files"]) ?? 0
+            let roots = (rawObject["roots"] as? [[String: Any]])?.count ?? 0
+            let responseStatus = trimmed(stringValue(rawObject, keys: ["status"]))
+            let subtitle = "\(nodes) nodes • \(roots) roots • \(responseStatus ?? "unknown")"
+            let renderStatus: AgentToolCardRenderStatus = switch responseStatus {
+            case "ok": .success
+            case "partial", "pending": .warning
+            case "unavailable": .failure
+            default: status(from: statusWord, defaultStatus: .neutral)
+            }
+            return AgentToolCardRenderSummary(
+                toolName: "get_code_structure",
+                title: "Code Structure",
+                subtitle: subtitle,
+                detailText: files > 0 ? "\(files) rendered signature\(files == 1 ? "" : "s")" : nil,
+                status: renderStatus,
+                op: "get_code_structure"
+            )
+        }
+
+        // Historical transcripts can still contain the pre-cutover file-oriented result.
         let codeObject = selectedCodeStructureObject(rawObject)
         let fileCount = intValue(codeObject, keys: ["file_count", "fileCount"])
         let totalOmitted = codeStructureTotalOmitted(codeObject)
@@ -582,21 +609,14 @@ enum AgentToolCardRenderSummaryBuilder {
         let subtitle: String? = {
             if let fileCount {
                 var parts = ["\(fileCount) files"]
-                if totalOmitted > 0 {
-                    parts.append("\(totalOmitted) omitted")
-                }
-                if unmappedCount > 0 {
-                    parts.append("\(unmappedCount) unmapped")
-                }
+                if totalOmitted > 0 { parts.append("\(totalOmitted) omitted") }
+                if unmappedCount > 0 { parts.append("\(unmappedCount) unmapped") }
                 return parts.joined(separator: " • ")
-            }
-            if trimmed(stringValue(argsObject, keys: ["scope"])) == "selected" {
-                return "selected"
             }
             if let pathCount = arrayValue(argsObject, keys: ["paths"])?.count, pathCount > 0 {
                 return "\(pathCount) path\(pathCount == 1 ? "" : "s")"
             }
-            return nil
+            return "selection"
         }()
         let detailText = codeStructureUnmappedDetail(paths: unmappedPaths, unmappedCount: unmappedCount)
         let baseStatus = status(from: statusWord, defaultStatus: .neutral)
