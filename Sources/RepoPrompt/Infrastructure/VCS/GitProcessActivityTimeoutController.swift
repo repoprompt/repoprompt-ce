@@ -20,9 +20,9 @@ final class GitProcessActivityTimeoutController: @unchecked Sendable {
             var afterTimeoutClaim: (@Sendable (UInt64, Bool) async -> Void)?
             var beforeKillClaim: (@Sendable (UInt64) async -> Void)?
             var afterKillClaim: (@Sendable (UInt64, Bool) async -> Void)?
-            var isProcessRunning: (@Sendable (Process) -> Bool)?
-            var terminate: (@Sendable (Process) -> Void)?
-            var forceKill: (@Sendable (pid_t) -> Void)?
+            var isProcessRunning: (@Sendable (GitProcessLifecycleTarget) -> Bool)?
+            var terminate: (@Sendable (GitProcessLifecycleTarget) -> Bool)?
+            var forceKill: (@Sendable (pid_t) -> Bool)?
 
             init(
                 sleep: (@Sendable (Duration, UInt64, TestingSleepPhase) async throws -> Void)? = nil,
@@ -30,9 +30,9 @@ final class GitProcessActivityTimeoutController: @unchecked Sendable {
                 afterTimeoutClaim: (@Sendable (UInt64, Bool) async -> Void)? = nil,
                 beforeKillClaim: (@Sendable (UInt64) async -> Void)? = nil,
                 afterKillClaim: (@Sendable (UInt64, Bool) async -> Void)? = nil,
-                isProcessRunning: (@Sendable (Process) -> Bool)? = nil,
-                terminate: (@Sendable (Process) -> Void)? = nil,
-                forceKill: (@Sendable (pid_t) -> Void)? = nil
+                isProcessRunning: (@Sendable (GitProcessLifecycleTarget) -> Bool)? = nil,
+                terminate: (@Sendable (GitProcessLifecycleTarget) -> Bool)? = nil,
+                forceKill: (@Sendable (pid_t) -> Bool)? = nil
             ) {
                 self.sleep = sleep
                 self.beforeTimeoutClaim = beforeTimeoutClaim
@@ -74,8 +74,7 @@ final class GitProcessActivityTimeoutController: @unchecked Sendable {
     }
 
     func schedule(
-        process: Process,
-        processIdentifier: pid_t,
+        target: GitProcessLifecycleTarget,
         timeout: Duration,
         terminationGrace: Duration
     ) {
@@ -89,13 +88,51 @@ final class GitProcessActivityTimeoutController: @unchecked Sendable {
         generation &+= 1
         let scheduledGeneration = generation
         task?.cancel()
+
+        // An already-consumed spawn budget is authoritative synchronously.
+        // Do not rely on scheduling a zero-duration Task: a fast child/reaper
+        // could otherwise commit success before the timer runs.
+        if timeout <= .zero {
+            guard isProcessRunning(target) else {
+                task = nil
+                lock.unlock()
+                return
+            }
+            guard terminate(target) else {
+                task = nil
+                lock.unlock()
+                return
+            }
+            timedOut = true
+            task = Task { [self] in
+                do {
+                    try await sleep(
+                        for: terminationGrace,
+                        generation: scheduledGeneration,
+                        phase: .terminationGrace
+                    )
+                    await beforeKillClaim(generation: scheduledGeneration)
+                    let claimedKill = claimKillAndTerminate(
+                        generation: scheduledGeneration,
+                        target: target
+                    )
+                    await afterKillClaim(generation: scheduledGeneration, claimed: claimedKill)
+                } catch {
+                    // Cancellation makes the escalation generation inert.
+                }
+                clearTask(generation: scheduledGeneration)
+            }
+            lock.unlock()
+            return
+        }
+
         task = Task { [self] in
             do {
                 try await sleep(for: timeout, generation: scheduledGeneration, phase: .activityTimeout)
                 await beforeTimeoutClaim(generation: scheduledGeneration)
                 let claimedTimeout = claimTimeoutAndTerminate(
                     generation: scheduledGeneration,
-                    process: process
+                    target: target
                 )
                 await afterTimeoutClaim(generation: scheduledGeneration, claimed: claimedTimeout)
                 guard claimedTimeout else {
@@ -107,8 +144,7 @@ final class GitProcessActivityTimeoutController: @unchecked Sendable {
                 await beforeKillClaim(generation: scheduledGeneration)
                 let claimedKill = claimKillAndTerminate(
                     generation: scheduledGeneration,
-                    process: process,
-                    processIdentifier: processIdentifier
+                    target: target
                 )
                 await afterKillClaim(generation: scheduledGeneration, claimed: claimedKill)
             } catch {
@@ -127,29 +163,30 @@ final class GitProcessActivityTimeoutController: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func claimTimeoutAndTerminate(generation scheduledGeneration: UInt64, process: Process) -> Bool {
+    private func claimTimeoutAndTerminate(
+        generation scheduledGeneration: UInt64,
+        target: GitProcessLifecycleTarget
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard generation == scheduledGeneration, !Task.isCancelled, isProcessRunning(process) else {
+        guard generation == scheduledGeneration, !Task.isCancelled, isProcessRunning(target) else {
             return false
         }
+        guard terminate(target) else { return false }
         timedOut = true
-        terminate(process)
         return true
     }
 
     private func claimKillAndTerminate(
         generation scheduledGeneration: UInt64,
-        process: Process,
-        processIdentifier: pid_t
+        target: GitProcessLifecycleTarget
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard generation == scheduledGeneration, !Task.isCancelled, isProcessRunning(process) else {
+        guard generation == scheduledGeneration, !Task.isCancelled, isProcessRunning(target) else {
             return false
         }
-        forceKill(processIdentifier)
-        return true
+        return forceKill(target)
     }
 
     private func clearTask(generation scheduledGeneration: UInt64) {
@@ -198,32 +235,30 @@ final class GitProcessActivityTimeoutController: @unchecked Sendable {
         #endif
     }
 
-    private func isProcessRunning(_ process: Process) -> Bool {
+    private func isProcessRunning(_ target: GitProcessLifecycleTarget) -> Bool {
         #if DEBUG
             if let isProcessRunning = testingHooks?.isProcessRunning {
-                return isProcessRunning(process)
+                return isProcessRunning(target)
             }
         #endif
-        return process.isRunning
+        return target.isRunning
     }
 
-    private func terminate(_ process: Process) {
+    private func terminate(_ target: GitProcessLifecycleTarget) -> Bool {
         #if DEBUG
             if let terminate = testingHooks?.terminate {
-                terminate(process)
-                return
+                return terminate(target)
             }
         #endif
-        process.terminate()
+        return target.terminate()
     }
 
-    private func forceKill(_ processIdentifier: pid_t) {
+    private func forceKill(_ target: GitProcessLifecycleTarget) -> Bool {
         #if DEBUG
             if let forceKill = testingHooks?.forceKill {
-                forceKill(processIdentifier)
-                return
+                return forceKill(target.processIdentifier)
             }
         #endif
-        kill(processIdentifier, SIGKILL)
+        return target.forceKill()
     }
 }

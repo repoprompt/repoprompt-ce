@@ -26,6 +26,21 @@ public struct ChatStreamOutput {
     public let reasoning: String?
     public let tokens: ChatTokenInfo
     public let isFinal: Bool
+    public let cleanupHandle: ProviderConversationCleanupHandle?
+
+    public init(
+        text: String,
+        reasoning: String?,
+        tokens: ChatTokenInfo,
+        isFinal: Bool,
+        cleanupHandle: ProviderConversationCleanupHandle? = nil
+    ) {
+        self.text = text
+        self.reasoning = reasoning
+        self.tokens = tokens
+        self.isFinal = isFinal
+        self.cleanupHandle = cleanupHandle
+    }
 }
 
 struct PartialBuffer {
@@ -234,6 +249,11 @@ public class AIQueriesService {
         _ message: AIMessage,
         _ model: AIModel
     ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>)
+    typealias CleanupProviderConversationOverride = @Sendable (
+        _ handle: ProviderConversationCleanupHandle,
+        _ model: AIModel,
+        _ action: ProviderConversationCleanupAction
+    ) async -> ProviderConversationCleanupOutcome
 
     private let taskManager = TaskManager()
     private let chunkSizeThreshold = 8000 // e.g. 8KB
@@ -241,15 +261,18 @@ public class AIQueriesService {
     private let providerPool: DisposableProviderPool
     private let keyManager: KeyManager
     private let sendPromptOverride: SendPromptOverride?
+    private let cleanupProviderConversationOverride: CleanupProviderConversationOverride?
     private var currentModel: AIModel
 
     init(
         keyManager: KeyManager,
-        sendPromptOverride: SendPromptOverride? = nil
+        sendPromptOverride: SendPromptOverride? = nil,
+        cleanupProviderConversationOverride: CleanupProviderConversationOverride? = nil
     ) {
         currentModel = .claude4Sonnet
         self.keyManager = keyManager
         self.sendPromptOverride = sendPromptOverride
+        self.cleanupProviderConversationOverride = cleanupProviderConversationOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -258,11 +281,13 @@ public class AIQueriesService {
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
         keyManager: KeyManager,
-        sendPromptOverride: SendPromptOverride? = nil
+        sendPromptOverride: SendPromptOverride? = nil,
+        cleanupProviderConversationOverride: CleanupProviderConversationOverride? = nil
     ) {
         currentModel = model
         self.keyManager = keyManager
         self.sendPromptOverride = sendPromptOverride
+        self.cleanupProviderConversationOverride = cleanupProviderConversationOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -293,9 +318,42 @@ public class AIQueriesService {
         return trimmed.hasPrefix("**") || trimmed.contains("****")
     }
 
+    static func cleanupHandle(for result: AIStreamResult, model: AIModel) -> ProviderConversationCleanupHandle? {
+        if let explicit = result.cleanupHandle {
+            return explicit.hasProviderIdentifier ? explicit : nil
+        }
+        guard let providerSessionID = result.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !providerSessionID.isEmpty
+        else {
+            return nil
+        }
+        let handle = ProviderConversationCleanupHandle(
+            provider: String(describing: model.providerType),
+            sessionID: providerSessionID
+        )
+        return handle.hasProviderIdentifier ? handle : nil
+    }
+
     /// Cancel only the specified stream.
     func cancelStream(id: ChatStreamID) async {
         await taskManager.cancelTask(for: id)
+    }
+
+    func cleanupProviderConversation(
+        handle: ProviderConversationCleanupHandle,
+        model: AIModel,
+        action: ProviderConversationCleanupAction = .delete
+    ) async -> ProviderConversationCleanupOutcome {
+        if let cleanupProviderConversationOverride {
+            return await cleanupProviderConversationOverride(handle, model, action)
+        }
+        do {
+            let provider = try await providerPool.createProvider(for: model)
+            defer { Task { await provider.dispose() } }
+            return await provider.cleanupConversation(handle, action: action)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
     }
 
     func sendPrompt(
@@ -336,6 +394,7 @@ public class AIQueriesService {
                         var wasCancelled = false
                         var sawMessageStop = false
                         var lastTokenInfo: ChatTokenInfo?
+                        var cleanupHandle: ProviderConversationCleanupHandle?
                         let shouldEagerlyFlushReasoning = Self.shouldEagerlyFlushReasoningSummaries(for: model)
 
                         // Loop through the partial stream
@@ -381,6 +440,10 @@ public class AIQueriesService {
                                 }
                             }
 
+                            if let resultCleanupHandle = Self.cleanupHandle(for: result, model: model) {
+                                cleanupHandle = resultCleanupHandle
+                            }
+
                             // Track last known token info for final flush
                             let chunkTokenInfo = ChatTokenInfo(
                                 promptTokens: result.promptTokens,
@@ -405,7 +468,8 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: isFinal
+                                        isFinal: isFinal,
+                                        cleanupHandle: cleanupHandle
                                     )
                                 )
                                 if isFinal {
@@ -429,7 +493,8 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: true
+                                        isFinal: true,
+                                        cleanupHandle: cleanupHandle
                                     )
                                 )
                             }

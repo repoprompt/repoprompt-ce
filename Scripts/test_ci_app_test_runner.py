@@ -265,6 +265,7 @@ class CIAppTestRunnerTests(unittest.TestCase):
                         str(ledger),
                         "--serial-group-policy",
                         str(policy),
+                        "--strict-ledger",
                         "--print-suite-plan-json",
                     ]
                 )
@@ -279,6 +280,133 @@ class CIAppTestRunnerTests(unittest.TestCase):
             [suite["suite"] for suite in payload["parallel_eligible"]],
             ["RepoPromptTests.Free"],
         )
+
+    def test_main_print_suite_plan_json_rejects_missing_suite_when_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ledger = self.write_ledger(
+                root,
+                [
+                    {
+                        "suite": "RepoPromptTests.Known",
+                        "method": "testOne",
+                        "runtime_seconds": "1.0",
+                    },
+                ],
+            )
+            policy = self.write_policy(root)
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    ci_app_test_runner,
+                    "list_suites",
+                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
+                ),
+                mock.patch("sys.stdout", output),
+            ):
+                exit_code = ci_app_test_runner.main(
+                    [
+                        "--ledger",
+                        str(ledger),
+                        "--serial-group-policy",
+                        str(policy),
+                        "--strict-ledger",
+                        "--print-suite-plan-json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            output.getvalue().strip(),
+            "::error::ledger is missing discovered suites: ['RepoPromptTests.Unknown']",
+        )
+
+    def test_main_print_suite_plan_json_rejects_missing_suite_with_parallel_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ledger = self.write_ledger(
+                root,
+                [
+                    {
+                        "suite": "RepoPromptTests.Known",
+                        "method": "testOne",
+                        "runtime_seconds": "1.0",
+                    },
+                ],
+            )
+            policy = self.write_policy(root)
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    ci_app_test_runner,
+                    "list_suites",
+                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
+                ),
+                mock.patch("sys.stdout", output),
+            ):
+                exit_code = ci_app_test_runner.main(
+                    [
+                        "--ledger",
+                        str(ledger),
+                        "--serial-group-policy",
+                        str(policy),
+                        "--workers",
+                        "2",
+                        "--print-suite-plan-json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            output.getvalue().strip(),
+            "::error::ledger is missing discovered suites: ['RepoPromptTests.Unknown']",
+        )
+
+    def test_main_print_suite_plan_json_preserves_non_strict_missing_suite_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ledger = self.write_ledger(
+                root,
+                [
+                    {
+                        "suite": "RepoPromptTests.Known",
+                        "method": "testOne",
+                        "runtime_seconds": "1.0",
+                    },
+                ],
+            )
+            policy = self.write_policy(root)
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    ci_app_test_runner,
+                    "list_suites",
+                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
+                ),
+                mock.patch("sys.stdout", output),
+            ):
+                exit_code = ci_app_test_runner.main(
+                    [
+                        "--ledger",
+                        str(ledger),
+                        "--serial-group-policy",
+                        str(policy),
+                        "--print-suite-plan-json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue())
+        unknown = next(
+            suite
+            for suite in payload["parallel_eligible"]
+            if suite["suite"] == "RepoPromptTests.Unknown"
+        )
+        self.assertEqual(unknown["method_count"], 0)
+        self.assertEqual(unknown["classification"], "parallel_eligible")
 
     def test_main_reports_missing_ledger_file(self) -> None:
         output = io.StringIO()

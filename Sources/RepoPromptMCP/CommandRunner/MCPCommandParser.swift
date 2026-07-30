@@ -703,56 +703,49 @@ enum MCPCommandParser {
             args["mode"] = UncheckedSendableValue(mode)
             return .aliasCall(toolName: "get_file_tree", args: args)
 
-        // Code structure: structure <path> [path2] ... [--scope paths|selected]
+        // Code structure: structure [path ...] [--expand uses|used_by|both] [--depth 1...4] [--size small|medium|large]
+        // Omitting paths targets the current selection.
         case "structure", "struct", "map":
             let remaining = Array(parts.dropFirst())
             let flags = parseFlagArgs(remaining)
+            let allowedFlags: Set = ["paths", "path", "p", "expand", "depth", "signatures", "size"]
+            if let unknown = flags.named.keys.first(where: {
+                !allowedFlags.contains($0.replacingOccurrences(of: "-", with: "_"))
+            }) {
+                throw CommandParseError.invalidArgument("unknown structure flag --\(unknown)")
+            }
 
             var args: [String: UncheckedSendableValue] = [:]
-            let scope = (flags["scope"] ?? flags["s"] ?? "paths").lowercased()
-            args["scope"] = UncheckedSendableValue(scope)
-
             var paths = flags.positional.map { ctx.resolveWorkspacePathArg($0) }
             if let pathsArg = flags["paths"] ?? flags["path"] ?? flags["p"] {
                 paths.append(contentsOf: pathsArg.split(separator: ",").map {
                     ctx.resolveWorkspacePathArg(String($0).trimmingCharacters(in: .whitespaces))
                 })
             }
-            if scope == "selected" {
-                guard paths.isEmpty else {
-                    throw CommandParseError.invalidArgument("paths are forbidden with --scope selected")
-                }
-            } else if paths.isEmpty {
-                throw CommandParseError.missingArgument("file or directory path (or use --scope selected)")
-            } else {
+            if !paths.isEmpty {
                 args["paths"] = UncheckedSendableValue(paths)
             }
 
-            if let direction = flags["direction"] ?? flags["expand"] {
-                var expand: [String: UncheckedSendableValue] = [
-                    "direction": UncheckedSendableValue(direction)
-                ]
-                if let raw = flags["max-depth"] ?? flags["max_depth"] ?? flags["depth"],
-                   let depth = Int(raw)
-                {
-                    expand["max_depth"] = UncheckedSendableValue(depth)
-                }
+            if let expand = flags["expand"] {
                 args["expand"] = UncheckedSendableValue(expand)
             }
-
-            var limits: [String: UncheckedSendableValue] = [:]
-            let limitFlags = [
-                ("max_files", flags["max-files"] ?? flags["max_files"]),
-                ("max_edges", flags["max-edges"] ?? flags["max_edges"]),
-                ("max_codemap_tokens", flags["max-codemap-tokens"] ?? flags["max_codemap_tokens"])
-            ]
-            for (key, raw) in limitFlags {
-                if let raw, let value = Int(raw) {
-                    limits[key] = UncheckedSendableValue(value)
+            if let rawDepth = flags["depth"] {
+                guard let depth = Int(rawDepth), (1 ... 4).contains(depth) else {
+                    throw CommandParseError.invalidArgument("structure --depth must be an integer from 1 through 4")
                 }
+                args["depth"] = UncheckedSendableValue(depth)
             }
-            if !limits.isEmpty {
-                args["limits"] = UncheckedSendableValue(limits)
+            if let rawSignatures = flags["signatures"] {
+                guard let signatures = parseBoolFlag(rawSignatures) else {
+                    throw CommandParseError.invalidArgument("structure --signatures must be true or false")
+                }
+                args["signatures"] = UncheckedSendableValue(signatures)
+            }
+            if let size = flags["size"] {
+                guard ["small", "medium", "large"].contains(size) else {
+                    throw CommandParseError.invalidArgument("structure --size must be small, medium, or large")
+                }
+                args["size"] = UncheckedSendableValue(size)
             }
 
             return .aliasCall(toolName: "get_code_structure", args: args)

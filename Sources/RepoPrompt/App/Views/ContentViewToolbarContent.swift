@@ -9,6 +9,13 @@ struct ContentViewToolbarContent: ToolbarContent {
     @Binding var showMCPServerPopover: Bool
 
     var body: some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            agentChatTitleItem
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            agentChatTitleItem
+        }
+
         // Recommendation wizard button
         ToolbarItem(placement: .automatic) {
             if let wizardVM = recommendationWizardViewModel {
@@ -27,6 +34,19 @@ struct ContentViewToolbarContent: ToolbarContent {
         // Update pill (user-initiated Sparkle UI)
         ToolbarItem(placement: .automatic) {
             UpdateAvailableToolbarPill(sparkleManager: SparkleUpdaterManager.shared)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var agentChatTitleItem: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            AgentChatTitleClusterView(
+                model: windowState.agentChatTitleCluster,
+                menuSnapshot: { [weak windowState] in
+                    windowState?.agentChatTitleClusterMenuSnapshot()
+                },
+                menuActions: windowState.agentChatTitleClusterMenuActions()
+            )
         }
     }
 }

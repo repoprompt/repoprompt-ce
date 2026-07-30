@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-26",
+  "classification": "deterministic_contract_evidence_index_not_live_latency_baseline",
+  "curated_test_ledger": "Scripts/Fixtures/test-suite-contract-ledger.tsv",
+  "checkout_baseline": {
+    "base_commit": "664252ebc85e",
+    "workspace": "repoprompt-ce-release",
+    "tracked_files": 2341,
+    "tracked_source_test_script_files": 1654,
+    "tracked_source_test_script_bytes": 42426964,
+    "classification": "current_checkout_size_snapshot_not_performance_sample"
+  },
+  "capture_constraints": {
+    "visible_app_lifecycle_allowed": false,
+    "live_mcp_round_trip_status": "not_observed_task_prohibited",
+    "reason": "No live command was attempted because the M0 task explicitly prohibited launching, relaunching, or stopping the visible app; this is a constraint record, not an observed blocked execution.",
+    "fallback": "Use an already-running CE debug app and make dev-smoke in a separately authorized later measurement; do not infer live wall-clock latency from unit tests."
+  },
+  "m0_evidence_floors": {
+    "minimum_tracked_files": 2000,
+    "minimum_tracked_source_test_script_files": 1500,
+    "minimum_tracked_source_test_script_bytes": 40000000,
+    "minimum_controlled_queue_age_milliseconds": 250,
+    "minimum_joined_tool_lifecycle_event_count": 14,
+    "minimum_workload_matrix_count": 5,
+    "minimum_response_delivery_event_count": 7,
+    "minimum_durability_stage_count": 2,
+    "minimum_durability_lifecycle_event_count": 4,
+    "required_unique_executable_citations": 3,
+    "minimum_historical_git_command_scenarios": 5
+  },
+  "guarded_stage_contracts": [
+    {
+      "stage": "queue",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "observations": {
+        "ordinary_connection_capacity": 1,
+        "file_search_connection_capacity": 4,
+        "store_search_capacity": 4,
+        "controlled_oldest_waiter_age_milliseconds": 275,
+        "cancelled_waiter_count": 1
+      }
+    },
+    {
+      "stage": "main_actor",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "observations": {
+        "ordered_events": ["MCP.ToolCall.MainActorScheduled", "MCP.ToolCall.MainActorEntered", "MCP.ToolCall.MainActorExited"],
+        "shared_request_identity_required": true
+      }
+    },
+    {
+      "stage": "execution",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "observations": {
+        "joined_tool_lifecycle_event_count": 14,
+        "workload_matrix_count": 5,
+        "workload_matrices": ["same_connection_ordinary_burst", "same_connection_mixed_ordinary_search", "distinct_connections_one_window", "distinct_windows", "agent_transcript_short_vs_long"]
+      }
+    },
+    {
+      "stage": "persistence",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence": "RepoPromptTests.WorkspaceSelectionPersistenceTests/testDiskWriterFlushAndAtomicWriteTelemetryCarryDurabilityAttributionWithoutPaths",
+      "source_file": "Tests/RepoPromptTests/WorkspaceContext/WorkspaceSelectionPersistenceTests.swift",
+      "observations": {
+        "stage_names": ["EditFlow.WorkspaceDurability.FlushWait", "EditFlow.WorkspaceDurability.AtomicWrite"],
+        "lifecycle_events": ["WorkspaceDurability.FlushBegan", "WorkspaceDurability.FlushEnded", "WorkspaceDurability.WriteBegan", "WorkspaceDurability.WriteEnded"],
+        "path_data_in_dimensions": false
+      }
+    },
+    {
+      "stage": "response",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "observations": {
+        "ordered_event_count": 7,
+        "ordered_events": ["frame_accepted", "sdk_decode_completed", "handler_result_ready", "sdk_encode_completed", "transport_write_completed", "frame_committed", "stdout_write_completed"],
+        "shared_request_identity_required": true
+      }
+    }
+  ],
+  "historical_work_count_evidence": {
+    "git_blob": "f2c2693e7956c561dced51fc51fa165676a7efbc",
+    "source_commit": "6f8fcbb",
+    "status": "observed_no_visible_app",
+    "git_commands": {
+      "warm_status": 3,
+      "uncommitted_summary": 6,
+      "quick_artifact": 7,
+      "standard_artifact_with_one_untracked_file": 15,
+      "deep_artifact_with_one_untracked_file": 15
+    },
+    "read_file_fixture": {
+      "full_disk_bytes": 19,
+      "returned_bytes": 7,
+      "returned_lines": 1,
+      "cache_hit": false
+    }
+  },
+  "interpretation": "This is an M0 deterministic contract-evidence index, not a live latency baseline. The checkout counts describe only this checkout. Evidence floors make the referenced queue, MainActor, execution, durability, response, and historical work-count observations substantive; ledger and source-file provenance keep every executable citation resolvable. The artifact does not prove those separate tests passed in the current run, and live latency remains unobserved until measured before M2 no-regression decisions."
+}

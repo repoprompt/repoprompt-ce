@@ -367,6 +367,8 @@ import XCTest
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             manager.resetAppliedIndexProjectionLookupDiagnosticsForTesting()
+            await store.resetFilesInRootRequestCountForTesting()
+            await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
 
             await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
                 rootID: root.id,
@@ -387,6 +389,12 @@ import XCTest
             XCTAssertEqual(diagnostics.directIDLookupMissCount, 2)
             XCTAssertEqual(diagnostics.canonicalResyncCount, 0)
             XCTAssertEqual(diagnostics.handledGenerationByRootID[root.id], canonical.generation)
+            let storeDiagnostics = await store.appliedIndexRecordLookupDiagnosticsForTesting()
+            XCTAssertEqual(storeDiagnostics.lookupRequests, 1)
+            XCTAssertEqual(storeDiagnostics.requestedRecords, 2)
+            XCTAssertEqual(storeDiagnostics.rootSnapshots, 0)
+            let enumerationCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(enumerationCount, 0)
             await manager.unloadAllRootFolders()
         }
 
@@ -486,6 +494,8 @@ import XCTest
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
             _ = try manager.attachRootShell(for: root, workspaceID: UUID())
             manager.resetAppliedIndexProjectionLookupDiagnosticsForTesting()
+            await store.resetFilesInRootRequestCountForTesting()
+            await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
 
             await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
                 rootID: root.id,
@@ -501,6 +511,12 @@ import XCTest
             XCTAssertEqual(diagnostics.directIDLookupMissCount, 1)
             XCTAssertEqual(diagnostics.canonicalResyncCount, 1)
             XCTAssertEqual(diagnostics.handledGenerationByRootID[root.id], canonical.generation)
+            let storeDiagnostics = await store.appliedIndexRecordLookupDiagnosticsForTesting()
+            XCTAssertEqual(storeDiagnostics.lookupRequests, 1)
+            XCTAssertEqual(storeDiagnostics.requestedRecords, 1)
+            XCTAssertEqual(storeDiagnostics.rootSnapshots, 1)
+            let enumerationCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(enumerationCount, 1)
             await manager.unloadAllRootFolders()
         }
 

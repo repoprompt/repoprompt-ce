@@ -143,6 +143,10 @@ PYTHON
 "$SCRIPT_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Staged app SwiftPM resource bundle layout"
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Staged app MCP helper layout"
 "$SCRIPT_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "arm64,x86_64" "Staged public app"
+python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json" verify-bundle \
+    --arch all \
+    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
 "$SCRIPT_DIR/write_app_artifact_manifest.py" verify \
     --app "$APP_BUNDLE" \
     --manifest "$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json" \

@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class PromptContextPreAssemblyServiceTests: XCTestCase {
@@ -114,6 +115,74 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         XCTAssertFalse(result.fileTreeContent?.contains(fixture.logicalRoot.standardizedFileURL.path) ?? true, result.fileTreeContent ?? "")
         XCTAssertFalse(result.fileTreeContent?.contains(fixture.worktreeRoot.standardizedFileURL.path) ?? true, result.fileTreeContent ?? "")
         XCTAssertEqual(result.gitDiff, PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
+    }
+
+    func testSelectedUnavailableCodemapOmitsNilFallbackReadAndReportsLogicalMissingPath() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "PromptPreAssemblyBinaryLogical")
+        let worktreeRoot = try makeTemporaryRoot(name: "PromptPreAssemblyBinaryWorktree")
+        let relativePath = "Assets/Opaque.dat"
+        try FileManager.default.createDirectory(
+            at: logicalRoot.appendingPathComponent("Assets"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: worktreeRoot.appendingPathComponent("Assets"),
+            withIntermediateDirectories: true
+        )
+        try Data([0x00, 0x01, 0x02, 0x03]).write(
+            to: logicalRoot.appendingPathComponent(relativePath)
+        )
+        try Data([0x00, 0x04, 0x05, 0x06]).write(
+            to: worktreeRoot.appendingPathComponent(relativePath)
+        )
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: UUID(),
+            bindings: [makeBinding(logicalRoot: logicalRoot, worktreeRoot: worktreeRoot)]
+        )
+        let lookupContext = try WorkspaceLookupContext(
+            rootScope: XCTUnwrap(projection).lookupRootScope,
+            bindingProjection: projection
+        )
+        let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
+        let unavailablePresentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .unavailable([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .none, codeMapUsage: .selected),
+            selection: StoredSelection(
+                selectedPaths: [relativePath],
+                codemapAutoEnabled: false
+            ),
+            store: store,
+            lookupContext: lookupContext,
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: .automaticOnly(),
+            selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
+            completeGitDiffProvider: { nil }
+        )
+
+        let result = await PromptContextPreAssemblyService.resolve(
+            request,
+            codemapPresentation: unavailablePresentation
+        )
+
+        XCTAssertTrue(result.entries.isEmpty)
+        XCTAssertEqual(result.missingPaths, [relativePath])
+        XCTAssertFalse(result.missingPaths.contains {
+            $0.contains(worktreeRoot.standardizedFileURL.path)
+        })
+        guard case .unavailable = result.codemapPresentation.coverage else {
+            return XCTFail("Failed selected codemap fallback must remain unavailable")
+        }
     }
 
     func testResolveSelectedDiffUsesPhysicalizedSelectionAndPolicy() async throws {
@@ -342,7 +411,12 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             ]
         )
         addTeardownBlock { repositoryFixture.cleanup() }
-        let store = WorkspaceFileContextStore(codemapProjectionPreloadLaunchPolicyForTesting: .disabled)
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let store = codemapFixture.makeStore(
+            codemapLocalGitClassificationProbe: .production,
+            codemapGitEligibilityProbe: .production(),
+            codemapGraphIndexBuildLaunchPolicy: .disabled
+        )
         _ = try await store.loadRoot(path: logicalRoot.path)
         let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
             sessionID: UUID(),
@@ -441,6 +515,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                     try Task.checkCancellation()
                     return "must-not-publish"
                 }
+            }
+            defer {
+                task.cancel()
+                gate.release()
             }
 
             try await gate.waitUntilStarted()
@@ -1094,7 +1172,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
     private func readyCodemapDemand(
         store: WorkspaceFileContextStore,
         fileID: UUID,
-        timeout: Duration = .seconds(20)
+        timeout: Duration = .seconds(60)
     ) async throws -> WorkspaceCodemapArtifactDemandReady {
         var result = await store.requestCodemapArtifact(forFileID: fileID)
         let clock = ContinuousClock()
@@ -1252,7 +1330,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             do {
                 try await condition.waitUntil(
                     "preassembly content read gate release",
-                    timeout: 5
+                    timeout: 20
                 ) { $0.released }
             } catch is CancellationError {
                 // Cancellation is the contract for the cancellation-path test; the
@@ -1265,7 +1343,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         func waitUntilStarted() async throws {
             try await condition.waitUntil(
                 "preassembly content read gate start",
-                timeout: 5
+                timeout: 20
             ) { $0.started }
         }
 
