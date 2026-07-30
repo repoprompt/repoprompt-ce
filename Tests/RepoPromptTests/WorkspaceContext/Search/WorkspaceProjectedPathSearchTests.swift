@@ -4,6 +4,83 @@ import XCTest
 final class WorkspaceProjectedPathSearchTests: XCTestCase {
     private typealias Support = WorkspaceRootSeedTestSupport
 
+    private final class OverlayHistoryDeinitCounter {
+        var count = 0
+    }
+
+    private final class OverlayHistoryDeinitProbe {
+        private let counter: OverlayHistoryDeinitCounter
+
+        init(counter: OverlayHistoryDeinitCounter) {
+            self.counter = counter
+        }
+
+        deinit {
+            counter.count += 1
+        }
+    }
+
+    func testOverlayHistoryPagesPreserveOrderBranchesAndIterativeSharedTailRelease() throws {
+        var base = WorkspacePathSearchOverlayHistory<Int>()
+        for value in 0 ..< 34 {
+            base = base.appending(value)
+        }
+        var baseValues: [Int] = []
+        base.visitNewestFirst { baseValues.append($0) }
+        XCTAssertEqual(baseValues, Array((0 ..< 34).reversed()))
+        XCTAssertEqual(base.metricsForTesting.recentPayloadCount, 0)
+        XCTAssertEqual(base.metricsForTesting.compactedPageCount, 2)
+        XCTAssertTrue(base.metricsForTesting.isWithinStructuralBounds)
+
+        var fullPageBranch = base
+        for value in 34 ..< 51 {
+            fullPageBranch = fullPageBranch.appending(value)
+        }
+        var recentBranch = base.appending(100)
+        recentBranch = recentBranch.appending(101)
+
+        var fullPageValues: [Int] = []
+        fullPageBranch.visitNewestFirst { fullPageValues.append($0) }
+        XCTAssertEqual(fullPageValues, Array((0 ..< 51).reversed()))
+        XCTAssertEqual(fullPageBranch.metricsForTesting.compactedPageCount, 3)
+        XCTAssertTrue(fullPageBranch.metricsForTesting.isWithinStructuralBounds)
+
+        var recentBranchValues: [Int] = []
+        recentBranch.visitNewestFirst { recentBranchValues.append($0) }
+        XCTAssertEqual(recentBranchValues, [101, 100] + Array((0 ..< 34).reversed()))
+        XCTAssertEqual(recentBranch.metricsForTesting.recentPayloadCount, 2)
+        XCTAssertEqual(recentBranch.metricsForTesting.compactedPageCount, 2)
+        XCTAssertTrue(recentBranch.metricsForTesting.isWithinStructuralBounds)
+
+        let payloadsPerPage = 17
+        let retainedPageCount = 512
+        let finalPageCount = 2048
+        let counter = OverlayHistoryDeinitCounter()
+        var retainedHistory: WorkspacePathSearchOverlayHistory<OverlayHistoryDeinitProbe>?
+        var history: WorkspacePathSearchOverlayHistory<OverlayHistoryDeinitProbe>? = .init()
+        for pageIndex in 0 ..< finalPageCount {
+            for _ in 0 ..< payloadsPerPage {
+                history = history?.appending(OverlayHistoryDeinitProbe(counter: counter))
+            }
+            if pageIndex + 1 == retainedPageCount {
+                retainedHistory = history
+            }
+        }
+
+        let metrics = try XCTUnwrap(history?.metricsForTesting)
+        XCTAssertEqual(metrics.recentPayloadCount, 0)
+        XCTAssertEqual(metrics.compactedPageCount, finalPageCount)
+        XCTAssertEqual(metrics.totalPayloadCount, finalPageCount * payloadsPerPage)
+        XCTAssertEqual(metrics.maximumCompactedPagePayloadCount, payloadsPerPage)
+        XCTAssertTrue(metrics.isWithinStructuralBounds)
+
+        history = nil
+        XCTAssertEqual(counter.count, (finalPageCount - retainedPageCount) * payloadsPerPage)
+        XCTAssertEqual(retainedHistory?.metricsForTesting.compactedPageCount, retainedPageCount)
+        retainedHistory = nil
+        XCTAssertEqual(counter.count, finalPageCount * payloadsPerPage)
+    }
+
     func testProjectedMatcherExactlyMatchesFullTargetIndexAcrossQueriesAndLimits() async throws {
         let root = WorkspaceRootRecord(
             name: "Projected Root",
@@ -108,7 +185,7 @@ final class WorkspaceProjectedPathSearchTests: XCTestCase {
         }
     }
 
-    func testRealProjectedPatchesCross32CompactSegmentsAndRetainOlderGenerations() async throws {
+    func testRealProjectedPatchesUseBoundedPagesAndRetainOlderGenerations() async throws {
         let root = WorkspaceRootRecord(name: "Patch Target", fullPath: "/tmp/Patch Target", kind: .sessionWorktree)
         let basePaths = (0 ..< 40).map { "File\($0).swift" }
         let snapshot = try await Support.snapshot(paths: basePaths.map { ($0, "100644") })
@@ -170,7 +247,8 @@ final class WorkspaceProjectedPathSearchTests: XCTestCase {
         assertSearchParity(beyondFormerThreshold, entries: entries, root: root, identity: identity(4))
 
         var retainedBeforeCompaction: WorkspaceSearchRootPathIndex?
-        for iteration in 0 ..< 20 {
+        var retainedSharedPageTail: WorkspaceSearchRootPathIndex?
+        for iteration in 0 ..< 337 {
             let renamedPath = "Cycle\(iteration)-文件.swift"
             entries.removeAll { $0.id == renamedID }
             entries.append(makeEntry(path: renamedPath, id: renamedID, root: root))
@@ -182,25 +260,41 @@ final class WorkspaceProjectedPathSearchTests: XCTestCase {
             )
             if iteration == 12 {
                 retainedBeforeCompaction = beyondFormerThreshold
-                XCTAssertEqual(beyondFormerThreshold.overlaySegmentCountForTesting, 16)
+                XCTAssertEqual(beyondFormerThreshold.overlayHistoryMetricsForTesting.recentPayloadCount, 16)
+                XCTAssertEqual(beyondFormerThreshold.overlayHistoryMetricsForTesting.compactedPageCount, 0)
+                XCTAssertTrue(beyondFormerThreshold.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
+            } else if iteration == 166 {
+                retainedSharedPageTail = beyondFormerThreshold
+                XCTAssertEqual(beyondFormerThreshold.overlayHistoryMetricsForTesting.compactedPageCount, 10)
             }
-            assertSearchParity(
-                beyondFormerThreshold,
-                entries: entries,
-                root: root,
-                identity: identity(UInt64(5 + iteration))
-            )
+            if iteration < 20 || iteration.isMultiple(of: 64) || iteration == 336 {
+                assertSearchParity(
+                    beyondFormerThreshold,
+                    entries: entries,
+                    root: root,
+                    identity: identity(UInt64(5 + iteration))
+                )
+            }
         }
-        XCTAssertLessThanOrEqual(beyondFormerThreshold.overlaySegmentCountForTesting, 16)
+        XCTAssertEqual(beyondFormerThreshold.overlayHistoryMetricsForTesting.recentPayloadCount, 0)
+        XCTAssertEqual(beyondFormerThreshold.overlayHistoryMetricsForTesting.compactedPageCount, 20)
+        XCTAssertEqual(beyondFormerThreshold.overlayHistoryMetricsForTesting.totalPayloadCount, 340)
+        XCTAssertTrue(beyondFormerThreshold.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
         XCTAssertEqual(beyondFormerThreshold.buildKind, .projectedReuse)
         XCTAssertEqual(
-            beyondFormerThreshold.search("Cycle19-文件", limit: 1).map(\.entry.id),
+            beyondFormerThreshold.search("Cycle336-文件", limit: 1).map(\.entry.id),
             [renamedID]
         )
 
         let retained = try XCTUnwrap(retainedBeforeCompaction)
         XCTAssertEqual(retained.search("Cycle12-文件", limit: 1).map(\.entry.id), [renamedID])
-        XCTAssertTrue(retained.search("Cycle19-文件", limit: 1).isEmpty)
+        XCTAssertTrue(retained.search("Cycle336-文件", limit: 1).isEmpty)
+
+        let retainedTail = try XCTUnwrap(retainedSharedPageTail)
+        XCTAssertEqual(retainedTail.search("Cycle166-文件", limit: 1).map(\.entry.id), [renamedID])
+        XCTAssertTrue(retainedTail.search("Cycle336-文件", limit: 1).isEmpty)
+        XCTAssertEqual(retainedTail.overlayHistoryMetricsForTesting.compactedPageCount, 10)
+        XCTAssertTrue(retainedTail.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
 
         XCTAssertEqual(initial.buildKind, .projectedReuse)
         XCTAssertEqual(initial.projectedAccumulatedChangedPathCount, 0)
@@ -256,7 +350,7 @@ final class WorkspaceProjectedPathSearchTests: XCTestCase {
         )
     }
 
-    func testMaterializedOverlaySegmentsCompactWithoutInvalidatingRetainedGeneration() throws {
+    func testMaterializedOverlayHistoryUsesBoundedPagesWithoutInvalidatingRetainedGeneration() throws {
         let root = WorkspaceRootRecord(name: "Segment Root", fullPath: "/tmp/Segment Root")
         let basePaths = (0 ..< 80).map { "Base\($0).swift" }
         let idsByPath = Dictionary(uniqueKeysWithValues: basePaths.map { ($0, UUID()) })
@@ -275,8 +369,9 @@ final class WorkspaceProjectedPathSearchTests: XCTestCase {
         let deletedID = try XCTUnwrap(idsByPath["Base0.swift"])
         var retainedBeforeCompaction: WorkspaceSearchRootPathIndex?
         var retainedEntries: [WorkspaceSearchCatalogEntry] = []
+        var retainedSharedPageTail: WorkspaceSearchRootPathIndex?
 
-        for iteration in 0 ..< 40 {
+        for iteration in 0 ..< 340 {
             entries.removeAll { entry in
                 entry.id == mutableID || (iteration == 0 && entry.id == deletedID)
             }
@@ -293,19 +388,33 @@ final class WorkspaceProjectedPathSearchTests: XCTestCase {
             if iteration == 15 {
                 retainedBeforeCompaction = index
                 retainedEntries = entries
-                XCTAssertEqual(index.overlaySegmentCountForTesting, 16)
+                XCTAssertEqual(index.overlayHistoryMetricsForTesting.recentPayloadCount, 16)
+                XCTAssertEqual(index.overlayHistoryMetricsForTesting.compactedPageCount, 0)
+                XCTAssertTrue(index.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
+            } else if iteration == 169 {
+                retainedSharedPageTail = index
+                XCTAssertEqual(index.overlayHistoryMetricsForTesting.compactedPageCount, 10)
             }
         }
 
-        XCTAssertLessThanOrEqual(index.overlaySegmentCountForTesting, 16)
-        assertSearchParity(index, entries: entries, root: root, identity: identity(40))
+        XCTAssertEqual(index.overlayHistoryMetricsForTesting.recentPayloadCount, 0)
+        XCTAssertEqual(index.overlayHistoryMetricsForTesting.compactedPageCount, 20)
+        XCTAssertEqual(index.overlayHistoryMetricsForTesting.totalPayloadCount, 340)
+        XCTAssertTrue(index.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
+        assertSearchParity(index, entries: entries, root: root, identity: identity(340))
         XCTAssertTrue(index.search("Base0.swift", limit: 10).isEmpty)
-        XCTAssertEqual(index.search("Mutable 39 Å", limit: 10).map(\.entry.id), [mutableID])
+        XCTAssertEqual(index.search("Mutable 339 Å", limit: 10).map(\.entry.id), [mutableID])
 
         let retained = try XCTUnwrap(retainedBeforeCompaction)
         assertSearchParity(retained, entries: retainedEntries, root: root, identity: identity(16))
         XCTAssertEqual(retained.search("Mutable 15 Å", limit: 10).map(\.entry.id), [mutableID])
-        XCTAssertTrue(retained.search("Mutable 39 Å", limit: 10).isEmpty)
+        XCTAssertTrue(retained.search("Mutable 339 Å", limit: 10).isEmpty)
+
+        let retainedTail = try XCTUnwrap(retainedSharedPageTail)
+        XCTAssertEqual(retainedTail.search("Mutable 169 Å", limit: 10).map(\.entry.id), [mutableID])
+        XCTAssertTrue(retainedTail.search("Mutable 339 Å", limit: 10).isEmpty)
+        XCTAssertEqual(retainedTail.overlayHistoryMetricsForTesting.compactedPageCount, 10)
+        XCTAssertTrue(retainedTail.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
     }
 
     func testProjectedMatcherUsesBoundedTopKStorageAndReusableScratch() async {

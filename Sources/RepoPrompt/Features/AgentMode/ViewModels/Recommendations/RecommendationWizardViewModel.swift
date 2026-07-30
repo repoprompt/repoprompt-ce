@@ -1,6 +1,23 @@
 import Combine
 import Foundation
 
+struct RecommendationActionRevisionGuard: Equatable {
+    private(set) var durableRevision: UInt64 = 0
+    private(set) var computedRevision: UInt64?
+
+    var isCurrent: Bool {
+        computedRevision == durableRevision
+    }
+
+    mutating func invalidate() {
+        durableRevision &+= 1
+    }
+
+    mutating func markComputed() {
+        computedRevision = durableRevision
+    }
+}
+
 // MARK: - Wizard Step
 
 /// Identifies wizard steps in the recommendation flow.
@@ -91,6 +108,9 @@ final class RecommendationWizardViewModel: ObservableObject {
     /// Loading state for refresh operations.
     @Published private(set) var isLoading: Bool = false
 
+    /// Workspace and inherited Agent Models scope targeted by the current wizard state.
+    @Published private(set) var target: AgentModelsOperationIdentity?
+
     /// Provider status snapshot.
     @Published private(set) var providerStatus: ProviderStatusSnapshot?
 
@@ -120,6 +140,7 @@ final class RecommendationWizardViewModel: ObservableObject {
     private weak var workspaceManager: WorkspaceManagerViewModel?
     let windowID: Int
     private var cancellables = Set<AnyCancellable>()
+    private var actionRevisionGuard = RecommendationActionRevisionGuard()
 
     // MARK: - Computed Properties
 
@@ -140,6 +161,43 @@ final class RecommendationWizardViewModel: ObservableObject {
     var progressText: String {
         guard !steps.isEmpty else { return "" }
         return "Step \(currentStepIndex + 1) of \(steps.count)"
+    }
+
+    var agentModelsScopeLabel: String? {
+        guard let target else { return nil }
+        return RecommendationWizardScopePresentation.agentModelsScopeLabel(
+            for: target,
+            workspaceName: workspaceManager?.workspace(withID: target.sourceWorkspaceID)?.name
+        )
+    }
+
+    let mcpPresetsScopeLabel = RecommendationWizardScopePresentation.mcpPresetsScopeLabel
+
+    var canApplyRecommendations: Bool {
+        !isLoading && target != nil
+    }
+
+    var applyActionScopeLabels: [String] {
+        switch currentStep {
+        case .intro:
+            var labels: [String] = []
+            if hasActionableAgentModelsRecommendations, let agentModelsScopeLabel {
+                labels.append(agentModelsScopeLabel)
+            }
+            if hasActionableMCPPresetRecommendation {
+                labels.append(mcpPresetsScopeLabel)
+            }
+            return labels
+        case .chatModel, .contextBuilder:
+            return agentModelsScopeLabel.map { [$0] } ?? []
+        case .mcpAgentDefaults:
+            guard recommendations.mcpAgentDefaults?.alreadySatisfied == false else { return [] }
+            return agentModelsScopeLabel.map { [$0] } ?? []
+        case .presets:
+            return [mcpPresetsScopeLabel]
+        case .summary, .none:
+            return []
+        }
     }
 
     /// Whether we can go to the previous step.
@@ -241,9 +299,9 @@ final class RecommendationWizardViewModel: ObservableObject {
     private func setupSubscriptions() {
         // Subscribe to workspace changes - new workspace should start at intro
         workspaceManager?.$activeWorkspaceID
-            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.refresh(navigation: .resetToIntro)
+            .removeDuplicates()
+            .sink { [weak self] workspaceID in
+                self?.handleActiveWorkspaceChange(to: workspaceID)
             }
             .store(in: &cancellables)
 
@@ -276,6 +334,23 @@ final class RecommendationWizardViewModel: ObservableObject {
             }
             .store(in: &cancellables)
         }
+
+        // Inheritance changes replace the target synchronously; profile-only writes
+        // invalidate actions until the debounced recomputation installs fresh state.
+        NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
+            .sink { [weak self] notification in
+                guard let self else { return }
+                invalidateActionsIfRelevant(notification)
+                handlePotentialTargetChange()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
+            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refresh(navigation: .preserveCurrentStep)
+            }
+            .store(in: &cancellables)
 
         // Subscribe to recommendation-related setting changes
         // Filter out notifications that we emitted ourselves to avoid self-triggered loops
@@ -315,19 +390,27 @@ final class RecommendationWizardViewModel: ObservableObject {
     /// Refresh recommendations for the current workspace with specified navigation behavior.
     /// - Parameter navigation: How to handle step navigation after recomputation.
     func refresh(navigation: RefreshNavigationMode = .resetToIntro) {
-        guard let wsID = workspaceManager?.activeWorkspaceID else {
-            steps = []
-            hasActiveRecommendations = false
-            providerStatus = nil
-            currentStepIndex = 0
+        guard let currentTarget = makeCurrentTarget() else {
+            clearComputedState(isLoading: false)
+            target = nil
             return
         }
+        refresh(target: currentTarget, navigation: navigation)
+    }
 
+    private func refresh(
+        target nextTarget: AgentModelsOperationIdentity,
+        navigation: RefreshNavigationMode
+    ) {
+        if target != nextTarget {
+            clearComputedState(isLoading: true)
+        }
+        target = nextTarget
         isLoading = true
         let previousStep = currentStep // snapshot before recompute
 
         // Recompute state (provider status, recommendations, steps)
-        let recs = recomputeState(for: wsID)
+        let recs = recomputeState(for: nextTarget)
         steps = buildSteps(from: recs)
 
         // Navigate based on mode
@@ -345,18 +428,22 @@ final class RecommendationWizardViewModel: ObservableObject {
         }
 
         isLoading = false
+        actionRevisionGuard.markComputed()
     }
 
     /// Recomputes provider status and recommendations, updates core published state except navigation.
     @discardableResult
-    private func recomputeState(for workspaceID: UUID) -> RecommendationSet {
+    private func recomputeState(for identity: AgentModelsOperationIdentity) -> RecommendationSet {
         // 1) Provider status snapshot
         let status = engine.computeProviderStatus()
         providerStatus = status
 
         // 2) Compute + apply mutes
-        let raw = engine.computeRecommendations(for: workspaceID, enabledProviders: appliedRecommendationProviders)
-        let filtered = engine.applyMutedFlags(raw, workspaceID: workspaceID)
+        let raw = engine.computeRecommendations(
+            for: identity,
+            enabledProviders: appliedRecommendationProviders
+        )
+        let filtered = engine.applyMutedFlags(raw, workspaceID: identity.sourceWorkspaceID)
 
         // 3) Update VM state (except step index)
         recommendations = filtered
@@ -369,6 +456,69 @@ final class RecommendationWizardViewModel: ObservableObject {
         }
 
         return filtered
+    }
+
+    private var hasActionableAgentModelsRecommendations: Bool {
+        if let rec = recommendations.chatModel,
+           shouldShowChatModelRecommendation(rec),
+           !rec.isMuted
+        {
+            return true
+        }
+        if let rec = recommendations.contextBuilder, !rec.alreadySatisfied, !rec.isMuted {
+            return true
+        }
+        if let rec = recommendations.mcpAgentDefaults, !rec.alreadySatisfied, !rec.isMuted {
+            return true
+        }
+        return false
+    }
+
+    private var hasActionableMCPPresetRecommendation: Bool {
+        guard let rec = recommendations.mcpPresetExposure else { return false }
+        return !rec.alreadySatisfied && !rec.isMuted
+    }
+
+    private func makeCurrentTarget() -> AgentModelsOperationIdentity? {
+        makeTarget(workspaceID: workspaceManager?.activeWorkspaceID)
+    }
+
+    private func makeTarget(workspaceID: UUID?) -> AgentModelsOperationIdentity? {
+        guard let workspaceID else { return nil }
+        let inheritanceMode = settingsStore.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode
+        return AgentModelsOperationIdentity(
+            sourceWorkspaceID: workspaceID,
+            inheritanceMode: inheritanceMode
+        )
+    }
+
+    private func handleActiveWorkspaceChange(to workspaceID: UUID?) {
+        applyTargetChange(makeTarget(workspaceID: workspaceID))
+    }
+
+    private func handlePotentialTargetChange() {
+        applyTargetChange(makeCurrentTarget())
+    }
+
+    private func applyTargetChange(_ nextTarget: AgentModelsOperationIdentity?) {
+        guard target != nextTarget else { return }
+
+        clearComputedState(isLoading: nextTarget != nil)
+        target = nextTarget
+        if let nextTarget {
+            refresh(target: nextTarget, navigation: .resetToIntro)
+        }
+    }
+
+    private func clearComputedState(isLoading: Bool) {
+        recommendations = RecommendationSet()
+        appliedRecommendations = RecommendationSet()
+        steps = []
+        hasActiveRecommendations = false
+        providerStatus = nil
+        currentStepIndex = 0
+        userDidSelectChatBackend = false
+        self.isLoading = isLoading
     }
 
     /// Updates selectedChatBackend for wizard actions.
@@ -547,28 +697,37 @@ final class RecommendationWizardViewModel: ObservableObject {
 
     /// Apply the current step's recommendation and advance to next step.
     func applyCurrentStep() {
-        guard let wsID = workspaceManager?.activeWorkspaceID else { return }
+        guard let identity = validatedActionIdentity() else { return }
         guard let step = currentStep else { return }
+        var applied = RecommendationSet()
 
         switch step {
         case .chatModel:
             if let rec = recommendations.chatModel {
-                engine.applyChatModelRecommendation(rec, backend: selectedChatBackend, workspaceID: wsID)
+                engine.applyChatModelRecommendation(
+                    rec,
+                    backend: selectedChatBackend,
+                    identity: identity
+                )
+                applied.chatModel = rec
             }
             // Reset explicit selection flag after applying
             userDidSelectChatBackend = false
             shouldReapplyProviderSensitiveRecommendations = false
         case .contextBuilder:
             if let rec = recommendations.contextBuilder {
-                engine.applyContextBuilderRecommendation(rec, workspaceID: wsID)
+                engine.applyContextBuilderRecommendation(rec, identity: identity)
+                applied.contextBuilder = rec
             }
         case .presets:
             if let rec = recommendations.mcpPresetExposure {
                 engine.applyMCPPresetExposure(rec)
+                applied.mcpPresetExposure = rec
             }
         case .mcpAgentDefaults:
             if let rec = recommendations.mcpAgentDefaults, !rec.alreadySatisfied {
-                engine.applyMCPAgentDefaultsRecommendation(rec, workspaceID: wsID)
+                engine.applyMCPAgentDefaultsRecommendation(rec, identity: identity)
+                applied.mcpAgentDefaults = rec
             }
         case .intro, .summary:
             // Nothing to apply for intro/summary
@@ -580,11 +739,7 @@ final class RecommendationWizardViewModel: ObservableObject {
 
         // 2) Notify other view models (PromptViewModel, ContextBuilderAgentViewModel, etc)
         // Pass self as object so our own subscription filters it out
-        NotificationCenter.default.post(
-            name: .recommendationsDidApply,
-            object: self,
-            userInfo: ["workspaceID": wsID]
-        )
+        postRecommendationsDidApply(for: identity, applied: applied)
     }
 
     /// Skip the current step without applying.
@@ -597,7 +752,7 @@ final class RecommendationWizardViewModel: ObservableObject {
 
     /// Mute the current step's recommendation and advance to next step.
     func muteCurrentStep() {
-        guard let wsID = workspaceManager?.activeWorkspaceID else { return }
+        guard let identity = validatedActionIdentity() else { return }
         guard let step = currentStep else { return }
 
         let kind: RecommendationKind? = switch step {
@@ -610,7 +765,7 @@ final class RecommendationWizardViewModel: ObservableObject {
 
         guard let kind else { return }
 
-        engine.mute(kind, workspaceID: wsID)
+        engine.mute(kind, workspaceID: identity.sourceWorkspaceID)
         if step == .chatModel {
             shouldReapplyProviderSensitiveRecommendations = false
         }
@@ -621,8 +776,8 @@ final class RecommendationWizardViewModel: ObservableObject {
 
     /// Mark wizard as completed (call on dismiss or finish).
     func markCompleted() {
-        guard let wsID = workspaceManager?.activeWorkspaceID else { return }
-        engine.markWizardCompleted(workspaceID: wsID)
+        guard let identity = validatedActionIdentity() else { return }
+        engine.markWizardCompleted(workspaceID: identity.sourceWorkspaceID)
     }
 
     /// Reset to intro step (shows status view when no active recommendations).
@@ -640,11 +795,10 @@ final class RecommendationWizardViewModel: ObservableObject {
 
         if didApply {
             // Post notification so PromptVM/ContextBuilderVM can update bindings correctly
-            NotificationCenter.default.post(
-                name: .recommendationsDidApply,
-                object: self,
-                userInfo: ["workspaceID": workspaceID]
-            )
+            postAgentModelsRecommendationsDidApply(for: AgentModelsOperationIdentity(
+                sourceWorkspaceID: workspaceID,
+                scope: .global
+            ))
         }
 
         // Refresh wizard state to reflect any changes
@@ -661,11 +815,10 @@ final class RecommendationWizardViewModel: ObservableObject {
 
         if didApply {
             // Post notification so PromptVM/ContextBuilderVM can update bindings correctly
-            NotificationCenter.default.post(
-                name: .recommendationsDidApply,
-                object: self,
-                userInfo: ["workspaceID": wsID]
-            )
+            postAgentModelsRecommendationsDidApply(for: AgentModelsOperationIdentity(
+                sourceWorkspaceID: wsID,
+                scope: .global
+            ))
         }
     }
 
@@ -677,22 +830,24 @@ final class RecommendationWizardViewModel: ObservableObject {
     /// Apply all recommendations at once (for quick setup).
     /// After applying, verifies by recomputing recommendations before deciding whether to show Summary.
     func applyAllRecommendations() {
-        guard let wsID = workspaceManager?.activeWorkspaceID else {
-            return
-        }
+        guard let identity = validatedActionIdentity() else { return }
 
         // Only apply and track unsatisfied, non-muted recommendations
         var applied = RecommendationSet()
 
         if let rec = recommendations.chatModel, shouldShowChatModelRecommendation(rec), !rec.isMuted {
-            engine.applyChatModelRecommendation(rec, backend: selectedChatBackend, workspaceID: wsID)
+            engine.applyChatModelRecommendation(
+                rec,
+                backend: selectedChatBackend,
+                identity: identity
+            )
             applied.chatModel = rec
             // Reset explicit selection flag after applying
             userDidSelectChatBackend = false
             shouldReapplyProviderSensitiveRecommendations = false
         }
         if let rec = recommendations.contextBuilder, !rec.alreadySatisfied, !rec.isMuted {
-            engine.applyContextBuilderRecommendation(rec, workspaceID: wsID)
+            engine.applyContextBuilderRecommendation(rec, identity: identity)
             applied.contextBuilder = rec
         }
         if let rec = recommendations.mcpPresetExposure, !rec.alreadySatisfied, !rec.isMuted {
@@ -700,21 +855,17 @@ final class RecommendationWizardViewModel: ObservableObject {
             applied.mcpPresetExposure = rec
         }
         if let rec = recommendations.mcpAgentDefaults, !rec.alreadySatisfied, !rec.isMuted {
-            engine.applyMCPAgentDefaultsRecommendation(rec, workspaceID: wsID)
+            engine.applyMCPAgentDefaultsRecommendation(rec, identity: identity)
             applied.mcpAgentDefaults = rec
         }
 
         appliedRecommendations = applied
 
-        // Post single notification AFTER all recommendations applied
-        // Pass self as object so our own subscription filters it out
-        NotificationCenter.default.post(
-            name: .recommendationsDidApply,
-            object: self,
-            userInfo: ["workspaceID": wsID]
-        )
+        // Notify each unique affected scope AFTER all recommendations are applied.
+        // Pass self as object so our own subscription filters the notifications out.
+        postRecommendationsDidApply(for: identity, applied: applied)
 
-        markCompleted()
+        engine.markWizardCompleted(workspaceID: identity.sourceWorkspaceID)
 
         // Verify the settings actually satisfy recommendations before clearing the UI.
         refresh(navigation: .preserveCurrentStep)
@@ -725,11 +876,33 @@ final class RecommendationWizardViewModel: ObservableObject {
         }
     }
 
+    private func postRecommendationsDidApply(
+        for identity: AgentModelsOperationIdentity,
+        applied: RecommendationSet
+    ) {
+        RecommendationApplyNotification.post(
+            sourceWorkspaceID: identity.sourceWorkspaceID,
+            agentModelsScope: applied.hasAgentModelsRecommendations ? identity.scope : nil,
+            includesPresetExposure: applied.mcpPresetExposure != nil,
+            object: self
+        )
+    }
+
+    private func postAgentModelsRecommendationsDidApply(for identity: AgentModelsOperationIdentity) {
+        RecommendationApplyNotification.post(
+            sourceWorkspaceID: identity.sourceWorkspaceID,
+            agentModelsScope: identity.scope,
+            includesPresetExposure: false,
+            object: self
+        )
+    }
+
     // MARK: - Mute Recommendations
 
     /// Mute a recommendation and skip to next step.
     func muteAndSkip(_ kind: RecommendationKind) {
-        guard let wsID = workspaceManager?.activeWorkspaceID else { return }
+        guard let identity = validatedActionIdentity() else { return }
+        let wsID = identity.sourceWorkspaceID
 
         engine.mute(kind, workspaceID: wsID)
 
@@ -757,7 +930,8 @@ final class RecommendationWizardViewModel: ObservableObject {
 
     /// Unmute a recommendation and refresh.
     func unmute(_ kind: RecommendationKind) {
-        guard let wsID = workspaceManager?.activeWorkspaceID else { return }
+        guard let identity = validatedActionIdentity() else { return }
+        let wsID = identity.sourceWorkspaceID
 
         engine.unmute(kind, workspaceID: wsID)
 
@@ -779,6 +953,31 @@ final class RecommendationWizardViewModel: ObservableObject {
     }
 
     // MARK: - Private Helpers
+
+    private func validatedActionIdentity() -> AgentModelsOperationIdentity? {
+        guard let target,
+              target == makeCurrentTarget(),
+              actionRevisionGuard.isCurrent
+        else {
+            refresh(navigation: .preserveCurrentStep)
+            return nil
+        }
+        return target
+    }
+
+    private func invalidateActionsIfRelevant(_ notification: Notification) {
+        guard let target else { return }
+        let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+        switch target.scope {
+        case .global:
+            guard scopeRaw == AgentModelsSettingsNotification.Scope.global.rawValue else { return }
+        case let .workspace(workspaceID):
+            guard scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+                  notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID == workspaceID
+            else { return }
+        }
+        actionRevisionGuard.invalidate()
+    }
 
     /// Build wizard steps based on available recommendations.
     /// Only includes steps for recommendations that need action (not satisfied and not muted).

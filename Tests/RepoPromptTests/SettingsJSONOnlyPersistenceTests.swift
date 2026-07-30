@@ -188,6 +188,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
+        defaults.set(true, forKey: "telemetry.enabled")
         let store = GlobalSettingsStore(
             defaults: defaults,
             fileStore: GlobalSettingsFileStore(fileURL: fileURL, now: { Date(timeIntervalSince1970: 0) })
@@ -195,6 +196,99 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertFalse(store.telemetryEnabled())
         XCTAssertEqual(defaults.object(forKey: "telemetry.enabled") as? Bool, false)
+    }
+
+    func testBlockedSchemaTelemetryMirrorPreservesExistingValueAndDefaultsAbsentMirrorOff() throws {
+        let blockedDocuments: [(name: String, json: String, reason: GlobalSettingsPersistenceBlockReason)] = [
+            (
+                "future",
+                #"{"schemaVersion":999,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-07-11T00:00:00Z"}"#,
+                .unsupportedFutureSchema(
+                    onDiskVersion: 999,
+                    supportedVersion: GlobalSettingsDocument.currentSchemaVersion
+                )
+            ),
+            (
+                "incompatible",
+                #"{"schemaVersion":4,"updatedAt":"2026-07-11T00:00:00Z"}"#,
+                .incompatibleSchema
+            )
+        ]
+
+        for blocked in blockedDocuments {
+            for priorMirror in [Optional(true), Optional(false), nil] {
+                let temp = try makeTempDirectory()
+                defer { try? FileManager.default.removeItem(at: temp) }
+                let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+                try FileManager.default.createDirectory(
+                    at: fileURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try Data(blocked.json.utf8).write(to: fileURL)
+                let defaults = try makeIsolatedDefaults()
+                if let priorMirror {
+                    defaults.set(priorMirror, forKey: "telemetry.enabled")
+                }
+
+                let store = GlobalSettingsStore(
+                    defaults: defaults,
+                    fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+                )
+                let expected = priorMirror ?? false
+
+                XCTAssertEqual(store.persistenceBlockReason, blocked.reason, blocked.name)
+                XCTAssertEqual(defaults.object(forKey: "telemetry.enabled") as? Bool, expected, blocked.name)
+                XCTAssertEqual(store.telemetryEnabled(), expected, blocked.name)
+                XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), blocked.json, blocked.name)
+            }
+        }
+    }
+
+    func testMissingTelemetrySettingsRemovesStaleMirrorAndUsesBuildDefault() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: "telemetry.enabled")
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        XCTAssertNil(defaults.object(forKey: "telemetry.enabled"))
+        #if REPOPROMPT_SENTRY_ENABLED
+            XCTAssertTrue(store.telemetryEnabled())
+        #else
+            XCTAssertFalse(store.telemetryEnabled())
+        #endif
+    }
+
+    func testSuccessfulRecoveryResynchronizesTelemetryMirror() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(
+            #"{"schemaVersion":999,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-07-11T00:00:00Z"}"#.utf8
+        ).write(to: fileURL)
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: "telemetry.enabled")
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertTrue(store.telemetryEnabled())
+
+        XCTAssertTrue(store.recoverBlockedPersistenceAfterBackup())
+
+        XCTAssertNil(store.persistenceBlockReason)
+        XCTAssertNil(defaults.object(forKey: "telemetry.enabled"))
+        #if REPOPROMPT_SENTRY_ENABLED
+            XCTAssertTrue(store.telemetryEnabled())
+        #else
+            XCTAssertFalse(store.telemetryEnabled())
+        #endif
     }
 
     func testTelemetryJSONValueOverridesStaleEnabledMirror() throws {
@@ -235,11 +329,12 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
     }
 
     func testSentryScrubStringRedactsSensitiveValues() {
-        let raw = "token=abcdef password:sekret /Users/\(NSUserName())/project 192.168.1.42"
+        let raw = "token=abcdef password:sekret /Users/alice/project 192.168.1.42"
         let scrubbed = SentryTelemetryBootstrap.scrubStringForTesting(raw)
 
         XCTAssertFalse(scrubbed.contains("abcdef"))
         XCTAssertFalse(scrubbed.contains("sekret"))
+        XCTAssertFalse(scrubbed.contains("/Users/alice"))
         XCTAssertFalse(scrubbed.contains("192.168.1.42"))
         XCTAssertFalse(scrubbed.contains("/Users/\(NSUserName())"))
         XCTAssertTrue(scrubbed.contains("token=[redacted]"))
@@ -556,7 +651,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let fileStore = GlobalSettingsFileStore(fileURL: fileURL, now: { Date(timeIntervalSince1970: 0) })
         let document = fileStore.loadOrCreateDefault()
 
-        XCTAssertEqual(document.schemaVersion, GlobalSettingsDocument.currentSchemaVersion)
+        XCTAssertEqual(document.schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
         XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
         let backupDirectory = fileURL.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true)
         let backups = try FileManager.default.contentsOfDirectory(atPath: backupDirectory.path)
@@ -574,7 +669,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
         let document = fileStore.loadOrCreateDefault()
 
-        XCTAssertEqual(document.schemaVersion, GlobalSettingsDocument.currentSchemaVersion)
+        XCTAssertEqual(document.schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
         let preserved = try String(contentsOf: fileURL, encoding: .utf8)
         XCTAssertEqual(preserved, futureJSON)
         XCTAssertThrowsError(try fileStore.save(GlobalSettingsDocument())) { error in
@@ -693,6 +788,122 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(reloaded.showDatesInMessageTimestamps())
     }
 
+    func testAgentSessionHandoffInstructionsDefaultsEmptyWithoutMaterializing() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        let before = try Data(contentsOf: fileURL)
+
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), "")
+        XCTAssertNil(try GlobalSettingsFileStore(fileURL: fileURL).load().scalarPreferences?.agentMode?.agentSessionHandoffInstructions)
+        XCTAssertEqual(try Data(contentsOf: fileURL), before)
+    }
+
+    func testAgentSessionHandoffInstructionsSavesAndReloadsVerbatim() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let instructions = "  Leading whitespace\n\nTrailing whitespace  \n"
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(instructions))
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), instructions)
+        XCTAssertEqual(try makeStore(at: fileURL).agentSessionHandoffInstructions(), instructions)
+    }
+
+    func testAgentSessionHandoffInstructionsClearRemovesOptionalField() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions("Saved default"))
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(""))
+
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), "")
+        XCTAssertNil(try GlobalSettingsFileStore(fileURL: fileURL).load().scalarPreferences?.agentMode?.agentSessionHandoffInstructions)
+    }
+
+    func testAgentSessionHandoffInstructionsNoOpClearDoesNotRewriteFile() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        let before = try Data(contentsOf: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(""))
+        XCTAssertEqual(try Data(contentsOf: fileURL), before)
+    }
+
+    func testAgentSessionHandoffInstructionsPreservesAgentModeSiblings() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let siblings = GlobalScalarPreferences.AgentModeSettings(
+            proEditAgentMode: true,
+            proEditAgentKind: "codexExec",
+            proEditAgentModel: "gpt-test",
+            proEditAgentModeMigrated: true,
+            agentAutoExpandToolCards: false,
+            maxBackgroundAgentComposeTabs: 9,
+            showBuiltInWorkflowCleanupGuidance: false,
+            codexGoalSupportEnabled: true,
+            codexReasoningSummariesEnabled: false,
+            providerConversationCleanupAction: "delete",
+            restrictMCPAgentDiscoveryToRoleLabels: true
+        )
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: siblings)
+        ))
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions("Saved default"))
+        XCTAssertEqual(
+            try fileStore.load().scalarPreferences?.agentMode,
+            GlobalScalarPreferences.AgentModeSettings(
+                proEditAgentMode: true,
+                proEditAgentKind: "codexExec",
+                proEditAgentModel: "gpt-test",
+                proEditAgentModeMigrated: true,
+                agentAutoExpandToolCards: false,
+                maxBackgroundAgentComposeTabs: 9,
+                showBuiltInWorkflowCleanupGuidance: false,
+                codexGoalSupportEnabled: true,
+                codexReasoningSummariesEnabled: false,
+                providerConversationCleanupAction: "delete",
+                restrictMCPAgentDiscoveryToRoleLabels: true,
+                agentSessionHandoffInstructions: "Saved default"
+            )
+        )
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(""))
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.agentMode, siblings)
+    }
+
+    func testAgentSessionHandoffInstructionsSetterEnforcesCharacterLimitWithoutMutation() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        let maximum = AgentSessionHandoffInstructionsPolicy.maximumCharacterCount
+        let accepted = String(repeating: "a", count: maximum)
+        let rejected = accepted + "b"
+
+        XCTAssertTrue(store.setAgentSessionHandoffInstructions(accepted))
+        XCTAssertEqual(try makeStore(at: fileURL).agentSessionHandoffInstructions(), accepted)
+        let beforeRejectedWrite = try Data(contentsOf: fileURL)
+
+        XCTAssertFalse(store.setAgentSessionHandoffInstructions(rejected))
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), accepted)
+        XCTAssertEqual(try Data(contentsOf: fileURL), beforeRejectedWrite)
+        XCTAssertEqual(
+            try GlobalSettingsFileStore(fileURL: fileURL).load().scalarPreferences?.agentMode?.agentSessionHandoffInstructions,
+            accepted
+        )
+    }
+
     // MARK: - Cross-window observability & persistence-block recovery
 
     private func makeStore(at fileURL: URL) throws -> GlobalSettingsStore {
@@ -788,7 +999,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temp) }
         let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let versionFourJSON = #"{"schemaVersion":4,"updatedAt":"2026-06-27T13:11:41Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"agentModelsSettingsByWorkspaceID":{"workspace-1":{"selectedAgentRaw":"claudeCode"}},"globalDefaults":{"discoverAgentRaw":"claudeCode","discoverModelsByAgent":{"claudeCode":"haiku"}},"scalarPreferences":{"ui":{"appearanceMode":"dark"},"modelSelection":{"planningModel":"haiku"}}}"#
+        let versionFourJSON = #"{"schemaVersion":4,"updatedAt":"2026-06-27T13:11:41Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"agentModelsSettingsByWorkspaceID":{"workspace-1":{"selectedAgentRaw":"claudeCode"}},"globalDefaults":{"discoverAgentRaw":"claudeCode","discoverModelsByAgent":{"claudeCode":"haiku"}},"scalarPreferences":{"ui":{"appearanceMode":"dark"},"modelSelection":{"planningModel":"haiku"},"agentMode":{"agentSessionHandoffInstructions":"  Imported verbatim  "}}}"#
         try Data(versionFourJSON.utf8).write(to: fileURL)
 
         let store = try makeStore(at: fileURL)
@@ -800,6 +1011,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(store.globalContextBuilderAgentSelection().agentRaw, "claudeCode")
         XCTAssertEqual(store.globalContextBuilderAgentSelection().modelRaw, "haiku")
         XCTAssertEqual(store.planningModelRaw(), "haiku")
+        XCTAssertEqual(store.agentSessionHandoffInstructions(), "  Imported verbatim  ")
 
         let persisted = try String(contentsOf: fileURL, encoding: .utf8)
         XCTAssertTrue(persisted.contains(#""schemaVersion" : 4"#))
@@ -939,6 +1151,360 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(post.globalContextBuilderAgentSelection().agentRaw, "codexExec", "saves must persist again after recovery")
     }
 
+    // MARK: - Content-derived schema and compatibility repair
+
+    func testBaselineAndDefaultContentUseSchemaV2InMemoryAndOnDisk() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+
+        let created = fileStore.loadOrCreateDefault()
+        XCTAssertEqual(created.schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
+        XCTAssertEqual(try fileStore.load().schemaVersion, created.schemaVersion)
+
+        try fileStore.save(GlobalSettingsDocument(scalarPreferences: seededScalarPreferences()))
+        XCTAssertEqual(try fileStore.load().schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
+    }
+
+    func testCompatibleLineagedSchemaV2LoadDoesNotRewriteBytes() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = Data(lineagedBaselineJSON.utf8)
+        try original.write(to: fileURL)
+
+        let loaded = try GlobalSettingsFileStore(fileURL: fileURL).load()
+
+        XCTAssertEqual(loaded.schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
+    func testWorkspaceAgentModelsUsesFixedFeatureSchemaV4() {
+        let document = GlobalSettingsDocument(
+            agentModelsSettings: [UUID(): WorkspaceAgentModelsSettings(inheritanceMode: .useWorkspaceOverrides)]
+        )
+
+        XCTAssertEqual(GlobalSettingsDocument.workspaceAgentModelsSchemaVersion, 4)
+        XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+    }
+
+    func testFalseV4BacksUpExactBytesNormalizesOnlyHeaderAndIsIdempotent() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = Data(falseV4JSON(includeEmptyAgentModelsObject: true).utf8)
+        try original.write(to: fileURL)
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let loaded = try GlobalSettingsFileStore(fileURL: fileURL, now: { now }).load()
+
+        XCTAssertEqual(loaded.schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
+        let backupDirectory = fileURL.deletingLastPathComponent().appendingPathComponent("Backups")
+        let backups = try falseV4Backups(in: backupDirectory)
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(backups.first)), original)
+
+        var expected = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String: Any])
+        expected["schemaVersion"] = GlobalSettingsDocument.baselineSchemaVersion
+        let actual = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        XCTAssertEqual(
+            try JSONSerialization.data(withJSONObject: actual, options: [.sortedKeys]),
+            try JSONSerialization.data(withJSONObject: expected, options: [.sortedKeys])
+        )
+        XCTAssertEqual(
+            loaded.scalarPreferences?.agentMode?.agentSessionHandoffInstructions,
+            "  Preserve raw instructions  "
+        )
+
+        var rollbackWriter = try FrozenV1028GlobalSettingsDocument.load(from: fileURL)
+        rollbackWriter.setAppearanceMode("Light")
+        try rollbackWriter.save(to: fileURL, now: now.addingTimeInterval(1))
+        XCTAssertEqual(
+            try GlobalSettingsFileStore(fileURL: fileURL, now: { now }).load().schemaVersion,
+            GlobalSettingsDocument.baselineSchemaVersion
+        )
+        XCTAssertEqual(try falseV4Backups(in: backupDirectory).count, 1)
+    }
+
+    func testFalseV4WithoutWorkspaceProfilesKeyAlsoNormalizes() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(falseV4JSON(includeEmptyAgentModelsObject: false).utf8).write(to: fileURL)
+
+        XCTAssertEqual(
+            try GlobalSettingsFileStore(fileURL: fileURL).load().schemaVersion,
+            GlobalSettingsDocument.baselineSchemaVersion
+        )
+    }
+
+    func testFalseV4PresentNullAndWrongShapeArePreservedAndLatchSaves() throws {
+        for (index, rawValue) in ["null", "[]", #""invalid""#].enumerated() {
+            let temp = try makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            let fileURL = temp.appendingPathComponent("Settings-\(index)/globalSettings.json")
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let original = Data(falseV4JSON(rawAgentModelsValue: rawValue).utf8)
+            try original.write(to: fileURL)
+            let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+
+            let store = try GlobalSettingsStore(
+                defaults: makeIsolatedDefaults(),
+                fileStore: fileStore
+            )
+
+            XCTAssertEqual(store.persistenceBlockReason, .automaticSchemaNormalizationFailed)
+            XCTAssertFalse(fileStore.performUserInitiatedCompatibleImport())
+            store.setShowTooltips(false)
+            XCTAssertFalse(store.retryBlockedPersistenceSave())
+            XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        }
+    }
+
+    func testFalseV4WorkspaceOverridesRemainV4WithoutBackup() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let workspaceID = UUID()
+        let json = """
+        {"schemaVersion":4,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-05-20T00:00:00Z",
+        "copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},
+        "agentModelsSettingsByWorkspaceID":{"\(workspaceID.uuidString)":{"inheritanceMode":"useWorkspaceOverrides","profile":null}},
+        "globalDefaults":{},"scalarPreferences":{}}
+        """
+        let original = Data(json.utf8)
+        try original.write(to: fileURL)
+
+        XCTAssertThrowsError(try FrozenV1028GlobalSettingsDocument.load(from: fileURL)) { error in
+            XCTAssertEqual(
+                error as? FrozenV1028GlobalSettingsDocument.CompatibilityError,
+                .unsupportedFutureSchema(GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+            )
+        }
+        let document = try GlobalSettingsFileStore(fileURL: fileURL).load()
+
+        XCTAssertEqual(document.schemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fileURL.deletingLastPathComponent().appendingPathComponent("Backups").path
+        ))
+    }
+
+    func testFalseV4PartialDecodeIsPreservedAndBlocksAutomaticSaves() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = Data(
+            #"{"schemaVersion":4,"schemaLineage":"repoprompt-ce.global-settings","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{},"scalarPreferences":{},"unknown":{"keep":true}}"#.utf8
+        )
+        try original.write(to: fileURL)
+
+        let store = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        XCTAssertEqual(store.persistenceBlockReason, .automaticSchemaNormalizationFailed)
+        store.setShowTooltips(false)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
+    func testFalseV4BackupFailurePreservesOriginalAndBlocksAutomaticAndLaterSaves() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = Data(falseV4JSON(includeEmptyAgentModelsObject: true).utf8)
+        try original.write(to: fileURL)
+        var atomicWriteCalled = false
+        let fileStore = GlobalSettingsFileStore(
+            fileURL: fileURL,
+            normalizationBackupWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) },
+            normalizationAtomicWriter: { _, _ in atomicWriteCalled = true }
+        )
+
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+
+        XCTAssertEqual(store.persistenceBlockReason, .automaticSchemaNormalizationFailed)
+        XCTAssertFalse(atomicWriteCalled)
+        store.setAppearanceModeRaw("Dark")
+        XCTAssertFalse(store.retryBlockedPersistenceSave())
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
+    func testFalseV4AtomicWriteFailurePreservesOriginalAfterExactBackup() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = Data(falseV4JSON(includeEmptyAgentModelsObject: false).utf8)
+        try original.write(to: fileURL)
+        var backedUpData: Data?
+        let fileStore = GlobalSettingsFileStore(
+            fileURL: fileURL,
+            normalizationBackupWriter: { data, url in
+                backedUpData = data
+                try data.write(to: url, options: .atomic)
+            },
+            normalizationAtomicWriter: { _, _ in throw CocoaError(.fileWriteOutOfSpace) }
+        )
+
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+
+        XCTAssertEqual(backedUpData, original)
+        XCTAssertEqual(store.persistenceBlockReason, .automaticSchemaNormalizationFailed)
+        store.setUseTransparency(false)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
+    func testSessionPersistenceBlockDismissalResetsOnReasonChangeAndUnblock() throws {
+        let (store, fileURL) = try makeBlockedStore(
+            json: #"{"schemaVersion":999,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-05-20T00:00:00Z"}"#
+        )
+        store.dismissCurrentPersistenceBlockForSession()
+        XCTAssertTrue(store.isCurrentPersistenceBlockDismissedForSession)
+
+        try Data(#"{"unexpected":true}"#.utf8).write(to: fileURL)
+        XCTAssertFalse(store.reloadFromDisk())
+        XCTAssertEqual(store.persistenceBlockReason, .incompatibleSchema)
+        XCTAssertFalse(store.isCurrentPersistenceBlockDismissedForSession)
+
+        store.dismissCurrentPersistenceBlockForSession()
+        try Data(lineagedBaselineJSON.utf8).write(to: fileURL)
+        XCTAssertTrue(store.reloadFromDisk())
+        XCTAssertNil(store.persistenceBlockReason)
+        XCTAssertFalse(store.isCurrentPersistenceBlockDismissedForSession)
+    }
+
+    func testSessionPersistenceBlockDismissalAndObsoleteDurableValueDoNotSurviveRelaunch() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let blockedJSON = #"{"schemaVersion":999,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-05-20T00:00:00Z"}"#
+        try Data(blockedJSON.utf8).write(to: fileURL)
+        let defaults = try makeIsolatedDefaults()
+        defaults.set("obsolete", forKey: "settings.persistenceBlockSuppressionSignature")
+        let first = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+        first.dismissCurrentPersistenceBlockForSession()
+        XCTAssertTrue(first.isCurrentPersistenceBlockDismissedForSession)
+
+        let relaunched = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        XCTAssertFalse(relaunched.isCurrentPersistenceBlockDismissedForSession)
+        XCTAssertNotNil(relaunched.persistenceBlockReason)
+    }
+
+    func testV1028ProductionStoreOldNewOldRoundTrip() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let workspaceID = UUID()
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let copy = CopyGlobalSettings(
+            workspaceID: workspaceID,
+            fileTreeOption: .files,
+            codeMapUsage: .complete,
+            gitInclusion: .all
+        )
+        let chat = ChatGlobalSettings(
+            workspaceID: workspaceID,
+            fileTreeOption: .files,
+            codeMapUsage: .complete,
+            gitInclusion: .all,
+            planActMode: .plan,
+            proFileEdits: true,
+            discoveryTokenBudget: 64000,
+            discoveryEnhancementMode: "enhance"
+        )
+        try fileStore.save(GlobalSettingsDocument(
+            copySettings: [workspaceID: copy],
+            chatSettings: [workspaceID: chat],
+            globalDefaults: GlobalDefaults(
+                discoverAgentRaw: nil,
+                discoverModelsByAgent: nil,
+                discoveryTokenBudget: 48000,
+                discoveryEnhancementMode: "enhance",
+                recommendationSchemaVersion: 7,
+                tokenBudgetSchemaVersion: 3,
+                codeMapsGloballyDisabled: true
+            ),
+            scalarPreferences: GlobalScalarPreferences(
+                ui: .init(appearanceMode: "Dark", useTransparency: false, showTooltips: true),
+                promptPackaging: .init(
+                    promptSectionsOrder: "prompt,files",
+                    duplicateUserInstructionsAtTop: true,
+                    filePathDisplayOption: "Full",
+                    selectedFilesSortMethod: "nameAscending",
+                    fileEditFormat: "Diff",
+                    modelTemperature: 0.3,
+                    setModelTemperature: true
+                ),
+                modelSelection: .init(preferredComposeModel: "claude-sonnet", planningModel: "gpt-5"),
+                mcp: .init(autoStart: true, showModelPresets: true),
+                agentMode: .init(proEditAgentMode: true, maxBackgroundAgentComposeTabs: 4)
+            )
+        ))
+
+        var root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        var chats = try XCTUnwrap(root["chatSettingsByWorkspaceID"] as? [String: Any])
+        var legacyChat = try XCTUnwrap(chats[workspaceID.uuidString] as? [String: Any])
+        legacyChat["contextBuilderAgentRaw"] = "codexExec"
+        legacyChat["contextBuilderAgentModelRaw"] = "gpt-5.2-codex"
+        chats[workspaceID.uuidString] = legacyChat
+        root["chatSettingsByWorkspaceID"] = chats
+        try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            .write(to: fileURL, options: .atomic)
+
+        var oldWriter = try FrozenV1028GlobalSettingsDocument.load(from: fileURL)
+        XCTAssertEqual(oldWriter.schemaVersion, FrozenV1028GlobalSettingsDocument.schemaVersion)
+        oldWriter.setAppearanceMode("Light")
+        try oldWriter.save(to: fileURL, now: Date(timeIntervalSince1970: 1_700_000_100))
+
+        let patched = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(patched.copySettings(for: workspaceID).fileTreeOption, .files)
+        XCTAssertEqual(patched.chatSettings(for: workspaceID).discoveryTokenBudget, 64000)
+        XCTAssertEqual(patched.globalContextBuilderAgentSelection().agentRaw, "codexExec")
+        patched.setShowTooltips(false)
+
+        var rollbackWriter = try FrozenV1028GlobalSettingsDocument.load(from: fileURL)
+        XCTAssertEqual(rollbackWriter.schemaVersion, 2)
+        let patchedRaw = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        XCTAssertNil(patchedRaw["agentModelsSettingsByWorkspaceID"])
+        rollbackWriter.setAppearanceMode("System")
+        try rollbackWriter.save(to: fileURL, now: Date(timeIntervalSince1970: 1_700_000_200))
+
+        let reloaded = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(reloaded.appearanceModeRaw(), "System")
+        XCTAssertFalse(reloaded.showTooltips())
+        XCTAssertEqual(reloaded.copySettings(for: workspaceID).fileTreeOption, .files)
+        XCTAssertEqual(reloaded.chatSettings(for: workspaceID).discoveryTokenBudget, 64000)
+    }
+
     // MARK: - Agent Models scoped settings
 
     func testAgentModelsMissingDefaultsResolveGlobalWithoutPersistingWorkspaceProfile() throws {
@@ -1057,6 +1623,84 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertFalse(saved.copySettings.isEmpty)
     }
 
+    func testInvalidSynchronizedAgentModelsStateRepairsGlobalAndDormantWorkspaceProfiles() throws {
+        let invalidTuples: [(planning: String?, compose: String?)] = [
+            (nil, nil),
+            (AIModel.gpt54Pro.rawValue, nil),
+            (AIModel.gpt54Pro.rawValue, AIModel.claude4Sonnet.rawValue)
+        ]
+
+        for tuple in invalidTuples {
+            let temp = try makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+            let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+            let dormantWorkspaceID = UUID()
+            let workspaceProfile = AgentModelsSettingsProfile(
+                planningModelRaw: tuple.planning,
+                preferredComposeModelRaw: tuple.compose,
+                syncChatModelWithOracle: true
+            )
+            let invalidDocument = GlobalSettingsDocument(
+                agentModelsSettings: [
+                    dormantWorkspaceID: WorkspaceAgentModelsSettings(
+                        inheritanceMode: .useGlobalSettings,
+                        profile: workspaceProfile
+                    )
+                ],
+                scalarPreferences: seededScalarPreferences(modelSelection: .init(
+                    preferredComposeModel: tuple.compose,
+                    planningModel: tuple.planning,
+                    syncChatModelWithOracle: true
+                ))
+            )
+            try fileStore.save(invalidDocument)
+
+            let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+
+            XCTAssertEqual(store.planningModelRaw(), tuple.planning)
+            XCTAssertEqual(store.preferredComposeModelRaw(), tuple.compose)
+            XCTAssertFalse(store.syncChatModelWithOracle())
+            let repairedWorkspace = try XCTUnwrap(store.workspaceAgentModelsProfile(for: dormantWorkspaceID))
+            XCTAssertEqual(repairedWorkspace.planningModelRaw, tuple.planning)
+            XCTAssertEqual(repairedWorkspace.preferredComposeModelRaw, tuple.compose)
+            XCTAssertFalse(repairedWorkspace.syncChatModelWithOracle)
+
+            store.setShowDatesInMessageTimestamps(true)
+
+            let saved = try fileStore.load()
+            XCTAssertEqual(saved.scalarPreferences?.modelSelection?.planningModel, tuple.planning)
+            XCTAssertEqual(saved.scalarPreferences?.modelSelection?.preferredComposeModel, tuple.compose)
+            XCTAssertEqual(saved.scalarPreferences?.modelSelection?.syncChatModelWithOracle, false)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.inheritanceMode, .useGlobalSettings)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.profile?.planningModelRaw, tuple.planning)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.profile?.preferredComposeModelRaw, tuple.compose)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.profile?.syncChatModelWithOracle, false)
+
+            let bytesAfterUnrelatedSave = try Data(contentsOf: fileURL)
+            let reloaded = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+            XCTAssertEqual(reloaded.planningModelRaw(), tuple.planning)
+            XCTAssertEqual(reloaded.preferredComposeModelRaw(), tuple.compose)
+            XCTAssertFalse(reloaded.syncChatModelWithOracle())
+            XCTAssertEqual(
+                reloaded.workspaceAgentModelsProfile(for: dormantWorkspaceID)?.syncChatModelWithOracle,
+                false
+            )
+            XCTAssertEqual(try Data(contentsOf: fileURL), bytesAfterUnrelatedSave)
+
+            try fileStore.save(invalidDocument)
+            XCTAssertTrue(reloaded.reloadFromDisk())
+            let repairedAfterReload = try fileStore.load()
+            XCTAssertEqual(repairedAfterReload.scalarPreferences?.modelSelection?.planningModel, tuple.planning)
+            XCTAssertEqual(repairedAfterReload.scalarPreferences?.modelSelection?.preferredComposeModel, tuple.compose)
+            XCTAssertEqual(repairedAfterReload.scalarPreferences?.modelSelection?.syncChatModelWithOracle, false)
+            XCTAssertEqual(
+                repairedAfterReload.agentModelsSettings[dormantWorkspaceID]?.profile?.syncChatModelWithOracle,
+                false
+            )
+        }
+    }
+
     func testAgentModelsProfilePreservesUnknownContextBuilderProviderAndModelRawValues() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
@@ -1117,7 +1761,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         store.setPlanningModelRaw(AIModel.gpt54Pro.rawValue)
         XCTAssertEqual(recorder.snapshot().count, 5)
-        store.setPreferredComposeModelRaw(AIModel.claude4Sonnet.rawValue)
+        store.setPreferredComposeModelRaw(AIModel.gpt54Pro.rawValue)
         XCTAssertEqual(recorder.snapshot().count, 5)
         store.setSyncChatModelWithOracle(true)
         XCTAssertEqual(recorder.snapshot().count, 5)
@@ -1205,7 +1849,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         store.setGlobalAgentModelsProfile(
             AgentModelsSettingsProfile(
                 planningModelRaw: AIModel.gpt54Pro.rawValue,
-                preferredComposeModelRaw: nil,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
                 syncChatModelWithOracle: true
             ),
             contextBuilderWriteIntent: .preserveExistingOwnership
@@ -1215,7 +1859,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(viewModel.currentBuiltinChatModelName, AIModel.gpt54Pro.displayName)
     }
 
-    func testAgentModelsViewModelBlankBuiltinChatDoesNotMirrorToOracleWhenSynced() throws {
+    func testAgentModelsViewModelClearingSynchronizedModelDisablesSyncWithoutClearingSibling() throws {
         let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
             scalarPreferences: seededScalarPreferences()
@@ -1227,7 +1871,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         store.setGlobalAgentModelsProfile(
             AgentModelsSettingsProfile(
                 planningModelRaw: AIModel.gpt54Pro.rawValue,
-                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
                 syncChatModelWithOracle: true
             ),
             contextBuilderWriteIntent: .preserveExistingOwnership
@@ -1241,13 +1885,33 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         globalViewModel.setBuiltinChatModel(raw: blankRaw)
 
         XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertNil(store.globalAgentModelsProfile().preferredComposeModelRaw)
+        XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
+
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
+                syncChatModelWithOracle: true
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let globalOracleViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            settingsManager: manager,
+            settingsStore: store
+        )
+        globalOracleViewModel.setOracleModel(raw: blankRaw)
+        XCTAssertNil(store.globalAgentModelsProfile().planningModelRaw)
+        XCTAssertEqual(store.globalAgentModelsProfile().preferredComposeModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
 
         let workspaceID = UUID()
         store.setWorkspaceAgentModelsProfile(
             workspaceID: workspaceID,
             profile: AgentModelsSettingsProfile(
                 planningModelRaw: AIModel.gpt54Pro.rawValue,
-                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
                 syncChatModelWithOracle: true
             )
         )
@@ -1264,6 +1928,171 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(
             store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
             AIModel.gpt54Pro.rawValue
+        )
+        XCTAssertNil(store.workspaceAgentModelsProfile(for: workspaceID)?.preferredComposeModelRaw)
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle, false)
+
+        store.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
+                syncChatModelWithOracle: true
+            )
+        )
+        let workspaceOracleViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            workspaceID: workspaceID,
+            workspaceName: "Scoped blank guard",
+            settingsManager: manager,
+            settingsStore: store
+        )
+        workspaceOracleViewModel.setOracleModel(raw: blankRaw)
+        XCTAssertNil(store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.preferredComposeModelRaw,
+            AIModel.gpt54Pro.rawValue
+        )
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle, false)
+    }
+
+    func testAgentModelsViewModelRejectsSyncWhenOracleModelIsBlank() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let manager = WindowSettingsManager(windowID: -406, store: store)
+        let globalViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        globalViewModel.syncChatWithOracle = true
+
+        XCTAssertFalse(globalViewModel.syncChatWithOracle)
+        XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
+
+        let workspaceID = UUID()
+        store.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile(preferredComposeModelRaw: AIModel.gpt54Pro.rawValue)
+        )
+        let workspaceViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            workspaceID: workspaceID,
+            workspaceName: "Blank Oracle",
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        workspaceViewModel.syncChatWithOracle = true
+
+        XCTAssertFalse(workspaceViewModel.syncChatWithOracle)
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle, false)
+    }
+
+    func testDurableAgentModelsSettersDisableEveryInvalidSynchronizedTuple() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        var assertionMessages: [String] = []
+        let store = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: fileStore,
+            invalidAgentModelsProfileAssertion: { assertionMessages.append($0) }
+        )
+        let workspaceID = UUID()
+        let invalidProfiles = [
+            AgentModelsSettingsProfile(syncChatModelWithOracle: true),
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                syncChatModelWithOracle: true
+            ),
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                syncChatModelWithOracle: true
+            )
+        ]
+
+        for profile in invalidProfiles {
+            store.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: .preserveExistingOwnership
+            )
+            XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, profile.planningModelRaw)
+            XCTAssertEqual(
+                store.globalAgentModelsProfile().preferredComposeModelRaw,
+                profile.preferredComposeModelRaw
+            )
+            XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
+
+            store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+            XCTAssertEqual(
+                store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+                profile.planningModelRaw
+            )
+            XCTAssertEqual(
+                store.workspaceAgentModelsProfile(for: workspaceID)?.preferredComposeModelRaw,
+                profile.preferredComposeModelRaw
+            )
+            XCTAssertEqual(
+                store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle,
+                false
+            )
+        }
+
+        let diagnostics = store.recentSettingsWriteDiagnostics()
+        XCTAssertEqual(
+            diagnostics.map(\.reason),
+            ["both_blank", "both_blank", "one_blank", "one_blank", "divergent", "divergent"]
+                .map { "agent_models.profile.invalid_sync.\($0)" }
+        )
+        XCTAssertEqual(assertionMessages.count, 6)
+        for reason in ["both_blank", "one_blank", "divergent"] {
+            XCTAssertEqual(assertionMessages.count(where: { $0.contains(reason) }), 2)
+        }
+    }
+
+    func testLegacyScalarModelSettersPreserveSiblingAndRejectInvalidSync() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let model = AIModel.gpt54Pro.rawValue
+        let synchronized = AgentModelsSettingsProfile(
+            planningModelRaw: model,
+            preferredComposeModelRaw: model,
+            syncChatModelWithOracle: true
+        )
+
+        store.setGlobalAgentModelsProfile(
+            synchronized,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setPreferredComposeModelRaw(nil, honorSync: true)
+        XCTAssertEqual(store.planningModelRaw(), model)
+        XCTAssertNil(store.preferredComposeModelRaw())
+        XCTAssertFalse(store.syncChatModelWithOracle())
+
+        store.setGlobalAgentModelsProfile(
+            synchronized,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setPlanningModelRaw(nil, honorSync: true)
+        XCTAssertNil(store.planningModelRaw())
+        XCTAssertEqual(store.preferredComposeModelRaw(), model)
+        XCTAssertFalse(store.syncChatModelWithOracle())
+
+        store.setSyncChatModelWithOracle(true)
+        XCTAssertFalse(store.syncChatModelWithOracle())
+        XCTAssertEqual(
+            fileStore.document.scalarPreferences?.modelSelection?.syncChatModelWithOracle,
+            false
         )
     }
 
@@ -1682,6 +2511,65 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         await fulfillment(of: [drained], timeout: 1.0)
     }
 
+    private var lineagedBaselineJSON: String {
+        #"{"schemaVersion":2,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{},"scalarPreferences":{}}"#
+    }
+
+    private func falseV4JSON(includeEmptyAgentModelsObject: Bool) -> String {
+        let agentModels = includeEmptyAgentModelsObject
+            ? #","agentModelsSettingsByWorkspaceID":{}"#
+            : ""
+        return """
+        {
+          "schemaVersion": 4,
+          "schemaLineage": "repoprompt-ce.global-settings",
+          "updatedAt": "2026-05-20T00:00:00Z",
+          "copySettingsByWorkspaceID": {},
+          "chatSettingsByWorkspaceID": {},
+          "globalDefaults": {
+            "discoverAgentRaw": "codexExec",
+            "discoverModelsByAgent": {"codexExec": "gpt-5.2-codex"},
+            "unknownNested": {"keep": [1, true, "value"]}
+          },
+          "scalarPreferences": {
+            "ui": {"appearanceMode": "Dark", "showTooltips": true},
+            "promptPackaging": {"modelTemperature": 0.25},
+            "agentMode": {"agentSessionHandoffInstructions": "  Preserve raw instructions  "},
+            "unknownGroup": {"future": "preserve"}
+          },
+          "unknownRoot": {"preserve": 42}
+          \(agentModels)
+        }
+        """
+    }
+
+    private func falseV4JSON(rawAgentModelsValue: String) -> String {
+        falseV4JSON(includeEmptyAgentModelsObject: false).replacingOccurrences(
+            of: #""unknownRoot": {"preserve": 42}"#,
+            with: #""agentModelsSettingsByWorkspaceID": \#(rawAgentModelsValue), "unknownRoot": {"preserve": 42}"#
+        )
+    }
+
+    private func falseV4Backups(in directory: URL) throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix("globalSettings.false-v4-") }
+    }
+
+    private func makeBlockedStore(
+        json: String,
+        defaults: UserDefaults? = nil
+    ) throws -> (GlobalSettingsStore, URL) {
+        let temp = try makeTempDirectory()
+        addTeardownBlock { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(json.utf8).write(to: fileURL)
+        let defaults = try defaults ?? makeIsolatedDefaults()
+        return (GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL)), fileURL)
+    }
+
     private func makeIsolatedDefaults() throws -> UserDefaults {
         let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -1707,6 +2595,141 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             .appendingPathComponent("SettingsJSONOnlyPersistenceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    func testTierCleanupNormalizesAllAgentModelsProfilesInOneSaveAndNotifiesExactScopes() throws {
+        let workspaceID = UUID()
+        let tierRaw = AIModel.openAIServiceTierVariant(base: .gpt54Pro, tier: "flex").rawValue
+        let tierSelectionRaw = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: tierRaw
+        ).rawValue
+        let normalizedSelectionRaw = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AIModel.gpt54Pro.rawValue
+        ).rawValue
+        let emptyBaseSelectionRaw = "\(AgentProviderKind.codexExec.rawValue):openai_tier__flex__"
+        let parseInvalidSelectionRaw = "agent-selection:\(AgentProviderKind.codexExec.rawValue):\(tierRaw)"
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            agentModelsSettings: [
+                workspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(
+                        planningModelRaw: tierRaw,
+                        preferredComposeModelRaw: tierRaw,
+                        mcpAgentRoleOverrides: [
+                            "explore": tierSelectionRaw,
+                            "engineer": emptyBaseSelectionRaw
+                        ]
+                    )
+                )
+            ],
+            globalDefaults: GlobalDefaults(
+                discoverAgentRaw: AgentProviderKind.codexExec.rawValue,
+                discoverModelsByAgent: [AgentProviderKind.codexExec.rawValue: tierRaw],
+                mcpAgentRoleOverrides: [
+                    "code": tierSelectionRaw,
+                    "review": parseInvalidSelectionRaw
+                ]
+            ),
+            scalarPreferences: GlobalScalarPreferences(
+                modelSelection: .init(preferredComposeModel: tierRaw, planningModel: tierRaw)
+            )
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        fileStore.saveCount = 0
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+
+        store.normalizeDisabledOpenAIServiceTierVariants()
+
+        XCTAssertEqual(fileStore.saveCount, 1)
+        XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(store.globalAgentModelsProfile().preferredComposeModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().contextBuilderModelsByAgent?[AgentProviderKind.codexExec.rawValue],
+            AIModel.gpt54Pro.rawValue
+        )
+        XCTAssertEqual(store.globalAgentModelsProfile().mcpAgentRoleOverrides?["code"], normalizedSelectionRaw)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().mcpAgentRoleOverrides?["review"],
+            parseInvalidSelectionRaw,
+            "Parse-invalid overrides must survive byte-identical"
+        )
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["explore"],
+            normalizedSelectionRaw
+        )
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["engineer"],
+            emptyBaseSelectionRaw,
+            "A parsed tier wrapper with an empty base must survive without reconstruction"
+        )
+        XCTAssertEqual(Set(recorder.snapshot().compactMap(\.scope)), Set(["global", "workspace"]))
+
+        store.normalizeDisabledOpenAIServiceTierVariants()
+        XCTAssertEqual(fileStore.saveCount, 1, "Cleanup must be idempotent")
+    }
+
+    func testDisablingServiceTierVariantsInstallsParsingPolicyBeforeCleanup() throws {
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: "openAIShowServiceTierVariants")
+        var policyObservedDuringCleanup: Bool?
+
+        APISettingsViewModel.persistOpenAIShowServiceTierVariants(
+            false,
+            defaults: defaults,
+            normalizeDisabledVariants: {
+                policyObservedDuringCleanup = defaults.bool(forKey: "openAIShowServiceTierVariants")
+            }
+        )
+
+        XCTAssertEqual(policyObservedDuringCleanup, false)
+        XCTAssertFalse(defaults.bool(forKey: "openAIShowServiceTierVariants"))
+    }
+
+    func testReloadNotifiesChangedAndRemovedAgentModelsScopesAfterInstallation() throws {
+        let changedWorkspaceID = UUID()
+        let removedWorkspaceID = UUID()
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            agentModelsSettings: [
+                changedWorkspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue)
+                ),
+                removedWorkspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue)
+                )
+            ],
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: GlobalScalarPreferences(
+                modelSelection: .init(planningModel: AIModel.gpt54Pro.rawValue)
+            )
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+        fileStore.document = GlobalSettingsDocument(
+            agentModelsSettings: [
+                changedWorkspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.claude4Sonnet.rawValue)
+                )
+            ],
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: GlobalScalarPreferences(
+                modelSelection: .init(planningModel: AIModel.claude4Sonnet.rawValue)
+            )
+        )
+
+        XCTAssertTrue(store.reloadFromDisk())
+        XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.claude4Sonnet.rawValue)
+        let notifications = recorder.snapshot()
+        XCTAssertTrue(notifications.contains { $0.scope == "global" && $0.workspaceID == nil })
+        XCTAssertTrue(notifications.contains { $0.workspaceID == changedWorkspaceID })
+        XCTAssertTrue(notifications.contains { $0.workspaceID == removedWorkspaceID })
     }
 
     private var obsoleteGitignorePreferenceKey: String {
@@ -1739,7 +2762,8 @@ private final class CountingGlobalSettingsFileStore: GlobalSettingsFileStoring {
     func save(_ document: GlobalSettingsDocument) throws {
         saveCount += 1
         var saved = document
-        saved.schemaVersion = max(saved.schemaVersion, GlobalSettingsDocument.currentSchemaVersion)
+        saved.schemaVersion = saved.requiredSchemaVersion
+        saved.schemaLineage = GlobalSettingsDocument.schemaLineage
         self.document = saved
     }
 

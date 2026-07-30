@@ -67,21 +67,6 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.snapshotSelection().manualCodemapPaths.isEmpty)
     }
 
-    func testGraphReadinessDoesNotMutateManualMode() {
-        let fixture = makeFixture(fileName: "Manual.swift")
-        fixture.viewModel.enterManualCodemapMode()
-
-        fixture.viewModel.handleAutomaticCodemapReadinessForTesting(
-            rootEpoch: WorkspaceCodemapRootEpoch(
-                rootID: fixture.file.rootIdentifier,
-                rootLifetimeID: UUID()
-            )
-        )
-
-        XCTAssertFalse(fixture.viewModel.codemapAutoEnabled)
-        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
-    }
-
     func testNewSourceGenerationClearsExistingInferredMarkersSynchronously() {
         let fixture = makeFixture(fileName: "Generation.swift")
         fixture.viewModel.setAutoCodemapFilesForTesting([fixture.file])
@@ -173,6 +158,184 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         }
     }
 
+    func testMatchingReadyMarkerCoalescesReadinessRetry() async throws {
+        let fixture = try await makeRetryLifecycleFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
+        fixture.viewModel.armAutomaticCodemapReadinessRetryForTesting(
+            rootEpoch: fixture.rootEpoch,
+            fileID: fixture.targetFileID
+        )
+        let armedGeneration = fixture.viewModel.automaticCodemapSelectionGenerationForTesting
+
+        fixture.viewModel.handleCodemapMarkerReadinessForTesting(.init(
+            rootEpoch: fixture.rootEpoch,
+            revision: 1,
+            changes: [.init(
+                fileID: UUID(),
+                standardizedRelativePath: "Other.swift",
+                requestGeneration: 1,
+                pathGeneration: 1,
+                state: .ready
+            )]
+        ))
+        XCTAssertTrue(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+        XCTAssertTrue(fixture.viewModel.automaticCodemapReadinessRetryTaskActiveForTesting)
+        XCTAssertEqual(
+            fixture.viewModel.automaticCodemapSelectionGenerationForTesting,
+            armedGeneration
+        )
+
+        fixture.viewModel.handleCodemapMarkerReadinessForTesting(.init(
+            rootEpoch: fixture.rootEpoch,
+            revision: 2,
+            changes: [.init(
+                fileID: fixture.targetFileID,
+                standardizedRelativePath: "Target.swift",
+                requestGeneration: 0,
+                pathGeneration: 0,
+                state: .ready
+            )]
+        ))
+        XCTAssertTrue(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+        XCTAssertEqual(
+            fixture.viewModel.automaticCodemapSelectionGenerationForTesting,
+            armedGeneration
+        )
+
+        let matchingReady = WorkspaceCodemapMarkerReadinessEvent(
+            rootEpoch: fixture.rootEpoch,
+            revision: 3,
+            changes: [.init(
+                fileID: fixture.targetFileID,
+                standardizedRelativePath: "Target.swift",
+                requestGeneration: 1,
+                pathGeneration: 1,
+                state: .ready
+            )]
+        )
+        fixture.viewModel.handleCodemapMarkerReadinessForTesting(matchingReady)
+        let triggeredGeneration = fixture.viewModel.automaticCodemapSelectionGenerationForTesting
+        XCTAssertEqual(triggeredGeneration, armedGeneration &+ 1)
+        XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+        XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryTaskActiveForTesting)
+
+        fixture.viewModel.handleCodemapMarkerReadinessForTesting(matchingReady)
+        XCTAssertEqual(
+            fixture.viewModel.automaticCodemapSelectionGenerationForTesting,
+            triggeredGeneration
+        )
+        fixture.viewModel.enterManualCodemapMode()
+        await fixture.viewModel.unloadAllRootFolders()
+    }
+
+    func testPendingReadinessRetryAutonomouslySchedulesOnceWithoutReadinessEvents() async throws {
+        let fixture = try await makeRetryLifecycleFixture(retryDelay: .milliseconds(10))
+        defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
+        fixture.viewModel.armAutomaticCodemapReadinessRetryForTesting(
+            rootEpoch: fixture.rootEpoch,
+            fileID: fixture.targetFileID
+        )
+        let armedGeneration = fixture.viewModel.automaticCodemapSelectionGenerationForTesting
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+
+        while fixture.viewModel.automaticCodemapSelectionGenerationForTesting == armedGeneration,
+              clock.now < deadline
+        {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(
+            fixture.viewModel.automaticCodemapSelectionGenerationForTesting,
+            armedGeneration &+ 1
+        )
+        XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+        XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryTaskActiveForTesting)
+        fixture.viewModel.enterManualCodemapMode()
+        await fixture.viewModel.unloadAllRootFolders()
+    }
+
+    func testPendingReadinessRetryCancelsForModeSelectionAndRootChanges() async throws {
+        do {
+            let fixture = try await makeRetryLifecycleFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
+            fixture.viewModel.armAutomaticCodemapReadinessRetryForTesting(
+                rootEpoch: fixture.rootEpoch,
+                fileID: fixture.targetFileID
+            )
+
+            fixture.viewModel.enterManualCodemapMode()
+
+            XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+            XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryTaskActiveForTesting)
+            await fixture.viewModel.unloadAllRootFolders()
+        }
+
+        do {
+            let fixture = try await makeRetryLifecycleFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
+            fixture.viewModel.armAutomaticCodemapReadinessRetryForTesting(
+                rootEpoch: fixture.rootEpoch,
+                fileID: fixture.targetFileID
+            )
+
+            fixture.viewModel.removeFileFromAllSelections(fixture.source)
+
+            XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+            XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryTaskActiveForTesting)
+            await fixture.viewModel.unloadAllRootFolders()
+        }
+
+        do {
+            let fixture = try await makeRetryLifecycleFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
+            fixture.viewModel.armAutomaticCodemapReadinessRetryForTesting(
+                rootEpoch: fixture.rootEpoch,
+                fileID: fixture.targetFileID
+            )
+
+            let detached = await fixture.viewModel.detachRootShell(
+                forRootPath: fixture.rootURL.path,
+                unloadStoreRoot: true
+            )
+
+            XCTAssertTrue(detached)
+            XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+            XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryTaskActiveForTesting)
+        }
+    }
+
+    func testStaleReadyMarkerAfterSelectionGenerationChangeDoesNotPublish() async throws {
+        let fixture = try await makeRetryLifecycleFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.rootURL) }
+        fixture.viewModel.armAutomaticCodemapReadinessRetryForTesting(
+            rootEpoch: fixture.rootEpoch,
+            fileID: fixture.targetFileID
+        )
+        fixture.viewModel.removeFileFromAllSelections(fixture.source)
+        let invalidatedGeneration = fixture.viewModel.automaticCodemapSelectionGenerationForTesting
+
+        fixture.viewModel.handleCodemapMarkerReadinessForTesting(.init(
+            rootEpoch: fixture.rootEpoch,
+            revision: 1,
+            changes: [.init(
+                fileID: fixture.targetFileID,
+                standardizedRelativePath: "Target.swift",
+                requestGeneration: 1,
+                pathGeneration: 1,
+                state: .ready
+            )]
+        ))
+
+        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+        XCTAssertFalse(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+        XCTAssertEqual(
+            fixture.viewModel.automaticCodemapSelectionGenerationForTesting,
+            invalidatedGeneration
+        )
+        await fixture.viewModel.unloadAllRootFolders()
+    }
+
     func testMilestoneDProductionCallersContainNoEagerCodemapOrCacheActions() throws {
         let repoRoot = try RepoRoot.url()
         let relativePaths = [
@@ -205,24 +368,72 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         }
     }
 
-    func testPublicationRevalidationIsFinalAwaitBeforeSynchronousCommit() throws {
+    func testValueReceiptRevalidationIsFinalAwaitBeforeSynchronousCommit() throws {
         let repoRoot = try RepoRoot.url()
         let sourceURL = repoRoot.appendingPathComponent(
             "Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift"
         )
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        let revalidation = try XCTUnwrap(try source.range(
+        let revalidationCall = try XCTUnwrap(source.range(
+            of: "let revalidation = await workspaceFileContextStore.revalidateAutomaticCodemapSelection("
+        ))
+        let postRevalidationGuard = try XCTUnwrap(source.range(
             of: "guard automaticCodemapSelectionIsCurrent(",
-            range: XCTUnwrap(source.range(
-                of: "revalidateAutomaticCodemapSelectionForPublication("
-            )).upperBound ..< source.endIndex
+            range: revalidationCall.upperBound ..< source.endIndex
         ))
         let commit = try XCTUnwrap(source.range(
             of: "resetAutoCodemapFiles(resolvedTargets)",
-            range: revalidation.lowerBound ..< source.endIndex
+            range: postRevalidationGuard.lowerBound ..< source.endIndex
         ))
-        let synchronousCommitRegion = source[revalidation.lowerBound ..< commit.upperBound]
+        let synchronousCommitRegion = source[postRevalidationGuard.lowerBound ..< commit.upperBound]
         XCTAssertFalse(synchronousCommitRegion.contains("await"))
+    }
+
+    private func makeRetryLifecycleFixture(
+        retryDelay: Duration = .seconds(10)
+    ) async throws -> (
+        viewModel: WorkspaceFilesViewModel,
+        source: FileViewModel,
+        targetFileID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        rootURL: URL
+    ) {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceFilesAutoCodemapModeTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try "struct Source {}\n".write(
+            to: rootURL.appendingPathComponent("Source.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "struct Target {}\n".write(
+            to: rootURL.appendingPathComponent("Target.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = WorkspaceFileContextStore()
+        let root = try await store.loadRoot(path: rootURL.path)
+        let rootLifetimeID = try await store.rootLifetimeIDForTesting(rootID: root.id)
+        let records = await store.files(inRoot: root.id)
+        let target = try XCTUnwrap(records.first { $0.standardizedRelativePath == "Target.swift" })
+        let viewModel = WorkspaceFilesViewModel(
+            workspaceFileContextStore: store,
+            automaticCodemapReadinessRetryDelay: retryDelay
+        )
+        _ = try viewModel.attachRootShell(for: root, workspaceID: UUID())
+        let materializedSource = await viewModel.materializeFileForUserInput(
+            rootURL.appendingPathComponent("Source.swift").path
+        )
+        let source = try XCTUnwrap(materializedSource)
+        viewModel.selectFileForTesting(source)
+        return (
+            viewModel,
+            source,
+            target.id,
+            WorkspaceCodemapRootEpoch(rootID: root.id, rootLifetimeID: rootLifetimeID),
+            rootURL
+        )
     }
 
     private func makeFixture(fileName: String) -> (

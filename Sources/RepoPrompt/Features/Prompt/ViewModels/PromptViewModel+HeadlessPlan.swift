@@ -14,6 +14,9 @@ enum HeadlessMode {
 /// A frozen snapshot of tab state for headless generation.
 /// Used when running plan/chat via AIQueriesService without activating the tab.
 struct HeadlessContextSnapshot {
+    /// Exact workspace authority for inactive/background generation.
+    let workspaceID: UUID?
+
     /// The compose tab this snapshot came from
     let tabID: UUID
 
@@ -33,6 +36,7 @@ struct HeadlessContextSnapshot {
     let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
 
     init(
+        workspaceID: UUID? = nil,
         tabID: UUID,
         promptText: String,
         selection: StoredSelection,
@@ -40,6 +44,7 @@ struct HeadlessContextSnapshot {
         reviewGitContext: FrozenPromptGitReviewContext,
         finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
     ) {
+        self.workspaceID = workspaceID
         self.tabID = tabID
         self.promptText = promptText
         self.selection = selection

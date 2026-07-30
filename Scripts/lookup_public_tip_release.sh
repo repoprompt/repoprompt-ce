@@ -92,6 +92,14 @@ else:
 PYTHON
 }
 
+curl_headers=(
+    --header 'Accept: application/vnd.github+json'
+    --header 'X-GitHub-Api-Version: 2022-11-28'
+)
+if [[ -n "${TIP_GH_TOKEN:-}" ]]; then
+    curl_headers+=(--header "Authorization: Bearer $TIP_GH_TOKEN")
+fi
+
 classification=transport-failure
 status=000
 for attempt in 1 2 3; do
@@ -105,8 +113,7 @@ for attempt in 1 2 3; do
     if status="$(curl --location --silent \
         --connect-timeout 10 \
         --max-time 30 \
-        --header 'Accept: application/vnd.github+json' \
-        --header 'X-GitHub-Api-Version: 2022-11-28' \
+        "${curl_headers[@]}" \
         --dump-header "$RESPONSE_HEADERS" \
         --output "$RESPONSE_BODY" \
         --write-out '%{http_code}' \

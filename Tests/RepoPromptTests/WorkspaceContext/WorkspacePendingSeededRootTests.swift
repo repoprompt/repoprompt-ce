@@ -69,11 +69,18 @@ import XCTest
             let createdFileFlags = FSEventStreamEventFlags(
                 kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
             )
-            _ = try await store.acceptWatcherPayloadForTesting(
+            let syntheticEventID: FSEventStreamEventId = 9_000_000_000_000_000_000
+            let acceptedPayload = try await store.acceptWatcherPayloadForTesting(
                 rootID: physicalRoot.id,
-                events: [(postCommitURL.path, createdFileFlags, 99001)]
+                events: [(postCommitURL.path, createdFileFlags, syntheticEventID)]
             )
-            _ = await store.awaitAppliedIngress(rootRefs: [physicalRoot])
+            let acceptedWatcherWatermark = try XCTUnwrap(acceptedPayload)
+            let ingressSamples = await store.awaitAppliedIngress(rootRefs: [physicalRoot])
+            let ingressSample = try XCTUnwrap(ingressSamples.first)
+            XCTAssertGreaterThanOrEqual(
+                ingressSample.appliedWatcherWatermark,
+                acceptedWatcherWatermark.rawValue
+            )
             let postCommitRecord = await store.file(
                 rootID: physicalRoot.id,
                 relativePath: "PostCommit.swift"

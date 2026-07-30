@@ -1517,56 +1517,27 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     func saveOpenAIShowServiceTierVariants() {
-        let wasEnabled = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
-        UserDefaults.standard.set(openAIShowServiceTierVariants, forKey: "openAIShowServiceTierVariants")
-
-        // When turning variants OFF, normalize saved model preferences to strip tier wrappers
-        if wasEnabled, !openAIShowServiceTierVariants {
-            normalizeTierVariantPreferences()
-        }
+        Self.persistOpenAIShowServiceTierVariants(openAIShowServiceTierVariants)
 
         Task {
             await updateAvailableModels()
         }
     }
 
-    /// Strips tier variant wrappers from saved model preferences when variants are disabled.
-    /// This prevents "hidden forced tier" behavior where a tier-variant selection silently
-    /// continues to override the global tier even after the user turns off variants.
-    private func normalizeTierVariantPreferences() {
-        let settingsStore = GlobalSettingsStore.shared
-        if let rawValue = settingsStore.planningModelRaw(), !rawValue.isEmpty,
-           case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            settingsStore.setPlanningModelRaw(
-                base.rawValue,
-                reason: "api_settings.normalize_tier_variant.planning",
-                honorSync: false
-            )
+    @MainActor
+    static func persistOpenAIShowServiceTierVariants(
+        _ enabled: Bool,
+        defaults: UserDefaults = .standard,
+        normalizeDisabledVariants: @MainActor () -> Void = {
+            GlobalSettingsStore.shared.normalizeDisabledOpenAIServiceTierVariants()
         }
+    ) {
+        let wasEnabled = defaults.bool(forKey: "openAIShowServiceTierVariants")
+        defaults.set(enabled, forKey: "openAIShowServiceTierVariants")
 
-        let normalizedPlanning = settingsStore.planningModelRaw()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if settingsStore.syncChatModelWithOracle(), !normalizedPlanning.isEmpty {
-            settingsStore.setPreferredComposeModelRaw(
-                normalizedPlanning,
-                reason: "api_settings.normalize_tier_variant.preferred_compose.sync_to_planning",
-                honorSync: false
-            )
-        } else if let rawValue = settingsStore.preferredComposeModelRaw(), !rawValue.isEmpty,
-                  case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            settingsStore.setPreferredComposeModelRaw(
-                base.rawValue,
-                reason: "api_settings.normalize_tier_variant.preferred_compose",
-                honorSync: false
-            )
-        }
-
-        let contextBuilderKey = "contextBuilderModel"
-        if let rawValue = UserDefaults.standard.string(forKey: contextBuilderKey), !rawValue.isEmpty,
-           case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            UserDefaults.standard.set(base.rawValue, forKey: contextBuilderKey)
+        // Install the parsing policy before synchronous Agent Models notifications fire.
+        if wasEnabled, !enabled {
+            normalizeDisabledVariants()
         }
     }
 
@@ -2018,6 +1989,13 @@ public class APISettingsViewModel: ObservableObject {
             contextBuilderVerifiedCLIProviders = verifiedProviders
             isContextBuilderProviderValidationComplete = true
         }
+
+        func test_resetContextBuilderProviderValidation() {
+            contextBuilderProviderValidationTask?.cancel()
+            contextBuilderProviderValidationTask = nil
+            contextBuilderVerifiedCLIProviders = []
+            isContextBuilderProviderValidationComplete = false
+        }
     #endif
 
     private func resetPreferredModelIfNeeded(for provider: AIProviderType) {
@@ -2070,7 +2048,7 @@ public class APISettingsViewModel: ObservableObject {
                     settingsStore.setPlanningModelRaw(
                         replacement,
                         reason: "api_settings.provider_reset.planning.\(reasonSuffix)",
-                        honorSync: false
+                        honorSync: true
                     )
                 }
                 settingsStore.setPreferredComposeModelRaw(
@@ -2966,7 +2944,7 @@ public class APISettingsViewModel: ObservableObject {
             await applyCodexConnectionState(
                 connected: true,
                 error: nil,
-                phase: .connected(resolvedExecutable: resolution.resolvedCommand),
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
                 updateModels: true
             )
             return true
@@ -3011,7 +2989,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("User guidance: \(resolution.userMessage)")
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
-        collector.append("Codex executable resolved at \(resolution.resolvedCommand)")
+        collector.append("Codex executable resolved: \(resolution.displayDescription ?? resolution.debugMessage)")
 
         applyCodexConnectionPhase(.refreshingAuth)
         collector.append("Checking Codex managed authentication state before health check")
@@ -3055,7 +3033,7 @@ public class APISettingsViewModel: ObservableObject {
             await applyCodexConnectionState(
                 connected: ok,
                 error: ok ? nil : "Codex CLI health check returned an empty response.",
-                phase: ok ? .connected(resolvedExecutable: resolution.resolvedCommand) : .failed(message: "Codex CLI health check returned an empty response."),
+                phase: ok ? .connected(resolvedExecutable: resolution.displayDescription) : .failed(message: "Codex CLI health check returned an empty response."),
                 updateModels: true
             )
             if ok {
@@ -3103,13 +3081,13 @@ public class APISettingsViewModel: ObservableObject {
 
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") {
-            return "Codex CLI is not installed. Install it and ensure it's available on PATH."
+            return "The selected Codex runtime is unavailable. Reinstall RepoPrompt CE or configure a valid explicit override."
         }
         if lowered.contains("permission denied") {
             return "Permission denied. Ensure the 'codex' executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") {
-            return "Codex CLI is not authenticated. Run 'codex login' in your terminal."
+            return CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage
         }
         return message
     }

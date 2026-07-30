@@ -18,6 +18,11 @@ enum AgentExternalMCPRunStarter {
         _ agentModeVM: AgentModeViewModel
     ) async throws -> AgentModeViewModel.MCPInstructionDispatch
 
+    private enum RequestBindingDisposition {
+        case preserveCallerBinding
+        case applyRequestBindingPolicy(BindCurrentRequestToTab)
+    }
+
     /// Extracts a reasoning effort suffix from a model string if present.
     /// Supports formats like "gpt-5.4-high", "o3_low", "gpt-5.4-fast-high".
     /// The model string is passed through unchanged (preserving service tier and other modifiers);
@@ -31,11 +36,10 @@ enum AgentExternalMCPRunStarter {
         return (modelRaw, nil)
     }
 
-    static func start(
+    static func startPreservingCallerBinding(
         target: AgentModeViewModel.MCPSessionTarget,
         message: String,
         metadata: RequestMetadata,
-        bindCurrentRequestToTab: BindCurrentRequestToTab,
         agentModeVM: AgentModeViewModel,
         agentRaw: String?,
         modelRaw: String?,
@@ -45,6 +49,70 @@ enum AgentExternalMCPRunStarter {
         expectedParentSessionID: UUID? = nil,
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
         dispatchInstruction: DispatchInstruction? = nil
+    ) async throws -> StartOutcome {
+        try await startWithBindingDisposition(
+            target: target,
+            message: message,
+            metadata: metadata,
+            bindingDisposition: .preserveCallerBinding,
+            agentModeVM: agentModeVM,
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            taskLabelKind: taskLabelKind,
+            workflow: workflow,
+            expectedParentSessionID: expectedParentSessionID,
+            oracleReviewSource: oracleReviewSource,
+            dispatchInstruction: dispatchInstruction
+        )
+    }
+
+    static func startApplyingRequestBindingPolicy(
+        target: AgentModeViewModel.MCPSessionTarget,
+        message: String,
+        metadata: RequestMetadata,
+        bindCurrentRequestToTab: @escaping BindCurrentRequestToTab,
+        agentModeVM: AgentModeViewModel,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
+        workflow: AgentWorkflowDefinition? = nil,
+        expectedParentSessionID: UUID? = nil,
+        oracleReviewSource: AgentRunOracleReviewSource? = nil,
+        dispatchInstruction: DispatchInstruction? = nil
+    ) async throws -> StartOutcome {
+        try await startWithBindingDisposition(
+            target: target,
+            message: message,
+            metadata: metadata,
+            bindingDisposition: .applyRequestBindingPolicy(bindCurrentRequestToTab),
+            agentModeVM: agentModeVM,
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            taskLabelKind: taskLabelKind,
+            workflow: workflow,
+            expectedParentSessionID: expectedParentSessionID,
+            oracleReviewSource: oracleReviewSource,
+            dispatchInstruction: dispatchInstruction
+        )
+    }
+
+    private static func startWithBindingDisposition(
+        target: AgentModeViewModel.MCPSessionTarget,
+        message: String,
+        metadata: RequestMetadata,
+        bindingDisposition: RequestBindingDisposition,
+        agentModeVM: AgentModeViewModel,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        workflow: AgentWorkflowDefinition?,
+        expectedParentSessionID: UUID?,
+        oracleReviewSource: AgentRunOracleReviewSource?,
+        dispatchInstruction: DispatchInstruction?
     ) async throws -> StartOutcome {
         let resolvedModel: String?
         let resolvedEffort: String?
@@ -96,14 +164,25 @@ enum AgentExternalMCPRunStarter {
                 modelRaw: resolvedModel,
                 reasoningEffortRaw: resolvedEffort
             )
-            try await bindCurrentRequestToTab(target.tabID, metadata)
-            #if DEBUG
-                AgentModePerfDiagnostics.event("mcp.routing.externalRunStarterBoundRequest", tabID: target.tabID, fields: [
-                    "sessionID": sessionID.uuidString,
-                    "connectionID": metadata.connectionID?.uuidString ?? "nil",
-                    "windowID": metadata.windowID.map(String.init) ?? "nil"
-                ])
-            #endif
+            switch bindingDisposition {
+            case .preserveCallerBinding:
+                #if DEBUG
+                    AgentModePerfDiagnostics.event("mcp.routing.externalRunStarterPreservedCallerBinding", tabID: target.tabID, fields: [
+                        "sessionID": sessionID.uuidString,
+                        "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                        "windowID": metadata.windowID.map(String.init) ?? "nil"
+                    ])
+                #endif
+            case let .applyRequestBindingPolicy(bindCurrentRequestToTab):
+                try await bindCurrentRequestToTab(target.tabID, metadata)
+                #if DEBUG
+                    AgentModePerfDiagnostics.event("mcp.routing.externalRunStarterBoundRequest", tabID: target.tabID, fields: [
+                        "sessionID": sessionID.uuidString,
+                        "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                        "windowID": metadata.windowID.map(String.init) ?? "nil"
+                    ])
+                #endif
+            }
 
             guard agentModeVM.session(for: target.tabID, createIfNeeded: false) != nil else {
                 throw MCPError.internalError("Failed to resolve target agent session.")

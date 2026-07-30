@@ -125,6 +125,12 @@ class DebugAppProcessTests(unittest.TestCase):
 
 
 class LifecycleSurfaceTests(unittest.TestCase):
+    @staticmethod
+    def copy_finder_launcher(root: Path) -> Path:
+        launcher = root / "Launch RepoPrompt CE.command"
+        launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
+        return launcher
+
     def test_lifecycle_surfaces_have_no_process_name_kill_fallback(self) -> None:
         run_script = (SCRIPT_DIR / "run.sh").read_text(encoding="utf-8")
         conductor_script = (SCRIPT_DIR / "conductor.py").read_text(encoding="utf-8")
@@ -156,8 +162,7 @@ class LifecycleSurfaceTests(unittest.TestCase):
         self.assertIsNotNone(dirname)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            launcher = root / "Launch RepoPrompt CE.command"
-            launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
+            launcher = self.copy_finder_launcher(root)
             bin_dir = root / "bin"
             bin_dir.mkdir()
             (bin_dir / "dirname").symlink_to(dirname)
@@ -177,6 +182,78 @@ class LifecycleSurfaceTests(unittest.TestCase):
         self.assertIn("safe coordinated launcher requires Python 3", result.stdout)
         self.assertIn("No uncoordinated fallback is provided", result.stdout)
         self.assertNotIn("Building and relaunching", result.stdout)
+
+    def test_finder_launcher_exports_resolved_full_xcode_to_conductor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = self.copy_finder_launcher(root)
+            scripts = root / "Scripts"
+            scripts.mkdir()
+            developer_dir = root / "Xcode-beta.app" / "Contents" / "Developer"
+            resolver = scripts / "resolve_full_xcode_developer_dir.sh"
+            resolver.write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' {str(developer_dir)!r}\n",
+                encoding="utf-8",
+            )
+            resolver.chmod(0o755)
+            capture = root / "capture.txt"
+            conductor = root / "conductor"
+            conductor.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$DEVELOPER_DIR\" > \"$LAUNCHER_CAPTURE\"\n"
+                "printf '%s\\n' \"$*\" >> \"$LAUNCHER_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            conductor.chmod(0o755)
+            env = os.environ.copy()
+            env["LAUNCHER_CAPTURE"] = str(capture)
+            env.pop("DEVELOPER_DIR", None)
+
+            result = subprocess.run(
+                ["/bin/bash", str(launcher)],
+                env=env,
+                input="q\n",
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            captured_lines = capture.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(captured_lines, [str(developer_dir), "app relaunch"])
+        self.assertIn(f"Xcode:   {developer_dir}", result.stdout)
+
+    def test_finder_launcher_resolver_failure_precedes_lifecycle_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = self.copy_finder_launcher(root)
+            scripts = root / "Scripts"
+            scripts.mkdir()
+            resolver = scripts / "resolve_full_xcode_developer_dir.sh"
+            resolver.write_text("#!/usr/bin/env bash\necho 'no compatible Xcode' >&2\nexit 1\n", encoding="utf-8")
+            resolver.chmod(0o755)
+            lifecycle_marker = root / "lifecycle-invoked"
+            conductor = root / "conductor"
+            conductor.write_text(
+                f"#!/usr/bin/env bash\nprintf 'invoked\\n' > {str(lifecycle_marker)!r}\n",
+                encoding="utf-8",
+            )
+            conductor.chmod(0o755)
+
+            result = subprocess.run(
+                ["/bin/bash", str(launcher)],
+                env=os.environ.copy(),
+                input="\n",
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            lifecycle_was_invoked = lifecycle_marker.exists()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Couldn't select a compatible full Xcode installation", result.stdout)
+        self.assertIn("no compatible Xcode", result.stderr)
+        self.assertFalse(lifecycle_was_invoked)
 
 
 if __name__ == "__main__":
