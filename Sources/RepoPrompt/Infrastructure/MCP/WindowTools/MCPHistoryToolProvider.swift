@@ -39,8 +39,8 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
 
             **Scope**: Window routing does not imply workspace scope; history scans all saved workspaces by default. Use `workspace` to filter by saved name, UUID, or `Workspace-*` storage directory. Stale indexes are skipped and reported in `skipped_workspaces`.
 
-            **Truncation**: `truncated` means `limit` capped returned results; `scan_truncated` means `max_sessions_scanned` capped work.
-            **Caching**: The cross-workspace session inventory is cached for ~90 seconds for query-loop performance. A session saved within that window may not appear in `list_sessions`/`search`/`time` until the cache expires. `get_session` retries once with a cache-bypassed scan on `session_id` miss so freshly-saved sessions can resolve immediately; transcript content is signature-checked and cache-invalidated when the session file changes.
+            **Truncation**: `truncated` means `limit` capped returned results; `scan_truncated` means `max_sessions_scanned` or a cooperative workspace/index/byte/turn/elapsed budget capped work. `scan_diagnostics` identifies budget limits with typed counters and `retryable`; narrow `workspace`, `session_id`, or date scope before retrying.
+            **Caching**: The cross-workspace session inventory is cached for ~90 seconds for query-loop performance. A session saved within that window may not appear in `list_sessions`/`search`/`time` until the cache expires. `get_session` first resolves the exact session filename without a full inventory scan, then retains one cache-bypassed fresh-scan fallback for just-saved sessions; transcript content is signature-checked and cache-invalidated when the session file changes.
             """,
             annotations: .repoPromptLocalReadOnly,
             inputSchema: .object(
@@ -69,7 +69,7 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                     ),
                     "limit": .integer(description: "Max returned results. list_sessions default 30, search default 20, max 100."),
                     "idle_threshold_minutes": .integer(description: "[list_sessions, time] Idle gap threshold in minutes for active duration. Omitted uses the app setting/default (currently 10). Range 0...1440."),
-                    "max_sessions_scanned": .integer(description: "[list_sessions, search, time] Max sessions hydrated/scanned before scan_truncated. Default 200, cap 1000."),
+                    "max_sessions_scanned": .integer(description: "[list_sessions, search, time] Max sessions hydrated/scanned before scan_truncated. Default 200, cap 1000. Independent cooperative inventory/turn/elapsed budgets may also truncate and are reported in scan_diagnostics."),
                     "include_turn_request_text": .boolean(description: "[search] Verbose opt-in: include clipped matched-turn user request text. Default false to keep output compact."),
                     "query": .string(description: "[search] Search term (required for search). Case-insensitive substring match."),
                     "session_id": .string(description: "[search, time, get_session] Limit to a specific session UUID."),
@@ -95,9 +95,15 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                 required: ["op"]
             )
         ) { _, args in
-            let reply = try await HistoryMCPToolService.execute(args: args, scanner: self.scanner)
-            return try Self.encode(reply)
+            try await self.execute(args: args)
         }
+    }
+
+    /// Shared production execution seam used by the registered MCP tool and focused
+    /// persistent-connection integration coverage.
+    func execute(args: [String: Value]) async throws -> Value {
+        let reply = try await HistoryMCPToolService.execute(args: args, scanner: scanner)
+        return try Self.encode(reply)
     }
 
     // MARK: - Reply Encoding

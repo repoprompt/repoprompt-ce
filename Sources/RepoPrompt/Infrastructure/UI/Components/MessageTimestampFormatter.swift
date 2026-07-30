@@ -6,6 +6,21 @@ import Foundation
 enum MessageTimestampFormatter {
     private static let cache = MessageTimestampFormatterCache()
 
+    /// Pre-warms the formatter cache on a background thread so that the first call from
+    /// the main thread (during SwiftUI rendering) does not block on expensive ICU locale
+    /// processing (ulocimp_addLikelySubtags / setLocalizedDateFormatFromTemplate).
+    static func warmUp() {
+        let calendar = Calendar.current
+        let locale = Locale.current
+        let now = Date()
+        // Touch every format / template variant the formatter can produce.
+        _ = cache.string(from: now, format: "HH:mm:ss", calendar: calendar, locale: locale)
+        for template in ["EEE", "MMM d", "MMM d y"] {
+            _ = cache.string(from: now, template: template, calendar: calendar, locale: locale)
+        }
+        _ = cache.relativeDayLabel(-1, calendar: calendar, locale: locale)
+    }
+
     static func string(
         from date: Date,
         includeDateContext: Bool,

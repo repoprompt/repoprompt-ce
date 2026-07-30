@@ -191,6 +191,110 @@ class LocalProductionIdentityToolTests(unittest.TestCase):
 
 
 class LocalProductionInstallerTests(unittest.TestCase):
+    def test_full_xcode_resolver_preserves_explicit_compatible_developer_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            developer_dir = self.create_fake_xcode(root / "Explicit Xcode.app", sdk_version="27.0")
+            candidate_dir = self.create_fake_xcode(root / "Candidate Xcode.app", sdk_version="27.0")
+            marker = root / "xcode-select-invoked"
+            bin_dir = self.create_xcode_resolver_stubs(root, marker=marker)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "DEVELOPER_DIR": str(developer_dir),
+                }
+            )
+
+            result = subprocess.run(
+                [str(SCRIPT_DIR / "resolve_full_xcode_developer_dir.sh"), str(candidate_dir)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(developer_dir))
+        self.assertFalse(marker.exists())
+
+    def test_full_xcode_resolver_discovers_first_compatible_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selected_clt = root / "CommandLineTools"
+            selected_clt.mkdir()
+            old_xcode = self.create_fake_xcode(root / "Xcode-old.app", sdk_version="25.4")
+            compatible_xcode = self.create_fake_xcode(root / "Xcode-beta.app", sdk_version="27.0")
+            bin_dir = self.create_xcode_resolver_stubs(root, selected_path=selected_clt)
+            env = os.environ.copy()
+            env.pop("DEVELOPER_DIR", None)
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+
+            result = subprocess.run(
+                [
+                    str(SCRIPT_DIR / "resolve_full_xcode_developer_dir.sh"),
+                    str(old_xcode),
+                    str(compatible_xcode),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(compatible_xcode))
+
+    def test_full_xcode_resolver_prefers_compatible_stable_candidate_over_beta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selected_clt = root / "CommandLineTools"
+            selected_clt.mkdir()
+            beta_xcode = self.create_fake_xcode(root / "Xcode-beta.app", sdk_version="27.0")
+            stable_xcode = self.create_fake_xcode(root / "Xcode-26.3.app", sdk_version="26.3")
+            bin_dir = self.create_xcode_resolver_stubs(root, selected_path=selected_clt)
+            env = os.environ.copy()
+            env.pop("DEVELOPER_DIR", None)
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+
+            result = subprocess.run(
+                [
+                    str(SCRIPT_DIR / "resolve_full_xcode_developer_dir.sh"),
+                    str(beta_xcode),
+                    str(stable_xcode),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(stable_xcode))
+
+    def test_full_xcode_resolver_fails_actionably_when_no_candidate_is_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selected_clt = root / "CommandLineTools"
+            selected_clt.mkdir()
+            old_xcode = self.create_fake_xcode(root / "Xcode-old.app", sdk_version="25.4")
+            bin_dir = self.create_xcode_resolver_stubs(root, selected_path=selected_clt)
+            env = os.environ.copy()
+            env.pop("DEVELOPER_DIR", None)
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+
+            result = subprocess.run(
+                [str(SCRIPT_DIR / "resolve_full_xcode_developer_dir.sh"), str(old_xcode)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a full Xcode with the macOS 26 SDK or newer", result.stderr)
+        self.assertIn(str(selected_clt), result.stderr)
+
     def test_finder_launcher_routes_confirmed_install_through_conductor(self) -> None:
         launcher = ROOT_DIR / "Install RepoPrompt CE Local Production.command"
         self.assertTrue(os.access(launcher, os.X_OK))
@@ -285,6 +389,15 @@ class LocalProductionInstallerTests(unittest.TestCase):
             f"{SHA1_A}|{SHA256_A}|{generation}",
         )
         self.assertNotIn("find-identity", context["security_log"].read_text(encoding="utf-8"))
+
+    def test_installer_uses_packager_output_without_reinvoking_swift(self) -> None:
+        result, context = self.run_installer([certificate(SHA1_A, SHA256_A)], expected_sha1=SHA1_A)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(context["swift_log"].exists())
+        self.assertEqual(
+            (context["install_dir"] / "RepoPrompt CE.app" / "payload.txt").read_text(encoding="utf-8"),
+            "new\n",
+        )
 
     def test_multiple_first_use_candidates_fail_with_fingerprints_and_explicit_selection_succeeds(self) -> None:
         failed, _ = self.run_installer(
@@ -512,6 +625,10 @@ class LocalProductionInstallerTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         shutil.copy2(SCRIPT_DIR / "install_local_production.sh", scripts / "install_local_production.sh")
         shutil.copy2(SCRIPT_DIR / "local_signing_identity.py", scripts / "local_signing_identity.py")
+        shutil.copy2(
+            SCRIPT_DIR / "resolve_full_xcode_developer_dir.sh",
+            scripts / "resolve_full_xcode_developer_dir.sh",
+        )
         if fail_registry_verification or fail_registry_write:
             real_tool = scripts / "local_signing_identity_real.py"
             shutil.move(scripts / "local_signing_identity.py", real_tool)
@@ -548,7 +665,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        build_dir = temp_dir / "build"
+        build_dir = root / ".build" / "release"
         install_dir = temp_dir / "Applications"
         installed_app = install_dir / "RepoPrompt CE.app"
         installed_app.mkdir(parents=True)
@@ -623,7 +740,19 @@ class LocalProductionInstallerTests(unittest.TestCase):
             esac
             """,
         )
-        self.write_stub(bin_dir, "swift", 'printf "%s\\n" "$FAKE_BUILD_DIR"\n')
+        swift_log = temp_dir / "swift.log"
+        self.write_stub(bin_dir, "swift", 'printf "%s\\n" "$*" >> "$SWIFT_LOG"\nexit 97\n')
+        self.write_stub(
+            bin_dir,
+            "xcrun",
+            """\
+            if [[ "$*" == "--sdk macosx --show-sdk-version" && "${DEVELOPER_DIR:-}" == "$FAKE_DEVELOPER_DIR" ]]; then
+                printf '27.0\\n'
+                exit 0
+            fi
+            exit 1
+            """,
+        )
         self.write_stub(
             bin_dir,
             "codesign",
@@ -680,6 +809,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         )
 
         env = os.environ.copy()
+        fake_developer_dir = self.create_fake_xcode(temp_dir / "Xcode.app", sdk_version="27.0")
         env.update(
             {
                 "PATH": f"{bin_dir}:{env.get('PATH', '')}",
@@ -689,12 +819,14 @@ class LocalProductionInstallerTests(unittest.TestCase):
                 "LOCAL_SIGNING_IDENTITY_INVENTORY_FIXTURE": str(fixture),
                 "LOCAL_SIGNING_IDENTITY_EVALUATED_AT": "2030-01-01T00:00:00Z",
                 "FAKE_BUILD_DIR": str(build_dir),
+                "FAKE_DEVELOPER_DIR": str(fake_developer_dir),
                 "FAKE_KEYCHAIN": str(keychain),
                 "FAKE_INVENTORY_FIXTURE": str(fixture),
                 "FAKE_AFTER_MINT_FIXTURE": str(after_fixture),
                 "FAKE_IMPORTED_IDENTITY": str(import_log),
                 "FAKE_DESIGNATED_SHA1": expected_sha1,
                 "SECURITY_LOG": str(security_log),
+                "SWIFT_LOG": str(swift_log),
                 "PACKAGE_CAPTURE": str(package_capture),
                 "OPENSSL_REJECTS_LEGACY": "1" if openssl_rejects_legacy else "0",
                 "FAIL_FINAL_INSTALL_MOVE": "1" if fail_final_install_move else "0",
@@ -706,6 +838,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
                 "TMPDIR": str(installer_tmp),
                 "FAKE_REGISTRY_PATH": str(registry_path),
                 "FAKE_INSTALLED_APP": str(installed_app),
+                "DEVELOPER_DIR": str(fake_developer_dir),
             }
         )
         if selected:
@@ -721,6 +854,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
             "package_capture": package_capture,
             "security_log": security_log,
             "import_log": import_log,
+            "swift_log": swift_log,
             "tmp_root": installer_tmp,
         }
         return self.invoke(context), context
@@ -748,6 +882,47 @@ class LocalProductionInstallerTests(unittest.TestCase):
         path = bin_dir / name
         path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + textwrap.dedent(body), encoding="utf-8")
         path.chmod(0o755)
+
+    @staticmethod
+    def create_fake_xcode(app_path: Path, *, sdk_version: str) -> Path:
+        developer_dir = app_path / "Contents" / "Developer"
+        (developer_dir / "usr" / "bin").mkdir(parents=True)
+        (developer_dir / "Platforms" / "MacOSX.platform").mkdir(parents=True)
+        xcodebuild = developer_dir / "usr" / "bin" / "xcodebuild"
+        xcodebuild.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        xcodebuild.chmod(0o755)
+        (developer_dir / ".fixture-sdk-version").write_text(f"{sdk_version}\n", encoding="utf-8")
+        return developer_dir
+
+    @classmethod
+    def create_xcode_resolver_stubs(
+        cls,
+        root: Path,
+        *,
+        selected_path: Path | None = None,
+        marker: Path | None = None,
+    ) -> Path:
+        bin_dir = root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        selected = str(selected_path or root / "CommandLineTools")
+        marker_command = f"printf 'invoked\\n' > {str(marker)!r}\n" if marker else ""
+        cls.write_stub(
+            bin_dir,
+            "xcode-select",
+            f"""\
+            {marker_command}printf '%s\\n' {selected!r}
+            """,
+        )
+        cls.write_stub(
+            bin_dir,
+            "xcrun",
+            """\
+            [[ "$*" == "--sdk macosx --show-sdk-version" ]] || exit 64
+            [[ -f "${DEVELOPER_DIR:-}/.fixture-sdk-version" ]] || exit 65
+            cat "$DEVELOPER_DIR/.fixture-sdk-version"
+            """,
+        )
+        return bin_dir
 
 
 if __name__ == "__main__":

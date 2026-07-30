@@ -255,19 +255,10 @@ final class AgentRuntimeProviderService {
                 modelString: modelString,
                 enableDebugLogging: Self.enableDebugLogging
             )
-            var processConfig = CLIProcessConfiguration(
-                command: config.commandName,
-                enableDebugLogging: Self.enableDebugLogging,
-                captureStdoutTailBytes: 128 * 1024,
-                captureStderrTailBytes: 256 * 1024,
-                logStdinSampleBytes: 0
-            )
-            processConfig.ensureAdditionalPaths(config.additionalPathHints)
-            let runner = CLIProcessRunner(config: processConfig)
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")
             }
-            return CodexExecAgentProvider(runner: runner, config: config)
+            return CodexExecAgentProvider(config: config)
         case .openCode:
             let config = OpenCodeAgentConfig(
                 modelString: modelString,

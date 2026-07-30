@@ -2297,7 +2297,8 @@ enum AgentTranscriptIO {
             from oldTranscript: AgentTranscript,
             to newTranscript: AgentTranscript
         ) -> (all: Int, legacyNonFull: Int) {
-            let newTierByTurnID = Dictionary(uniqueKeysWithValues: newTranscript.turns.map { ($0.id, $0.retentionTier) })
+            // Use uniquingKeysWith to tolerate duplicate turn IDs without crashing; keep first.
+            let newTierByTurnID = Dictionary(newTranscript.turns.map { ($0.id, $0.retentionTier) }, uniquingKeysWith: { first, _ in first })
             var all = 0
             var legacyNonFull = 0
             for turn in oldTranscript.turns {
@@ -3800,8 +3801,10 @@ enum AgentTranscriptIO {
         )
         let projection = materialized.projection
         let blocks = projection.archivedBlocks + projection.workingBlocks
-        // Build turn lookup for rewriting baked summary text in handoff
-        let turnsByID = Dictionary(uniqueKeysWithValues: materialized.transcript.turns.map { ($0.id, $0) })
+        // Build turn lookup for rewriting baked summary text in handoff.
+        // Use uniquingKeysWith to tolerate duplicate turn IDs without crashing;
+        // keep the first occurrence when duplicates are present.
+        let turnsByID = Dictionary(materialized.transcript.turns.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         // Collect collapsedSummary structs by turnID so we can reformat baked system rows
         var collapsedSummaryByTurnID: [UUID: AgentTranscriptGroupedHistorySummary] = [:]
         for turn in materialized.transcript.turns {

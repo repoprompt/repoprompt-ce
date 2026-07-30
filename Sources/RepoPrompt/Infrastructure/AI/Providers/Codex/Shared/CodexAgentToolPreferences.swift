@@ -8,7 +8,6 @@ enum CodexAgentToolPreferences {
 
     enum ApprovalPolicy: CaseIterable {
         case onRequest
-        case onFailure
         case unlessTrusted
         case never
 
@@ -16,8 +15,6 @@ enum CodexAgentToolPreferences {
             switch self {
             case .onRequest:
                 "On Request"
-            case .onFailure:
-                "On Failure"
             case .unlessTrusted:
                 "Unless Trusted"
             case .never:
@@ -29,8 +26,6 @@ enum CodexAgentToolPreferences {
             switch self {
             case .onRequest:
                 "on-request"
-            case .onFailure:
-                "on-failure"
             case .unlessTrusted:
                 "unless-trusted"
             case .never:
@@ -44,8 +39,6 @@ enum CodexAgentToolPreferences {
                 switch self {
                 case .onRequest:
                     "on-request"
-                case .onFailure:
-                    "on-failure"
                 case .unlessTrusted:
                     "untrusted"
                 case .never:
@@ -55,8 +48,6 @@ enum CodexAgentToolPreferences {
                 switch self {
                 case .onRequest:
                     "onRequest"
-                case .onFailure:
-                    "onFailure"
                 case .unlessTrusted:
                     "unlessTrusted"
                 case .never:
@@ -65,25 +56,12 @@ enum CodexAgentToolPreferences {
             }
         }
 
-        var appServerConfigOverrideValue: String {
-            switch self {
-            case .onRequest:
-                "on-request"
-            case .onFailure:
-                "on-failure"
-            case .unlessTrusted:
-                "untrusted"
-            case .never:
-                "never"
-            }
-        }
-
         init?(storedValue: String) {
             switch storedValue {
             case "onRequest", "on-request":
                 self = .onRequest
             case "onFailure", "on-failure":
-                self = .onFailure
+                self = .onRequest
             case "unlessTrusted", "unless-trusted", "untrusted":
                 self = .unlessTrusted
             case "never":
@@ -144,17 +122,6 @@ enum CodexAgentToolPreferences {
             }
         }
 
-        var appServerConfigOverrideValue: String {
-            switch self {
-            case .readOnly:
-                "read-only"
-            case .workspaceWrite:
-                "workspace-write"
-            case .dangerFullAccess:
-                "danger-full-access"
-            }
-        }
-
         init?(storedValue: String) {
             switch storedValue {
             case "readOnly", "read-only":
@@ -196,13 +163,8 @@ enum CodexAgentToolPreferences {
             case .user:
                 "user"
             case .autoReview:
-                // Codex accepts both auto_review and guardian_subagent; send the legacy value for older app-server builds.
-                "guardian_subagent"
+                "auto_review"
             }
-        }
-
-        var appServerConfigOverrideValue: String {
-            appServerRequestValue
         }
 
         init?(storedValue: String) {

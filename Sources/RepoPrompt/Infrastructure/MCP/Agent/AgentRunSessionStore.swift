@@ -25,19 +25,38 @@ actor AgentRunSessionStore {
         case rejected(reason: String)
     }
 
+    enum WakeReason: String, Equatable {
+        case instructionDelivered = "instruction_delivered"
+        case steeringRequested = "steering_requested"
+    }
+
+    struct NoteworthyWake: Equatable {
+        let snapshot: AgentRunMCPSnapshot
+        let reason: WakeReason
+        let steeringMessage: String?
+        let steeringOriginRunID: UUID?
+
+        init(
+            snapshot: AgentRunMCPSnapshot,
+            reason: WakeReason,
+            steeringMessage: String?,
+            steeringOriginRunID: UUID? = nil
+        ) {
+            self.snapshot = snapshot
+            self.reason = reason
+            self.steeringMessage = steeringMessage
+            self.steeringOriginRunID = steeringOriginRunID
+        }
+    }
+
     enum WaitDisposition: Equatable {
         case snapshotReady(AgentRunMCPSnapshot)
-        case noteworthySnapshot(AgentRunMCPSnapshot, WakeReason)
+        case noteworthySnapshot(NoteworthyWake)
         case epochAdvanced(AgentRunTurnEpoch, AgentRunEpochTransitionKind)
         case terminalPublicationRejected(epoch: AgentRunTurnEpoch, reason: String)
         case timedOut
         case expired
         case cancelled
-    }
-
-    enum WakeReason: String, Equatable {
-        case instructionDelivered = "instruction_delivered"
-        case steeringRequested = "steering_requested"
     }
 
     private struct Waiter {
@@ -50,8 +69,7 @@ actor AgentRunSessionStore {
     private struct EpochState {
         let epoch: AgentRunTurnEpoch?
         var latestSnapshot: AgentRunMCPSnapshot?
-        var pendingNoteworthySnapshot: AgentRunMCPSnapshot?
-        var pendingWakeReason: WakeReason?
+        var pendingNoteworthyWake: NoteworthyWake?
         var terminalCommitID: UUID?
         var terminalSnapshot: AgentRunMCPSnapshot?
         var successorEpoch: AgentRunTurnEpoch?
@@ -155,9 +173,17 @@ actor AgentRunSessionStore {
     func noteSnapshotAndWakeWaiters(
         _ snapshot: AgentRunMCPSnapshot,
         cursor: WaitCursor,
-        reason: WakeReason
+        reason: WakeReason,
+        steeringMessage: String? = nil,
+        steeringOriginRunID: UUID? = nil
     ) {
-        ingestSnapshot(snapshot, cursor: cursor, wakeReason: reason)
+        ingestSnapshot(
+            snapshot,
+            cursor: cursor,
+            wakeReason: reason,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: steeringOriginRunID
+        )
     }
 
     func publishTerminal(
@@ -219,8 +245,7 @@ actor AgentRunSessionStore {
         state.terminalCommitID = commitID
         state.terminalSnapshot = envelope.snapshot
         state.latestSnapshot = envelope.snapshot
-        state.pendingNoteworthySnapshot = nil
-        state.pendingWakeReason = nil
+        state.pendingNoteworthyWake = nil
 
         guard record.currentEpoch == envelope.epoch else {
             record.epochStates[envelope.epoch.id] = state
@@ -281,7 +306,9 @@ actor AgentRunSessionStore {
     func wakeCurrentWaiters(
         _ snapshot: AgentRunMCPSnapshot,
         cursor: WaitCursor,
-        reason: WakeReason
+        reason: WakeReason,
+        steeringMessage: String? = nil,
+        steeringOriginRunID: UUID? = nil
     ) {
         guard snapshot.sessionID == cursor.registration.sessionID else { return }
         guard var record = currentRecord(for: cursor.registration, operation: "wake") else { return }
@@ -298,14 +325,21 @@ actor AgentRunSessionStore {
         guard !waiters.isEmpty else { return }
         let disposition: WaitDisposition = acceptedSnapshot.isActionableForMCPWait
             ? .snapshotReady(acceptedSnapshot)
-            : .noteworthySnapshot(acceptedSnapshot, reason)
+            : .noteworthySnapshot(NoteworthyWake(
+                snapshot: acceptedSnapshot,
+                reason: reason,
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: steeringOriginRunID
+            ))
         resume(waiters, with: disposition)
     }
 
     private func ingestSnapshot(
         _ snapshot: AgentRunMCPSnapshot,
         cursor: WaitCursor,
-        wakeReason: WakeReason?
+        wakeReason: WakeReason?,
+        steeringMessage: String? = nil,
+        steeringOriginRunID: UUID? = nil
     ) {
         guard snapshot.sessionID == cursor.registration.sessionID else {
             recordRejectedOperation(
@@ -338,13 +372,18 @@ actor AgentRunSessionStore {
         let disposition: WaitDisposition? = if acceptedSnapshot.isActionableForMCPWait {
             .snapshotReady(acceptedSnapshot)
         } else if let wakeReason {
-            .noteworthySnapshot(acceptedSnapshot, wakeReason)
+            .noteworthySnapshot(NoteworthyWake(
+                snapshot: acceptedSnapshot,
+                reason: wakeReason,
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: steeringOriginRunID
+            ))
         } else {
             nil
         }
         let waiters = disposition == nil ? [] : takeWaiters(from: &record) { $0.cursor == cursor }
-        if case .noteworthySnapshot = disposition, waiters.isEmpty {
-            setPendingWake(snapshot: acceptedSnapshot, reason: wakeReason, in: &record, cursor: cursor)
+        if case let .noteworthySnapshot(wake) = disposition, waiters.isEmpty {
+            setPendingWake(wake, in: &record, cursor: cursor)
         } else if disposition != nil {
             clearPendingWake(in: &record, cursor: cursor)
         }
@@ -378,7 +417,12 @@ actor AgentRunSessionStore {
             var updated = record
             clearPendingWake(in: &updated, cursor: cursor)
             records[cursor.registration.sessionID] = updated
-            return .noteworthySnapshot(latestSnapshot(in: updated, cursor: cursor) ?? pending.snapshot, pending.reason)
+            return .noteworthySnapshot(NoteworthyWake(
+                snapshot: latestSnapshot(in: updated, cursor: cursor) ?? pending.snapshot,
+                reason: pending.reason,
+                steeringMessage: pending.steeringMessage,
+                steeringOriginRunID: pending.steeringOriginRunID
+            ))
         }
         if let timeoutSeconds, timeoutSeconds <= 0 {
             return .timedOut
@@ -413,10 +457,12 @@ actor AgentRunSessionStore {
                 if let pending = pendingWake(in: current, cursor: cursor) {
                     clearPendingWake(in: &current, cursor: cursor)
                     records[cursor.registration.sessionID] = current
-                    continuation.resume(returning: .noteworthySnapshot(
-                        latestSnapshot(in: current, cursor: cursor) ?? pending.snapshot,
-                        pending.reason
-                    ))
+                    continuation.resume(returning: .noteworthySnapshot(NoteworthyWake(
+                        snapshot: latestSnapshot(in: current, cursor: cursor) ?? pending.snapshot,
+                        reason: pending.reason,
+                        steeringMessage: pending.steeringMessage,
+                        steeringOriginRunID: pending.steeringOriginRunID
+                    )))
                     return
                 }
                 let timeoutTask: Task<Void, Never>? = timeoutSeconds.map { timeout in
@@ -554,47 +600,34 @@ actor AgentRunSessionStore {
         return record.epochStates[epoch.id]?.terminalPublicationFailure
     }
 
-    private func pendingWake(in record: Record, cursor: WaitCursor) -> (snapshot: AgentRunMCPSnapshot, reason: WakeReason)? {
-        let state: EpochState? = if let epoch = cursor.epoch {
-            record.epochStates[epoch.id]
-        } else {
-            record.preEpochState
+    private func pendingWake(in record: Record, cursor: WaitCursor) -> NoteworthyWake? {
+        if let epoch = cursor.epoch {
+            return record.epochStates[epoch.id]?.pendingNoteworthyWake
         }
-        guard let snapshot = state?.pendingNoteworthySnapshot,
-              let reason = state?.pendingWakeReason
-        else {
-            return nil
-        }
-        return (snapshot, reason)
+        return record.preEpochState.pendingNoteworthyWake
     }
 
     private func setPendingWake(
-        snapshot: AgentRunMCPSnapshot,
-        reason: WakeReason?,
+        _ wake: NoteworthyWake,
         in record: inout Record,
         cursor: WaitCursor
     ) {
-        guard let reason else { return }
         if let epoch = cursor.epoch {
             guard var state = record.epochStates[epoch.id] else { return }
-            state.pendingNoteworthySnapshot = snapshot
-            state.pendingWakeReason = reason
+            state.pendingNoteworthyWake = wake
             record.epochStates[epoch.id] = state
         } else {
-            record.preEpochState.pendingNoteworthySnapshot = snapshot
-            record.preEpochState.pendingWakeReason = reason
+            record.preEpochState.pendingNoteworthyWake = wake
         }
     }
 
     private func clearPendingWake(in record: inout Record, cursor: WaitCursor) {
         if let epoch = cursor.epoch {
             guard var state = record.epochStates[epoch.id] else { return }
-            state.pendingNoteworthySnapshot = nil
-            state.pendingWakeReason = nil
+            state.pendingNoteworthyWake = nil
             record.epochStates[epoch.id] = state
         } else {
-            record.preEpochState.pendingNoteworthySnapshot = nil
-            record.preEpochState.pendingWakeReason = nil
+            record.preEpochState.pendingNoteworthyWake = nil
         }
     }
 
@@ -777,17 +810,33 @@ extension AgentRunSessionStore {
     static func signalSnapshotAndWakeWaiters(
         _ snapshot: AgentRunMCPSnapshot,
         cursor: WaitCursor,
-        reason: WakeReason
+        reason: WakeReason,
+        steeringMessage: String? = nil,
+        steeringOriginRunID: UUID? = nil
     ) async {
-        await shared.noteSnapshotAndWakeWaiters(snapshot, cursor: cursor, reason: reason)
+        await shared.noteSnapshotAndWakeWaiters(
+            snapshot,
+            cursor: cursor,
+            reason: reason,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: steeringOriginRunID
+        )
     }
 
     static func wakeCurrentWaiters(
         _ snapshot: AgentRunMCPSnapshot,
         cursor: WaitCursor,
-        reason: WakeReason
+        reason: WakeReason,
+        steeringMessage: String? = nil,
+        steeringOriginRunID: UUID? = nil
     ) async {
-        await shared.wakeCurrentWaiters(snapshot, cursor: cursor, reason: reason)
+        await shared.wakeCurrentWaiters(
+            snapshot,
+            cursor: cursor,
+            reason: reason,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: steeringOriginRunID
+        )
     }
 }
 

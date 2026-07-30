@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "default_mode": "parallel_eligible",
+  "groups": {
+    "mcp_shared_server": {
+      "lane": "mcp_shared_server",
+      "reason": "Uses shared MCP server lifecycle or process-visible MCP routing state."
+    },
+    "WindowStatesManager": {
+      "lane": "app_window_state",
+      "reason": "Mutates process-global window state registry."
+    },
+    "ServerNetworkManager": {
+      "lane": "mcp_shared_server",
+      "reason": "Mutates process-global server/network manager state."
+    },
+    "ServerNetworkManager.bootstrapSocket": {
+      "lane": "mcp_shared_server",
+      "reason": "Mutates the shared bootstrap socket configuration."
+    },
+    "ServerNetworkManager.runRoutingHistory": {
+      "lane": "mcp_shared_server",
+      "reason": "Mutates shared run-routing diagnostics state."
+    },
+    "GlobalSettingsStore": {
+      "lane": "global_settings",
+      "reason": "Mutates process-global settings store state."
+    },
+    "GlobalSettingsStore.mcpAutoStart": {
+      "lane": "global_settings",
+      "reason": "Mutates the shared MCP autostart setting."
+    },
+    "global_settings": {
+      "lane": "global_settings",
+      "reason": "Mutates shared app settings through production-shaped test paths."
+    },
+    "UserDefaults.standard": {
+      "lane": "user_defaults",
+      "reason": "Mutates the process-wide standard UserDefaults domain."
+    },
+    "GitWorkspaceStateAuthority.shared": {
+      "lane": "git_workspace_state",
+      "reason": "Uses the shared git workspace state authority singleton."
+    },
+    "git_process_admission": {
+      "lane": "git_process_admission",
+      "reason": "Uses shared git process admission controls or observations."
+    },
+    "window_registry": {
+      "lane": "app_window_state",
+      "reason": "Mutates shared window registry state."
+    },
+    "WorkspaceManager": {
+      "lane": "workspace_manager",
+      "reason": "Mutates shared workspace manager lifecycle or listener state."
+    },
+    "workspace_manager": {
+      "lane": "workspace_manager",
+      "reason": "Mutates shared workspace manager lifecycle or listener state."
+    },
+    "debug_hooks": {
+      "lane": "debug_hooks",
+      "reason": "Mutates process-global debug hook state."
+    },
+    "test_debug_hooks": {
+      "lane": "debug_hooks",
+      "reason": "Mutates test-only debug hook state."
+    },
+    "test_local_debug_hooks": {
+      "lane": "debug_hooks",
+      "reason": "Mutates test-local debug hook state."
+    }
+  }
+}
