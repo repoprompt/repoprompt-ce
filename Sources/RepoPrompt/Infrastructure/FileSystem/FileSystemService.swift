@@ -26,6 +26,15 @@ struct FileSystemMutationWaiter {
     let continuation: CheckedContinuation<Void, any Error>
 }
 
+struct FileSystemInFlightMutation {
+    let relativePaths: Set<String>
+}
+
+struct FileSystemMutationDrainWaiter {
+    let relativePaths: Set<String>
+    let continuation: CheckedContinuation<Void, Never>
+}
+
 final class FileSystemServiceFSEventCallbackContext {
     weak var service: FileSystemService?
 
@@ -161,8 +170,11 @@ actor FileSystemService {
         /// Test-only barrier immediately before namespace-manifest authority fencing.
         var workspaceRootNamespaceEnumerationWillFinishHandler: (@Sendable () async -> Void)?
 
-        /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
+        /// Test-only gate invoked before a mutation is submitted to the blocking-I/O queue.
         var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+
+        /// Test-only synchronous gate invoked on the blocking-I/O queue immediately before filesystem I/O.
+        var mutationIOWillExecuteHandler: (@Sendable (FileSystemUncancellableMutation) -> Void)?
 
         /// Test-only replacement for the real Finder Trash operation.
         var moveItemToTrashIOForTesting: (@Sendable (URL) throws -> Void)?
@@ -179,7 +191,13 @@ actor FileSystemService {
 
     /// Request waiters are actor-owned and may be cancelled independently from detached filesystem I/O.
     var mutationWaiters: [UUID: FileSystemMutationWaiter] = [:]
+    /// In-flight records retain mutation and path authority until detached reconciliation completes.
+    var inFlightMutations: [UUID: FileSystemInFlightMutation] = [:]
+    var mutationDrainWaiters: [UUID: FileSystemMutationDrainWaiter] = [:]
     var deferredEditPublicationsByMutationID: [UUID: FileSystemDeferredEditPublication] = [:]
+    #if DEBUG
+        var completedMutationMonitorCountForTesting = 0
+    #endif
 
     /// Tracks paths we know about, to detect additions/removals. Ordinary roots
     /// keep the legacy in-memory representation; seeded roots retain their
@@ -244,6 +262,7 @@ actor FileSystemService {
     let path: String
     let rootURL: URL
     let canonicalRootURL: URL
+    let mutationAuthorityUsesCaseSensitiveNames: Bool
     let ignoreRulePolicy: IgnoreRulePolicy
     var canonicalRootPath: String {
         canonicalRootURL.path
@@ -352,9 +371,13 @@ actor FileSystemService {
         enableHierarchicalIgnores: Bool = true
     ) async throws {
         self.path = path
-        rootURL = URL(fileURLWithPath: path).standardizedFileURL
-        canonicalRootURL = rootURL.resolvingSymlinksInPath()
-        ignoreRulePolicy = try IgnoreRulePolicy.resolvingLoadedRoot(rootURL)
+        let resolvedRootURL = URL(fileURLWithPath: path).standardizedFileURL
+        rootURL = resolvedRootURL
+        canonicalRootURL = resolvedRootURL.resolvingSymlinksInPath()
+        mutationAuthorityUsesCaseSensitiveNames = (try? resolvedRootURL.resourceValues(
+            forKeys: [.volumeSupportsCaseSensitiveNamesKey]
+        ).volumeSupportsCaseSensitiveNames) ?? false
+        ignoreRulePolicy = try IgnoreRulePolicy.resolvingLoadedRoot(resolvedRootURL)
         self.respectRepoIgnore = respectRepoIgnore
         self.respectCursorignore = respectCursorignore
         self.skipSymlinks = skipSymlinks
@@ -404,6 +427,12 @@ actor FileSystemService {
             mutationIOWillBeginHandler = handler
         }
 
+        func setMutationIOWillExecuteHandlerForTesting(
+            _ handler: (@Sendable (FileSystemUncancellableMutation) -> Void)?
+        ) {
+            mutationIOWillExecuteHandler = handler
+        }
+
         func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {
             moveItemToTrashIOForTesting = operation
         }
@@ -420,6 +449,18 @@ actor FileSystemService {
 
         func pendingMutationWaiterCountForTesting() -> Int {
             mutationWaiters.count
+        }
+
+        func pendingInFlightMutationCountForTesting() -> Int {
+            inFlightMutations.count
+        }
+
+        func pendingMutationDrainWaiterCountForTesting() -> Int {
+            mutationDrainWaiters.count
+        }
+
+        func mutationMonitorCompletionCountForTesting() -> Int {
+            completedMutationMonitorCountForTesting
         }
 
         func pendingDeferredEditPublicationCountForTesting() -> Int {
@@ -448,9 +489,13 @@ actor FileSystemService {
             }
         ) async throws {
             self.path = path
-            rootURL = URL(fileURLWithPath: path).standardizedFileURL
-            canonicalRootURL = rootURL.resolvingSymlinksInPath()
-            ignoreRulePolicy = try IgnoreRulePolicy.resolvingLoadedRoot(rootURL)
+            let resolvedRootURL = URL(fileURLWithPath: path).standardizedFileURL
+            rootURL = resolvedRootURL
+            canonicalRootURL = resolvedRootURL.resolvingSymlinksInPath()
+            mutationAuthorityUsesCaseSensitiveNames = (try? resolvedRootURL.resourceValues(
+                forKeys: [.volumeSupportsCaseSensitiveNamesKey]
+            ).volumeSupportsCaseSensitiveNames) ?? false
+            ignoreRulePolicy = try IgnoreRulePolicy.resolvingLoadedRoot(resolvedRootURL)
             self.respectRepoIgnore = respectRepoIgnore
             self.respectCursorignore = respectCursorignore
             self.skipSymlinks = skipSymlinks

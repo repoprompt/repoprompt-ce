@@ -5,6 +5,12 @@ import Foundation
     import Glibc
 #endif
 
+private let fileSystemMutationIOQueue = DispatchQueue(
+    label: "com.repoprompt.filesystem-mutation-io",
+    qos: .utility,
+    attributes: .concurrent
+)
+
 extension FileSystemService {
     // MARK: - File and folder manipulation utilities
 
@@ -67,25 +73,44 @@ extension FileSystemService {
     }
 
     /// Starts filesystem I/O that cannot be cancelled safely once handed to Foundation.
+    /// Blocking calls run on a dispatch queue so slow writes do not occupy Swift's cooperative executor.
     ///
     /// Reconciliation contract: request cancellation only removes and resumes the actor-owned
     /// waiter. The detached monitor remains the sole completion owner and always reconciles the
     /// service caches plus synthetic delta publication against the eventual on-disk result.
     private func startUncancellableMutation(
         _ operation: FileSystemUncancellableMutation,
+        relativePaths: Set<String>,
         io: @escaping @Sendable () throws -> Void
-    ) -> (id: UUID, task: Task<Void, any Error>) {
+    ) throws -> (id: UUID, task: Task<Void, any Error>) {
+        let authorityPaths = mutationAuthorityPaths(relativePaths)
+        guard !hasInFlightMutation(conflictingWith: authorityPaths) else {
+            throw FileSystemError.mutationInProgress
+        }
         let id = UUID()
+        inFlightMutations[id] = FileSystemInFlightMutation(relativePaths: authorityPaths)
         #if DEBUG
             let willBegin = mutationIOWillBeginHandler
+            let willExecute = mutationIOWillExecuteHandler
         #else
             let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
+            let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)? = nil
         #endif
         let task = Task.detached(priority: .utility) {
             if let willBegin {
                 await willBegin(operation)
             }
-            try io()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                fileSystemMutationIOQueue.async {
+                    willExecute?(operation)
+                    do {
+                        try io()
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
         }
         return (id, task)
     }
@@ -112,12 +137,80 @@ extension FileSystemService {
         waiter.continuation.resume(throwing: CancellationError())
     }
 
-    private func completeMutationWaiter(_ id: UUID, error: (any Error)? = nil) {
-        guard let waiter = mutationWaiters.removeValue(forKey: id) else { return }
-        if let error {
-            waiter.continuation.resume(throwing: error)
-        } else {
+    private func completeMutation(_ id: UUID, error: (any Error)? = nil) {
+        if let waiter = mutationWaiters.removeValue(forKey: id) {
+            if let error {
+                waiter.continuation.resume(throwing: error)
+            } else {
+                waiter.continuation.resume()
+            }
+        }
+        guard inFlightMutations.removeValue(forKey: id) != nil else { return }
+        #if DEBUG
+            completedMutationMonitorCountForTesting += 1
+        #endif
+        resumeDrainedMutationWaiters()
+    }
+
+    private func mutationAuthorityPaths(_ relativePaths: Set<String>) -> Set<String> {
+        Set(relativePaths.map { relativePath in
+            let normalized = relativePath.precomposedStringWithCanonicalMapping
+            guard !mutationAuthorityUsesCaseSensitiveNames else { return normalized }
+            return normalized.folding(
+                options: [.caseInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+        })
+    }
+
+    private func hasInFlightMutation(conflictingWith authorityPaths: Set<String>) -> Bool {
+        inFlightMutations.values.contains { mutation in
+            Self.pathsOverlap(mutation.relativePaths, authorityPaths)
+        }
+    }
+
+    private nonisolated static func pathsOverlap(_ lhs: Set<String>, _ rhs: Set<String>) -> Bool {
+        lhs.contains { left in
+            rhs.contains { right in
+                left == right || left.hasPrefix(right + "/") || right.hasPrefix(left + "/")
+            }
+        }
+    }
+
+    func awaitMutationDrain(conflictingWith relativePaths: Set<String>) async {
+        let authorityPaths = mutationAuthorityPaths(relativePaths)
+        guard hasInFlightMutation(conflictingWith: authorityPaths) else { return }
+        await withCheckedContinuation { continuation in
+            let id = UUID()
+            mutationDrainWaiters[id] = FileSystemMutationDrainWaiter(
+                relativePaths: authorityPaths,
+                continuation: continuation
+            )
+        }
+    }
+
+    private func resumeDrainedMutationWaiters() {
+        let drained = mutationDrainWaiters.filter { _, waiter in
+            !hasInFlightMutation(conflictingWith: waiter.relativePaths)
+        }
+        for (id, waiter) in drained {
+            mutationDrainWaiters.removeValue(forKey: id)
             waiter.continuation.resume()
+        }
+    }
+
+    private nonisolated static func performBlockingMutationIO(
+        _ io: @escaping @Sendable () throws -> Void
+    ) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            fileSystemMutationIOQueue.async {
+                do {
+                    try io()
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 
@@ -142,12 +235,17 @@ extension FileSystemService {
             throw FileSystemError.fileAlreadyExists
         }
 
-        let destDir = (newFull as NSString).deletingLastPathComponent
-        try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
-        _ = try mutationTarget(forRelativePath: newTarget.relativePath)
-
-        let mutation = startUncancellableMutation(.move) {
-            try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
+        let rootPath = canonicalRootPath
+        let mutation = try startUncancellableMutation(
+            .move,
+            relativePaths: [oldTarget.relativePath, newTarget.relativePath]
+        ) {
+            try FileSystemService.moveFileSecurely(
+                rootPath: rootPath,
+                fromRelativePath: oldTarget.relativePath,
+                toRelativePath: newTarget.relativePath,
+                createDestinationParents: true
+            )
         }
         Task.detached { [weak self] in
             do {
@@ -155,12 +253,10 @@ extension FileSystemService {
                 await self?.reconcileMovedFile(
                     mutationID: mutation.id,
                     oldRelativePath: oldTarget.relativePath,
-                    newRelativePath: newTarget.relativePath,
-                    oldFullPath: oldFull,
-                    newFullPath: newFull
+                    newRelativePath: newTarget.relativePath
                 )
             } catch {
-                await self?.completeMutationWaiter(
+                await self?.completeMutation(
                     mutation.id,
                     error: FileSystemError.failedToCreateFile(error)
                 )
@@ -172,18 +268,22 @@ extension FileSystemService {
     private func reconcileMovedFile(
         mutationID: UUID,
         oldRelativePath: String,
-        newRelativePath: String,
-        oldFullPath: String,
-        newFullPath: String
+        newRelativePath: String
     ) async {
         switch await catalogRegularFileEligibility(relativePath: newRelativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
+            let rootPath = canonicalRootPath
             do {
-                try await Task.detached(priority: .utility) {
-                    try FileManager.default.moveItem(atPath: newFullPath, toPath: oldFullPath)
-                }.value
+                try await Self.performBlockingMutationIO {
+                    try FileSystemService.moveFileSecurely(
+                        rootPath: rootPath,
+                        fromRelativePath: newRelativePath,
+                        toRelativePath: oldRelativePath,
+                        createDestinationParents: false
+                    )
+                }
             } catch {
                 forgetTrackedPath(oldRelativePath)
                 publishFileSystemDeltas(
@@ -191,7 +291,7 @@ extension FileSystemService {
                     source: .syntheticMutation
                 )
             }
-            completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
+            completeMutation(mutationID, error: FileSystemError.invalidRelativePath)
             return
         }
 
@@ -207,7 +307,7 @@ extension FileSystemService {
             [.fileRemoved(oldRelativePath), .fileAdded(newRelativePath)],
             source: .syntheticMutation
         )
-        completeMutationWaiter(mutationID)
+        completeMutation(mutationID)
     }
 
     func createFile(atRelativePath relativePath: String, content: String) async throws {
@@ -217,9 +317,6 @@ extension FileSystemService {
         let fullPath = target.url.path
         let fullURL = target.url
 
-        let directoryURL = fullURL.deletingLastPathComponent()
-        try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
-        _ = try mutationTarget(forRelativePath: target.relativePath)
         guard !fm.fileExists(atPath: fullPath, isDirectory: nil) else {
             throw FileSystemError.fileAlreadyExists
         }
@@ -233,8 +330,16 @@ extension FileSystemService {
             )
         }
 
-        let mutation = startUncancellableMutation(.create) {
-            try FileSystemService.writeFileRobust(to: fullURL, data: data)
+        let rootPath = canonicalRootPath
+        let mutation = try startUncancellableMutation(
+            .create,
+            relativePaths: [target.relativePath]
+        ) {
+            try FileSystemService.writeFileNoReplace(
+                rootPath: rootPath,
+                relativePath: target.relativePath,
+                data: data
+            )
         }
         Task.detached { [weak self] in
             do {
@@ -245,9 +350,9 @@ extension FileSystemService {
                     url: fullURL
                 )
             } catch {
-                await self?.completeMutationWaiter(
+                await self?.completeMutation(
                     mutation.id,
-                    error: FileSystemError.failedToCreateFile(error)
+                    error: FileSystemService.normalizedCreateError(error)
                 )
             }
         }
@@ -264,11 +369,15 @@ extension FileSystemService {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            _ = try? await Task.detached(priority: .utility) {
-                try FileManager.default.removeItem(at: url)
-            }.value
+            let rootPath = canonicalRootPath
+            _ = try? await Self.performBlockingMutationIO {
+                try FileSystemService.removeSecureMutationItem(
+                    rootPath: rootPath,
+                    relativePath: relativePath
+                )
+            }
             forgetTrackedPath(relativePath)
-            completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
+            completeMutation(mutationID, error: FileSystemError.invalidRelativePath)
             return
         }
 
@@ -276,7 +385,7 @@ extension FileSystemService {
         visitedPaths.insert(relativePath)
         visitedItems[relativePath] = false
         publishFileSystemDeltas([.fileAdded(relativePath)], source: .syntheticMutation)
-        completeMutationWaiter(mutationID)
+        completeMutation(mutationID)
     }
 
     func deleteFile(atRelativePath relativePath: String) async throws {
@@ -285,7 +394,7 @@ extension FileSystemService {
         try await requireRegularMutationSource(relativePath: target.relativePath)
         try Task.checkCancellation()
         let url = target.url
-        let mutation = startUncancellableMutation(.delete) {
+        let mutation = try startUncancellableMutation(.delete, relativePaths: [target.relativePath]) {
             try FileManager.default.removeItem(at: url)
         }
         Task.detached { [weak self] in
@@ -297,7 +406,7 @@ extension FileSystemService {
                     url: url
                 )
             } catch {
-                await self?.completeMutationWaiter(
+                await self?.completeMutation(
                     mutation.id,
                     error: FileSystemError.failedToDeleteFile(error)
                 )
@@ -310,7 +419,7 @@ extension FileSystemService {
         fileSystemDebugLog("File deleted at \(url.path)")
         forgetTrackedPath(relativePath)
         publishFileSystemDeltas([.fileRemoved(relativePath)], source: .syntheticMutation)
-        completeMutationWaiter(mutationID)
+        completeMutation(mutationID)
     }
 
     func moveItemToTrash(atRelativePath relativePath: String) async throws {
@@ -333,7 +442,7 @@ extension FileSystemService {
                 _ = try Self.moveURLToTrashOffActor(url)
             }
         #endif
-        let mutation = startUncancellableMutation(.trash) {
+        let mutation = try startUncancellableMutation(.trash, relativePaths: [normalizedRelativePath]) {
             try moveItemToTrashIO(url)
         }
         Task.detached { [weak self] in
@@ -346,7 +455,7 @@ extension FileSystemService {
                     wasDirectory: wasDirectory
                 )
             } catch {
-                await self?.completeMutationWaiter(
+                await self?.completeMutation(
                     mutation.id,
                     error: FileSystemError.failedToDeleteFile(error)
                 )
@@ -374,7 +483,7 @@ extension FileSystemService {
             deltas = [wasDirectory ? .folderRemoved(relativePath) : .fileRemoved(relativePath)]
         }
         publishFileSystemDeltas(deltas, source: .syntheticMutation)
-        completeMutationWaiter(mutationID)
+        completeMutation(mutationID)
     }
 
     private func forgetTrackedPath(_ relativePath: String) {
@@ -430,7 +539,7 @@ extension FileSystemService {
             )
         }
 
-        let mutation = startUncancellableMutation(.edit) {
+        let mutation = try startUncancellableMutation(.edit, relativePaths: [target.relativePath]) {
             try FileSystemService.writeFileRobust(to: fullURL, data: data)
         }
         Task.detached { [weak self] in
@@ -443,7 +552,7 @@ extension FileSystemService {
                     modificationPublicationPolicy: modificationPublicationPolicy
                 )
             } catch {
-                await self?.completeMutationWaiter(
+                await self?.completeMutation(
                     mutation.id,
                     error: FileSystemError.failedToEditFile(error)
                 )
@@ -471,7 +580,7 @@ extension FileSystemService {
         case .ineligible:
             forgetTrackedPath(relativePath)
             publishFileSystemDeltas([.fileRemoved(relativePath)], source: .syntheticMutation)
-            completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
+            completeMutation(mutationID, error: FileSystemError.invalidRelativePath)
             return
         }
 
@@ -487,13 +596,13 @@ extension FileSystemService {
         case .publishSyntheticModification:
             publishDeferredEditPublication(deferredPublication)
         case .deferSyntheticModificationToSuccessfulCaller:
-            guard mutationWaiters[mutationID] != nil else {
+            if mutationWaiters[mutationID] != nil {
+                deferredEditPublicationsByMutationID[mutationID] = deferredPublication
+            } else {
                 publishDeferredEditPublication(deferredPublication)
-                return
             }
-            deferredEditPublicationsByMutationID[mutationID] = deferredPublication
         }
-        completeMutationWaiter(mutationID)
+        completeMutation(mutationID)
     }
 
     func resolveDeferredEditPublication(
@@ -537,11 +646,236 @@ extension FileSystemService {
         return attributes[.modificationDate] as? Date
     }
 
-    private static func writeFile(
-        to url: URL,
+    private nonisolated static func normalizedCreateError(_ error: any Error) -> any Error {
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(EEXIST) {
+            return FileSystemError.fileAlreadyExists
+        }
+        return FileSystemError.failedToCreateFile(error)
+    }
+
+    /// Writes under a descriptor-walked parent and publishes with no-replace semantics.
+    /// Parent traversal never follows symbolic links, and the temporary prefix is watcher-excluded.
+    private static func writeFileNoReplace(
+        rootPath: String,
+        relativePath: String,
         data: Data
     ) throws {
-        try data.write(to: url, options: .atomic) // blocking write
+        try withSecureMutationParent(
+            rootPath: rootPath,
+            relativePath: relativePath,
+            createIntermediates: true
+        ) { parentDescriptor, leafName in
+            let temporaryName = ".repoprompt.tmp.create.\(UUID().uuidString)"
+            let temporaryDescriptor = openat(
+                parentDescriptor,
+                temporaryName,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o644
+            )
+            guard temporaryDescriptor >= 0 else {
+                throw posixMutationError(
+                    operation: "exclusive temporary create",
+                    path: relativePath,
+                    code: errno
+                )
+            }
+            defer {
+                _ = close(temporaryDescriptor)
+                _ = unlinkat(parentDescriptor, temporaryName, 0)
+            }
+
+            try writeAll(data, to: temporaryDescriptor, path: relativePath)
+            guard fsync(temporaryDescriptor) == 0 else {
+                throw posixMutationError(operation: "temporary fsync", path: relativePath, code: errno)
+            }
+
+            #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+                if renameatx_np(
+                    parentDescriptor,
+                    temporaryName,
+                    parentDescriptor,
+                    leafName,
+                    UInt32(RENAME_EXCL)
+                ) == 0 {
+                    return
+                }
+                let renameError = errno
+                if renameError == EEXIST {
+                    throw posixMutationError(
+                        operation: "exclusive rename",
+                        path: relativePath,
+                        code: renameError
+                    )
+                }
+            #endif
+
+            if linkat(parentDescriptor, temporaryName, parentDescriptor, leafName, 0) == 0 {
+                return
+            }
+            throw posixMutationError(
+                operation: "exclusive link",
+                path: relativePath,
+                code: errno
+            )
+        }
+    }
+
+    private static func moveFileSecurely(
+        rootPath: String,
+        fromRelativePath: String,
+        toRelativePath: String,
+        createDestinationParents: Bool
+    ) throws {
+        try withSecureMutationParent(
+            rootPath: rootPath,
+            relativePath: fromRelativePath,
+            createIntermediates: false
+        ) { sourceParent, sourceName in
+            try withSecureMutationParent(
+                rootPath: rootPath,
+                relativePath: toRelativePath,
+                createIntermediates: createDestinationParents
+            ) { destinationParent, destinationName in
+                #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+                    guard renameatx_np(
+                        sourceParent,
+                        sourceName,
+                        destinationParent,
+                        destinationName,
+                        UInt32(RENAME_EXCL)
+                    ) == 0 else {
+                        throw posixMutationError(
+                            operation: "exclusive move",
+                            path: "\(fromRelativePath) -> \(toRelativePath)",
+                            code: errno
+                        )
+                    }
+                #else
+                    guard linkat(sourceParent, sourceName, destinationParent, destinationName, 0) == 0 else {
+                        throw posixMutationError(
+                            operation: "exclusive move link",
+                            path: "\(fromRelativePath) -> \(toRelativePath)",
+                            code: errno
+                        )
+                    }
+                    guard unlinkat(sourceParent, sourceName, 0) == 0 else {
+                        let unlinkError = errno
+                        _ = unlinkat(destinationParent, destinationName, 0)
+                        throw posixMutationError(
+                            operation: "exclusive move unlink",
+                            path: fromRelativePath,
+                            code: unlinkError
+                        )
+                    }
+                #endif
+            }
+        }
+    }
+
+    private static func removeSecureMutationItem(rootPath: String, relativePath: String) throws {
+        try withSecureMutationParent(
+            rootPath: rootPath,
+            relativePath: relativePath,
+            createIntermediates: false
+        ) { parentDescriptor, leafName in
+            guard unlinkat(parentDescriptor, leafName, 0) == 0 else {
+                throw posixMutationError(operation: "secure remove", path: relativePath, code: errno)
+            }
+        }
+    }
+
+    private static func withSecureMutationParent<T>(
+        rootPath: String,
+        relativePath: String,
+        createIntermediates: Bool,
+        _ body: (Int32, String) throws -> T
+    ) throws -> T {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let leafName = components.last,
+              !leafName.isEmpty,
+              components.allSatisfy({ $0 != "." && $0 != ".." })
+        else {
+            throw FileSystemError.invalidRelativePath
+        }
+
+        var currentDescriptor = open(
+            rootPath,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard currentDescriptor >= 0 else {
+            throw posixMutationError(operation: "secure root open", path: rootPath, code: errno)
+        }
+        defer { _ = close(currentDescriptor) }
+
+        for component in components.dropLast() {
+            var nextDescriptor = openat(
+                currentDescriptor,
+                component,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            if nextDescriptor < 0, errno == ENOENT, createIntermediates {
+                if mkdirat(currentDescriptor, component, 0o755) != 0, errno != EEXIST {
+                    throw posixMutationError(
+                        operation: "secure parent create",
+                        path: relativePath,
+                        code: errno
+                    )
+                }
+                nextDescriptor = openat(
+                    currentDescriptor,
+                    component,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            guard nextDescriptor >= 0 else {
+                throw posixMutationError(
+                    operation: "secure parent open",
+                    path: relativePath,
+                    code: errno
+                )
+            }
+            _ = close(currentDescriptor)
+            currentDescriptor = nextDescriptor
+        }
+        return try body(currentDescriptor, leafName)
+    }
+
+    private static func writeAll(_ data: Data, to descriptor: Int32, path: String) throws {
+        var writeError: Int32 = 0
+        data.withUnsafeBytes { bytes in
+            guard var base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            var remaining = data.count
+            while remaining > 0 {
+                #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+                    let count = Darwin.write(descriptor, base, remaining)
+                #else
+                    let count = Glibc.write(descriptor, base, remaining)
+                #endif
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    writeError = errno
+                    break
+                }
+                if count == 0 {
+                    writeError = EIO
+                    break
+                }
+                remaining -= count
+                base = base.advanced(by: count)
+            }
+        }
+        guard writeError == 0 else {
+            throw posixMutationError(operation: "temporary write", path: path, code: writeError)
+        }
+    }
+
+    private static func posixMutationError(operation: String, path: String, code: Int32) -> NSError {
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(code),
+            userInfo: [NSLocalizedDescriptionKey: "\(operation) failed for \(path) (\(code))"]
+        )
     }
 
     /// Robust write that works across external/network volumes:

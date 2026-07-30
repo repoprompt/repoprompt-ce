@@ -669,6 +669,83 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(finalWaiterCount, 0)
 
             await service.setMutationIOWillBeginHandlerForTesting(nil)
+            let competitorPath = "CreateCompetitor.swift"
+            let competitorURL = root.appendingPathComponent(competitorPath)
+            let competitorFence = TestBlockingFence(name: "atomic create competitor")
+            let completionCountBeforeCompetitor = await service.mutationMonitorCompletionCountForTesting()
+            await service.setMutationIOWillExecuteHandlerForTesting { operation in
+                guard operation == .create else { return }
+                competitorFence.enterAndWait()
+            }
+            let competingCreateTask = Task {
+                try await store.createFile(
+                    rootID: record.id,
+                    relativePath: competitorPath,
+                    content: "requested"
+                )
+            }
+            let competitorGateEntered = await Task.detached {
+                competitorFence.waitUntilEntered()
+            }.value
+            XCTAssertTrue(competitorGateEntered)
+            try "competitor".write(to: competitorURL, atomically: true, encoding: .utf8)
+            competitorFence.release()
+            do {
+                _ = try await competingCreateTask.value
+                XCTFail("Expected atomic no-replace create to reject the competitor")
+            } catch FileSystemError.fileAlreadyExists {
+                // Expected: the late competitor owns the path.
+            }
+            XCTAssertEqual(try String(contentsOf: competitorURL, encoding: .utf8), "competitor")
+            let competitorMonitorDrained = await waitForAsyncCondition(timeout: .seconds(2)) {
+                let mutations = await service.pendingInFlightMutationCountForTesting()
+                let monitorCompletions = await service.mutationMonitorCompletionCountForTesting()
+                return mutations == 0 && monitorCompletions == completionCountBeforeCompetitor + 1
+            }
+            XCTAssertTrue(competitorMonitorDrained)
+
+            await service.setMutationIOWillExecuteHandlerForTesting(nil)
+            let outsideRoot = try makeTemporaryRoot(name: "CreateSymlinkRaceOutside")
+            let symlinkRacePath = "LateParent/CreatedOutside.swift"
+            let symlinkRaceParent = root.appendingPathComponent("LateParent")
+            let symlinkRaceFence = TestBlockingFence(name: "descriptor-relative create parent")
+            await service.setMutationIOWillExecuteHandlerForTesting { operation in
+                guard operation == .create else { return }
+                symlinkRaceFence.enterAndWait()
+            }
+            let symlinkRaceTask = Task {
+                try await store.createFile(
+                    rootID: record.id,
+                    relativePath: symlinkRacePath,
+                    content: "must stay inside"
+                )
+            }
+            let symlinkRaceEntered = await Task.detached {
+                symlinkRaceFence.waitUntilEntered()
+            }.value
+            XCTAssertTrue(symlinkRaceEntered)
+            try FileManager.default.createSymbolicLink(
+                at: symlinkRaceParent,
+                withDestinationURL: outsideRoot
+            )
+            symlinkRaceFence.release()
+            do {
+                _ = try await symlinkRaceTask.value
+                XCTFail("Expected descriptor-relative create to reject a late parent symlink")
+            } catch {
+                // Expected: no-follow parent traversal rejects the late symlink.
+            }
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: outsideRoot.appendingPathComponent("CreatedOutside.swift").path
+                )
+            )
+            let symlinkRaceMonitorDrained = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await service.pendingInFlightMutationCountForTesting() == 0
+            }
+            XCTAssertTrue(symlinkRaceMonitorDrained)
+
+            await service.setMutationIOWillExecuteHandlerForTesting(nil)
             await store.stopWatchingRoot(id: record.id)
         }
 
@@ -683,6 +760,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let service = try XCTUnwrap(loadedService)
             let publications = LockedFileSystemPublications()
             let publicationCancellable = await service.publisherForChanges().sink { publications.append($0) }
+            let initialMonitorCompletionCount = await service.mutationMonitorCompletionCountForTesting()
             let mutationGate = AsyncGate()
             await service.setMutationIOWillBeginHandlerForTesting { operation in
                 guard operation == .edit else { return }
@@ -726,10 +804,43 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "old")
             let waiterCountAfterCancellation = await service.pendingMutationWaiterCountForTesting()
             XCTAssertEqual(waiterCountAfterCancellation, 0)
+            let retainedFenceCount = await store.codemapPathFenceCountForTesting(
+                rootID: record.id,
+                relativePath: "OverwriteAfterCancellation.swift"
+            )
+            XCTAssertEqual(retainedFenceCount, 1)
+
+            let drainCompletedSignal = AsyncSignal()
+            let drainTask = Task {
+                await service.awaitMutationDrain(conflictingWith: ["OverwriteAfterCancellation.swift"])
+                await drainCompletedSignal.mark()
+            }
+            let drainWaiterRegistered = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await service.pendingMutationDrainWaiterCountForTesting() == 1
+            }
+            XCTAssertTrue(drainWaiterRegistered)
+            let drainCompletedBeforeRelease = await drainCompletedSignal.isMarked()
+            XCTAssertFalse(drainCompletedBeforeRelease)
 
             await mutationGate.release()
             let observedCancellation = await resultTask.value
             XCTAssertTrue(observedCancellation)
+            let drainCompleted = await waitForAsyncCondition(timeout: .seconds(5)) {
+                await drainCompletedSignal.isMarked()
+            }
+            XCTAssertTrue(drainCompleted)
+            if drainCompleted {
+                await drainTask.value
+            } else {
+                drainTask.cancel()
+            }
+            let fenceReleased = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await store.codemapPathFenceCountForTesting(
+                    rootID: record.id,
+                    relativePath: "OverwriteAfterCancellation.swift"
+                ) == 0
+            }
+            XCTAssertTrue(fenceReleased)
             let reconciled = await waitForAsyncCondition(timeout: .seconds(5)) {
                 guard (try? String(contentsOf: fileURL, encoding: .utf8)) == "new" else { return false }
                 return await (try? store.readContent(
@@ -742,6 +853,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertNotNil(catalogFile)
             let finalWaiterCount = await service.pendingMutationWaiterCountForTesting()
             XCTAssertEqual(finalWaiterCount, 0)
+            let finalMutationCount = await service.pendingInFlightMutationCountForTesting()
+            XCTAssertEqual(finalMutationCount, 0)
+            let finalDrainWaiterCount = await service.pendingMutationDrainWaiterCountForTesting()
+            XCTAssertEqual(finalDrainWaiterCount, 0)
+            let finalMonitorCompletionCount = await service.mutationMonitorCompletionCountForTesting()
+            XCTAssertEqual(finalMonitorCompletionCount, initialMonitorCompletionCount + 1)
             let fallbackPublished = await waitForAsyncCondition(timeout: .seconds(2)) {
                 publications.snapshot().contains { publication in
                     publication.source == .syntheticMutation

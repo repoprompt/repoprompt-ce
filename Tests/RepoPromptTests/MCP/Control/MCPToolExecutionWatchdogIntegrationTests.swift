@@ -1453,7 +1453,7 @@ import XCTest
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let clock = ExecutionWatchdogManualClock()
-                let gate = MCPExecutionIgnoringCancellationGate()
+                let mutationIOFence = TestBlockingFence(name: "file_actions blocking mutation I/O")
                 let recorder = MCPExecutionTraceRecorder()
                 let manager = fixture.networkManager
                 let store = fixture.contextA.window.workspaceFileContextStore
@@ -1463,11 +1463,12 @@ import XCTest
                 let createdURL = fixture.contextA.rootURL.appendingPathComponent("CreatedAfterWatchdog.swift")
                 var fileActionTask: Task<PersistentMCPTestRPCResponse, Error>?
                 var queuedReadTask: Task<PersistentMCPTestRPCResponse, Error>?
+                let initialMonitorCompletionCount = await service.mutationMonitorCompletionCountForTesting()
 
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
-                await service.setMutationIOWillBeginHandlerForTesting { operation in
+                await service.setMutationIOWillExecuteHandlerForTesting { operation in
                     guard operation == .create else { return }
-                    await gate.enterAndWait()
+                    mutationIOFence.enterAndWait()
                 }
                 do {
                     let endpoint = try fixture.endpointA()
@@ -1484,14 +1485,24 @@ import XCTest
                             name: MCPWindowToolName.fileActions,
                             arguments: [
                                 "action": "create",
-                                "path": createdURL.path,
-                                "content": SwiftFixtureSource.emptyStruct("CreatedAfterWatchdog")
+                                "path": "CreatedAfterWatchdog.swift",
+                                "content": SwiftFixtureSource.emptyStruct("CreatedAfterWatchdog"),
+                                "_rawJSON": true
                             ]
                         )
                     }
                     fileActionTask = activeFileActionTask
                     try await clock.waitForSleeperCount(1)
-                    try await gate.waitUntilEntered(count: 1)
+                    let mutationIOEntered = await Task.detached {
+                        mutationIOFence.waitUntilEntered()
+                    }.value
+                    XCTAssertTrue(mutationIOEntered)
+                    let waiterRegistered = await Self.waitUntil {
+                        let waiters = await service.pendingMutationWaiterCountForTesting()
+                        let mutations = await service.pendingInFlightMutationCountForTesting()
+                        return waiters == 1 && mutations == 1
+                    }
+                    XCTAssertTrue(waiterRegistered)
 
                     let activeQueuedReadTask = Task {
                         try await endpoint.callTool(
@@ -1510,9 +1521,70 @@ import XCTest
                     fileActionTask = nil
                     let timeoutText = try Self.toolResultText(timeoutResponse)
                     XCTAssertEqual(timeoutText.components(separatedBy: "tool_execution_timeout").count - 1, 1, timeoutText)
+                    let timeoutObject = try Self.toolResultObject(timeoutResponse)
+                    XCTAssertEqual(timeoutObject["code"] as? String, "tool_execution_timeout")
+                    XCTAssertEqual(timeoutObject["cancellation_origin"] as? String, "watchdog_deadline")
+                    XCTAssertEqual(timeoutObject["settlement"] as? String, MCPToolExecutionSettlement.cancellation.rawValue)
+                    XCTAssertNil(timeoutObject["retryable"])
                     let pendingWaiters = await service.pendingMutationWaiterCountForTesting()
                     XCTAssertEqual(pendingWaiters, 0)
+                    let pendingMutations = await service.pendingInFlightMutationCountForTesting()
+                    XCTAssertEqual(pendingMutations, 1)
                     XCTAssertFalse(FileManager.default.fileExists(atPath: createdURL.path))
+
+                    let conflictingResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.fileActions,
+                        arguments: [
+                            "action": "create",
+                            "path": "CreatedAfterWatchdog.swift",
+                            "content": "conflicting replay"
+                        ]
+                    )
+                    let conflictingText = try Self.toolResultText(conflictingResponse)
+                    XCTAssertTrue(conflictingText.contains("conflicting filesystem mutation"), conflictingText)
+                    XCTAssertFalse(conflictingText.contains("retryable"), conflictingText)
+
+                    let rootValues = try? fixture.contextA.rootURL.resourceValues(
+                        forKeys: [.volumeSupportsCaseSensitiveNamesKey]
+                    )
+                    if rootValues?.volumeSupportsCaseSensitiveNames == false {
+                        let caseVariantResponse = try await endpoint.callTool(
+                            name: MCPWindowToolName.fileActions,
+                            arguments: [
+                                "action": "create",
+                                "path": "createdafterwatchdog.swift",
+                                "content": "case-variant conflicting replay"
+                            ]
+                        )
+                        let caseVariantText = try Self.toolResultText(caseVariantResponse)
+                        XCTAssertTrue(
+                            caseVariantText.contains("conflicting filesystem mutation"),
+                            caseVariantText
+                        )
+                    }
+
+                    await service.setMutationIOWillExecuteHandlerForTesting(nil)
+                    let unrelatedURL = fixture.contextA.rootURL.appendingPathComponent("UnrelatedWhilePending.swift")
+                    let unrelatedResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.fileActions,
+                        arguments: [
+                            "action": "create",
+                            "path": "UnrelatedWhilePending.swift",
+                            "content": SwiftFixtureSource.emptyStruct("UnrelatedWhilePending")
+                        ]
+                    )
+                    let unrelatedText = try Self.toolResultText(unrelatedResponse)
+                    XCTAssertTrue(unrelatedText.contains("## File Action ✅"), unrelatedText)
+                    XCTAssertTrue(unrelatedText.contains("- Action: create"), unrelatedText)
+                    XCTAssertTrue(
+                        unrelatedText.contains("- Path: `UnrelatedWhilePending.swift`"),
+                        unrelatedText
+                    )
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: unrelatedURL.path))
+                    let completionsAfterUnrelated = await service.mutationMonitorCompletionCountForTesting()
+                    XCTAssertEqual(completionsAfterUnrelated, initialMonitorCompletionCount + 1)
+                    let pendingAfterUnrelated = await service.pendingInFlightMutationCountForTesting()
+                    XCTAssertEqual(pendingAfterUnrelated, 1)
 
                     let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
                     XCTAssertFalse(isTerminal)
@@ -1524,9 +1596,15 @@ import XCTest
                     XCTAssertFalse(events.contains { $0.phase == .cleanupGraceExpired })
                     XCTAssertFalse(events.contains { $0.phase == .connectionForceDisconnectRequested })
 
-                    await gate.release()
+                    _ = try await endpoint.client.request(method: "tools/list", params: [:])
+                    mutationIOFence.release()
                     let reconciled = await Self.waitUntil {
-                        guard FileManager.default.fileExists(atPath: createdURL.path) else { return false }
+                        let mutations = await service.pendingInFlightMutationCountForTesting()
+                        let monitorCompletions = await service.mutationMonitorCompletionCountForTesting()
+                        guard FileManager.default.fileExists(atPath: createdURL.path),
+                              mutations == 0,
+                              monitorCompletions == initialMonitorCompletionCount + 2
+                        else { return false }
                         return await store.file(
                             rootID: fixture.contextA.rootID,
                             relativePath: "CreatedAfterWatchdog.swift"
@@ -1535,18 +1613,19 @@ import XCTest
                     XCTAssertTrue(reconciled)
                     let finalWaiters = await service.pendingMutationWaiterCountForTesting()
                     XCTAssertEqual(finalWaiters, 0)
+                    let finalMonitorCompletionCount = await service.mutationMonitorCompletionCountForTesting()
+                    XCTAssertEqual(finalMonitorCompletionCount, initialMonitorCompletionCount + 2)
 
-                    await service.setMutationIOWillBeginHandlerForTesting(nil)
+                    await service.setMutationIOWillExecuteHandlerForTesting(nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
-                    _ = try await endpoint.client.request(method: "tools/list", params: [:])
                     MCPToolExecutionTracer.setTestSink(nil)
                     await fixture.cleanup()
                     try await fixture.assertCleanedUp()
                 } catch {
                     fileActionTask?.cancel()
                     queuedReadTask?.cancel()
-                    await gate.release()
-                    await service.setMutationIOWillBeginHandlerForTesting(nil)
+                    mutationIOFence.release()
+                    await service.setMutationIOWillExecuteHandlerForTesting(nil)
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
                     if let fileActionTask { _ = try? await fileActionTask.value }
@@ -1561,7 +1640,7 @@ import XCTest
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let clock = ExecutionWatchdogManualClock()
-                let gate = MCPExecutionIgnoringCancellationGate()
+                let mutationIOFence = TestBlockingFence(name: "file_actions overwrite blocking mutation I/O")
                 let recorder = MCPExecutionTraceRecorder()
                 let manager = fixture.networkManager
                 let store = fixture.contextA.window.workspaceFileContextStore
@@ -1579,9 +1658,9 @@ import XCTest
                 var queuedReadTask: Task<PersistentMCPTestRPCResponse, Error>?
 
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
-                await service.setMutationIOWillBeginHandlerForTesting { operation in
+                await service.setMutationIOWillExecuteHandlerForTesting { operation in
                     guard operation == .edit else { return }
-                    await gate.enterAndWait()
+                    mutationIOFence.enterAndWait()
                 }
                 do {
                     let endpoint = try fixture.endpointA()
@@ -1606,7 +1685,10 @@ import XCTest
                     }
                     fileActionTask = activeFileActionTask
                     try await clock.waitForSleeperCount(1)
-                    try await gate.waitUntilEntered(count: 1)
+                    let mutationIOEntered = await Task.detached {
+                        mutationIOFence.waitUntilEntered()
+                    }.value
+                    XCTAssertTrue(mutationIOEntered)
 
                     let activeQueuedReadTask = Task {
                         try await endpoint.callTool(
@@ -1639,7 +1721,7 @@ import XCTest
                     XCTAssertFalse(events.contains { $0.phase == .cleanupGraceExpired })
                     XCTAssertFalse(events.contains { $0.phase == .connectionForceDisconnectRequested })
 
-                    await gate.release()
+                    mutationIOFence.release()
                     let reconciled = await Self.waitUntil {
                         guard (try? String(contentsOf: fileURL, encoding: .utf8)) == "new" else { return false }
                         return await (try? store.readContent(
@@ -1651,7 +1733,7 @@ import XCTest
                     let finalWaiters = await service.pendingMutationWaiterCountForTesting()
                     XCTAssertEqual(finalWaiters, 0)
 
-                    await service.setMutationIOWillBeginHandlerForTesting(nil)
+                    await service.setMutationIOWillExecuteHandlerForTesting(nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
                     _ = try await endpoint.client.request(method: "tools/list", params: [:])
                     MCPToolExecutionTracer.setTestSink(nil)
@@ -1660,8 +1742,8 @@ import XCTest
                 } catch {
                     fileActionTask?.cancel()
                     queuedReadTask?.cancel()
-                    await gate.release()
-                    await service.setMutationIOWillBeginHandlerForTesting(nil)
+                    mutationIOFence.release()
+                    await service.setMutationIOWillExecuteHandlerForTesting(nil)
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
                     if let fileActionTask { _ = try? await fileActionTask.value }
