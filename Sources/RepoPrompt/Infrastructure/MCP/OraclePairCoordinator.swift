@@ -3,6 +3,7 @@ import Foundation
 enum OracleLaneFailureCode: String, Equatable {
     case emptyResponse = "empty_response"
     case executionFailed = "execution_failed"
+    case cancelled
 }
 
 struct OracleLaneFailure: Equatable {
@@ -38,6 +39,51 @@ struct OracleLaneExecutionError: LocalizedError {
 
     var errorDescription: String? {
         message
+    }
+}
+
+struct OraclePairRoute: Hashable {
+    let workspaceID: UUID
+    let tabID: UUID
+    let agentModeSessionID: UUID?
+    let agentModeRunID: UUID?
+}
+
+enum OraclePairClaimKey: Hashable {
+    case route(OraclePairRoute)
+    case workspace(UUID)
+}
+
+enum OraclePairClaimError: Error, Equatable {
+    case conflict
+}
+
+@MainActor
+final class OraclePairClaimRegistry {
+    private var claimedKeys: Set<OraclePairClaimKey> = []
+
+    func withClaim<Result>(
+        _ keys: Set<OraclePairClaimKey>,
+        operation: @MainActor () async throws -> Result
+    ) async throws -> Result {
+        guard !keys.contains(where: conflicts(with:)) else { throw OraclePairClaimError.conflict }
+        claimedKeys.formUnion(keys)
+        defer { claimedKeys.subtract(keys) }
+        return try await operation()
+    }
+
+    private func conflicts(with requested: OraclePairClaimKey) -> Bool {
+        claimedKeys.contains { existing in
+            switch (requested, existing) {
+            case let (.route(requestedRoute), .route(existingRoute)):
+                requestedRoute == existingRoute
+            case let (.route(route), .workspace(workspaceID)),
+                 let (.workspace(workspaceID), .route(route)):
+                route.workspaceID == workspaceID
+            case let (.workspace(requestedID), .workspace(existingID)):
+                requestedID == existingID
+            }
+        }
     }
 }
 

@@ -15,6 +15,36 @@ import XCTest
             try await super.tearDown()
         }
 
+        func testDisabledSecondaryPreservesSingleSendValidationError() async {
+            let settings = GlobalSettingsStore.shared
+            let priorSecondaryModel = settings.secondaryOracleModelRaw()
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
+            defer {
+                settings.setSecondaryOracleModelRaw(priorSecondaryModel, commit: false)
+            }
+
+            let oracle = makeOracleViewModel(cleanupRecorder: OracleCleanupRecorder())
+            let args: [String: Value] = ["message": .string("")]
+            let routedError: ChatToolError?
+            do {
+                _ = try await oracle.tool_chatSend(args: args, promptVM: oracle.promptViewModel)
+                routedError = nil
+            } catch {
+                routedError = error as? ChatToolError
+            }
+            let directError: ChatToolError?
+            do {
+                _ = try await oracle.tool_singleChatSend(args: args, promptVM: oracle.promptViewModel)
+                directError = nil
+            } catch {
+                directError = error as? ChatToolError
+            }
+
+            XCTAssertEqual(routedError?.code.rawValue, directError?.code.rawValue)
+            XCTAssertEqual(routedError?.message, directError?.message)
+            XCTAssertEqual(routedError?.message, "message cannot be empty")
+        }
+
         func testOracleCleanupHelperInvokesAIQueriesServiceDelete() async {
             let recorder = OracleCleanupRecorder()
             let oracle = makeOracleViewModel(cleanupRecorder: recorder)

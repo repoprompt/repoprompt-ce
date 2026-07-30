@@ -93,6 +93,36 @@ final class OracleMessageFinalisationHubTests: XCTestCase {
         XCTAssertTrue(retainedResumedAfterFulfilment)
     }
 
+    func testTerminalOutcomeIsStructuredFirstWriterWinsAndDiscardAllowsRetry() async {
+        let hub = MessageFinalisationHub()
+        let messageID = UUID()
+
+        await hub.fulfil(
+            messageID,
+            outcome: .failed(message: "provider failed", partialResponse: "partial")
+        )
+        await hub.fulfil(messageID, outcome: .completed)
+        let failedOutcome = await hub.outcome(for: messageID)
+        XCTAssertEqual(
+            failedOutcome,
+            .failed(message: "provider failed", partialResponse: "partial")
+        )
+
+        await hub.discard(messageID)
+        let completedAfterDiscard = await hub.isCompleted(messageID)
+        XCTAssertFalse(completedAfterDiscard)
+
+        await hub.fulfil(
+            messageID,
+            outcome: .cancelled(message: "cancelled", partialResponse: nil)
+        )
+        let cancelledOutcome = await hub.outcome(for: messageID)
+        XCTAssertEqual(
+            cancelledOutcome,
+            .cancelled(message: "cancelled", partialResponse: nil)
+        )
+    }
+
     private func makeWaiter(
         hub: MessageFinalisationHub,
         messageID: UUID,

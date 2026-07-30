@@ -48,6 +48,32 @@ enum ChatSessionLookupResult {
     case ambiguous
 }
 
+enum ChatLogicalHistoryKey: Hashable {
+    case session(UUID)
+    case oraclePair(UUID)
+}
+
+struct ChatSessionFileRecord {
+    let fileURL: URL
+    let sessionID: UUID
+    let oraclePairID: UUID?
+    let oracleLane: OracleLane?
+    let modificationDate: Date
+}
+
+struct ChatLogicalHistoryGroup {
+    let key: ChatLogicalHistoryKey
+    let records: [ChatSessionFileRecord]
+
+    var newestModificationDate: Date {
+        records.map(\.modificationDate).max() ?? .distantPast
+    }
+
+    var weight: Int {
+        records.count
+    }
+}
+
 /// Chat history limit options
 public enum ChatHistoryLimit: Int, CaseIterable {
     case fifty = 50
@@ -73,14 +99,10 @@ public enum ChatHistoryLimit: Int, CaseIterable {
 /// An actor that reads/writes ChatSessions from each workspace's "Chats" folder.
 /// (Refactored to remove Task.detached usage but keep method signatures & behavior identical.)
 actor ChatDataService {
-    /// The JSON decoder we'll use
-    private let decoder = JSONDecoder()
-
-    init() {
-        // Customize encoder/decoder if desired (dates, etc.)
-    }
+    init() {}
 
     private static let fileSaveQueue = DispatchQueue(label: "com.repoprompt.chatDataServiceFileSaveQueue")
+    private var deletedSessionIDs: Set<UUID> = []
 
     // MARK: - Lightweight decode helpers
 
@@ -123,6 +145,13 @@ actor ChatDataService {
         _ session: ChatSession,
         for workspace: WorkspaceModel
     ) async throws -> URL {
+        guard !deletedSessionIDs.contains(session.id) else {
+            throw ChatDataError.saveFailed(NSError(
+                domain: "ChatDataService",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The chat session was deleted."]
+            ))
+        }
         // 1) Get "Chats" folder
         let chatsFolder = try ensureChatsFolder(for: workspace)
 
@@ -136,17 +165,79 @@ actor ChatDataService {
         sessionToSave.savedAt = Date()
         let sessionCopy = sessionToSave // constant copy to capture in the closure
 
-        // 4) Encode & write using a fresh encoder inside the shared static queue
-        return try await withCheckedThrowingContinuation { continuation in
-            Self.fileSaveQueue.async {
-                do {
-                    let freshEncoder = JSONEncoder() // Use a fresh encoder
-                    let data = try freshEncoder.encode(sessionCopy)
-                    try data.write(to: fileURL, options: .atomic)
-                    continuation.resume(returning: fileURL)
-                } catch {
-                    continuation.resume(throwing: error)
+        // Keep the actor non-reentrant for the complete filesystem operation, and
+        // share the same critical section with nonisolated batch readers.
+        return try Self.fileSaveQueue.sync {
+            let data = try JSONEncoder().encode(sessionCopy)
+            try data.write(to: fileURL, options: .atomic)
+            return fileURL
+        }
+    }
+
+    /// Saves a logical chat group as one in-process transaction. Each JSON replacement
+    /// is atomic; if any member fails, every earlier member is restored before returning.
+    func saveChatSessions(
+        _ sessions: [ChatSession],
+        for workspace: WorkspaceModel
+    ) async throws -> [UUID: URL] {
+        guard !sessions.isEmpty else { return [:] }
+        guard sessions.allSatisfy({ !deletedSessionIDs.contains($0.id) }) else {
+            throw ChatDataError.saveFailed(NSError(
+                domain: "ChatDataService",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "A chat session in the logical group was deleted."]
+            ))
+        }
+        let chatsFolder = try ensureChatsFolder(for: workspace)
+        let savedAt = Date()
+        let prepared = sessions.map { session -> (ChatSession, URL) in
+            var copy = session
+            let fileURL = chatsFolder.appendingPathComponent("ChatSession-\(session.id.uuidString).json")
+            copy.fileURL = fileURL
+            copy.savedAt = savedAt
+            return (copy, fileURL)
+        }
+
+        return try Self.fileSaveQueue.sync {
+            var originals: [URL: Data] = [:]
+            var originallyMissing: Set<URL> = []
+            var written: [URL] = []
+            do {
+                let encoder = JSONEncoder()
+                for (session, fileURL) in prepared {
+                    if FileManager.default.fileExists(atPath: fileURL.path) {
+                        originals[fileURL] = try Data(contentsOf: fileURL)
+                    } else {
+                        originallyMissing.insert(fileURL)
+                    }
+                    try encoder.encode(session).write(to: fileURL, options: .atomic)
+                    written.append(fileURL)
                 }
+                return Dictionary(uniqueKeysWithValues: prepared.map { ($0.0.id, $0.1) })
+            } catch {
+                var rollbackError: Error?
+                for fileURL in written.reversed() {
+                    do {
+                        if let original = originals[fileURL] {
+                            try original.write(to: fileURL, options: .atomic)
+                        } else if originallyMissing.contains(fileURL) {
+                            try FileManager.default.removeItem(at: fileURL)
+                        }
+                    } catch {
+                        rollbackError = rollbackError ?? error
+                    }
+                }
+                if let rollbackError {
+                    throw ChatDataError.saveFailed(NSError(
+                        domain: "ChatDataService",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "Logical chat save and rollback failed.",
+                            NSUnderlyingErrorKey: rollbackError
+                        ]
+                    ))
+                }
+                throw error
             }
         }
     }
@@ -161,11 +252,12 @@ actor ChatDataService {
         }
 
         do {
-            // Use memory-mapped reads to reduce peak memory pressure for large sessions
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-            var session = try decoder.decode(ChatSession.self, from: data)
-            session.fileURL = fileURL
-            return session
+            return try Self.fileSaveQueue.sync {
+                let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+                var session = try JSONDecoder().decode(ChatSession.self, from: data)
+                session.fileURL = fileURL
+                return session
+            }
         } catch {
             throw ChatDataError.loadFailed(error)
         }
@@ -174,6 +266,11 @@ actor ChatDataService {
     private enum ChatSessionStubLoadOutcome {
         case success(index: Int, session: ChatSession)
         case failure(index: Int, fileURL: URL, message: String)
+    }
+
+    private struct ChatSessionStubSnapshot {
+        let data: Data?
+        let readFailure: String?
     }
 
     /// Load a lightweight `ChatSession` suitable for session lists without decoding full message text.
@@ -190,6 +287,18 @@ actor ChatDataService {
             return ChatSessionStubLoadBatchResult(sessions: [], failures: [], requestedCount: 0)
         }
 
+        let snapshots = Self.fileSaveQueue.sync {
+            files.map { fileURL in
+                do {
+                    return try ChatSessionStubSnapshot(
+                        data: Data(contentsOf: fileURL, options: .mappedIfSafe),
+                        readFailure: nil
+                    )
+                } catch {
+                    return ChatSessionStubSnapshot(data: nil, readFailure: String(describing: error))
+                }
+            }
+        }
         let effectiveLimit = min(max(1, maxConcurrent), files.count)
         var outcomes = [ChatSessionStubLoadOutcome?](repeating: nil, count: files.count)
         var nextIndexToSchedule = 0
@@ -197,9 +306,16 @@ actor ChatDataService {
         await withTaskGroup(of: ChatSessionStubLoadOutcome.self) { group in
             func schedule(_ index: Int) {
                 let fileURL = files[index]
+                let snapshot = snapshots[index]
                 group.addTask {
+                    if let readFailure = snapshot.readFailure {
+                        return .failure(index: index, fileURL: fileURL, message: readFailure)
+                    }
                     do {
-                        let session = try Self.loadChatSessionStubFromDisk(from: fileURL)
+                        let session = try Self.decodeChatSessionStub(
+                            from: snapshot.data ?? Data(),
+                            fileURL: fileURL
+                        )
                         return .success(index: index, session: session)
                     } catch {
                         return .failure(index: index, fileURL: fileURL, message: String(describing: error))
@@ -248,19 +364,30 @@ actor ChatDataService {
     }
 
     private nonisolated static func loadChatSessionStubFromDisk(from fileURL: URL) throws -> ChatSession {
+        let data: Data
+        do {
+            data = try fileSaveQueue.sync {
+                try Data(contentsOf: fileURL, options: .mappedIfSafe)
+            }
+        } catch {
+            throw ChatDataError.loadFailed(error)
+        }
+        return try decodeChatSessionStub(from: data, fileURL: fileURL)
+    }
+
+    private nonisolated static func decodeChatSessionStub(
+        from data: Data,
+        fileURL: URL
+    ) throws -> ChatSession {
         let filename = fileURL.lastPathComponent
         guard filename.starts(with: "ChatSession-"), filename.hasSuffix(".json") else {
             throw ChatDataError.invalidFilename(filename)
         }
 
         do {
-            // Use memory-mapped reads to reduce peak memory pressure when listing many sessions
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let header = try JSONDecoder().decode(ChatSessionHeader.self, from: data)
             let count = header.messageCount ?? header.messages?.count ?? 0
-
             let shortID = header.shortID ?? ChatSession.makeShortID(name: header.name, uuid: header.id)
-
             return ChatSession(
                 id: header.id,
                 workspaceID: header.workspaceID,
@@ -286,39 +413,112 @@ actor ChatDataService {
         }
     }
 
-    /// Returns a list of "ChatSession-xxx.json" files in the workspace’s Chats folder, sorted by mod date desc.
-    func listChatSessions(for workspace: WorkspaceModel) async throws -> [URL] {
+    private func rawChatSessionFiles(for workspace: WorkspaceModel) throws -> [URL] {
         let chatsFolder = try ensureChatsFolder(for: workspace)
-
-        let contents = try FileManager.default.contentsOfDirectory(
-            at: chatsFolder,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        )
-        let jsonFiles = contents.filter {
-            $0.pathExtension.lowercased() == "json" &&
-                $0.lastPathComponent.starts(with: "ChatSession-")
+        return try Self.fileSaveQueue.sync {
+            try FileManager.default.contentsOfDirectory(
+                at: chatsFolder,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ).filter {
+                $0.pathExtension.lowercased() == "json" &&
+                    $0.lastPathComponent.starts(with: "ChatSession-")
+            }
         }
+    }
 
-        let sortedFiles = jsonFiles.sorted { lhs, rhs in
+    private nonisolated static func fileRecord(from fileURL: URL) -> ChatSessionFileRecord? {
+        fileSaveQueue.sync {
+            guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
+                  let header = try? JSONDecoder().decode(ChatSessionHeader.self, from: data)
+            else { return nil }
+            let modified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? header.savedAt
+            return ChatSessionFileRecord(
+                fileURL: fileURL,
+                sessionID: header.id,
+                oraclePairID: header.oraclePairID,
+                oracleLane: header.oracleLane,
+                modificationDate: modified
+            )
+        }
+    }
+
+    nonisolated static func logicalHistoryGroups(
+        from records: [ChatSessionFileRecord]
+    ) -> [ChatLogicalHistoryGroup] {
+        let grouped = Dictionary(grouping: records) { record in
+            record.oraclePairID.map(ChatLogicalHistoryKey.oraclePair) ?? .session(record.sessionID)
+        }
+        return grouped.map { key, records in
+            let ordered = records.sorted { lhs, rhs in
+                let leftLane = lhs.oracleLane == .primary ? 0 : lhs.oracleLane == .secondary ? 1 : 2
+                let rightLane = rhs.oracleLane == .primary ? 0 : rhs.oracleLane == .secondary ? 1 : 2
+                if leftLane != rightLane { return leftLane < rightLane }
+                return lhs.sessionID.uuidString < rhs.sessionID.uuidString
+            }
+            return ChatLogicalHistoryGroup(key: key, records: ordered)
+        }.sorted { lhs, rhs in
+            if lhs.newestModificationDate != rhs.newestModificationDate {
+                return lhs.newestModificationDate > rhs.newestModificationDate
+            }
+            return String(describing: lhs.key) < String(describing: rhs.key)
+        }
+    }
+
+    nonisolated static func retentionPartition(
+        groups: [ChatLogicalHistoryGroup],
+        limit: Int
+    ) -> (kept: [ChatLogicalHistoryGroup], dropped: [ChatLogicalHistoryGroup]) {
+        guard limit >= 0 else { return (groups, []) }
+        var used = 0
+        var splitIndex = groups.endIndex
+        for (index, group) in groups.enumerated() {
+            guard used + group.weight <= limit else {
+                splitIndex = index
+                break
+            }
+            used += group.weight
+        }
+        return (Array(groups[..<splitIndex]), Array(groups[splitIndex...]))
+    }
+
+    /// Returns chat files newest-first. Oracle pairs are one logical retention unit:
+    /// a history cutoff may retain fewer than the configured physical-session limit,
+    /// but it never retains or deletes only one member of a pair.
+    func listChatSessions(for workspace: WorkspaceModel) async throws -> [URL] {
+        let files = try rawChatSessionFiles(for: workspace)
+        let records = files.compactMap(Self.fileRecord(from:))
+        let readableURLs = Set(records.map(\.fileURL))
+        let unreadable = files.filter { !readableURLs.contains($0) }
+        let groups = Self.logicalHistoryGroups(from: records)
+        let partition = Self.retentionPartition(
+            groups: groups,
+            limit: chatHistoryLimit == .unlimited ? -1 : chatHistoryLimit.rawValue
+        )
+        let droppedRecords = partition.dropped.flatMap(\.records)
+        if !droppedRecords.isEmpty {
+            try await deleteChatSessionFiles(
+                droppedRecords.map(\.fileURL),
+                sessionIDs: Set(droppedRecords.map(\.sessionID))
+            )
+        }
+        return (partition.kept.flatMap(\.records).map(\.fileURL) + unreadable).sorted { lhs, rhs in
             let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
             let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
             return lhsDate > rhsDate
         }
+    }
 
-        // Apply chat history limit based on user setting
-        let limit = chatHistoryLimit
-        if limit != .unlimited, sortedFiles.count > limit.rawValue {
-            let filesToDelete = sortedFiles.dropFirst(limit.rawValue)
-            for url in filesToDelete {
-                // Best-effort delete; ignore individual failures
-                try? FileManager.default.removeItem(at: url)
-            }
-            return Array(sortedFiles.prefix(limit.rawValue))
+    /// Reads persisted pair metadata without triggering history retention.
+    func oraclePairSessionStubs(
+        for workspace: WorkspaceModel,
+        pairID: UUID
+    ) async throws -> [ChatSession] {
+        try rawChatSessionFiles(for: workspace).compactMap { fileURL in
+            guard let record = Self.fileRecord(from: fileURL), record.oraclePairID == pairID else { return nil }
+            return try Self.loadChatSessionStubFromDisk(from: fileURL)
         }
-
-        // If unlimited or under limit, return all files
-        return sortedFiles
     }
 
     /// Get metadata for recent chat sessions without loading full content
@@ -436,9 +636,95 @@ actor ChatDataService {
         return nil
     }
 
-    /// Delete a particular chat session file.
+    /// Deletes a logical group without exposing a half-deleted pair to actor clients.
+    /// Files are first moved into a hidden same-directory transaction folder; any
+    /// staging failure restores every prior move before the error is returned.
+    func deleteChatSessionFiles(
+        _ fileURLs: [URL],
+        sessionIDs: Set<UUID> = []
+    ) async throws {
+        deletedSessionIDs.formUnion(sessionIDs)
+        var seenURLs = Set<URL>()
+        let uniqueURLs = fileURLs.filter { seenURLs.insert($0).inserted }
+        guard !uniqueURLs.isEmpty else { return }
+        guard let parent = uniqueURLs.first?.deletingLastPathComponent(),
+              uniqueURLs.allSatisfy({ $0.deletingLastPathComponent().standardizedFileURL == parent.standardizedFileURL })
+        else {
+            deletedSessionIDs.subtract(sessionIDs)
+            throw ChatDataError.invalidFilename("Logical chat deletion must stay within one Chats folder.")
+        }
+        do {
+            try Self.fileSaveQueue.sync {
+                let transaction = parent.appendingPathComponent(".chat-delete-\(UUID().uuidString)", isDirectory: true)
+                var staged: [(source: URL, destination: URL)] = []
+                do {
+                    try FileManager.default.createDirectory(at: transaction, withIntermediateDirectories: false)
+                    for source in uniqueURLs {
+                        let destination = transaction.appendingPathComponent(source.lastPathComponent)
+                        try FileManager.default.moveItem(at: source, to: destination)
+                        staged.append((source, destination))
+                    }
+                    try FileManager.default.removeItem(at: transaction)
+                } catch {
+                    var rollbackError: Error?
+                    for move in staged.reversed() {
+                        do {
+                            try FileManager.default.moveItem(at: move.destination, to: move.source)
+                        } catch {
+                            rollbackError = rollbackError ?? error
+                        }
+                    }
+                    if rollbackError == nil {
+                        try? FileManager.default.removeItem(at: transaction)
+                    }
+                    if let rollbackError {
+                        throw ChatDataError.saveFailed(NSError(
+                            domain: "ChatDataService",
+                            code: 3,
+                            userInfo: [
+                                NSLocalizedDescriptionKey: "Logical chat deletion and rollback failed; staged files were preserved at \(transaction.path).",
+                                NSUnderlyingErrorKey: rollbackError
+                            ]
+                        ))
+                    }
+                    throw error
+                }
+            }
+        } catch {
+            deletedSessionIDs.subtract(sessionIDs)
+            throw error
+        }
+    }
+
+    func existingChatSessionFileURLs(
+        for workspace: WorkspaceModel,
+        sessionIDs: Set<UUID>
+    ) throws -> [URL] {
+        let chatsFolder = try ensureChatsFolder(for: workspace)
+        return Self.fileSaveQueue.sync {
+            sessionIDs.compactMap { sessionID in
+                let fileURL = chatsFolder.appendingPathComponent("ChatSession-\(sessionID.uuidString).json")
+                return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : nil
+            }
+        }
+    }
+
+    func logicalSessionStubs(
+        for workspace: WorkspaceModel,
+        matching session: ChatSession
+    ) async throws -> [ChatSession] {
+        if let pairID = session.oraclePairID {
+            return try await oraclePairSessionStubs(for: workspace, pairID: pairID)
+        }
+        return try rawChatSessionFiles(for: workspace).compactMap { fileURL in
+            guard let stub = try? Self.loadChatSessionStubFromDisk(from: fileURL) else { return nil }
+            return stub.id == session.id ? stub : nil
+        }
+    }
+
+    /// Low-level compatibility entry point for unpaired callers.
     func deleteChatSessionFile(_ fileURL: URL) async throws {
-        try FileManager.default.removeItem(at: fileURL)
+        try await deleteChatSessionFiles([fileURL])
     }
 
     // MARK: - Folder Helpers

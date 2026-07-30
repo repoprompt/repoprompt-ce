@@ -67,6 +67,140 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertFalse(encodedString.contains("delegateResults"), encodedString)
     }
 
+    func testLogicalRetentionNeverSplitsOraclePairs() {
+        let pairID = UUID()
+        let pairDate = Date()
+        let singleDate = pairDate.addingTimeInterval(-1)
+        let primary = ChatSessionFileRecord(
+            fileURL: URL(fileURLWithPath: "/tmp/primary.json"),
+            sessionID: UUID(),
+            oraclePairID: pairID,
+            oracleLane: .primary,
+            modificationDate: pairDate
+        )
+        let secondary = ChatSessionFileRecord(
+            fileURL: URL(fileURLWithPath: "/tmp/secondary.json"),
+            sessionID: UUID(),
+            oraclePairID: pairID,
+            oracleLane: .secondary,
+            modificationDate: pairDate
+        )
+        let single = ChatSessionFileRecord(
+            fileURL: URL(fileURLWithPath: "/tmp/single.json"),
+            sessionID: UUID(),
+            oraclePairID: nil,
+            oracleLane: nil,
+            modificationDate: singleDate
+        )
+
+        let groups = ChatDataService.logicalHistoryGroups(from: [single, secondary, primary])
+        let twoSlots = ChatDataService.retentionPartition(groups: groups, limit: 2)
+        XCTAssertEqual(twoSlots.kept.count, 1)
+        XCTAssertEqual(twoSlots.kept.first?.records.map(\.oracleLane), [.primary, .secondary])
+        XCTAssertEqual(twoSlots.dropped.flatMap(\.records).map(\.sessionID), [single.sessionID])
+
+        let oneSlot = ChatDataService.retentionPartition(groups: groups, limit: 1)
+        XCTAssertTrue(oneSlot.kept.isEmpty)
+        XCTAssertEqual(Set(oneSlot.dropped.flatMap(\.records).map(\.sessionID)), Set([
+            primary.sessionID,
+            secondary.sessionID,
+            single.sessionID
+        ]))
+    }
+
+    func testPairSaveAndDeleteOperateAsLogicalTransactions() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Pair Transaction")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pairID = UUID()
+        let primary = ChatSession(
+            workspaceID: fixture.workspace.id,
+            oraclePairID: pairID,
+            oracleLane: .primary,
+            name: "Primary"
+        )
+        let secondary = ChatSession(
+            workspaceID: fixture.workspace.id,
+            oraclePairID: pairID,
+            oracleLane: .secondary,
+            name: "Secondary"
+        )
+
+        let urls = try await service.saveChatSessions([primary, secondary], for: fixture.workspace)
+        let primaryURL = try XCTUnwrap(urls[primary.id])
+        let secondaryURL = try XCTUnwrap(urls[secondary.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: primaryURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondaryURL.path))
+        let stubs = try await service.oraclePairSessionStubs(for: fixture.workspace, pairID: pairID)
+        XCTAssertEqual(Set(stubs.map(\.id)), Set([primary.id, secondary.id]))
+
+        try await service.deleteChatSessionFiles(
+            [primaryURL, secondaryURL],
+            sessionIDs: Set([primary.id, secondary.id])
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: primaryURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: secondaryURL.path))
+    }
+
+    func testPairSaveRollsBackEarlierMemberAndCanRetry() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Pair Save Rollback")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pairID = UUID()
+        var primary = ChatSession(
+            workspaceID: fixture.workspace.id,
+            oraclePairID: pairID,
+            oracleLane: .primary,
+            name: "Original Primary"
+        )
+        let secondary = ChatSession(
+            workspaceID: fixture.workspace.id,
+            oraclePairID: pairID,
+            oracleLane: .secondary,
+            name: "Secondary"
+        )
+        let primaryURL = try await service.saveChatSession(primary, for: fixture.workspace)
+        let chatsFolder = primaryURL.deletingLastPathComponent()
+        let blockedSecondaryURL = chatsFolder.appendingPathComponent("ChatSession-\(secondary.id.uuidString).json")
+        try FileManager.default.createDirectory(at: blockedSecondaryURL, withIntermediateDirectories: false)
+        primary.name = "Updated Primary"
+
+        do {
+            _ = try await service.saveChatSessions([primary, secondary], for: fixture.workspace)
+            XCTFail("Expected the second pair member write to fail")
+        } catch {
+            let restored = try await service.loadChatSession(from: primaryURL)
+            XCTAssertEqual(restored.name, "Original Primary")
+        }
+
+        try FileManager.default.removeItem(at: blockedSecondaryURL)
+        let retryURLs = try await service.saveChatSessions([primary, secondary], for: fixture.workspace)
+        let retriedPrimary = try await service.loadChatSession(from: XCTUnwrap(retryURLs[primary.id]))
+        let retriedSecondary = try await service.loadChatSession(from: XCTUnwrap(retryURLs[secondary.id]))
+        XCTAssertEqual(retriedPrimary.name, "Updated Primary")
+        XCTAssertEqual(retriedSecondary.name, "Secondary")
+    }
+
+    func testLogicalDeleteRollsBackStagedMembersAndAllowsRetry() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Pair Delete Rollback")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let session = ChatSession(workspaceID: fixture.workspace.id, name: "Keep Me")
+        let fileURL = try await service.saveChatSession(session, for: fixture.workspace)
+        let missingURL = fileURL.deletingLastPathComponent().appendingPathComponent("ChatSession-\(UUID().uuidString).json")
+
+        do {
+            try await service.deleteChatSessionFiles([fileURL, missingURL], sessionIDs: [session.id])
+            XCTFail("Expected logical deletion to roll back")
+        } catch {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        }
+
+        _ = try await service.saveChatSession(session, for: fixture.workspace)
+        try await service.deleteChatSessionFiles([fileURL], sessionIDs: [session.id])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+    }
+
     func testLegacyChatSessionEditPayloadsAreIgnoredOnDecodeAndOmittedOnEncode() throws {
         let sessionID = UUID()
         let messageID = UUID()
@@ -100,5 +234,19 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         let encodedString = String(data: encoded, encoding: .utf8) ?? ""
         XCTAssertFalse(encodedString.contains("changedFilesByMessage"), encodedString)
         XCTAssertFalse(encodedString.contains("delegateEditItemsByMessage"), encodedString)
+    }
+
+    private func makeTemporaryWorkspace(named name: String) throws -> (root: URL, workspace: WorkspaceModel) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChatHistoryJSONOnlyTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return (
+            root,
+            WorkspaceModel(
+                name: name,
+                repoPaths: [root.path],
+                customStoragePath: root
+            )
+        )
     }
 }
