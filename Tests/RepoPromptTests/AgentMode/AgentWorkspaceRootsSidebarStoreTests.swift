@@ -287,6 +287,48 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertNil(mixedSummary.progressFraction)
     }
 
+    func testRecoveryExhaustionIsActionableWithoutExposingPendingFileDetails() throws {
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        let watermark = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: 1,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        let coverage = try WorkspaceCodemapGraphCatalogCoverage.validated(
+            rootEpoch: rootEpoch,
+            catalogWatermark: watermark,
+            enumerationState: .partial,
+            isCatalogSealed: true,
+            supportedCount: 1736,
+            classifiedCount: 1735,
+            pendingCount: 1,
+            contributedCount: 1735,
+            emptyCount: 0,
+            terminalArtifactCount: 0,
+            terminalExcludedCount: 0
+        ).get()
+        let exhausted = AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .unavailable,
+            coverage: coverage,
+            unavailableReason: .workerRecoveryExhausted
+        ))
+
+        XCTAssertEqual(exhausted.state, .recoveryExhausted)
+        XCTAssertEqual(exhausted.statusText, "Retry needed")
+        XCTAssertTrue(exhausted.canRetry)
+        XCTAssertFalse(exhausted.canToggle)
+        XCTAssertFalse(exhausted.showsProgress)
+        XCTAssertTrue(exhausted.tooltip.contains("repeated worker recovery attempts"))
+        XCTAssertFalse(exhausted.tooltip.contains("/"))
+        let summary = AgentWorkspaceCodemapSummary.make([exhausted])
+        XCTAssertEqual(summary.state, .recoveryExhausted)
+        XCTAssertEqual(summary.detailText, "Indexing needs retry")
+    }
+
     func testCodemapStatusNotificationsCoalesceRootRowResnapshots() async {
         let root = makeProjection(name: "A", path: "/tmp/A")
         let manager = makeWorkspaceManager()
@@ -340,6 +382,33 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
 
         XCTAssertEqual(actions.map(\.1), [false, true])
         XCTAssertTrue(store.rootRows[0].codemap.isPaused)
+        XCTAssertTrue(store.codemapActionRootIDs.isEmpty)
+    }
+
+    func testCodemapRetryResnapshotsAuthoritativeStateBeforeClearingPending() async {
+        let root = makeProjection(name: "A", path: "/tmp/A")
+        let manager = makeWorkspaceManager()
+        var status = snapshot(
+            availability: .unavailable,
+            unavailableReason: .workerRecoveryExhausted
+        )
+        var retriedRootIDs: [UUID] = []
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { [root] },
+            rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+            codemapStatusLookup: { _ in status },
+            retryCodemapGraphIndex: { rootID in
+                retriedRootIDs.append(rootID)
+                status = self.snapshot(availability: .indexing)
+            },
+            workspaceManager: manager,
+            windowID: -1
+        )
+
+        await store.retryCodemapGeneration(rowID: root.id)
+
+        XCTAssertEqual(retriedRootIDs, [root.id])
+        XCTAssertEqual(store.rootRows[0].codemap.state, .indexing)
         XCTAssertTrue(store.codemapActionRootIDs.isEmpty)
     }
 
@@ -649,7 +718,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         suspended: Bool = false,
         coverage: WorkspaceCodemapGraphCatalogCoverage? = nil,
         updatesPending: Bool = false,
-        graphRevision: UInt64? = nil
+        graphRevision: UInt64? = nil,
+        unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = nil
     ) -> WorkspaceCodemapRootStatusSnapshot {
         WorkspaceCodemapRootStatusSnapshot(
             rootEpoch: rootEpoch,
@@ -675,7 +745,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
                 safetyCounter: 8,
                 revocationReason: availability == .revoked ? .rootUnloaded : nil
             ),
-            unavailableReason: availability == .unavailable ? .graphUnavailable : nil
+            unavailableReason: unavailableReason ?? (availability == .unavailable ? .graphUnavailable : nil)
         )
     }
 
