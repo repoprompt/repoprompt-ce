@@ -646,9 +646,9 @@ def request_path_evidence(
     elif tool == "read_file":
         raw_paths = [payload["path"]] if isinstance(payload.get("path"), str) else []
     elif tool == "get_code_structure":
-        if payload.get("scope") == "selected":
-            return
         paths = payload.get("paths")
+        if paths is None:
+            return
         raw_paths = paths if isinstance(paths, list) and all(isinstance(path, str) for path in paths) else []
     else:
         return
@@ -2083,13 +2083,61 @@ def self_test_command(_args: argparse.Namespace) -> int:
         }],
     })
     actual_structure = routed_response({
-        "status": "success", "files": [{
+        "status": "ok", "size": "medium", "roots": [], "files": [{
             "path": f"{fixture_root.name}/{fixture_file.name}",
-            "content": marker, "role": "seed", "tokens": 1,
+            "content": marker, "role": "seed", "depth": 0, "reached_by": [], "tokens": 1,
         }],
-        "summary": {"requested_seeds": 1, "resolved_seeds": 1, "returned_files": 1},
+        "summary": {"seeds": 1, "nodes": 1, "edges": 0, "files": 1, "tokens": 1},
         "issues": [],
-    }, payload={"scope": "paths", "paths": [str(fixture_file)]})
+    }, payload={"paths": [str(fixture_file)], "signatures": True, "size": "medium"})
+    budget_structure = routed_response({
+        "status": "partial", "size": "small", "files": [],
+        "roots": [{
+            "root": fixture_root.name, "status": "partial",
+            "truncated": {"reason": "size", "dropped_nodes": 3},
+            "issues": [{
+                "code": "graph_size_limit", "phase": "graph_traversal",
+                "retryable": False, "retry_after_ms": None,
+                "attempted": None, "limit": None,
+            }],
+        }],
+        "summary": {"seeds": 1, "nodes": 1, "edges": 0, "files": 0, "tokens": 0},
+        "issues": [],
+    }, payload={"paths": [str(fixture_root)], "signatures": False, "size": "small"})
+    checks["codemap_budget_nested_root_issue_accepted"] = (
+        codemap_budget_evidence(budget_structure)["dropped_file_count"] == 3
+    )
+    pending_structure = routed_response({
+        "status": "pending", "size": "large", "files": [],
+        "roots": [{
+            "root": fixture_root.name, "status": "pending",
+            "issues": [{
+                "code": "graph_indexing", "phase": "graph_snapshot",
+                "retryable": True, "retry_after_ms": 100,
+                "attempted": None, "limit": None,
+            }],
+        }],
+        "summary": {"seeds": 1, "nodes": 0, "edges": 0, "files": 0, "tokens": 0},
+        "issues": [],
+        "retry": {"retryable": True, "retry_after_ms": 100},
+    }, payload={"paths": [str(fixture_file)], "signatures": True, "size": "large"})
+    checks["codemap_pending_nullable_retry_metadata_accepted"] = (
+        codemap_retryable_pending_evidence(pending_structure)["issue_codes"]
+        == ["graph_indexing"]
+    )
+    legacy_timeout_structure = json.loads(json.dumps(pending_structure))
+    legacy_timeout_structure["_benchmark_response"]["status"] = "timeout"
+    legacy_timeout_structure["_benchmark_response"]["roots"][0]["issues"][0].update({
+        "code": "readiness_timeout",
+        "attempted": CODEMAP_GATE_WAIT_MILLISECONDS,
+        "limit": CODEMAP_GATE_WAIT_MILLISECONDS,
+    })
+    try:
+        codemap_retryable_pending_evidence(legacy_timeout_structure)
+        checks["codemap_legacy_timeout_contract_rejected"] = False
+    except BenchmarkError:
+        checks["codemap_legacy_timeout_contract_rejected"] = True
+
     tree_fixture_text = (
         f"{fixture_root.name}\n"
         f"└── {fixture_file.name} +\n\n{CODEMAP_TREE_LEGEND}"
@@ -2166,7 +2214,7 @@ def self_test_command(_args: argparse.Namespace) -> int:
         expected_file_path=str(fixture_file), expected_file_type="swift", expected_content=marker,
     )["ok"]
     selected_structure = dict(actual_structure)
-    selected_structure["_benchmark_payload"] = {"scope": "selected"}
+    selected_structure["_benchmark_payload"] = {"signatures": True, "size": "medium"}
     checks["actual_selected_code_structure_shape"] = structured_success_evidence(
         selected_structure, "get_code_structure", expected_root_id=fixture_root_id,
         expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
@@ -2271,8 +2319,9 @@ def self_test_command(_args: argparse.Namespace) -> int:
     removed_structure_actual = routed_response({
         "status": "unavailable", "files": [],
         "issues": [{"code": "path_not_found", "phase": "seed_resolution"}],
-        "summary": {"requested_seeds": 0, "resolved_seeds": 0, "returned_files": 0},
-    }, roots=[], payload={"scope": "paths", "paths": [str(fixture_file)]})
+        "size": "medium", "roots": [],
+        "summary": {"seeds": 0, "nodes": 0, "edges": 0, "files": 0, "tokens": 0},
+    }, roots=[], payload={"paths": [str(fixture_file)], "signatures": True, "size": "medium"})
     checks["actual_removed_structure_shape"] = structured_removed_evidence(
         removed_structure_actual, "get_code_structure", expected_root_id=fixture_root_id,
         expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
@@ -2301,7 +2350,7 @@ def self_test_command(_args: argparse.Namespace) -> int:
         "tool": "get_code_structure", "status": "unavailable",
         "root": fixture_root_record, "files": [],
         "issue": {"code": "path_not_found"},
-    }, roots=[], payload={"scope": "paths", "paths": [str(fixture_file)]})
+    }, roots=[], payload={"paths": [str(fixture_file)], "signatures": True, "size": "medium"})
     checks["enriched_removed_structure_absent_root"] = structured_removed_evidence(
         enriched_removed_structure, "get_code_structure", expected_root_id=fixture_root_id,
         expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
@@ -2353,9 +2402,10 @@ def self_test_command(_args: argparse.Namespace) -> int:
     )["ok"]
     non_git_structure_actual = routed_response({
         "status": "unavailable", "files": [],
-        "issues": [{"code": "git_root_unavailable", "phase": "seed_demand"}],
-        "summary": {"requested_seeds": 1, "resolved_seeds": 0, "returned_files": 0},
-    }, payload={"scope": "paths", "paths": [str(fixture_file)]})
+        "issues": [{"code": "git_root_unavailable", "phase": "seed_resolution"}],
+        "size": "medium", "roots": [],
+        "summary": {"seeds": 0, "nodes": 0, "edges": 0, "files": 0, "tokens": 0},
+    }, payload={"paths": [str(fixture_file)], "signatures": True, "size": "medium"})
     checks["actual_non_git_structure_shape"] = structured_removed_evidence(
         non_git_structure_actual, "get_code_structure", expected_root_id=fixture_root_id,
         expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
@@ -4888,7 +4938,7 @@ def collect_follow_on_evidence(
     for mark_prefix, label in (("first_codemap", "first-codemap"), ("warm_codemap", "warm-codemap")):
         item, _ = timed_operation(
             mark_prefix, label, "get_code_structure",
-            {"scope": "paths", "paths": [path], "context_id": context_id},
+            {"paths": [path], "signatures": True, "size": "large", "context_id": context_id},
             lambda response: codemap_structure_evidence(
                 response, expected_root_id=logical_root_id,
                 expected_root_path=logical_root_path,
@@ -7306,10 +7356,12 @@ def codemap_structure_evidence(
         expected_worktree_id=expected_worktree_id,
         expected_physical_worktree_path=expected_physical_worktree_path,
     )
-    if record.get("status") != "ready":
-        raise BenchmarkError(f"get_code_structure returned {record.get('status')!r}, not ready")
-    if record.get("retry") is not None:
-        raise BenchmarkError("ready get_code_structure unexpectedly included retry metadata")
+    if record.get("status") not in {"ok", "partial"}:
+        raise BenchmarkError(f"get_code_structure returned {record.get('status')!r}, not useful")
+    if record.get("size") not in {"small", "medium", "large"}:
+        raise BenchmarkError("get_code_structure omitted its effective size")
+    if record.get("status") == "ok" and record.get("retry") is not None:
+        raise BenchmarkError("complete get_code_structure unexpectedly included retry metadata")
     issues = record.get("issues")
     if not isinstance(issues, list):
         raise BenchmarkError("get_code_structure omitted typed issues")
@@ -7324,7 +7376,8 @@ def codemap_structure_evidence(
     if expected_marker not in content:
         raise BenchmarkError("get_code_structure codemap text omitted the expected real marker")
     return {
-        "status": "ready",
+        "status": record["status"],
+        "size": record["size"],
         "file_path_sha256": sha256_bytes(expected_file_path.encode()),
         "codemap_content_sha256": sha256_bytes(content.encode()),
         "codemap_content_present": True,
@@ -7421,69 +7474,82 @@ def codemap_tree_marker_evidence(
     }
 
 
-def codemap_retryable_terminal_evidence(
-    value: Any,
-    *,
-    expected_status: str,
-    expected_issue_code: str,
-) -> dict[str, Any]:
-    payload = tool_payload(value, "get_code_structure")
-    issues = payload.get("issues")
-    retry = payload.get("retry")
-    if payload.get("status") != expected_status or payload.get("files") != []:
-        raise BenchmarkError(f"expected empty typed {expected_status} code-structure result")
-    if not isinstance(issues, list) or not isinstance(retry, dict):
-        raise BenchmarkError("retryable terminal result omitted typed issues or reply retry")
-    matches = [item for item in issues if isinstance(item, dict) and item.get("code") == expected_issue_code]
-    if len(matches) != 1:
-        raise BenchmarkError(f"terminal result omitted exact issue {expected_issue_code}")
-    issue = matches[0]
-    if (
-        issue.get("retryable") is not True
-        or not positive_integer(issue.get("retry_after_ms"))
-        or not isinstance(issue.get("attempted"), int)
-        or not (
-            CODEMAP_GATE_WAIT_MILLISECONDS - CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
-            <= issue["attempted"]
-            <= CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
+def codemap_reply_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    issues = [
+        issue for issue in payload.get("issues") or []
+        if isinstance(issue, dict)
+    ]
+    for root in payload.get("roots") or []:
+        if not isinstance(root, dict):
+            continue
+        issues.extend(
+            issue for issue in root.get("issues") or []
+            if isinstance(issue, dict)
         )
-        or issue.get("limit") != CODEMAP_GATE_WAIT_MILLISECONDS
-        or retry.get("retryable") is not True
+    return issues
+
+
+def codemap_retryable_pending_evidence(value: Any) -> dict[str, Any]:
+    payload = tool_payload(value, "get_code_structure")
+    issues = codemap_reply_issues(payload)
+    retry = payload.get("retry")
+    retryable_issues = [issue for issue in issues if issue.get("retryable") is True]
+    if payload.get("status") != "pending" or payload.get("files") != []:
+        raise BenchmarkError("expected empty typed pending code-structure result")
+    if not retryable_issues or not isinstance(retry, dict):
+        raise BenchmarkError("pending result omitted typed retryable issues or reply retry")
+    if any(
+        not positive_integer(issue.get("retry_after_ms"))
+        or issue.get("attempted") is not None
+        or issue.get("limit") is not None
+        for issue in retryable_issues
+    ) or (
+        retry.get("retryable") is not True
         or not positive_integer(retry.get("retry_after_ms"))
     ):
-        raise BenchmarkError("retryable terminal result omitted non-null retry metadata")
+        raise BenchmarkError("pending result omitted current nullable retry metadata")
+    issue_codes = sorted({
+        str(issue["code"]) for issue in retryable_issues
+        if isinstance(issue.get("code"), str)
+    })
+    if not issue_codes:
+        raise BenchmarkError("pending result omitted a typed retryable issue code")
     return {
-        "status": expected_status,
-        "issue_codes": [expected_issue_code],
+        "status": "pending",
+        "issue_codes": issue_codes,
         "empty": True,
         "retryable": True,
         "retry_after_ms": retry["retry_after_ms"],
-        "attempted": issue["attempted"],
-        "limit": issue["limit"],
+        "attempted": None,
+        "limit": None,
     }
 
 
 def codemap_budget_evidence(value: Any) -> dict[str, Any]:
     payload = tool_payload(value, "get_code_structure")
-    issues = payload.get("issues")
     matches = [
-        issue for issue in issues or []
-        if isinstance(issue, dict) and issue.get("code") == "hard_budget_exceeded"
+        issue for issue in codemap_reply_issues(payload)
+        if issue.get("code") == "graph_size_limit"
+    ]
+    truncated = [
+        root.get("truncated") for root in payload.get("roots") or []
+        if isinstance(root, dict) and isinstance(root.get("truncated"), dict)
     ]
     if (
-        payload.get("status") != "budget"
-        or payload.get("files") != []
+        payload.get("status") != "partial"
+        or payload.get("size") != "small"
         or len(matches) != 1
-        or matches[0].get("attempted") != 2
-        or matches[0].get("limit") != 1
+        or matches[0].get("attempted") is not None
+        or matches[0].get("limit") is not None
+        or not truncated
+        or any(item.get("reason") != "size" or not positive_integer(item.get("dropped_nodes")) for item in truncated)
     ):
-        raise BenchmarkError("strict directory overflow lacked exact empty limit-plus-one evidence")
+        raise BenchmarkError("small directory output lacked current size-truncation evidence")
     return {
-        "status": "budget",
-        "empty": True,
-        "attempted": 2,
-        "limit": 1,
-        "issue_codes": ["hard_budget_exceeded"],
+        "status": "partial",
+        "size": "small",
+        "dropped_file_count": sum(item["dropped_nodes"] for item in truncated),
+        "issue_codes": ["graph_size_limit"],
     }
 
 
@@ -7498,9 +7564,9 @@ def codemap_debug_action(
     )
     if not call_succeeded(response):
         raise BenchmarkError(f"DEBUG codemap action {action!r} failed")
-    snapshot = find_value(response, "codemap_projection")
+    snapshot = find_value(response, "codemap_graph_index")
     if not isinstance(snapshot, dict):
-        raise BenchmarkError(f"DEBUG codemap action {action!r} omitted codemap_projection")
+        raise BenchmarkError(f"DEBUG codemap action {action!r} omitted codemap_graph_index")
     return {"response": response, "snapshot": snapshot}
 
 
@@ -7545,11 +7611,12 @@ def verify_agent_codemap_transcript(
             reported_status_count += 1
         arguments = call["arguments"]
         if tool == "get_code_structure":
-            if arguments.get("scope") != "paths" or arguments.get("paths") != expected["paths"]:
+            if arguments.get("paths") != expected["paths"]:
                 raise BenchmarkError("codemap transcript structure paths did not match")
-            limits = arguments.get("limits")
-            if isinstance(limits, dict) and "wait_ms" in limits:
-                raise BenchmarkError("agent supplied forbidden model-facing limits.wait_ms")
+            if arguments.get("signatures") is not True or arguments.get("size") != "large":
+                raise BenchmarkError("codemap transcript omitted current signature/size arguments")
+            if set(arguments) - {"paths", "expand", "depth", "signatures", "size"}:
+                raise BenchmarkError("agent supplied a non-current get_code_structure field")
         elif arguments.get("path") != expected.get("path"):
             raise BenchmarkError("codemap transcript tree path did not match")
     if not records["assistants"] or records["assistants"][-1] != expected_output:
@@ -7653,9 +7720,7 @@ def agent_codemap_direct_evidence(
             timed = runner.timed_call(
                 f"codemap-agent-direct-structure-{session_id[:8]}-{ordinal}",
                 tool,
-                {"scope": "paths", "paths": expected["paths"],
-                 "limits": {"max_files": 100, "max_edges": 400,
-                            "max_codemap_tokens": 12_000},
+                {"paths": expected["paths"], "signatures": True, "size": "large",
                  "context_id": context_id},
                 check=False, context_id=context_id,
             )
@@ -7718,7 +7783,6 @@ def verify_agent_codemap_revoked_transcript(
     matching = [
         call for call in records["calls"]
         if call["tool"] == "get_code_structure"
-        and call["arguments"].get("scope") == "paths"
         and call["arguments"].get("paths") == [expected_first_path]
     ]
     if len(matching) != 1:
@@ -7758,7 +7822,6 @@ def wait_for_exact_agent_structure_call(
                 continue
             if any(
                 call["tool"] == "get_code_structure"
-                and call["arguments"].get("scope") == "paths"
                 and call["arguments"].get("paths") == [expected_path]
                 for call in records["calls"]
             ):
@@ -7784,9 +7847,9 @@ def codemap_agent_prompt(
     for ordinal, (tool, expected) in enumerate(calls, start=1):
         if tool == "get_code_structure":
             instructions.append(
-                f"{ordinal}. Call get_code_structure with scope paths and paths exactly {expected['paths']!r}; "
-                "do not supply limits.wait_ms; the server owns a fixed 10-second demand wait. "
-                "Require status ready with non-empty real codemap content."
+                f"{ordinal}. Call get_code_structure with paths exactly {expected['paths']!r}, "
+                "signatures true, and size large; use no other request fields. "
+                "Require status ok or useful partial with non-empty real codemap content."
             )
         else:
             instructions.append(
@@ -8154,11 +8217,11 @@ def smoke_command(args: argparse.Namespace) -> int:
         )
         structure = runner.call(
             "structure-selected", "get_code_structure",
-            {"scope": "selected", "context_id": parent_context}, check=False,
+            {"signatures": True, "size": "large", "context_id": parent_context}, check=False,
         )
         explicit_structure = runner.call(
             "structure-explicit", "get_code_structure",
-            {"scope": "paths", "paths": [plan["dataset"]["read_path"]],
+            {"paths": [plan["dataset"]["read_path"]], "signatures": True, "size": "large",
              "context_id": parent_context}, check=False,
         )
         selected_evidence = structured_success_evidence(
@@ -8232,13 +8295,13 @@ def smoke_command(args: argparse.Namespace) -> int:
         )
         non_git_structure = runner.call(
             "non-git-structure", "get_code_structure",
-            {"scope": "paths", "paths": [str(non_git / "NonGit.swift")],
+            {"paths": [str(non_git / "NonGit.swift")], "signatures": True, "size": "medium",
              "context_id": parent_context},
             check=False,
         )
         main_structure_after_non_git = runner.call(
             "main-structure-after-non-git", "get_code_structure",
-            {"scope": "paths", "paths": [plan["dataset"]["read_path"]],
+            {"paths": [plan["dataset"]["read_path"]], "signatures": True, "size": "large",
              "context_id": parent_context}, check=False,
         )
         work_after = runner.call(
@@ -8330,8 +8393,7 @@ def smoke_command(args: argparse.Namespace) -> int:
                 "read": ("read_file", {"path": file_path, "start_line": 1, "limit": 1000, "context_id": parent_context}),
                 "selection": ("manage_selection", {"op": "get", "view": "files", "context_id": parent_context}),
                 "structure": ("get_code_structure", {
-                    "scope": "paths", "paths": [file_path],
-                    "limits": {"max_files": 100, "max_edges": 200, "max_codemap_tokens": 6000},
+                    "paths": [file_path], "signatures": True, "size": "medium",
                     "context_id": parent_context,
                 }),
             }
@@ -8411,7 +8473,7 @@ def smoke_command(args: argparse.Namespace) -> int:
             )
             added_structure = runner.call(
                 f"{kind}-structure-after-add", "get_code_structure",
-                {"scope": "paths", "paths": [str(secondary_file)],
+                {"paths": [str(secondary_file)], "signatures": True, "size": "large",
                  "context_id": parent_context}, check=False,
             )
             added_search_evidence = structured_success_evidence(
@@ -8518,7 +8580,7 @@ def smoke_command(args: argparse.Namespace) -> int:
             )
             structure_after_remove = runner.call(
                 f"{kind}-structure-after-remove", "get_code_structure",
-                {"scope": "paths", "paths": [str(secondary_file)],
+                {"paths": [str(secondary_file)], "signatures": True, "size": "large",
                  "context_id": parent_context}, check=False,
             )
             removed_search_evidence = structured_removed_evidence(
@@ -8823,10 +8885,14 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
     secure_write(
         artifact / "get-code-structure-schema.txt", structure_schema.encode(), exclusive=True
     )
-    if re.search(r"\bwait_ms\b", structure_schema):
+    required_structure_terms = {"paths", "expand", "depth", "signatures", "size", "small", "medium", "large"}
+    missing_structure_terms = sorted(
+        term for term in required_structure_terms
+        if re.search(rf"\b{re.escape(term)}\b", structure_schema) is None
+    )
+    if missing_structure_terms:
         raise BenchmarkError(
-            "get_code_structure still advertises model-facing wait_ms; "
-            "demand wait must be an internal fixed 10-second contract"
+            f"get_code_structure schema omitted current contract terms: {missing_structure_terms}"
         )
     save_json(artifact / "plan.json", plan, exclusive=True)
     save_json(artifact / "codemap-fixture.json", fixture, exclusive=True)
@@ -8871,7 +8937,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         if not call_succeeded(runtime):
             raise BenchmarkError("codemap root identity snapshot failed")
         root_identity = runtime_root_identity(runtime, str(root))
-        start_snapshot = codemap_debug_action(runner, plan, "codemap_projection_snapshot")["snapshot"]
+        start_snapshot = codemap_debug_action(runner, plan, "codemap_graph_index_snapshot")["snapshot"]
         memory_session_id, _ = start_owned_memory_sampler(
             runner, artifact.name, memory_acquisition
         )
@@ -8913,11 +8979,10 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         ) -> dict[str, Any]:
             requested_path = item["path"]
             expected_path = item.get("expected_file", requested_path)
-            limits = {"max_files": 100, "max_edges": 400, "max_codemap_tokens": 12_000}
             call = runner.timed_call(
                 f"codemap-{cohort}-{temperature}-{ordinal}",
                 "get_code_structure",
-                {"scope": "paths", "paths": [requested_path], "limits": limits,
+                {"paths": [requested_path], "signatures": True, "size": "large",
                  "context_id": plan["scope"]["context_id"]},
                 timeout=CODEMAP_GATE_WAIT_MILLISECONDS / 1000
                 + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS / 1000 + 5,
@@ -8963,7 +9028,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
                 "ordinal": ordinal,
                 "path_sha256": sha256_bytes(requested_path.encode()),
                 "expected_file_sha256": sha256_bytes(expected_path.encode()),
-                "wait_ms_omitted": True,
+                "request_size": "large",
                 "internal_wait_contract_ms": CODEMAP_GATE_WAIT_MILLISECONDS,
                 "duration_ms": elapsed_ms,
                 "tree_marker_duration_ms": tree_elapsed_ms,
@@ -9042,26 +9107,25 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
 
         # Directory overflow must fail before any codemap admission or build.
         before_overflow = codemap_debug_action(
-            runner, plan, "codemap_projection_snapshot"
+            runner, plan, "codemap_graph_index_snapshot"
         )["snapshot"]
         overflow = runner.call(
             "codemap-directory-overflow", "get_code_structure",
-            {"scope": "paths", "paths": [fixture["overflow_directory"]],
-             "limits": {"max_files": 1, "max_edges": 1, "max_codemap_tokens": 256},
+            {"paths": [fixture["overflow_directory"]], "signatures": False, "size": "small",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         overflow_evidence = codemap_budget_evidence(overflow)
         after_overflow = codemap_debug_action(
-            runner, plan, "codemap_projection_snapshot"
+            runner, plan, "codemap_graph_index_snapshot"
         )["snapshot"]
         overflow_deltas = {
             key: codemap_counter_delta(before_overflow, after_overflow, key)
             for key in (
                 "builds", "materializations", "manifest_writes",
-                "projection_demands_acquired", "projection_batches_queued",
-                "projection_batches_started", "projection_catalog_pages",
-                "projection_catalog_candidates", "projection_builds_started",
-                "projection_segments_published",
+                "graph_index_runs_started", "graph_index_batches_queued",
+                "graph_index_batches_started", "graph_index_catalog_pages",
+                "graph_index_catalog_candidates",
+                "graph_index_changes_published",
             )
         }
         results["directory-overflow"] = {
@@ -9113,7 +9177,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         non_git_structure = runner.call(
             "codemap-non-git-structure", "get_code_structure",
-            {"scope": "paths", "paths": [str(non_git_file)],
+            {"paths": [str(non_git_file)], "signatures": True, "size": "medium",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         after_non_git = codemap_debug_action(
@@ -9137,7 +9201,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         non_git_deltas = {
             key: codemap_counter_delta(before_non_git["snapshot"], after_non_git["snapshot"], key)
-            for key in ("builds", "projection_batches_started", "projection_catalog_candidates")
+            for key in ("builds", "graph_index_batches_started", "graph_index_catalog_candidates")
         }
         non_git_engine_absent = (
             find_value(before_non_git["response"], "engine_present") is False
@@ -9166,7 +9230,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         created_structure = runner.call(
             "codemap-watcher-create-structure", "get_code_structure",
-            {"scope": "paths", "paths": [watcher_old],
+            {"paths": [watcher_old], "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         create_evidence = codemap_structure_evidence(
@@ -9191,7 +9255,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         edited_structure = runner.call(
             "codemap-watcher-edit-structure", "get_code_structure",
-            {"scope": "paths", "paths": [watcher_old],
+            {"paths": [watcher_old], "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         edit_evidence = codemap_structure_evidence(
@@ -9217,7 +9281,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         moved_structure = runner.call(
             "codemap-watcher-rename-structure", "get_code_structure",
-            {"scope": "paths", "paths": [watcher_new],
+            {"paths": [watcher_new], "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         rename_evidence = codemap_structure_evidence(
@@ -9242,7 +9306,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         deleted_structure = runner.call(
             "codemap-watcher-delete-structure", "get_code_structure",
-            {"scope": "paths", "paths": [watcher_new],
+            {"paths": [watcher_new], "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         deleted_payload = tool_payload(deleted_structure, "get_code_structure")
@@ -9272,9 +9336,10 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
                        "issue_codes": deleted_issue_codes, "marker_absent": delete_absent},
         }
 
-        # The DEBUG hold pauses only future projection-batch admission; timeout must be real.
+        # The DEBUG hold pauses only future graph-index admission. The graph-native
+        # reply must remain prompt, typed pending, and explicitly retryable.
         hold_result = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_acquire", expires_ms=30_000
+            runner, plan, "codemap_graph_index_hold_acquire", expires_ms=30_000
         )
         hold_id = find_value(hold_result["response"], "hold_id")
         if not isinstance(hold_id, str):
@@ -9294,27 +9359,18 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
              "content": f"struct {timeout_marker} {{}}\n",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
-        timeout_call = runner.timed_call(
+        pending_call = runner.timed_call(
             "codemap-held-timeout", "get_code_structure",
-            {"scope": "paths", "paths": [timeout_path],
-             "expand": {"direction": "referrers", "max_depth": 1},
+            {"paths": [timeout_path], "expand": "referrers", "depth": 1,
+             "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]},
-            timeout=CODEMAP_GATE_WAIT_MILLISECONDS / 1000
-            + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS / 1000 + 5,
+            timeout=15,
             check=False,
         )
-        timeout_elapsed_ms = (timeout_call.finished_ns - timeout_call.started_ns) / 1_000_000
-        timeout_evidence = codemap_retryable_terminal_evidence(
-            timeout_call.response, expected_status="timeout", expected_issue_code="readiness_timeout"
-        )
-        if not (
-            CODEMAP_GATE_WAIT_MILLISECONDS - CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
-            <= timeout_elapsed_ms
-            <= CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
-        ):
-            raise BenchmarkError("held timeout did not honor the 10s ± 500ms monotonic contract")
+        pending_elapsed_ms = (pending_call.finished_ns - pending_call.started_ns) / 1_000_000
+        pending_evidence = codemap_retryable_pending_evidence(pending_call.response)
         released = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_release", hold_id=hold_id
+            runner, plan, "codemap_graph_index_hold_release", hold_id=hold_id
         )
         if find_value(released["response"], "released") is not True:
             raise BenchmarkError("DEBUG codemap hold was not owned/released")
@@ -9324,8 +9380,8 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         save_json(artifact / "state.json", state)
         timeout_retry = runner.call(
             "codemap-timeout-retry", "get_code_structure",
-            {"scope": "paths", "paths": [timeout_path],
-             "expand": {"direction": "referrers", "max_depth": 1},
+            {"paths": [timeout_path], "expand": "referrers", "depth": 1,
+             "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         retry_evidence = codemap_structure_evidence(
@@ -9334,10 +9390,10 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             expected_file_path=timeout_path, expected_marker=timeout_marker,
             expected_file_type=plan["dataset"]["code_file_type"],
         )
-        results["explicit-10s-timeout-contract"] = {
+        results["held-indexing-retry-contract"] = {
             "ok": call_succeeded(timeout_create),
-            "elapsed_ms": timeout_elapsed_ms,
-            "timeout": timeout_evidence,
+            "elapsed_ms": pending_elapsed_ms,
+            "pending": pending_evidence,
             "retry": retry_evidence,
             "future_admission_hold_released": True,
         }
@@ -9346,14 +9402,14 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         parent_calls: list[tuple[str, dict[str, Any]]] = []
         for item in fixture["individuals"][:2]:
             parent_calls.extend([
-                ("get_code_structure", {"paths": [item["path"]], "omit_wait_ms": True,
+                ("get_code_structure", {"paths": [item["path"]],
                                         "expected_file": item["path"], "marker": item["marker"]}),
                 ("get_file_tree", {"path": str(Path(item["path"]).parent),
                                    "expected_file": item["path"]}),
             ])
         for item in fixture["directories"][:2]:
             parent_calls.extend([
-                ("get_code_structure", {"paths": [item["path"]], "omit_wait_ms": True,
+                ("get_code_structure", {"paths": [item["path"]],
                                         "expected_file": item["expected_file"],
                                         "marker": item["marker"]}),
                 ("get_file_tree", {"path": str(Path(item["expected_file"]).parent),
@@ -9388,7 +9444,6 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         save_json(artifact / "state.json", state)
         child_calls = [
             ("get_code_structure", {"paths": [fixture["individuals"][5]["path"]],
-                                    "omit_wait_ms": True,
                                     "expected_file": fixture["individuals"][5]["path"],
                                     "marker": fixture["individuals"][5]["marker"]}),
             ("get_file_tree", {"path": str(Path(fixture["individuals"][5]["path"]).parent),
@@ -9472,7 +9527,6 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         })
         primary_probe_calls = [
             ("get_code_structure", {"paths": [fixture["individuals"][6]["path"]],
-                                    "omit_wait_ms": True,
                                     "expected_file": fixture["individuals"][6]["path"],
                                     "marker": fixture["individuals"][6]["marker"]}),
             ("get_file_tree", {"path": str(Path(fixture["individuals"][6]["path"]).parent),
@@ -9482,9 +9536,8 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         def primary_structure_pressure(label: str) -> TimedCall:
             return runner.timed_call(
                 label, "get_code_structure",
-                {"scope": "paths", "paths": [fixture["directories"][6]["path"]],
-                 "limits": {"max_files": 100, "max_edges": 400,
-                            "max_codemap_tokens": 12_000},
+                {"paths": [fixture["directories"][6]["path"]],
+                 "signatures": True, "size": "large",
                  "context_id": plan["scope"]["context_id"]}, check=False,
             )
 
@@ -9503,7 +9556,6 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         save_json(artifact / "state.json", state)
         secondary_calls = [
             ("get_code_structure", {"paths": [fixture["individuals"][7]["path"]],
-                                    "omit_wait_ms": True,
                                     "expected_file": fixture["individuals"][7]["path"],
                                     "marker": fixture["individuals"][7]["marker"]}),
             ("get_file_tree", {"path": str(Path(fixture["individuals"][7]["path"]).parent),
@@ -9520,7 +9572,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         linked_prewarm_parent = str(Path(linked_prewarm_path).parent)
         linked_prewarm = runner.call(
             "codemap-linked-prewarm", "get_code_structure",
-            {"scope": "paths", "paths": [linked_prewarm_path],
+            {"paths": [linked_prewarm_path], "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
         linked_prewarm_evidence = codemap_structure_evidence(
@@ -9544,7 +9596,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             expected_file_path=linked_prewarm_path,
         )
         linked_hold = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_acquire",
+            runner, plan, "codemap_graph_index_hold_acquire",
             target_root_id=linked_identity["id"], expires_ms=60_000,
         )
         linked_hold_id = find_value(linked_hold["response"], "hold_id")
@@ -9561,7 +9613,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         linked_blocked_path = str(linked_root / blocked_item["path"])
         linked_blocked_calls = [*secondary_calls,
             ("get_code_structure", {
-                "paths": [linked_blocked_path], "omit_wait_ms": True,
+                "paths": [linked_blocked_path],
                 "expected_file": linked_blocked_path, "marker": blocked_item["marker"],
             }),
             ("get_file_tree", {
@@ -9658,7 +9710,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         revoked_call = runner.call(
             "codemap-linked-revoked-probe", "get_code_structure",
-            {"scope": "paths", "paths": [linked_blocked_path],
+            {"paths": [linked_blocked_path], "signatures": True, "size": "large",
              "context_id": linked_context}, check=False, context_id=linked_context,
         )
         linked_revoked = structured_removed_evidence(
@@ -9686,7 +9738,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             transcript_xml_from_log(linked_log), expected_first_path=linked_blocked_path,
         )
         linked_released = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_release",
+            runner, plan, "codemap_graph_index_hold_release",
             target_root_id=linked_identity["id"], hold_id=linked_hold_id,
         )
         if find_value(linked_released["response"], "released") is not True:
@@ -9740,7 +9792,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         }
 
         final_snapshot = codemap_debug_action(
-            runner, plan, "codemap_projection_snapshot"
+            runner, plan, "codemap_graph_index_snapshot"
         )["snapshot"]
         raw_queue_wait_values = final_snapshot.get("queue_wait_ms")
         start_queue_ordinal = start_snapshot.get("queue_wait_sample_ordinal")
@@ -9762,7 +9814,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             raw_queue_wait_values[-queue_sample_delta:] if queue_sample_delta else []
         )
         resource_keys = (
-            "retained_path_bytes", "retained_source_bytes", "retained_projection_bytes",
+            "retained_path_bytes", "retained_source_bytes", "retained_graph_index_bytes",
             "staged_graph_bytes", "resident_graph_bytes", "queued_manifest_mutation_bytes",
         )
         resources_bounded = all(
@@ -9772,8 +9824,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             for key in resource_keys
         )
         rejection_keys = (
-            "projection_budget_rejections", "projection_demand_busy_rejections",
-            "busy_rejections", "failures", "manifest_failures",
+            "graph_index_budget_rejections", "busy_rejections", "failures", "manifest_failures",
         )
         rejection_deltas = {
             key: codemap_counter_delta(start_snapshot, final_snapshot, key)
@@ -9805,7 +9856,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             released = runner.call(
                 "codemap-finally-release-hold", DEBUG_TOOL,
                 diagnostic_payload(
-                    plan, "codemap_projection_hold_release", hold_id=active_hold,
+                    plan, "codemap_graph_index_hold_release", hold_id=active_hold,
                     **({"target_root_id": active_hold_target_root_id}
                        if active_hold_target_root_id else {}),
                 ),
@@ -11774,7 +11825,7 @@ def cleanup_command(args: argparse.Namespace) -> int:
             response = runner.call(
                 f"cleanup-release-codemap-hold-{str(hold_id)[:8]}", DEBUG_TOOL,
                 diagnostic_payload(
-                    plan, "codemap_projection_hold_release", hold_id=hold_id,
+                    plan, "codemap_graph_index_hold_release", hold_id=hold_id,
                     **({"target_root_id": hold.get("target_root_id")}
                        if isinstance(hold.get("target_root_id"), str) else {}),
                 ),

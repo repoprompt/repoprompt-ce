@@ -1,6 +1,18 @@
 import Foundation
 import MCP // <- required for `Value`
 
+private actor OracleProviderCleanupHandleBox {
+    private var handle: ProviderConversationCleanupHandle?
+
+    func update(_ handle: ProviderConversationCleanupHandle) {
+        self.handle = handle
+    }
+
+    func current() -> ProviderConversationCleanupHandle? {
+        handle
+    }
+}
+
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
 extension OracleViewModel {
@@ -165,7 +177,8 @@ extension OracleViewModel {
         modelParam: String?,
         mode rawMode: String,
         allPresets: [ModelPreset],
-        promptVM: PromptViewModel
+        promptVM: PromptViewModel,
+        planningModelRawOverride: String? = nil
     ) async throws -> ModelSelectionResult {
         /// Resolve a chat preset for the MCP mode even when the selected model preset
         /// does not map one explicitly. Ensures UI display and prompt building stay in sync.
@@ -191,7 +204,14 @@ extension OracleViewModel {
         let modeLabel = mode.capitalized
 
         func strictPlanningModel() throws -> AIModel {
-            let resolution = promptVM.mcpOraclePlanningModelResolution()
+            let resolution = if let planningModelRawOverride {
+                PromptViewModel.mcpOraclePlanningModelResolution(
+                    rawValue: planningModelRawOverride,
+                    isModelAvailable: { promptVM.mcpOracleIsProviderConfigured(for: $0) }
+                )
+            } else {
+                promptVM.mcpOraclePlanningModelResolution()
+            }
             if case let .configured(model) = resolution {
                 return model
             }
@@ -361,7 +381,9 @@ extension OracleViewModel {
     @MainActor
     func resolveMCPFollowUpModel(
         mode: String,
-        modelParam: String? = nil
+        modelParam: String? = nil,
+        workspaceID: UUID? = nil,
+        planningModelRawOverride: String? = nil
     ) async throws -> (model: AIModel, chatPresetID: UUID?, mcpControlInfo: String?) {
         let presetsManager = ModelPresetsManager.shared
         let allPresets = presetsManager.allPresets()
@@ -369,7 +391,10 @@ extension OracleViewModel {
             modelParam: modelParam,
             mode: mode,
             allPresets: allPresets,
-            promptVM: promptViewModel
+            promptVM: promptViewModel,
+            planningModelRawOverride: planningModelRawOverride ?? workspaceID.flatMap {
+                GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: $0).planningModelRaw
+            }
         )
         return (selection.model, selection.chatPresetID, selection.mcpControlInfo)
     }
@@ -565,6 +590,31 @@ extension OracleViewModel {
         }
         // 2️⃣ shortID
         return sessions.first { $0.shortID == raw }
+    }
+
+    @MainActor
+    private func resolveSessionForExplicitContinuation(
+        id rawID: String,
+        tabID: UUID?
+    ) async throws -> ChatSession? {
+        if let loaded = resolveSession(id: rawID) {
+            return loaded
+        }
+        guard let tabID,
+              let candidate = workspaceManager.bindingCandidate(forContextID: tabID),
+              let workspace = workspaceManager.workspaces.first(where: { $0.id == candidate.workspaceID }),
+              let persisted = try await chatData.findSession(for: workspace, id: rawID, composeTabID: tabID)
+        else {
+            return nil
+        }
+
+        // Inactive headless generation deliberately avoids publishing into the active
+        // workspace's chat catalog. Load only an explicitly requested continuation;
+        // activation remains disabled for an inactive tab, so currentSession is untouched.
+        if !sessions.contains(where: { $0.id == persisted.id }) {
+            sessions.append(persisted)
+        }
+        return persisted
     }
 
     @MainActor
@@ -899,7 +949,10 @@ extension OracleViewModel {
         }
 
         if let idString = idString?.trimmingCharacters(in: .whitespacesAndNewlines), !idString.isEmpty {
-            guard let existing = resolveSession(id: idString) else {
+            guard let existing = try await resolveSessionForExplicitContinuation(
+                id: idString,
+                tabID: resolvedTabID
+            ) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(idString)' not found")
             }
             guard Self.sessionBelongsToResolvedTab(existing, tabID: resolvedTabID) else {
@@ -1514,7 +1567,7 @@ extension OracleViewModel {
     /// - Creates a `ChatSession` with the resulting user+assistant messages
     /// - Returns a `ChatSendReply` suitable for MCP or UI callers
     @MainActor
-    private func runHeadless(
+    func runHeadless(
         prompt: String,
         modelParam: String?,
         chatName: String,
@@ -1524,6 +1577,12 @@ extension OracleViewModel {
         useChatModelDirectly: Bool = false,
         gitScopeOverride: GitInclusion? = nil,
         reviewGitContext: FrozenPromptGitReviewContext = .automaticOnly(),
+        workspaceID: UUID? = nil,
+        lookupContext: WorkspaceLookupContext? = nil,
+        resolvedModel: AIModel? = nil,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws -> ChatSendReply {
         // Check cancellation at entry
@@ -1538,7 +1597,10 @@ extension OracleViewModel {
         let model: AIModel
         let chatPresetID: UUID?
 
-        if useChatModelDirectly {
+        if let resolvedModel {
+            model = resolvedModel
+            chatPresetID = nil
+        } else if useChatModelDirectly {
             // UI-triggered: use the current chat model directly, bypassing MCP preset logic
             model = promptViewModel.preferredAIModel
             chatPresetID = nil
@@ -1561,10 +1623,13 @@ extension OracleViewModel {
 
         // 2) Build snapshot
         let snapshot = HeadlessContextSnapshot(
+            workspaceID: workspaceID,
             tabID: tabID,
             promptText: trimmedPrompt,
             selection: selection,
-            reviewGitContext: reviewGitContext
+            lookupContext: lookupContext,
+            reviewGitContext: reviewGitContext,
+            finalReviewAuthorization: finalReviewAuthorization
         )
 
         try Task.checkCancellation()
@@ -1581,6 +1646,15 @@ extension OracleViewModel {
 
         // 4) Stream via AIQueriesService WITHOUT touching OracleViewModel.messages
         let (streamID, stream) = try await aiQueriesService.sendPrompt(aiMessage, model: model)
+        let cleanupHandleBox = OracleProviderCleanupHandleBox()
+        var didScheduleProviderCleanup = false
+        defer {
+            if !didScheduleProviderCleanup {
+                Task {
+                    await self.cleanupOracleProviderConversation(cleanupHandleBox.current(), model: model)
+                }
+            }
+        }
 
         // Register this headless stream by tab ID so Discover can cancel it.
         headlessStreamsByTabID[tabID] = streamID
@@ -1593,8 +1667,8 @@ extension OracleViewModel {
         // (One Task.sleep for entire stream, not per-chunk - avoids CPU churn)
         let timeout: Duration = .seconds(4 * 60 * 60)
 
-        let (finalText, finalReasoning, finalTokenInfo) = try await withThrowingTaskGroup(
-            of: (String, String, ChatTokenInfo).self
+        let (finalText, _, finalTokenInfo, providerCleanupHandle) = try await withThrowingTaskGroup(
+            of: (String, String, ChatTokenInfo, ProviderConversationCleanupHandle?).self
         ) { group in
             // Timeout task - throws after 4 hours
             group.addTask {
@@ -1603,10 +1677,11 @@ extension OracleViewModel {
             }
 
             // Streaming task - accumulates locally, returns result
-            group.addTask { [stream, onProgress] in
+            group.addTask { [stream, onProgress, cleanupHandleBox] in
                 var accText = ""
                 var accReasoning = ""
                 var tokens = ChatTokenInfo()
+                var cleanupHandle: ProviderConversationCleanupHandle?
                 var iterator = stream.makeAsyncIterator()
 
                 while let chunk = try await iterator.next() {
@@ -1621,6 +1696,10 @@ extension OracleViewModel {
                     {
                         tokens = chunk.tokens
                     }
+                    if let handle = chunk.cleanupHandle {
+                        cleanupHandle = handle
+                        await cleanupHandleBox.update(handle)
+                    }
                     // Only hop to MainActor for progress callback
                     if let onProgress {
                         let text = accText
@@ -1628,7 +1707,7 @@ extension OracleViewModel {
                         await MainActor.run { onProgress(text, reasoning) }
                     }
                 }
-                return (accText, accReasoning, tokens)
+                return (accText, accReasoning, tokens, cleanupHandle)
             }
 
             // Wait for stream to complete or timeout to fire
@@ -1651,8 +1730,14 @@ extension OracleViewModel {
             selection: selection,
             chatName: chatName,
             chatPresetID: chatPresetID,
-            tabID: tabID
+            tabID: tabID,
+            workspaceID: workspaceID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
         )
+
+        didScheduleProviderCleanup = true
+        Task { await cleanupOracleProviderConversation(providerCleanupHandle, model: model) }
 
         // 6) Return ChatSendReply
         return ChatSendReply(
@@ -1667,7 +1752,7 @@ extension OracleViewModel {
     /// Helper: persist a new ChatSession from a headless run without
     /// mutating the current chat stream (no changes to `messages` or `currentSessionID`).
     @MainActor
-    private func createSessionFromHeadlessRun(
+    func createSessionFromHeadlessRun(
         prompt: String,
         response: String,
         model: AIModel,
@@ -1676,10 +1761,18 @@ extension OracleViewModel {
         chatName: String?,
         chatPresetID: UUID?,
         tabID: UUID,
+        workspaceID: UUID? = nil,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil,
         setActiveForTab: Bool = false
     ) async throws -> (session: ChatSession, shortID: String) {
-        guard let workspace = workspaceManager.activeWorkspace else {
-            throw ChatSessionError.invalidFilename("No active workspace to attach plan chat.")
+        let workspace: WorkspaceModel? = if let workspaceID {
+            workspaceManager.workspaces.first(where: { $0.id == workspaceID })
+        } else {
+            workspaceManager.activeWorkspace
+        }
+        guard let workspace else {
+            throw ChatSessionError.invalidFilename("The target workspace for this plan chat is unavailable.")
         }
 
         // 1) Build StoredMessage entries
@@ -1720,16 +1813,27 @@ extension OracleViewModel {
         var session = ChatSession(
             workspaceID: workspace.id,
             composeTabID: tabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
             name: resolvedName,
             messages: [userMsg, aiMsg],
             selectedFilePaths: allowedPaths,
-            selectedPromptIDs: Array(promptViewModel.selectedPromptIDsForChat),
+            selectedPromptIDs: workspace.id == workspaceManager.activeWorkspaceID
+                ? Array(promptViewModel.selectedPromptIDsForChat)
+                : [],
             preferredAIModel: model.rawValue,
             selectedChatPresetID: chatPresetID
         )
 
         if setActiveForTab {
-            workspaceManager.setActiveChatSessionID(session.id, forTabID: tabID)
+            if workspaceID != nil {
+                workspaceManager.setActiveChatSessionID(
+                    session.id,
+                    for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tabID)
+                )
+            } else {
+                workspaceManager.setActiveChatSessionID(session.id, forTabID: tabID)
+            }
         }
 
         // 3) Persist to disk via ChatDataService
@@ -1737,7 +1841,9 @@ extension OracleViewModel {
         session.fileURL = fileURL
 
         // 4) Register in-memory but DO NOT disturb the live session/stream
-        sessions.append(session)
+        if workspace.id == workspaceManager.activeWorkspaceID {
+            sessions.append(session)
+        }
 
         return (session, session.shortID)
     }

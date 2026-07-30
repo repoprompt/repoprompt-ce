@@ -248,6 +248,20 @@ enum AgentContextExportResolver {
         let invalidPaths: [String]
     }
 
+    private struct PresentationAuthoritySnapshot {
+        let lookupContext: WorkspaceLookupContext
+        let physicalSelection: StoredSelection
+        let rootScope: WorkspaceLookupRootScope
+        let roots: [WorkspaceRootRef]
+        let logicalRootDisplayNamesByRootID: [UUID: String]
+        let presentationPlan: AgentCodemapPresentationPlan
+    }
+
+    private struct ModelPresentationAttempt {
+        let authority: PresentationAuthoritySnapshot
+        let resolution: RowResolution
+    }
+
     static func selectionSummary(for selection: StoredSelection) -> AgentContextSelectionSummary {
         var explicitFileKeys = Set(selection.selectedPaths.map(normalizedSelectionKey))
         var slicedFileKeys = Set<String>()
@@ -350,67 +364,54 @@ enum AgentContextExportResolver {
             return displayModel
         }
 
-        let lookupContext = await lookupContext(source: source, store: store)
-        let physicalizeStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
-        let physicalSelection = lookupContext.physicalizeSelection(source.selection)
-        var physicalizeFields = AgentSelectedFilesDiagnostics.selectionFields(physicalSelection)
-        physicalizeFields["hasProjection"] = String(lookupContext.bindingProjection != nil)
-        AgentSelectedFilesDiagnostics.durationEvent("resolver.physicalizeSelection", startMS: physicalizeStartMS, fields: physicalizeFields)
-
-        let resolveRowsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
-        let resolution = await resolveRows(
-            selection: physicalSelection,
-            store: store,
-            rootScope: lookupContext.rootScope,
-            profile: .uiAssisted
-        )
-        AgentSelectedFilesDiagnostics.durationEvent(
-            "resolver.resolveRows",
-            startMS: resolveRowsStartMS,
-            fields: [
-                "rowEntries": String(resolution.rows.count),
-                "missingPaths": String(resolution.missingPaths.count),
-                "invalidPaths": String(resolution.invalidPaths.count)
-            ]
-        )
-
-        let roots = await store.rootRefs(scope: lookupContext.rootScope)
-        let presentationPlan = await WorkspaceCodemapPresentationIntentResolver.plan(
-            codeMapUsage: codeMapUsage,
-            selection: physicalSelection,
-            store: store,
-            rootScope: lookupContext.rootScope,
-            profile: .uiAssisted
-        )
-        let logicalRootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
         let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: store)
         do {
             return try await coordinator.withPresentation(
-                for: presentationPlan.intent,
-                rootScope: lookupContext.rootScope,
-                logicalRootDisplayNamesByRootID: logicalRootDisplayNames
-            ) { presentation in
+                prepareAttempt: {
+                    let attempt = await modelPresentationAttempt(
+                        source: source,
+                        store: store,
+                        codeMapUsage: codeMapUsage
+                    )
+                    return WorkspaceCodemapPresentationAttempt(
+                        context: attempt,
+                        intent: attempt.authority.presentationPlan.intent,
+                        rootScope: attempt.authority.rootScope,
+                        logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID,
+                        requestedCodemapCount: requestedCodemapCount(
+                            for: attempt.authority.presentationPlan.intent,
+                            codeMapUsage: codeMapUsage
+                        )
+                    )
+                }
+            ) { attempt, presentation in
                 let presentation = merging(
                     presentation,
-                    preflightIssues: presentationPlan.preflightIssues
+                    preflightIssues: attempt.authority.presentationPlan.preflightIssues
+                )
+                let resolution = await validatedSelectedFallbackResolution(
+                    attempt.resolution,
+                    presentation: presentation,
+                    store: store,
+                    codeMapUsage: codeMapUsage
                 )
                 let codemapFilesByID = await codemapFileRecordsByID(
                     for: presentation,
                     resolution: resolution,
-                    roots: roots,
+                    roots: attempt.authority.roots,
                     store: store,
                     codeMapUsage: codeMapUsage
                 )
                 return makeModel(
                     source: source,
-                    lookupContext: lookupContext,
+                    lookupContext: attempt.authority.lookupContext,
                     resolution: resolution,
-                    roots: roots,
+                    roots: attempt.authority.roots,
                     codemapFilesByID: codemapFilesByID,
                     filePathDisplay: filePathDisplay,
                     codeMapUsage: codeMapUsage,
                     codemapPresentation: presentation,
-                    logicalRootDisplayNamesByRootID: logicalRootDisplayNames
+                    logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID
                 )
             }
         } catch {
@@ -419,71 +420,74 @@ enum AgentContextExportResolver {
             } else {
                 .coordinationUnavailable
             }
+            let attempt = await modelPresentationAttempt(
+                source: source,
+                store: store,
+                codeMapUsage: codeMapUsage
+            )
             let presentation = merging(
                 unavailablePresentation(issue),
-                preflightIssues: presentationPlan.preflightIssues
+                preflightIssues: attempt.authority.presentationPlan.preflightIssues
+            )
+            let resolution = await validatedSelectedFallbackResolution(
+                attempt.resolution,
+                presentation: presentation,
+                store: store,
+                codeMapUsage: codeMapUsage
             )
             let codemapFilesByID = await codemapFileRecordsByID(
                 for: presentation,
                 resolution: resolution,
-                roots: roots,
+                roots: attempt.authority.roots,
                 store: store,
                 codeMapUsage: codeMapUsage
             )
             return makeModel(
                 source: source,
-                lookupContext: lookupContext,
+                lookupContext: attempt.authority.lookupContext,
                 resolution: resolution,
-                roots: roots,
+                roots: attempt.authority.roots,
                 codemapFilesByID: codemapFilesByID,
                 filePathDisplay: filePathDisplay,
                 codeMapUsage: codeMapUsage,
                 codemapPresentation: presentation,
-                logicalRootDisplayNamesByRootID: logicalRootDisplayNames
+                logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID
             )
         }
     }
 
-    static func buildClipboardContent(_ request: AgentContextClipboardRequest) async -> String {
-        let lookupContext = await authoritativeLookupContextForClipboardIfNeeded(request)
-        let effectiveRequest = AgentContextClipboardRequest(
-            cfg: request.cfg,
-            source: request.source,
-            store: request.store,
-            lookupContext: lookupContext,
-            filePathDisplay: request.filePathDisplay,
-            onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
-            showCodeMapMarkers: request.showCodeMapMarkers,
-            metaInstructions: request.metaInstructions,
-            includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
-            promptSectionsOrder: request.promptSectionsOrder,
-            disabledPromptSections: request.disabledPromptSections,
-            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
-            reviewGitContext: request.reviewGitContext,
-            completeGitDiffProvider: request.completeGitDiffProvider
-        )
-        let physicalSelection = lookupContext.physicalizeSelection(request.source.selection)
-        let rootScope = lookupContext.rootScope.excludingWorkspaceGitData
-        let presentationPlan = await codemapPresentationPlan(
-            codeMapUsage: request.cfg.codeMapUsage,
-            selection: physicalSelection,
-            store: request.store,
-            rootScope: rootScope,
-            profile: .uiAssisted
-        )
+    static func buildClipboardContent(
+        _ request: AgentContextClipboardRequest,
+        presentationCoordinator: WorkspaceCodemapPresentationCoordinator? = nil
+    ) async -> String {
+        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: request.store)
         do {
-            return try await WorkspaceCodemapPresentationCoordinator(store: request.store).withPresentation(
-                for: presentationPlan.intent,
-                rootScope: rootScope,
-                logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(
-                    store: request.store
-                )
-            ) { presentation in
+            return try await coordinator.withPresentation(
+                prepareAttempt: {
+                    let authority = await presentationAuthoritySnapshot(
+                        source: request.source,
+                        store: request.store,
+                        codeMapUsage: request.cfg.codeMapUsage,
+                        fallbackLookupContext: request.lookupContext,
+                        excludingWorkspaceGitData: true
+                    )
+                    return WorkspaceCodemapPresentationAttempt(
+                        context: authority,
+                        intent: authority.presentationPlan.intent,
+                        rootScope: authority.rootScope,
+                        logicalRootDisplayNamesByRootID: authority.logicalRootDisplayNamesByRootID,
+                        requestedCodemapCount: requestedCodemapCount(
+                            for: authority.presentationPlan.intent,
+                            codeMapUsage: request.cfg.codeMapUsage
+                        )
+                    )
+                }
+            ) { authority, presentation in
                 await assembleClipboardContent(
-                    effectiveRequest,
+                    clipboardRequest(request, lookupContext: authority.lookupContext),
                     codemapPresentation: merging(
                         presentation,
-                        preflightIssues: presentationPlan.preflightIssues
+                        preflightIssues: authority.presentationPlan.preflightIssues
                     )
                 )
             }
@@ -493,11 +497,18 @@ enum AgentContextExportResolver {
             } else {
                 .coordinationUnavailable
             }
+            let authority = await presentationAuthoritySnapshot(
+                source: request.source,
+                store: request.store,
+                codeMapUsage: request.cfg.codeMapUsage,
+                fallbackLookupContext: request.lookupContext,
+                excludingWorkspaceGitData: true
+            )
             return await assembleClipboardContent(
-                effectiveRequest,
+                clipboardRequest(request, lookupContext: authority.lookupContext),
                 codemapPresentation: merging(
                     unavailablePresentation(issue),
-                    preflightIssues: presentationPlan.preflightIssues
+                    preflightIssues: authority.presentationPlan.preflightIssues
                 )
             )
         }
@@ -602,22 +613,164 @@ enum AgentContextExportResolver {
         )
     }
 
-    private static func authoritativeLookupContextForClipboardIfNeeded(
-        _ request: AgentContextClipboardRequest
+    private static func authoritativeLookupContext(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore,
+        fallback: WorkspaceLookupContext
     ) async -> WorkspaceLookupContext {
-        guard request.source.hasWorktreeBindings,
-              let projection = request.lookupContext.bindingProjection,
-              !projection.isFullyMaterialized
-        else {
-            return request.lookupContext
-        }
-
+        guard source.hasWorktreeBindings else { return fallback }
         return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
             source: AgentWorkspaceLookupContextSource(
-                activeAgentSessionID: request.source.activeAgentSessionID,
-                worktreeBindings: request.source.worktreeBindings
+                activeAgentSessionID: source.activeAgentSessionID,
+                worktreeBindings: source.worktreeBindings
             ),
-            store: request.store
+            store: store
+        )
+    }
+
+    private static func presentationAuthoritySnapshot(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage,
+        fallbackLookupContext: WorkspaceLookupContext,
+        excludingWorkspaceGitData: Bool
+    ) async -> PresentationAuthoritySnapshot {
+        let lookupContext = await authoritativeLookupContext(
+            source: source,
+            store: store,
+            fallback: fallbackLookupContext
+        )
+        let physicalSelection = lookupContext.physicalizeSelection(source.selection)
+        let rootScope = excludingWorkspaceGitData
+            ? lookupContext.rootScope.excludingWorkspaceGitData
+            : lookupContext.rootScope
+        let roots = await store.rootRefs(scope: rootScope)
+        let presentationPlan = await codemapPresentationPlan(
+            codeMapUsage: codeMapUsage,
+            selection: physicalSelection,
+            store: store,
+            rootScope: rootScope,
+            profile: .uiAssisted
+        )
+        let logicalRootDisplayNamesByRootID = await lookupContext.logicalRootDisplayNamesByRootID(
+            store: store
+        )
+        return PresentationAuthoritySnapshot(
+            lookupContext: lookupContext,
+            physicalSelection: physicalSelection,
+            rootScope: rootScope,
+            roots: roots,
+            logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+            presentationPlan: presentationPlan
+        )
+    }
+
+    private static func modelPresentationAttempt(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage
+    ) async -> ModelPresentationAttempt {
+        let authority = await presentationAuthoritySnapshot(
+            source: source,
+            store: store,
+            codeMapUsage: codeMapUsage,
+            fallbackLookupContext: .visibleWorkspace,
+            excludingWorkspaceGitData: false
+        )
+        let resolution = await resolveRows(
+            selection: authority.physicalSelection,
+            store: store,
+            rootScope: authority.rootScope,
+            profile: .uiAssisted
+        )
+        return ModelPresentationAttempt(authority: authority, resolution: resolution)
+    }
+
+    private static func requestedCodemapCount(
+        for intent: WorkspaceCodemapOperationPresentationIntent,
+        codeMapUsage: CodeMapUsage
+    ) -> Int? {
+        guard codeMapUsage == .selected else { return nil }
+        guard case let .exact(fileIDs, _) = intent else { return 0 }
+        return Set(fileIDs).count
+    }
+
+    private static func clipboardRequest(
+        _ request: AgentContextClipboardRequest,
+        lookupContext: WorkspaceLookupContext
+    ) -> AgentContextClipboardRequest {
+        AgentContextClipboardRequest(
+            cfg: request.cfg,
+            source: request.source,
+            store: request.store,
+            lookupContext: lookupContext,
+            filePathDisplay: request.filePathDisplay,
+            onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: request.showCodeMapMarkers,
+            metaInstructions: request.metaInstructions,
+            includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
+            promptSectionsOrder: request.promptSectionsOrder,
+            disabledPromptSections: request.disabledPromptSections,
+            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
+            reviewGitContext: request.reviewGitContext,
+            completeGitDiffProvider: request.completeGitDiffProvider
+        )
+    }
+
+    private static func validatedSelectedFallbackResolution(
+        _ resolution: RowResolution,
+        presentation: WorkspaceCodemapOperationPresentation,
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage
+    ) async -> RowResolution {
+        guard codeMapUsage == .selected else { return resolution }
+        guard !Task.isCancelled else {
+            return cancelledSelectedFallbackResolution(resolution)
+        }
+        var rows: [RowResolutionEntry] = []
+        rows.reserveCapacity(resolution.rows.count)
+        var missingPaths = resolution.missingPaths
+        for row in resolution.rows {
+            let file = row.entry.file
+            if let rendered = presentation.renderedEntriesByFileID[file.id],
+               rendered.rootEpoch.rootID == file.rootID
+            {
+                rows.append(row)
+                continue
+            }
+            do {
+                guard try await store.readContent(
+                    rootID: file.rootID,
+                    relativePath: file.standardizedRelativePath,
+                    workloadClass: .promptAccounting
+                ) != nil else {
+                    missingPaths.append(file.standardizedRelativePath)
+                    continue
+                }
+                rows.append(row)
+            } catch {
+                if Task.isCancelled || error is CancellationError {
+                    return cancelledSelectedFallbackResolution(resolution)
+                }
+                missingPaths.append(file.standardizedRelativePath)
+            }
+        }
+        return RowResolution(
+            rows: rows,
+            selectedFileIDs: resolution.selectedFileIDs,
+            missingPaths: Array(Set(missingPaths)).sorted(),
+            invalidPaths: resolution.invalidPaths
+        )
+    }
+
+    private static func cancelledSelectedFallbackResolution(
+        _ resolution: RowResolution
+    ) -> RowResolution {
+        RowResolution(
+            rows: [],
+            selectedFileIDs: resolution.selectedFileIDs,
+            missingPaths: resolution.missingPaths,
+            invalidPaths: resolution.invalidPaths
         )
     }
 

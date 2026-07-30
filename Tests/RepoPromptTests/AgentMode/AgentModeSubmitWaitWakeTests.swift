@@ -22,6 +22,23 @@ final class AgentModeSubmitWaitWakeTests: XCTestCase {
             selectedAgent: .claudeCode,
             codexCompactionInFlight: false
         ))
+
+        let acceptedRunID = UUID()
+        XCTAssertEqual(
+            AgentModeViewModel.test_validatedSteeringOriginRunID(
+                capturedRunID: acceptedRunID,
+                currentRunID: acceptedRunID
+            ),
+            acceptedRunID
+        )
+        XCTAssertNil(AgentModeViewModel.test_validatedSteeringOriginRunID(
+            capturedRunID: acceptedRunID,
+            currentRunID: UUID()
+        ))
+        XCTAssertNil(AgentModeViewModel.test_validatedSteeringOriginRunID(
+            capturedRunID: nil,
+            currentRunID: acceptedRunID
+        ))
     }
 
     func testCodexDeliverySignalWaitsForProviderAcceptanceOrDurableQueueInsertion() {

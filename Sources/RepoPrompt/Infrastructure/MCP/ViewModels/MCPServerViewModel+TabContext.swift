@@ -957,6 +957,26 @@ extension MCPServerViewModel {
         return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
     }
 
+    /// Returns true only for the current bidirectional run mapping.
+    ///
+    /// Pending-policy mapping tokens identify rollback/replacement generations; they do not own
+    /// application commit authority. ServerNetworkManager composes this mapping with its
+    /// actor-owned application, policy, window/tab, and live-connection state.
+    @MainActor
+    func hasCurrentRunRouteMapping(
+        runID: UUID,
+        connectionID: UUID,
+        expectedTabID: UUID?
+    ) -> Bool {
+        guard connectionIDByRunID[runID] == connectionID,
+              connectionIDToRunID[connectionID] == runID
+        else { return false }
+
+        guard let expectedTabID else { return true }
+        return tabContextByConnectionID[connectionID]?.runID == runID
+            && tabContextByConnectionID[connectionID]?.tabID == expectedTabID
+    }
+
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
     @MainActor
     func purgeClosedTabContext(tabID: UUID) {
@@ -2445,6 +2465,37 @@ extension MCPServerViewModel {
             pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)
         }
         return adjustedLookupContext
+    }
+
+    /// Resolves mutation routing and lookup authority together so an inactive,
+    /// persisted Agent tab can hydrate its worktree binding before the mutation
+    /// gate evaluates it. Re-resolving the snapshot after hydration keeps stale or
+    /// superseded routes fail-closed instead of falling back to the visible checkout.
+    @MainActor
+    func resolveMutationFileToolContext(
+        from metadata: RequestMetadata,
+        toolName: String
+    ) async throws -> (
+        resolvedContext: ResolvedTabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
+    ) {
+        var resolvedContext = try resolveTabContextSnapshot(
+            from: metadata,
+            toolName: toolName,
+            policy: .allowLegacyImplicitRouting
+        )
+        let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if !resolvedContext.usesActiveTabCompatibility,
+           resolvedContext.snapshot.activeAgentSessionID != nil,
+           case .unhydrated = resolvedContext.snapshot.worktreeBindingState
+        {
+            resolvedContext = try resolveTabContextSnapshot(
+                from: metadata,
+                toolName: toolName,
+                policy: .allowLegacyImplicitRouting
+            )
+        }
+        return (resolvedContext, lookupContext)
     }
 
     @MainActor
@@ -4455,6 +4506,10 @@ extension MCPServerViewModel {
         guard let storedTab = manager.composeTab(for: identity),
               storedTab.selection == updatedTab.selection
         else { return nil }
+        selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
+            storedTab.selection,
+            for: identity
+        )
         let committedSelectionRevision = manager.selectionRevisionForMCP(
             workspaceID: identity.workspaceID,
             tabID: identity.tabID
@@ -4485,6 +4540,11 @@ extension MCPServerViewModel {
         manager.beginApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext applying to UI: tab=\(applyTab.id) selectionCount=\(applyTab.selection.selectedPaths.count) promptChars=\(applyTab.promptText.count)")
         await manager.applyComposeTabState(applyTab)
+        // Refresh after the full UI apply because its final recount can enqueue another stale snapshot.
+        selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
+            applyTab.selection,
+            for: identity
+        )
         manager.endApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext UI applied: tab=\(applyTab.id)")
         guard isStillCurrent(), !Task.isCancelled else { return nil }

@@ -99,7 +99,7 @@ struct AgentSessionRow: View {
     }
 
     private var showsDisclosureChevron: Bool {
-        threadDepth == 0 && hasThreadChildren && onToggleThreadCollapse != nil
+        hasThreadChildren && onToggleThreadCollapse != nil
     }
 
     private var hiddenCountTooltip: String {
@@ -561,14 +561,10 @@ struct AgentSessionRow: View {
                 .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(Color.red)
                 .accessibilityLabel("Failed in background")
-        } else if threadDepth > 0 {
-            // Sub-agent identity glyph.
-            Image(systemName: "arrow.turn.down.right")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.secondary.opacity(0.55))
-                .accessibilityHidden(true)
         } else if showsDisclosureChevron, let onToggleThreadCollapse {
-            // Expandable root identity glyph — tappable disclosure affordance.
+            // Expandable thread identity glyph — tappable disclosure affordance.
+            // Nested expandable rows reuse this status slot instead of drawing
+            // a second leading sub-agent arrow; leaf children keep the arrow.
             // MCP-controlled roots tint the chevron orange when idle so the
             // row still signals "opened by an MCP client" without needing a
             // dedicated leading rail.
@@ -591,6 +587,12 @@ struct AgentSessionRow: View {
             .onHover { isDisclosureHovered = $0 }
             .hoverTooltip(disclosureAccessibilityLabel)
             .accessibilityLabel(disclosureAccessibilityLabel)
+        } else if threadDepth > 0 {
+            // Leaf sub-agent identity glyph.
+            Image(systemName: "arrow.turn.down.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.secondary.opacity(0.55))
+                .accessibilityHidden(true)
         } else if isMCPControlledRoot {
             // MCP-controlled leaf root — keeps the existing anchor-dot
             // design but recolors it orange and bumps the size a hair so

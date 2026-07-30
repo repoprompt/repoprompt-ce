@@ -113,7 +113,9 @@ ensure_swift_files_collected(){
 
 run_swiftformat(){
     local mode="$1"
-    ensure_tool swiftformat
+    local swiftformat_bin
+
+    swiftformat_bin="$("$ROOT_DIR/Scripts/install_format_tools.sh" resolve-swiftformat)" || exit
     ensure_swift_files_collected
 
     if (( ${#SWIFT_FILES[@]} == 0 )); then
@@ -129,7 +131,7 @@ run_swiftformat(){
     fi
 
     cd "$ROOT_DIR"
-    run swiftformat "${args[@]}" "${SWIFT_FILES[@]}"
+    run "$swiftformat_bin" "${args[@]}" "${SWIFT_FILES[@]}"
 }
 
 run_swiftlint(){

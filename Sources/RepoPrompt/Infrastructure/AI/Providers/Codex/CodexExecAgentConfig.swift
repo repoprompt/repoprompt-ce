@@ -13,8 +13,7 @@ struct CodexExecAgentConfig {
         modelString: String? = nil,
         enableDebugLogging: Bool = false
     ) {
-        let resolvedCommand = commandName ?? "codex"
-        self.commandName = resolvedCommand
+        self.commandName = commandName ?? CLILaunchProfiles.codex.commandName
         self.additionalPathHints = additionalPathHints
         self.modelString = modelString
         self.enableDebugLogging = enableDebugLogging
