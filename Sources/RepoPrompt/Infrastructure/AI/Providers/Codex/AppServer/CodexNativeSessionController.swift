@@ -496,6 +496,7 @@ final class CodexNativeSessionController {
         /// Identifier paired with `latestTurnStatus`; this is the last terminal turn, not an active turn.
         let latestTerminalTurnID: String?
         let latestTurnStatus: TurnStatus?
+        let latestTurnFailure: TurnFailure?
         let activeToolItems: [ToolItemObservation]
         let hasAuthoritativeActiveTurnItems: Bool
 
@@ -509,6 +510,7 @@ final class CodexNativeSessionController {
             activeTurnIDs: [String],
             latestTerminalTurnID: String? = nil,
             latestTurnStatus: TurnStatus?,
+            latestTurnFailure: TurnFailure? = nil,
             activeToolItems: [ToolItemObservation] = [],
             hasAuthoritativeActiveTurnItems: Bool = false
         ) {
@@ -521,6 +523,7 @@ final class CodexNativeSessionController {
             self.activeTurnIDs = activeTurnIDs
             self.latestTerminalTurnID = latestTerminalTurnID
             self.latestTurnStatus = latestTurnStatus
+            self.latestTurnFailure = latestTurnFailure
             self.activeToolItems = activeToolItems
             self.hasAuthoritativeActiveTurnItems = hasAuthoritativeActiveTurnItems
         }
@@ -2016,6 +2019,7 @@ final class CodexNativeSessionController {
         var activeTurnIDs: [String] = []
         var latestTerminalTurnID: String?
         var latestTurnStatus: TurnStatus?
+        var latestTurnFailure: TurnFailure?
         var activeToolItems: [ThreadSnapshot.ToolItemObservation] = []
         var authoritativeActiveTurnIDs: Set<String> = []
         for turn in turns {
@@ -2040,6 +2044,7 @@ final class CodexNativeSessionController {
             if let parsedStatus = parseTerminalTurnStatus(from: statusRaw) {
                 latestTerminalTurnID = turnID
                 latestTurnStatus = parsedStatus
+                latestTurnFailure = parsedStatus == .failed ? parseTurnFailure(from: turn) : nil
             }
         }
         let hasAuthoritativeActiveTurnItems = !activeTurnIDs.isEmpty
@@ -2054,6 +2059,7 @@ final class CodexNativeSessionController {
             activeTurnIDs: activeTurnIDs,
             latestTerminalTurnID: latestTerminalTurnID,
             latestTurnStatus: latestTurnStatus,
+            latestTurnFailure: latestTurnFailure,
             activeToolItems: activeToolItems,
             hasAuthoritativeActiveTurnItems: hasAuthoritativeActiveTurnItems
         )

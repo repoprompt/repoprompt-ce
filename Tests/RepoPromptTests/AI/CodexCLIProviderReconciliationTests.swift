@@ -17,6 +17,11 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
                         [
                             "id": "turn-b",
                             "status": "failed",
+                            "error": [
+                                "message": "persisted terminal failure",
+                                "codexErrorInfo": "quotaExceeded",
+                                "additionalDetails": ["requestId": "request-1"]
+                            ],
                             "items": []
                         ]
                     ]
@@ -27,6 +32,36 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
 
         XCTAssertEqual(snapshot.latestTerminalTurnID, "turn-b")
         XCTAssertEqual(snapshot.latestTurnStatus, .failed)
+        XCTAssertEqual(snapshot.latestTurnFailure?.message, "persisted terminal failure")
+        XCTAssertEqual(snapshot.latestTurnFailure?.codexErrorInfo, "quotaExceeded")
+        XCTAssertEqual(snapshot.latestTurnFailure?.additionalDetails, #"{"requestId":"request-1"}"#)
+
+        let completedAfterFailure = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "idle"],
+                    "turns": [
+                        [
+                            "id": "turn-a",
+                            "status": "failed",
+                            "error": ["message": "stale failure"],
+                            "items": []
+                        ],
+                        [
+                            "id": "turn-b",
+                            "status": "completed",
+                            "items": []
+                        ]
+                    ]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+
+        XCTAssertEqual(completedAfterFailure.latestTerminalTurnID, "turn-b")
+        XCTAssertEqual(completedAfterFailure.latestTurnStatus, .completed)
+        XCTAssertNil(completedAfterFailure.latestTurnFailure)
     }
 
     func testCanonicalCompletionReconcilesStreamingTailAndConnectionReplacement() async throws {
@@ -129,6 +164,11 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
             ],
             snapshotTurnID: "turn",
             snapshotStatus: .failed,
+            snapshotFailure: .init(
+                message: "persisted terminal failure",
+                codexErrorInfo: "quotaExceeded",
+                additionalDetails: #"{"requestId":"request-1"}"#
+            ),
             snapshotRuntimeStatus: .systemError
         )
         let provider = makeProvider(controller: controller)
@@ -141,10 +181,7 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
             for try await _ in stream {}
             XCTFail("Expected the persisted failed turn to settle the stream with an error")
         } catch {
-            XCTAssertEqual(
-                error.localizedDescription,
-                "Codex's persisted turn completed with a failure after its terminal notification was missed."
-            )
+            XCTAssertEqual(error.localizedDescription, "persisted terminal failure")
         }
 
         XCTAssertGreaterThanOrEqual(controller.readSnapshotCount, 1)
@@ -308,6 +345,7 @@ private final class SnapshotReconcilingCodexProviderController: CodexSessionCont
     private var _shutdownCount = 0
     private let snapshotTurnID: String
     private let snapshotStatus: CodexNativeSessionController.TurnStatus
+    private let snapshotFailure: CodexNativeSessionController.TurnFailure?
     private let snapshotRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus
     private let snapshotActiveTurnIDs: [String]
 
@@ -317,12 +355,14 @@ private final class SnapshotReconcilingCodexProviderController: CodexSessionCont
         events scriptedEvents: [CodexNativeSessionController.Event],
         snapshotTurnID: String,
         snapshotStatus: CodexNativeSessionController.TurnStatus,
+        snapshotFailure: CodexNativeSessionController.TurnFailure? = nil,
         snapshotRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus = .idle,
         snapshotActiveTurnIDs: [String] = [],
         canonicalCompletionDelay: TimeInterval? = nil
     ) {
         self.snapshotTurnID = snapshotTurnID
         self.snapshotStatus = snapshotStatus
+        self.snapshotFailure = snapshotFailure
         self.snapshotRuntimeStatus = snapshotRuntimeStatus
         self.snapshotActiveTurnIDs = snapshotActiveTurnIDs
         var continuationReference: AsyncStream<CodexNativeSessionController.Event>.Continuation?
@@ -403,7 +443,8 @@ private final class SnapshotReconcilingCodexProviderController: CodexSessionCont
             currentTurnID: snapshotActiveTurnIDs.last,
             activeTurnIDs: snapshotActiveTurnIDs,
             latestTerminalTurnID: snapshotTurnID,
-            latestTurnStatus: snapshotStatus
+            latestTurnStatus: snapshotStatus,
+            latestTurnFailure: snapshotFailure
         )
     }
 

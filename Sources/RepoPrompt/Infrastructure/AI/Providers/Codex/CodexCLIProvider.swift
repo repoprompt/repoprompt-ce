@@ -9,6 +9,7 @@ final class CodexCLIProvider: AIProvider {
     private struct ReconciledTerminalTurn: Equatable {
         let turnID: String
         let status: CodexNativeSessionController.TurnStatus
+        let failure: CodexNativeSessionController.TurnFailure?
     }
 
     private actor TerminalReconciliationState {
@@ -601,7 +602,8 @@ final class CodexCLIProvider: AIProvider {
                         throw CancellationError()
                     case .failed:
                         throw AIProviderError.invalidResponse(
-                            detail: "Codex's persisted turn completed with a failure after its terminal notification was missed."
+                            detail: reconciledTerminal.failure?.message
+                                ?? "Codex's persisted turn completed with a failure after its terminal notification was missed."
                         )
                     }
                 }
@@ -868,7 +870,8 @@ final class CodexCLIProvider: AIProvider {
                     guard runtimeIsTerminal else { continue }
                     let terminal = ReconciledTerminalTurn(
                         turnID: expectedTurnID,
-                        status: status
+                        status: status,
+                        failure: snapshot.latestTurnFailure
                     )
                     guard await state.claim(
                         terminal,
