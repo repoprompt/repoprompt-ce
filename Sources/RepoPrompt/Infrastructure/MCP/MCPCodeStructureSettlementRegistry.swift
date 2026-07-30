@@ -6,7 +6,9 @@ import Foundation
 /// provider receives an invocation-scoped lease. Completion, cleanup-grace expiry, and external
 /// cancellation transition that lease under this registry's single lock. Once any lease becomes
 /// detaching, detached, abandoned, or force-disconnecting, later same-window detach-disposition
-/// calls receive typed busy until every unsettled lease clears.
+/// calls receive typed busy while the invocation-scoped `Slot` capability exists. An entry is
+/// removed by exact provider settlement, explicit reserved early-exit cleanup, or fail-safe orphan
+/// reclamation when the final capability is destroyed.
 final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
     enum BusyReason: Equatable {
         case detached
@@ -123,13 +125,11 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         }
 
         deinit {
-            #if DEBUG
-                registry?.assertLeaseReleased(
-                    windowID: windowID,
-                    leaseID: leaseID,
-                    invocationID: invocationID
-                )
-            #endif
+            registry?.releaseOrphanedLease(
+                windowID: windowID,
+                leaseID: leaseID,
+                invocationID: invocationID
+            )
         }
     }
 
@@ -202,6 +202,12 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
             }
         }
     }
+
+    #if DEBUG
+        func debugDrainWaiterCount(windowID: Int) -> Int {
+            lock.withLock { drainWaitersByWindowID[windowID]?.count ?? 0 }
+        }
+    #endif
 
     private func recordCompletion(
         windowID: Int,
@@ -359,6 +365,22 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         return result.0
     }
 
+    private func releaseOrphanedLease(
+        windowID: Int,
+        leaseID: UUID,
+        invocationID: UUID
+    ) {
+        // The final Slot owner has disappeared, so no exact provider settlement can still arrive.
+        // Remove only that capability's entry and do not fabricate a settlement callback.
+        _ = transition(
+            windowID: windowID,
+            leaseID: leaseID,
+            invocationID: invocationID
+        ) { _ in
+            (.remove, ())
+        }
+    }
+
     private enum Mutation {
         case retain(Entry)
         case remove
@@ -418,19 +440,6 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         }
         return .settling
     }
-
-    #if DEBUG
-        private func assertLeaseReleased(
-            windowID: Int,
-            leaseID: UUID,
-            invocationID: UUID
-        ) {
-            let leaked = lock.withLock {
-                entriesByWindowID[windowID]?[leaseID]?.invocationID == invocationID
-            }
-            assert(!leaked, "Leaked get_code_structure settlement lease \(invocationID)")
-        }
-    #endif
 }
 
 private extension MCPCodeStructureSettlementRegistry.State {

@@ -2419,6 +2419,146 @@ import XCTest
             }
         }
 
+        func testDetachedGetFileTreeFencesStructuredReadsButDoesNotBlockApplyEdits() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let clock = ExecutionWatchdogManualClock()
+                let operationGate = MCPExecutionIgnoringCancellationGate()
+                let applyEditsProbe = MCPPostProviderAdmissionProbe()
+                let manager = fixture.networkManager
+                let windowID = fixture.contextA.window.windowID
+                var treeResponseTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(
+                    toolName: MCPWindowToolName.getFileTree
+                ) {
+                    await operationGate.enterAndWait()
+                    return .null
+                }
+                await manager.debugSetResolvedToolOperationOverride(
+                    toolName: MCPWindowToolName.applyEdits
+                ) {
+                    await applyEditsProbe.record(connectionID: ServerNetworkManager.currentConnectionID)
+                }
+
+                do {
+                    let endpoint = try fixture.endpointA()
+                    let detachedCandidate = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.getFileTree,
+                            arguments: [
+                                "type": "files",
+                                "context_id": fixture.contextA.tabID.uuidString,
+                                "_rawJSON": true
+                            ]
+                        )
+                    }
+                    treeResponseTask = detachedCandidate
+                    try await clock.waitForSleeperCount(1)
+                    try await operationGate.waitUntilEntered(count: 1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+                    try await clock.waitForSleeperCount(1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+
+                    let timeoutPayload = try await Self.toolResultObject(detachedCandidate.value)
+                    treeResponseTask = nil
+                    XCTAssertEqual(timeoutPayload["code"] as? String, "tool_execution_timeout")
+                    XCTAssertEqual(timeoutPayload["settlement"] as? String, "detached")
+                    let detachedSnapshot = await manager.debugCodeStructureSettlementSnapshot(
+                        windowID: windowID
+                    )
+                    XCTAssertEqual(
+                        detachedSnapshot,
+                        .init(activeCount: 1, detachedCount: 1)
+                    )
+
+                    let readResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString,
+                            "_rawJSON": true
+                        ]
+                    )
+                    let readPayload = try Self.toolResultObject(readResponse)
+                    XCTAssertEqual(
+                        readPayload["code"] as? String,
+                        "tool_execution_structure_settlement_busy"
+                    )
+
+                    _ = try await endpoint.callTool(
+                        name: MCPWindowToolName.applyEdits,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "search": fixture.contextA.sentinel,
+                            "replace": fixture.contextA.sentinel,
+                            "context_id": fixture.contextA.tabID.uuidString,
+                            "_rawJSON": true
+                        ]
+                    )
+                    try await applyEditsProbe.waitUntilEntered(connectionID: endpoint.connectionID)
+                    let postMutationSnapshot = await manager.debugCodeStructureSettlementSnapshot(
+                        windowID: windowID
+                    )
+                    XCTAssertEqual(
+                        postMutationSnapshot,
+                        .init(activeCount: 1, detachedCount: 1),
+                        "Successful mutation admission must not clear a structured-read fence"
+                    )
+                    let ordinaryLimiter = await manager.connectionLimiterSnapshotForTesting(
+                        connectionID: endpoint.connectionID,
+                        lane: .ordinary
+                    )
+                    XCTAssertEqual(ordinaryLimiter?.activePermitCount, 0)
+                    XCTAssertEqual(ordinaryLimiter?.waiterCount, 0)
+
+                    await operationGate.release()
+                    await manager.debugAwaitCodeStructureSettlementDrain(windowID: windowID)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.getFileTree,
+                        operation: nil
+                    )
+
+                    let postDrainRead = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString
+                        ]
+                    )
+                    XCTAssertTrue(
+                        try Self.toolResultText(postDrainRead).contains(fixture.contextA.sentinel)
+                    )
+
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.applyEdits,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await operationGate.release()
+                    treeResponseTask?.cancel()
+                    if let treeResponseTask {
+                        _ = try? await treeResponseTask.value
+                    }
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.getFileTree,
+                        operation: nil
+                    )
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.applyEdits,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         private static func waitUntil(
             timeout: Duration = .seconds(10),
             condition: () async -> Bool

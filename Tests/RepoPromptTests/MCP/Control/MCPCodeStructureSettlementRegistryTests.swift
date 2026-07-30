@@ -68,6 +68,146 @@ final class MCPCodeStructureSettlementRegistryTests: XCTestCase {
         await registry.awaitDrained(windowID: windowID)
     }
 
+    func testDroppingFinalAbandonedSlotReleasesFenceAndResumesDrainWaiters() async throws {
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 27
+        var abandoned: MCPCodeStructureSettlementRegistry.Slot? = admittedSlot(
+            registry,
+            windowID: windowID
+        )
+
+        XCTAssertEqual(abandoned?.cancel(), .abandoned(nil))
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 1, detachedCount: 1)
+        )
+
+        let drained = expectation(description: "Drain waiter resumed")
+        let waiter = Task {
+            await registry.awaitDrained(windowID: windowID)
+            drained.fulfill()
+        }
+        try await AsyncTestWait.waitUntil(
+            "settlement drain waiter registered",
+            timeout: 1
+        ) {
+            registry.debugDrainWaiterCount(windowID: windowID) == 1
+        }
+
+        abandoned = nil
+
+        await fulfillment(of: [drained], timeout: 1)
+        waiter.cancel()
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+        let replacement = admittedSlot(registry, windowID: windowID)
+        XCTAssertEqual(replacement.recordCompletion(.success), .deliver)
+    }
+
+    func testDroppingFinalDetachedSlotReleasesFenceAndAllowsReadmission() {
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 29
+        var detached: MCPCodeStructureSettlementRegistry.Slot? = admittedSlot(
+            registry,
+            windowID: windowID
+        )
+
+        XCTAssertEqual(detached?.resolveGraceExpiry(), .detach)
+        XCTAssertEqual(detached?.activateDetach(), .activated)
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 1, detachedCount: 1)
+        )
+
+        detached = nil
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+
+        let replacement = admittedSlot(registry, windowID: windowID)
+        XCTAssertEqual(replacement.recordCompletion(.success), .deliver)
+    }
+
+    func testDroppingFinalDetachingSlotReleasesFence() {
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 30
+        var detaching: MCPCodeStructureSettlementRegistry.Slot? = admittedSlot(
+            registry,
+            windowID: windowID
+        )
+
+        XCTAssertEqual(detaching?.resolveGraceExpiry(), .detach)
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 1, detachedCount: 1)
+        )
+
+        detaching = nil
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+    }
+
+    func testDroppingFinalReservedSlotReleasesEntry() {
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 31
+        var reserved: MCPCodeStructureSettlementRegistry.Slot? = admittedSlot(
+            registry,
+            windowID: windowID
+        )
+
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 1, detachedCount: 0)
+        )
+
+        reserved = nil
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+    }
+
+    func testOrphanCleanupRemovesOnlyItsExactLease() {
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 32
+        var first: MCPCodeStructureSettlementRegistry.Slot? = admittedSlot(
+            registry,
+            windowID: windowID
+        )
+        var second: MCPCodeStructureSettlementRegistry.Slot? = admittedSlot(
+            registry,
+            windowID: windowID
+        )
+
+        XCTAssertEqual(first?.cancel(), .abandoned(nil))
+        XCTAssertEqual(second?.resolveGraceExpiry(), .forceDisconnect)
+
+        second = nil
+
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 1, detachedCount: 1)
+        )
+        guard case .busy(.abandoned) = registry.admit(
+            windowID: windowID,
+            connectionID: UUID(),
+            invocationID: UUID()
+        ) else {
+            return XCTFail("Orphan cleanup must not clear another lease")
+        }
+
+        first = nil
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+    }
+
     func testCancellationDuringDetachingBecomesAbandonedWithoutDowngradingDetached() async {
         let registry = MCPCodeStructureSettlementRegistry()
         let windowID = 31
