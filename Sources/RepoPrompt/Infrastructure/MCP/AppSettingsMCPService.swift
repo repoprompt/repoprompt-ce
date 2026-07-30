@@ -708,20 +708,12 @@ private enum AppSettingsMCPRegistry {
             description: "Optional independent Secondary Oracle model. Null disables the second lane.",
             read: { stringOrNull($0.secondaryOracleModelRaw()) },
             write: { store, value in
-                let raw = try optionalString(from: value)
-                if let raw,
-                   AIModel.fromModelName(raw) == nil
-                {
-                    throw MCPError.invalidParams(
-                        "Secondary Oracle Model '\(raw)' is not a recognized model identifier."
-                    )
-                }
-                store.setSecondaryOracleModelRaw(
-                    raw,
+                try store.setSecondaryOracleModelRaw(
+                    optionalString(from: value),
                     reason: "app_settings.models.secondary_oracle_model"
                 )
             },
-            afterWrite: postRecommendationsDidApply,
+            afterWrite: nil,
             candidateProvider: aiModelRawCandidates
         ),
         boolSetting(

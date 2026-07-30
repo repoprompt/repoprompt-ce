@@ -5,7 +5,8 @@ import Foundation
 ///
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
-/// workspace-scoped Agent Models profiles. Scalar fields stay optional so missing
+/// workspace-scoped Agent Models profiles. Schema v5 adds Secondary Oracle model
+/// selection. Scalar fields stay optional so missing
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
@@ -14,7 +15,8 @@ struct GlobalSettingsDocument: Codable {
     /// version from `currentSchemaVersion`.
     static let baselineSchemaVersion = 2
     static let workspaceAgentModelsSchemaVersion = 4
-    static let currentSchemaVersion = 4
+    static let secondaryOracleSchemaVersion = 5
+    static let currentSchemaVersion = 5
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -77,6 +79,11 @@ struct GlobalSettingsDocument: Codable {
         var requiredVersion = Self.baselineSchemaVersion
         if let agentModelsSettingsByWorkspaceID, !agentModelsSettingsByWorkspaceID.isEmpty {
             requiredVersion = max(requiredVersion, Self.workspaceAgentModelsSchemaVersion)
+        }
+        if scalarPreferences?.modelSelection?.secondaryOracleModel != nil ||
+            agentModelsSettingsByWorkspaceID?.values.contains(where: { $0.profile?.secondaryOracleModelRaw != nil }) == true
+        {
+            requiredVersion = max(requiredVersion, Self.secondaryOracleSchemaVersion)
         }
         return requiredVersion
     }

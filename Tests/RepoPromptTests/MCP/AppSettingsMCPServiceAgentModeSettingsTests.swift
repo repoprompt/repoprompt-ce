@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import MCP
 @testable import RepoPromptApp
@@ -178,9 +179,19 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
         let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
-        let service = AppSettingsMCPService(store: store)
+        let notificationCenter = NotificationCenter()
+        let service = AppSettingsMCPService(store: store, notificationCenter: notificationCenter)
         let key = "models.secondary_oracle_model"
-        let model = AIModel.claude4Sonnet.rawValue
+        let model = "custom-secondary-model"
+        var settingsNotifications: [Foundation.Notification] = []
+        let settingsCancellable = NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
+            .filter { ($0.object as? GlobalSettingsStore) === store }
+            .sink { settingsNotifications.append($0) }
+        defer { settingsCancellable.cancel() }
+        var recommendationNotifications: [Foundation.Notification] = []
+        let recommendationCancellable = notificationCenter.publisher(for: .recommendationsDidApply)
+            .sink { recommendationNotifications.append($0) }
+        defer { recommendationCancellable.cancel() }
 
         let set = try await service.handleForTesting([
             "op": .string("set"), "key": .string(key), "value": .string(model)
@@ -188,6 +199,15 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertEqual(set.objectValue?["new_value"]?.stringValue, model)
         XCTAssertEqual(store.secondaryOracleModelRaw(), model)
         XCTAssertEqual(try fileStore.load().scalarPreferences?.modelSelection?.secondaryOracleModel, model)
+        XCTAssertEqual(try fileStore.load().schemaVersion, GlobalSettingsDocument.secondaryOracleSchemaVersion)
+        XCTAssertEqual(settingsNotifications.count, 1)
+        XCTAssertTrue(recommendationNotifications.isEmpty)
+
+        let unchanged = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(key), "value": .string(model)
+        ])
+        XCTAssertEqual(unchanged.objectValue?["changed"]?.boolValue, false)
+        XCTAssertEqual(settingsNotifications.count, 1)
 
         let cleared = try await service.handleForTesting([
             "op": .string("set"), "key": .string(key), "value": .null
@@ -195,6 +215,8 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertNil(cleared.objectValue?["new_value"]?.stringValue)
         XCTAssertNil(store.secondaryOracleModelRaw())
         XCTAssertNil(try fileStore.load().scalarPreferences?.modelSelection?.secondaryOracleModel)
+        XCTAssertEqual(settingsNotifications.count, 2)
+        XCTAssertTrue(recommendationNotifications.isEmpty)
     }
 
     func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {

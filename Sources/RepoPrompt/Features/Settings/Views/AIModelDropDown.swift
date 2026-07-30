@@ -335,8 +335,13 @@ struct AIModelDropdown: View {
         customOpenRouterModels: [String],
         compatibleClaudeBackendDisplayName: (AIModel) -> String? = { _ in nil }
     ) -> String {
+        let trimmedRawValue = currentModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isSecondaryOracle = destinationID == "agentModels.secondaryOracle"
+        if isSecondaryOracle, trimmedRawValue.isEmpty {
+            return "Disabled"
+        }
         if availableModels.isEmpty {
-            return "No models available"
+            return isSecondaryOracle ? trimmedRawValue : "No models available"
         }
 
         // Check custom OpenRouter models
@@ -355,8 +360,10 @@ struct AIModelDropdown: View {
         }
 
         if destinationID == "planningModel" {
-            let trimmedRawValue = currentModel.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmedRawValue.isEmpty ? "Select an Oracle model" : "Invalid Oracle model"
+        }
+        if isSecondaryOracle {
+            return trimmedRawValue
         }
 
         // Fallback to first available for non-Oracle destinations.

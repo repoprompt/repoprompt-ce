@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-07-26. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-07-30. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -40,13 +40,15 @@ representing its content. Schema-requiring features have fixed introduction cons
 
 - `baselineSchemaVersion = 2`
 - `workspaceAgentModelsSchemaVersion = 4`
+- `secondaryOracleSchemaVersion = 5`
 
 `requiredSchemaVersion` returns the maximum fixed feature version required by the
 document. It must never use `currentSchemaVersion` as the version of an existing feature:
-when another feature introduces v5, add a fixed constant for that feature and include it
-in the maximum. Baseline CE content is stamped v2. A document is stamped v4 only when
-`agentModelsSettingsByWorkspaceID` is nonempty. Save, compatible import, recovery, and
-default creation all use this content-derived minimum. Lineage is still stamped on every
+when another feature introduces a schema, add a fixed constant for that feature and include
+it in the maximum. Baseline CE content is stamped v2. A document is stamped v4 when
+`agentModelsSettingsByWorkspaceID` is nonempty, and v5 whenever global or workspace
+Secondary Oracle model selection is non-nil. Save, compatible import, recovery, and default
+creation all use this content-derived minimum. Lineage is still stamped on every
 CE write, and future-schema and unlineaged preservation guards remain unchanged.
 
 ## False-v4 normalization

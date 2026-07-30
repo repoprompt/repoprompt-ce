@@ -360,7 +360,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     func setSecondaryOracleModel(raw: String) {
         updateSelectedProfile(reason: "agent_models.secondary_oracle_model") { profile in
-            profile.secondaryOracleModelRaw = raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : raw
+            profile.secondaryOracleModelRaw = raw
         }
     }
 

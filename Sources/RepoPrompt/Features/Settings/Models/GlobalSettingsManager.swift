@@ -1040,6 +1040,7 @@ class GlobalSettingsStore: ObservableObject {
         line: UInt = #line,
         function: StaticString = #function
     ) {
+        let oldAgentModelsProfile = globalAgentModelsProfile()
         let oldValue = scalarPreferences.modelSelection?.secondaryOracleModel
         updateModelSelectionScalar(commit: commit) { settings in
             settings.secondaryOracleModel = Self.trimmedNonEmptyModelRaw(raw)
@@ -1054,6 +1055,9 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
+        if globalAgentModelsProfile() != oldAgentModelsProfile {
+            postAgentModelsSettingsDidChange(scope: .global)
+        }
     }
 
     func setPlanningModelRaw(
